@@ -40623,30 +40623,80 @@ static bool sample_fast_top_p(
     return true;
 }
 
-static int sample_full_vocab(
-        const float *logits,
-        uint32_t     n_vocab,
-        float        temperature,
-        float        top_p,
-        float        min_p,
-        uint64_t    *rng,
-        float       *prob_scratch) {
+static bool sample_mask_allows(const uint32_t *mask, size_t words, uint32_t id) {
+    if (!mask) return true;
+    const size_t word = id / 32u;
+    if (word >= words) return false;
+    return (mask[word] & (UINT32_C(1) << (id & 31u))) != 0;
+}
+
+static bool sample_filtered_allows(
+        const uint32_t *allow_mask,
+        size_t          allow_words,
+        const uint32_t *deny_mask,
+        size_t          deny_words,
+        uint32_t        id) {
+    return sample_mask_allows(allow_mask, allow_words, id) &&
+           !(deny_mask && sample_mask_allows(deny_mask, deny_words, id));
+}
+
+static int sample_argmax_filtered(
+        const float    *logits,
+        uint32_t        n_vocab,
+        const uint32_t *allow_mask,
+        size_t          allow_words,
+        const uint32_t *deny_mask,
+        size_t          deny_words) {
+    if (!allow_mask && !deny_mask) return sample_argmax(logits, n_vocab);
+    int best = -1;
+    float best_v = DS4_NEG_INF;
+    for (uint32_t i = 0; i < n_vocab; i++) {
+        if (!sample_filtered_allows(allow_mask, allow_words, deny_mask, deny_words, i)) {
+            continue;
+        }
+        const float v = logits[i];
+        if (!isfinite(v)) continue;
+        if (best < 0 || v > best_v) {
+            best_v = v;
+            best = (int)i;
+        }
+    }
+    return best;
+}
+
+static int sample_full_vocab_filtered(
+        const float    *logits,
+        uint32_t        n_vocab,
+        float           temperature,
+        float           top_p,
+        float           min_p,
+        const uint32_t *allow_mask,
+        size_t          allow_words,
+        const uint32_t *deny_mask,
+        size_t          deny_words,
+        uint64_t       *rng,
+        float          *prob_scratch) {
     float max_logit = DS4_NEG_INF;
-    int best = 0;
+    int best = -1;
     uint32_t finite = 0;
     for (uint32_t i = 0; i < n_vocab; i++) {
+        if (!sample_filtered_allows(allow_mask, allow_words, deny_mask, deny_words, i)) {
+            continue;
+        }
         const float v = logits[i];
         if (!isfinite(v)) continue;
         finite++;
-        if (v > max_logit) {
+        if (best < 0 || v > max_logit) {
             max_logit = v;
             best = (int)i;
         }
     }
-    if (finite == 0) return sample_argmax(logits, n_vocab);
+    if (finite == 0) return sample_argmax_filtered(logits, n_vocab, allow_mask,
+                                                   allow_words, deny_mask,
+                                                   deny_words);
 
     int fast_token = best;
-    if (top_p < 1.0f &&
+    if (!allow_mask && !deny_mask && top_p < 1.0f &&
         sample_fast_top_p(logits,
                           n_vocab,
                           finite,
@@ -40685,6 +40735,9 @@ static int sample_full_vocab(
         }
 
         for (uint32_t i = 0; i < n_vocab; i++) {
+            if (!sample_filtered_allows(allow_mask, allow_words, deny_mask, deny_words, i)) {
+                continue;
+            }
             const float v = logits[i];
             prob_scratch[i] = -1.0f;
             if (!isfinite(v)) continue;
@@ -40698,6 +40751,9 @@ static int sample_full_vocab(
         if (sum <= 0.0f || !isfinite(sum)) return best;
         float r = sample_rng_f32(rng) * sum;
         for (uint32_t i = 0; i < n_vocab; i++) {
+            if (!sample_filtered_allows(allow_mask, allow_words, deny_mask, deny_words, i)) {
+                continue;
+            }
             const float p = prob_scratch[i];
             if (p < 0.0f) continue;
             r -= p;
@@ -40716,6 +40772,9 @@ static int sample_full_vocab(
          * only candidates that can survive. This preserves the nucleus mass
          * and RNG semantics while avoiding a full-vocabulary qsort. */
         for (uint32_t i = 0; i < n_vocab; i++) {
+            if (!sample_filtered_allows(allow_mask, allow_words, deny_mask, deny_words, i)) {
+                continue;
+            }
             const float v = logits[i];
             prob_scratch[i] = -1.0f;
             if (!isfinite(v)) continue;
@@ -40727,6 +40786,9 @@ static int sample_full_vocab(
 
         const float min_prob = (1.0f / sum) * min_p;
         for (uint32_t i = 0; i < n_vocab; i++) {
+            if (!sample_filtered_allows(allow_mask, allow_words, deny_mask, deny_words, i)) {
+                continue;
+            }
             const float p = prob_scratch[i];
             if (p < 0.0f || p / sum < min_prob) continue;
             n++;
@@ -40735,6 +40797,9 @@ static int sample_full_vocab(
         cand = xmalloc((size_t)n * sizeof(cand[0]));
         uint32_t out = 0;
         for (uint32_t i = 0; i < n_vocab; i++) {
+            if (!sample_filtered_allows(allow_mask, allow_words, deny_mask, deny_words, i)) {
+                continue;
+            }
             const float p = prob_scratch[i];
             if (p < 0.0f || p / sum < min_prob) continue;
             cand[out++] = (sample_candidate){
@@ -40744,6 +40809,9 @@ static int sample_full_vocab(
     } else {
         cand = xmalloc((size_t)finite * sizeof(cand[0]));
         for (uint32_t i = 0; i < n_vocab; i++) {
+            if (!sample_filtered_allows(allow_mask, allow_words, deny_mask, deny_words, i)) {
+                continue;
+            }
             const float v = logits[i];
             if (!isfinite(v)) continue;
             const float p = expf((v - max_logit) / temperature);
@@ -40786,16 +40854,23 @@ static int sample_full_vocab(
     return id;
 }
 
-static int sample_top_p_min_p(
-        const float *logits,
-        uint32_t     n_vocab,
-        float        temperature,
-        int          top_k,
-        float        top_p,
-        float        min_p,
-        uint64_t    *rng,
-        float       *prob_scratch) {
-    if (temperature <= 0.0f) return sample_argmax(logits, n_vocab);
+static int sample_top_p_min_p_filtered(
+        const float    *logits,
+        uint32_t        n_vocab,
+        float           temperature,
+        int             top_k,
+        float           top_p,
+        float           min_p,
+        const uint32_t *allow_mask,
+        size_t          allow_words,
+        const uint32_t *deny_mask,
+        size_t          deny_words,
+        uint64_t       *rng,
+        float          *prob_scratch) {
+    if (temperature <= 0.0f) {
+        return sample_argmax_filtered(logits, n_vocab, allow_mask, allow_words,
+                                      deny_mask, deny_words);
+    }
     if (top_p <= 0.0f || top_p > 1.0f) top_p = 1.0f;
     if (min_p < 0.0f) min_p = 0.0f;
     if (top_k <= 0) {
@@ -40803,8 +40878,9 @@ static int sample_top_p_min_p(
         if (owned_scratch) {
             prob_scratch = xmalloc((size_t)n_vocab * sizeof(prob_scratch[0]));
         }
-        const int token = sample_full_vocab(logits, n_vocab, temperature,
-                                            top_p, min_p, rng, prob_scratch);
+        const int token = sample_full_vocab_filtered(
+            logits, n_vocab, temperature, top_p, min_p,
+            allow_mask, allow_words, deny_mask, deny_words, rng, prob_scratch);
         if (owned_scratch) free(prob_scratch);
         return token;
     }
@@ -40815,6 +40891,9 @@ static int sample_top_p_min_p(
     float vals[1024];
     int n = 0;
     for (uint32_t i = 0; i < n_vocab; i++) {
+        if (!sample_filtered_allows(allow_mask, allow_words, deny_mask, deny_words, i)) {
+            continue;
+        }
         float v = logits[i];
         if (!isfinite(v)) continue;
         if (n == top_k && v <= vals[n - 1]) continue;
@@ -40827,7 +40906,10 @@ static int sample_top_p_min_p(
         vals[j] = v;
         ids[j] = (int)i;
     }
-    if (n == 0) return sample_argmax(logits, n_vocab);
+    if (n == 0) {
+        return sample_argmax_filtered(logits, n_vocab, allow_mask, allow_words,
+                                      deny_mask, deny_words);
+    }
 
     float probs[1024];
     const float max_logit = vals[0];
@@ -40858,7 +40940,33 @@ static int sample_top_p_min_p(
     return ids[filtered - 1];
 }
 
+static int sample_top_p_min_p(
+        const float *logits,
+        uint32_t     n_vocab,
+        float        temperature,
+        int          top_k,
+        float        top_p,
+        float        min_p,
+        uint64_t    *rng,
+        float       *prob_scratch) {
+    return sample_top_p_min_p_filtered(logits, n_vocab, temperature, top_k,
+                                       top_p, min_p, NULL, 0, NULL, 0, rng,
+                                       prob_scratch);
+}
+
 #ifdef DS4_TEST_HOOKS
+int ds4_test_sample_logits_masked(const float *logits, uint32_t n_vocab,
+                                  float temperature, int top_k,
+                                  float top_p, float min_p,
+                                  const uint32_t *allow_mask, size_t allow_words,
+                                  const uint32_t *deny_mask, size_t deny_words,
+                                  uint64_t *rng, float *prob_scratch) {
+    if (!logits || !rng || n_vocab == 0 || !allow_mask) return -1;
+    return sample_top_p_min_p_filtered(logits, n_vocab, temperature, top_k,
+                                       top_p, min_p, allow_mask, allow_words,
+                                       deny_mask, deny_words, rng, prob_scratch);
+}
+
 int ds4_test_sample_logits(const float *logits, uint32_t n_vocab,
                            float temperature, int top_k,
                            float top_p, float min_p, uint64_t *rng,
@@ -67975,6 +68083,20 @@ int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
     return sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k,
                               top_p, min_p, rng, s->sample_probs);
+}
+
+int ds4_session_sample_masked(ds4_session *s, float temperature, int top_k,
+                              float top_p, float min_p,
+                              const uint32_t *allow_mask,
+                              size_t allow_mask_words,
+                              const uint32_t *deny_mask,
+                              size_t deny_mask_words,
+                              uint64_t *rng) {
+    if (!s || !s->logits || !allow_mask) return -1;
+    return sample_top_p_min_p_filtered(s->logits, DS4_N_VOCAB, temperature,
+                                       top_k, top_p, min_p, allow_mask,
+                                       allow_mask_words, deny_mask,
+                                       deny_mask_words, rng, s->sample_probs);
 }
 
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {

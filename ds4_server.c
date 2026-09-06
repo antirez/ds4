@@ -4,6 +4,7 @@
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
 #include "ds4_kvstore.h"
+#include "ds4_llguidance.h"
 #include "ds4_tp.h"
 #include "rax.h"
 
@@ -435,6 +436,270 @@ static char *json_minify_raw_value(const char *json) {
     return buf_take(&b);
 }
 
+typedef enum {
+    DS4_TEXT_FORMAT_TEXT,
+    DS4_TEXT_FORMAT_JSON_OBJECT,
+    DS4_TEXT_FORMAT_JSON_SCHEMA,
+    DS4_TEXT_FORMAT_REGEX,
+    DS4_TEXT_FORMAT_LARK,
+    DS4_TEXT_FORMAT_LLGUIDANCE,
+} ds4_text_format_type;
+
+static const char *const text_format_names[] = {
+    "text", "json_object", "json_schema", "regex", "lark", "llguidance"
+};
+
+typedef struct {
+    ds4_text_format_type type;
+    char *constraint_data;
+    /* Prepared during request validation; owned until request_free(). */
+    ds4_llguidance *decoder;
+} ds4_text_format;
+
+static void ds4_text_format_clear(ds4_text_format *f) {
+    if (!f) return;
+    ds4_llguidance_free(f->decoder);
+    free(f->constraint_data);
+    memset(f, 0, sizeof(*f));
+}
+
+static bool ds4_text_format_is_structured(const ds4_text_format *f) {
+    return f && f->type != DS4_TEXT_FORMAT_TEXT;
+}
+
+static void ds4_text_format_set_constraint(ds4_text_format *f,
+                                           ds4_text_format_type type,
+                                           char *constraint_data) {
+    ds4_text_format_clear(f);
+    f->type = type;
+    f->constraint_data = constraint_data;
+}
+
+static const char *ds4_text_format_constraint_type(const ds4_text_format *f) {
+    return text_format_names[f ? f->type : DS4_TEXT_FORMAT_TEXT];
+}
+
+static bool ds4_text_format_prepare(ds4_llguidance_cache *cache,
+                                    ds4_text_format *f,
+                                    char *err, size_t errlen) {
+    if (!ds4_text_format_is_structured(f) || f->decoder) return true;
+    if (!ds4_llguidance_available()) {
+        snprintf(err, errlen,
+                 "structured outputs require building ds4 with LLGUIDANCE=1");
+        return false;
+    }
+    char llg_err[160] = {0};
+    f->decoder = ds4_llguidance_create(cache,
+        ds4_text_format_constraint_type(f), f->constraint_data,
+        llg_err, sizeof(llg_err));
+    if (!f->decoder) {
+        snprintf(err, errlen, "invalid structured output constraint: %s",
+                 llg_err[0] ? llg_err : "llguidance rejected constraint");
+        return false;
+    }
+    return true;
+}
+
+typedef struct {
+    char *type;
+    char *schema;
+    char *wrapped_schema;
+    char *regex;
+    char *grammar;
+} text_format_fields;
+
+typedef enum {
+    FORMAT_CHAT,
+    FORMAT_RESPONSES,
+    FORMAT_SCHEMA_WRAPPER,
+} text_format_envelope;
+
+static void text_format_fields_free(text_format_fields *f) {
+    free(f->type);
+    free(f->schema);
+    free(f->wrapped_schema);
+    free(f->regex);
+    free(f->grammar);
+}
+
+/* Only Chat accepts a json_schema wrapper. Both APIs otherwise share the
+ * same fields; name and strict are type-checked compatibility metadata. */
+static bool parse_text_format_fields(const char **p, text_format_fields *f,
+                                      text_format_envelope envelope,
+                                      char *err, size_t errlen) {
+    json_ws(p);
+    if (**p != '{') return false;
+    (*p)++;
+    json_ws(p);
+    while (**p && **p != '}') {
+        char *key = NULL;
+        if (!json_string(p, &key)) return false;
+        json_ws(p);
+        if (**p != ':') {
+            free(key);
+            return false;
+        }
+        (*p)++;
+        char **field = NULL;
+        if (!strcmp(key, "schema")) field = &f->schema;
+        else if (envelope != FORMAT_SCHEMA_WRAPPER) {
+            if (!strcmp(key, "type")) field = &f->type;
+            else if (!strcmp(key, "regex")) field = &f->regex;
+            else if (!strcmp(key, "grammar")) field = &f->grammar;
+        }
+        bool ok;
+        if (field) {
+            free(*field);
+            *field = NULL;
+            ok = field == &f->schema ? json_raw_value(p, field) : json_string(p, field);
+        } else if (envelope == FORMAT_CHAT && !strcmp(key, "json_schema")) {
+            text_format_fields nested = {0};
+            ok = parse_text_format_fields(p, &nested, FORMAT_SCHEMA_WRAPPER, err, errlen);
+            if (ok && !nested.schema) {
+                snprintf(err, errlen, "json_schema.schema is required");
+                ok = false;
+            }
+            if (ok) {
+                free(f->wrapped_schema);
+                f->wrapped_schema = nested.schema;
+                nested.schema = NULL;
+            }
+            text_format_fields_free(&nested);
+        } else if (!strcmp(key, "name")) {
+            char *name = NULL;
+            ok = json_string(p, &name);
+            free(name);
+        } else if (!strcmp(key, "strict")) {
+            bool strict;
+            ok = json_bool(p, &strict);
+        } else {
+            ok = json_skip_value(p);
+        }
+        free(key);
+        if (!ok) return false;
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != '}') return false;
+    (*p)++;
+    return true;
+}
+
+static bool parse_text_format(const char **p, ds4_text_format *format,
+                               text_format_envelope envelope,
+                               char *err, size_t errlen) {
+    const char *what = envelope == FORMAT_CHAT ? "response_format" : "text.format";
+    json_ws(p);
+    if (json_lit(p, "null")) {
+        ds4_text_format_clear(format);
+        return true;
+    }
+    text_format_fields fields = {0};
+    bool ok = false;
+    if (!parse_text_format_fields(p, &fields, envelope, err, errlen)) {
+        if (!err[0]) snprintf(err, errlen, "invalid %s", what);
+        goto done;
+    }
+    ds4_text_format_type type = DS4_TEXT_FORMAT_TEXT;
+    if (fields.type) {
+        size_t i;
+        for (i = 0; i < sizeof(text_format_names) / sizeof(text_format_names[0]); i++) {
+            if (!strcmp(fields.type, text_format_names[i])) break;
+        }
+        if (i == sizeof(text_format_names) / sizeof(text_format_names[0])) {
+            snprintf(err, errlen, "%s.type=%s not supported", what, fields.type);
+            goto done;
+        }
+        type = (ds4_text_format_type)i;
+    }
+    char **data = NULL;
+    const char *required = NULL;
+    switch (type) {
+    case DS4_TEXT_FORMAT_TEXT:
+        break;
+    case DS4_TEXT_FORMAT_JSON_OBJECT:
+        if (fields.schema) {
+            type = DS4_TEXT_FORMAT_JSON_SCHEMA;
+            data = &fields.schema;
+        }
+        break;
+    case DS4_TEXT_FORMAT_JSON_SCHEMA:
+        data = fields.wrapped_schema ? &fields.wrapped_schema : &fields.schema;
+        required = envelope == FORMAT_CHAT ? "json_schema.schema" : "schema";
+        break;
+    case DS4_TEXT_FORMAT_REGEX:
+        data = &fields.regex;
+        required = "regex";
+        break;
+    case DS4_TEXT_FORMAT_LARK:
+    case DS4_TEXT_FORMAT_LLGUIDANCE:
+        data = &fields.grammar;
+        required = "grammar";
+        break;
+    }
+    if (required && !*data) {
+        snprintf(err, errlen, "%s.%s is required", what, required);
+        goto done;
+    }
+    ds4_text_format_set_constraint(format, type, data ? *data : NULL);
+    if (data) *data = NULL;
+    ok = true;
+done:
+    text_format_fields_free(&fields);
+    return ok;
+}
+
+static bool parse_chat_response_format(const char **p, ds4_text_format *format,
+                                       char *err, size_t errlen) {
+    return parse_text_format(p, format, FORMAT_CHAT, err, errlen);
+}
+
+static bool parse_responses_text_format_object(const char **p, ds4_text_format *format,
+                                               char *err, size_t errlen) {
+    return parse_text_format(p, format, FORMAT_RESPONSES, err, errlen);
+}
+
+static bool parse_responses_text_value(const char **p,
+                                       ds4_text_format *format,
+                                       char *err,
+                                       size_t errlen) {
+    json_ws(p);
+    if (json_lit(p, "null")) {
+        ds4_text_format_clear(format);
+        return true;
+    }
+    if (**p != '{') return false;
+    (*p)++;
+    json_ws(p);
+    while (**p && **p != '}') {
+        char *key = NULL;
+        if (!json_string(p, &key)) return false;
+        json_ws(p);
+        if (**p != ':') {
+            free(key);
+            return false;
+        }
+        (*p)++;
+        if (!strcmp(key, "format")) {
+            if (!parse_responses_text_format_object(p, format, err, errlen)) {
+                free(key);
+                return false;
+            }
+        } else if (!json_skip_value(p)) {
+            free(key);
+            return false;
+        }
+        free(key);
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != '}') return false;
+    (*p)++;
+    return true;
+}
+
 #define SERVER_IMAGE_MARKER_BYTES 64
 
 typedef struct {
@@ -696,6 +961,7 @@ static void random_tool_id(char *dst, size_t dstlen, api_style api) {
 }
 
 typedef struct server server;
+static ds4_llguidance_cache *server_constraint_cache(server *s);
 static void server_inference_lock(server *s);
 static void server_inference_unlock(server *s);
 
@@ -805,6 +1071,7 @@ typedef struct {
     int cache_read_tokens;
     int cache_write_tokens;
     ds4_think_mode think_mode;
+    ds4_text_format text_format;
     bool has_tools;
     bool prompt_preserves_reasoning;
     /* For /v1/responses: emit reasoning_summary_* events / fields only when the
@@ -969,6 +1236,10 @@ static bool parse_ignore_eos_value(const char **p, request *r) {
 static bool request_validate_ignore_eos(const request *r,
                                         char *err, size_t errlen) {
     if (!r || !r->ignore_eos) return true;
+    if (ds4_text_format_is_structured(&r->text_format)) {
+        snprintf(err, errlen, "ignore_eos cannot be combined with structured outputs");
+        return false;
+    }
     if (r->temperature_set && r->temperature == 0.0f) return true;
     snprintf(err, errlen,
              "ignore_eos requires an explicit temperature of 0");
@@ -985,6 +1256,7 @@ static void request_free(request *r) {
     free(r->stops.v);
     free(r->raw_body);
     free(r->prompt_text);
+    ds4_text_format_clear(&r->text_format);
     stop_list_clear(&r->responses_live_call_ids);
     free(r->responses_live_call_ids.v);
     free(r->responses_live_suffix_text);
@@ -2540,7 +2812,7 @@ bad:
     return true;
 }
 
-static bool append_glm_tool_schema_json(buf *b, const char *json,
+static bool append_glm_tool_constraint_data(buf *b, const char *json,
                                         bool *emitted) {
     json_args args = {0};
     *emitted = false;
@@ -2589,7 +2861,7 @@ static void append_glm_tools_prompt_text(buf *b, const char *tool_schemas) {
         char *raw = NULL;
         if (!json_raw_value(&p, &raw)) break;
         bool emitted = false;
-        if (!append_glm_tool_schema_json(b, raw, &emitted)) {
+        if (!append_glm_tool_constraint_data(b, raw, &emitted)) {
             buf_puts(b, raw);
             emitted = true;
         }
@@ -3625,6 +3897,15 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                 free(key);
                 goto bad;
             }
+        } else if (!strcmp(key, "response_format")) {
+            if (!parse_chat_response_format(&p, &r->text_format, err, errlen)) {
+                free(key);
+                chat_msgs_free(&msgs);
+                free(tool_schemas);
+                if (!err[0]) snprintf(err, errlen, "invalid response_format");
+                request_free(r);
+                return false;
+            }
         } else if (!strcmp(key, "ignore_eos")) {
             if (!parse_ignore_eos_value(&p, r)) {
                 free(key);
@@ -3676,6 +3957,23 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
         return false;
     }
     r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
+    if (ds4_text_format_is_structured(&r->text_format)) {
+        if (r->has_tools) {
+            snprintf(err, errlen,
+                     "structured outputs with tools are not supported");
+            chat_msgs_free(&msgs);
+            free(tool_schemas);
+            request_free(r);
+            return false;
+        }
+        if (!ds4_text_format_prepare(server_constraint_cache(s), &r->text_format,
+                                                      err, errlen)) {
+            chat_msgs_free(&msgs);
+            free(tool_schemas);
+            request_free(r);
+            return false;
+        }
+    }
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
@@ -4814,6 +5112,17 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
                 free(key);
                 goto bad;
             }
+        } else if (!strcmp(key, "text")) {
+            if (!parse_responses_text_value(&p, &r->text_format, err, errlen)) {
+                free(key);
+                chat_msgs_free(&msgs);
+                buf_free(&loaded_tool_schemas);
+                free(instructions);
+                free(tool_schemas);
+                if (!err[0]) snprintf(err, errlen, "invalid text");
+                request_free(r);
+                return false;
+            }
         } else if (!strcmp(key, "reasoning")) {
             bool effort_seen = false;
             if (!parse_responses_reasoning(&p, &reasoning_effort,
@@ -4903,6 +5212,29 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
         (!tool_choice_none && combined_tool_schemas.len) ?
         combined_tool_schemas.ptr : NULL;
     r->has_tools = active_tool_schemas && active_tool_schemas[0];
+    if (ds4_text_format_is_structured(&r->text_format)) {
+        if (r->has_tools) {
+            snprintf(err, errlen,
+                     "structured outputs with tools are not supported");
+            chat_msgs_free(&msgs);
+            buf_free(&combined_tool_schemas);
+            buf_free(&loaded_tool_schemas);
+            free(instructions);
+            free(tool_schemas);
+            request_free(r);
+            return false;
+        }
+        if (!ds4_text_format_prepare(server_constraint_cache(s), &r->text_format,
+                                                      err, errlen)) {
+            chat_msgs_free(&msgs);
+            buf_free(&combined_tool_schemas);
+            buf_free(&loaded_tool_schemas);
+            free(instructions);
+            free(tool_schemas);
+            request_free(r);
+            return false;
+        }
+    }
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
@@ -7311,6 +7643,7 @@ static bool request_uses_structured_stream(const request *r) {
                          request_uses_openai_live_stream(r));
 }
 
+
 /* Codex' Responses API uses 24-hex suffixes for response/item ids. Prefix
  * controls the variant (resp_, rs_, msg_, fc_) so each event references a
  * stable identifier across output_item.added / .done. */
@@ -9128,6 +9461,7 @@ static void id_list_push_unique(stop_list *ids, const char *id);
 
 struct server {
     ds4_engine *engine;
+    ds4_llguidance_cache *constraint_cache;
     ds4_tp *tp_leader;
     server_slot *slots;
     int slot_count;
@@ -9162,6 +9496,10 @@ struct server {
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
 };
+
+static ds4_llguidance_cache *server_constraint_cache(server *s) {
+    return s ? s->constraint_cache : NULL;
+}
 
 static void server_inference_lock(server *s) {
     pthread_mutex_lock(&s->inference_mu);
@@ -12024,6 +12362,7 @@ static void *decode_worker_main(void *arg) {
 static void generate_job_inner(server *s, server_slot *slot, job *j) {
     char err[160];
     err[0] = '\0';
+    ds4_llguidance *structured = j->req.text_format.decoder;
     const bool multimodal = j->req.image_count != 0;
     pthread_mutex_lock(&s->inference_mu);
     const int old_pos = ds4_session_pos(slot->session);
@@ -12227,6 +12566,10 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     char req_flags[64];
     log_flags(req_flags, sizeof(req_flags), responses_protocol,
               j->req.has_tools, false, false, false);
+    if (structured) {
+        trace_event(s, trace_id, "structured output constraint=%s",
+                    ds4_text_format_constraint_type(&j->req.text_format));
+    }
     if (responses_live_continuation) {
         server_log(DS4_LOG_PREFILL,
                    "ds4-server: responses live continuation RESPPROTO match=%s ids=%d cached=%d prompt=%d",
@@ -12495,6 +12838,11 @@ decode_again:
     double last_decode_log_t = decode_t0;
     int last_decode_log_completion = 0;
     thinking_state thinking = thinking_state_from_prompt(&j->req);
+    bool structured_waiting_for_think_close = structured && thinking.inside;
+    if (structured_waiting_for_think_close) {
+        trace_event(s, trace_id,
+                    "structured output constraint delayed until </think>");
+    }
     const bool thinking_gates_tool_markers = ds4_think_mode_enabled(j->req.think_mode);
     bool tool_scan_waiting_for_think_close =
         thinking_gates_tool_markers && thinking.inside;
@@ -12533,14 +12881,17 @@ decode_again:
             temperature = 0.0f;
         }
         const int eos_token = ds4_token_eos(s->engine);
-        int token = j->req.ignore_eos ?
-            ds4_session_argmax_ignoring_eos(slot->session,
-                                            j->req.think_mode) :
-            ds4_session_sample(slot->session, temperature, top_k,
-                               top_p, min_p, &rng);
+        bool structured_active = structured && !structured_waiting_for_think_close;
+        int token = structured_active ?
+            ds4_llguidance_sample(structured, slot->session,
+                                  temperature, top_k, top_p, min_p,
+                                  &rng, err, sizeof(err)) :
+            j->req.ignore_eos ?
+            ds4_session_argmax_ignoring_eos(slot->session, j->req.think_mode) :
+            ds4_session_sample(slot->session, temperature, top_k, top_p, min_p, &rng);
         if (token < 0) {
             finish = "error";
-            snprintf(err, sizeof(err), "failed to select a non-EOS token");
+            if (!err[0]) snprintf(err, sizeof(err), "failed to select a token");
             break;
         }
         if (ds4_token_is_stop_for_think_mode(s->engine,
@@ -12556,6 +12907,8 @@ decode_again:
         int ntok = 0;
         const int block_start = ds4_session_pos(slot->session);
         if (!s->batched_mode &&
+            !structured_active &&
+            !structured_waiting_for_think_close &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {
@@ -12609,6 +12962,14 @@ decode_again:
                 stop_decode = true;
                 break;
             }
+            structured_active = structured && !structured_waiting_for_think_close;
+            if (structured_active &&
+                !ds4_llguidance_accept(structured, s->engine, token,
+                                       err, sizeof(err))) {
+                finish = "error";
+                stop_decode = true;
+                break;
+            }
 
             size_t piece_len = 0;
             char *piece = ds4_token_text(s->engine, token, &piece_len);
@@ -12620,6 +12981,14 @@ decode_again:
             const bool was_thinking = thinking.inside;
             if (!dsml_decode_state_is_tool(dsml_tracker.decode))
                 thinking_state_feed(&thinking, piece, piece_len);
+            if (structured_waiting_for_think_close &&
+                was_thinking &&
+                !thinking.inside)
+            {
+                structured_waiting_for_think_close = false;
+                trace_event(s, trace_id,
+                            "structured output constraint activated after </think>");
+            }
             if (j->req.kind == REQ_CHAT && j->req.has_tools) {
                 if (thinking.inside) {
                     dsml_decode_tracker_init(&dsml_tracker);
@@ -13995,6 +14364,7 @@ static void server_close_resources(server *s) {
     pthread_cond_destroy(&s->cv);
     pthread_mutex_destroy(&s->mu);
     if (s->tp_leader) ds4_tp_send_stop(s->tp_leader);
+    ds4_llguidance_cache_free(s->constraint_cache);
     ds4_engine_close(s->engine);
     ds4_tp_free(s->tp_leader);
     memset(s, 0, sizeof(*s));
@@ -14431,6 +14801,15 @@ int main(int argc, char **argv) {
     pthread_cond_init(&s.model_cv, NULL);
     pthread_mutex_init(&s.trace_mu, NULL);
 
+    if (ds4_llguidance_available()) {
+        s.constraint_cache = ds4_llguidance_cache_create(engine);
+        if (!s.constraint_cache) {
+            server_log(DS4_LOG_DEFAULT, "ds4-server: failed to allocate tokenizer cache");
+            server_close_resources(&s);
+            return 1;
+        }
+    }
+
     for (int i = 0; i < slot_count; i++) {
         server_slot *slot = &s.slots[i];
         slot->srv = &s;
@@ -14603,6 +14982,265 @@ static void test_assert(bool cond, const char *file, int line, const char *expr)
 }
 
 #define TEST_ASSERT(expr) test_assert((expr), __FILE__, __LINE__, #expr)
+
+static void test_text_format_shared_parsing(void) {
+    const struct {
+        const char *json;
+        ds4_text_format_type type;
+        const char *data;
+    } cases[] = {
+        {"null", DS4_TEXT_FORMAT_TEXT, NULL},
+        {"{}", DS4_TEXT_FORMAT_TEXT, NULL},
+        {"{\"type\":\"text\",\"regex\":\"unused\"}", DS4_TEXT_FORMAT_TEXT, NULL},
+        {"{\"type\":\"regex\",\"regex\":\"old\",\"regex\":\"new\",\"name\":\"ignored\",\"strict\":false}",
+         DS4_TEXT_FORMAT_REGEX, "new"},
+        {"{\"type\":\"json_object\",\"schema\":{\"type\":\"object\"}}",
+         DS4_TEXT_FORMAT_JSON_SCHEMA, "{\"type\":\"object\"}"},
+        {"{\"type\":\"regex\",\"type\":\"json_object\",\"extra\":[1,{}]}",
+         DS4_TEXT_FORMAT_JSON_OBJECT, NULL},
+    };
+    const char *invalid[] = {
+        "{\"type\":\"regex\",\"regex\":4}",
+        "{\"type\":\"json_schema\"}",
+        "{\"type\":\"regex\",\"regex\":\"new\",\"strict\":\"true\"}",
+        "{\"type\":\"lark\",\"grammar\":null}",
+        "{\"type\":\"json_object\",\"name\":17}",
+        "{\"type\":\"unknown\"}",
+    };
+    for (int api = FORMAT_CHAT; api <= FORMAT_RESPONSES; api++) {
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            ds4_text_format fmt = {0};
+            ds4_text_format_set_constraint(&fmt, DS4_TEXT_FORMAT_REGEX, xstrdup("previous"));
+            const char *p = cases[i].json;
+            char err[160] = {0};
+            TEST_ASSERT(parse_text_format(&p, &fmt, (text_format_envelope)api, err, sizeof(err)));
+            TEST_ASSERT(*p == '\0');
+            TEST_ASSERT(fmt.type == cases[i].type);
+            TEST_ASSERT(cases[i].data ? fmt.constraint_data && !strcmp(fmt.constraint_data, cases[i].data)
+                                      : fmt.constraint_data == NULL);
+            ds4_text_format_clear(&fmt);
+        }
+        for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+            ds4_text_format fmt = {0};
+            ds4_text_format_set_constraint(&fmt, DS4_TEXT_FORMAT_REGEX, xstrdup("previous"));
+            const char *p = invalid[i];
+            char err[160] = {0};
+            TEST_ASSERT(!parse_text_format(&p, &fmt, (text_format_envelope)api, err, sizeof(err)));
+            TEST_ASSERT(err[0] != '\0');
+            TEST_ASSERT(fmt.type == DS4_TEXT_FORMAT_REGEX);
+            TEST_ASSERT(!strcmp(fmt.constraint_data, "previous"));
+            ds4_text_format_clear(&fmt);
+        }
+    }
+    /* Nested Chat schemas take precedence regardless of field order. */
+    const char *wrapped[] = {
+        "{\"type\":\"json_schema\",\"schema\":false,\"json_schema\":{\"schema\":true}}",
+        "{\"json_schema\":{\"schema\":true},\"schema\":false,\"type\":\"json_schema\"}",
+    };
+    for (size_t i = 0; i < sizeof(wrapped) / sizeof(wrapped[0]); i++) {
+        ds4_text_format fmt = {0};
+        const char *p = wrapped[i];
+        char err[160] = {0};
+        TEST_ASSERT(parse_chat_response_format(&p, &fmt, err, sizeof(err)));
+        TEST_ASSERT(!strcmp(fmt.constraint_data, "true"));
+        ds4_text_format_clear(&fmt);
+    }
+}
+
+static void test_parse_chat_response_format_json_schema(void) {
+    const char *json =
+        "{\"type\":\"json_schema\",\"json_schema\":{"
+        "\"name\":\"calendar_event\",\"strict\":true,"
+        "\"schema\":{\"type\":\"object\",\"properties\":{"
+        "\"name\":{\"type\":\"string\"}},\"required\":[\"name\"],"
+        "\"additionalProperties\":false}}}";
+    const char *p = json;
+    ds4_text_format fmt = {0};
+    char err[160] = {0};
+
+    TEST_ASSERT(parse_chat_response_format(&p, &fmt, err, sizeof(err)));
+    TEST_ASSERT(fmt.type == DS4_TEXT_FORMAT_JSON_SCHEMA);
+    TEST_ASSERT(fmt.constraint_data && strstr(fmt.constraint_data, "\"additionalProperties\""));
+    TEST_ASSERT(!strcmp(ds4_text_format_constraint_type(&fmt), "json_schema"));
+    json_ws(&p);
+    TEST_ASSERT(*p == '\0');
+
+    ds4_text_format_clear(&fmt);
+}
+
+static void test_parse_chat_response_format_json_object(void) {
+    const char *json = "{\"type\":\"json_object\"}";
+    const char *p = json;
+    ds4_text_format fmt = {0};
+    char err[160] = {0};
+
+    TEST_ASSERT(parse_chat_response_format(&p, &fmt, err, sizeof(err)));
+    TEST_ASSERT(fmt.type == DS4_TEXT_FORMAT_JSON_OBJECT);
+    TEST_ASSERT(fmt.constraint_data == NULL);
+    TEST_ASSERT(!strcmp(ds4_text_format_constraint_type(&fmt), "json_object"));
+
+    ds4_text_format_clear(&fmt);
+}
+
+static void test_parse_chat_response_format_llguidance_extensions(void) {
+    const struct {
+        const char *json;
+        ds4_text_format_type type;
+        const char *constraint_type;
+        const char *needle;
+    } cases[] = {
+        {
+            "{\"type\":\"regex\",\"regex\":\"INV-[0-9]{4}\"}",
+            DS4_TEXT_FORMAT_REGEX,
+            "regex",
+            "INV-"
+        },
+        {
+            "{\"type\":\"lark\",\"grammar\":\"%llguidance {}\\nstart: /OK/\"}",
+            DS4_TEXT_FORMAT_LARK,
+            "lark",
+            "start:"
+        },
+        {
+            "{\"type\":\"llguidance\",\"grammar\":\"{\\\"grammars\\\":[]}\"}",
+            DS4_TEXT_FORMAT_LLGUIDANCE,
+            "llguidance",
+            "grammars"
+        },
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const char *p = cases[i].json;
+        ds4_text_format fmt = {0};
+        char err[160] = {0};
+
+        TEST_ASSERT(parse_chat_response_format(&p, &fmt, err, sizeof(err)));
+        TEST_ASSERT(fmt.type == cases[i].type);
+        TEST_ASSERT(!strcmp(ds4_text_format_constraint_type(&fmt),
+                            cases[i].constraint_type));
+        TEST_ASSERT(fmt.constraint_data && strstr(fmt.constraint_data, cases[i].needle));
+        json_ws(&p);
+        TEST_ASSERT(*p == '\0');
+
+        ds4_text_format_clear(&fmt);
+    }
+}
+
+static void test_parse_chat_response_format_rejects_missing_schema(void) {
+    const char *json = "{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"bad\"}}";
+    const char *p = json;
+    ds4_text_format fmt = {0};
+    char err[160] = {0};
+
+    TEST_ASSERT(!parse_chat_response_format(&p, &fmt, err, sizeof(err)));
+    TEST_ASSERT(strstr(err, "schema is required") != NULL);
+
+    ds4_text_format_clear(&fmt);
+}
+
+static void test_parse_responses_text_format_json_schema(void) {
+    const char *json =
+        "{\"format\":{\"type\":\"json_schema\","
+        "\"name\":\"calendar_event\",\"strict\":true,"
+        "\"schema\":{\"type\":\"object\",\"properties\":{"
+        "\"date\":{\"type\":\"string\"}},\"required\":[\"date\"],"
+        "\"additionalProperties\":false}}}";
+    const char *p = json;
+    ds4_text_format fmt = {0};
+    char err[160] = {0};
+
+    TEST_ASSERT(parse_responses_text_value(&p, &fmt, err, sizeof(err)));
+    TEST_ASSERT(fmt.type == DS4_TEXT_FORMAT_JSON_SCHEMA);
+    TEST_ASSERT(fmt.constraint_data && strstr(fmt.constraint_data, "\"required\""));
+    TEST_ASSERT(!strcmp(ds4_text_format_constraint_type(&fmt), "json_schema"));
+    json_ws(&p);
+    TEST_ASSERT(*p == '\0');
+
+    ds4_text_format_clear(&fmt);
+}
+
+static void test_parse_responses_text_format_json_object(void) {
+    const char *json = "{\"format\":{\"type\":\"json_object\"}}";
+    const char *p = json;
+    ds4_text_format fmt = {0};
+    char err[160] = {0};
+
+    TEST_ASSERT(parse_responses_text_value(&p, &fmt, err, sizeof(err)));
+    TEST_ASSERT(fmt.type == DS4_TEXT_FORMAT_JSON_OBJECT);
+    TEST_ASSERT(fmt.constraint_data == NULL);
+    TEST_ASSERT(!strcmp(ds4_text_format_constraint_type(&fmt), "json_object"));
+
+    ds4_text_format_clear(&fmt);
+}
+
+static void test_parse_responses_text_format_llguidance_extensions(void) {
+    const struct {
+        const char *json;
+        ds4_text_format_type type;
+        const char *constraint_type;
+        const char *needle;
+    } cases[] = {
+        {
+            "{\"format\":{\"type\":\"regex\",\"regex\":\"INV-[0-9]{4}\"}}",
+            DS4_TEXT_FORMAT_REGEX,
+            "regex",
+            "INV-"
+        },
+        {
+            "{\"format\":{\"type\":\"lark\",\"grammar\":\"%llguidance {}\\nstart: /OK/\"}}",
+            DS4_TEXT_FORMAT_LARK,
+            "lark",
+            "start:"
+        },
+        {
+            "{\"format\":{\"type\":\"llguidance\",\"grammar\":\"{\\\"grammars\\\":[]}\"}}",
+            DS4_TEXT_FORMAT_LLGUIDANCE,
+            "llguidance",
+            "grammars"
+        },
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const char *p = cases[i].json;
+        ds4_text_format fmt = {0};
+        char err[160] = {0};
+
+        TEST_ASSERT(parse_responses_text_value(&p, &fmt, err, sizeof(err)));
+        TEST_ASSERT(fmt.type == cases[i].type);
+        TEST_ASSERT(!strcmp(ds4_text_format_constraint_type(&fmt),
+                            cases[i].constraint_type));
+        TEST_ASSERT(fmt.constraint_data && strstr(fmt.constraint_data, cases[i].needle));
+        json_ws(&p);
+        TEST_ASSERT(*p == '\0');
+
+        ds4_text_format_clear(&fmt);
+    }
+}
+
+static void test_parse_responses_text_format_rejects_unknown_type(void) {
+    const char *json = "{\"format\":{\"type\":\"xml\"}}";
+    const char *p = json;
+    ds4_text_format fmt = {0};
+    char err[160] = {0};
+
+    TEST_ASSERT(!parse_responses_text_value(&p, &fmt, err, sizeof(err)));
+    TEST_ASSERT(strstr(err, "not supported") != NULL);
+
+    ds4_text_format_clear(&fmt);
+}
+
+static void test_parse_responses_text_format_text_is_noop(void) {
+    const char *json = "{\"format\":{\"type\":\"text\"}}";
+    const char *p = json;
+    ds4_text_format fmt = {0};
+    char err[160] = {0};
+
+    TEST_ASSERT(parse_responses_text_value(&p, &fmt, err, sizeof(err)));
+    TEST_ASSERT(fmt.type == DS4_TEXT_FORMAT_TEXT);
+    TEST_ASSERT(fmt.constraint_data == NULL);
+
+    ds4_text_format_clear(&fmt);
+}
 
 static void test_server_bind_slot(server *s, server_slot *slot) {
     memset(slot, 0, sizeof(*slot));
@@ -15984,6 +16622,13 @@ static void test_chat_ignore_eos_contract(void) {
     r.temperature_set = true;
     r.temperature = 0.0f;
     TEST_ASSERT(request_validate_ignore_eos(&r, err, sizeof(err)));
+
+    r.text_format.type = DS4_TEXT_FORMAT_JSON_OBJECT;
+    TEST_ASSERT(!request_validate_ignore_eos(&r, err, sizeof(err)));
+    TEST_ASSERT(strstr(err, "structured outputs") != NULL);
+    r.ignore_eos = false;
+    TEST_ASSERT(request_validate_ignore_eos(&r, err, sizeof(err)));
+    r.text_format.type = DS4_TEXT_FORMAT_TEXT;
 
     p = "false";
     TEST_ASSERT(parse_ignore_eos_value(&p, &r));
@@ -19756,6 +20401,16 @@ static void ds4_server_unit_tests_run(void) {
     test_render_drops_old_reasoning_without_tools();
     test_render_preserves_reasoning_with_tools();
     test_render_chat_prompt_text_renders_tools_before_system();
+    test_text_format_shared_parsing();
+    test_parse_chat_response_format_json_schema();
+    test_parse_chat_response_format_json_object();
+    test_parse_chat_response_format_llguidance_extensions();
+    test_parse_chat_response_format_rejects_missing_schema();
+    test_parse_responses_text_format_json_schema();
+    test_parse_responses_text_format_json_object();
+    test_parse_responses_text_format_llguidance_extensions();
+    test_parse_responses_text_format_rejects_unknown_type();
+    test_parse_responses_text_format_text_is_noop();
     test_render_glm_chat_prompt_text();
     test_render_glm_drops_old_reasoning_without_tools();
     test_render_glm_preserves_reasoning_with_tools();

@@ -49,6 +49,25 @@ Max only with sufficient context; otherwise it falls back to normal thinking.
 `xhigh` maps to normal thinking, not Think Max. Use `think:false`, a disabled
 thinking object, or a non-thinking model alias for direct answers.
 
+## Structured outputs
+
+Structured outputs are available when the server is built with llguidance:
+
+```sh
+make LLGUIDANCE=1
+```
+
+By default, this clones llguidance into `.deps/llguidance` and builds the
+static library there. To use an existing checkout instead, pass
+`LLGUIDANCE_DIR=/path/to/llguidance`.
+
+With that build, `/v1/chat/completions` supports
+`response_format.type=json_schema`, `json_object`, `regex`, `lark`, and
+`llguidance`; `/v1/responses` supports the same modes through `text.format`.
+Structured outputs use constrained decoding. If thinking is enabled, the
+constraint applies after `</think>` so the final assistant content is structured.
+They currently cannot be combined with tools or `ignore_eos`.
+
 ## Multiple sessions
 
 ```sh
