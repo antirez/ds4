@@ -36,6 +36,9 @@
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
 #endif
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
 #include <stdarg.h>
 #include <time.h>
 #include <unistd.h>
@@ -4066,10 +4069,62 @@ static void ds4_vec_dot_q8_K_pair_q8_K(
     *s1 = sum1;
 }
 
+#if defined(__AVX2__)
+static inline int32_t ds4_dot_iq2_pair_16_avx2(const int8_t *grid0, const int8_t *grid1, const int8_t *q8) {
+    int64_t g0, g1;
+    memcpy(&g0, grid0, sizeof(g0));
+    memcpy(&g1, grid1, sizeof(g1));
+
+    const __m128i gv = _mm_set_epi64x(g1, g0);
+    const __m128i qv = _mm_loadu_si128((const __m128i *)q8);
+
+    const __m256i g16 = _mm256_cvtepi8_epi16(gv);
+    const __m256i q16 = _mm256_cvtepi8_epi16(qv);
+    const __m256i prod = _mm256_madd_epi16(g16, q16);
+
+    const __m128i lo = _mm256_castsi256_si128(prod);
+    const __m128i hi = _mm256_extracti128_si256(prod, 1);
+    __m128i sum4 = _mm_add_epi32(lo, hi);
+    sum4 = _mm_hadd_epi32(sum4, sum4);
+    sum4 = _mm_hadd_epi32(sum4, sum4);
+    return _mm_cvtsi128_si32(sum4);
+}
+#endif
+
 static DS4_MAYBE_UNUSED void ds4_vec_dot_iq2_xxs_q8_K(int n, float *s, const block_iq2_xxs *x, const block_q8_K *y) {
     const int nb = n / QK_K;
 
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+#if defined(__AVX2__)
+    uint32_t aux32[2];
+    const uint8_t *aux8 = (const uint8_t *)aux32;
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = f16_to_f32(x[i].d) * y[i].d;
+        const uint16_t *q2 = x[i].qs;
+        const int8_t *q8 = y[i].qs;
+        int32_t bsum = 0;
+
+        for (int ib32 = 0; ib32 < QK_K / 32; ib32++) {
+            memcpy(aux32, q2, 2 * sizeof(uint32_t));
+            q2 += 4;
+
+            const uint32_t ls = 2 * (aux32[1] >> 28) + 1;
+            int32_t sumi = 0;
+            for (int l = 0; l < 4; l += 2) {
+                const uint32_t sign_idx0 = (aux32[1] >> (7 * l)) & 127;
+                const uint32_t sign_idx1 = (aux32[1] >> (7 * (l + 1))) & 127;
+                sumi += ds4_dot_iq2_pair_16_avx2(iq2xxs_signed_grid[aux8[l]][sign_idx0],
+                                                  iq2xxs_signed_grid[aux8[l + 1]][sign_idx1],
+                                                  q8);
+                q8 += 16;
+            }
+            bsum += sumi * (int32_t)ls;
+        }
+        sumf += d * (float)bsum;
+    }
+    *s = 0.125f * sumf;
+#elif defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
     float sumf = 0.0f;
 
     for (int i = 0; i < nb; i++) {
