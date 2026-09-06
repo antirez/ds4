@@ -1536,22 +1536,17 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat,
     const int rollback_len = chat->transcript.len;
     const size_t rollback_images = chat->image_count;
     if (image) {
-        ds4_tokens_push(&chat->transcript, ds4_token_user(engine));
         ds4_vision_span *span = repl_chat_add_image(chat);
+        const char *text_parts[] = {"", user_text ? user_text : ""};
         char image_error[160] = {0};
-        if (!span || !ds4_prompt_append_vision(engine, &chat->transcript,
-                                               span, image,
-                                               image_error,
-                                               sizeof(image_error))) {
+        if (!span || !ds4_chat_append_multimodal_message(
+                engine, &chat->transcript, "user", text_parts,
+                image, 1, span, image_error, sizeof(image_error))) {
             repl_chat_trim_images(chat, rollback_images);
             chat->transcript.len = rollback_len;
             fprintf(stderr, "ds4: failed to add image: %s\n",
                     image_error[0] ? image_error : "out of memory");
             return 1;
-        }
-        if (user_text && user_text[0]) {
-            ds4_tokenize_text(engine, "\n", &chat->transcript);
-            ds4_tokenize_text(engine, user_text, &chat->transcript);
         }
     } else {
         ds4_chat_append_message(engine, &chat->transcript, "user", user_text);

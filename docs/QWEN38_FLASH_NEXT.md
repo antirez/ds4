@@ -169,6 +169,20 @@ raises the cap), encoded on the GPU, and takes the model's 3D rope positions;
 live KV reuse keys on the image fingerprints. `make test-qwen4-vision`
 compares the tower with the Hugging Face implementation.
 
+To check CLI `/read` image turns and text follow-ups with ordinary and MTP
+decode, use two different PNG or JPEG images with the model-backed regression:
+
+```sh
+make ds4
+uv run tests/test_qwen4_cli_vision.py --model /path/to/main-with-mtp.gguf \
+  --ple /path/to/ple.gguf --vision gguf/mmproj-Qwen3.8-Flash-Next-Q8_0.gguf \
+  --image /path/to/first.png --image /path/to/second.png
+```
+
+The test checks that all four turns complete in each mode, including errors
+that the interactive CLI can report without a nonzero process exit. It saves
+the responses and diagnostics for inspection; it does not grade image content.
+
 Metal only for now. The Metal graph accepts Q8_0, Q4_0, F16, BF16 and F32
 dense weights, Q8_0/MXFP4/Q4_0/Q4_K/Q2_K/IQ2_XXS experts, F16/F32/Q8_0
 hyper-connection mixers and a Q8_0/Q4_0/MXFP4/F16/F32 n-gram table.
