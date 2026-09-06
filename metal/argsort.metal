@@ -273,3 +273,105 @@ kernel void kernel_argsort_merge_f32_i32(
 
 // Host-visible merge variant used by DS4 top-k selection.
 template [[host_name("kernel_argsort_merge_f32_i32_desc")]] kernel argsort_merge_t kernel_argsort_merge_f32_i32<DS4_SORT_ORDER_DESC>;
+
+// Exact fused top-512 selection for wide M5 prefill rows. This reproduces the
+// canonical 1024-wide block sort and left-biased merge order, including its
+// tie behavior, while keeping intermediate indices in threadgroup memory.
+kernel void kernel_topk_fused512(
+        constant ds4_metal_args_argsort & args [[buffer(0)]],
+        device const float *scores [[buffer(1)]],
+        device uint32_t *selected [[buffer(2)]],
+        uint token [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]]) {
+    constexpr uint block_width = 1024u;
+    constexpr uint keep_count = 512u;
+    threadgroup int32_t block_idx[block_width];
+    threadgroup float block_scores[block_width];
+    threadgroup int32_t retained[keep_count];
+    threadgroup int32_t merged[keep_count];
+
+    if (token >= (uint)args.ne01) return;
+    device const float *row = scores + (uint64_t)token * (uint)args.ne00;
+    const uint n_comp = (uint)args.ne00;
+
+    for (uint base = 0u; base < n_comp; base += block_width) {
+        const uint col = base + tid;
+        block_idx[tid] = (int32_t)col;
+        if (col < n_comp) block_scores[tid] = row[col];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Keep this comparison network identical to
+        // kernel_argsort_f32_i32_desc above. In particular, strict float
+        // comparisons preserve its deterministic, non-stable tie order.
+        for (uint k = 2u; k <= block_width; k <<= 1u) {
+            for (uint j = k >> 1u; j > 0u; j >>= 1u) {
+                const uint other = tid ^ j;
+                if (other > tid) {
+                    const int32_t lhs = block_idx[tid];
+                    const int32_t rhs = block_idx[other];
+                    if ((tid & k) == 0u) {
+                        if (lhs >= (int32_t)n_comp ||
+                            (rhs < (int32_t)n_comp &&
+                             block_scores[lhs - (int32_t)base] <
+                             block_scores[rhs - (int32_t)base])) {
+                            block_idx[tid] = rhs;
+                            block_idx[other] = lhs;
+                        }
+                    } else {
+                        if (rhs >= (int32_t)n_comp ||
+                            (lhs < (int32_t)n_comp &&
+                             block_scores[lhs - (int32_t)base] >
+                             block_scores[rhs - (int32_t)base])) {
+                            block_idx[tid] = rhs;
+                            block_idx[other] = lhs;
+                        }
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
+
+        const uint block_len = min(block_width, n_comp - base);
+        const uint run_len = min(keep_count, block_len);
+        if (base == 0u) {
+            if (tid < keep_count) retained[tid] = block_idx[tid];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            continue;
+        }
+
+        if (tid < keep_count) {
+            const int k0 = (int)tid;
+            int low = k0 > (int)run_len ? k0 - (int)run_len : 0;
+            int high = min(k0, (int)keep_count);
+            while (low < high) {
+                const int mid = (low + high) >> 1;
+                const int32_t idx0 = retained[mid];
+                const int32_t idx1 = block_idx[k0 - mid - 1];
+                if (row[idx0] >= row[idx1]) {
+                    low = mid + 1;
+                } else {
+                    high = mid;
+                }
+            }
+
+            const int i = low;
+            const int j = k0 - i;
+            if (i >= (int)keep_count) {
+                merged[tid] = block_idx[j];
+            } else if (j >= (int)run_len) {
+                merged[tid] = retained[i];
+            } else if (row[retained[i]] >= row[block_idx[j]]) {
+                merged[tid] = retained[i];
+            } else {
+                merged[tid] = block_idx[j];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid < keep_count) retained[tid] = merged[tid];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid < keep_count) {
+        selected[(uint64_t)token * keep_count + tid] = (uint32_t)retained[tid];
+    }
+}
