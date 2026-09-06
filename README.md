@@ -4,8 +4,8 @@
 
 **DwarfStar** is a small native inference engine optimized first for
 **DeepSeek V4 Flash** (including the experimental vision model).
-It also supports **GLM 5.2 and 5.3**, **GLM 5.3 Flash**, and
-**DeepSeek V4 PRO**. It is self-contained and
+It also supports **GLM 5.2 and 5.3**, **GLM 5.3 Flash**, the experimental
+**Qwen 3.8 Flash Next** port, and **DeepSeek V4 PRO**. It is self-contained and
 deliberately narrow, not a general GGUF runner. Model loading, prompt rendering,
 tool calls, KV state, the HTTP server, and the coding agent are built and tested together.
 The repository also includes tools and data for GGUF, imatrix, quality, and speed.
