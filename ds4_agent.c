@@ -7808,6 +7808,11 @@ static void agent_bash_job_free(agent_bash_job *job) {
     }
     if (job->pipe_fd >= 0) close(job->pipe_fd);
     if (job->tmp_fd >= 0) close(job->tmp_fd);
+    /* Remove the mkstemp() output file created in agent_bash_start(); only
+     * that function's error paths unlinked it, so a job that started
+     * successfully otherwise leaves /tmp/ds4_agent_output_* behind for the
+     * lifetime of the process (unbounded accumulation across many jobs). */
+    if (job->path[0]) unlink(job->path);
     free(job->cmd);
     free(job);
 }
