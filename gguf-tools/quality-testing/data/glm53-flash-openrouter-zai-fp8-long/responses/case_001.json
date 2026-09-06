@@ -1,0 +1,54 @@
+{
+  "id": "gen-1788630681-LmBN65Ul2k3Unea2xZQ9",
+  "object": "chat.completion",
+  "created": 1788630681,
+  "model": "z-ai/glm-5.3-flash",
+  "provider": "Z.AI",
+  "system_fingerprint": null,
+  "service_tier": null,
+  "choices": [
+    {
+      "index": 0,
+      "logprobs": null,
+      "finish_reason": "length",
+      "native_finish_reason": "length",
+      "message": {
+        "role": "assistant",
+        "content": "## How storage and retrieval work (based on this excerpt)\n\n**File layout.** Each checkpoint is one file named `<40-char-hex-sha1>.kv` in a cache directory. The file consists of:\n\n1. A fixed header (`DS4_KVSTORE_FIXED_HEADER` bytes) written by `ds4_kvstore_fill_header`: magic `KVC`, format version (byte 3), quantization bits, reason code, extension flags, model id, then LE32 fields for tokens/hits/ctx_size, a payload",
+        "refusal": null,
+        "reasoning": "The excerpt ends mid-function; store path partially visible. Explain based on what's shown.",
+        "reasoning_details": [
+          {
+            "type": "reasoning.text",
+            "text": "The excerpt ends mid-function; store path partially visible. Explain based on what's shown.",
+            "format": "unknown",
+            "index": 0
+          }
+        ]
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 7317,
+    "completion_tokens": 128,
+    "total_tokens": 7445,
+    "cost": 0.000346535,
+    "is_byok": false,
+    "prompt_tokens_details": {
+      "cached_tokens": 3904,
+      "cache_write_tokens": 0,
+      "audio_tokens": 0,
+      "video_tokens": 0
+    },
+    "cost_details": {
+      "upstream_inference_cost": 0.000346535,
+      "upstream_inference_prompt_cost": 0.000314535,
+      "upstream_inference_completions_cost": 3.2e-05
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 18,
+      "image_tokens": 0,
+      "audio_tokens": 0
+    }
+  }
+}

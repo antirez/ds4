@@ -8897,6 +8897,19 @@ static bool agent_worker_compact_if_needed(agent_worker *w, const char *reason,
     return agent_worker_compact(w, reason, err, err_len);
 }
 
+static int agent_worker_rewind(agent_worker *w, int pos,
+                               char *err, size_t err_len) {
+    ds4_session_rewind(w->session, pos);
+    ds4_tokens prefix = {0};
+    ds4_tokens_copy(&prefix, ds4_session_tokens(w->session));
+    int rc = 0;
+    if (ds4_session_common_prefix(w->session, &prefix) != prefix.len) {
+        rc = agent_worker_sync_tokens(w, &prefix, false, err, err_len);
+    }
+    ds4_tokens_free(&prefix);
+    return rc;
+}
+
 static int worker_finish_generated_token(agent_worker *w,
                                          int token,
                                          int *generated,
@@ -9261,8 +9274,9 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                                 (int)(text_len > 80 ? 80 : text_len),
                                 text);
                     free(text);
-                    ds4_session_rewind(w->session, block_start + ti);
-                    if (worker_force_generated_text(w, "[upto]\n", max_tokens,
+                    if (agent_worker_rewind(w, block_start + ti,
+                                             err, sizeof(err)) != 0 ||
+                        worker_force_generated_text(w, "[upto]\n", max_tokens,
                                                     &generated, t0, &stream,
                                                     err, sizeof(err)) != 0) {
                         agent_dsml_parser_free(&dsml);
@@ -9311,8 +9325,9 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                     /* Later tokens were proposed under the old parser mode.
                      * Re-evaluate this boundary token to restore its logits,
                      * then sample the suffix under the new mode. */
-                    ds4_session_rewind(w->session, block_start + ti);
-                    if (ds4_session_eval(w->session, token,
+                    if (agent_worker_rewind(w, block_start + ti,
+                                             err, sizeof(err)) != 0 ||
+                        ds4_session_eval(w->session, token,
                                          err, sizeof(err)) != 0) {
                         agent_dsml_parser_free(&dsml);
                         agent_set_error(w, err);

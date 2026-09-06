@@ -11,6 +11,7 @@
 
 #if defined(GGML_USE_HIP)
 #include "vendors/hip.h"
+#include "../../ds4_rocm_memory.h"
 #else
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
@@ -182,6 +183,7 @@ struct ds4_naive_pool : public ggml_cuda_pool {
         }
 
         void * ptr = nullptr;
+        CUDA_CHECK(ds4_rocm_allocation_fits(size) ? hipSuccess : hipErrorOutOfMemory);
         CUDA_CHECK(cudaMallocAsync(&ptr, size, t_ds4_pool_stream));
         {
             std::lock_guard<std::mutex> guard(mutex);

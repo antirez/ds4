@@ -397,9 +397,16 @@ static void print_bench_specific(FILE *fp, const help_colors *c) {
 
 static void print_eval_specific(FILE *fp, const help_colors *c) {
     title(fp, c, "Evaluation");
-    opt(fp, c, "-n, --tokens N", "Max generated tokens per question. Default: 16000");
-    opt(fp, c, "--questions N", "Run only the first N embedded questions.");
+    opt(fp, c, "--suite NAME", "core, hard, all, or hard-smoke. Default: core");
+    opt(fp, c, "--source NAME", "Run only cases from this source.");
+    opt(fp, c, "--domain NAME", "Run only cases in this domain.");
+    opt(fp, c, "--case-id ID", "Run the case with this source ID.");
+    opt(fp, c, "--list-cases", "List selected cases without loading a model.");
+    opt(fp, c, "--validate-cases", "Validate all embedded cases and exit.");
+    opt(fp, c, "-n, --tokens N", "Override the generation budget for every question.");
+    opt(fp, c, "--questions N", "Run only the first N selected questions.");
     opt(fp, c, "--case-sequence LIST", "Run 1-based case numbers in this comma-separated order.");
+    opt(fp, c, "--retry-incomplete", "Retry a missing final answer once with twice the budget.");
     opt(fp, c, "--trace FILE", "Write questions, outputs, and grading decisions.");
     opt(fp, c, "--regrade-trace FILE", "Regrade a prior trace without loading the model.");
     opt(fp, c, "--soft-limit-reply-budget N", "Soft close thinking near the end of reply budget. Default: 1024");

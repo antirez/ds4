@@ -26,7 +26,7 @@ def main():
     dot = ref_sq = candidate_sq = sum_abs = sum_sq = max_abs = 0.0
     nonfinite = 0
     for expected, actual in zip(reference, candidate):
-        if not math.isfinite(actual):
+        if not math.isfinite(expected) or not math.isfinite(actual):
             nonfinite += 1
             continue
         delta = abs(expected - actual)
@@ -38,12 +38,17 @@ def main():
         candidate_sq += actual * actual
 
     count = len(reference)
+    if nonfinite or ref_sq == 0 or candidate_sq == 0:
+        print(f"invalid vision embeddings: nonfinite={nonfinite} "
+              f"reference_norm_sq={ref_sq} candidate_norm_sq={candidate_sq}",
+              file=sys.stderr)
+        return 1
     cosine = dot / math.sqrt(ref_sq * candidate_sq)
     mean_abs = sum_abs / count
     rms = math.sqrt(sum_sq / count)
     print(f"values={count} nonfinite={nonfinite} max_abs={max_abs:.9g} "
           f"mean_abs={mean_abs:.9g} rms={rms:.9g} cosine={cosine:.12f}")
-    if nonfinite or max_abs > 0.06 or mean_abs > 0.001 or cosine < 0.995:
+    if max_abs > 0.06 or mean_abs > 0.001 or cosine < 0.995:
         print("vision embedding comparison failed", file=sys.stderr)
         return 1
     return 0

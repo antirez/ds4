@@ -1,4 +1,5 @@
 #include <hip/hip_runtime.h>
+#include "ds4_rocm_memory.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -57,7 +58,7 @@ extern "C" int ds4_gpu_tensor_alloc_on(ds4_gpu_tensor *t, int tier,
     if (!t) return 1;
     if (!rocm_tier_valid(tier)) return 2;
     if (bytes == 0) bytes = 1;
-    if (hipMalloc(&t->ptr, (size_t)bytes) != hipSuccess) return 3;
+    if (ds4_rocm_malloc(&t->ptr, (size_t)bytes) != hipSuccess) return 3;
     t->bytes = bytes;
     t->owner = 1;
     t->device_id = 0;

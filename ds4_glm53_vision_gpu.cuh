@@ -261,6 +261,7 @@ __global__ static void glm53_vision_layernorm_gelu_kernel(
         __syncthreads();
     }
     const float mean = partial[0] / (float)width;
+    __syncthreads();
     float var = 0.0f;
     for (uint32_t d = tid; d < width; d += blockDim.x) {
         const float centered = xr[d] - mean;

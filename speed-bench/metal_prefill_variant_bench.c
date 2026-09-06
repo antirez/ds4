@@ -24,6 +24,7 @@ typedef struct {
     const char *prompt_path;
     const char *candidate_env;
     int prefix_tokens;
+    int initial_tokens;
     int warmup_tokens;
     int ctx;
     int repeats;
@@ -42,7 +43,8 @@ static void usage(FILE *fp, const char *argv0) {
             "  -m, --model PATH       GGUF path (default: ds4flash.gguf)\n"
             "  --prompt-file PATH     token source (default: ds4.c)\n"
             "  --candidate-env NAME   unset NAME for control, set NAME=1 for candidate\n"
-            "  --prefix-tokens N      timed prefill length (default: 8192)\n"
+            "  --prefix-tokens N      final prefill length (default: 8192)\n"
+            "  --initial-tokens N     untimed live prefix before appending to that length\n"
             "  --warmup-tokens N      untimed tokens per variant (default: 32; min: 32)\n"
             "  --ctx N                session allocation (default: max lengths + 1)\n"
             "  --repeats N            alternating ABBA/BAAB pairs (default: 2)\n",
@@ -101,6 +103,8 @@ static bench_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--warmup-tokens")) {
             cfg.warmup_tokens = parse_int_arg(
                 need_arg(&i, argc, argv, arg), arg, DEFAULT_WARMUP_TOKENS);
+        } else if (!strcmp(arg, "--initial-tokens")) {
+            cfg.initial_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg, 0);
         } else if (!strcmp(arg, "--ctx")) {
             cfg.ctx = parse_int_arg(need_arg(&i, argc, argv, arg), arg, 2);
         } else if (!strcmp(arg, "--repeats")) {
@@ -116,6 +120,10 @@ static bench_config parse_options(int argc, char **argv) {
     if (!cfg.candidate_env || cfg.candidate_env[0] == '\0' ||
         strchr(cfg.candidate_env, '=') != NULL) {
         fprintf(stderr, "%s: --candidate-env requires a valid name\n", BENCH_NAME);
+        exit(2);
+    }
+    if (cfg.initial_tokens >= cfg.prefix_tokens) {
+        fprintf(stderr, "%s: --initial-tokens must be less than --prefix-tokens\n", BENCH_NAME);
         exit(2);
     }
     const int longest =
@@ -332,12 +340,13 @@ int main(int argc, char **argv) {
     }
 
     fprintf(stderr,
-            "%s: model=%s prompt=%s prefix=%d warmup=%d ctx=%d repeats=%d "
+            "%s: model=%s prompt=%s prefix=%d initial=%d warmup=%d ctx=%d repeats=%d "
             "candidate_env=%s\n",
             BENCH_NAME,
             cfg.model_path,
             cfg.prompt_path,
             cfg.prefix_tokens,
+            cfg.initial_tokens,
             cfg.warmup_tokens,
             cfg.ctx,
             cfg.repeats,
@@ -356,6 +365,8 @@ int main(int argc, char **argv) {
         .len = cfg.prefix_tokens,
         .cap = cfg.prefix_tokens,
     };
+    ds4_tokens initial = { .v = tokens.v, .len = cfg.initial_tokens, .cap = cfg.initial_tokens };
+    const int timed_tokens = cfg.prefix_tokens - cfg.initial_tokens;
     size_t run = 0;
     for (int repeat = 0; repeat < cfg.repeats; repeat++) {
         const int *order = orders[repeat & 1];
@@ -375,6 +386,11 @@ int main(int argc, char **argv) {
             }
 
             err[0] = '\0';
+            if (initial.len && ds4_session_sync(session, &initial, err, sizeof(err)) != 0) {
+                fprintf(stderr, "%s: initial prefix failed: %s\n", BENCH_NAME, err);
+                ds4_session_free(session);
+                goto done;
+            }
             const double t0 = now_sec();
             const int sync_rc =
                 ds4_session_sync(session, &prefix, err, sizeof(err));
@@ -435,7 +451,7 @@ int main(int argc, char **argv) {
 
             results[variant].seconds += seconds;
             results[variant].runs++;
-            results[variant].tokens += (size_t)cfg.prefix_tokens;
+            results[variant].tokens += (size_t)timed_tokens;
             exact_runs++;
             printf("run=%zu repeat=%d pattern=%s slot=%d variant=%s "
                    "tokens=%d seconds=%.6f tokens_per_second=%.4f exact=yes\n",
@@ -444,10 +460,10 @@ int main(int argc, char **argv) {
                    pattern,
                    slot + 1,
                    variant == 0 ? "control" : "candidate",
-                   cfg.prefix_tokens,
+                   timed_tokens,
                    seconds,
                    seconds > 0.0
-                       ? (double)cfg.prefix_tokens / seconds
+                       ? (double)timed_tokens / seconds
                        : 0.0);
             fflush(stdout);
             ds4_session_free(session);

@@ -2,6 +2,7 @@
 #include "ds4_image.h"
 
 #include <errno.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -51,6 +52,21 @@ int main(int argc, char **argv) {
         if (!ds4_engine_vision_encode_file(engine, argv[3], &next,
                                            error, sizeof(error))) {
             fprintf(stderr, "vision encode failed: %s\n", error);
+            ds4_vision_embedding_free(&embedding);
+            ds4_engine_close(engine);
+            return 1;
+        }
+        const size_t count = (size_t)next.token_count * 4096u;
+        bool valid = next.data != NULL && count != 0;
+        for (size_t j = 0; valid && j < count; j++)
+            valid = isfinite(next.data[j]);
+        if (valid && embedding.data) {
+            valid = next.token_count == embedding.token_count &&
+                memcmp(next.data, embedding.data, count * sizeof(float)) == 0;
+        }
+        if (!valid) {
+            fprintf(stderr, "vision embedding is nonfinite, empty, or not repeatable\n");
+            ds4_vision_embedding_free(&next);
             ds4_vision_embedding_free(&embedding);
             ds4_engine_close(engine);
             return 1;

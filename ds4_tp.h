@@ -164,6 +164,8 @@ int ds4_tp_send_sync_multimodal(ds4_tp *tp, uint64_t session_id,
                                 uint32_t image_count);
 int ds4_tp_send_eval(ds4_tp *tp, uint64_t session_id,
                      uint64_t seq, int token);
+int ds4_tp_send_glm_mtp(ds4_tp *tp, uint64_t session_id,
+                       uint64_t seq, int token, int limit);
 int ds4_tp_send_rewind(ds4_tp *tp, uint64_t session_id, int pos);
 int ds4_tp_send_invalidate(ds4_tp *tp, uint64_t session_id);
 int ds4_tp_send_eval_batch(ds4_tp *tp, const ds4_tp_batch_item *items,
@@ -202,6 +204,7 @@ typedef enum {
     DS4_TP_FRAME_SYNC_MULTIMODAL = 18,
     DS4_TP_FRAME_RDMA_WARM = 19,
     DS4_TP_FRAME_RDMA_POSTED = 20,
+    DS4_TP_FRAME_GLM_MTP = 21,
 } ds4_tp_frame_type;
 
 typedef struct {
@@ -209,6 +212,7 @@ typedef struct {
     uint64_t session_id;
     uint64_t seq;
     int value;
+    int limit;
     int *tokens;
     uint32_t n_tokens;
     ds4_tp_batch_item *items;

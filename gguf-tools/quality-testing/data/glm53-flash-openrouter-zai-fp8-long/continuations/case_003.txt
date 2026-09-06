@@ -1,0 +1,5 @@
+## State owned by the server
+
+**Per-connection / request state (parsed from client requests):**
+
+- `ds4_tokens prompt`, plus `ds4_vision_span *images` / `image_count` — the tokenized prompt and decoded image payloads (`server_image_inputs` holds base64-decoded bytes with a
