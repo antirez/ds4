@@ -290,7 +290,7 @@ endif
 ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_linux_memory.h
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
 
-ds4_image.o: ds4_image.c ds4_image.h third_party/iris/jpeg.h third_party/iris/png.h
+ds4_image.o: ds4_image.c ds4_image.h third_party/iris/jpeg.h third_party/iris/png.h third_party/webp/webp.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_image.c
 
 ds4_ssd.o: ds4_ssd.c ds4_ssd.h

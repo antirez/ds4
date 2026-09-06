@@ -9,8 +9,10 @@
 
 #define JPEG_IMPLEMENTATION
 #define PNG_IMPLEMENTATION
+#define WEBP_IMPLEMENTATION
 #include "third_party/iris/jpeg.h"
 #include "third_party/iris/png.h"
+#include "third_party/webp/webp.h"
 
 typedef struct {
     uint32_t state[8];
@@ -275,7 +277,26 @@ int ds4_image_decode_memory(
         return ok;
     }
 
-    ds4_image_error(error, error_cap, "image must be JPEG or PNG");
+    if (webp_is_webp(encoded, encoded_len)) {
+        char reason[128] = {0};
+        webp_image *decoded =
+            webp_load_mem_err(encoded, encoded_len, reason, sizeof(reason));
+        if (!decoded) {
+            ds4_image_error(error, error_cap,
+                            reason[0] ? reason : "invalid or unsupported WebP image");
+            return 0;
+        }
+        /* WebP carries no orientation metadata of its own. */
+        int ok = ds4_oriented_rgb(out, decoded->data,
+                                  (uint32_t)decoded->width,
+                                  (uint32_t)decoded->height,
+                                  (uint32_t)decoded->channels, 1);
+        webp_free(decoded);
+        if (!ok) ds4_image_error(error, error_cap, "unable to allocate decoded WebP pixels");
+        return ok;
+    }
+
+    ds4_image_error(error, error_cap, "image must be JPEG, PNG or WebP");
     return 0;
 }
 
