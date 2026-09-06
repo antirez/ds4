@@ -5946,7 +5946,17 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     if (bytes == 0) bytes = 1;
     ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
     if (!t) return NULL;
-    if (!cuda_ok(cudaMalloc(&t->ptr, (size_t)bytes), "tensor alloc")) {
+    /* DS4_CUDA_MANAGED: route the general tensor allocator through managed
+     * (unified) memory so allocations can draw from the full UMA pool (incl. GTT
+     * beyond the BIOS VRAM carve-out). On Strix Halo a large carve-out (e.g.
+     * 96 GB) leaves too little headroom once ~81 GB of weights are resident, so
+     * device-only cudaMalloc of the prefill scratch OOMs at higher context.
+     * Opt-in, zero-overhead when unset; complements the auto-managed KV class. */
+    static int managed_all = -1;
+    if (managed_all < 0) managed_all = (getenv("DS4_CUDA_MANAGED") != NULL) ? 1 : 0;
+    cudaError_t rc = managed_all ? cudaMallocManaged(&t->ptr, (size_t)bytes)
+                                 : cudaMalloc(&t->ptr, (size_t)bytes);
+    if (!cuda_ok(rc, managed_all ? "tensor alloc (DS4_CUDA_MANAGED)" : "tensor alloc")) {
         free(t);
         return NULL;
     }
