@@ -154,7 +154,8 @@ the [client setup guide](docs/CLIENTS.md).
 
 [Models and vision](docs/MODELS.md) lists the supported downloads and memory
 requirements. DeepSeek Vision Experimental uses a different checkpoint from
-Flash 0731; GLM 5.3 Flash adds vision to the same text model.
+Flash 0731; GLM 5.3 Flash and Qwen3.8 Flash Next add vision to the same text
+model through a separate encoder.
 
 With the matching encoder passed as `--vision FILE`, use `/read image.png`
 in the CLI or `view_image` in the native agent.
@@ -167,7 +168,10 @@ Qwen3.8 uses one combined main/MTP GGUF plus a required external PLE sidecar:
 ```
 
 The download updates `ds4flash.gguf` to the combined model. Omit `--mtp` for
-ordinary decode with the same files. See [Qwen setup](docs/QWEN38_FLASH_NEXT.md)
+ordinary decode with the same files. Vision uses a separate encoder;
+`./download_model.sh qwen38-vision` downloads it, and you pass it as
+`--vision gguf/mmproj-Qwen3.8-Flash-Next-Q8_0.gguf`. See
+[Qwen setup](docs/QWEN38_FLASH_NEXT.md)
 for details; if using `DS4_GGUF_DIR`, adjust the PLE path accordingly.
 
 Speculative decoding is opt-in. GLM and Qwen use `--mtp`; Flash DSpark needs a matching

@@ -25,6 +25,12 @@ Adjust the PLE path if you set `DS4_GGUF_DIR`. The external PLE table is mapped
 separately, allowing this release to run on 128 GB Macs; context size and other
 workloads still affect memory use.
 
+Vision needs llama.cpp's mmproj encoder, which is a separate download:
+
+```sh
+./download_model.sh qwen38-vision
+```
+
 ## Build your own GGUF
 
 For calibrated IQ2_XXS gate/up experts with MXFP4 down projections, embedded
@@ -153,8 +159,9 @@ applies the static YaRN scaling from the model card, up to about 1M tokens;
 use a factor of 2 for 512k. Static YaRN costs a little accuracy on short
 prompts, so leave it off otherwise.
 
-Images go through the model's Qwen3-VL vision tower. Pass llama.cpp's mmproj
-file (`ggml-org/Qwen3.8-Flash-Next-GGUF` ships a Q8_0 one, or run
+Images go through the model's Qwen3-VL vision tower. Download llama.cpp's
+mmproj file with `./download_model.sh qwen38-vision` (it comes from
+`ggml-org/Qwen3.8-Flash-Next-GGUF`; alternatively run
 `convert_hf_to_gguf.py --mmproj --outtype f16` on the checkpoint) with
 `--vision` and send `image_url` parts as usual. Each image is resized to
 multiples of 32 pixels within 64 to 1024 tokens (`DS4_QWEN4_IMAGE_MAX_TOKENS`

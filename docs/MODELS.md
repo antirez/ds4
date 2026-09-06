@@ -59,6 +59,11 @@ Omit `--mtp` for ordinary decode; both modes use the same model and sidecar.
 Adjust the PLE path if you set `DS4_GGUF_DIR`. See [Qwen setup](QWEN38_FLASH_NEXT.md)
 for memory, conversion, vision, and sampling details.
 
+Vision uses a separate encoder. `./download_model.sh qwen38-vision` downloads
+llama.cpp's Q8_0 mmproj from
+[ggml-org/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/ggml-org/Qwen3.8-Flash-Next-GGUF);
+pass it at runtime with `--vision`.
+
 ## GLM 5.3 Flash
 
 | Target | Approximate file size | Use |
@@ -148,3 +153,17 @@ be saved with `/save`.
 For two-Mac TP, pass the same encoder on both ranks. The coordinator encodes
 the image and sends the projected visual tokens to the worker.
 For HTTP image formats and limits, see [serving](SERVER.md#images).
+
+### Qwen3.8 Flash Next
+
+The text GGUF stays the same. Download and add the encoder explicitly:
+
+```sh
+./download_model.sh qwen38-vision
+./ds4 --ple gguf/Qwen3.8-Flash-Next-PLE-Q4_1.gguf --mtp \
+  --vision gguf/mmproj-Qwen3.8-Flash-Next-Q8_0.gguf
+```
+
+The encoder is llama.cpp's Q8_0 mmproj conversion of the model's Qwen3-VL
+tower. Use `/read image.png` in `ds4` or `image_url` parts over HTTP; see
+[Qwen setup](QWEN38_FLASH_NEXT.md) for image limits and resize behavior.
