@@ -12624,6 +12624,81 @@ static int ds4_gpu_model_views_cover_spans(
         const uint64_t *sizes,
         uint32_t        count);
 
+typedef struct {
+    uint64_t off;
+    uint64_t end;
+} ds4_gpu_span_merge;
+
+static int ds4_gpu_span_merge_cmp(const void *a, const void *b) {
+    const ds4_gpu_span_merge *sa = a;
+    const ds4_gpu_span_merge *sb = b;
+    if (sa->off < sb->off) return -1;
+    if (sa->off > sb->off) return 1;
+    if (sa->end < sb->end) return -1;
+    if (sa->end > sb->end) return 1;
+    return 0;
+}
+
+/* Adjacent --layers tensor spans often cover one contiguous shard. Mapping each
+ * span as its own Metal no-copy buffer fragments residency and can slow decode
+ * by tens of times versus one overlapping range. Merge abutting spans (with a
+ * small alignment gap) before creating views. */
+static uint32_t ds4_gpu_coalesce_model_map_spans(
+        const uint64_t *offsets,
+        const uint64_t *sizes,
+        uint32_t        count,
+        uint64_t        model_size,
+        uint64_t       *out_offsets,
+        uint64_t       *out_sizes) {
+    if (!offsets || !sizes || !out_offsets || !out_sizes || count == 0) return 0;
+
+    ds4_gpu_span_merge *spans = (ds4_gpu_span_merge *)malloc((size_t)count * sizeof(spans[0]));
+    if (!spans) return 0;
+
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        if (offsets[i] > model_size || sizes[i] == 0 || sizes[i] > model_size - offsets[i]) {
+            free(spans);
+            return 0;
+        }
+        spans[n].off = offsets[i];
+        spans[n].end = offsets[i] + sizes[i];
+        n++;
+    }
+    if (n == 0) {
+        free(spans);
+        return 0;
+    }
+
+    qsort(spans, (size_t)n, sizeof(spans[0]), ds4_gpu_span_merge_cmp);
+
+    const uint64_t page = (uint64_t)getpagesize();
+    const uint64_t gap_slop = page > 65536u ? page : 65536u;
+    uint32_t out = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (out == 0) {
+            out_offsets[out] = spans[i].off;
+            out_sizes[out] = spans[i].end - spans[i].off;
+            out++;
+            continue;
+        }
+        const uint64_t prev_off = out_offsets[out - 1u];
+        const uint64_t prev_end = prev_off + out_sizes[out - 1u];
+        if (spans[i].off > prev_end + gap_slop) {
+            out_offsets[out] = spans[i].off;
+            out_sizes[out] = spans[i].end - spans[i].off;
+            out++;
+            continue;
+        }
+        if (spans[i].end > prev_end) {
+            out_sizes[out - 1u] = spans[i].end - prev_off;
+        }
+    }
+
+    free(spans);
+    return out;
+}
+
 int ds4_gpu_set_model_map_spans(
         const void *model_map,
         uint64_t model_size,
@@ -12644,6 +12719,32 @@ int ds4_gpu_set_model_map_spans(
         return 1;
     }
 
+    uint64_t *merged_offsets = (uint64_t *)malloc((size_t)count * sizeof(merged_offsets[0]));
+    uint64_t *merged_sizes = (uint64_t *)malloc((size_t)count * sizeof(merged_sizes[0]));
+    if (!merged_offsets || !merged_sizes) {
+        free(merged_offsets);
+        free(merged_sizes);
+        return 0;
+    }
+    const uint32_t merged_count = ds4_gpu_coalesce_model_map_spans(
+            offsets, sizes, count, model_size, merged_offsets, merged_sizes);
+    if (merged_count == 0) {
+        free(merged_offsets);
+        free(merged_sizes);
+        fprintf(stderr, "ds4: Metal model span list is invalid or outside the GGUF mapping\n");
+        return 0;
+    }
+    if (merged_count == 1) {
+        const int ok = ds4_gpu_set_model_map_range(model_map,
+                                                   model_size,
+                                                   merged_offsets[0],
+                                                   merged_sizes[0],
+                                                   max_tensor_bytes);
+        free(merged_offsets);
+        free(merged_sizes);
+        return ok;
+    }
+
     @autoreleasepool {
         const double t0 = ds4_gpu_now_ms();
         max_tensor_bytes = ds4_gpu_effective_model_max_tensor_bytes(model_size, max_tensor_bytes);
@@ -12653,31 +12754,32 @@ int ds4_gpu_set_model_map_spans(
 
         uint64_t mapped_total = 0;
         uint64_t first_offset = UINT64_MAX;
-        for (uint32_t i = 0; i < count; i++) {
-            if (offsets[i] > model_size || sizes[i] == 0 || sizes[i] > model_size - offsets[i]) {
-                fprintf(stderr, "ds4: Metal model span %u is outside the GGUF mapping\n", i);
-                ds4_gpu_model_residency_clear();
-                ds4_gpu_model_views_clear();
-                return 0;
-            }
-            if (offsets[i] < first_offset) first_offset = offsets[i];
+        for (uint32_t i = 0; i < merged_count; i++) {
+            if (merged_offsets[i] < first_offset) first_offset = merged_offsets[i];
             uint64_t effective_max = max_tensor_bytes;
-            if (effective_max > sizes[i]) effective_max = sizes[i];
+            if (effective_max > merged_sizes[i]) effective_max = merged_sizes[i];
+            /* Contiguous coalesced ranges use the same overlapping-view path as
+             * an unrestricted map (no 128 GiB default cap), so --layers on a
+             * per-host shard does not pay per-tensor buffer fragmentation. */
             if (!ds4_gpu_add_model_view_range(model_map,
                                               model_size,
-                                              offsets[i],
-                                              sizes[i],
+                                              merged_offsets[i],
+                                              merged_sizes[i],
                                               effective_max,
-                                              true,
+                                              false,
                                               &mapped_total)) {
                 ds4_gpu_model_residency_clear();
                 ds4_gpu_model_views_clear();
+                free(merged_offsets);
+                free(merged_sizes);
                 return 0;
             }
         }
         if (!ds4_gpu_finish_model_views(t0, mapped_total, first_offset)) {
             ds4_gpu_model_residency_clear();
             ds4_gpu_model_views_clear();
+            free(merged_offsets);
+            free(merged_sizes);
             return 0;
         }
         g_model_map_ptr = model_map;
@@ -12687,10 +12789,14 @@ int ds4_gpu_set_model_map_spans(
         g_model_mapped_max_tensor_bytes = max_tensor_bytes;
         if (ds4_gpu_model_map_log_enabled()) {
             fprintf(stderr,
-                    "ds4: Metal mapped mmaped model as %u disjoint shared buffers across %u tensor spans\n",
+                    "ds4: Metal mapped mmaped model as %u overlapping shared buffers "
+                    "across %u coalesced ranges (%u tensor spans)\n",
                     g_model_view_count,
+                    merged_count,
                     count);
         }
+        free(merged_offsets);
+        free(merged_sizes);
         return 1;
     }
 }
