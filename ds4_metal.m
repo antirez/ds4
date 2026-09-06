@@ -15,8 +15,10 @@
 #include <limits.h>
 #include <time.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <sys/resource.h>   /* setiopolicy_np: kernel-level I/O deprioritisation */
 #include <sys/sysctl.h>
 #include <mach/mach.h>
 #include <mach-o/dyld.h>
@@ -1038,6 +1040,722 @@ static id<MTLBuffer> g_stream_compact_down_addr_buffers[DS4_METAL_STREAM_EXPERT_
 static id<MTLBuffer> g_stream_compact_selected_buffers[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static id<MTLBuffer> g_stream_selected_id_buffers[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static id<MTLBuffer> g_stream_expert_validate_status_buffer;
+
+/* ================== router-lookahead expert prefetch ======================
+ * DS4_PF_LOOKAHEAD=1: while layer L computes, work out which experts layer
+ * L+1 is going to want and read them from the model file during idle disk
+ * time, so the demand read for L+1 finds the bytes already in memory.
+ *
+ * The prediction runs layer L+1's OWN router on the hidden state that layer
+ * L's router just consumed.  The residual stream changes little between
+ * adjacent layers, so the stale input still ranks the right experts:
+ * measured offline over 3.5k decode positions, the top 4 guesses cover 46%
+ * of the misses the cache takes at L+1, at about 0.4 wasted reads per useful
+ * one.  Scoring replicates the selection kernel exactly, so a guess is wrong
+ * only where the hidden state actually moved:
+ *     score = sqrt(softplus(W @ h)) + selection_bias
+ * A dedicated thread does the 256x4096 matvec off the decode critical path;
+ * the decode hook only copies the hidden vector into a one-deep mailbox and
+ * never blocks.
+ *
+ * Speculation only ever uses disk time the decode is not using.  A reader
+ * waits for the demand pread pool to go idle and DROPS its candidate if that
+ * never happens within DS4_PF_WAIT_MAX_US.  That is the difference between
+ * this helping and hurting: decode here is bandwidth limited, not latency
+ * limited, so a speculative read that competes with a demand read is close to
+ * pure loss.  Measured (300 tokens, 1150 cache slots):
+ *     competing (yield 300us, then read anyway)  3.00 t/s vs 3.18 without
+ *     gap filling (this)                         3.05/3.14 vs 3.05/3.05
+ *
+ * Prefetched bytes land in staging buffers and the demand pread consumes them
+ * with a memcpy instead of touching the SSD.  Which experts get cached does
+ * not change, so generation output is bit for bit identical with this on or
+ * off; only where the bytes come from changes.
+ *
+ * Two extras ride on the same forecast:
+ *   - Hash-routed layers are not guesses at all.  DeepSeek V4 Flash routes
+ *     its first layers by token id through a fixed table, so their experts
+ *     are certain the moment a token is sampled (ds4_gpu_pf_note_token_id).
+ *   - Eviction protect (DS4_PF_RETAIN) marks the experts about to be used so
+ *     the cache stops evicting them right before use.  Costs no extra I/O.
+ *
+ * All of this is inert unless DS4_PF_LOOKAHEAD is set. */
+#define DS4_PF_QCAP 128
+/* Largest router input width accepted at registration, and therefore the
+ * largest hidden vector the decode hook can ever be asked to convert. */
+#define DS4_PF_IN_MAX 8192
+
+static int g_pf_state;   /* 0 unknown, 1 active, -1 disabled */
+static struct { uint64_t gate, up, down, gate_bytes, down_bytes; int set; }
+    g_pf_off[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
+static pthread_mutex_t g_pf_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_pf_cond = PTHREAD_COND_INITIALIZER;
+/* Queue entries: target layer, expert, decode-token clock at push time.  A
+ * guess is only worth reading until its layer's demand fires; after that it
+ * would burn scarce idle-gap time on bytes nobody will consume. */
+static uint32_t g_pf_q[DS4_PF_QCAP][3];
+static uint32_t g_pf_qhead, g_pf_qtail;   /* pop at head, push at tail */
+static uint32_t g_pf_last_tok
+    [DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER][DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+static uint64_t g_pf_cur_tok;
+static uint32_t g_pf_tok_issued;
+static uint32_t g_pf_topk = 8, g_pf_max_tok = 12;
+static float g_pf_thresh = 1.0f;   /* logit gate: 75.7% issued-precision offline */
+static _Atomic uint64_t g_pf_stat_issued, g_pf_stat_bytes, g_pf_stat_dropped;
+static _Atomic uint64_t g_pf_stat_consumed, g_pf_stat_evicted;
+
+/* Staging pool: speculative reads land here ONCE; the demand pread worker
+ * consumes the bytes with a memcpy instead of re-reading the SSD.  Slots are
+ * recycled FIFO; a slot is keyed by its gate-slice absolute offset. */
+#define DS4_PF_STAGE_SLOTS 128   /* array cap; g_pf_stage_n is the live count */
+typedef struct {
+    _Atomic int state;          /* 0 free, 1 filling, 2 ready */
+    _Atomic uint32_t ready_mask;/* slices complete and safe to consume */
+    uint32_t layer, expert;
+    uint64_t offs[3], lens[3];  /* gate, up, down */
+    uint64_t tok;               /* freshness stamp */
+    _Atomic int consumed;       /* any slice handed to a demand read */
+    uint8_t *buf;               /* gate|up|down concatenated */
+} ds4_pf_stage_slot;
+static ds4_pf_stage_slot g_pf_stage[DS4_PF_STAGE_SLOTS];
+static uint32_t g_pf_stage_next;
+static uint32_t g_pf_stage_n = 32;   /* DS4_PF_SLOTS; buffers malloc'd lazily */
+static uint32_t g_pf_cooldown = 8;   /* DS4_PF_COOLDOWN: re-issue guard, tokens */
+static uint32_t g_pf_yield_us = 300; /* DS4_PF_YIELD_US: soft yield to demand */
+static int g_pf_gate_up_only;
+/* Strict gap-filling: wait for the demand pread pool to go idle and DROP the
+ * candidate if it never does, so speculation only ever consumes SSD time the
+ * decode was not using.  This is the difference between prefetch helping and
+ * hurting: decode here is bandwidth-limited, not latency-limited, so a
+ * speculative read that competes with a demand read is close to pure loss.
+ * Measured (300 tok, 1150 slots, palindrome A B B A):
+ *   competing (yield 300us then read anyway)  3.00 t/s vs 3.18 raw
+ *   gap-filling (this)                        3.05/3.14 vs 3.05/3.05 raw,
+ *                                             load_pread_avg -3.4% (4/4 separation)
+ * Set DS4_PF_WAIT_MAX_US=0 to restore the old competing behaviour. */
+static uint32_t g_pf_wait_max_us = 8000;
+static pthread_mutex_t g_pf_stage_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* ------------------- router-lookahead predictor (mode 2) -------------------
+ * DS4_PF_LOOKAHEAD=1: instead of trained heads over selection history, run
+ * layer L+1's own router on the hidden state layer L's router just consumed.
+ * The residual stream changes little between adjacent layers, so the stale
+ * input still ranks the right experts: measured offline on 3.5k positions,
+ * top-4 guesses cover 46% of the misses the cache will take at L+1, with
+ * ~0.4 wasted reads per useful one.  Routers are the model's own
+ * ffn_gate_inp tensors (f16, registered at weight-bind time); scoring
+ * replicates the selection kernel exactly: score = sqrt(softplus(W@h)) + b.
+ * A dedicated thread does the 256x4096 matvec off the decode critical path;
+ * the decode hook only copies the hidden vector into a one-deep mailbox. */
+static int g_pf_lookahead;
+static const __fp16 *g_pf_router_w[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
+static const float  *g_pf_router_b[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
+static float *g_pf_router_wf[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
+static uint32_t g_pf_router_in_dim;
+static uint32_t g_pf_router_n_expert;
+static pthread_mutex_t g_pf_la_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_pf_la_cond  = PTHREAD_COND_INITIALIZER;
+static float   *g_pf_la_hidden;              /* mailbox: in_dim floats */
+static uint32_t g_pf_la_layer = UINT32_MAX;  /* UINT32_MAX = mailbox empty */
+static uint32_t g_pf_la_depth = 1;   /* DS4_PF_LOOKAHEAD_DEPTH: 1..3 */
+static uint32_t g_pf_la_topk2 = 2;   /* DS4_PF_LOOKAHEAD_TOPK2: budget past d=1 */
+static _Atomic uint64_t g_pf_la_pred_calls, g_pf_la_pred_skips;
+/* Hash layers route by token id via a fixed tid2eid table, so the moment a
+ * token is sampled their experts are KNOWN, not guessed.  Pushed at token
+ * start, exempt from the per-token speculation cap (they cannot waste). */
+#define DS4_PF_HASH_MAX 8
+static const int32_t *g_pf_hash_t2e[DS4_PF_HASH_MAX];
+static uint32_t g_pf_hash_vocab[DS4_PF_HASH_MAX];
+static uint32_t g_pf_hash_used[DS4_PF_HASH_MAX];
+static _Atomic uint64_t g_pf_hash_pushes;
+/* Retain mode: the forecast also VETOES evictions.  The predictor stamps the
+ * next layer's top-scoring experts (and the hash layers' certain ones) with
+ * the token clock they're needed under; the eviction victim scan refuses to
+ * evict a stamped entry while that clock is current.  Stamps expire on their
+ * own as the clock advances — wrong guesses protect a slot for under a
+ * token.  DS4_PF_RETAIN sets how many experts per layer (0 disables). */
+static _Atomic uint32_t
+    g_pf_retain_stamp[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER]
+                     [DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+static uint32_t g_pf_retain_k = 6;
+static _Atomic uint64_t g_pf_retain_skips;
+
+/* Called from the eviction victim scan (any thread).  `want` mirrors the
+ * stamping rule: entries are stamped clock+1 (clock+2 for layer 3, whose
+ * demand lands just after the decode-token clock ticks at layer 3). */
+static int ds4_gpu_pf_retained(uint32_t layer, uint32_t expert) {
+    if (!g_pf_lookahead || g_pf_retain_k == 0) return 0;
+    const uint32_t want =
+        (uint32_t)g_stream_expert_cache_decode_tokens + 1u;
+    if (atomic_load_explicit(&g_pf_retain_stamp[layer][expert],
+                             memory_order_relaxed) == want) {
+        atomic_fetch_add(&g_pf_retain_skips, 1);
+        return 1;
+    }
+    return 0;
+}
+
+static void ds4_gpu_pf_report(void) {
+    const uint64_t issued = atomic_load(&g_pf_stat_issued);
+    const uint64_t consumed = atomic_load(&g_pf_stat_consumed);
+    fprintf(stderr,
+            "ds4: prefetch final: staged=%llu bytes=%.2f GiB "
+            "consumed_slices=%llu unused_evictions=%llu dropped=%llu "
+            "mode=%s\n",
+            (unsigned long long)issued,
+            atomic_load(&g_pf_stat_bytes) / 1073741824.0,
+            (unsigned long long)consumed,
+            (unsigned long long)atomic_load(&g_pf_stat_evicted),
+            (unsigned long long)atomic_load(&g_pf_stat_dropped),
+            g_pf_gate_up_only ? "gate-up" : "full");
+    if (g_pf_lookahead) {
+        fprintf(stderr,
+                "ds4: lookahead final: predictions=%llu hook_skips=%llu "
+                "hash_pushes=%llu retain_skips=%llu\n",
+                (unsigned long long)atomic_load(&g_pf_la_pred_calls),
+                (unsigned long long)atomic_load(&g_pf_la_pred_skips),
+                (unsigned long long)atomic_load(&g_pf_hash_pushes),
+                (unsigned long long)atomic_load(&g_pf_retain_skips));
+    }
+}
+
+/* Racy read-only peek: worst case we skip a warm or warm a resident expert —
+ * both harmless (page cache only). */
+static int ds4_gpu_pf_expert_resident(uint32_t layer, uint32_t expert) {
+    if (layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER ||
+        expert >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT) return 1;
+    return g_stream_expert_cache[layer][expert].valid != 0;
+}
+
+static int ds4_gpu_pf_demand_busy(void);   /* defined near the pread pool */
+
+/* How far the decode has got, so a queued guess can tell whether its moment
+ * has already passed.  Advanced once per (layer, decode token) from the
+ * selection hook, which is exactly when that layer's demand reads go out. */
+static uint32_t g_pf_prev_layer = UINT32_MAX;
+static uint64_t g_pf_prev_tok;
+
+static void ds4_gpu_pf_note_layer(uint32_t layer) {
+    g_pf_prev_layer = layer;
+    g_pf_prev_tok = g_stream_expert_cache_decode_tokens;
+}
+
+static void ds4_gpu_pf_forget_progress(void) {
+    g_pf_prev_layer = UINT32_MAX;
+}
+
+/* A queued guess is dead once its decode-token clock has moved on, or once
+ * the decode has already reached (or passed) the layer it was meant to beat.
+ * g_pf_prev_layer advances as each layer's selections are noted, which is
+ * exactly when that layer's demand reads are issued. */
+static int ds4_gpu_pf_entry_stale(uint32_t T, uint32_t etok) {
+    const uint64_t now = g_stream_expert_cache_decode_tokens;
+    if ((uint32_t)now != etok) return 1;
+    const uint32_t cur = g_pf_prev_layer;
+    if (cur == UINT32_MAX || g_pf_prev_tok != now) return 0;
+    if (T < 3u) {
+        /* The decode-token clock ticks at layer 3, so hash-layer entries
+         * (pushed at sampling, cur still on the previous token's last layer)
+         * share a clock with that tail.  They only die once the new token's
+         * early layers actually pass them. */
+        return cur < 3u && cur >= T;
+    }
+    return cur >= T;
+}
+
+static void *ds4_gpu_pf_thread_main(void *arg) {
+    (void)arg;
+    /* Ask the KERNEL to deprioritise these reads rather than approximating it in
+     * userspace.  The demand pread pool runs QOS_CLASS_USER_INTERACTIVE; without
+     * this, speculative reads queue as equals and land in front of reads the
+     * decode is actually waiting on (measured: -5.7% when unthrottled).
+     * MEASURED WORSE, so this is OFF by default.  IOPOL_THROTTLE defers while
+     * ANY other I/O is pending and has no deadline concept, but a prefetch must
+     * land within ~20ms (a few layers) or it is wasted -- and during read phases
+     * demand I/O is essentially always pending, so throttled speculation
+     * starves.  Wide open: 2.96 t/s unthrottled vs 2.87 throttled (raw 3.06),
+     * with consumption collapsing 9012 -> 3612 slices at similar staging
+     * (precision 47% -> 26%): the reads landed after they were needed.
+     * The userspace gap-filling loop wins precisely because it waits for a good
+     * moment and then issues at FULL priority.
+     * DS4_PF_IOPOL: 0 off (default), 1 throttle, 2 utility. */
+    {
+        const char *ip = getenv("DS4_PF_IOPOL");
+        const int mode = (ip && ip[0]) ? atoi(ip) : 0;
+        if (mode) {
+            pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND, 0);
+            setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD,
+                           mode == 2 ? IOPOL_UTILITY : IOPOL_THROTTLE);
+        }
+    }
+    for (;;) {
+        pthread_mutex_lock(&g_pf_mutex);
+        while (g_pf_qhead == g_pf_qtail) {
+            pthread_cond_wait(&g_pf_cond, &g_pf_mutex);
+        }
+        const uint32_t T = g_pf_q[g_pf_qhead % DS4_PF_QCAP][0];
+        const uint32_t e = g_pf_q[g_pf_qhead % DS4_PF_QCAP][1];
+        const uint32_t etok = g_pf_q[g_pf_qhead % DS4_PF_QCAP][2];
+        g_pf_qhead++;
+        pthread_mutex_unlock(&g_pf_mutex);
+        if (T >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER || !g_pf_off[T].set) {
+            continue;
+        }
+        if (ds4_gpu_pf_expert_resident(T, e)) continue;
+        if (ds4_gpu_pf_entry_stale(T, etok)) {
+            atomic_fetch_add(&g_pf_stat_dropped, 1);
+            continue;
+        }
+        /* soft yield: let an active demand batch have the SSD first */
+        if (g_pf_wait_max_us) {
+            const uint32_t q = g_pf_yield_us ? g_pf_yield_us : 100;
+            uint32_t waited = 0;
+            while (ds4_gpu_pf_demand_busy() && waited < g_pf_wait_max_us) {
+                usleep(q);
+                waited += q;
+            }
+            if (ds4_gpu_pf_demand_busy()) {
+                atomic_fetch_add(&g_pf_stat_dropped, 1);
+                continue;
+            }
+        } else if (g_pf_yield_us && ds4_gpu_pf_demand_busy()) {
+            usleep(g_pf_yield_us);
+        }
+        /* The wait is where guesses rot: the layer this expert was meant for
+         * may have taken its demand miss while we were yielding.  Reading it
+         * now would spend the just-opened gap on bytes nobody will consume. */
+        if (ds4_gpu_pf_entry_stale(T, etok) ||
+            ds4_gpu_pf_expert_resident(T, e)) {
+            atomic_fetch_add(&g_pf_stat_dropped, 1);
+            continue;
+        }
+
+        const uint64_t slot_bytes = g_pf_off[T].gate_bytes * 2ull +
+                                    (g_pf_gate_up_only ? 0ull :
+                                     g_pf_off[T].down_bytes);
+        /* claim a staging slot (FIFO recycle; never steal one mid-fill) */
+        ds4_pf_stage_slot *s = NULL;
+        pthread_mutex_lock(&g_pf_stage_mutex);
+        int already = 0;
+        for (uint32_t i = 0; i < g_pf_stage_n; i++) {
+            if (atomic_load(&g_pf_stage[i].state) != 0 &&
+                g_pf_stage[i].layer == T && g_pf_stage[i].expert == e) {
+                already = 1;
+                break;
+            }
+        }
+        if (!already) {
+            for (uint32_t tries = 0; tries < g_pf_stage_n; tries++) {
+                ds4_pf_stage_slot *c =
+                    &g_pf_stage[(g_pf_stage_next + tries) % g_pf_stage_n];
+                const int st = atomic_load(&c->state);
+                if (st == 1) continue;
+                if (st == 2 && !atomic_load(&c->consumed)) {
+                    atomic_fetch_add(&g_pf_stat_evicted, 1);
+                }
+                s = c;
+                g_pf_stage_next = (uint32_t)((c - g_pf_stage) + 1) % g_pf_stage_n;
+                atomic_store(&s->ready_mask, 0);
+                atomic_store(&s->state, 1);
+                break;
+            }
+        }
+        pthread_mutex_unlock(&g_pf_stage_mutex);
+        if (already || !s) continue;
+        if (!s->buf) {
+            s->buf = malloc(slot_bytes);
+            if (!s->buf) { atomic_store(&s->state, 0); continue; }
+        }
+        s->layer = T; s->expert = e; s->tok = g_pf_cur_tok;
+        atomic_store(&s->consumed, 0);
+        s->offs[0] = g_pf_off[T].gate + (uint64_t)e * g_pf_off[T].gate_bytes;
+        s->offs[1] = g_pf_off[T].up + (uint64_t)e * g_pf_off[T].gate_bytes;
+        s->offs[2] = g_pf_off[T].down + (uint64_t)e * g_pf_off[T].down_bytes;
+        s->lens[0] = g_pf_off[T].gate_bytes;
+        s->lens[1] = g_pf_off[T].gate_bytes;
+        s->lens[2] = g_pf_gate_up_only ? 0 : g_pf_off[T].down_bytes;
+        if (g_pf_gate_up_only) s->offs[2] = UINT64_MAX;
+        int ok = 1;
+        uint64_t bufpos = 0;
+        for (int i = 0; i < 3 && ok; i++) {
+            /* A completed slice is useful by itself.  Do not begin another
+             * speculative slice after exact demand resumes. */
+            if (i != 0 && ds4_gpu_pf_demand_busy()) break;
+            uint64_t done = 0;
+            while (done < s->lens[i]) {
+                ssize_t nr = pread(g_model_fd, s->buf + bufpos + done,
+                                   (size_t)(s->lens[i] - done),
+                                   (off_t)(s->offs[i] + done));
+                if (nr <= 0) { ok = 0; break; }
+                done += (uint64_t)nr;
+            }
+            atomic_fetch_add(&g_pf_stat_bytes, done);
+            if (ok && done == s->lens[i] && s->lens[i] != 0) {
+                atomic_fetch_or(&s->ready_mask, 1u << i);
+            }
+            bufpos += s->lens[i];
+        }
+        const int useful = ok && atomic_load(&s->ready_mask) != 0;
+        atomic_store(&s->state, useful ? 2 : 0);
+        if (useful) atomic_fetch_add(&g_pf_stat_issued, 1);
+    }
+    return NULL;
+}
+
+/* Demand-side: if a pread task's exact range is staged and ready, satisfy it
+ * with a memcpy and skip the SSD.  Called from pread workers. */
+static int ds4_gpu_pf_stage_consume(uint64_t offset, uint64_t len,
+                                    uint8_t *dst) {
+    if (g_pf_state != 1) return 0;
+    int hit = 0;
+    pthread_mutex_lock(&g_pf_stage_mutex);
+    for (uint32_t i = 0; i < g_pf_stage_n && !hit; i++) {
+        ds4_pf_stage_slot *s = &g_pf_stage[i];
+        if (atomic_load(&s->state) == 0) continue;
+        const uint32_t ready_mask = atomic_load(&s->ready_mask);
+        uint64_t bufpos = 0;
+        for (int k = 0; k < 3; k++) {
+            if ((ready_mask & (1u << k)) != 0 &&
+                s->offs[k] == offset && s->lens[k] == len) {
+                memcpy(dst, s->buf + bufpos, (size_t)len);
+                atomic_fetch_add(&g_pf_stat_consumed, 1);
+                atomic_store(&s->consumed, 1);
+                hit = 1;
+                break;
+            }
+            bufpos += s->lens[k];
+        }
+    }
+    pthread_mutex_unlock(&g_pf_stage_mutex);
+    return hit;
+}
+
+/* Model-load registration of per-layer router tensors (f16 weight rows,
+ * optional f32 selection bias) for the lookahead predictor.  Pointers are
+ * into the mmapped model and stay valid for the process lifetime. */
+void ds4_gpu_pf_register_router(uint32_t layer, const void *w_f16,
+                                const void *bias_f32, uint32_t in_dim,
+                                uint32_t n_expert) {
+    if (layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER || !w_f16 ||
+        in_dim == 0 || in_dim > DS4_PF_IN_MAX ||
+        n_expert == 0 || n_expert > DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT) {
+        return;
+    }
+    if ((g_pf_router_in_dim && g_pf_router_in_dim != in_dim) ||
+        (g_pf_router_n_expert && g_pf_router_n_expert != n_expert)) {
+        return;
+    }
+    g_pf_router_in_dim = in_dim;
+    g_pf_router_n_expert = n_expert;
+    g_pf_router_w[layer] = (const __fp16 *)w_f16;
+    g_pf_router_b[layer] = (const float *)bias_f32;
+}
+
+void ds4_gpu_pf_register_hash_router(uint32_t layer, const void *t2e_i32,
+                                     uint32_t n_vocab, uint32_t n_used) {
+    if (layer >= DS4_PF_HASH_MAX || !t2e_i32 || n_vocab == 0 ||
+        n_used == 0 || n_used > 8) {
+        return;
+    }
+    g_pf_hash_t2e[layer] = (const int32_t *)t2e_i32;
+    g_pf_hash_vocab[layer] = n_vocab;
+    g_pf_hash_used[layer] = n_used;
+}
+
+/* Called from the decode loop the moment the next token is known, before the
+ * forward pass starts.  Enqueues the hash layers' certain experts so the
+ * prefetch readers can pull them in during the token's first idle gaps.
+ * Default ON since guess expiry landed: without expiry these pushes measured
+ * neutral (stale entries burned the token-start gaps: drops 2.3k -> 4.7k and
+ * consumption fell); with expiry they win both interleaved pairs
+ * (load_pread_avg 4.50 vs 5.15, 4.66 vs 4.79).  DS4_PF_HASH=0 disables;
+ * layer 0 is always skipped (its demand follows ~1 ms after the push). */
+static int ds4_gpu_pf_hash_enabled(void) {
+    static int checked = 0, enabled = 0;
+    if (!checked) {
+        const char *env = getenv("DS4_PF_HASH");
+        enabled = !(env && env[0] && strcmp(env, "0") == 0);
+        checked = 1;
+    }
+    return enabled;
+}
+
+void ds4_gpu_pf_note_token_id(uint32_t token_id) {
+    if (g_pf_state != 1 || !g_pf_lookahead || !ds4_gpu_pf_hash_enabled()) return;
+    int pushed = 0;
+    for (uint32_t L = 1; L < DS4_PF_HASH_MAX; L++) {
+        const int32_t *t2e = g_pf_hash_t2e[L];
+        if (!t2e || token_id >= g_pf_hash_vocab[L] || !g_pf_off[L].set) {
+            continue;
+        }
+        const uint32_t n_used = g_pf_hash_used[L];
+        for (uint32_t j = 0; j < n_used; j++) {
+            const int32_t e32 = t2e[(uint64_t)token_id * n_used + j];
+            if (e32 < 0 ||
+                e32 >= (int32_t)DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT) {
+                continue;
+            }
+            const uint32_t e = (uint32_t)e32;
+            if (g_pf_retain_k) {
+                /* Certain selections: retain-stamp them whether resident or
+                 * about to be fetched.  Expires at the layer-3 clock tick. */
+                atomic_store_explicit(
+                        &g_pf_retain_stamp[L][e],
+                        (uint32_t)g_stream_expert_cache_decode_tokens + 1u,
+                        memory_order_relaxed);
+            }
+            if (ds4_gpu_pf_expert_resident(L, e)) continue;
+            pthread_mutex_lock(&g_pf_mutex);
+            if (g_pf_qtail - g_pf_qhead < DS4_PF_QCAP) {
+                g_pf_q[g_pf_qtail % DS4_PF_QCAP][0] = L;
+                g_pf_q[g_pf_qtail % DS4_PF_QCAP][1] = e;
+                g_pf_q[g_pf_qtail % DS4_PF_QCAP][2] =
+                    (uint32_t)g_stream_expert_cache_decode_tokens;
+                g_pf_qtail++;
+                pushed = 1;
+                atomic_fetch_add(&g_pf_hash_pushes, 1);
+            }
+            pthread_mutex_unlock(&g_pf_mutex);
+        }
+    }
+    if (pushed) pthread_cond_signal(&g_pf_cond);
+}
+
+static void *ds4_gpu_pf_la_thread_main(void *arg) {
+    (void)arg;
+    const uint32_t in_dim = g_pf_router_in_dim;
+    const uint32_t n_exp = g_pf_router_n_expert;
+    float *h = malloc((size_t)in_dim * sizeof(float));
+    float *score = malloc((size_t)n_exp * sizeof(float));
+    if (!h || !score) { free(h); free(score); return NULL; }
+    for (;;) {
+        pthread_mutex_lock(&g_pf_la_mutex);
+        while (g_pf_la_layer == UINT32_MAX) {
+            pthread_cond_wait(&g_pf_la_cond, &g_pf_la_mutex);
+        }
+        const uint32_t src = g_pf_la_layer;
+        memcpy(h, g_pf_la_hidden, (size_t)in_dim * sizeof(float));
+        g_pf_la_layer = UINT32_MAX;
+        pthread_mutex_unlock(&g_pf_la_mutex);
+
+        const uint64_t tok = g_stream_expert_cache_decode_tokens;
+        if (tok != g_pf_cur_tok) {
+            g_pf_cur_tok = tok;
+            g_pf_tok_issued = 0;
+            pthread_mutex_lock(&g_pf_mutex);
+            if (g_pf_qhead != g_pf_qtail) {
+                atomic_fetch_add(&g_pf_stat_dropped, g_pf_qtail - g_pf_qhead);
+                g_pf_qhead = g_pf_qtail;
+            }
+            pthread_mutex_unlock(&g_pf_mutex);
+        }
+        int pushed = 0;
+        for (uint32_t d = 1; d <= g_pf_la_depth; d++) {
+            const uint32_t T = src + d;
+            if (T >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER) break;
+            const __fp16 *W16 = g_pf_router_w[T];
+            if (!W16 || !g_pf_off[T].set) continue;
+            float *W = g_pf_router_wf[T];
+            if (!W) {   /* one-time f32 expansion of this layer's router rows */
+                W = malloc((size_t)n_exp * in_dim * sizeof(float));
+                if (!W) continue;
+                for (size_t i = 0; i < (size_t)n_exp * in_dim; i++) {
+                    W[i] = (float)W16[i];
+                }
+                g_pf_router_wf[T] = W;
+            }
+            const float *bias = g_pf_router_b[T];
+            atomic_fetch_add(&g_pf_la_pred_calls, 1);
+            for (uint32_t e = 0; e < n_exp; e++) {
+                const float *row = W + (size_t)e * in_dim;
+                float acc = 0.0f;
+                for (uint32_t i = 0; i < in_dim; i++) acc += row[i] * h[i];
+                /* selection score exactly as kernel_..._router_select
+                 * computes it: probs = sqrt(softplus(logit)) + bias */
+                const float sp = acc > 20.0f ? acc : log1pf(expf(acc));
+                score[e] = sqrtf(sp) + (bias ? bias[e] : 0.0f);
+            }
+            /* Retain veto: stamp the forecast's own top-6-equivalent so the
+             * eviction scan spares them until their moment passes. */
+            if (d == 1 && g_pf_retain_k) {
+                float sc[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+                memcpy(sc, score, n_exp * sizeof(float));
+                const uint32_t stamp =
+                    (uint32_t)tok + 1u + (T == 3u ? 1u : 0u);
+                for (uint32_t k = 0; k < g_pf_retain_k; k++) {
+                    int besti = -1;
+                    float bestv = -1e30f;
+                    for (uint32_t i = 0; i < n_exp; i++) {
+                        if (sc[i] > bestv) { bestv = sc[i]; besti = (int)i; }
+                    }
+                    if (besti < 0) break;
+                    sc[besti] = -1e30f;
+                    atomic_store_explicit(
+                            &g_pf_retain_stamp[T][(uint32_t)besti],
+                            stamp, memory_order_relaxed);
+                }
+            }
+            /* Farther targets get a smaller budget: their accuracy is lower
+             * and a nearer, better-informed guess for the same layer follows
+             * one hook later. */
+            const uint32_t budget = d == 1 ? g_pf_topk : g_pf_la_topk2;
+            for (uint32_t k = 0;
+                 k < budget && g_pf_tok_issued < g_pf_max_tok; k++) {
+                int besti = -1;
+                float bestv = -1e30f;
+                for (uint32_t i = 0; i < n_exp; i++) {
+                    if (score[i] > bestv) { bestv = score[i]; besti = (int)i; }
+                }
+                if (besti < 0 || bestv <= g_pf_thresh) break;
+                score[besti] = -1e30f;
+                const uint32_t e = (uint32_t)besti;
+                if (ds4_gpu_pf_expert_resident(T, e)) continue;
+                if (g_pf_cooldown && g_pf_last_tok[T][e] != 0 &&
+                    tok - g_pf_last_tok[T][e] < g_pf_cooldown) continue;
+                pthread_mutex_lock(&g_pf_mutex);
+                if (g_pf_qtail - g_pf_qhead < DS4_PF_QCAP) {
+                    g_pf_q[g_pf_qtail % DS4_PF_QCAP][0] = T;
+                    g_pf_q[g_pf_qtail % DS4_PF_QCAP][1] = e;
+                    g_pf_q[g_pf_qtail % DS4_PF_QCAP][2] = (uint32_t)tok;
+                    g_pf_qtail++;
+                    pushed = 1;
+                    g_pf_last_tok[T][e] = (uint32_t)tok;
+                    g_pf_tok_issued++;
+                } else {
+                    atomic_fetch_add(&g_pf_stat_dropped, 1);
+                }
+                pthread_mutex_unlock(&g_pf_mutex);
+            }
+        }
+        if (pushed) pthread_cond_signal(&g_pf_cond);
+    }
+    return NULL;
+}
+
+/* Decode hook: layer L's selections were just read back, so the hidden that
+ * produced them is final in x's shared-memory buffer.  Copy it into the
+ * predictor mailbox and return; never block the decode thread. */
+static void ds4_gpu_pf_init_locked(void);
+static int g_pf_la_x_is_f16 = -1;   /* probed on first successful read */
+static void ds4_gpu_pf_lookahead_note_x(uint32_t layer,
+                                        const ds4_gpu_tensor *x) {
+    if (g_pf_state == 0) {
+        pthread_mutex_lock(&g_pf_mutex);
+        if (g_pf_state == 0) ds4_gpu_pf_init_locked();
+        pthread_mutex_unlock(&g_pf_mutex);
+    }
+    if (g_pf_state != 1 || !g_pf_lookahead || !x) return;
+    const uint32_t in_dim = g_pf_router_in_dim;
+    if (in_dim == 0) return;
+    int any_target = 0;
+    for (uint32_t d = 1; d <= g_pf_la_depth && !any_target; d++) {
+        const uint32_t T = layer + d;
+        if (T < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER &&
+            g_pf_router_w[T]) {
+            any_target = 1;
+        }
+    }
+    if (!any_target) return;
+    if (pthread_mutex_trylock(&g_pf_la_mutex) != 0) {
+        atomic_fetch_add(&g_pf_la_pred_skips, 1);
+        return;
+    }
+    if (g_pf_la_layer != UINT32_MAX) {   /* predictor still busy */
+        pthread_mutex_unlock(&g_pf_la_mutex);
+        atomic_fetch_add(&g_pf_la_pred_skips, 1);
+        return;
+    }
+    int ok = 0;
+    if (g_pf_la_x_is_f16 != 1 &&
+        ds4_gpu_tensor_read(x, 0, g_pf_la_hidden, (uint64_t)in_dim * 4u)) {
+        g_pf_la_x_is_f16 = 0;
+        ok = 1;
+    } else {
+        __fp16 tmp[DS4_PF_IN_MAX];   /* in_dim is capped at registration */
+        if (ds4_gpu_tensor_read(x, 0, tmp, (uint64_t)in_dim * 2u)) {
+            for (uint32_t i = 0; i < in_dim; i++) {
+                g_pf_la_hidden[i] = (float)tmp[i];
+            }
+            g_pf_la_x_is_f16 = 1;
+            ok = 1;
+        }
+    }
+    if (ok) {
+        g_pf_la_layer = layer;
+        pthread_cond_signal(&g_pf_la_cond);
+    }
+    pthread_mutex_unlock(&g_pf_la_mutex);
+}
+
+static void ds4_gpu_pf_init_locked(void) {
+    g_pf_state = -1;
+    const char *la_env = getenv("DS4_PF_LOOKAHEAD");
+    if (la_env && la_env[0] && la_env[0] != '0') {
+        if (g_pf_router_in_dim == 0) {
+            fprintf(stderr,
+                    "ds4: lookahead prefetch: no routers registered, off\n");
+            return;
+        }
+        const char *tk = getenv("DS4_PF_TOPK");
+        /* An explicit 0 keeps the certain hash-layer prefetch but stops
+         * guessing, which is how the two halves get measured apart. */
+        g_pf_topk = (tk && tk[0]) ? (uint32_t)atoi(tk) : 4;
+        if (g_pf_topk > 32) g_pf_topk = 32;
+        const char *mt = getenv("DS4_PF_MAX_TOK");
+        g_pf_max_tok = (mt && atoi(mt) > 0) ? (uint32_t)atoi(mt) : 32;
+        const char *tenv = getenv("DS4_PF_THRESH");
+        g_pf_thresh = (tenv && tenv[0]) ? (float)atof(tenv) : -1e30f;
+        const char *dep = getenv("DS4_PF_LOOKAHEAD_DEPTH");
+        if (dep && atoi(dep) > 0) g_pf_la_depth = (uint32_t)atoi(dep);
+        if (g_pf_la_depth > 3) g_pf_la_depth = 3;
+        const char *rk = getenv("DS4_PF_RETAIN");
+        if (rk && rk[0]) g_pf_retain_k = (uint32_t)atoi(rk);
+        if (g_pf_retain_k > 16) g_pf_retain_k = 16;
+        const char *tk2 = getenv("DS4_PF_LOOKAHEAD_TOPK2");
+        if (tk2 && atoi(tk2) > 0) g_pf_la_topk2 = (uint32_t)atoi(tk2);
+        if (g_pf_la_topk2 > 32) g_pf_la_topk2 = 32;
+        const char *sl = getenv("DS4_PF_SLOTS");
+        if (sl && atoi(sl) > 0) {
+            g_pf_stage_n = (uint32_t)atoi(sl);
+            if (g_pf_stage_n > DS4_PF_STAGE_SLOTS) {
+                g_pf_stage_n = DS4_PF_STAGE_SLOTS;
+            }
+        }
+        const char *cd = getenv("DS4_PF_COOLDOWN");
+        g_pf_cooldown = (cd && cd[0]) ? (uint32_t)atoi(cd) : 2;
+        const char *yl = getenv("DS4_PF_YIELD_US");
+        g_pf_yield_us = (yl && yl[0]) ? (uint32_t)atoi(yl) : 100;
+        const char *wm = getenv("DS4_PF_WAIT_MAX_US");
+        g_pf_wait_max_us = (wm && wm[0]) ? (uint32_t)atoi(wm) : 3000;
+        g_pf_gate_up_only = getenv("DS4_PF_FULL_EXPERT") == NULL;
+        g_pf_la_hidden =
+            malloc((size_t)g_pf_router_in_dim * sizeof(float));
+        if (!g_pf_la_hidden) return;
+        pthread_t th;
+        if (pthread_create(&th, NULL, ds4_gpu_pf_la_thread_main, NULL) != 0) {
+            fprintf(stderr, "ds4: lookahead prefetch: predictor thread failed\n");
+            return;
+        }
+        for (int i = 0; i < 2; i++) {
+            if (pthread_create(&th, NULL, ds4_gpu_pf_thread_main, NULL) != 0) {
+                fprintf(stderr, "ds4: lookahead prefetch: reader thread failed\n");
+                return;
+            }
+        }
+        g_pf_lookahead = 1;
+        g_pf_state = 1;
+        atexit(ds4_gpu_pf_report);
+        fprintf(stderr,
+                "ds4: router-lookahead prefetch active: depth=%u topk=%u/%u "
+                "cap=%u/token %s slices, cooldown=%u wait_max=%uus\n",
+                g_pf_la_depth, g_pf_topk, g_pf_la_topk2, g_pf_max_tok,
+                g_pf_gate_up_only ? "gate-up" : "full",
+                g_pf_cooldown, g_pf_wait_max_us);
+        return;
+    }
+}
+
+/* ================ end router-lookahead expert prefetch =================== */
 
 @interface DS4MetalTensor : NSObject
 @property(nonatomic, strong) id<MTLBuffer> buffer;
@@ -13323,16 +14041,29 @@ static int ds4_gpu_stream_expert_pread_into(
     return 1;
 }
 
+/* Serve a demand read from prefetch staging when the exact range is already
+ * sitting there, otherwise read it from the model file as usual. */
+static void ds4_gpu_stream_expert_execute_pread_task(
+        ds4_gpu_stream_expert_pread_task *task) {
+    if (ds4_gpu_pf_stage_consume(task->offset, task->len, task->dst)) {
+        task->ok = 1;
+        task->read_bytes = 0;   /* zero SSD bytes: served from prefetch staging */
+        task->ms = 0.0;
+        return;
+    }
+    task->ok = ds4_gpu_stream_expert_pread_into(task->offset,
+                                                task->len,
+                                                task->dst,
+                                                &task->read_bytes,
+                                                &task->ms);
+}
+
 static void *ds4_gpu_stream_expert_pread_worker(void *arg) {
     ds4_gpu_stream_expert_pread_worker_args *wa =
         (ds4_gpu_stream_expert_pread_worker_args *)arg;
     for (uint32_t i = wa->worker_index; i < wa->n_tasks; i += wa->n_workers) {
         ds4_gpu_stream_expert_pread_task *task = &wa->tasks[i];
-        task->ok = ds4_gpu_stream_expert_pread_into(task->offset,
-                                                    task->len,
-                                                    task->dst,
-                                                    &task->read_bytes,
-                                                    &task->ms);
+        ds4_gpu_stream_expert_execute_pread_task(task);
     }
     return NULL;
 }
@@ -13344,6 +14075,12 @@ static pthread_t g_stream_expert_pread_pool_threads[18];
 static uint32_t g_stream_expert_pread_pool_thread_count;
 static uint32_t g_stream_expert_pread_pool_active_workers;
 static uint32_t g_stream_expert_pread_pool_remaining_workers;
+
+/* True while demand reads are in flight.  Speculation waits for this to go
+ * quiet and gives up rather than competing for the same bandwidth. */
+static int ds4_gpu_pf_demand_busy(void) {
+    return g_stream_expert_pread_pool_remaining_workers != 0;
+}
 static uint32_t g_stream_expert_pread_pool_n_tasks;
 static uint32_t g_stream_expert_pread_pool_next_task;
 static uint64_t g_stream_expert_pread_pool_generation;
@@ -13387,11 +14124,7 @@ static void *ds4_gpu_stream_expert_pread_pool_worker(void *arg) {
                 &g_stream_expert_pread_pool_tasks[task_index];
             pthread_mutex_unlock(&g_stream_expert_pread_pool_mutex);
 
-            task->ok = ds4_gpu_stream_expert_pread_into(task->offset,
-                                                        task->len,
-                                                        task->dst,
-                                                        &task->read_bytes,
-                                                        &task->ms);
+            ds4_gpu_stream_expert_execute_pread_task(task);
 
             pthread_mutex_lock(&g_stream_expert_pread_pool_mutex);
         }
@@ -14267,6 +15000,7 @@ static void ds4_gpu_stream_expert_cache_note_selected_hotness(
                 (uint32_t)selected_ids[i],
                 1);
     }
+    ds4_gpu_pf_note_layer(layer);
 }
 
 static void ds4_gpu_stream_expert_cache_note_frequency_hotness(
@@ -15105,6 +15839,7 @@ static void ds4_gpu_stream_expert_cache_clear_entry(
 
 static void ds4_gpu_stream_expert_cache_clear_all(int reset_stats) {
     ds4_gpu_stream_expert_pending_load_clear();
+    ds4_gpu_pf_forget_progress();
     g_stream_expert_cache_done_seq = g_stream_expert_cache_cb_seq;
     g_stream_expert_cache_batch_seq = 0;
     g_stream_expert_cache_owned_seq = 0;
@@ -15294,6 +16029,9 @@ static int ds4_gpu_stream_expert_cache_entry_protected(
                 &g_stream_expert_cache[layer][expert])) {
         return 1;
     }
+    /* The routing forecast says this one is about to be used: do not spend it
+     * now only to read it back a moment later. */
+    if (ds4_gpu_pf_retained(layer, expert)) return 1;
     return layer == protect_layer &&
            ds4_gpu_stream_expert_cache_is_protected(expert,
                                                     protect_ids,
@@ -16476,6 +17214,17 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
                                                    gate_expert_bytes,
                                                    down_expert_bytes)) {
         return 1;
+    }
+
+    /* Prefetch reads bytes for experts nobody has asked for yet, so it needs
+     * this layer's expert stride on disk before any demand read happens. */
+    if (layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER && !g_pf_off[layer].set) {
+        g_pf_off[layer].gate = gate_offset;
+        g_pf_off[layer].up = up_offset;
+        g_pf_off[layer].down = down_offset;
+        g_pf_off[layer].gate_bytes = gate_expert_bytes;
+        g_pf_off[layer].down_bytes = down_expert_bytes;
+        g_pf_off[layer].set = 1;
     }
 
     ds4_gpu_stream_expert_pending_load_clear();
@@ -37853,6 +38602,9 @@ int ds4_gpu_glm_routed_moe_one_tensor(
                 ds4_gpu_stream_expert_cache_note_selected_hotness(layer_index,
                                                                   stream_selected_ids,
                                                                   n_expert);
+                if (!have_prefetched_selected) {
+                    ds4_gpu_pf_lookahead_note_x(layer_index, x);
+                }
                 if (!ds4_gpu_moe_selected_hotlist_record(layer_index,
                                                          stream_selected_ids,
                                                          n_expert,
@@ -41161,6 +41913,7 @@ int ds4_gpu_routed_moe_one_tensor(
                 ds4_gpu_stream_expert_cache_note_selected_hotness(layer_index,
                                                                   selected_ids,
                                                                   n_expert);
+                ds4_gpu_pf_lookahead_note_x(layer_index, x);
                 if (!ds4_gpu_moe_selected_trace_record(selected_ids, n_expert) ||
                     !ds4_gpu_moe_selected_hotlist_record(layer_index,
                                                          selected_ids,
