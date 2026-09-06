@@ -1,0 +1,5 @@
+ds4-bench: context buffers 1933.10 MiB (ctx=65665, backend=metal, prefill_chunk=2048, raw_kv_rows=2304, compressed_kv_rows=16418)
+ds4: Metal device Apple M5 Max, 128.00 GiB RAM
+ds4: Metal model views created in 2.665 ms, residency requested in 8132.561 ms, warmup 4.000 ms (mapped 82697.67 MiB from offset 5.08 MiB)
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: metal backend initialized for graph diagnostics
