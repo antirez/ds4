@@ -183,6 +183,12 @@ existing KV cache. See [steering documentation](dir-steering/README.md).
 the live conversation. A turn marker must start a line, roles must alternate,
 and the last turn must be `ASSISTANT:`.
 
+Metal routed-MoE prefill defaults to wider token tiles for aligned chunks: 128
+tokens when possible, otherwise 64, with 32 as the fallback. This applies to
+`Q2_K`, `IQ2_XXS`, and `Q4_K` routed expert matmuls and is primarily a prefill
+optimization. For A/B testing, set `DS4_METAL_MOE_TILE_MAX=32` to force the old
+32-token path, or `64` to cap the new path at 64-token tiles.
+
 ## Capability Evaluation
 
 `ds4-eval` runs embedded capability regression tests against a real GGUF.
