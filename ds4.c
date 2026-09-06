@@ -11311,7 +11311,7 @@ static void layer_grouped_out_one(
         const ds4_model   * model,
         const ds4_layer_weights * layer,
         const float       * heads) {
-    const uint32_t n_groups = 8;
+    const uint32_t n_groups = DS4_N_OUT_GROUP;
     const uint32_t group_heads = DS4_N_HEAD / n_groups;
     const uint32_t group_dim = DS4_N_HEAD_DIM * group_heads;
     const uint32_t rank = 1024;
@@ -11330,7 +11330,7 @@ static void layer_grouped_out_one_decode_scratch(
         const ds4_layer_weights * layer,
         const float            * heads,
         ds4_cpu_decode_scratch * scratch) {
-    const uint32_t n_groups = 8;
+    const uint32_t n_groups = DS4_N_OUT_GROUP;
     const uint32_t group_heads = DS4_N_HEAD / n_groups;
     const uint32_t group_dim = DS4_N_HEAD_DIM * group_heads;
     const uint32_t rank = 1024;
@@ -11347,7 +11347,7 @@ static void layer_grouped_out_batch(
         const ds4_layer_weights * layer,
         const float       * heads,
         uint32_t            n_tok) {
-    const uint32_t n_groups = 8;
+    const uint32_t n_groups = DS4_N_OUT_GROUP;
     const uint32_t group_heads = DS4_N_HEAD / n_groups;
     const uint32_t group_dim = DS4_N_HEAD_DIM * group_heads;
     const uint32_t rank = 1024;
