@@ -13569,7 +13569,8 @@ typedef struct {
 } client_arg;
 
 static void append_model_json_values(buf *b, const char *id, const char *name,
-                                     int ctx, int default_tokens) {
+                                     int ctx, int default_tokens,
+                                     bool has_vision) {
     const int max_completion = default_tokens < ctx ? default_tokens : ctx;
     buf_printf(b,
         "{\"id\":");
@@ -13582,6 +13583,7 @@ static void append_model_json_values(buf *b, const char *id, const char *name,
     json_escape(b, name);
     buf_printf(b,
         ","
+        "\"input\":[\"text\"%s],"
         "\"context_length\":%d,"
         "\"top_provider\":{"
             "\"context_length\":%d,"
@@ -13600,6 +13602,7 @@ static void append_model_json_values(buf *b, const char *id, const char *name,
             "\"seed\","
             "\"stream\","
             "\"reasoning_effort\"]}",
+        has_vision ? ",\"image\"" : "",
         ctx,
         ctx,
         max_completion);
@@ -13610,7 +13613,8 @@ static void append_model_json(buf *b, const server *s, const char *id) {
                              id,
                              ds4_engine_model_name(s->engine),
                              s->ctx_size,
-                             s->default_tokens);
+                             s->default_tokens,
+                             ds4_engine_has_vision(s->engine));
 }
 
 static bool send_model(server *s, int fd, const char *id) {
@@ -18251,23 +18255,26 @@ static void test_tool_history_validation_handles_large_replays(void) {
     chat_msgs_free(&anthropic);
 }
 
-static void test_model_metadata_clamps_completion_to_context(void) {
+static void test_model_metadata_reports_input_and_clamps_completion(void) {
     buf b = {0};
     append_model_json_values(&b, "deepseek-v4-flash", "DeepSeek V4 Flash",
-                             32768, 393216);
+                             32768, 393216, true);
     TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4-flash\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"name\":\"DeepSeek V4 Flash\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"context_length\":32768") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"max_completion_tokens\":32768") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"input\":[\"text\",\"image\"]") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"ignore_eos\"") != NULL);
     buf_free(&b);
 
     append_model_json_values(&b, "deepseek-v4-pro", "DeepSeek V4 Pro",
-                             100000, 4096);
+                             100000, 4096, false);
     TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4-pro\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"name\":\"DeepSeek V4 Pro\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"context_length\":100000") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"max_completion_tokens\":4096") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"input\":[\"text\"]") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"image\"") == NULL);
     buf_free(&b);
 }
 
@@ -19846,7 +19853,7 @@ static void ds4_server_unit_tests_run(void) {
     test_json_string_handles_surrogates();
     test_json_int_handles_non_finite_values();
     test_tool_history_validation_handles_large_replays();
-    test_model_metadata_clamps_completion_to_context();
+    test_model_metadata_reports_input_and_clamps_completion();
     test_live_prefix_rewind_target();
     test_client_socket_nonblocking_flag();
     test_client_disconnect_probe();
