@@ -24393,7 +24393,19 @@ static int routed_moe_launch(
      * [n_tokens, n_expert, *] by the validation above.  Any entry
      * failure falls through to the legacy sorted-pairs path (the
      * buffers are scratch there too). */
-    if (iq2_path && n_tokens > 1u && !owned_filtered && cuda_use_mmq()) {
+    /* Not while the experts are streamed. This tier needs a pointer to the whole
+     * routed tensor of the layer, and under SSD streaming that tensor is not
+     * resident: resolving it makes the fallback cache materialise hundreds of MiB
+     * per layer that the streaming path deliberately keeps off the device. On a
+     * card with room to spare that is merely wasteful; on one without, the
+     * allocation fails and the sticky CUDA error takes the run down with it
+     * (measured on a 12 GiB card: "moe gate mmq (528.00 MiB): out of memory",
+     * then an illegal memory access, exit 1, with any real prompt).
+     *
+     * The aligned variant of this tier a few lines above already carries the same
+     * guard for the same reason; the raw variant was missing it. */
+    if (iq2_path && n_tokens > 1u && !owned_filtered && !g_ssd_streaming_mode &&
+        cuda_use_mmq()) {
         const uint64_t gate_total = (uint64_t)n_total_expert * gate_expert_bytes;
         const uint64_t down_total = (uint64_t)n_total_expert * down_expert_bytes;
         const int mmq_tier = ds4_tensor_device_idx(out);
