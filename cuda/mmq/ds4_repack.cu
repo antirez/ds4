@@ -470,6 +470,9 @@ bool ds4_repack_q2k_candidate(const ds4_repack_tensor &t) {
     if (t.type != 10u || t.ndim != 3u) return false; /* GGML_TYPE_Q2_K */
     if (t.dims[0] == 0 || t.dims[1] == 0 || t.dims[2] == 0 || t.dims[2] > UINT32_MAX) return false;
     if (t.dims[0] % 256u != 0 || t.dims[1] % 2u != 0) return false;
+    /* nb_row and nrows are passed to the kernel as uint32_t; reject tensors
+     * whose dims would truncate there. */
+    if (t.dims[0] / 256u > UINT32_MAX || t.dims[1] > UINT32_MAX) return false;
     if (t.bytes == 0 || t.bytes % 84u != 0) return false;
     static const char down_sfx[] = ".ffn_down_exps.weight";
     const size_t n = t.name.size();
