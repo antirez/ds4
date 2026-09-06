@@ -54379,16 +54379,29 @@ static uint32_t ds4_dspark_scheduler_break_even_window(void) {
     return ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_BREAK_EVEN_WINDOW", 0);
 }
 
-static uint32_t ds4_dspark_scheduler_no_draft_skip_cycles(void) {
-    return ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_NO_DRAFT_SKIP", 3);
+/* The no-draft pauses trade proposal cost against missed accepts, so the
+ * right default is backend-specific, like the confidence threshold: on
+ * Metal proposing is cheap enough that pausing after declined proposals
+ * stays a small win, while on memory-bound CUDA decode every accept a
+ * pause forfeits costs a full extra decode, which is never repaid by the
+ * skipped proposals. Env overrides still reach any value on any backend. */
+static bool ds4_dspark_scheduler_pause_default_on(const ds4_session *s) {
+    return s && s->engine && s->engine->backend == DS4_BACKEND_METAL;
 }
 
-static uint32_t ds4_dspark_scheduler_short_accept_no_draft_skip_cycles(void) {
-    return ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_SHORT_ACCEPT_NO_DRAFT_SKIP", 4);
+static uint32_t ds4_dspark_scheduler_no_draft_skip_cycles(const ds4_session *s) {
+    return ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_NO_DRAFT_SKIP",
+                              ds4_dspark_scheduler_pause_default_on(s) ? 3 : 0);
 }
 
-static uint32_t ds4_dspark_scheduler_cold_low_confidence_skip_cycles(void) {
-    return ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_COLD_LOW_CONFIDENCE_SKIP", 7);
+static uint32_t ds4_dspark_scheduler_short_accept_no_draft_skip_cycles(const ds4_session *s) {
+    return ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_SHORT_ACCEPT_NO_DRAFT_SKIP",
+                              ds4_dspark_scheduler_pause_default_on(s) ? 4 : 0);
+}
+
+static uint32_t ds4_dspark_scheduler_cold_low_confidence_skip_cycles(const ds4_session *s) {
+    return ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_COLD_LOW_CONFIDENCE_SKIP",
+                              ds4_dspark_scheduler_pause_default_on(s) ? 7 : 0);
 }
 
 static uint32_t ds4_dspark_scheduler_tail_min_tokens(void) {
@@ -54487,20 +54500,20 @@ static void ds4_session_dspark_scheduler_note(
     }
 
     const uint32_t no_draft_skip =
-        ds4_dspark_scheduler_no_draft_skip_cycles();
+        ds4_dspark_scheduler_no_draft_skip_cycles(s);
     if (no_draft && no_draft_skip != 0) {
         uint32_t skip = no_draft_skip;
         if (s->dspark_sched_lifetime_accepted != 0 &&
             !s->dspark_sched_long_accept_seen) {
             const uint32_t short_accept_skip =
-                ds4_dspark_scheduler_short_accept_no_draft_skip_cycles();
+                ds4_dspark_scheduler_short_accept_no_draft_skip_cycles(s);
             if (skip < short_accept_skip) skip = short_accept_skip;
         } else if (s->dspark_sched_lifetime_accepted == 0 &&
                    s->dspark_last_confidence0_valid &&
                    s->dspark_last_confidence0 <=
                        ds4_dspark_scheduler_cold_low_confidence_threshold()) {
             const uint32_t cold_low_conf_skip =
-                ds4_dspark_scheduler_cold_low_confidence_skip_cycles();
+                ds4_dspark_scheduler_cold_low_confidence_skip_cycles(s);
             if (skip < cold_low_conf_skip) skip = cold_low_conf_skip;
         }
         if (s->dspark_sched_skip < skip) {
