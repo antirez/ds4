@@ -6759,6 +6759,25 @@ static bool agent_edit_upto_forcer_should_replace(agent_edit_upto_forcer *forcer
     return false;
 }
 
+static bool agent_edit_match_anchors(const char *data, size_t len,
+                                     const char *old, size_t head_len,
+                                     const char *tail, size_t tail_len,
+                                     const char **match, size_t *match_len,
+                                     char *err, size_t err_len) {
+    const char *head_pos = NULL;
+    const char *tail_pos = NULL;
+    if (!agent_find_unique(data, len, old, head_len, &head_pos, "old head",
+                           err, err_len))
+        return false;
+    if (!agent_find_unique_after(data, len, head_pos + head_len,
+                                 tail, tail_len, &tail_pos, "old tail",
+                                 err, err_len))
+        return false;
+    *match = head_pos;
+    *match_len = (size_t)(tail_pos - head_pos) + tail_len;
+    return true;
+}
+
 static bool agent_edit_find_old_span(const char *data, size_t len,
                                      const char *old, bool allow_upto,
                                      const char **match,
@@ -6801,19 +6820,51 @@ static bool agent_edit_find_old_span(const char *data, size_t len,
                  "old text after [upto] must include a unique tail anchor");
         return false;
     }
-    const char *head_pos = NULL;
-    const char *tail_pos = NULL;
-    if (!agent_find_unique(data, len, old, head_len, &head_pos, "old head",
-                           err, err_len))
-        return false;
-    if (!agent_find_unique_after(data, len, head_pos + head_len,
-                                 tail, tail_len, &tail_pos, "old tail",
-                                 err, err_len))
-        return false;
-    *anchored = true;
-    *match = head_pos;
-    *match_len = (size_t)(tail_pos - head_pos) + tail_len;
-    return true;
+    if (agent_edit_match_anchors(data, len, old, head_len, tail, tail_len,
+                                 match, match_len, err, err_len)) {
+        *anchored = true;
+        return true;
+    }
+    /* The model may indent [upto] like the surrounding code, or pad it with
+     * blanks before its newline.  Those blanks belong to the marker line,
+     * not to the anchors, so retry once treating the whole line as the
+     * marker: drop the head's line-trailing blanks and the blank padding
+     * after the marker.  The exact needles must run first: a forcer-injected
+     * marker can sit after partial indentation whose blanks are what makes
+     * the head unique, so edits that match today must keep matching as-is. */
+    size_t lenient_head_len = head_len;
+    while (lenient_head_len > 0 && (old[lenient_head_len - 1] == ' ' ||
+                                    old[lenient_head_len - 1] == '\t'))
+        lenient_head_len--;
+    if (lenient_head_len > 0 && old[lenient_head_len - 1] != '\n')
+        lenient_head_len = head_len; /* inline head: blanks are content */
+    const char *lenient_tail = upto + strlen(marker);
+    size_t lenient_tail_len = old_len - head_len - strlen(marker);
+    size_t pad = 0;
+    while (pad < lenient_tail_len && (lenient_tail[pad] == ' ' ||
+                                      lenient_tail[pad] == '\t'))
+        pad++;
+    if (pad < lenient_tail_len && (lenient_tail[pad] == '\n' ||
+                                   lenient_tail[pad] == '\r')) {
+        lenient_tail += pad;
+        lenient_tail_len -= pad;
+    }
+    while (lenient_tail_len > 0 &&
+           (*lenient_tail == '\n' || *lenient_tail == '\r')) {
+        lenient_tail++;
+        lenient_tail_len--;
+    }
+    if (lenient_head_len == head_len && lenient_tail == tail)
+        return false; /* nothing to relax: keep the exact-match error */
+    char lenient_err[256];
+    if (agent_edit_match_anchors(data, len, old, lenient_head_len,
+                                 lenient_tail, lenient_tail_len,
+                                 match, match_len,
+                                 lenient_err, sizeof(lenient_err))) {
+        *anchored = true;
+        return true;
+    }
+    return false; /* report the exact-match error */
 }
 
 #ifdef DS4_AGENT_TEST
@@ -7293,6 +7344,101 @@ static void test_agent_steering_command(void) {
 
 static void test_agent_terminal_wrap_output_is_deferred(void);
 
+/* Golden cases for [upto] anchor matching, mostly around the
+ * whitespace-lenient retry: the model can emit the marker indented like the
+ * surrounding code or padded with blanks before its newline.  A NULL span
+ * means the case must fail with an error containing err_part. */
+typedef struct {
+    const char *name;
+    const char *file;     /* file content the edit runs against */
+    const char *old;      /* edit old argument */
+    const char *span;     /* expected matched span, NULL if it must fail */
+    const char *err_part; /* expected error substring when span is NULL */
+} agent_edit_golden_case;
+
+static const agent_edit_golden_case agent_edit_golden_cases[] = {
+    { "plain unique old without [upto]",
+      "int a;\nint b;\nint c;\n",
+      "int b;\n",
+      "int b;\n", NULL },
+    { "[upto] indented with a tab while the file uses spaces",
+      "static int parse(void) {\n    int ok = compute();\n    return ok;\n}\n",
+      "static int parse(void) {\n\t[upto]\n    return ok;\n}\n",
+      "static int parse(void) {\n    int ok = compute();\n    return ok;\n}\n",
+      NULL },
+    { "indented [upto] before a dedenting line",
+      "void a(void) {\n    x();\n}\n\nvoid b(void) {\n    y();\n}\n",
+      "    x();\n    [upto]\nvoid b(void) {\n",
+      "    x();\n}\n\nvoid b(void) {\n", NULL },
+    { "trailing blanks between [upto] and the newline",
+      "int a;\nint b;\nint c;\n",
+      "int a;\n[upto]  \nint c;\n",
+      "int a;\nint b;\nint c;\n", NULL },
+    { "trailing blank then CRLF after [upto]",
+      "int a;\r\nint b;\r\nint c;\r\n",
+      "int a;\r\n[upto] \r\nint c;\r\n",
+      "int a;\r\nint b;\r\nint c;\r\n", NULL },
+    /* Locks the exact-needles-first order: the auto-upto forcer can inject
+     * '[upto]\n' after partial indentation whose blanks are what makes the
+     * head prefix unique, so the head must not be trimmed unconditionally. */
+    { "head whose uniqueness depends on its trailing blanks",
+      "x();\n  y();\nx();\nz();\n",
+      "x();\n  [upto]\ny();\n",
+      "x();\n  y();\n", NULL },
+    { "inline head [upto] tail keeps its exact spacing",
+      "alpha middle omega\n",
+      "alpha [upto] omega\n",
+      "alpha middle omega\n", NULL },
+    { "indented [upto] whose next file line shares the prefix",
+      "static int parse(void) {\n    int ok = 0;\n    use(ok);\n"
+      "    return ok;\n}\n",
+      "    int ok = 0;\n    [upto]\n    return ok;\n}\n",
+      "    int ok = 0;\n    use(ok);\n    return ok;\n}\n", NULL },
+    { "two [upto] markers stay an error",
+      "int a;\nint b;\n",
+      "int a;\n[upto]\n[upto]\nint b;\n",
+      NULL, "more than one [upto]" },
+    { "blanks-only tail stays an error",
+      "int a;\nint b;\n",
+      "int a;\n[upto]  ",
+      NULL, "must include a unique tail anchor" },
+    { "absent head still reports the exact-match error",
+      "int a;\nint b;\n",
+      "int zz;\n    [upto]\nint b;\n",
+      NULL, "old head anchor not found" },
+};
+
+static void test_agent_edit_upto_whitespace_golden_cases(void) {
+    size_t ncases = sizeof(agent_edit_golden_cases) /
+                    sizeof(agent_edit_golden_cases[0]);
+    for (size_t i = 0; i < ncases; i++) {
+        const agent_edit_golden_case *t = &agent_edit_golden_cases[i];
+        const char *match = NULL;
+        size_t match_len = 0;
+        bool anchored = false;
+        char err[256] = "";
+        bool ok = agent_edit_find_old_span(t->file, strlen(t->file), t->old,
+                                           true, &match, &match_len, &anchored,
+                                           err, sizeof(err));
+        if (t->span) {
+            if (ok && match_len == strlen(t->span) &&
+                memcmp(match, t->span, match_len) == 0) continue;
+            if (ok)
+                fprintf(stderr, "golden case failed: %s (got span '%.*s')\n",
+                        t->name, (int)match_len, match);
+            else
+                fprintf(stderr, "golden case failed: %s (got error '%s')\n",
+                        t->name, err);
+        } else {
+            if (!ok && strstr(err, t->err_part) != NULL) continue;
+            fprintf(stderr,
+                    "golden case failed: %s (expected error '%s', got %s)\n",
+                    t->name, t->err_part, ok ? "a match" : err);
+        }
+        agent_test_failures++;
+    }
+}
+
 static void ds4_agent_unit_tests_run(void) {
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
     test_agent_edit_upto_requires_tail_after_newline_strip();
@@ -7313,6 +7459,7 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_dsml_stream_tool_call_chunked();
     test_agent_glm_tool_parser_rejects_missing_value();
     test_agent_terminal_wrap_output_is_deferred();
+    test_agent_edit_upto_whitespace_golden_cases();
 }
 #endif
 
