@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Word-exact Q8_K staging used only by the Q4 tiled-prefill kernels.
+// Exact Q8_K staging used only by the Q4 tiled-prefill kernels.
 #ifndef DS4_ROCM_Q4_LDS_CUH
 #define DS4_ROCM_Q4_LDS_CUH
 
@@ -16,16 +16,26 @@ enum { block_words = 73u }; // sizeof(Q8_K) / sizeof(uint32_t)
 
 // LDS-only layout. Keep the external Q8_K scratch packed; align the hot qs
 // payload of every staged block so the dot can read four words at a time.
+// Every Q4 group consumes two adjacent Q8 sums. Add them once during staging,
+// then share the result across all 32 output rows. Keeping 32-bit group sums
+// retains the 76-word pitch: a 72-word pitch would make eight K-block lanes
+// collide on four LDS banks instead of eight for scalar metadata reads.
 struct alignas(16) aligned_q8_K {
     float d;
     uint32_t padding[3];
     int8_t qs[256];
-    int16_t bsums[16];
+    int32_t group_sums[8];
 };
 static_assert(sizeof(aligned_q8_K) == 304u &&
               offsetof(aligned_q8_K, qs) == 16u &&
-              offsetof(aligned_q8_K, bsums) == 272u,
+              offsetof(aligned_q8_K, group_sums) == 272u,
               "Q4 aligned LDS block layout");
+
+DS4_Q4_LDS_INLINE int32_t pair_sum(uint32_t packed) {
+    int16_t pair[2];
+    __builtin_memcpy(pair, &packed, sizeof(packed));
+    return (int32_t)pair[0] + (int32_t)pair[1];
+}
 
 DS4_Q4_LDS_INLINE bool aligned_scope(
         uint32_t blocks, uint32_t out_dim, uint32_t n_tok, uint32_t groups,
@@ -52,8 +62,14 @@ DS4_Q4_LDS_INLINE void copy_thread_aligned(
             for (uint32_t w = lane; w < block_words; w += 32u) {
                 // Copy object representations: the words contain float,
                 // byte and short fields, not an array of uint32_t objects.
+                uint32_t value;
+                __builtin_memcpy(&value, block + w, sizeof(value));
+                if (w >= 65u) {
+                    const int32_t sum = pair_sum(value);
+                    __builtin_memcpy(&value, &sum, sizeof(value));
+                }
                 __builtin_memcpy(dst + slot * 76u + (w == 0u ? 0u : w + 3u),
-                                 block + w, sizeof(uint32_t));
+                                 &value, sizeof(value));
             }
         }
     }

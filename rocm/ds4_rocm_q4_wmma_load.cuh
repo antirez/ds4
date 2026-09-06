@@ -39,6 +39,14 @@ DS4_Q4_LOAD_INLINE uint64_t source(
     return ((uint64_t)tok0 + token(j)) * token_stride +
            (uint64_t)group * group_stride + k0 + column(j);
 }
+
+// The final WMMA stage only reads LDS. Subsequent register/output operations
+// cannot overwrite it, so only stages followed by another producer need a
+// reuse barrier. The separate producer-to-consumer barrier is unconditional.
+DS4_Q4_LOAD_INLINE bool needs_reuse_barrier(
+        uint32_t block, uint32_t blocks, uint32_t stage, uint32_t stages) {
+    return block + 1u < blocks || stage + 1u < stages;
+}
 } // namespace ds4_rocm_q4_wmma_load
 #undef DS4_Q4_LOAD_INLINE
 #endif

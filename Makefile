@@ -167,6 +167,9 @@ help:
 	@echo "  make bench-metal-q4-token-pair  Bitwise checks and kernel-only Q4 Q-b token-pair A/B"
 	@echo "  make test-metal-q4-qb-token-pair  Check the M1 Q-b token-pair runtime and opt-out"
 	@echo "  make test-q4-epilogue-host  Check CUDA Q4 epilogue bits and admission without a GPU"
+	@echo "  make test-q4-prefill-reduce-host  Check the CUDA Q4 RMS reduction tree without a GPU"
+	@echo "  make test-cuda-q4-prefill-reduce  Check Q4 RMS reduction rounding/barriers on CUDA"
+	@echo "  make test-rocm-q4-dot-host  Check production Q4 dot and staged pair sums without HIP"
 	@echo "  make test-metal-iq2-live-index  Check IQ2 SSD live-cache index policy and fallback"
 	@echo "  make test-rocm-q4-parity  Run ROCm Q4_K dense/pair/prefill oracle (or SKIP without HIP)"
 	@echo "  make test-rocm-q4-prefill Run ROCm Q4 tiled-prefill parity/canary oracle"
@@ -940,7 +943,7 @@ endif
 test-glm-attention: tests/test_glm_attention
 	./tests/test_glm_attention
 
-ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_glm53_vision_gpu.cuh ds4_deepseek4_vision_gpu.cuh ds4_image.h ds4_iq2_tables_cuda.inc cuda/mmq/ds4_mmq.h cuda/ds4_q8_quantize.cuh cuda/ds4_q8_prefill_layout.h $(Q4_PREFILL_DEQUANT_HEADERS)
+ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_glm53_vision_gpu.cuh ds4_deepseek4_vision_gpu.cuh ds4_image.h ds4_iq2_tables_cuda.inc cuda/mmq/ds4_mmq.h cuda/ds4_q8_quantize.cuh cuda/ds4_q8_prefill_layout.h cuda/ds4_q4_prefill_reduce.h $(Q4_PREFILL_DEQUANT_HEADERS)
 	$(NVCC) $(NVCCFLAGS) -c -o $@ ds4_cuda.cu
 
 # Vendored mmq pieces (see cuda/mmq/VENDOR.md).  ds4_mmq.cu transitively
@@ -1011,6 +1014,46 @@ ds4_rocm_compat.o: ds4_rocm_compat.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_gpu_args.h ds
 
 ds4_rocm_unavailable.o: ds4_rocm_unavailable.cu
 	$(HIPCC) $(ROCM_CFLAGS) -c -o $@ ds4_rocm_unavailable.cu
+
+.PHONY: test-q4-prefill-reduce-host test-cuda-q4-prefill-reduce bench-cuda-q4-prefill-reduce
+tests/test_q4_prefill_reduce_host: tests/test_cuda_q4_prefill_reduce.cpp cuda/ds4_q4_prefill_reduce.h
+	$(CXX) -O2 -Wall -Wextra -std=c++17 -fno-fast-math -o $@ $<
+
+tests/test_q4_prefill_reduce_host_fast: tests/test_cuda_q4_prefill_reduce.cpp cuda/ds4_q4_prefill_reduce.h
+	$(CXX) -O3 -Wall -Wextra -std=c++17 -ffast-math -fno-finite-math-only -o $@ $<
+
+test-q4-prefill-reduce-host: tests/test_q4_prefill_reduce_host tests/test_q4_prefill_reduce_host_fast
+	./tests/test_q4_prefill_reduce_host
+	./tests/test_q4_prefill_reduce_host_fast
+
+tests/test_cuda_q4_prefill_reduce: tests/test_cuda_q4_prefill_reduce.cpp cuda/ds4_q4_prefill_reduce.h
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -x cu -o $@ $<
+
+CUDA_Q4_PREFILL_REDUCE_TEST_ARGS ?=
+test-cuda-q4-prefill-reduce:
+	@reduce_nvcc="$(strip $(NVCC))"; \
+	if [ -z "$$reduce_nvcc" ]; then reduce_nvcc="$$(command -v nvcc 2>/dev/null || true)"; fi; \
+	reduce_probe="$${reduce_nvcc%% *}"; \
+	if [ -z "$$reduce_probe" ] || ! command -v "$$reduce_probe" >/dev/null 2>&1; then \
+		echo "CUDA Q4 prefill reduction: FAIL (nvcc and CUDA device required)"; exit 1; \
+	fi; \
+	$(MAKE) --no-print-directory tests/test_cuda_q4_prefill_reduce NVCC="$$reduce_nvcc" || exit $$?; \
+	./tests/test_cuda_q4_prefill_reduce $(CUDA_Q4_PREFILL_REDUCE_TEST_ARGS)
+
+bench-cuda-q4-prefill-reduce:
+	$(MAKE) test-cuda-q4-prefill-reduce CUDA_Q4_PREFILL_REDUCE_TEST_ARGS=--bench
+
+.PHONY: test-rocm-q4-dot-host
+ROCM_Q4_DOT_HEADERS = rocm/ds4_rocm_q4_dot.cuh rocm/ds4_rocm_q4_lds.cuh
+tests/test_rocm_q4_dot_host: tests/test_rocm_q4_dot_host.cpp $(ROCM_Q4_DOT_HEADERS)
+	$(CXX) -O2 -Wall -Wextra -std=c++17 -fno-fast-math -I. -o $@ $<
+
+tests/test_rocm_q4_dot_host_fast: tests/test_rocm_q4_dot_host.cpp $(ROCM_Q4_DOT_HEADERS)
+	$(CXX) -O3 -Wall -Wextra -std=c++17 -ffast-math -fno-finite-math-only -I. -o $@ $<
+
+test-rocm-q4-dot-host: tests/test_rocm_q4_dot_host tests/test_rocm_q4_dot_host_fast
+	./tests/test_rocm_q4_dot_host
+	./tests/test_rocm_q4_dot_host_fast
 
 .PHONY: test-rocm-q4-lds-host
 tests/test_rocm_q4_lds_host: tests/test_rocm_q4_lds_host.cpp rocm/ds4_rocm_q4_lds.cuh
@@ -1398,6 +1441,8 @@ test-quality-api: tests/test_quality_api.c gguf-tools/quality-testing/score_offi
 	./tests/test_quality_api
 
 clean:
+	rm -f tests/test_q4_prefill_reduce_host tests/test_q4_prefill_reduce_host_fast tests/test_cuda_q4_prefill_reduce
+	rm -f tests/test_rocm_q4_dot_host tests/test_rocm_q4_dot_host_fast
 	rm -f tests/test_rocm_q4_qb_epilogue_host tests/test_rocm_q4_qb_epilogue_host_fast tests/test_rocm_q4_qb_epilogue
 	rm -f tests/test_rocm_q4_decode_host
 	rm -f tests/test_rocm_q4_decode_lane4

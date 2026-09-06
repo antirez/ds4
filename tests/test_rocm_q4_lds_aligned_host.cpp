@@ -25,7 +25,7 @@ static_assert(alignof(lds::aligned_q8_K) == 16, "aligned Q8_K alignment");
 static_assert(offsetof(lds::aligned_q8_K, d) == 0, "aligned scale offset");
 static_assert(offsetof(lds::aligned_q8_K, padding) == 4, "aligned padding offset");
 static_assert(offsetof(lds::aligned_q8_K, qs) == 16, "aligned quant offset");
-static_assert(offsetof(lds::aligned_q8_K, bsums) == 272, "aligned sum offset");
+static_assert(offsetof(lds::aligned_q8_K, group_sums) == 272, "aligned sum offset");
 
 static void require(bool ok, const char *what) {
     if (!ok) {
@@ -63,7 +63,14 @@ static void test_tile(uint32_t nt, uint32_t nb, uint32_t threads,
         const uint32_t dest = dst_start + (p * BLOCKS + b) * 76u +
                               (w == 0u ? 0u : w + 3u);
         require(source < src.size() && dest < got.size(), "reference bounds");
-        expected[dest] = src[source];
+        if (w >= 65u) {
+            int16_t pair[2];
+            std::memcpy(pair, &src[source], sizeof(pair));
+            const int32_t sum = (int32_t)pair[0] + (int32_t)pair[1];
+            std::memcpy(&expected[dest], &sum, sizeof(sum));
+        } else {
+            expected[dest] = src[source];
+        }
         owner[dest] = (int)(((p * BLOCKS + b) % (threads / 32u)) * 32u + w % 32u);
         require(expected[dest] != untouched[dest], "distinct copy and canary values");
     }
@@ -99,8 +106,9 @@ static void test_tile(uint32_t nt, uint32_t nb, uint32_t threads,
                 "scale bits");
         require(std::memcmp(packed.qs, aligned.qs, sizeof(packed.qs)) == 0,
                 "all signed quant bytes");
-        require(std::memcmp(packed.bsums, aligned.bsums, sizeof(packed.bsums)) == 0,
-                "all signed block sums");
+        for (uint32_t g = 0; g < 8u; ++g)
+            require(aligned.group_sums[g] == (int32_t)packed.bsums[2u * g] +
+                        (int32_t)packed.bsums[2u * g + 1u], "all exact signed pair sums");
     }
     require(src == source_before, "source immutable");
 }

@@ -12565,6 +12565,9 @@ __global__ static void dsv4_qkv_rms_norm_rows_kv_rope_kernel(
     }
 }
 
+#include "cuda/ds4_q4_prefill_reduce.h"
+
+template<bool Q4_PREFILL_REDUCE>
 __global__ static void head_rms_norm_rope_tail_kernel(
         float *x,
         uint32_t n_tok,
@@ -12591,13 +12594,19 @@ __global__ static void head_rms_norm_rope_tail_kernel(
         sum += v * v;
     }
     __shared__ float partial[256];
-    partial[threadIdx.x] = sum;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+    float total;
+    if (Q4_PREFILL_REDUCE) {
+        total = ds4_q4_prefill_reduce_256(sum, partial);
+    } else {
+        partial[threadIdx.x] = sum;
         __syncthreads();
+        for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+            __syncthreads();
+        }
+        total = partial[0];
     }
-    const float scale = rsqrtf(partial[0] / (float)head_dim + eps);
+    const float scale = rsqrtf(total / (float)head_dim + eps);
     const uint32_t n_nope = head_dim - n_rot;
     for (uint32_t i = threadIdx.x; i < n_nope; i += blockDim.x) {
         xr[i] *= scale;
@@ -23558,7 +23567,7 @@ extern "C" int ds4_gpu_head_rms_norm_tensor(ds4_gpu_tensor *x, uint32_t n_tok, u
 extern "C" int ds4_gpu_head_rms_norm_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow, float eps) {
     if (!x || n_rot > head_dim || (n_rot & 1u) ||
         x->bytes < (uint64_t)n_tok * n_head * head_dim * sizeof(float)) return 0;
-    head_rms_norm_rope_tail_kernel<<<n_tok * n_head, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, eps);
+    head_rms_norm_rope_tail_kernel<false><<<n_tok * n_head, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, eps);
     return cuda_ok(cudaGetLastError(), "head_rms_norm_rope_tail launch");
 }
 extern "C" int ds4_gpu_dsv4_fp8_kv_quantize_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t head_dim, uint32_t n_rot) {
@@ -43888,7 +43897,9 @@ extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
                 inverse ? 1 : 0, freq_base, freq_scale, ext_factor,
                 attn_factor, beta_fast, beta_slow, eps);
     } else {
-        head_rms_norm_rope_tail_kernel<<<
+        // The resident Q4 prefill boundary retains F32 projection values;
+        // only its 256-thread RMS reduction changes synchronization.
+        head_rms_norm_rope_tail_kernel<true><<<
             n_tok * n_head, 256, 0, stream>>>(
                 (float *)out->ptr,
                 n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig,

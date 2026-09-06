@@ -60,6 +60,11 @@
 /tests/test_rocm_q4_lds_aligned_host
 /tests/test_rocm_q4_lds_aligned_host_fast
 /tests/test_rocm_q4_lds_aligned
+/tests/test_rocm_q4_dot_host
+/tests/test_rocm_q4_dot_host_fast
+/tests/test_q4_prefill_reduce_host
+/tests/test_q4_prefill_reduce_host_fast
+/tests/test_cuda_q4_prefill_reduce
 /tests/test_rocm_q4_wmma_load_host
 /tests/test_rocm_q4_qb_epilogue_host
 /tests/test_rocm_q4_qb_epilogue_host_fast

@@ -11,6 +11,23 @@ static void check(bool ok, const char *what) {
 }
 
 int main() {
+    size_t barrier_cases = 0;
+    // Every stage publishes before WMMA reads it; a reuse fence is needed
+    // precisely when another K stage can overwrite those same LDS slots.
+    for (uint32_t blocks = 1u; blocks <= 128u; ++blocks)
+    for (uint32_t stages : {2u, 4u}) {
+        uint32_t barriers = 0;
+        for (uint32_t b = 0u; b < blocks; ++b)
+        for (uint32_t s = 0u; s < stages; ++s) {
+            ++barriers; // unchanged producer-to-consumer barrier
+            const bool another_stage = b * stages + s + 1u < blocks * stages;
+            check(load::needs_reuse_barrier(b, blocks, s, stages) == another_stage,
+                  "uniform K64/K128 reuse barrier across K-block boundaries");
+            barriers += load::needs_reuse_barrier(b, blocks, s, stages);
+            ++barrier_cases;
+        }
+        check(barriers == 2u * blocks * stages - 1u, "exactly one fence removed");
+    }
     alignas(16) unsigned char base[32] = {};
     size_t policies = 0, maps = 0;
     for (unsigned offset = 0; offset < 17; ++offset)
@@ -73,6 +90,6 @@ int main() {
     check(load::source(4092u, 4096u, 7u, 192u, 1ull << 33, 1ull << 32) ==
           4159ull * (1ull << 33) + 7ull * (1ull << 32) + 252ull,
           "64-bit source addressing");
-    std::printf("Q4 K64 LOAD4 host: PASS %zu policies, %zu staging maps\n",
-                policies, maps);
+    std::printf("Q4 K64 LOAD4 host: PASS %zu policies, %zu staging maps, %zu K64/K128 barrier cases\n",
+                policies, maps, barrier_cases);
 }

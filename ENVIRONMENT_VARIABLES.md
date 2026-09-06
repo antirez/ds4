@@ -33,8 +33,9 @@ Any defined value, including `0` or empty, disables it. The older
 `DS4_ROCM_DISABLE_Q4_PREFILL_LDS_VECTOR` rollbacks also prevent selection.
 
 This candidate preserves the packed global scratch and quantizer. It exposes
-four-word reads to the dot loop while retaining the integer and FP32 operation
-order. The existing `DS4_ROCM_Q4_PREFILL_TILE8_STATS=1` report includes
+four-word reads to the dot loop and prepares exact integer group sums once in
+LDS, preserving integer results and FP32 accumulation order. The existing
+`DS4_ROCM_Q4_PREFILL_TILE8_STATS=1` report includes
 `lds_aligned_calls`; collect it separately from performance measurements.
 GPU correctness and throughput remain unverified; see the
 [aligned LDS test and benchmark procedure](speed-bench/rocm_q4_prefill_lds_aligned.md).
