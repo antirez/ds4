@@ -1,5 +1,6 @@
 #define DS4_SERVER_TEST
 #define DS4_SERVER_TEST_NO_MAIN
+#include <inttypes.h>
 #include "../ds4_server.c"
 #ifndef DS4_NO_GPU
 #include "../ds4_gpu.h"
@@ -103,10 +104,13 @@ static ds4_backend test_model_backend(void) {
 static ds4_engine *test_open_engine(bool quality) {
     ds4_engine *engine = NULL;
     /* DS4_TEST_MTP loads the MTP head on the fast engine so the speculative
-     * verify regression can reuse it; draft=4 hits the multi-row verify path. */
+     * verify regression can reuse it; draft=4 hits the multi-row verify path.
+     * DS4_TEST_PLE binds the Qwen pack's PLE sidecar the same way. */
     const char *mtp = getenv("DS4_TEST_MTP");
+    const char *ple = getenv("DS4_TEST_PLE");
     ds4_engine_options opt = {
         .model_path = test_model_path(),
+        .ple_path = (ple && ple[0]) ? ple : NULL,
         .backend = test_model_backend(),
         .quality = quality,
         .ssd_streaming = test_env_bool("DS4_TEST_SSD_STREAMING"),
@@ -144,6 +148,98 @@ static void test_close_engine(bool quality) {
     ds4_engine **slot = quality ? &test_engine_quality : &test_engine_fast;
     ds4_engine_close(*slot);
     *slot = NULL;
+}
+
+/* Qwen3.8 rewind: one token back restores the verify snapshot, anything else
+ * resets the recurrent state and replays the kept tokens on the next eval;
+ * both must land on the logits a fresh session produces for the same tokens. */
+static void test_session_rewind_replay(void) {
+    ds4_engine *engine = test_get_engine(false);
+    if (!engine) return;
+    if (!ds4_engine_is_qwen4(engine)) {
+        puts("session-rewind: Qwen3.8 model required, skipped");
+        return;
+    }
+    ds4_session *live = NULL, *fresh = NULL;
+    ds4_tokens prompt = {0}, replay = {0};
+    char err[192] = {0};
+    ds4_token_score got[8], want[8];
+    const bool mtp = test_env_bool("DS4_TEST_GLM_MTP");
+    if (mtp) setenv("DS4_QWEN4_SPEC_FORCE_ACCEPT", "1", 1);
+
+    ds4_chat_begin(engine, &prompt);
+    ds4_chat_append_message(engine, &prompt, "user", "Count from one to ten.");
+    ds4_chat_append_assistant_prefix(engine, &prompt, DS4_THINK_NONE);
+    TEST_ASSERT(ds4_session_create(&live, engine, 1024) == 0);
+    TEST_ASSERT(ds4_session_create(&fresh, engine, 1024) == 0);
+    if (!live || !fresh) goto cleanup;
+    TEST_ASSERT(ds4_session_sync(live, &prompt, err, sizeof(err)) == 0);
+    for (int i = 0; i < prompt.len; i++) ds4_tokens_push(&replay, prompt.v[i]);
+
+    /* three greedy steps; under MTP the first cycle seeds a draft and the
+     * forced-accept cycles after it commit token pairs */
+    int last_n = 1;
+    for (int step = 0; step < 3; step++) {
+        const int first = ds4_session_argmax(live);
+        if (mtp) {
+            int acc[2] = {0, 0};
+            last_n = ds4_session_eval_speculative_argmax(live, first, 2, -1, acc, 2, err, sizeof(err));
+            TEST_ASSERT(last_n == 1 || last_n == 2);
+            if (last_n < 1) goto cleanup;
+            for (int i = 0; i < last_n; i++) ds4_tokens_push(&replay, acc[i]);
+        } else {
+            TEST_ASSERT(ds4_session_eval(live, first, err, sizeof(err)) == 0);
+            ds4_tokens_push(&replay, first);
+        }
+    }
+    if (mtp) TEST_ASSERT(last_n == 2);   /* the one-token rewind below takes the snapshot path */
+    TEST_ASSERT(ds4_session_pos(live) == replay.len);
+    if (mtp) TEST_ASSERT(ds4_session_top_logprobs(live, want, 8) == 8);
+
+    /* rewind one token (snapshot path under MTP) and re-evaluate it */
+    const int last = replay.v[replay.len - 1];
+    ds4_session_rewind(live, replay.len - 1);
+    TEST_ASSERT(ds4_session_pos(live) == replay.len - 1);
+    TEST_ASSERT(ds4_session_eval(live, last, err, sizeof(err)) == 0);
+    /* Match the replay's prefill/decode split. A full-prefix prefill uses
+     * different floating-point accumulation than the final decode step. */
+    ds4_tokens prefix = replay;
+    prefix.len--;
+    if (!mtp) {
+        TEST_ASSERT(ds4_session_sync(fresh, &prefix, err, sizeof(err)) == 0);
+        TEST_ASSERT(ds4_session_eval(fresh, last, err, sizeof(err)) == 0);
+        TEST_ASSERT(ds4_session_top_logprobs(fresh, want, 8) == 8);
+    }
+    /* MTP restores row zero of the verifier snapshot: re-evaluating row one
+     * must reproduce its original logits, including the prior decode state. */
+    TEST_ASSERT(ds4_session_top_logprobs(live, got, 8) == 8);
+    TEST_ASSERT(got[0].id == want[0].id);
+    for (int i = 0; i < 8; i++) TEST_ASSERT(fabsf(got[i].logprob - want[i].logprob) < 2e-3f);
+
+    /* rewind two tokens (reset + replay path) and re-evaluate both */
+    ds4_session_rewind(live, replay.len - 2);
+    TEST_ASSERT(ds4_session_pos(live) == replay.len - 2);
+    TEST_ASSERT(ds4_session_eval(live, replay.v[replay.len - 2], err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_eval(live, last, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_pos(live) == replay.len);
+    ds4_session_free(fresh);
+    fresh = NULL;
+    TEST_ASSERT(ds4_session_create(&fresh, engine, 1024) == 0);
+    if (!fresh) goto cleanup;
+    prefix.len = replay.len - 2;
+    TEST_ASSERT(ds4_session_sync(fresh, &prefix, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_eval(fresh, replay.v[replay.len - 2], err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_eval(fresh, last, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_top_logprobs(fresh, want, 8) == 8);
+    TEST_ASSERT(ds4_session_top_logprobs(live, got, 8) == 8);
+    TEST_ASSERT(got[0].id == want[0].id);
+    for (int i = 0; i < 8; i++) TEST_ASSERT(fabsf(got[i].logprob - want[i].logprob) < 2e-3f);
+
+cleanup:
+    ds4_tokens_free(&replay);
+    ds4_tokens_free(&prompt);
+    ds4_session_free(fresh);
+    ds4_session_free(live);
 }
 
 static void test_session_snapshot_roundtrip(void) {
@@ -247,6 +343,19 @@ static void test_session_snapshot_roundtrip(void) {
     if (!restored) goto cleanup;
     TEST_ASSERT(ds4_session_load_snapshot(restored, &snapshot,
                                           err, sizeof(err)) == 0);
+    {
+        /* a loaded snapshot must save back byte-identical */
+        ds4_session_snapshot again = {0};
+        TEST_ASSERT(ds4_session_save_snapshot(restored, &again, err, sizeof(err)) == 0);
+        TEST_ASSERT(again.len == snapshot.len);
+        if (again.len == snapshot.len && memcmp(again.ptr, snapshot.ptr, again.len) != 0) {
+            size_t first = 0;
+            while (first < again.len && again.ptr[first] == snapshot.ptr[first]) first++;
+            fprintf(stderr, "ds4-test: snapshot round trip differs at byte %zu of %" PRIu64 "\n", first, again.len);
+            TEST_ASSERT(false);
+        }
+        ds4_session_snapshot_free(&again);
+    }
     TEST_ASSERT(ds4_session_top_logprobs(restored, restored_before, 8) == 8);
     for (int i = 0; i < 8; i++) {
         if (restored_before[i].id != before[i].id ||
@@ -6830,6 +6939,7 @@ typedef struct {
 static const ds4_test_entry test_entries[] = {
 #ifndef DS4_NO_GPU
     {"--session-snapshot", "session-snapshot", "session snapshot and recurrent-state round trip", test_session_snapshot_roundtrip},
+    {"--session-rewind", "session-rewind", "Qwen3.8 rewind by snapshot restore and by replay", test_session_rewind_replay},
     {"--long-context", "long-context", "long-context story fact-recall regression", test_long_story_fact_recall},
     {"--tool-call-quality", "tool-call-quality", "model tool call and post-result stop regression", test_tool_call_quality},
     {"--think-tool-recovery", "think-tool-recovery", "recover a complete tool call emitted inside unclosed reasoning", test_think_tool_recovery},
@@ -6879,6 +6989,7 @@ static void test_print_help(const char *prog) {
     puts("  DS4_TEST_LOCAL_GOLDEN_FILE=FILE  Local fixture. Default: flash-0731/local-golden.vec.");
     puts("  DS4_TEST_MPP_EQ_CASE=NAME  Run only Tensor equivalence cases whose id contains NAME.");
     puts("  DS4_TEST_MTP=FILE         Legacy MTP support GGUF for --mtp-verify-depth.");
+    puts("  DS4_TEST_PLE=FILE         Qwen PLE sidecar for packs that require one.");
     puts("  DS4_TEST_DSPARK=FILE      DSpark support GGUF for --dspark-verify-depth.");
     puts("  DS4_TEST_CONTINUED_PREFILL_TOKENS=N  Large suffix size for --glm53-continued-prefill.");
     puts("  DS4_TEST_CONTINUED_PREFILL_STEPS=N   Number of consecutive large suffixes to test.");

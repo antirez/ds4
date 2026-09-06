@@ -1,0 +1,5 @@
+# Mutex vs. Atomic Counter
+
+## Core Concept
+
+Both are synchronization primitives used in concurrent programming, but they operate at

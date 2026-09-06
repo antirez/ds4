@@ -10,6 +10,7 @@
 /ds4flash.gguf
 /TODO.md
 /gguf/
+/OUT/
 /core
 /core.*
 /tests/test_engine_mgpu_placement
@@ -46,6 +47,9 @@
 /tests/test_glm_attention_rocm
 /tests/test_linux_memory
 /tests/test_rocm_memory
+/tests/test_qwen4_kernels
+/tests/test_qwen4_spec
+/tests/test_qwen4_vision
 /tests/test_deepseek4_vision_image
 *.o
 *.dSYM/

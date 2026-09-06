@@ -1,0 +1,540 @@
+{
+  "snapshot": "/Users/ifioravanti/.cache/huggingface/hub/models--Qwen--Qwen3.8-Flash-Next/snapshots/de4b8e4d43b917e7706784d8bb445c9af86a3540",
+  "mmproj": "gguf/mmproj-Qwen3.8-Flash-Next-Q8_0.gguf",
+  "mmproj_sha256": "b2e9b5e4a44c107f8867e67dbf09b607fd99ae33c1a97a60a6720aeb252a9dad",
+  "versions": {
+    "numpy": "2.5.3",
+    "torch": "2.14.0",
+    "transformers": "5.16.1",
+    "gguf": "0.19.0",
+    "pillow": "12.3.0"
+  },
+  "min_cos": 0.99,
+  "min_tokens": 64,
+  "max_tokens": 1024,
+  "require_quality": false,
+  "results": [
+    {
+      "image": "tests/vision-fixtures/qwen38/orbit.png",
+      "image_sha256": "7512a7d0f918b72616cc38d0131feb019da44418361f161469487ccd69c77c9b",
+      "grid": [
+        15,
+        20
+      ],
+      "shape": [
+        300,
+        2560
+      ],
+      "implementation": {
+        "pass": true,
+        "min_cos": 0.999999810390818,
+        "mean_cos": 0.9999999987282528,
+        "worst_token": 255,
+        "max_abs": 0.00027151405811309814,
+        "mean_abs": 8.369575123850665e-07
+      },
+      "quantization_quality": {
+        "pass": false,
+        "min_cos": 0.9820682809996838,
+        "mean_cos": 0.999861086386269,
+        "worst_token": 239,
+        "max_abs": 0.016790976747870445,
+        "mean_abs": 0.00029485781922733954
+      },
+      "metal_vs_original": {
+        "pass": false,
+        "min_cos": 0.9820773168115122,
+        "mean_cos": 0.9998610752850322,
+        "worst_token": 239,
+        "max_abs": 0.016785232350230217,
+        "mean_abs": 0.00029503705538299935
+      }
+    },
+    {
+      "image": "tests/vision-fixtures/qwen38/maple.png",
+      "image_sha256": "76198c864eef7eb35103bb599c227a0d1258d5c67b058f76f62437ef464fa9bf",
+      "grid": [
+        15,
+        20
+      ],
+      "shape": [
+        300,
+        2560
+      ],
+      "implementation": {
+        "pass": true,
+        "min_cos": 0.9999999920203452,
+        "mean_cos": 0.999999999824895,
+        "worst_token": 286,
+        "max_abs": 9.141862392425537e-06,
+        "mean_abs": 2.360405522068565e-07
+      },
+      "quantization_quality": {
+        "pass": true,
+        "min_cos": 0.9995882094835764,
+        "mean_cos": 0.9999678432590567,
+        "worst_token": 235,
+        "max_abs": 0.003081709146499634,
+        "mean_abs": 0.00014482836790238963
+      },
+      "metal_vs_original": {
+        "pass": true,
+        "min_cos": 0.9995893146083558,
+        "mean_cos": 0.9999678502367696,
+        "worst_token": 235,
+        "max_abs": 0.0030796080827713013,
+        "mean_abs": 0.00014480336093015001
+      }
+    },
+    {
+      "image": "tests/vision-fixtures/glm53/diagram.png",
+      "image_sha256": "ed423c191b553ff2e6fea5c01e0df7d0f8766d254a2df00b0d8b8d32ed54be45",
+      "grid": [
+        22,
+        38
+      ],
+      "shape": [
+        836,
+        2560
+      ],
+      "implementation": {
+        "pass": true,
+        "min_cos": 0.9995718009793326,
+        "mean_cos": 0.999998457302481,
+        "worst_token": 251,
+        "max_abs": 0.0026396550238132477,
+        "mean_abs": 2.225303571292521e-05
+      },
+      "quantization_quality": {
+        "pass": true,
+        "min_cos": 0.9978967993644141,
+        "mean_cos": 0.9999638796676716,
+        "worst_token": 67,
+        "max_abs": 0.013870634138584137,
+        "mean_abs": 0.00013706545454112543
+      },
+      "metal_vs_original": {
+        "pass": true,
+        "min_cos": 0.9978684724194867,
+        "mean_cos": 0.9999632477353108,
+        "worst_token": 67,
+        "max_abs": 0.01398748904466629,
+        "mean_abs": 0.0001387248778299173
+      }
+    },
+    {
+      "image": "tests/vision-fixtures/glm53/text.png",
+      "image_sha256": "3527da96122fd75d3b7cff45cebf8ad0ce27b5971d9b460d62e2ceb59b833921",
+      "grid": [
+        25,
+        31
+      ],
+      "shape": [
+        775,
+        2560
+      ],
+      "implementation": {
+        "pass": true,
+        "min_cos": 0.9999999927231183,
+        "mean_cos": 0.99999999987036,
+        "worst_token": 86,
+        "max_abs": 2.6844441890716553e-05,
+        "mean_abs": 2.1573448259036745e-07
+      },
+      "quantization_quality": {
+        "pass": true,
+        "min_cos": 0.998274131647711,
+        "mean_cos": 0.999969104298077,
+        "worst_token": 462,
+        "max_abs": 0.011821478605270386,
+        "mean_abs": 0.00012853711286301255
+      },
+      "metal_vs_original": {
+        "pass": true,
+        "min_cos": 0.9982791407293277,
+        "mean_cos": 0.9999691119867311,
+        "worst_token": 462,
+        "max_abs": 0.011816650629043579,
+        "mean_abs": 0.00012853288037036943
+      }
+    },
+    {
+      "image": "tests/vision-fixtures/glm53/earth.jpg",
+      "image_sha256": "a48278513a38768ff92247972e60bc873eb361a8527cb8686a3e19c3ae1bdf9d",
+      "grid": [
+        16,
+        16
+      ],
+      "shape": [
+        256,
+        2560
+      ],
+      "implementation": {
+        "pass": true,
+        "min_cos": 0.9999999976051862,
+        "mean_cos": 0.9999999999544038,
+        "worst_token": 30,
+        "max_abs": 3.598630428314209e-05,
+        "mean_abs": 3.0568869089189525e-07
+      },
+      "quantization_quality": {
+        "pass": true,
+        "min_cos": 0.9977112080278612,
+        "mean_cos": 0.9999359584479885,
+        "worst_token": 137,
+        "max_abs": 0.0202968567609787,
+        "mean_abs": 0.00036317867950974087
+      },
+      "metal_vs_original": {
+        "pass": true,
+        "min_cos": 0.9977105111302702,
+        "mean_cos": 0.9999359659989886,
+        "worst_token": 137,
+        "max_abs": 0.020260870456695557,
+        "mean_abs": 0.0003631339435922143
+      }
+    },
+    {
+      "image": "tests/vision-fixtures/glm53/screenshot.png",
+      "image_sha256": "28d2f8b7860e520df26542041e263c9cf641e9c5bff0652e67b186e55a6b073c",
+      "grid": [
+        25,
+        39
+      ],
+      "shape": [
+        975,
+        2560
+      ],
+      "implementation": {
+        "pass": true,
+        "min_cos": 0.9997842553003062,
+        "mean_cos": 0.999997404237045,
+        "worst_token": 915,
+        "max_abs": 0.002093017101287842,
+        "mean_abs": 2.5817744321455013e-05
+      },
+      "quantization_quality": {
+        "pass": true,
+        "min_cos": 0.9923334965685806,
+        "mean_cos": 0.9999421593439434,
+        "worst_token": 216,
+        "max_abs": 0.009784296154975891,
+        "mean_abs": 0.00013915049579251305
+      },
+      "metal_vs_original": {
+        "pass": true,
+        "min_cos": 0.992104804463413,
+        "mean_cos": 0.9999382090291498,
+        "worst_token": 216,
+        "max_abs": 0.010407522320747375,
+        "mean_abs": 0.0001434950857847248
+      }
+    }
+  ],
+  "hardware": "Apple M3 Ultra, 512 GiB",
+  "date": "2026-09-07",
+  "suite_exit_code": 0,
+  "before_decoder_fix": [
+    {
+      "image": "tests/vision-fixtures/qwen38/orbit.png",
+      "grid": [
+        15,
+        20
+      ],
+      "shape": [
+        300,
+        2560
+      ],
+      "implementation": {
+        "pass": true,
+        "min_cos": 0.999999810390818,
+        "mean_cos": 0.9999999987282528,
+        "worst_token": 255,
+        "max_abs": 0.00027151405811309814,
+        "mean_abs": 8.369575123850665e-07
+      },
+      "quantization_quality": {
+        "pass": false,
+        "min_cos": 0.9820682809996838,
+        "mean_cos": 0.999861086386269,
+        "worst_token": 239,
+        "max_abs": 0.016790976747870445,
+        "mean_abs": 0.00029485781922733954
+      },
+      "metal_vs_original": {
+        "pass": false,
+        "min_cos": 0.9820773168115122,
+        "mean_cos": 0.9998610752850322,
+        "worst_token": 239,
+        "max_abs": 0.016785232350230217,
+        "mean_abs": 0.00029503705538299935
+      },
+      "image_sha256": "7512a7d0f918b72616cc38d0131feb019da44418361f161469487ccd69c77c9b"
+    },
+    {
+      "image": "tests/vision-fixtures/qwen38/maple.png",
+      "grid": [
+        15,
+        20
+      ],
+      "shape": [
+        300,
+        2560
+      ],
+      "implementation": {
+        "pass": true,
+        "min_cos": 0.9999999920203452,
+        "mean_cos": 0.999999999824895,
+        "worst_token": 286,
+        "max_abs": 9.141862392425537e-06,
+        "mean_abs": 2.360405522068565e-07
+      },
+      "quantization_quality": {
+        "pass": true,
+        "min_cos": 0.9995882094835764,
+        "mean_cos": 0.9999678432590567,
+        "worst_token": 235,
+        "max_abs": 0.003081709146499634,
+        "mean_abs": 0.00014482836790238963
+      },
+      "metal_vs_original": {
+        "pass": true,
+        "min_cos": 0.9995893146083558,
+        "mean_cos": 0.9999678502367696,
+        "worst_token": 235,
+        "max_abs": 0.0030796080827713013,
+        "mean_abs": 0.00014480336093015001
+      },
+      "image_sha256": "76198c864eef7eb35103bb599c227a0d1258d5c67b058f76f62437ef464fa9bf"
+    },
+    {
+      "image": "tests/vision-fixtures/glm53/diagram.png",
+      "grid": [
+        22,
+        38
+      ],
+      "shape": [
+        836,
+        2560
+      ],
+      "implementation": {
+        "pass": true,
+        "min_cos": 0.9995718009793326,
+        "mean_cos": 0.999998457302481,
+        "worst_token": 251,
+        "max_abs": 0.0026396550238132477,
+        "mean_abs": 2.225303571292521e-05
+      },
+      "quantization_quality": {
+        "pass": true,
+        "min_cos": 0.9978967993644141,
+        "mean_cos": 0.9999638796676716,
+        "worst_token": 67,
+        "max_abs": 0.013870634138584137,
+        "mean_abs": 0.00013706545454112543
+      },
+      "metal_vs_original": {
+        "pass": true,
+        "min_cos": 0.9978684724194867,
+        "mean_cos": 0.9999632477353108,
+        "worst_token": 67,
+        "max_abs": 0.01398748904466629,
+        "mean_abs": 0.0001387248778299173
+      },
+      "image_sha256": "ed423c191b553ff2e6fea5c01e0df7d0f8766d254a2df00b0d8b8d32ed54be45"
+    },
+    {
+      "image": "tests/vision-fixtures/glm53/text.png",
+      "grid": [
+        25,
+        31
+      ],
+      "shape": [
+        775,
+        2560
+      ],
+      "implementation": {
+        "pass": true,
+        "min_cos": 0.9999999927231183,
+        "mean_cos": 0.99999999987036,
+        "worst_token": 86,
+        "max_abs": 2.6844441890716553e-05,
+        "mean_abs": 2.1573448259036745e-07
+      },
+      "quantization_quality": {
+        "pass": true,
+        "min_cos": 0.998274131647711,
+        "mean_cos": 0.999969104298077,
+        "worst_token": 462,
+        "max_abs": 0.011821478605270386,
+        "mean_abs": 0.00012853711286301255
+      },
+      "metal_vs_original": {
+        "pass": true,
+        "min_cos": 0.9982791407293277,
+        "mean_cos": 0.9999691119867311,
+        "worst_token": 462,
+        "max_abs": 0.011816650629043579,
+        "mean_abs": 0.00012853288037036943
+      },
+      "image_sha256": "3527da96122fd75d3b7cff45cebf8ad0ce27b5971d9b460d62e2ceb59b833921"
+    },
+    {
+      "image": "tests/vision-fixtures/glm53/earth.jpg",
+      "grid": [
+        16,
+        16
+      ],
+      "shape": [
+        256,
+        2560
+      ],
+      "implementation": {
+        "pass": false,
+        "min_cos": 0.9574351682599859,
+        "mean_cos": 0.996463571566587,
+        "worst_token": 231,
+        "max_abs": 0.06891359388828278,
+        "mean_abs": 0.0024166457010173408
+      },
+      "quantization_quality": {
+        "pass": true,
+        "min_cos": 0.9977112080278612,
+        "mean_cos": 0.9999359584479885,
+        "worst_token": 137,
+        "max_abs": 0.0202968567609787,
+        "mean_abs": 0.00036317867950974087
+      },
+      "metal_vs_original": {
+        "pass": false,
+        "min_cos": 0.9488489810471763,
+        "mean_cos": 0.9963192303024502,
+        "worst_token": 231,
+        "max_abs": 0.07257913798093796,
+        "mean_abs": 0.00245989413678357
+      },
+      "image_sha256": "a48278513a38768ff92247972e60bc873eb361a8527cb8686a3e19c3ae1bdf9d"
+    },
+    {
+      "image": "tests/vision-fixtures/glm53/screenshot.png",
+      "grid": [
+        25,
+        39
+      ],
+      "shape": [
+        975,
+        2560
+      ],
+      "implementation": {
+        "pass": true,
+        "min_cos": 0.9997842553003062,
+        "mean_cos": 0.999997404237045,
+        "worst_token": 915,
+        "max_abs": 0.002093017101287842,
+        "mean_abs": 2.5817744321455013e-05
+      },
+      "quantization_quality": {
+        "pass": true,
+        "min_cos": 0.9923334965685806,
+        "mean_cos": 0.9999421593439434,
+        "worst_token": 216,
+        "max_abs": 0.009784296154975891,
+        "mean_abs": 0.00013915049579251305
+      },
+      "metal_vs_original": {
+        "pass": true,
+        "min_cos": 0.992104804463413,
+        "mean_cos": 0.9999382090291498,
+        "worst_token": 216,
+        "max_abs": 0.010407522320747375,
+        "mean_abs": 0.0001434950857847248
+      },
+      "image_sha256": "28d2f8b7860e520df26542041e263c9cf641e9c5bff0652e67b186e55a6b073c"
+    }
+  ],
+  "diagnostic_lossless_earth": {
+    "image": "/tmp/ds4-vision-validation/earth-decoded.png",
+    "grid": [
+      16,
+      16
+    ],
+    "shape": [
+      256,
+      2560
+    ],
+    "implementation": {
+      "pass": true,
+      "min_cos": 0.9999999976051862,
+      "mean_cos": 0.9999999999544038,
+      "worst_token": 30,
+      "max_abs": 3.598630428314209e-05,
+      "mean_abs": 3.0568869089189525e-07
+    },
+    "quantization_quality": {
+      "pass": true,
+      "min_cos": 0.9977112080278612,
+      "mean_cos": 0.9999359584479885,
+      "worst_token": 137,
+      "max_abs": 0.0202968567609787,
+      "mean_abs": 0.00036317867950974087
+    },
+    "metal_vs_original": {
+      "pass": true,
+      "min_cos": 0.9977105111302702,
+      "mean_cos": 0.9999359659989886,
+      "worst_token": 137,
+      "max_abs": 0.020260870456695557,
+      "mean_abs": 0.0003631339435922143
+    }
+  },
+  "quality_gate_check": {
+    "exit_code": 1,
+    "result": {
+      "image": "tests/vision-fixtures/qwen38/orbit.png",
+      "image_sha256": "7512a7d0f918b72616cc38d0131feb019da44418361f161469487ccd69c77c9b",
+      "grid": [
+        15,
+        20
+      ],
+      "shape": [
+        300,
+        2560
+      ],
+      "implementation": {
+        "pass": true,
+        "min_cos": 0.999999810390818,
+        "mean_cos": 0.9999999987282528,
+        "worst_token": 255,
+        "max_abs": 0.00027151405811309814,
+        "mean_abs": 8.369575123850665e-07
+      },
+      "quantization_quality": {
+        "pass": false,
+        "min_cos": 0.9820682809996838,
+        "mean_cos": 0.999861086386269,
+        "worst_token": 239,
+        "max_abs": 0.016790976747870445,
+        "mean_abs": 0.00029485781922733954
+      },
+      "metal_vs_original": {
+        "pass": false,
+        "min_cos": 0.9820773168115122,
+        "mean_cos": 0.9998610752850322,
+        "worst_token": 239,
+        "max_abs": 0.016785232350230217,
+        "mean_abs": 0.00029503705538299935
+      }
+    }
+  },
+  "jpeg_decoder_tests": {
+    "cases": 39,
+    "pixel_agreement": "exact",
+    "reference": "Pillow/libjpeg",
+    "sampling": [
+      "4:4:4",
+      "4:2:2",
+      "4:2:0"
+    ],
+    "baseline_and_progressive": true
+  }
+}

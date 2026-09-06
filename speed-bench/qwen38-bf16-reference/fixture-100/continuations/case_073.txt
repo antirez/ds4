@@ -1,0 +1,1 @@
+Ecco un breve esempio di **race condition** in C, con due thread che incrementano una variabile condivisa

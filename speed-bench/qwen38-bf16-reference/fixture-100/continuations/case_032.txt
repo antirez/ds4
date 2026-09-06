@@ -1,0 +1,5 @@
+# Mutex vs Contatore Atomico
+
+## Concetto Fondamentale
+
+Entrambi sono meccanismi di **s

@@ -1,0 +1,2 @@
+<think>
+The user is asking me to write a brief checklist for reviewing memory lifetimes in a Pull Request (PR).

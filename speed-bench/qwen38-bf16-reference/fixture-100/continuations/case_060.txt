@@ -1,0 +1,3 @@
+```python
+def median_of_three(a, b, c):
+    return sorted([a, b, c])[

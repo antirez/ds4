@@ -1,0 +1,1 @@
+Checksums detect accidental corruption by treating data as a mathematical object and computing a fixed-size value derived from its entire content,

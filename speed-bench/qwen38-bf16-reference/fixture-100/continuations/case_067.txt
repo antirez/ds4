@@ -1,0 +1,5 @@
+# Why mmap Page Residency Differs from Virtual Address Space Size
+
+## Core Distinction
+
+**Virtual address space size

@@ -1391,6 +1391,8 @@ static void tokens_remove(ds4_tokens *dst, int pos, int n) {
 
 static const char *repl_glm_reasoning_effort_text(ds4_think_mode mode) {
     switch (mode) {
+    case DS4_THINK_LOW:
+    case DS4_THINK_MEDIUM:
     case DS4_THINK_HIGH: return "Reasoning Effort: High";
     case DS4_THINK_MAX:  return "Reasoning Effort: Max";
     case DS4_THINK_NONE: return NULL;
@@ -1534,22 +1536,17 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat,
     const int rollback_len = chat->transcript.len;
     const size_t rollback_images = chat->image_count;
     if (image) {
-        ds4_tokens_push(&chat->transcript, ds4_token_user(engine));
         ds4_vision_span *span = repl_chat_add_image(chat);
+        const char *text_parts[] = {"", user_text ? user_text : ""};
         char image_error[160] = {0};
-        if (!span || !ds4_prompt_append_vision(engine, &chat->transcript,
-                                               span, image,
-                                               image_error,
-                                               sizeof(image_error))) {
+        if (!span || !ds4_chat_append_multimodal_message(
+                engine, &chat->transcript, "user", text_parts,
+                image, 1, span, image_error, sizeof(image_error))) {
             repl_chat_trim_images(chat, rollback_images);
             chat->transcript.len = rollback_len;
             fprintf(stderr, "ds4: failed to add image: %s\n",
                     image_error[0] ? image_error : "out of memory");
             return 1;
-        }
-        if (user_text && user_text[0]) {
-            ds4_tokenize_text(engine, "\n", &chat->transcript);
-            ds4_tokenize_text(engine, user_text, &chat->transcript);
         }
     } else {
         ds4_chat_append_message(engine, &chat->transcript, "user", user_text);
@@ -2025,6 +2022,8 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.glm_mtp = true;
         } else if (!strcmp(arg, "--mtp-model")) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--ple")) {
+            c.engine.ple_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-draft")) {
             c.engine.mtp_draft_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mtp-margin")) {

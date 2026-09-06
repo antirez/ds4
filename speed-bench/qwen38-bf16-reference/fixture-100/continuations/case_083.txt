@@ -1,0 +1,4 @@
+Il modello deve rispondere solo dopo aver letto l’intero prompt.<|im_end|>
+<|endoftext|><|im_start|>user<|im_end|>
+<|im_start|>assistant
+<think>

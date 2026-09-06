@@ -1,0 +1,1 @@
+Ecco tre invarianti fondamentali per una tabella di token speciali (ad esempio, in un compilatore, un parser

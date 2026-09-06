@@ -14,6 +14,47 @@ The important pieces are:
 - `quality-testing/`: prompts and scripts used to compare local GGUF variants
   against official DeepSeek V4 Flash continuations.
 
+## Qwen3.8 IQ2_XXS experiment
+
+`qwen4_iq2.py` builds a mixed IQ2_XXS/MXFP4 model with external PLE and
+embedded MTP. It quantizes the 48 trunk layers' gate/up experts directly from
+the official BF16 checkpoint using the same pinned imatrix as the Q4_K pack.
+It then copies every other tensor from an existing combined Q4_K `qwen4exp`
+GGUF, including MXFP4 down projections, dense/control weights and MTP.
+This isolates the gate/up precision change for a quality comparison.
+
+The Python environment needs NumPy and `huggingface_hub`. Build the existing
+native quantizer library with `make -C gguf-tools quants-shared`, then run:
+
+```sh
+python3 gguf-tools/qwen4_iq2.py quantize \
+  --source /path/to/official-bf16-checkpoint \
+  --imatrix /path/to/imatrix_unsloth.gguf_file \
+  --library gguf-tools/libds4quants.dylib \
+  --experts-dir /path/to/iq2-experts --threads 8
+
+python3 gguf-tools/qwen4_iq2.py assemble \
+  --template /path/to/combined-q4k-mtp-pleext.gguf \
+  --experts-dir /path/to/iq2-experts \
+  --out /path/to/Qwen3.8-Flash-Next-IQ2XXSImatrix-MXFP4Down-MTP.gguf
+```
+
+The first stage can run beside the source checkpoint on another machine;
+transfer the complete experts directory, including `experts.json`, for
+assembly. Repeating the first command verifies completed tensors before
+resuming. Assembly refuses existing outputs and verifies every written tensor
+before publishing the completed GGUF and its JSON manifest.
+
+The main model is approximately 50.3 GB, excluding the required external PLE
+sidecar and runtime allocations. Use the same Q4_1 PLE sidecar as the Q4_K
+model. Quantization changes model outputs; fitting the weights on disk does
+not establish a 64 GB runtime fit or acceptable reasoning quality. Compare
+with the same evaluator settings using `ds4-eval --suite hard --ple FILE`.
+The [completed comparison](../speed-bench/qwen38-iq2-quality.md) records
+36/50 hard-suite passes, the BF16 probability drift, a 64K-context memory
+sweep and an ordinary/MTP greedy parity check. IQ2 is a candidate for a
+64 GB memory budget, pending validation on that hardware.
+
 ## Build
 
 ```sh
@@ -191,3 +232,32 @@ make -C gguf-tools quality-score
 gguf-tools/quality-testing/score_official MODEL.gguf gguf-tools/quality-testing/data/manifest.tsv /tmp/model.tsv 4096
 python3 gguf-tools/quality-testing/compare_scores.py /tmp/old.tsv /tmp/new.tsv
 ```
+
+## Qwen3.8 Flash Next
+
+`qwen4_exp_convert.py` wraps llama.cpp's `convert_hf_to_gguf.py` and writes
+the `qwen4exp` schema DS4 loads, including the MTP block as `blk.<n>.nextn.*`.
+It needs a llama.cpp master checkout (b96806d96 or newer, found through
+`--llama-cpp` or `$LLAMA_CPP`) and a Python with torch, safetensors and
+transformers, such as llama.cpp's own venv:
+
+```sh
+python gguf-tools/qwen4_exp_convert.py --src /path/to/Qwen3.8-Flash-Next \
+  --out Qwen3.8-Flash-Next-Q8.gguf --outtype q8_0
+python gguf-tools/qwen4_exp_convert.py --src /path/to/Qwen3.8-Flash-Next \
+  --out Qwen3.8-Flash-Next-MXFP4.gguf --outtype q8_0 --experts mxfp4
+```
+
+Options: `--outtype q8_0|f32` (dense projections), `--experts
+q8_0|mxfp4|q4_k|f32` (routed experts; `--experts-down` picks the 640-wide down
+projection type when the gate/up type needs 256-wide rows), `--ngram
+q8_0|mxfp4|q4_0|f32` (the per-layer n-gram table), `--hc-type f16|f32|q8_0`
+(hyper-connection mixers), `--indexer bf16|f16|q8_0|f32` (the QSA indexer
+projections, kept at the released BF16 by default), `--no-mtp` and
+`--dry-run`. Norms, conv kernels, `ssm_a`, dt biases and the routers stay F32.
+`gen_qwen4_unicode.py` regenerates `ds4_qwen4_unicode.inc` for the `qwen35`
+pre-tokenizer from a current `regex` release.
+
+`make test-qwen4-kernels` runs the Metal kernel tests and
+`make test-qwen4-vision` checks the vision tower against the HF implementation
+(`tests/qwen4_vision_ref.py`).

@@ -1,0 +1,1 @@
+A safe format for storing a model checkpoint header should prioritize **integrity**, **versioning**, **metadata clarity**, and

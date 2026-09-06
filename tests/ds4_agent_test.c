@@ -519,15 +519,16 @@ static void test_footer_only_updates(void) {
 }
 
 static void test_tool_contracts(void) {
-    for (int glm = 0; glm < 2; glm++) {
+    for (int glm = 0; glm < 3; glm++) {
         for (int vision = 0; vision < 2; vision++) {
-            char *prompt = glm ? agent_build_glm_tools_prompt(false, vision) :
+            char *prompt = glm == 2 ? agent_build_qwen_tools_prompt(false, vision) :
+                           glm ? agent_build_glm_tools_prompt(false, vision) :
                                  agent_build_dsml_tools_prompt(false, vision);
             AGENT_TEST_ASSERT((strstr(prompt, "view_image") != NULL) == vision);
             AGENT_TEST_ASSERT(strstr(prompt, "POSIX extended") && strstr(prompt, "128 KiB"));
             AGENT_TEST_ASSERT(strstr(prompt, "&amp;lt;/"));
             char name[64];
-            snprintf(name, sizeof(name), "prompt-%s-%d.txt", glm ? "glm" : "dsml", vision);
+            snprintf(name, sizeof(name), "prompt-%s-%d.txt", glm == 2 ? "qwen" : glm ? "glm" : "dsml", vision);
             test_fixture(name, prompt, strlen(prompt));
             free(prompt);
         }
@@ -595,6 +596,12 @@ static void test_observation_error_is_not_context_exhaustion(void) {
 int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--terminal-driver")) return test_terminal_driver();
     if (argc == 3 && !strcmp(argv[1], "--terminal-fixtures")) test_output_dir = argv[2];
+    char *options[] = {"ds4-agent", "--model", "qwen.gguf", "--ple", "ple.gguf",
+                    "--vision", "mmproj.gguf", "--non-interactive", "-p", "test"};
+    agent_config cfg = parse_options((int)(sizeof(options) / sizeof(options[0])), options);
+    AGENT_TEST_ASSERT(cfg.engine.ple_path && !strcmp(cfg.engine.ple_path, "ple.gguf"));
+    AGENT_TEST_ASSERT(cfg.engine.vision_path && !strcmp(cfg.engine.vision_path, "mmproj.gguf"));
+    AGENT_TEST_ASSERT(cfg.engine.model_path && !strcmp(cfg.engine.model_path, "qwen.gguf"));
     ds4_agent_unit_tests_run();
     test_observation_error_is_not_context_exhaustion();
     test_atomic_file_tools();

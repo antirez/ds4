@@ -1,0 +1,176 @@
+{
+  "revision": "3bf8552ee49a4290126be9d503e72f96bff494bc",
+  "encoder": "/Users/ifioravanti/github/ds4/gguf/mmproj-Qwen3.8-Flash-Next-Q8_0.gguf",
+  "encoder_sha256": "b2e9b5e4a44c107f8867e67dbf09b607fd99ae33c1a97a60a6720aeb252a9dad",
+  "runs": [
+    {
+      "model": "iq2",
+      "command": [
+        "/Users/ifioravanti/github/ds4/ds4-server",
+        "-m",
+        "/Users/ifioravanti/models/qwen38-iq2-imatrix/Qwen3.8-Flash-Next-IQ2XXSImatrix-MXFP4Down-MTP.gguf",
+        "--ple",
+        "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf",
+        "--vision",
+        "/Users/ifioravanti/github/ds4/gguf/mmproj-Qwen3.8-Flash-Next-Q8_0.gguf",
+        "--metal",
+        "--ctx",
+        "8192",
+        "--prefill-chunk",
+        "1024",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "18938"
+      ],
+      "started": 1788733344.69397,
+      "returncode": 0,
+      "cases": [
+        {
+          "name": "diagram",
+          "pass": true,
+          "missing": [],
+          "forbidden": [],
+          "provider": null,
+          "answer": "Based on the diagram provided:\n\nThe three box labels from left to right are:\n1.  **INPUT**\n2.  **ENCODER**\n3.  **SUMMARY**\n\nThe box that immediately follows ENCODER is **SUMMARY**."
+        },
+        {
+          "name": "ocr",
+          "pass": true,
+          "missing": [],
+          "forbidden": [],
+          "provider": null,
+          "answer": "Venue: NORTH HARBOR\nTrain: 482\nGate: C7\nDeparture: 19:45\nSeat: 14A\nAccess code: MINT-731"
+        },
+        {
+          "name": "spatial",
+          "pass": true,
+          "missing": [],
+          "forbidden": [],
+          "provider": null,
+          "answer": "Based on the provided image, here are the three colored shapes and their relative positions:\n\n1.  **Blue Circle**\n    *   Located in the **upper-left** portion of the image.\n    *   It is to the **left** of the Red Triangle.\n    *   It is **above** and slightly to the **left** of the Green Square.\n\n2.  **Red Triangle**\n    *   Located in the **upper-right** portion of the image.\n    *   It is to the **right** of the Blue Circle.\n    *   It is **above** and slightly to the **right** of the Green Square.\n\n3.  **Green Square**\n    *   Located in the **lower-center** portion of the image.\n    *   It is **below** both the Blue Circle and the Red Triangle.\n    *   It is positioned **between** the Blue Circle (to its upper-left) and the Red Triangle (to its upper-right).\n\nIn summary:\n- The Blue Circle and Red Triangle are positioned side-by-side at the top.\n- The Green Square is centered below them, forming a triangular arrangement with the other two shapes."
+        },
+        {
+          "name": "screenshot",
+          "pass": true,
+          "missing": [],
+          "forbidden": [],
+          "provider": null,
+          "answer": "Based on the screenshot:\n\n- **Selected file:** `deploy.sh` (highlighted in yellow/orange in the FILES sidebar)\n- **Build status:** FAILED (shown in red text: \"Build 42: FAILED\")\n- **Exact error:** `error: missing CUDA_HOME`\n- **Exit status:** `exit status 2`"
+        },
+        {
+          "name": "photo",
+          "pass": true,
+          "missing": [],
+          "forbidden": [],
+          "provider": null,
+          "answer": "The main subject of this photograph is **Planet Earth**, viewed from space. It is a full-globe image, often referred to as the \u201cBlue Marble,\u201d showcasing the planet\u2019s oceans, continents, and swirling cloud patterns against the blackness of space.\n\nThe most clearly visible continent in this image is **Africa**. Its distinctive shape \u2014 including the Horn of Africa, the Sahel region, and the southern tip \u2014 is prominently displayed in the center-left portion of the globe.\n\nThe large island off its southeastern coast is **Madagascar**. It is clearly visible as a long, narrow landmass situated in the Indian Ocean, separated from the African mainland by the Mozambique Channel.\n\n---\n\n**Summary:**\n- **Main Subject**: Planet Earth (viewed from space)\n- **Most Clearly Visible Continent**: Africa\n- **Large Island Off Southeastern Coast**: Madagascar\n\nThis iconic view was famously captured by the Apollo 17 crew in 1972, though similar images have been taken by satellites since then. The clarity of Africa and Madagascar makes them easily identifiable landmarks in this global perspective."
+        },
+        {
+          "name": "unrelated",
+          "pass": true,
+          "missing": [],
+          "forbidden": [],
+          "provider": null,
+          "answer": "No. The image shows three labeled geometric shapes: a blue circle, a red triangle, and a green square."
+        }
+      ],
+      "passed": 6,
+      "finished": 1788733371.069199
+    },
+    {
+      "model": "q4k",
+      "command": [
+        "/Users/ifioravanti/github/ds4/ds4-server",
+        "-m",
+        "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+        "--ple",
+        "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf",
+        "--vision",
+        "/Users/ifioravanti/github/ds4/gguf/mmproj-Qwen3.8-Flash-Next-Q8_0.gguf",
+        "--metal",
+        "--ctx",
+        "8192",
+        "--prefill-chunk",
+        "1024",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "18938"
+      ],
+      "started": 1788733371.069612,
+      "returncode": 0,
+      "cases": [
+        {
+          "name": "diagram",
+          "pass": true,
+          "missing": [],
+          "forbidden": [],
+          "provider": null,
+          "answer": "Based on the provided diagram, here is the information you requested:\n\n-   The three box labels from left to right are: **INPUT**, **ENCODER**, and **SUMMARY**.\n-   The box that immediately follows ENCODER is **SUMMARY**."
+        },
+        {
+          "name": "ocr",
+          "pass": true,
+          "missing": [],
+          "forbidden": [],
+          "provider": null,
+          "answer": "Based on the image provided, here are the transcribed details:\n\n*   **Venue:** NORTH HARBOR\n*   **Train:** 482\n*   **Gate:** C7\n*   **Departure:** 19:45\n*   **Seat:** 14A\n*   **Access Code:** MINT-731"
+        },
+        {
+          "name": "spatial",
+          "pass": true,
+          "missing": [],
+          "forbidden": [],
+          "provider": null,
+          "answer": "Based on the image provided, here are the three colored shapes and their relative positions:\n\n1.  **Blue Circle**: Located in the **top-left** portion of the image.\n2.  **Red Triangle**: Located in the **top-right** portion of the image.\n3.  **Green Square**: Located in the **bottom-center** portion of the image.\n\n---\n\n### Relative Positions:\n\n- The **Blue Circle** is to the **left** of the Red Triangle and **above** the Green Square.\n- The **Red Triangle** is to the **right** of the Blue Circle and **above** the Green Square.\n- The **Green Square** is **below** both the Blue Circle and the Red Triangle, and centered horizontally between them.\n\nIn summary:\n- Top row: Blue Circle (left), Red Triangle (right)\n- Bottom row: Green Square (centered below the top two)"
+        },
+        {
+          "name": "screenshot",
+          "pass": true,
+          "missing": [],
+          "forbidden": [],
+          "provider": null,
+          "answer": "Based on the screenshot provided:\n\n1.  **Selected File:** The file `deploy.sh` is selected (highlighted in yellow in the left sidebar).\n2.  **Build Status:** The build **failed** (indicated by the red text \"Build 42: FAILED\" in the terminal).\n3.  **Exact Error:** The error message shown is `error: missing CUDA_HOME`.\n4.  **Exit Status:** The exit status displayed is `exit status 2`."
+        },
+        {
+          "name": "photo",
+          "pass": true,
+          "missing": [],
+          "forbidden": [],
+          "provider": null,
+          "answer": "The main subject of this photograph is the planet **Earth**, viewed from space. The image prominently features the African continent, with its distinctive shape and reddish-brown terrain clearly visible against the blue oceans and swirling white clouds.\n\nThe most clearly visible continent is **Africa**.\n\nThe large island off its southeastern coast is **Madagascar**. It is easily identifiable as the elongated landmass situated in the Indian Ocean, separated from the mainland by the Mozambique Channel."
+        },
+        {
+          "name": "unrelated",
+          "pass": true,
+          "missing": [],
+          "forbidden": [],
+          "provider": null,
+          "answer": "No. The image shows three labeled geometric shapes: a blue circle, a red triangle, and a green square."
+        }
+      ],
+      "passed": 6,
+      "finished": 1788733414.885879
+    }
+  ],
+  "file_sha256": {
+    "ds4-server": "d5fd5dfae1a716dd10e2057af6fc90d75268faa28836c72e3aff2540a58e9580",
+    "tests/run_glm53_vision_quality.py": "849a97fe0f1ae37278f9306a64759baf5b6b114d9457905e3dc355fcbb13723b",
+    "tests/vision-fixtures/glm53/README.md": "7ba16d74fa2b5c56b12ae30587e8492128a39ada615ee7de885ba89ecccda9a8",
+    "tests/vision-fixtures/glm53/cases.json": "b95deec8bde6640a4828b76391f656f40e8eac098f0dff5396bda3f3df10bcea",
+    "tests/vision-fixtures/glm53/diagram.png": "ed423c191b553ff2e6fea5c01e0df7d0f8766d254a2df00b0d8b8d32ed54be45",
+    "tests/vision-fixtures/glm53/earth.jpg": "a48278513a38768ff92247972e60bc873eb361a8527cb8686a3e19c3ae1bdf9d",
+    "tests/vision-fixtures/glm53/screenshot.png": "28d2f8b7860e520df26542041e263c9cf641e9c5bff0652e67b186e55a6b073c",
+    "tests/vision-fixtures/glm53/spatial.png": "515542d4bc1bc9b1922ed417757eed225be4c1486fdc292ad373ebf24f0e42f9",
+    "tests/vision-fixtures/glm53/text.png": "3527da96122fd75d3b7cff45cebf8ad0ce27b5971d9b460d62e2ceb59b833921"
+  },
+  "settings": {
+    "temperature": 0,
+    "reasoning_effort": "none",
+    "max_tokens": 320,
+    "max_image_tokens": 1024,
+    "mtp": false,
+    "retries": 0
+  }
+}

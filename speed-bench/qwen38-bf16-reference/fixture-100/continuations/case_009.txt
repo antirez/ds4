@@ -1,0 +1,1 @@
+Here are three critical invariants for a tokenizer special-token table, designed to ensure correctness, determinism, and safety during

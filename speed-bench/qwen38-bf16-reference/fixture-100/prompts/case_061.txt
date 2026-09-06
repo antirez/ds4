@@ -1,0 +1,1 @@
+Explain why sorted arrays make membership tests faster with binary search.

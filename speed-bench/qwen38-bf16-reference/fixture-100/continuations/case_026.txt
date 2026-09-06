@@ -1,0 +1,3 @@
+Here is a brief, structured plan for testing long-context prompt chunking strategies.
+
+### 1. Define Objectives

@@ -8,6 +8,9 @@ NATIVE_CPU_FLAG ?= -march=native
 endif
 SAMPLING_TEST := tests/test_sampling
 GLM53_KDA_TEST := tests/test_glm53_kda
+QWEN4_KERNEL_TEST := tests/test_qwen4_kernels
+QWEN4_HOST_TEST := tests/test_qwen4_host
+QWEN4_SPEC_TEST := tests/test_qwen4_spec
 GLM53_KDA_ROCM_TEST := tests/test_glm53_kda_rocm
 
 DEBUG_FLAGS ?= -g
@@ -85,6 +88,9 @@ help:
 	@echo "  make metal-prefill-variant-bench  Build the balanced Metal prefill variant benchmark"
 	@echo "  make check-mxfp4-half-lut  Verify the checked-in MXFP4 half LUT matches the generator"
 	@echo "  make test-mxfp4-metal  Check the MXFP4 half LUT, then run Metal MXFP4 exactness tests"
+	@echo "  make test-qwen4-kernels  Run the Qwen3.8 Metal kernel tests"
+	@echo "  make test-qwen4-vision  Compare the Qwen3.8 vision tower with HF (set DS4_QWEN4_SNAPSHOT, DS4_QWEN4_MMPROJ, DS4_QWEN4_IMAGE)"
+	@echo "  make test-qwen4-host   Run the campaign-branch host/spec tests for the superseded native qwen4 engine"
 	@echo "  make dspark-verify-depth  Run DSpark speculative verification smoke if support GGUF is present"
 	@echo "  make mtp-verify-depth  Run legacy MTP speculative verification smoke if MTP GGUF is present"
 	@echo "  make clean        Remove build outputs"
@@ -436,6 +442,54 @@ endif
 test-glm53-kda: $(GLM53_KDA_TEST)
 	./$(GLM53_KDA_TEST)
 
+ifeq ($(UNAME_S),Darwin)
+tests/test_qwen4_kernels.o: tests/test_qwen4_kernels.c ds4_gpu.h ds4.h
+	$(CC) $(CFLAGS) -I. -c -o $@ tests/test_qwen4_kernels.c
+
+$(QWEN4_KERNEL_TEST): tests/test_qwen4_kernels.o ds4_metal.o ds4_image.o
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+tests/test_qwen4_vision.o: tests/test_qwen4_vision.c ds4.h
+	$(CC) $(CFLAGS) -I. -c -o $@ tests/test_qwen4_vision.c
+
+tests/test_qwen4_vision: tests/test_qwen4_vision.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+endif
+
+.PHONY: test-qwen4-kernels test-qwen4-vision
+test-qwen4-kernels: $(QWEN4_KERNEL_TEST)
+	./$(QWEN4_KERNEL_TEST)
+
+# DS4_QWEN4_SNAPSHOT=<HF checkpoint dir> DS4_QWEN4_MMPROJ=<mmproj.gguf> DS4_QWEN4_IMAGE=<image>
+test-qwen4-vision: tests/test_qwen4_vision
+	@test -n "$(DS4_QWEN4_SNAPSHOT)" -a -n "$(DS4_QWEN4_MMPROJ)" -a -n "$(DS4_QWEN4_IMAGE)" || \
+	  { echo "set DS4_QWEN4_SNAPSHOT, DS4_QWEN4_MMPROJ and DS4_QWEN4_IMAGE"; exit 1; }
+	python3 tests/qwen4_vision_ref.py --snapshot "$(DS4_QWEN4_SNAPSHOT)" --mmproj "$(DS4_QWEN4_MMPROJ)" --image "$(DS4_QWEN4_IMAGE)"
+
+# Campaign-branch tests for the superseded native qwen4 engine (kept for
+# reference; ds4_qwen4.c is not part of the shipped build). The Metal variant
+# (tests/test_qwen4_metal.c) does not compile against the adopted qwen4-exp
+# ds4_gpu.h API and is intentionally left without a target.
+ds4_qwen4.o: ds4_qwen4.c ds4_qwen4.h
+	$(CC) $(CFLAGS) -c -o $@ ds4_qwen4.c
+
+tests/test_qwen4_host.o: tests/test_qwen4_host.c ds4_qwen4.h ds4_image.h
+	$(CC) $(CFLAGS) -I. -c -o $@ tests/test_qwen4_host.c
+
+$(QWEN4_HOST_TEST): tests/test_qwen4_host.o ds4_qwen4.o ds4_image.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+tests/test_qwen4_spec.o: tests/test_qwen4_spec.c ds4_qwen4.h
+	$(CC) $(CFLAGS) -I. -c -o $@ tests/test_qwen4_spec.c
+
+$(QWEN4_SPEC_TEST): tests/test_qwen4_spec.o ds4_qwen4.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+.PHONY: test-qwen4-host
+test-qwen4-host: $(QWEN4_HOST_TEST) $(QWEN4_SPEC_TEST)
+	./$(QWEN4_HOST_TEST)
+	./$(QWEN4_SPEC_TEST)
+
 tests/test_glm53_kda_rocm.o: tests/test_glm53_kda.c ds4_gpu.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
 
@@ -700,13 +754,15 @@ test-frontends: ds4_test ds4_agent_test
 	./ds4_test --server
 	./ds4_agent_test
 
+# Select model-compatible groups when checkpoint-specific fixtures are unavailable.
+# Empty DS4_TEST_ARGS retains the complete default suite.
 test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test test-session-state test-linux-memory \
 	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
 	tests/test_deepseek4_vision_image tests/test_prompt_prefix $(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
 	./ds4-eval --validate-cases
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
-	./ds4_test
+	./ds4_test $(DS4_TEST_ARGS)
 	./tests/test_layer_pack
 	./tests/test_engine_mgpu_placement
 	./tests/test_gpu_args
@@ -724,7 +780,6 @@ dspark-verify-depth: ds4_test
 	@if [ ! -f "$(DS4_TEST_MODEL)" ]; then \
 		echo "dspark-verify-depth: skipped, missing model $(DS4_TEST_MODEL)"; \
 	elif [ ! -f "$(DS4_DSPARK_SUPPORT)" ]; then \
-		echo "dspark-verify-depth: skipped, missing DSpark support $(DS4_DSPARK_SUPPORT)"; \
 		echo "dspark-verify-depth: run ./download_model.sh ds4f-dspark or set DS4_DSPARK_SUPPORT=FILE"; \
 	else \
 		DS4_TEST_MODEL="$(DS4_TEST_MODEL)" DS4_TEST_DSPARK="$(DS4_DSPARK_SUPPORT)" ./ds4_test --dspark-verify-depth; \
@@ -770,3 +825,5 @@ clean:
 	rm -f tests/test_session_state tests/test_session_state_gpu tests/test_tp_commands
 	rm -f tests/test_metal_tp_spec
 	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_metal_moe_prefill tests/test_metal_dense_mpp tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_deepseek4_vision_image tests/test_prompt_prefix tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f tests/test_qwen4_kernels tests/test_qwen4_vision
+	rm -f $(QWEN4_HOST_TEST) $(QWEN4_SPEC_TEST)

@@ -1,0 +1,461 @@
+{
+  "schema_version": 1,
+  "complete": true,
+  "hardware": "Apple M3 Ultra, 512 GiB, Metal",
+  "rebase": {
+    "branch": "qwen3.8-flash-next",
+    "head_before": "1bf4842f3a12b9df33c5477d0df5e407f8770e63",
+    "remote_before": "1bf4842f3a12b9df33c5477d0df5e407f8770e63",
+    "main": "9ab705347c1775e7599ede7eb81a6255ec7dccb5",
+    "merge_base": "b0a147a7fba6d1a104d047d5a140e9bb4bfc13cd",
+    "backup_ref": "backup/qwen38-before-main-rebase-1bf4842",
+    "runtime_revision": "927d8451dffa820c827529af8041da5744d84903",
+    "expected_merge_tree": "4660b6a1040c829e8e5b88a57b6e5e699387679c",
+    "expected_conflicted_paths": [
+      ".gitignore",
+      "Makefile",
+      "README.md",
+      "ds4.c",
+      "gguf-tools/quality-testing/score_official.c"
+    ],
+    "all_clean_merge_paths_exact": true,
+    "ds4_exact_independent_resolution": true,
+    "duplicate_commits_dropped": [
+      "9d7e322",
+      "5acdc2a",
+      "af11362"
+    ]
+  },
+  "frozen": {
+    "revision": "927d8451dffa820c827529af8041da5744d84903",
+    "command": [
+      "cc",
+      "-o",
+      "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round2/rebase/frozen/ds4-bench-diag",
+      "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp/bench-262k/teacher-forced/driver.o",
+      "/Users/ifioravanti/github/ds4/ds4_help.o",
+      "/Users/ifioravanti/github/ds4/ds4_gpu_args.o",
+      "/Users/ifioravanti/github/ds4/ds4.o",
+      "/Users/ifioravanti/github/ds4/ds4_metal.o",
+      "/Users/ifioravanti/github/ds4/ds4_image.o",
+      "/Users/ifioravanti/github/ds4/ds4_distributed.o",
+      "/Users/ifioravanti/github/ds4/ds4_tp.o",
+      "/Users/ifioravanti/github/ds4/ds4_ssd.o",
+      "/Users/ifioravanti/github/ds4/ds4_layer_pack.o",
+      "-lm",
+      "-pthread",
+      "-framework",
+      "Foundation",
+      "-framework",
+      "Metal"
+    ],
+    "source_hashes": {
+      "ds4.c": "eec87c4e311c2c2cba3d4f327670bbb20a10dc4ee1ead815d0a681a5d4476341",
+      "ds4.h": "c12fee863ae93a1095dd30f3f8e1c7eb929fa23176762508d0bfe91b25c8c62f",
+      "ds4_metal.m": "37e8357b3a769e673f9135c9a7487c7e46dae2aba9bcbf51e75a6fddc681bbb8",
+      "metal/qwen4.metal": "afe6619cb55a847acf5eb5d48392a275cdab84d019d2d812aa8819fdfe6e761b",
+      "metal/moe.metal": "ffec4f2b07c8581e7b85e31ca64f10dad895a7b77b1c0c819d41a805753a782f"
+    },
+    "files": {
+      "ds4-bench-diag": "d1f0bc8a94cf38150af1267b01a12f48c7081d3d5ca2b569239212d5a50f5c67",
+      "moe.metal": "ffec4f2b07c8581e7b85e31ca64f10dad895a7b77b1c0c819d41a805753a782f",
+      "ds4-bench": "c20a5399d9db9072adaac7bb15e6bc3334556b6316ab692b9c0ebb364670a33c",
+      "qwen4.metal": "afe6619cb55a847acf5eb5d48392a275cdab84d019d2d812aa8819fdfe6e761b",
+      "ds4": "a6f229c327621e42ca8eb99d850d56c021a3b40801372f85b0b9fb063fab5a09"
+    }
+  },
+  "model": "Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+  "ple": "Qwen3.8-Flash-Next-PLE-Q4_1.gguf",
+  "focused_checks": [
+    {
+      "command": [
+        "./ds4_test",
+        "--server"
+      ],
+      "returncode": 0,
+      "wall_s": 0.31292662501800805,
+      "log": "OUT/qwen38-mtp-round2/rebase/check-00.log"
+    },
+    {
+      "command": [
+        "./ds4_agent_test"
+      ],
+      "returncode": 0,
+      "wall_s": 0.20089012500829995,
+      "log": "OUT/qwen38-mtp-round2/rebase/check-01.log"
+    },
+    {
+      "command": [
+        "./ds4-eval",
+        "--validate-cases"
+      ],
+      "returncode": 0,
+      "wall_s": 0.18344737496227026,
+      "log": "OUT/qwen38-mtp-round2/rebase/check-02.log"
+    },
+    {
+      "command": [
+        "./ds4-eval",
+        "--self-test-extractors"
+      ],
+      "returncode": 0,
+      "wall_s": 0.010884499992243946,
+      "log": "OUT/qwen38-mtp-round2/rebase/check-03.log"
+    },
+    {
+      "command": [
+        "./tests/test_qwen4_spec"
+      ],
+      "returncode": 0,
+      "wall_s": 0.15410795802017674,
+      "log": "OUT/qwen38-mtp-round2/rebase/check-04.log"
+    },
+    {
+      "command": [
+        "./tests/test_session_state_gpu"
+      ],
+      "returncode": 0,
+      "wall_s": 2.896165582991671,
+      "log": "OUT/qwen38-mtp-round2/rebase/check-05.log"
+    },
+    {
+      "command": [
+        "./tests/test_qwen4_kernels"
+      ],
+      "returncode": 0,
+      "wall_s": 5.7145132920122705,
+      "log": "OUT/qwen38-mtp-round2/rebase/check-06.log"
+    },
+    {
+      "command": [
+        "./tests/test_glm53_kda"
+      ],
+      "returncode": 0,
+      "wall_s": 0.38819049997255206,
+      "log": "OUT/qwen38-mtp-round2/rebase/check-07.log"
+    },
+    {
+      "command": [
+        "./tests/test_mxfp4_metal"
+      ],
+      "returncode": 0,
+      "wall_s": 0.36364024999784306,
+      "log": "OUT/qwen38-mtp-round2/rebase/check-08.log"
+    }
+  ],
+  "cpu_build": "CPU build exit=0 elapsed=5.8s log=/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round2/rebase/cpu-build.log",
+  "cpu_cli_checks": [
+    {
+      "command": "./ds4 --help",
+      "exit": 0
+    },
+    {
+      "command": "./ds4-server --help",
+      "exit": 0
+    },
+    {
+      "command": "./ds4-bench --help",
+      "exit": 0
+    },
+    {
+      "command": "./ds4-eval --help",
+      "exit": 0
+    },
+    {
+      "command": "./ds4-agent --help",
+      "exit": 0
+    },
+    {
+      "command": "./ds4-eval --validate-cases",
+      "exit": 0
+    },
+    {
+      "command": "./ds4-eval --self-test-extractors",
+      "exit": 0
+    }
+  ],
+  "cpu_tests": [
+    {
+      "command": "make -j8 test-session-state test-linux-memory test-quality-api tests/test_prompt_prefix tests/test_gpu_args",
+      "exit": 0,
+      "elapsed_seconds": 5.049
+    },
+    {
+      "command": "./tests/test_prompt_prefix",
+      "exit": 0,
+      "elapsed_seconds": 0.269
+    },
+    {
+      "command": "./tests/test_gpu_args",
+      "exit": 0,
+      "elapsed_seconds": 0.196
+    }
+  ],
+  "teacher_forced": {
+    "contexts": [
+      4096,
+      8192
+    ],
+    "generated_tokens_per_frontier": 128,
+    "vocabulary": 248320,
+    "reference_revision": "bd9cfbc",
+    "rows": 256,
+    "exact": 256,
+    "top1_matches": 256,
+    "max_abs": 0.0
+  },
+  "speed": {
+    "rows": [
+      {
+        "context": 4096,
+        "prefill_before": 1163.56,
+        "prefill_after": 1159.79,
+        "decode_before": 48.64,
+        "decode_after": 48.91
+      },
+      {
+        "context": 8192,
+        "prefill_before": 1158.13,
+        "prefill_after": 1160.38,
+        "decode_before": 48.69,
+        "decode_after": 48.71
+      }
+    ],
+    "frontier_dump_count": 2,
+    "all_frontier_dumps_exact": true,
+    "greedy_text_exact": true,
+    "greedy_text_sha256": {
+      "4096": "ff3cdb70b36a215e5beb37895fabfc46fbeb39f87b193e40679bafa5768f399b",
+      "8192": "a7995d1e7f326f257a3acda2426cfb3efd9c7a3f6381ff6891952d30ac1db254"
+    }
+  },
+  "mtp": {
+    "repeats": 2,
+    "ctx": 8192,
+    "summary": {
+      "hamlet": {
+        "median_tps": {
+          "baseline": 60.935,
+          "candidate": 60.724999999999994
+        },
+        "range_tps": {
+          "baseline": [
+            60.86,
+            61.01
+          ],
+          "candidate": [
+            60.72,
+            60.73
+          ]
+        },
+        "speedup": 0.9965537047673749,
+        "all_outputs_identical": true,
+        "acceptance_identical": true
+      },
+      "fibonacci": {
+        "median_tps": {
+          "baseline": 73.88,
+          "candidate": 73.9
+        },
+        "range_tps": {
+          "baseline": [
+            73.74,
+            74.02
+          ],
+          "candidate": [
+            73.84,
+            73.96
+          ]
+        },
+        "speedup": 1.0002707092582568,
+        "all_outputs_identical": true,
+        "acceptance_identical": true
+      },
+      "explanation": {
+        "median_tps": {
+          "baseline": 65.63499999999999,
+          "candidate": 65.5
+        },
+        "range_tps": {
+          "baseline": [
+            65.61,
+            65.66
+          ],
+          "candidate": [
+            65.27,
+            65.73
+          ]
+        },
+        "speedup": 0.9979431705644856,
+        "all_outputs_identical": true,
+        "acceptance_identical": false
+      }
+    },
+    "records": [
+      {
+        "config": "baseline",
+        "case": "hamlet",
+        "repeat": -1,
+        "warmup": true,
+        "decode_tps": 61.25,
+        "cycles": 56,
+        "accepted": 37,
+        "output_sha256": "d11f9ce3df9ff2e1ea9a0c520403a453e97e2f32421d1196de26377b865da0b7"
+      },
+      {
+        "config": "candidate",
+        "case": "hamlet",
+        "repeat": -1,
+        "warmup": true,
+        "decode_tps": 60.91,
+        "cycles": 56,
+        "accepted": 37,
+        "output_sha256": "d11f9ce3df9ff2e1ea9a0c520403a453e97e2f32421d1196de26377b865da0b7"
+      },
+      {
+        "config": "baseline",
+        "case": "hamlet",
+        "repeat": 0,
+        "warmup": false,
+        "decode_tps": 60.86,
+        "cycles": 56,
+        "accepted": 37,
+        "output_sha256": "d11f9ce3df9ff2e1ea9a0c520403a453e97e2f32421d1196de26377b865da0b7"
+      },
+      {
+        "config": "candidate",
+        "case": "hamlet",
+        "repeat": 0,
+        "warmup": false,
+        "decode_tps": 60.72,
+        "cycles": 56,
+        "accepted": 37,
+        "output_sha256": "d11f9ce3df9ff2e1ea9a0c520403a453e97e2f32421d1196de26377b865da0b7"
+      },
+      {
+        "config": "baseline",
+        "case": "fibonacci",
+        "repeat": 0,
+        "warmup": false,
+        "decode_tps": 74.02,
+        "cycles": 201,
+        "accepted": 198,
+        "output_sha256": "10a592df12556e0be8696c72527fcca7a79dde1d676b6a8753004e6e82945954"
+      },
+      {
+        "config": "candidate",
+        "case": "fibonacci",
+        "repeat": 0,
+        "warmup": false,
+        "decode_tps": 73.96,
+        "cycles": 201,
+        "accepted": 198,
+        "output_sha256": "10a592df12556e0be8696c72527fcca7a79dde1d676b6a8753004e6e82945954"
+      },
+      {
+        "config": "baseline",
+        "case": "explanation",
+        "repeat": 0,
+        "warmup": false,
+        "decode_tps": 65.66,
+        "cycles": 145,
+        "accepted": 110,
+        "output_sha256": "3e24cf4106eba2c5e501a6987e719a5e98756a6c43aaf620f89592db7c7154fc"
+      },
+      {
+        "config": "candidate",
+        "case": "explanation",
+        "repeat": 0,
+        "warmup": false,
+        "decode_tps": 65.27,
+        "cycles": 144,
+        "accepted": 110,
+        "output_sha256": "3e24cf4106eba2c5e501a6987e719a5e98756a6c43aaf620f89592db7c7154fc"
+      },
+      {
+        "config": "candidate",
+        "case": "hamlet",
+        "repeat": 1,
+        "warmup": false,
+        "decode_tps": 60.73,
+        "cycles": 56,
+        "accepted": 37,
+        "output_sha256": "d11f9ce3df9ff2e1ea9a0c520403a453e97e2f32421d1196de26377b865da0b7"
+      },
+      {
+        "config": "baseline",
+        "case": "hamlet",
+        "repeat": 1,
+        "warmup": false,
+        "decode_tps": 61.01,
+        "cycles": 56,
+        "accepted": 37,
+        "output_sha256": "d11f9ce3df9ff2e1ea9a0c520403a453e97e2f32421d1196de26377b865da0b7"
+      },
+      {
+        "config": "candidate",
+        "case": "fibonacci",
+        "repeat": 1,
+        "warmup": false,
+        "decode_tps": 73.84,
+        "cycles": 201,
+        "accepted": 198,
+        "output_sha256": "10a592df12556e0be8696c72527fcca7a79dde1d676b6a8753004e6e82945954"
+      },
+      {
+        "config": "baseline",
+        "case": "fibonacci",
+        "repeat": 1,
+        "warmup": false,
+        "decode_tps": 73.74,
+        "cycles": 201,
+        "accepted": 198,
+        "output_sha256": "10a592df12556e0be8696c72527fcca7a79dde1d676b6a8753004e6e82945954"
+      },
+      {
+        "config": "candidate",
+        "case": "explanation",
+        "repeat": 1,
+        "warmup": false,
+        "decode_tps": 65.73,
+        "cycles": 144,
+        "accepted": 110,
+        "output_sha256": "3e24cf4106eba2c5e501a6987e719a5e98756a6c43aaf620f89592db7c7154fc"
+      },
+      {
+        "config": "baseline",
+        "case": "explanation",
+        "repeat": 1,
+        "warmup": false,
+        "decode_tps": 65.61,
+        "cycles": 145,
+        "accepted": 110,
+        "output_sha256": "3e24cf4106eba2c5e501a6987e719a5e98756a6c43aaf620f89592db7c7154fc"
+      }
+    ]
+  },
+  "mtp_tail": {
+    "events": 146,
+    "earlier_events_exact": true,
+    "baseline_final": "ds4: spec pos 303 token 2261 draft 17822 reject",
+    "rebased_final": "ds4: spec pos 303 token 2261 plain",
+    "output_exact": true,
+    "output_sha256": "3e24cf4106eba2c5e501a6987e719a5e98756a6c43aaf620f89592db7c7154fc",
+    "cause": "main 233eeb8 clamps accepted_cap to max_tokens, using plain T1 at the final one-token budget"
+  },
+  "sessions": {
+    "status": "passed",
+    "observations": 32,
+    "vocab": 248320,
+    "prefix": 257,
+    "chunk": 256,
+    "ctx": 8192,
+    "canonical_rows": 4,
+    "rewind_cases": 4
+  },
+  "limits": [
+    "No new 262K sweep after rebase; prior 262K measurements remain pre-rebase evidence.",
+    "No CUDA, ROCm, physical two-rank TP, vision-model, or M5 hardware QA in this rebase check.",
+    "MTP comparison covers greedy text and acceptance decisions, not every full predictor logit vector."
+  ]
+}

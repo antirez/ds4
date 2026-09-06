@@ -1,0 +1,1 @@
+To diagnose why generation slows down at long contexts, you need to isolate whether the bottleneck is in the **prefill**

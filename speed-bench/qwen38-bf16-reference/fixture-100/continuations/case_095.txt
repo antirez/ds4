@@ -1,0 +1,9 @@
+2x<|im_end|>
+<|endoftext|><|im_start|><|im_start|><|im_end|>
+<|im_start|>user<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+2x<|im_end|>

@@ -57,6 +57,20 @@ GLM's draft block is already in its main GGUF:
 The current GLM cycle commits up to two tokens. No external support file is
 needed, and ordinary decode remains the default.
 
+## Qwen3.8: built-in MTP
+
+The `qwen38-q4k` download contains one combined main/MTP GGUF and a required
+external PLE sidecar. There is no separate non-MTP model download:
+
+```sh
+./download_model.sh qwen38-q4k
+./ds4 --ple gguf/Qwen3.8-Flash-Next-PLE-Q4_1.gguf --mtp
+```
+
+Ordinary decode uses the same files with `--mtp` omitted. For non-zero
+temperature, add `--mtp-exact-sampling` to preserve the target sampling
+distribution. See [Qwen setup](QWEN38_FLASH_NEXT.md) for the Metal runtime.
+
 ## Sampling and reproducibility
 
 At temperature zero, accepted drafts must match the target's greedy

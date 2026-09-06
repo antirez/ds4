@@ -41,7 +41,7 @@ def check_fixtures(binary, directory):
     print(f"Footer: {len(data)} bytes including setup, no prompt erasure, 3 balanced frames")
     expected = {"google_search", "visit_page", "bash", "bash_status", "bash_stop",
                 "read", "more", "write", "edit", "search", "list"}
-    for family in ("glm", "dsml"):
+    for family in ("glm", "dsml", "qwen"):
         for vision in (0, 1):
             prompt = (directory / f"prompt-{family}-{vision}.txt").read_text()
             schemas = {}
@@ -52,7 +52,7 @@ def check_fixtures(binary, directory):
                 schemas[schema["name"]] = schema
             assert set(schemas) == expected | ({"view_image"} if vision else set())
             assert schemas["search"]["parameters"]["properties"]["mode"]["enum"] == ["literal", "regex"]
-    print("Tool schemas: both formats parse as JSON, with and without vision")
+    print("Tool schemas: all three formats parse as JSON, with and without vision")
 
 
 def check_pty(binary, directory):

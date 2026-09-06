@@ -1,0 +1,1 @@
+**Latenza** e **throughput** sono due metriche fondamentali per valutare le prestazioni di un sistema (come
