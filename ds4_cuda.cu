@@ -13946,14 +13946,17 @@ __global__ static void indexer_topk_tree_merge_pow2_kernel(
  * 512th-best key seen so far, so it can only discard candidates that cannot
  * belong to the final top set. Packing supplies the same value/index total
  * order as the existing bitonic and CUB tiers. */
-__global__ static void __launch_bounds__(512) indexer_topk_stream512_kernel(
+__global__ static void __launch_bounds__(256) indexer_topk_stream512_kernel(
         uint32_t *selected,
         const float *scores,
         uint32_t n_comp,
         uint32_t n_tokens,
         uint32_t top_k) {
-    constexpr uint32_t STREAM_THREADS = 512u;
-    constexpr uint32_t STREAM_ITEMS = 4u;
+    /* CUB's 512-thread x 4-item BlockExchange has produced rare, data-dependent
+     * out-of-range shared-memory accesses on Blackwell sm_120 and sm_121.
+     * Keep the same 2048-key capacity with the stable 256 x 8 layout. */
+    constexpr uint32_t STREAM_THREADS = 256u;
+    constexpr uint32_t STREAM_ITEMS = 8u;
     constexpr uint32_t STREAM_CAP = STREAM_THREADS * STREAM_ITEMS;
     using StreamSort = cub::BlockRadixSort<uint64_t, STREAM_THREADS, STREAM_ITEMS>;
     __shared__ uint64_t buf[STREAM_CAP];
@@ -14489,7 +14492,7 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
     if (top_k == 512u && n_tokens >= 32u &&
         getenv("DS4_CUDA_NO_TOPK2048") == NULL &&
         getenv("DS4_CUDA_NO_TOPK_STREAM") == NULL) {
-        indexer_topk_stream512_kernel<<<n_tokens, 512>>>(
+        indexer_topk_stream512_kernel<<<n_tokens, 256>>>(
                 (uint32_t *)selected->ptr,
                 (const float *)scores->ptr,
                 n_comp, n_tokens, top_k);
