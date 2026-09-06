@@ -2591,7 +2591,10 @@ template [[host_name("kernel_mul_mm_q8_0_f32_nax_direct_rhs_n128")]] kernel mul_
 // Tiled matrix-matrix kernel used for prompt batches larger than 8. DS4 uses
 // this to turn prefill into large simdgroup matrix operations; each block_q
 // contains 16*nl weights.
-template<typename S0, typename S0_4x4, typename S0_8x8, typename S1, typename S1_2x4, typename S1_8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &), typename T0, typename T0_4x4, typename T1, typename T1_2x4, bool CULL_TAIL_SIMDGROUPS = false>
+// The Q4/F16 pair uses M32/K64: four accumulators per SIMDgroup and half as
+// many staging barriers improve short-prefill occupancy. Both shapes keep
+// the same half inputs and ordered 8-wide K products; M32/K64 needs 8 KiB.
+template<typename S0, typename S0_4x4, typename S0_8x8, typename S1, typename S1_2x4, typename S1_8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &), typename T0, typename T0_4x4, typename T1, typename T1_2x4, bool CULL_TAIL_SIMDGROUPS = false, bool M32_K64 = false>
 kernel void kernel_mul_mm(
         constant ds4_metal_args_mul_mm & args,
         device const char * src0,
@@ -2602,21 +2605,20 @@ kernel void kernel_mul_mm(
         ushort tiitg[[thread_index_in_threadgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
 
+    constexpr int NR0 = M32_K64 ? 32 : 64;
     threadgroup S0 * sa = (threadgroup S0 *)(shmem);
     threadgroup S1 * sb = (threadgroup S1 *)(shmem + 4096);
-
-    constexpr int NR0 = 64;
     constexpr int NR1 = 32;
 
-    constexpr int NK  = 32;
-    constexpr int NL0 = NK/16;
-    constexpr int NL1 = NK/8;
+    constexpr int NK  = M32_K64 ? 64 : 32;
+    constexpr int NL0 = M32_K64 ? 4 : 2;
+    constexpr int NL1 = 4;
 
     const int im = tgpig.z;
     const int r0 = tgpig.y*NR0;
     const int r1 = tgpig.x*NR1;
 
-    // if this block is of 64x32 shape or smaller
+    // Active output rows within the NR0-by-32 tile.
     const short nr0 = (args.ne0 - r0 < NR0) ? (args.ne0 - r0) : NR0;
     const short nr1 = (args.ne1 - r1 < NR1) ? (args.ne1 - r1) : NR1;
     // SIMDgroups 0/1 own token rows 0..15 and SIMDgroups 2/3 own rows
@@ -2627,7 +2629,7 @@ kernel void kernel_mul_mm(
         !CULL_TAIL_SIMDGROUPS || 16*(short)(sgitg/2) < nr1;
 
     // a thread shouldn't load data outside of the matrix
-    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1; // 0 .. 63
+    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1; // 0 .. NR0-1
     const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : nr1 - 1; // 0 .. 31
 
     const short il0 = (tiitg % NL0);
@@ -2650,13 +2652,14 @@ kernel void kernel_mul_mm(
         + args.nb11*(r1 + lr1)
         + args.nb10*iy);
 
-    S0_8x8 ma[4];
+    constexpr short MA = NR0/16;
+    S0_8x8 ma[MA];
     S1_8x8 mb[2];
 
-    simdgroup_float8x8 mc[8];
+    simdgroup_float8x8 mc[2*MA];
 
     if (mma_active) {
-        for (short i = 0; i < 8; i++){
+        for (short i = 0; i < 2*MA; i++){
             mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
         }
     }
@@ -2674,7 +2677,7 @@ kernel void kernel_mul_mm(
                 const short lx = (tiitg/NL0)%8;
                 const short ly = i%8;
 
-                const short ib = 8*sx + sy;
+                const short ib = (NR0/8)*sx + sy;
 
                 *(sa + 64*ib + 8*ly + lx) = loop_k + 16*il + i < args.ne00 ? *((device T0 *) x + i) : 0;
             }
@@ -2691,7 +2694,7 @@ kernel void kernel_mul_mm(
                 const short lx = (tiitg/NL0)%8;
                 const short ly = i%8;
 
-                const short ib = 8*sx + sy;
+                const short ib = (NR0/8)*sx + sy;
 
                 // Pointer-form store avoids a slower address-lowering path in
                 // current Apple Metal compilers for this dequantized tile write.
@@ -2699,8 +2702,11 @@ kernel void kernel_mul_mm(
             }
         }
 
-        if (FC_mul_mm_bc_inp) {
-            for (short i = 0; i < 8; ++i) {
+        FOR_UNROLL (short pass = 0; pass < (M32_K64 ? 2 : 1); pass++) {
+            threadgroup S1 *sb_pass = sb + 1024*pass;
+            device const T1 *y_pass = y + 32*pass;
+            if (FC_mul_mm_bc_inp) {
+              for (short i = 0; i < 8; ++i) {
                 const short sx = (tiitg%NL1);
                 const short sy = (tiitg/NL1)/8;
 
@@ -2709,35 +2715,37 @@ kernel void kernel_mul_mm(
 
                 const short ib = 4*sx + sy;
 
-                *(sb + 64*ib + 8*ly + lx) = loop_k + iy + i < args.ne00 ? (S1) *((device T1 *) y + i) : 0;
+                *(sb_pass + 64*ib + 8*ly + lx) = loop_k + 32*pass + iy + i < args.ne00 ? (S1) *((device T1 *) y_pass + i) : 0;
+              }
+            } else {
+                const short sx = (tiitg%NL1);
+                const short sy = (tiitg/NL1)/8;
+
+                const short ly = (tiitg/NL1)%8;
+
+                const short ib = 4*sx + sy;
+
+                *(threadgroup S1_2x4 *)(sb_pass + 64*ib + 8*ly) = (S1_2x4)(*((device T1_2x4 *) y_pass));
             }
-        } else {
-            const short sx = (tiitg%NL1);
-            const short sy = (tiitg/NL1)/8;
-
-            const short ly = (tiitg/NL1)%8;
-
-            const short ib = 4*sx + sy;
-
-            *(threadgroup S1_2x4 *)(sb + 64*ib + 8*ly) = (S1_2x4)(*((device T1_2x4 *) y));
         }
 
-        il = (il + 2 < nl) ? il + 2 : il % 2;
-        x  = (il < 2) ? x + (2 + nl - 1)/nl : x;
+        constexpr short advance = M32_K64 ? 4 : 2;
+        il = (il + advance < nl) ? il + advance : il % NL0;
+        x  = (il < NL0) ? x + (advance + nl - 1)/nl : x;
 
         y += NK;
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // load matrices from threadgroup memory and conduct outer products
-        threadgroup const S0 * lsma = (sa + 4*64*(sgitg%2));
+        threadgroup const S0 * lsma = (sa + MA*64*(sgitg%2));
         threadgroup const S1 * lsmb = (sb + 2*64*(sgitg/2));
 
         if (mma_active) {
             FOR_UNROLL (short ik = 0; ik < NK/8; ik++) {
                 simdgroup_barrier(mem_flags::mem_none);
 
-                FOR_UNROLL (short i = 0; i < 4; i++) {
+                FOR_UNROLL (short i = 0; i < MA; i++) {
                     simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
                 }
 
@@ -2749,11 +2757,11 @@ kernel void kernel_mul_mm(
 
                 simdgroup_barrier(mem_flags::mem_none);
 
-                FOR_UNROLL (short i = 0; i < 8; i++){
-                    simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
+                FOR_UNROLL (short i = 0; i < 2*MA; i++){
+                    simdgroup_multiply_accumulate(mc[i], mb[i/MA], ma[i%MA], mc[i]);
                 }
 
-                lsma += 8*64;
+                lsma += (NR0/8)*64;
                 lsmb += 4*64;
             }
         }
@@ -2762,23 +2770,23 @@ kernel void kernel_mul_mm(
     if (!FC_mul_mm_bc_out || (r0 + NR0 <= args.ne0 && r1 + NR1 <= args.ne1)) {
         // if no bounds checks on the output are needed, we can directly write to device memory
         device float * C = (device float *) dst +
-            (r0 + 32*(sgitg &  1)) + \
+            (r0 + (NR0/2)*(sgitg &  1)) + \
             (r1 + 16*(sgitg >> 1)) * args.ne0 + im*args.ne1*args.ne0;
 
         if (mma_active) {
-            for (short i = 0; i < 8; i++) {
-                simdgroup_store(mc[i], C + 8*(i%4) + 8*args.ne0*(i/4), args.ne0, 0, false);
+            for (short i = 0; i < 2*MA; i++) {
+                simdgroup_store(mc[i], C + 8*(i%MA) + 8*args.ne0*(i/MA), args.ne0, 0, false);
             }
         }
     } else {
-        // block is smaller than 64x32, we should avoid writing data outside of the matrix
+        // Avoid writes outside a partial NR0-by-32 output tile.
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
+        threadgroup float * temp_str = ((threadgroup float *) shmem) + (NR0/2)*(sgitg&1) + (16*(sgitg >> 1))*NR0;
 
         if (mma_active) {
-            for (short i = 0; i < 8; i++) {
-                simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+            for (short i = 0; i < 2*MA; i++) {
+                simdgroup_store(mc[i], temp_str + 8*(i%MA) + 8*NR0*(i/MA), NR0, 0, false);
             }
         }
 
@@ -3036,3 +3044,4 @@ template [[host_name("kernel_mul_mm_q4_K_f32_tail_cull")]] kernel mul_mm_q4_K_ta
 // tile revisits the activation matrix; this variant lets the host perform it
 // once while preserving the MMA tile and accumulation order.
 template [[host_name("kernel_mul_mm_q4_K_f16_rhs")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q4_K, 16, dequantize_dense_q4_K, float, float4x4, half, half2x4>;
+template [[host_name("kernel_mul_mm_q4_K_f16_rhs_k64_m32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q4_K, 16, dequantize_dense_q4_K, float, float4x4, half, half2x4, false, true>;

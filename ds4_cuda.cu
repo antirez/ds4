@@ -1061,8 +1061,7 @@ __global__ static void dequant_q4_K_to_f16_kernel(
         __half *out,
         const cuda_block_q4_K *w,
         uint64_t in_dim,
-        uint64_t out_dim,
-        uint64_t blocks);
+        uint64_t out_dim);
 
 #include "cuda/ds4_q4_dequant_vec.cuh"
 
@@ -3356,8 +3355,7 @@ extern "C" int ds4_gpu_prepare_q4_attn_q_b_f16_sidecars(
                 (unsigned)((chunks + 255u) / 256u), 256>>>(
                     sidecars[mi], sources[mi],
                     CUDA_Q4_ATTN_Q_B_IN_DIM,
-                    CUDA_Q4_ATTN_Q_B_OUT_DIM,
-                    CUDA_Q4_ATTN_Q_B_IN_DIM / CUDA_QK_K);
+                    CUDA_Q4_ATTN_Q_B_OUT_DIM);
             if (cudaGetLastError() != cudaSuccess) {
                 build_failed = 1;
                 break;
@@ -12414,6 +12412,8 @@ __global__ static void rms_norm_weight_kernel(float *out, const float *x, const 
     }
 }
 
+#include "cuda/ds4_q4_prefill_reduce.h"
+
 __global__ static void dsv4_qkv_rms_norm_rows_kernel(
         float *q_out,
         const float *q,
@@ -12438,13 +12438,21 @@ __global__ static void dsv4_qkv_rms_norm_rows_kernel(
         sum += v * v;
     }
     __shared__ float partial[256];
-    partial[threadIdx.x] = sum;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+    float total;
+    if (rows > 8u) {
+        // Q-A and KV retain their per-thread products and exact reduction
+        // tree; only prefill replaces the nine shared stages with two fences.
+        total = ds4_q4_prefill_reduce_256(sum, partial);
+    } else {
+        partial[threadIdx.x] = sum;
         __syncthreads();
+        for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+            __syncthreads();
+        }
+        total = partial[0];
     }
-    const float scale = rsqrtf(partial[0] / (float)n + eps);
+    const float scale = rsqrtf(total / (float)n + eps);
     for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
         orow[i] = xr[i] * scale * w[i];
     }
@@ -12508,13 +12516,19 @@ __global__ static void dsv4_qkv_rms_norm_rows_kv_rope_kernel(
         sum += v * v;
     }
     __shared__ float partial[256];
-    partial[threadIdx.x] = sum;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+    float total;
+    if (rows > 8u) {
+        total = ds4_q4_prefill_reduce_256(sum, partial);
+    } else {
+        partial[threadIdx.x] = sum;
         __syncthreads();
+        for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+            __syncthreads();
+        }
+        total = partial[0];
     }
-    const float scale = rsqrtf(partial[0] / (float)n + eps);
+    const float scale = rsqrtf(total / (float)n + eps);
     if (which == 0u) {
         for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
             orow[i] = xr[i] * scale * w[i];
@@ -12565,8 +12579,6 @@ __global__ static void dsv4_qkv_rms_norm_rows_kv_rope_kernel(
         orow[i0 + 1u] = x0 * s + x1 * c;
     }
 }
-
-#include "cuda/ds4_q4_prefill_reduce.h"
 
 template<bool Q4_PREFILL_REDUCE>
 __global__ static void head_rms_norm_rope_tail_kernel(
@@ -23578,7 +23590,13 @@ extern "C" int ds4_gpu_head_rms_norm_tensor(ds4_gpu_tensor *x, uint32_t n_tok, u
 extern "C" int ds4_gpu_head_rms_norm_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow, float eps) {
     if (!x || n_rot > head_dim || (n_rot & 1u) ||
         x->bytes < (uint64_t)n_tok * n_head * head_dim * sizeof(float)) return 0;
-    head_rms_norm_rope_tail_kernel<false><<<n_tok * n_head, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, eps);
+    // Native Q4, Q8, SSD and quality prefill use the same F32 RMS tree as
+    // the resident Q4 epilogue. Decode and speculative widths retain theirs.
+    if (n_tok > 8u) {
+        head_rms_norm_rope_tail_kernel<true><<<n_tok * n_head, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, eps);
+    } else {
+        head_rms_norm_rope_tail_kernel<false><<<n_tok * n_head, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, eps);
+    }
     return cuda_ok(cudaGetLastError(), "head_rms_norm_rope_tail launch");
 }
 extern "C" int ds4_gpu_dsv4_fp8_kv_quantize_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t head_dim, uint32_t n_rot) {
@@ -26586,37 +26604,34 @@ __global__ static void dequant_q4_K_to_f16_kernel(
         __half *out,
         const cuda_block_q4_K *w,
         uint64_t in_dim,
-        uint64_t out_dim,
-        uint64_t blocks) {
+        uint64_t out_dim) {
     const uint64_t chunk =
         (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     const uint64_t chunks_per_row = in_dim / 16u;
     const uint64_t total_chunks = out_dim * chunks_per_row;
     if (chunk >= total_chunks) return;
 
-    const uint64_t row = chunk / chunks_per_row;
-    const uint64_t col0 = (chunk - row * chunks_per_row) * 16u;
-    const uint64_t block_in_row = col0 / CUDA_QK_K;
-    const uint32_t within0 = (uint32_t)(col0 % CUDA_QK_K);
-    const cuda_block_q4_K *block = w + row * blocks + block_in_row;
+    // Both callers use packed rows with in_dim divisible by 256. A 16-value
+    // chunk stays within one scale group, so neither row division nor
+    // repeated scale/min unpack is needed in the value loop.
+    const cuda_block_q4_K *block = w + (chunk >> 4u);
+    const uint32_t group = (uint32_t)((chunk >> 1u) & 7u);
+    const uint32_t byte0 = (group >> 1u) * 32u +
+                           (uint32_t)(chunk & 1u) * 16u;
     const float d = dev_f16_to_f32(block->d);
     const float dmin = dev_f16_to_f32(block->dmin);
+    uint8_t scale_code, min_code;
+    dev_q4_K_get_scale_min(group, block->scales, &scale_code, &min_code);
 
 #pragma unroll
     for (uint32_t k = 0; k < 16u; k++) {
-        const uint32_t within = within0 + k;
-        const uint32_t group = within >> 5u;
-        uint8_t scale_code, min_code;
-        dev_q4_K_get_scale_min(
-            group, block->scales, &scale_code, &min_code);
-        const uint8_t packed =
-            block->qs[(group >> 1u) * 32u + (within & 31u)];
+        const uint8_t packed = block->qs[byte0 + k];
         const uint8_t q = (group & 1u) ? (packed >> 4u)
                                        : (packed & 15u);
         const float value =
             (d * (float)scale_code) * (float)q -
             dmin * (float)min_code;
-        out[row * in_dim + col0 + k] = __float2half_rn(value);
+        out[chunk * 16u + k] = __float2half_rn(value);
     }
 }
 
@@ -26861,6 +26876,8 @@ __device__ static float quarter_warp_sum_f32(float v, uint32_t lane8) {
     return v;
 }
 
+#include "cuda/ds4_q8_k_bsum.h"
+
 __global__ static void q8_K_quantize_kernel(cuda_block_q8_K *out, const float *x, uint32_t in_dim, uint32_t n_rows) {
     uint32_t b = blockIdx.x;
     uint32_t row = blockIdx.y;
@@ -26895,18 +26912,19 @@ __global__ static void q8_K_quantize_kernel(cuda_block_q8_K *out, const float *x
         iscale_s = -127.0f / maxv_s;
     }
     __syncthreads();
+    int qv = 0;
     if (tid < CUDA_QK_K) {
-        int qv = (int)lrintf(iscale_s * xr[tid]);
+        qv = (int)lrintf(iscale_s * xr[tid]);
         if (qv > 127) qv = 127;
         if (qv < -128) qv = -128;
         yb->qs[tid] = (int8_t)qv;
     }
-    __syncthreads();
-    if (tid < CUDA_QK_K / 16) {
-        int sum = 0;
-        for (int i = 0; i < 16; i++) sum += yb->qs[tid * 16 + i];
-        yb->bsums[tid] = (int16_t)sum;
-    }
+    // Each complete 16-lane subgroup publishes its own integer sum. Reuse
+    // the clamped register values: later kernels consume qs and bsums, so
+    // no CTA fence or global reread is needed between these two stores.
+    const int sum = ds4_q8_K_bsum16(qv, tid, warpSize);
+    if ((tid & 15u) == 0u && tid < CUDA_QK_K)
+        yb->bsums[tid >> 4u] = (int16_t)sum;
     if (tid == 0) yb->d = 1.0f / iscale_s;
 }
 
@@ -43836,7 +43854,7 @@ extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
                 (unsigned)((chunks + 255u) / 256u), 256, 0, stream>>>(
                     scratch,
                     reinterpret_cast<const cuda_block_q4_K *>(source),
-                    in_dim, out_dim, blocks);
+                    in_dim, out_dim);
         }
         const cudaError_t dequant_err = cudaGetLastError();
         if (dequant_err != cudaSuccess) {

@@ -706,6 +706,8 @@ __device__ static float quarter_warp_sum_f32(float v, uint32_t lane8) {
     return v;
 }
 
+#include "../cuda/ds4_q8_k_bsum.h"
+
 __global__ static void q8_K_quantize_kernel(cuda_block_q8_K *out, const float *x, uint32_t in_dim, uint32_t n_rows) {
     uint32_t b = blockIdx.x;
     uint32_t row = blockIdx.y;
@@ -740,18 +742,19 @@ __global__ static void q8_K_quantize_kernel(cuda_block_q8_K *out, const float *x
         iscale_s = -127.0f / maxv_s;
     }
     __syncthreads();
+    int qv = 0;
     if (tid < CUDA_QK_K) {
-        int qv = (int)lrintf(iscale_s * xr[tid]);
+        qv = (int)lrintf(iscale_s * xr[tid]);
         if (qv > 127) qv = 127;
         if (qv < -128) qv = -128;
         yb->qs[tid] = (int8_t)qv;
     }
-    __syncthreads();
-    if (tid < CUDA_QK_K / 16) {
-        int sum = 0;
-        for (int i = 0; i < 16; i++) sum += yb->qs[tid * 16 + i];
-        yb->bsums[tid] = (int16_t)sum;
-    }
+    // The 256-thread launch gives every bsum a complete 16-lane subgroup.
+    // Sum the quantized registers exactly instead of fencing and rereading
+    // all 256 quant bytes from global memory. Consumers run in later kernels.
+    const int sum = ds4_q8_K_bsum16(qv, tid, warpSize);
+    if ((tid & 15u) == 0u && tid < CUDA_QK_K)
+        yb->bsums[tid >> 4u] = (int16_t)sum;
     if (tid == 0) yb->d = 1.0f / iscale_s;
 }
 

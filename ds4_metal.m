@@ -24066,12 +24066,20 @@ int ds4_gpu_matmul_q8_0_pair_tensor(
     return 1;
 }
 
-/* Experimental q_a/KV prefill pair.  The legacy M64xN32 Q4 kernel narrows
+static bool ds4_gpu_q4_K_prefill_pair_m32_shape(
+        uint64_t in_dim, uint64_t out0_dim, uint64_t out1_dim) {
+    return in_dim == 4096u && out0_dim == 1024u && out1_dim == 512u;
+}
+
+/* q_a/KV prefill pair.  The legacy M64xN32 Q4 kernel narrows
  * every 32xK RHS tile once per 64-row output band.  q_a and KV therefore
  * replay the same F32->F16 conversion 24 times at the 1024+512 production
- * shape.  Materialize one stream-local half RHS and feed it to both unchanged
- * 128-thread kernels instead.  A fixed-capacity sidecar makes reuse safe for
- * retained and unretained command-buffer modes; command-queue ordering plus
+ * shape. Materialize one stream-local half RHS. At that measured shape,
+ * M32xN32xK64 tiles replace the legacy 64-row tiles:
+ * twice as many output groups and half as many staging barriers improve
+ * occupancy for these short batches without changing the K accumulation.
+ * A fixed-capacity sidecar makes reuse safe for retained and unretained
+ * command-buffer modes; command-queue ordering plus
  * tracked resource hazards serialize consecutive uses on one stream. */
 static int ds4_gpu_try_q4_K_prefill_pair_f16_rhs(
         ds4_gpu_tensor *out0, ds4_gpu_tensor *out1,
@@ -24120,6 +24128,9 @@ static int ds4_gpu_try_q4_K_prefill_pair_f16_rhs(
     }
 
     @autoreleasepool {
+        const bool use_m32 =
+            ds4_gpu_q4_K_prefill_pair_m32_shape(in_dim, out0_dim, out1_dim);
+        const NSUInteger tile_m = use_m32 ? 32u : 64u;
         uint64_t inner0 = 0u;
         uint64_t inner1 = 0u;
         id<MTLBuffer> w0 = ds4_gpu_wrap_model_range(
@@ -24131,7 +24142,8 @@ static int ds4_gpu_try_q4_K_prefill_pair_f16_rhs(
         id<MTLBuffer> o1 = ds4_gpu_tensor_buffer(out1);
         id<MTLComputePipelineState> mm_pipeline =
             ds4_gpu_get_mul_mm_pipeline(
-                "kernel_mul_mm_q4_K_f16_rhs", false, false);
+                use_m32 ? "kernel_mul_mm_q4_K_f16_rhs_k64_m32"
+                        : "kernel_mul_mm_q4_K_f16_rhs", false, false);
         if (!w0 || !w1 || !xb || !o0 || !o1 ||
             inner0 > NSUIntegerMax || inner1 > NSUIntegerMax ||
             !g_cpy_contig_f32_f16_pipeline || !mm_pipeline ||
@@ -24179,7 +24191,7 @@ static int ds4_gpu_try_q4_K_prefill_pair_f16_rhs(
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
         if (!enc) return 0;
         [enc setComputePipelineState:mm_pipeline];
-        [enc setThreadgroupMemoryLength:6144u atIndex:0];
+        [enc setThreadgroupMemoryLength:use_m32 ? 8192u : 6144u atIndex:0];
 
         [enc setBytes:&args0 length:sizeof(args0) atIndex:0];
         [enc setBuffer:w0 offset:(NSUInteger)inner0 atIndex:1];
@@ -24187,7 +24199,7 @@ static int ds4_gpu_try_q4_K_prefill_pair_f16_rhs(
         [enc setBuffer:o0 offset:ds4_gpu_tensor_offset(out0) atIndex:3];
         [enc dispatchThreadgroups:MTLSizeMake(
                 (NSUInteger)n_tok / 32u,
-                (NSUInteger)out0_dim / 64u,
+                (NSUInteger)out0_dim / tile_m,
                 1u)
              threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
 
@@ -24196,7 +24208,7 @@ static int ds4_gpu_try_q4_K_prefill_pair_f16_rhs(
         [enc setBuffer:o1 offset:ds4_gpu_tensor_offset(out1) atIndex:3];
         [enc dispatchThreadgroups:MTLSizeMake(
                 (NSUInteger)n_tok / 32u,
-                (NSUInteger)out1_dim / 64u,
+                (NSUInteger)out1_dim / tile_m,
                 1u)
              threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -24221,9 +24233,14 @@ int ds4_gpu_matmul_q4_K_pair_tensor(
     const bool prefill_pair_call = n_tok >= 32u;
     const bool global_pair_disabled =
         getenv("DS4_METAL_DISABLE_Q4_DENSE_PAIR") != NULL;
+    const bool default_pair_shape =
+        ds4_gpu_q4_K_prefill_pair_m32_shape(in_dim, out0_dim, out1_dim) &&
+        n_tok >= 32u && n_tok <= DS4_METAL_Q4_PAIR_RHS_MAX_TOKENS &&
+        (n_tok % 32u) == 0u;
     const bool pair_requested =
         !global_pair_disabled && pair_disable != 1 &&
-        (pair_enable == 1 || pair_require == 1);
+        (pair_enable == 1 || pair_require == 1 ||
+         (pair_enable < 0 && default_pair_shape));
 
     if (!g_initialized && !ds4_gpu_init()) {
         return pair_require == 1 && prefill_pair_call ? -1 : 0;

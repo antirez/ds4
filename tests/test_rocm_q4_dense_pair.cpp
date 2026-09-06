@@ -1684,23 +1684,24 @@ bool run_pair_pre_enqueue_policy_oracle() {
     return ok;
 }
 
-bool run_prefill_q8_wave32_oracle(const aligned_model &model) {
+bool run_prefill_q8_quantizer_oracle(const aligned_model &model) {
 #if DS4_TEST_HAS_HIP_RUNTIME
     int device = 0;
     hipDeviceProp_t properties = {};
     if (hipGetDevice(&device) != hipSuccess ||
-        hipGetDeviceProperties(&properties, device) != hipSuccess ||
-        properties.warpSize != 32 ||
-        std::strncmp(properties.gcnArchName, "gfx1151", 7u) != 0) {
+        hipGetDeviceProperties(&properties, device) != hipSuccess) {
         std::fprintf(stderr,
-                     "ROCm Q4 Q8_K wave32 oracle: SKIP "
-                     "(requires gfx1151 wave32)\n");
-        return true;
+                     "ROCm Q4 Q8_K quantizer oracle: device query FAIL\n");
+        return false;
     }
+    const bool has_wave32 = properties.warpSize == 32 &&
+        std::strncmp(properties.gcnArchName, "gfx1151", 7u) == 0;
 
     bool ok = true;
     constexpr uint32_t n_tokens = 9u;
-    const uint32_t dimensions[] = {256u, 1024u, 4096u};
+    // The canonical quantizer also runs on wave64. Exercise complete and
+    // partial eight-block batches even when the optional wave32 path cannot.
+    const uint32_t dimensions[] = {256u, 768u, 1024u, 1792u, 2048u, 2304u, 4096u, 8192u};
     for (uint32_t in_dim : dimensions) {
         std::vector<float> x;
         fill_q8_wave32_activation(&x, n_tokens, in_dim);
@@ -1720,29 +1721,37 @@ bool run_prefill_q8_wave32_oracle(const aligned_model &model) {
         }
         const int legacy_rc = ds4_rocm_test_q8_K_quantize_tensor(
             legacy_gpu.ptr, x_gpu.ptr, in_dim, n_tokens, 0);
-        const int wave_rc = ds4_rocm_test_q8_K_quantize_tensor(
-            wave_gpu.ptr, x_gpu.ptr, in_dim, n_tokens, 1);
+        const int wave_rc = has_wave32 ? ds4_rocm_test_q8_K_quantize_tensor(
+            wave_gpu.ptr, x_gpu.ptr, in_dim, n_tokens, 1) : 0;
         std::vector<block_q8_K_test> legacy(block_count);
         std::vector<block_q8_K_test> wave(block_count);
         std::vector<block_q8_K_test> cpu(block_count);
-        const bool read_ok = legacy_rc != 0 && wave_rc != 0 &&
+        const bool read_ok = legacy_rc != 0 &&
             ds4_gpu_tensor_read(legacy_gpu.ptr, 0, legacy.data(), bytes) != 0 &&
-            ds4_gpu_tensor_read(wave_gpu.ptr, 0, wave.data(), bytes) != 0;
+            (!has_wave32 || (wave_rc != 0 &&
+             ds4_gpu_tensor_read(wave_gpu.ptr, 0, wave.data(), bytes) != 0));
         for (size_t i = 0; i < block_count; i++) {
             quantize_q8_K_cpu(x.data() + i * kQkK, &cpu[i]);
         }
-        const bool pair_equal = read_ok &&
-            std::memcmp(legacy.data(), wave.data(), bytes) == 0;
+        const bool pair_equal = read_ok && (!has_wave32 ||
+            std::memcmp(legacy.data(), wave.data(), bytes) == 0);
         const bool cpu_equal = read_ok &&
             std::memcmp(legacy.data(), cpu.data(), bytes) == 0;
         std::fprintf(stderr,
-                     "Q8_K wave32 raw K=%u blocks=%zu legacy=%d wave=%d "
+                     "Q8_K raw K=%u blocks=%zu legacy=%d wave=%d "
                      "pair=%s cpu=%s %s\n",
                      in_dim, block_count, legacy_rc, wave_rc,
-                     pair_equal ? "bitwise" : "MISMATCH",
+                     !has_wave32 ? "SKIP" : pair_equal ? "bitwise" : "MISMATCH",
                      cpu_equal ? "bitwise" : "MISMATCH",
                      pair_equal && cpu_equal ? "PASS" : "FAIL");
         ok = pair_equal && cpu_equal && ok;
+    }
+
+    if (!has_wave32) {
+        std::fprintf(stderr,
+                     "ROCm Q4 Q8_K wave32 dispatch oracle: SKIP "
+                     "(requires gfx1151 wave32; canonical raw bytes tested)\n");
+        return ok;
     }
 
     env_snapshot tile8_disable(kPrefillDisable);
@@ -3923,7 +3932,7 @@ int main(int argc, char **argv) {
         std::fprintf(stderr,
                      "ROCm Q4 tiled prefill parity "
                      "(forced DISABLE vs default+REQUIRE):\n");
-        const bool q8_wave32_ok = run_prefill_q8_wave32_oracle(model);
+        const bool q8_wave32_ok = run_prefill_q8_quantizer_oracle(model);
         const bool prefill9_ok = run_prefill_parity_case(
             model, 9u, model.weight0_offset, kM0, true,
             "prefill K=4096 M=65 n_tok=9");

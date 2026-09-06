@@ -320,8 +320,8 @@ static void check_x_unchanged(fixture *f, uint32_t stream) {
     free(actual);
 }
 
-static void test_shapes(fixture *f) {
-    set_pair_controls(true, false, true);
+static void test_shapes(fixture *f, bool explicit_enable) {
+    set_pair_controls(explicit_enable, false, explicit_enable);
     for (uint32_t i = 0; i < sizeof(k_tokens) / sizeof(k_tokens[0]); i++) {
         const uint32_t n_tokens = k_tokens[i];
         poison_outputs(f, 0u);
@@ -330,6 +330,39 @@ static void test_shapes(fixture *f) {
         check_outputs(f, 0u, n_tokens);
         check_x_unchanged(f, 0u);
     }
+}
+
+static void test_default_scope(fixture *f) {
+    set_pair_controls(false, false, false);
+    poison_outputs(f, 0u);
+    const uint32_t shapes[][3] = {
+        {IN_DIM, OUT1_DIM, OUT1_DIM}, {256u, OUT0_DIM, OUT1_DIM},
+    };
+    for (size_t i = 0; i < sizeof(shapes)/sizeof(shapes[0]); i++) {
+        const int rc = ds4_gpu_matmul_q4_K_pair_tensor(
+            f->candidate[0][0], f->candidate[0][1], f->model, f->model_size,
+            f->weight_offset[0], f->weight_offset[1],
+            shapes[i][0], shapes[i][1], shapes[i][2], f->x[0], 32u);
+        if (rc != 0) fail("default enabled an unmeasured shape");
+    }
+    const char *disable_flags[] = {
+        "DS4_METAL_ENABLE_Q4_PREFILL_PAIR_F16_RHS",
+        "DS4_METAL_DISABLE_Q4_PREFILL_PAIR_F16_RHS",
+        "DS4_METAL_DISABLE_Q4_DENSE_PAIR",
+    };
+    for (size_t i = 0; i < sizeof(disable_flags)/sizeof(disable_flags[0]); i++) {
+        if (setenv(disable_flags[i], i == 0 ? "0" : "1", 1)) fail("disable flag");
+        const int rc = ds4_gpu_matmul_q4_K_pair_tensor(
+            f->candidate[0][0], f->candidate[0][1], f->model, f->model_size,
+            f->weight_offset[0], f->weight_offset[1], IN_DIM,
+            OUT0_DIM, OUT1_DIM, f->x[0], 32u);
+        if (rc != 0) fail("default pair ignored an explicit opt-out");
+        if (unsetenv(disable_flags[i])) fail("restore disable flag");
+    }
+    check_tensor_all_poison(f->candidate[0][0], output_count(0u), "default-scope-out0");
+    check_tensor_all_poison(f->candidate[0][1], output_count(1u), "default-scope-out1");
+    check_x_unchanged(f, 0u);
+    fprintf(stderr, "Metal Q4 prefill pair default scope and opt-outs: PASS\n");
 }
 
 static void test_alias_rejection(fixture *f) {
@@ -352,6 +385,30 @@ static void test_alias_rejection(fixture *f) {
     check_tensor_all_poison(f->candidate[0][1], output_count(1u),
                             "alias-reject");
     fprintf(stderr, "Metal Q4 prefill pair alias rejection: PASS\n");
+}
+
+/* The optimized tile changes neither the admitted token range nor the
+ * output alignment contract. Rejection must leave caller buffers untouched. */
+static void test_ineligible_shapes(fixture *f) {
+    const uint32_t cases[][3] = {
+        {9u, OUT0_DIM, OUT1_DIM}, {31u, OUT0_DIM, OUT1_DIM},
+        {33u, OUT0_DIM, OUT1_DIM}, {127u, OUT0_DIM, OUT1_DIM},
+        {129u, OUT0_DIM, OUT1_DIM}, {32u, OUT0_DIM-1u, OUT1_DIM},
+        {32u, OUT0_DIM, OUT1_DIM-1u},
+    };
+    set_pair_controls(true, false, false);
+    for (size_t i = 0; i < sizeof(cases)/sizeof(cases[0]); i++) {
+        poison_outputs(f, 0u);
+        const int rc = ds4_gpu_matmul_q4_K_pair_tensor(
+            f->candidate[0][0], f->candidate[0][1], f->model, f->model_size,
+            f->weight_offset[0], f->weight_offset[1], IN_DIM,
+            cases[i][1], cases[i][2], f->x[0], cases[i][0]);
+        if (rc != 0) fail("ineligible pair did not fall back");
+        check_tensor_all_poison(f->candidate[0][0], output_count(0u), "shape-out0");
+        check_tensor_all_poison(f->candidate[0][1], output_count(1u), "shape-out1");
+        check_x_unchanged(f, 0u);
+    }
+    fprintf(stderr, "Metal Q4 prefill pair token/alignment boundaries: PASS\n");
 }
 
 static void test_required_failure_is_local(fixture *f) {
@@ -467,8 +524,11 @@ int main(void) {
 
     fixture f;
     fixture_init(&f);
-    test_shapes(&f);
+    test_shapes(&f, false);
+    test_shapes(&f, true);
+    test_default_scope(&f);
     test_alias_rejection(&f);
+    test_ineligible_shapes(&f);
     test_required_failure_is_local(&f);
     test_two_stream_async(&f);
     fixture_destroy(&f);
