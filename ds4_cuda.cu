@@ -7176,6 +7176,10 @@ __global__ static void attention_prefill_mixed_kernel(
     uint32_t raw_count = t + 1u - raw_start;
     uint32_t visible_comp = (t + 1u) / ratio;
     if (visible_comp > n_comp) visible_comp = n_comp;
+    /* Defense in depth: the launcher rejects shapes wider than the shared
+     * scores window, but never write past it even if a new call site skips
+     * that check (issue #803). */
+    if (raw_count + visible_comp > 512u) return;
     __shared__ float scores[512];
     __shared__ float partial[256];
     __shared__ float max_s;
@@ -18420,6 +18424,21 @@ static int attention_prefill_mixed_launch(
                                                                         n_head,
                                                                         head_dim);
         return cuda_ok(cudaGetLastError(), "attention mixed unpack launch");
+    }
+    /* The scalar fallback kernel accumulates raw + compressed scores in a
+     * fixed __shared__ float scores[512]; refuse shapes whose widest block
+     * would write past it, same bound and log as the ROCm launch (#803). */
+    const uint32_t max_raw = (window != 0u && window < n_tokens) ? window : n_tokens;
+    if ((uint64_t)max_raw + n_comp > 512u) {
+        fprintf(stderr,
+                "ds4: CUDA attention mixed scalar fallback unsupported for %llu scores "
+                "(cap=%u, tokens=%u, comp=%u, window=%u)\n",
+                (unsigned long long)((uint64_t)max_raw + n_comp),
+                512u,
+                n_tokens,
+                n_comp,
+                window);
+        return 0;
     }
     dim3 grid(n_tokens, n_head, 1);
     attention_prefill_mixed_kernel<<<grid, 256>>>((float *)heads->ptr,
