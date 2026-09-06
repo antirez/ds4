@@ -64259,6 +64259,14 @@ int ds4_chat_append_multimodal_message(
     }
     const bool tool = !strcmp(role, "tool") || !strcmp(role, "function");
     const bool user = !strcmp(role, "user");
+    /* A message without images is an ordinary chat message. Keep the native
+     * per-family rendering so a text-only tool observation never depends on
+     * vision support: DeepSeek text models render <tool_result> under the
+     * user role, not the observation tags used for image messages below. */
+    if (image_count == 0 && (tool || user)) {
+        ds4_chat_append_message(e, tokens, role, text_parts[0]);
+        return 1;
+    }
     if ((DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA &&
          e->vision_kind != DS4_VISION_DEEPSEEK4) || (!tool && !user)) {
         if (error && error_cap)
