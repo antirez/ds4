@@ -49,6 +49,32 @@ Max only with sufficient context; otherwise it falls back to normal thinking.
 `xhigh` maps to normal thinking, not Think Max. Use `think:false`, a disabled
 thinking object, or a non-thinking model alias for direct answers.
 
+### Explicit Flash mode aliases
+
+Clients that expose a model picker but inject their own thinking defaults can
+select a mode using one of these additional IDs:
+
+| Loaded backend | Non-thinking | Thinking High | Thinking Max |
+| --- | --- | --- | --- |
+| Flash without vision | `deepseek-v4-flash-nonthinking` | `deepseek-v4-flash-thinking-high` | `deepseek-v4-flash-thinking-max` |
+| Flash Vision Exp with a loaded encoder | `deepseek-v4-flash-vision-exp-nonthinking` | `deepseek-v4-flash-vision-exp-thinking-high` | `deepseek-v4-flash-vision-exp-thinking-max` |
+
+`GET /v1/models` adds the three aliases for the loaded Flash backend. Their
+metadata includes a distinct display name and the server's context/output
+limits. These are mode selections for the same loaded GGUF; they do not load or
+switch models. PRO and GLM servers do not advertise these Flash-specific IDs.
+
+Unlike the generic and legacy aliases, these explicit IDs take precedence over
+conflicting `think`, `thinking`, and reasoning-effort fields in all four POST
+APIs. Sampling parameters and output budgets still come from the request. Max
+retains the usual fallback to High when the server context is below 393216
+tokens. Use a generic model ID when the request body should control thinking.
+
+An explicit mode alias for a different backend is rejected: model lookup returns
+404, and a valid generation request using that alias returns 400 before it is
+queued. Existing compatibility aliases and their parameter precedence remain
+unchanged.
+
 ## Multiple sessions
 
 ```sh

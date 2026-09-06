@@ -1127,6 +1127,51 @@ static bool model_alias_enables_thinking(const char *model) {
             !strcmp(model, "zai/glm-5.3-flash-reasoner"));
 }
 
+typedef struct {
+    const char *id;
+    const char *name;
+    ds4_think_mode mode;
+    bool vision;
+} model_mode_alias;
+
+static const model_mode_alias model_mode_aliases[] = {
+    {"deepseek-v4-flash-nonthinking",
+     "DeepSeek V4 Flash (Non-Thinking)", DS4_THINK_NONE, false},
+    {"deepseek-v4-flash-thinking-high",
+     "DeepSeek V4 Flash (Thinking High)", DS4_THINK_HIGH, false},
+    {"deepseek-v4-flash-thinking-max",
+     "DeepSeek V4 Flash (Thinking Max)", DS4_THINK_MAX, false},
+    {"deepseek-v4-flash-vision-exp-nonthinking",
+     "DeepSeek V4 Flash Vision Exp (Non-Thinking)", DS4_THINK_NONE, true},
+    {"deepseek-v4-flash-vision-exp-thinking-high",
+     "DeepSeek V4 Flash Vision Exp (Thinking High)", DS4_THINK_HIGH, true},
+    {"deepseek-v4-flash-vision-exp-thinking-max",
+     "DeepSeek V4 Flash Vision Exp (Thinking Max)", DS4_THINK_MAX, true},
+};
+
+static const model_mode_alias *model_mode_alias_find(const char *id) {
+    if (!id) return NULL;
+    for (size_t i = 0; i < sizeof(model_mode_aliases) / sizeof(model_mode_aliases[0]); i++) {
+        if (!strcmp(id, model_mode_aliases[i].id)) return &model_mode_aliases[i];
+    }
+    return NULL;
+}
+
+/* Explicit mode IDs let clients select a mode even when they inject conflicting
+ * thinking defaults. Legacy IDs retain their request-parameter precedence. */
+static ds4_think_mode model_alias_apply_thinking(
+    const char *model, ds4_think_mode requested, int ctx_size)
+{
+    const model_mode_alias *alias = model_mode_alias_find(model);
+    return ds4_think_mode_for_context(alias ? alias->mode : requested, ctx_size);
+}
+
+static bool model_mode_alias_available(const model_mode_alias *alias,
+                                       const char *loaded_id, bool has_vision) {
+    return alias && loaded_id && !strcmp(loaded_id, "deepseek-v4-flash") &&
+           alias->vision == has_vision;
+}
+
 static server_model_syntax server_model_syntax_for_engine(ds4_engine *engine) {
     return ds4_engine_is_glm_dsa(engine) ?
            SERVER_MODEL_SYNTAX_GLM : SERVER_MODEL_SYNTAX_DEEPSEEK;
@@ -1141,7 +1186,8 @@ static const char *server_model_id_from_engine(ds4_engine *engine) {
 
 static bool server_model_alias_known(const char *id) {
     return id &&
-           (!strcmp(id, "deepseek-v4-flash") ||
+           (model_mode_alias_find(id) ||
+            !strcmp(id, "deepseek-v4-flash") ||
             !strcmp(id, "deepseek-v4-pro") ||
             !strcmp(id, "glm-5.2") ||
             !strcmp(id, "glm-5.2-chat") ||
@@ -1159,6 +1205,13 @@ static bool server_model_alias_known(const char *id) {
             !strcmp(id, "zai/glm-5.3-flash") ||
             !strcmp(id, "zai/glm-5.3-flash-chat") ||
             !strcmp(id, "zai/glm-5.3-flash-reasoner"));
+}
+
+static bool server_model_alias_available(ds4_engine *engine, const char *id) {
+    if (!server_model_alias_known(id)) return false;
+    const model_mode_alias *alias = model_mode_alias_find(id);
+    return !alias || model_mode_alias_available(
+        alias, server_model_id_from_engine(engine), ds4_engine_has_vision(engine));
 }
 
 static void stop_list_clear(stop_list *stops) {
@@ -3680,8 +3733,9 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
-    r->think_mode = ds4_think_mode_for_context(
-        think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    r->think_mode = model_alias_apply_thinking(
+        r->model, think_mode_from_enabled(thinking_enabled, reasoning_effort),
+        ctx_size);
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
@@ -3890,8 +3944,9 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
-    r->think_mode = ds4_think_mode_for_context(
-        think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    r->think_mode = model_alias_apply_thinking(
+        r->model, think_mode_from_enabled(thinking_enabled, reasoning_effort),
+        ctx_size);
     if (!anthropic_validate_tool_results(s, &msgs,
                                          &r->anthropic_requires_live_tool_state,
                                          err, errlen))
@@ -4907,8 +4962,9 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     r->has_tools = active_tool_schemas && active_tool_schemas[0];
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
-    r->think_mode = ds4_think_mode_for_context(
-        think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    r->think_mode = model_alias_apply_thinking(
+        r->model, think_mode_from_enabled(thinking_enabled, reasoning_effort),
+        ctx_size);
     if (!responses_validate_tool_outputs(s, &msgs, r->think_mode,
                                          &r->responses_requires_live_tool_state,
                                          &r->responses_requires_live_reasoning,
@@ -5113,8 +5169,9 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
     }
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
-    r->think_mode = ds4_think_mode_for_context(
-        think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    r->think_mode = model_alias_apply_thinking(
+        r->model, think_mode_from_enabled(thinking_enabled, reasoning_effort),
+        ctx_size);
     chat_msgs msgs = {0};
     chat_msg sys = {0};
     sys.role = xstrdup("system");
@@ -13474,9 +13531,10 @@ static void append_model_json_values(buf *b, const char *id, const char *name,
 }
 
 static void append_model_json(buf *b, const server *s, const char *id) {
+    const model_mode_alias *alias = model_mode_alias_find(id);
     append_model_json_values(b,
                              id,
-                             ds4_engine_model_name(s->engine),
+                             alias ? alias->name : ds4_engine_model_name(s->engine),
                              s->ctx_size,
                              s->default_tokens);
 }
@@ -13503,6 +13561,12 @@ static bool send_models(server *s, int fd) {
         append_model_json(&b, s, "deepseek-v4-flash");
         buf_putc(&b, ',');
         append_model_json(&b, s, "deepseek-v4-pro");
+    }
+    for (size_t i = 0; i < sizeof(model_mode_aliases) / sizeof(model_mode_aliases[0]); i++) {
+        const model_mode_alias *alias = &model_mode_aliases[i];
+        if (!server_model_alias_available(s->engine, alias->id)) continue;
+        buf_putc(&b, ',');
+        append_model_json(&b, s, alias->id);
     }
     buf_puts(&b, "]}\n");
     bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
@@ -13640,7 +13704,7 @@ static void *client_main(void *arg) {
     const size_t model_path_prefix_len = strlen(model_path_prefix);
     if (!strcmp(hr.method, "GET") &&
         !strncmp(hr.path, model_path_prefix, model_path_prefix_len) &&
-        server_model_alias_known(hr.path + model_path_prefix_len))
+        server_model_alias_available(s->engine, hr.path + model_path_prefix_len))
     {
         send_model(s, fd, hr.path + model_path_prefix_len);
         http_request_free(&hr);
@@ -13677,6 +13741,13 @@ static void *client_main(void *arg) {
     if (!req.model_from_request) {
         free(req.model);
         req.model = xstrdup(server_model_id_from_engine(s->engine));
+    }
+    if (model_mode_alias_find(req.model) &&
+        !server_model_alias_available(s->engine, req.model)) {
+        http_error(fd, s->enable_cors, 400,
+                   "mode alias does not match the loaded Flash/Vision backend");
+        request_free(&req);
+        goto done;
     }
     if (request_exceeds_context(&req, ctx_size)) {
         http_error_context_length_exceeded(fd, s->enable_cors, &req, req.prompt.len, ctx_size);
@@ -15931,6 +16002,110 @@ static void test_api_thinking_controls_parse(void) {
     mode = DS4_THINK_HIGH;
     TEST_ASSERT(parse_reasoning_effort_value(&openai_effort, &mode));
     TEST_ASSERT(mode == DS4_THINK_HIGH);
+}
+
+static void test_model_mode_alias_controls(void) {
+    const struct {
+        const char *id;
+        ds4_think_mode expected;
+        bool vision;
+    } cases[] = {
+        {"deepseek-v4-flash-nonthinking", DS4_THINK_NONE, false},
+        {"deepseek-v4-flash-thinking-high", DS4_THINK_HIGH, false},
+        {"deepseek-v4-flash-thinking-max", DS4_THINK_MAX, false},
+        {"deepseek-v4-flash-vision-exp-nonthinking", DS4_THINK_NONE, true},
+        {"deepseek-v4-flash-vision-exp-thinking-high", DS4_THINK_HIGH, true},
+        {"deepseek-v4-flash-vision-exp-thinking-max", DS4_THINK_MAX, true},
+    };
+    const int max_ctx = (int)ds4_think_max_min_context();
+    chat_msgs msgs = {0};
+    chat_msg user = {.role = xstrdup("user"), .content = xstrdup("Hello")};
+    chat_msgs_push(&msgs, user);
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const model_mode_alias *alias = model_mode_alias_find(cases[i].id);
+        TEST_ASSERT(server_model_alias_known(cases[i].id));
+        /* Client-injected thinking defaults cannot change an explicit mode ID. */
+        const ds4_think_mode requested[] = {DS4_THINK_NONE, DS4_THINK_HIGH, DS4_THINK_MAX};
+        for (size_t j = 0; j < sizeof(requested) / sizeof(requested[0]); j++) {
+            ds4_think_mode mode = model_alias_apply_thinking(
+                cases[i].id, requested[j], max_ctx);
+            TEST_ASSERT(mode == cases[i].expected);
+            char *prompt = render_chat_prompt_text(&msgs, NULL, NULL, mode);
+            TEST_ASSERT(strstr(prompt, cases[i].expected == DS4_THINK_NONE ?
+                               "<｜Assistant｜></think>" : "<｜Assistant｜><think>") != NULL);
+            TEST_ASSERT((strstr(prompt, ds4_think_max_prefix()) != NULL) ==
+                        (cases[i].expected == DS4_THINK_MAX));
+            free(prompt);
+        }
+        TEST_ASSERT(model_alias_apply_thinking(cases[i].id, DS4_THINK_NONE, max_ctx - 1) ==
+                    (cases[i].expected == DS4_THINK_MAX ? DS4_THINK_HIGH : cases[i].expected));
+        TEST_ASSERT(model_mode_alias_available(alias, "deepseek-v4-flash", cases[i].vision));
+        TEST_ASSERT(!model_mode_alias_available(alias, "deepseek-v4-flash", !cases[i].vision));
+        TEST_ASSERT(!model_mode_alias_available(alias, "deepseek-v4-pro", cases[i].vision));
+        TEST_ASSERT(!model_mode_alias_available(alias, "glm-5.2", cases[i].vision));
+        TEST_ASSERT(!model_mode_alias_available(alias, "glm-5.3-flash", cases[i].vision));
+    }
+    /* Generic and legacy aliases still use the mode resolved from the body. */
+    TEST_ASSERT(model_alias_apply_thinking("deepseek-v4-flash", DS4_THINK_NONE, max_ctx) == DS4_THINK_NONE);
+    TEST_ASSERT(model_alias_apply_thinking("deepseek-chat", DS4_THINK_HIGH, max_ctx) == DS4_THINK_HIGH);
+    TEST_ASSERT(model_alias_apply_thinking("deepseek-reasoner", DS4_THINK_NONE, max_ctx) == DS4_THINK_NONE);
+    TEST_ASSERT(model_alias_apply_thinking("glm-5.3-flash", DS4_THINK_MAX, max_ctx) == DS4_THINK_MAX);
+    TEST_ASSERT(model_alias_apply_thinking(NULL, DS4_THINK_HIGH, max_ctx) == DS4_THINK_HIGH);
+    TEST_ASSERT(!server_model_alias_known("deepseek-v4-flash-thinking-max-extra"));
+    TEST_ASSERT(!server_model_alias_available(NULL, "deepseek-v4-flash-vision-exp-thinking-high"));
+    TEST_ASSERT(!server_model_alias_available(NULL, "unknown-model"));
+    chat_msgs_free(&msgs);
+}
+
+static void test_model_mode_alias_http_metadata(void) {
+    const char *paths[] = {
+        "/v1/models",
+        "/v1/models/deepseek-v4-flash-thinking-high",
+        "/v1/models/deepseek-v4-flash-vision-exp-thinking-high",
+    };
+    server s = {0};
+    s.ctx_size = 32768;
+    s.default_tokens = 393216;
+    pthread_mutex_init(&s.mu, NULL);
+    pthread_cond_init(&s.clients_cv, NULL);
+    const bool flash = !strcmp(server_model_id_from_engine(NULL), "deepseek-v4-flash");
+    for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+        int sv[2] = {-1, -1};
+        int rc = socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+        TEST_ASSERT(rc == 0);
+        if (rc != 0) continue;
+        buf wire = {0};
+        buf_printf(&wire, "GET %s HTTP/1.1\r\nHost: localhost\r\n\r\n", paths[i]);
+        TEST_ASSERT(send_all(sv[1], wire.ptr, wire.len));
+        shutdown(sv[1], SHUT_WR);
+        client_arg *arg = xmalloc(sizeof(*arg));
+        *arg = (client_arg){.srv = &s, .fd = sv[0]};
+        s.clients = 1;
+        client_main(arg);
+        char *out = read_socket_text(sv[1]);
+        TEST_ASSERT(s.clients == 0);
+        TEST_ASSERT(strstr(out, (i == 0 || (i == 1 && flash)) ?
+                           "HTTP/1.1 200" : "HTTP/1.1 404") != NULL);
+        if (i == 0 || (i == 1 && flash)) {
+            TEST_ASSERT(strstr(out, "\"context_length\":32768") != NULL);
+            TEST_ASSERT(strstr(out, "\"max_completion_tokens\":32768") != NULL);
+            TEST_ASSERT((strstr(out, "\"id\":\"deepseek-v4-flash-thinking-high\"") != NULL) == flash);
+            TEST_ASSERT(strstr(out, "deepseek-v4-flash-vision-exp-") == NULL);
+            if (flash) TEST_ASSERT(strstr(out, "DeepSeek V4 Flash (Thinking High)") != NULL);
+            if (i == 0 && flash) {
+                TEST_ASSERT(strstr(out, "\"id\":\"deepseek-v4-flash\"") != NULL);
+                TEST_ASSERT(strstr(out, "\"id\":\"deepseek-v4-pro\"") != NULL);
+                TEST_ASSERT(strstr(out, "\"id\":\"deepseek-v4-flash-nonthinking\"") != NULL);
+                TEST_ASSERT(strstr(out, "\"id\":\"deepseek-v4-flash-thinking-max\"") != NULL);
+            }
+        }
+        free(out);
+        buf_free(&wire);
+        close(sv[1]);
+    }
+    pthread_cond_destroy(&s.clients_cv);
+    pthread_mutex_destroy(&s.mu);
 }
 
 static void test_render_think_max_prompt_prefix(void) {
@@ -19412,6 +19587,8 @@ static void ds4_server_unit_tests_run(void) {
     test_reasoning_effort_mapping();
     test_model_alias_thinking_controls();
     test_api_thinking_controls_parse();
+    test_model_mode_alias_controls();
+    test_model_mode_alias_http_metadata();
     test_render_think_max_prompt_prefix();
     test_render_non_thinking_prompt_closes_think();
     test_render_drops_old_reasoning_without_tools();
