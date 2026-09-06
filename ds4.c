@@ -64259,8 +64259,19 @@ int ds4_chat_append_multimodal_message(
     }
     const bool tool = !strcmp(role, "tool") || !strcmp(role, "function");
     const bool user = !strcmp(role, "user");
-    if ((DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA &&
-         e->vision_kind != DS4_VISION_DEEPSEEK4) || (!tool && !user)) {
+    if (!tool && !user) {
+        if (error && error_cap)
+            snprintf(error, error_cap,
+                     "multimodal messages require a supported user or tool role");
+        return 0;
+    }
+    /* Images need a vision encoder; text-only tool observations are plain
+     * chat turns and must work on vision-less engines (e.g. DeepSeek without
+     * --vision).  Requiring vision for them made every tool result fail to
+     * append, which forced spurious compactions and "context full". */
+    if (image_count != 0 &&
+        (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA &&
+         e->vision_kind != DS4_VISION_DEEPSEEK4)) {
         if (error && error_cap)
             snprintf(error, error_cap,
                      "multimodal messages require a supported user or tool role");
@@ -64275,9 +64286,15 @@ int ds4_chat_append_multimodal_message(
 
     const int old_len = tokens->len;
     ds4_vocab *vocab = &e->vocab;
+    const bool glm_family = DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA;
     if (tool) {
-        if (vocab->observation_id >= 0) token_vec_push(tokens, vocab->observation_id);
-        tokenize_rendered_chat_vocab(vocab, "<tool_response>", tokens);
+        if (glm_family) {
+            if (vocab->observation_id >= 0) token_vec_push(tokens, vocab->observation_id);
+            tokenize_rendered_chat_vocab(vocab, "<tool_response>", tokens);
+        } else {
+            token_vec_push(tokens, vocab->user_id);
+            bpe_tokenize_text(vocab, "<tool_result>", tokens);
+        }
     } else {
         token_vec_push(tokens, vocab->user_id);
     }
@@ -64285,10 +64302,13 @@ int ds4_chat_append_multimodal_message(
     size_t moved = 0;
     for (size_t i = 0; i <= image_count; i++) {
         const char *text = text_parts[i] ? text_parts[i] : "";
-        if (tool)
-            bpe_tokenize_tool_response_text(vocab, text, tokens);
-        else
+        if (!tool) {
             bpe_tokenize_text(vocab, text, tokens);
+        } else if (glm_family) {
+            bpe_tokenize_tool_response_text(vocab, text, tokens);
+        } else {
+            bpe_tokenize_tool_result_text(vocab, text, tokens);
+        }
         if (i == image_count) break;
         if (!ds4_prompt_append_vision(e, tokens, &spans[i], &embeddings[i],
                                       error, error_cap)) {
@@ -64301,8 +64321,10 @@ int ds4_chat_append_multimodal_message(
         }
         moved++;
     }
-    if (tool)
-        tokenize_rendered_chat_vocab(vocab, "</tool_response>", tokens);
+    if (tool && glm_family)
+        tokenize_rendered_chat_vocab(vocab, "&lt;/tool_response>", tokens);
+    else if (tool)
+        bpe_tokenize_text(vocab, "</tool_result>", tokens);
     return 1;
 }
 
