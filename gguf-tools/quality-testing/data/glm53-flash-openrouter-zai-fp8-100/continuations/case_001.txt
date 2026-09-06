@@ -1,0 +1,15 @@
+# TCP Echo Server Design for Slow Clients
+
+## Problem
+A naive echo server (read → write → repeat, one client at a time) blocks on slow clients: a client that reads slowly stalls the server's `send()`, starving everyone else.
+
+## Core Design: Non-blocking I/O with Event Loop
+
+**Model:** Single-threaded event loop using `epoll`/`kqueue`/`poll`, non-blocking sockets, per-connection output buffers.
+
+### Key Components
+
+1. **Connection state** — each client gets:
+   - Socket fd (set non-blocking)
+   - Input buffer
+   - **

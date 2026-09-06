@@ -1,0 +1,15 @@
+# Online Softmax Explained
+
+## The Problem
+
+Softmax needs the **maximum value** across all elements first:
+
+$$\text{softmax}(x_i) = \frac{e^{x_i - m}}{\sum_j e^{x_j - m}}$$
+
+where `m = max(x)`. In attention, scores for all keys must be computed before softmax — but that means storing all of them in memory (this is why standard attention is memory-hungry).
+
+**Online softmax** computes the result in a streaming fashion, processing one score at a time.
+
+## Setup with Simple Variables
+
+Say we have 

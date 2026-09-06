@@ -1,0 +1,8 @@
+## How a Ring Buffer Wraps
+
+A ring buffer (also called a circular buffer) is a fixed-size data structure that uses a single, contiguous block of memory but treats it as if it were circular. Here's how the wrapping works:
+
+### Basic Structure
+```c
+typedef struct {
+    int* data

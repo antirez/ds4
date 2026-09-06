@@ -1,0 +1,10 @@
+Il vantaggio principale della cache è **la velocità di accesso ai dati**.
+
+La frase completa potrebbe essere:
+
+*"Il vantaggio principale della cache è la sua elevata velocità di accesso, poiché memorizza i dati più frequentemente utilizzati in una memoria temporanea molto più rapida rispetto alla memoria principale."*
+
+**Perché la cache è vantaggiosa:**
+- Riduce i tempi di accesso ai dati (la cache è molto più veloce della RAM o del disco)
+- Migliora le prestazioni complessive del sistema
+-

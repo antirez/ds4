@@ -1,0 +1,15 @@
+# Testare un Parser da Riga di Comando: Guida ai Casi Limite
+
+## 1. Strategia generale
+
+Un parser CLI va testato a tre livelli:
+- **Unit test** delle singole funzioni di parsing
+- **Test di integrazione** dell'interfaccia completa
+- **Test end-to-end** eseguendo il binario come farebbe l'utente
+
+## 2. Categorie di casi limite
+
+### Input vuoti e mancanti
+```bash
+./programma                    # nessun argomento
+./programma ""                 # string

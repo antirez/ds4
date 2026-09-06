@@ -1,0 +1,1 @@
+A compiler uses an abstract syntax tree (AST) as its central, hierarchical representation of the source code's structure, stripping away syntactic details like parentheses, semicolons, and formatting to focus purely on the logical meaning and operator precedence. After the parser builds the AST from the token stream, the compiler traverses this tree

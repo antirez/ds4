@@ -1,0 +1,4 @@
+To understand the difference between **latency** and **throughput**, imagine a **water pipeline**.
+
+- **Latency** is how long it takes for a single drop of water to travel from the start of the pipe to the end.
+- **Throughput** is how many gallons of water flow through the entire pipe

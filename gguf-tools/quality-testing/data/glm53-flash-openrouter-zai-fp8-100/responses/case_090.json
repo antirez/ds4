@@ -1,0 +1,46 @@
+{
+  "id": "gen-1787762384-vhWIA9dUQsW2Y1xLZMFO",
+  "object": "chat.completion",
+  "created": 1787762384,
+  "model": "z-ai/glm-5.3-flash",
+  "provider": "Z.AI",
+  "system_fingerprint": null,
+  "service_tier": null,
+  "choices": [
+    {
+      "index": 0,
+      "logprobs": null,
+      "finish_reason": "length",
+      "native_finish_reason": "length",
+      "message": {
+        "role": "assistant",
+        "content": "# Calibration Data in Neural Network Quantization\n\n## What It Is\n\nCalibration data is a small, representative sample of real inputs (typically hundreds to thousands of examples) used during **post-training quantization (PTQ)** to estimate the statistical properties of network activations.\n\n## Why It's Needed\n\nQuantization maps continuous values to a discrete set of levels. While weights are directly available, the ranges of **activations** depend on the input data. Calibration data lets you observe actual activation distributions to determine:\n\n- **Dynamic range** — min/max values per layer or channel\n- **Percentiles/clipping thresholds** — e.g",
+        "refusal": null,
+        "reasoning": null
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 25,
+    "completion_tokens": 128,
+    "total_tokens": 153,
+    "cost": 3.3875e-05,
+    "is_byok": false,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "cache_write_tokens": 0,
+      "audio_tokens": 0,
+      "video_tokens": 0
+    },
+    "cost_details": {
+      "upstream_inference_cost": 3.3875e-05,
+      "upstream_inference_prompt_cost": 1.875e-06,
+      "upstream_inference_completions_cost": 3.2e-05
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 0,
+      "image_tokens": 0,
+      "audio_tokens": 0
+    }
+  }
+}

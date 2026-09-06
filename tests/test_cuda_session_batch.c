@@ -11,6 +11,10 @@
  *
  * Run with:
  *   DS4_TEST_MODEL=/path/to/model.gguf make test-cuda-session-batch
+ * Set DS4_TEST_CUDA_SINGLE_GPU=1 for the ordinary one-GPU CUDA path used by
+ * models such as GLM on DGX Spark.
+ * Set DS4_TEST_PROMPT_OFFSET=N to rotate which built-in prompt runs first.
+ * Set DS4_TEST_QUALITY=1 to run the engine's reference-quality CUDA paths.
  * Set DS4_TEST_SERVER_PREFILL=1 to exercise the progress-split prefill path
  * used by ds4-server.
  */
@@ -107,17 +111,20 @@ int main(void) {
         fprintf(stderr, "FAIL: DS4_TEST_MODEL is not set\n");
         return 1;
     }
+    const bool single_gpu = getenv("DS4_TEST_CUDA_SINGLE_GPU") != NULL;
     const bool server_prefill = getenv("DS4_TEST_SERVER_PREFILL") != NULL;
+    const bool quality = getenv("DS4_TEST_QUALITY") != NULL;
 
     int session_count = DEFAULT_SESSION_COUNT;
     const char *session_count_env = getenv("DS4_TEST_SESSION_COUNT");
     if (session_count_env && session_count_env[0]) {
         session_count = atoi(session_count_env);
     }
-    if (session_count < 2 || session_count > MAX_SESSION_COUNT) {
+    const int min_sessions = single_gpu ? 1 : 2;
+    if (session_count < min_sessions || session_count > MAX_SESSION_COUNT) {
         fprintf(stderr,
-                "FAIL: DS4_TEST_SESSION_COUNT must be between 2 and %d\n",
-                MAX_SESSION_COUNT);
+                "FAIL: DS4_TEST_SESSION_COUNT must be between %d and %d\n",
+                min_sessions, MAX_SESSION_COUNT);
         return 1;
     }
 
@@ -158,7 +165,8 @@ int main(void) {
     ds4_gpu_config gpu_cfg = {0};
     bool skip_cuda = false;
     char err[256] = {0};
-    if (parse_gpu_vram_arg("auto", "0,2,4,6,1,3,5,7",
+    if (parse_gpu_vram_arg("auto",
+                           single_gpu ? "0" : "0,2,4,6,1,3,5,7",
                            &gpu_cfg, &skip_cuda, err, sizeof(err)) != 0 ||
         skip_cuda) {
         fprintf(stderr, "FAIL: GPU configuration: %s\n", err);
@@ -169,7 +177,8 @@ int main(void) {
         .model_path = model,
         .backend = DS4_BACKEND_CUDA,
         .n_threads = 1,
-        .cuda_tensor_parallel = true,
+        .quality = quality,
+        .cuda_tensor_parallel = !single_gpu,
         .share_session_prefill_workspace = true,
         .placement_ctx_hint = (uint32_t)test_ctx,
     };
@@ -182,9 +191,20 @@ int main(void) {
     ds4_session *batched[MAX_SESSION_COUNT] = {0};
     ds4_tokens prompt[MAX_SESSION_COUNT] = {0};
     const int prompt_count = (int)(sizeof(prompts) / sizeof(prompts[0]));
+    int prompt_offset = 0;
+    const char *prompt_offset_env = getenv("DS4_TEST_PROMPT_OFFSET");
+    if (prompt_offset_env && prompt_offset_env[0]) {
+        prompt_offset = atoi(prompt_offset_env);
+    }
+    if (prompt_offset < 0 || prompt_offset >= prompt_count) {
+        fprintf(stderr,
+                "FAIL: DS4_TEST_PROMPT_OFFSET must be between 0 and %d\n",
+                prompt_count - 1);
+        return 1;
+    }
     for (int i = 0; i < session_count; i++) {
         const char *prompt_text = long_prompt && (i & 1) == 0
-            ? long_prompt : prompts[i % prompt_count];
+            ? long_prompt : prompts[(i + prompt_offset) % prompt_count];
         ds4_encode_chat_prompt(engine, NULL, prompt_text, DS4_THINK_NONE,
                                &prompt[i]);
         if (long_prompt && (i & 1) == 0) {
@@ -237,7 +257,8 @@ int main(void) {
         }
         if (step == DECODE_STEPS) break;
 
-        const int group = !power_of_two ? session_count :
+        const int group = session_count == 1 ? 1 :
+                          !power_of_two ? session_count :
                           step % 3 == 0 ? session_count :
                           step % 3 == 1 ? session_count / 2 :
                                           session_count / 4 > 1
@@ -346,9 +367,10 @@ int main(void) {
     }
 
     fprintf(stderr,
-            "test_cuda_session_batch PASS sessions=%d steps=%d "
+            "test_cuda_session_batch PASS mode=%s sessions=%d steps=%d "
             "worst_logit_abs=%g nonexact_logits=%d\n",
-            session_count, DECODE_STEPS, worst_abs, nonexact);
+            single_gpu ? "single-gpu" : "tp", session_count, DECODE_STEPS,
+            worst_abs, nonexact);
 
     free(actual);
     free(expected_argmax);

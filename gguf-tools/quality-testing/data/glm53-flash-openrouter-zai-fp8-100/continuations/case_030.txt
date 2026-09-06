@@ -1,0 +1,10 @@
+# Ricerca Binaria del Punto di Inserimento
+
+## Concetto
+
+La **ricerca binaria del punto di inserimento** (binary search for insertion point) serve a trovare la posizione in cui un elemento dovrebbe essere inserito in una lista ordinata, mantenendo l'ordinamento. È alla base di algoritmi come l'**insertion sort ottimizzato** e di funzioni come `bisect` in Python.
+
+## Idea
+
+Come nella ricerca binaria classica, si sfrutta l'ordinamento:
+- Si confronta il valore cercato con l'elemento centrale.

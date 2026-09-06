@@ -1,0 +1,7 @@
+Here is a plain-language explanation:
+
+**A confidence interval is a "best guess range" with a built-in guarantee.**
+
+Imagine you want to know the average height of all students in a school of 5,000 people. You can't measure everyone, so you measure a random sample of 50 students. 
+
+-

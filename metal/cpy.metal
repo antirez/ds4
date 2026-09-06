@@ -245,3 +245,39 @@ kernel void kernel_dsv4_flash_kv_stage_f16(
             : 0xfbffu;
     }
 }
+
+
+// Tiled-row expansion of a small table: dst row t = src row (pos0 + t) % ratio.
+// Replaces the per-segment copies the compressor store used to encode (one
+// dispatch per prefill layer instead of n_tokens/ratio single-threadgroup
+// copies).  Values are identical to the contiguous copies.
+struct ds4_cpy_tile_rows_args {
+    uint n_total;   // n_tokens * width
+    uint width;
+    uint ratio;
+    uint pos0;
+};
+
+kernel void kernel_cpy_tile_rows_f16_f32(
+        constant ds4_cpy_tile_rows_args & args,
+        device const half  * src,
+        device       float * dst,
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= args.n_total) return;
+    const uint t = gid / args.width;
+    const uint e = gid - t * args.width;
+    const uint r = (args.pos0 + t) % args.ratio;
+    dst[gid] = (float)src[r * args.width + e];
+}
+
+kernel void kernel_cpy_tile_rows_f32_f32(
+        constant ds4_cpy_tile_rows_args & args,
+        device const float * src,
+        device       float * dst,
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= args.n_total) return;
+    const uint t = gid / args.width;
+    const uint e = gid - t * args.width;
+    const uint r = (args.pos0 + t) % args.ratio;
+    dst[gid] = src[r * args.width + e];
+}

@@ -1,0 +1,4 @@
+Here is an explanation of why a page cache makes a second file read faster, broken down into the mechanics and the underlying principle.
+
+### The Core Principle: Locality of Reference
+The fundamental reason is **temporal locality**. This means that if you access a piece of data once, you are highly likely to access it

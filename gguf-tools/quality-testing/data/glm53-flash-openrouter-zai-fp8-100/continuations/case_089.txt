@@ -1,0 +1,14 @@
+# Hash Table Collision Handling
+
+A **collision** occurs when two different keys hash to the same index. Since hash functions can't guarantee unique outputs for all inputs, collisions are inevitable (see the *pigeonhole principle*). Here's how they're handled:
+
+## 1. Chaining (Separate Chaining)
+
+Each bucket stores a linked list (or dynamic array) of all entries that hash to that index.
+
+```
+Index 0: → ("apple", 3) → ("banana", 7)
+Index 1: (empty)
+Index 2: → ("cherry", 5)
+```
+

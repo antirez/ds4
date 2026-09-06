@@ -1,0 +1,10 @@
+# Why Small Logit Differences Can Change Greedy Continuations
+
+## The Core Mechanism: Argmax Is a Discrete Operation
+
+Greedy decoding takes `argmax` over logits at each step. Argmax is **not continuous** — it only cares about *which* logit is largest, not by how much. So:
+
+- If logits are `[5.2, 5.1, ...]`, the top token wins by 0.1
+- If a tiny perturbation makes them `[5.15, 5.16, ...]`, the argmax flips entirely
+
+The output token changes completely

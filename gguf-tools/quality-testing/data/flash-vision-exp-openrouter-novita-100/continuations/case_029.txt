@@ -1,0 +1,3 @@
+To compare two model quantizations (e.g., Q4_K_M vs. Q8_0, or FP16 vs. INT8) **without relying on a single "correct" answer**, you must shift your evaluation from *accuracy* to **behavioral fidelity** and **task-specific utility**. 
+
+Here is

@@ -1,0 +1,9 @@
+Here's pseudocode for a binary heap push operation (also called insert or sift-up):
+
+```
+function heapPush(heap, value):
+    // Add the new value at the end of the heap
+    heap.append(value)
+    
+    // Get the index of the newly added element
+    index = heap.length -

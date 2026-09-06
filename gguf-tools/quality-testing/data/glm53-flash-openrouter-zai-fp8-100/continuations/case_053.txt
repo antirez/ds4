@@ -1,0 +1,25 @@
+```json
+{
+  "type": "object",
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Nome della funzione da chiamare"
+    },
+    "arguments": {
+      "type": "object",
+      "description": "Argomenti della funzione come oggetto chiave-valore"
+    }
+  },
+  "required": ["name", "arguments"],
+  "additionalProperties": false
+}
+```
+
+Esempio di istanza valida:
+
+```json
+{
+  "name": "get_weather",
+  "arguments": {
+    "city

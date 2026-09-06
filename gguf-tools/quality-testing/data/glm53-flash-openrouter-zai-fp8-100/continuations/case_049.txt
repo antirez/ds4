@@ -1,0 +1,13 @@
+# Why 50 Prompts Beat One "Favorite" Prompt
+
+## The Core Problem with a Single Prompt
+
+Testing one prompt tells you how the model performs on **one task, phrased one way**. That's a single data point — and it's vulnerable to:
+
+- **Luck**: The model may have nailed (or flubbed) that specific example by chance
+- **Overfitting to your workflow**: Your favorite prompt may reflect your style, not typical use
+- **Hidden biases**: You may have unconsciously kept the prompt because it worked once
+
+## What 50 Prompts Reveal
+
+### 

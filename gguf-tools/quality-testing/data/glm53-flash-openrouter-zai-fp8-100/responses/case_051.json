@@ -1,0 +1,46 @@
+{
+  "id": "gen-1787762246-lj9eY3toQmZrimiaVA5S",
+  "object": "chat.completion",
+  "created": 1787762246,
+  "model": "z-ai/glm-5.3-flash",
+  "provider": "Z.AI",
+  "system_fingerprint": null,
+  "service_tier": null,
+  "choices": [
+    {
+      "index": 0,
+      "logprobs": null,
+      "finish_reason": "length",
+      "native_finish_reason": "length",
+      "message": {
+        "role": "assistant",
+        "content": "# Perché piccole differenze nei logit possono cambiare la continuazione greedy\n\n## Il meccanismo di base\n\nLa decodifica greedy seleziona sempre il token con **logit massimo**:\n\n$$\\text{token} = \\arg\\max_i \\; z_i$$\n\ndove $z_i$ sono i logit. La decisione dipende solo dall'**ordinamento** dei logit, non dalla loro magnitudine. Questo rende la scelta estremamente sensibile a perturbazioni.\n\n## Le ragioni principali\n\n### 1. Differenze piccole",
+        "refusal": null,
+        "reasoning": null
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 29,
+    "completion_tokens": 128,
+    "total_tokens": 157,
+    "cost": 3.4175e-05,
+    "is_byok": false,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "cache_write_tokens": 0,
+      "audio_tokens": 0,
+      "video_tokens": 0
+    },
+    "cost_details": {
+      "upstream_inference_cost": 3.4175e-05,
+      "upstream_inference_prompt_cost": 2.175e-06,
+      "upstream_inference_completions_cost": 3.2e-05
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 0,
+      "image_tokens": 0,
+      "audio_tokens": 0
+    }
+  }
+}

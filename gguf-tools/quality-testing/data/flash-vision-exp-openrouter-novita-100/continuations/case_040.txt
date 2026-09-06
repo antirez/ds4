@@ -1,0 +1,4 @@
+Here are the first five measurements to take when diagnosing generation slowdowns at long context, ordered from **most likely to reveal the bottleneck** to **most granular**:
+
+**1. Time-to-First-Token (TTFT) vs. Time-Per-Token (TPT)**
+- **Why first:** This splits

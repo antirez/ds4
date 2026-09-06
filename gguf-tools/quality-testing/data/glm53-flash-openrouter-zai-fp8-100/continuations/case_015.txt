@@ -1,0 +1,16 @@
+# Inserimento in un Heap Binario (Min-Heap)
+
+## Pseudocodice
+
+```
+FUNZIONE Inserisci(heap, elemento)
+    // Aggiungi l'elemento in fondo all'heap
+    heap[heap.dimensione] ← elemento
+    indice ← heap.dimensione
+    heap.dimensione ← heap.dimensione + 1
+    
+    // Ripristina la proprietà dell'heap (Heapify-Up / Sift-Up)
+    MENTRE indice > 0 FAI
+        genitore ← (indice - 1) DIV 2
+        
+        SE heap[indice

@@ -1,0 +1,1 @@
+Descrivi come confrontare due quantizzazioni senza fidarsi di una sola risposta.

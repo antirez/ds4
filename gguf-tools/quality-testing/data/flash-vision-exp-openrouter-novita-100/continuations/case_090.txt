@@ -1,0 +1,1 @@
+To understand the role of calibration data in neural network quantization, it helps to first recognize that quantization is essentially **a lossy compression technique**. You are taking a continuous range of high-precision floating-point numbers (FP32) and mapping them to a discrete set of lower-precision integers (e.g., INT8).

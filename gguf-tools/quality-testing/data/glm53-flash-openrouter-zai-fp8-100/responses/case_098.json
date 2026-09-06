@@ -1,0 +1,54 @@
+{
+  "id": "gen-1787762404-QWFEyVxDq0l9TGDMqbBo",
+  "object": "chat.completion",
+  "created": 1787762404,
+  "model": "z-ai/glm-5.3-flash",
+  "provider": "Z.AI",
+  "system_fingerprint": null,
+  "service_tier": null,
+  "choices": [
+    {
+      "index": 0,
+      "logprobs": null,
+      "finish_reason": "stop",
+      "native_finish_reason": "stop",
+      "message": {
+        "role": "assistant",
+        "content": "**391**\n\n(17 × 23 = 17 × 20 + 17 × 3 = 340 + 51 = 391)",
+        "refusal": null,
+        "reasoning": "17×23 = 391",
+        "reasoning_details": [
+          {
+            "type": "reasoning.text",
+            "text": "17×23 = 391",
+            "format": "unknown",
+            "index": 0
+          }
+        ]
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 28,
+    "completion_tokens": 41,
+    "total_tokens": 69,
+    "cost": 1.235e-05,
+    "is_byok": false,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "cache_write_tokens": 0,
+      "audio_tokens": 0,
+      "video_tokens": 0
+    },
+    "cost_details": {
+      "upstream_inference_cost": 1.235e-05,
+      "upstream_inference_prompt_cost": 2.1e-06,
+      "upstream_inference_completions_cost": 1.025e-05
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 7,
+      "image_tokens": 0,
+      "audio_tokens": 0
+    }
+  }
+}

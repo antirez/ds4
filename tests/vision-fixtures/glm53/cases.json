@@ -1,0 +1,46 @@
+[
+  {
+    "name": "diagram",
+    "image": "diagram.png",
+    "prompt": "Read the diagram. List the three box labels from left to right, and say which box immediately follows ENCODER.",
+    "required": ["input", "encoder", "summary"],
+    "forbidden": ["decoder"]
+  },
+  {
+    "name": "ocr",
+    "image": "text.png",
+    "prompt": "Transcribe the venue, train, gate, departure time, seat, and access code exactly as shown. Do not guess missing fields.",
+    "required": ["north harbor", "482", "c7", "19:45", "14a", "mint-731"]
+  },
+  {
+    "name": "spatial",
+    "image": "spatial.png",
+    "prompt": "List the three colored shapes and state where each one is relative to the others.",
+    "required": [
+      "blue circle",
+      "red triangle",
+      "green square",
+      ["upper-left", "upper left", "top-left", "top left"],
+      ["upper-right", "upper right", "top-right", "top right"],
+      ["lower-center", "lower center", "bottom-center", "bottom center", "below both"]
+    ]
+  },
+  {
+    "name": "screenshot",
+    "image": "screenshot.png",
+    "prompt": "Inspect this software screenshot. Which file is selected, did the build pass or fail, what exact error is shown, and what exit status appears?",
+    "required": ["deploy.sh", "failed", "missing cuda_home", "status 2"]
+  },
+  {
+    "name": "photo",
+    "image": "earth.jpg",
+    "prompt": "Describe the main subject of this photograph and name the most clearly visible continent and large island off its southeastern coast.",
+    "required": ["earth", "africa", "madagascar"]
+  },
+  {
+    "name": "unrelated",
+    "image": "spatial.png",
+    "prompt": "Does this image show a train ticket with gate C7? Answer yes or no and briefly state what it actually shows.",
+    "required": [["no.", "no,"], "blue circle", "red triangle", "green square"]
+  }
+]

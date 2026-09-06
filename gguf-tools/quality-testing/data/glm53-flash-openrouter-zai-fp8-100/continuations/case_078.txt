@@ -1,0 +1,10 @@
+# Perché l'errore di quantizzazione colpisce di più gli esperti rari
+
+## Contesto: Modelli Mixture-of-Experts (MoE)
+
+Nei modelli MoE, solo una parte degli "esperti" (reti feed-forward specializzate) viene attivata per ogni token. La quantizzazione comprime i pesi riducendo la precisione numerica (es. da FP16 a INT4), introducendo un **errore di quantizzazione**.
+
+## I motivi principali
+
+### 1. Meno dati per la calibrazione
+Gli esp

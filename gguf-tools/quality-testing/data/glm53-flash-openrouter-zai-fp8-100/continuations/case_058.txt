@@ -1,0 +1,7 @@
+# Checklist: Validazione di un Modello Quantizzato
+
+## 1. Preparazione
+- [ ] Definire un set di test fisso (prompt + risposte attese) dal modello originale non quantizzato
+- [ ] Includere casi semplici, medi e complessi
+- [ ] Documentare versione del modello, metodo di quantizzazione (GGUF, AWQ, GPTQ, ecc.) e livello (4-bit, 8-bit, ecc.)
+- [ ] Fissare i parametri di generazione (temperatura, top-p, seed) per confront

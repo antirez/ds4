@@ -1,0 +1,4 @@
+To understand why RMSNorm (Root Mean Square Normalization) requires a **sum of squares** and a **scaling pass**, we must first look at its mathematical definition and then break down the two operations step-by-step.
+
+### The Mathematical Definition
+RMSNorm normalizes a vector \( x \) by dividing it by its

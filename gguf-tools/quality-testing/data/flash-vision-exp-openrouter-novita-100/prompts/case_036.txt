@@ -1,0 +1,1 @@
+Scrivi un piano breve per testare il chunking di prompt lunghi.
