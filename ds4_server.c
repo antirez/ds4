@@ -5332,16 +5332,22 @@ static char *dsml_unescape_text(const char *s) {
 
 static char *dsml_attr(const char *tag, const char *name) {
     char pat[64];
-    snprintf(pat, sizeof(pat), "%s=\"", name);
-    const char *p = strstr(tag, pat);
-    if (!p) return NULL;
-    p += strlen(pat);
-    const char *q = strchr(p, '"');
-    if (!q) return NULL;
-    char *raw = xstrndup(p, (size_t)(q - p));
-    char *decoded = dsml_unescape_text(raw);
-    free(raw);
-    return decoded;
+    const int patlen = snprintf(pat, sizeof(pat), "%s=\"", name);
+    if (patlen < 0 || (size_t)patlen >= sizeof(pat)) return NULL;
+    /* Anchor the match to an attribute boundary: `name="` must start right after
+     * `<`, the tag name, or whitespace, so it is not matched inside a longer
+     * attribute like `fullname="..."` earlier in the same tag. */
+    for (const char *p = strstr(tag, pat); p; p = strstr(p + 1, pat)) {
+        if (p != tag && !isspace((unsigned char)p[-1]) && p[-1] != '<') continue;
+        const char *v = p + patlen;
+        const char *q = strchr(v, '"');
+        if (!q) return NULL;
+        char *raw = xstrndup(v, (size_t)(q - v));
+        char *decoded = dsml_unescape_text(raw);
+        free(raw);
+        return decoded;
+    }
+    return NULL;
 }
 
 static void tool_call_json_args_add(buf *args, const char *name, const char *value, const char *is_string) {
@@ -16344,6 +16350,30 @@ static void test_parse_glm_tool_call_message(void) {
     tool_calls_free(&calls);
 }
 
+static void test_dsml_attr_anchors_attribute_name(void) {
+    /* A preceding attribute whose name ends in the sought name (here `fullname`
+     * vs `name`) must not be matched: the value belongs to the real `name`. */
+    char *v = dsml_attr("<invoke fullname=\"wrong\" name=\"right\">", "name");
+    TEST_ASSERT(v && !strcmp(v, "right"));
+    free(v);
+
+    /* The ordinary single-attribute case still resolves. */
+    v = dsml_attr("<invoke name=\"tool\">", "name");
+    TEST_ASSERT(v && !strcmp(v, "tool"));
+    free(v);
+
+    /* A parameter named with a `string` suffix must not shadow the real
+     * `string=` type attribute that follows it. */
+    v = dsml_attr("<parameter name=\"mystring\" string=\"false\">", "string");
+    TEST_ASSERT(v && !strcmp(v, "false"));
+    free(v);
+
+    /* A genuinely absent attribute stays absent. */
+    v = dsml_attr("<invoke fullname=\"x\">", "name");
+    TEST_ASSERT(v == NULL);
+    free(v);
+}
+
 static void test_dsml_parser_recovers_loose_nested_parameters(void) {
     const char *generated =
         "review done\n\n"
@@ -19430,6 +19460,7 @@ static void ds4_server_unit_tests_run(void) {
     test_responses_input_tool_search_output_rejects_bad_tools();
     test_responses_input_function_call_namespace_round_trips_to_dsml();
     test_responses_output_sends_tool_search_call_item();
+    test_dsml_attr_anchors_attribute_name();
     test_dsml_tool_args_preserve_call_order();
     test_openai_tool_args_preserve_call_order();
     test_anthropic_thinking_and_tool_args_preserve_call_order();
