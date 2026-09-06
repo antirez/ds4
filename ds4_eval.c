@@ -4092,6 +4092,77 @@ static void eval_prefill_progress(void *ud, const char *event, int current, int 
     if (paused_sec > 0.0) ui->phase_start_sec += paused_sec;
 }
 
+/* Greedy-chain burst decode: carries the per-token bookkeeping of the classic
+ * decode loop so a chained burst emits exactly the same stream, stop checks,
+ * and think-close records. */
+typedef struct {
+    ds4_engine *engine;
+    eval_ui *ui;
+    int idx;
+    int generation_limit;
+    byte_buf *raw;
+    bool *generation_in_think;
+    bool *plain_in_think;
+    eval_think_close_info *think_close;
+    double *t0;
+    bool tty;
+    bool use_plain_color;
+    bool stop;
+    bool quit;
+    bool switch_case;
+} eval_chain_ctx;
+
+static bool eval_chain_on_token(void *vctx, int token) {
+    eval_chain_ctx *c = (eval_chain_ctx *)vctx;
+    eval_ui *ui = c->ui;
+    if (c->tty) {
+        tui_consume_input(ui);
+        if (tui_has_quit_request(ui)) { c->quit = true; return false; }
+        if (tui_has_switch_request(ui, c->idx)) { c->switch_case = true; return false; }
+        double paused_sec = tui_wait_if_paused(ui, ui->in_think ? "thinking" : "answer");
+        if (paused_sec > 0.0) {
+            ui->phase_start_sec += paused_sec;
+            *c->t0 += paused_sec;
+        }
+        if (tui_has_quit_request(ui)) { c->quit = true; return false; }
+        if (tui_has_switch_request(ui, c->idx)) { c->switch_case = true; return false; }
+    }
+
+    if (ds4_token_is_stop(c->engine, token)) { c->stop = true; return false; }
+    size_t len = 0;
+    char *text = ds4_token_text(c->engine, token, &len);
+    buf_append(c->raw, text, len);
+    ui->generated++;
+    ui->generated_tokens[c->idx] = ui->generated;
+    tui_run_clock_tick(ui);
+    if (*c->generation_in_think && c->raw->v && strstr(c->raw->v, "</think>")) {
+        *c->generation_in_think = false;
+        if (c->think_close->kind == EVAL_THINK_CLOSE_NONE) {
+            c->think_close->kind = EVAL_THINK_CLOSE_NATURAL;
+            c->think_close->token_index = ui->generated;
+            c->think_close->remaining_budget =
+                c->generation_limit - ui->generated + 1;
+            c->think_close->rank = 0;
+        }
+    }
+    double elapsed = now_sec() - ui->phase_start_sec;
+    ui->speed_tps = elapsed > 0.001 ? (double)ui->generated / elapsed : 0.0;
+
+    if (c->tty) {
+        stream_append_token_text(ui, text, len, false);
+        tui_refresh(ui, ui->in_think ? "thinking" : "answer");
+    } else {
+        if (*c->plain_in_think && strstr(c->raw->v ? c->raw->v : "", "</think>")) {
+            *c->plain_in_think = false;
+            plain_reset_color(c->use_plain_color);
+        }
+        fwrite(text, 1, len, stdout);
+        fflush(stdout);
+    }
+    free(text);
+    return true;
+}
+
 static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
                                     const eval_config *cfg, eval_ui *ui,
                                     FILE *trace, int idx, int generation_budget,
@@ -4236,6 +4307,12 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
 
     double t0 = ui->phase_start_sec;
     int forced_close_pos = -1;
+    /* Greedy chain bursts keep the token id on-device between evals (same
+     * machinery as the CLI chain decode).  Checked once per case; the burst
+     * branch below re-verifies per iteration that the think-close controller
+     * cannot intervene, so chained and classic decode pick identical tokens. */
+    const bool chain_burst_ok =
+        cfg->temperature <= 0.0f && ds4_session_chain_greedy_supported(session);
     for (int i = 0; i < generation_limit; i++) {
         if (tty) {
             tui_consume_input(ui);
@@ -4334,6 +4411,58 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
                     close_kind = EVAL_THINK_CLOSE_SOFT;
                     token = think_close_tokens.v[0];
                 }
+            }
+        }
+        /* Chained greedy burst: while the think-close controller cannot
+         * intervene (outside its reply-budget window), decode a run of argmax
+         * tokens with the id kept on-device.  The window is where the classic
+         * path may force a non-argmax token, so bursts stop ahead of it. */
+        if (token < 0 && chain_burst_ok && remaining_budget >= 2) {
+            int burst = remaining_budget;
+            if (generation_in_think && think_close_tokens.len > 0) {
+                const int window = think_close_tokens.len == 1
+                    ? cfg->soft_limit_reply_budget
+                    : cfg->hard_limit_reply_budget;
+                burst = remaining_budget - window;
+            }
+            if (burst >= 2) {
+                eval_chain_ctx cctx = {
+                    .engine = engine,
+                    .ui = ui,
+                    .idx = idx,
+                    .generation_limit = generation_limit,
+                    .raw = &raw,
+                    .generation_in_think = &generation_in_think,
+                    .plain_in_think = &plain_in_think,
+                    .think_close = &think_close,
+                    .t0 = &t0,
+                    .tty = tty,
+                    .use_plain_color = use_plain_color,
+                };
+                const int n = ds4_session_eval_chain_greedy(session, burst,
+                                                            eval_chain_on_token,
+                                                            &cctx, NULL,
+                                                            err, sizeof(err));
+                if (n < 0) {
+                    plain_reset_color(use_plain_color);
+                    ui->generated_tokens[idx] = ui->generated;
+                    tui_run_clock_stop(ui);
+                    fprintf(stderr, "ds4-eval: decode failed for %s: %s\n",
+                            tc->id, err);
+                    trace_write_case(trace, cfg, tc, idx, ui->ncases, "ERROR",
+                                     err, system, question,
+                                     raw.v ? raw.v : "", think_mode,
+                                     prompt_tokens, ui->generated, generation_limit,
+                                     now_sec() - t0, "?", &think_close);
+                    free(question);
+                    ds4_tokens_free(&think_close_tokens);
+                    buf_free(&raw);
+                    return EVAL_RUN_ERROR;
+                }
+                if (cctx.stop) break;
+                if (cctx.quit || cctx.switch_case) continue; /* handled above */
+                i += n - 1; /* keep i in lockstep with ui->generated */
+                continue;
             }
         }
         if (token < 0)

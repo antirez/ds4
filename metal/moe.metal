@@ -3444,6 +3444,98 @@ kernel void kernel_dsv4_attn_out_low_q8_0_f32(
         sgitg);
 }
 
+/* Exact one-token DeepSeek V4 Flash decode shape for the attention-output low
+ * projection.  The generic direct wrapper above has to recover the group and
+ * all tensor strides from runtime arguments, then walks a runtime 4096-wide K
+ * loop.  Decode always uses eight 4096 -> 1024 Q8_0 projections here.  Keep
+ * the established NR0=2 / NSG=4 lane mapping and reduction tree, but make the
+ * group offsets, row stride and four K trips literals so the compiler can
+ * eliminate the generic index arithmetic. */
+#define DS4_ATTN_OUT_LOW_Q8_STATIC_GROUPS 8
+#define DS4_ATTN_OUT_LOW_Q8_STATIC_K 4096
+#define DS4_ATTN_OUT_LOW_Q8_STATIC_ROWS 1024
+#define DS4_ATTN_OUT_LOW_Q8_STATIC_BLOCKS 128
+#define DS4_ATTN_OUT_LOW_Q8_STATIC_ROW_BYTES 4352
+#define DS4_ATTN_OUT_LOW_Q8_STATIC_GROUP_BYTES 4456448
+
+static inline void ds4_attn_out_low_q8_static_impl(
+        device const char * src0s,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3 tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    constexpr short NR0 = N_R0_Q8_0;
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NQ = 8;
+    constexpr short NSG = 4;
+
+    const uint group = tgpig.z;
+    const int r0 = (int)tgpig.x * NR0;
+    device const char *src0 = src0s +
+        (uint64_t)group * DS4_ATTN_OUT_LOW_Q8_STATIC_GROUP_BYTES;
+    device const float *y = (device const float *)(src1 +
+        (uint64_t)group * DS4_ATTN_OUT_LOW_Q8_STATIC_K * sizeof(float));
+    device float *out = (device float *)(dst +
+        (uint64_t)group * DS4_ATTN_OUT_LOW_Q8_STATIC_ROWS * sizeof(float));
+
+    device const block_q8_0 *ax[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        ax[row] = (device const block_q8_0 *)(src0 +
+            (uint64_t)(r0 + row) * DS4_ATTN_OUT_LOW_Q8_STATIC_ROW_BYTES);
+    }
+
+    float sumf[NR0] = { 0.0f };
+    const short ix = tiisg / (NW / NQ);
+    const short il = tiisg % (NW / NQ);
+    const int ib0 = sgitg * NQ + ix;
+    device const float *yb = y + ib0 * QK8_0 + il * NQ;
+    float yl[NQ];
+
+    /* Every lane visits ib0 + {0, 32, 64, 96}, exactly as the generic loop. */
+    for (int ib = ib0; ib < DS4_ATTN_OUT_LOW_Q8_STATIC_BLOCKS;
+         ib += NSG * NQ) {
+        for (short i = 0; i < NQ; ++i) {
+            yl[i] = yb[i];
+        }
+
+        for (short row = 0; row < NR0; ++row) {
+            device const int8_t *qs = ax[row][ib].qs + il * NQ;
+            float sumq = 0.0f;
+            FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                sumq += qs[i] * yl[i];
+            }
+            sumf[row] += sumq * ax[row][ib].d;
+        }
+        yb += NSG * NQ * QK8_0;
+    }
+
+    helper_mv_reduce_and_write<NR0>(
+        out, sumf, r0, DS4_ATTN_OUT_LOW_Q8_STATIC_ROWS,
+        tiisg, sgitg, shmem);
+}
+
+kernel void kernel_dsv4_attn_out_low_q8_0_flash_decode_static_f32(
+        constant ds4_metal_args_mul_mv_id & args,
+        device const char * src0s,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    /* This PSO is private to the exact host gate in
+     * ds4_gpu_attention_output_low_q8_tensor.  Avoid repeating that proof in
+     * every shader lane: the point of this specialization is to remove the
+     * dynamic shape arithmetic from this very large dispatch. */
+    ds4_attn_out_low_q8_static_impl(
+        src0s, src1, dst, shmem, tgpig, tiisg, sgitg);
+    (void)args;
+    (void)tiitg;
+}
+
 kernel void kernel_dsv4_attn_out_low_q4_K_f32(
         constant ds4_metal_args_mul_mv_id & args,
         device const char * src0s,
@@ -6694,6 +6786,134 @@ kernel void kernel_mul_mv_id_mxfp4_sum6_tp_full_rows_static_f32(
             out[first_row + row] = value +
                 (args.tp_addend ?
                     ((device const float *)add_in)[first_row + row] : 0.0f);
+        }
+    }
+    (void)tiitg;
+}
+
+/* Layout mirror of ds4_metal_args_dsv4_hc_expand (metal/dsv4_hc.metal); the
+ * files are concatenated into one library with moe.metal first, so the
+ * struct cannot be shared.  Only the decode t=0 fields are read here. */
+struct ds4_metal_args_moe_down_hc4 {
+    int64_t  n_embd;
+    int64_t  n_hc;
+    int64_t  n_tokens;
+    uint64_t nb_block0;
+    uint64_t nb_block1;
+    uint64_t nb_add0;
+    uint64_t nb_add1;
+    uint64_t nb_res0;
+    uint64_t nb_res1;
+    uint64_t nb_res2;
+    uint64_t nb_post0;
+    uint64_t nb_post1;
+    uint64_t nb_comb0;
+    uint64_t nb_comb1;
+    uint64_t nb_comb2;
+    uint64_t nb0;
+    uint64_t nb1;
+    uint64_t nb2;
+    int32_t  has_add;
+};
+
+/* Decode FFN tail fusion on top of the fixed-route full-rows static sum6:
+ *
+ *     after_ffn_hc = HCPost(down_sum6 + shared_out, residual_hc, split)
+ *
+ * The host reorders the layer tail so the plain shared-down Q8_0 matvec
+ * materializes shared_out before this dispatch.  The matvec body, the
+ * routed_out store and the per-row simd_sum are byte-identical to
+ * kernel_mul_mv_id_mxfp4_sum6_fixed_route_full_rows_static_f32; the epilogue
+ * then mirrors kernel_dsv4_shared_down_hc_expand4_q8_0 statement-for-
+ * statement (block_v = routed value; block_v += shared_out[d]; per dst_hc
+ * 0..3: acc = block_v*post, then comb_k*r_k in k order), so the result is
+ * bit-identical to the unfused dispatch pair. */
+kernel void kernel_mul_mv_id_mxfp4_sum6_fixed_route_full_rows_static_hc4_f32(
+        constant ds4_metal_args_mul_mv_id &args,
+        constant ds4_metal_args_moe_down_hc4 &hc,
+        device const char *src0s,
+        device const char *src1,
+        device char *dst,
+        device const char *ids,
+        device const char *add_in,
+        device const char *shared_out,
+        device const char *residual,
+        device const char *post,
+        device const char *comb,
+        device char *hc_dst,
+        threadgroup char *shmem [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiitg [[thread_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    if (hc.n_hc != 4 || hc.n_tokens != 1) {
+        return;
+    }
+    const short NSG = FC_mul_mv_nsg;
+    const uint32_t first_row = (uint32_t)((tgpig.x * NSG + sgitg) * N_R0_MXFP4);
+    device const int32_t *token_ids = (device const int32_t *)ids;
+    device const char *token_src1 = src1;
+    threadgroup float *lut = (threadgroup float *)shmem;
+    if (sgitg == 0) lut[tiisg] = ds4_metal_mxfp4_values[tiisg & 15];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    /* Same defensive fallback as the base kernel: unreachable in production
+     * because the host proves the shape before selecting this pipeline. */
+    const bool static_shape =
+        args.ne00 == DS4_MXFP4_DOWN_STATIC_NB * QK_MXFP4 &&
+        args.nb01 == (uint64_t)DS4_MXFP4_DOWN_STATIC_ROW_BLOCKS *
+                         sizeof(block_mxfp4) &&
+        args.nei0 == DS4_MXFP4_DOWN_STATIC_SLOTS;
+
+    float2 sumf = 0.0f;
+    if (static_shape) {
+        for (short slot = 0; slot < DS4_MXFP4_DOWN_STATIC_SLOTS; slot++) {
+            const int32_t expert = token_ids[slot];
+            device const char *expert_base =
+                src0s + (int64_t)expert * args.nb02;
+            device const float *y =
+                (device const float *)(token_src1 + (uint64_t)slot * args.nb11);
+            sumf += ds4_mxfp4_accumulate_full_rows_static(
+                expert_base, y, first_row, lut, tiisg);
+        }
+    } else {
+        for (int slot = 0; slot < args.nei0; slot++) {
+            const int32_t expert = token_ids[slot];
+            device const char *expert_base =
+                src0s + (int64_t)expert * args.nb02;
+            device const float *y =
+                (device const float *)(token_src1 + (uint64_t)slot * args.nb11);
+            sumf += ds4_mxfp4_accumulate_full_rows(
+                expert_base, args.nb01, y, args.ne00, first_row, lut, tiisg);
+        }
+    }
+
+    device float *out = (device float *)dst;
+    FOR_UNROLL (short row = 0; row < N_R0_MXFP4; row++) {
+        const float value = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            const uint32_t d = first_row + row;
+            out[d] = value +
+                (args.tp_addend ? ((device const float *)add_in)[d] : 0.0f);
+
+            float block_v = out[d];
+            block_v += *((device const float *)(shared_out + (uint64_t)d * sizeof(float)));
+
+            const float r0 = *((device const float *)(residual + (uint64_t)d * hc.nb_res0 + 0 * hc.nb_res1));
+            const float r1 = *((device const float *)(residual + (uint64_t)d * hc.nb_res0 + 1 * hc.nb_res1));
+            const float r2 = *((device const float *)(residual + (uint64_t)d * hc.nb_res0 + 2 * hc.nb_res1));
+            const float r3 = *((device const float *)(residual + (uint64_t)d * hc.nb_res0 + 3 * hc.nb_res1));
+
+            for (int64_t dst_hc = 0; dst_hc < 4; ++dst_hc) {
+                float acc = block_v * *((device const float *)(post + dst_hc * hc.nb_post0));
+
+                acc += *((device const float *)(comb + dst_hc * hc.nb_comb0 + 0 * hc.nb_comb1)) * r0;
+                acc += *((device const float *)(comb + dst_hc * hc.nb_comb0 + 1 * hc.nb_comb1)) * r1;
+                acc += *((device const float *)(comb + dst_hc * hc.nb_comb0 + 2 * hc.nb_comb1)) * r2;
+                acc += *((device const float *)(comb + dst_hc * hc.nb_comb0 + 3 * hc.nb_comb1)) * r3;
+
+                *((device float *)(hc_dst + (uint64_t)d * hc.nb0 + dst_hc * hc.nb1)) = acc;
+            }
         }
     }
     (void)tiitg;

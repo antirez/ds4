@@ -70,8 +70,9 @@ endif
 .PHONY: all help clean test test-rocm test-glm53-kda-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
-.PHONY: metal-decode-schedule-bench metal-prefill-variant-bench check-mxfp4-half-lut
+.PHONY: metal-decode-schedule-bench metal-prefill-variant-bench metal-session-chain-bench check-mxfp4-half-lut
 .PHONY: test-metal-moe-prefill test-metal-dense-mpp
+.PHONY: test-static-mixed-attention-metal test-metal-chain-state test-indexer-leading-query-metal
 
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
 
@@ -82,6 +83,7 @@ help:
 	@echo "  make test         Build and run tests"
 	@echo "  make metal-decode-schedule-bench  Build the balanced Metal decode schedule benchmark"
 	@echo "  make metal-prefill-variant-bench  Build the balanced Metal prefill variant benchmark"
+	@echo "  make metal-session-chain-bench  Build the balanced classic/session-chain benchmark"
 	@echo "  make check-mxfp4-half-lut  Verify the checked-in MXFP4 half LUT matches the generator"
 	@echo "  make test-mxfp4-metal  Check the MXFP4 half LUT, then run Metal MXFP4 exactness tests"
 	@echo "  make dspark-verify-depth  Run DSpark speculative verification smoke if support GGUF is present"
@@ -121,6 +123,15 @@ tests/test_metal_tp_spec: tests/test_metal_tp_spec.o $(CORE_OBJS)
 test-metal-session-batch: tests/test_metal_session_batch
 	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" ./tests/test_metal_session_batch
 
+tests/test_metal_chain_state.o: tests/test_metal_chain_state.c ds4.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_metal_chain_state: tests/test_metal_chain_state.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+test-metal-chain-state: tests/test_metal_chain_state
+	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" ./tests/test_metal_chain_state
+
 speed-bench/metal_decode_schedule_bench.o: speed-bench/metal_decode_schedule_bench.c ds4.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
@@ -137,11 +148,37 @@ speed-bench/metal_prefill_variant_bench: speed-bench/metal_prefill_variant_bench
 
 metal-prefill-variant-bench: speed-bench/metal_prefill_variant_bench
 
+speed-bench/metal_session_chain_bench.o: speed-bench/metal_session_chain_bench.c ds4.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+speed-bench/metal_session_chain_bench: speed-bench/metal_session_chain_bench.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+metal-session-chain-bench: speed-bench/metal_session_chain_bench
+
 tests/test_mxfp4_metal.o: tests/test_mxfp4_metal.c ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
 tests/test_mxfp4_metal: tests/test_mxfp4_metal.o ds4_metal.o ds4_image.o
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+tests/test_static_mixed_attention_metal.o: tests/test_static_mixed_attention_metal.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_static_mixed_attention_metal: tests/test_static_mixed_attention_metal.o ds4_metal.o ds4_image.o
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+test-static-mixed-attention-metal: tests/test_static_mixed_attention_metal
+	./tests/test_static_mixed_attention_metal
+
+tests/test_indexer_leading_query_metal.o: tests/test_indexer_leading_query_metal.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_indexer_leading_query_metal: tests/test_indexer_leading_query_metal.o ds4_metal.o ds4_image.o
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+test-indexer-leading-query-metal: tests/test_indexer_leading_query_metal
+	./tests/test_indexer_leading_query_metal
 
 check-mxfp4-half-lut:
 	python3 metal/generate_mxfp4_half_lut.py --check
@@ -722,6 +759,8 @@ test-quality-api: tests/test_quality_api.c gguf-tools/quality-testing/score_offi
 	./tests/test_quality_api
 
 clean:
+	rm -f speed-bench/metal_session_chain_bench
+	rm -f tests/test_static_mixed_attention_metal tests/test_metal_chain_state tests/test_indexer_leading_query_metal
 	rm -f tests/test_cuda_q8_scratch
 	rm -f tests/test_quality_api
 	rm -f tests/test_linux_memory tests/test_rocm_memory

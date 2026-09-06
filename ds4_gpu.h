@@ -176,6 +176,13 @@ int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
 
+/* Diagnostic GPU stage-counter profiler: timestamp samples taken at decode
+ * stage boundaries without ending the batch command buffer. */
+int ds4_gpu_stage_counters_enabled(void);
+int ds4_gpu_stage_counter_sample(const char *label);
+void ds4_gpu_stage_counter_reset(void);
+void ds4_gpu_stage_counter_report(uint32_t pos);
+
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map);
@@ -252,7 +259,11 @@ enum {
     DS4_GPU_TEST_MXFP4_DOWN_HALF_LUT = 1u << 4,
     DS4_GPU_TEST_OUTPUT_HC_WEIGHTS4 = 1u << 5,
     DS4_GPU_TEST_HC_RMS_SCALE_PROJ = 1u << 6,
+    DS4_GPU_TEST_ATTN_OUT_LOW_Q8_STATIC = 1u << 7,
+    DS4_GPU_TEST_INDEXED_ATTN_PREFILL_RB4 = 1u << 8,
+    DS4_GPU_TEST_BATCH_ATTN_OUT_HC_FUSION = 1u << 9,
 };
+int ds4_gpu_test_get_quality(void);
 void ds4_gpu_test_set_flags(uint32_t flags);
 void ds4_gpu_release_zero_prefix_prefill_mask_cache(void);
 #else
@@ -1186,6 +1197,28 @@ int ds4_gpu_head_rms_norm_rope_tail_tensor(
         float             beta_fast,
         float             beta_slow,
         float             eps);
+
+int ds4_gpu_dsv4_batch_qnorm_rope_kv_finalize_available(void);
+
+int ds4_gpu_dsv4_batch_qnorm_rope_kv_finalize_tensor(
+        ds4_gpu_tensor *q,
+        ds4_gpu_tensor *kv,
+        ds4_gpu_tensor *raw_cache,
+        uint32_t        raw_cap,
+        uint32_t        n_tok,
+        uint32_t        n_head,
+        uint32_t        head_dim,
+        uint32_t        n_rot,
+        uint32_t        pos0,
+        uint32_t        n_ctx_orig,
+        bool            inverse,
+        float           freq_base,
+        float           freq_scale,
+        float           ext_factor,
+        float           attn_factor,
+        float           beta_fast,
+        float           beta_slow,
+        float           eps);
 
 int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
         ds4_gpu_tensor       *out,
@@ -2318,6 +2351,31 @@ int ds4_gpu_attention_output_q8_batch_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *heads,
         uint32_t                n_tokens);
+
+#ifdef __APPLE__
+/* Optional pre-M5 batch Q8 attention-output B + HC4 epilogue. Returns 1
+ * when fused work was encoded, 0 when unsupported without encoding work,
+ * and -1 after an attempted-path failure. */
+int ds4_gpu_attention_output_q8_batch_hc_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *out_hc,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        ds4_gpu_tensor       *low,
+        ds4_gpu_tensor       *group_tmp,
+        ds4_gpu_tensor       *low_tmp,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                out_a_offset,
+        uint64_t                out_b_offset,
+        uint64_t                group_dim,
+        uint64_t                rank,
+        uint32_t                n_groups,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *heads,
+        uint32_t                n_tokens,
+        uint32_t                n_hc);
+#endif
 int ds4_gpu_attention_output_q4_K_batch_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *low,
@@ -2444,6 +2502,27 @@ int ds4_gpu_router_select_tensor(
         uint64_t                hash_offset,
         uint32_t                hash_rows,
         uint32_t                token,
+        uint32_t                n_expert,
+        uint32_t                n_expert_used,
+        float                   expert_weight_scale,
+        uint32_t                n_expert_groups,
+        uint32_t                n_group_used,
+        bool                    has_bias,
+        bool                    hash_mode,
+        const ds4_gpu_tensor *logits);
+
+/* One-token router select with the token id read from a device buffer
+ * (greedy chain decode); identical kernels to ds4_gpu_router_select_tensor. */
+int ds4_gpu_router_select_tensor_devtoken(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *weights,
+        ds4_gpu_tensor       *probs,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                bias_offset,
+        uint64_t                hash_offset,
+        uint32_t                hash_rows,
+        const ds4_gpu_tensor *token_dev,
         uint32_t                n_expert,
         uint32_t                n_expert_used,
         float                   expert_weight_scale,
@@ -2755,7 +2834,12 @@ int ds4_gpu_routed_moe_one_tensor(
         const ds4_gpu_tensor *x,
         const ds4_gpu_tensor *add_in,
         uint32_t                layer_index,
-        bool                    force_resident);
+        bool                    force_resident,
+        const ds4_gpu_tensor *hc_shared_out,
+        const ds4_gpu_tensor *hc_residual,
+        const ds4_gpu_tensor *hc_split,
+        ds4_gpu_tensor       *hc_out,
+        int                    *hc_fused_out);
 
 int ds4_gpu_routed_moe_batch_tensor(
         ds4_gpu_tensor       *out,
@@ -2786,6 +2870,7 @@ int ds4_gpu_routed_moe_batch_tensor(
         uint32_t                layer_index,
         uint32_t                n_tokens,
         bool                   *mid_is_f16,
+        bool                    defer_sum6,
         bool                    force_resident);
 
 /* =========================================================================
@@ -2991,6 +3076,23 @@ int ds4_gpu_hc_expand_add_split_tensor(
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc);
+
+#ifdef __APPLE__
+int ds4_gpu_moe_sum6_hc_expand_available(void);
+int ds4_gpu_moe_sum6_hc_expand_split_tensor(
+        ds4_gpu_tensor       *out_hc,
+        const ds4_gpu_tensor *expert_down,
+        const ds4_gpu_tensor *shared_out,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc);
+int ds4_gpu_test_moe_sum6_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *expert_down,
+        uint32_t                n_embd,
+        uint32_t                n_tokens);
+#endif
 
 int ds4_gpu_hc_expand_add_split_half_add_tensor(
         ds4_gpu_tensor       *out_hc,
