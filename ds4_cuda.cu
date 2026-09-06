@@ -10465,7 +10465,8 @@ __device__ __forceinline__ uint32_t tt_ring_off_bytes(uint32_t row, uint32_t c) 
 
 __device__ __forceinline__ void tt_ldmatrix_x4_addr(uint32_t (&r)[4], unsigned a) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.b16 {%0, %1, %2, %3}, [%4];"
+    /* .shared is required on Ampere; without it sm_80 treats [addr] as generic. */
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
                  : "r"(a));
 #else
@@ -10476,7 +10477,7 @@ __device__ __forceinline__ void tt_ldmatrix_x4_addr(uint32_t (&r)[4], unsigned a
 
 __device__ __forceinline__ void tt_ldmatrix_x2_addr(uint32_t (&r)[2], unsigned a) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-    asm volatile("ldmatrix.sync.aligned.m8n8.x2.b16 {%0, %1}, [%2];"
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];"
                  : "=r"(r[0]), "=r"(r[1])
                  : "r"(a));
 #else
@@ -10487,7 +10488,7 @@ __device__ __forceinline__ void tt_ldmatrix_x2_addr(uint32_t (&r)[2], unsigned a
 
 __device__ __forceinline__ void tt_ldmatrix_x2_trans_addr(uint32_t (&r)[2], unsigned a) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-    asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.b16 {%0, %1}, [%2];"
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0, %1}, [%2];"
                  : "=r"(r[0]), "=r"(r[1])
                  : "r"(a));
 #else
@@ -10837,7 +10838,8 @@ __device__ __forceinline__ void tt_issue_record_stage_cp_async(
         uint32_t row0,
         uint32_t nr,
         uint32_t raw_union_count,
-        const int2 * __restrict__ union_records_tile) {
+        const int2 * __restrict__ union_records_tile,
+        uint32_t rec_stride) {
     static_assert(TT_STAGE_ROWS == 32u, "token-tile record issue is fixed at R32");
     const uint32_t raw_rows = tt_stage_raw_rows(row0, nr, raw_union_count);
     const uint32_t lane = tt_lane_id();
@@ -10849,7 +10851,8 @@ __device__ __forceinline__ void tt_issue_record_stage_cp_async(
     if (comp_live && lane16 == 0u) {
         int2 *dst = rec_plane + rr;
         const uint32_t ci = row0 + rr - raw_union_count;
-        tt_cp_async_8B(dst, union_records_tile + ci, true);
+        const bool in_range = ci < rec_stride;
+        tt_cp_async_8B(dst, in_range ? union_records_tile + ci : NULL, in_range);
     }
 }
 
@@ -10864,6 +10867,9 @@ __device__ __forceinline__ void tt_issue_kv_stage_cp_async(
         uint32_t tile_base,
         const half * __restrict__ raw_kv,
         const half * __restrict__ comp_kv,
+        uint32_t n_mirror_rows,
+        uint32_t n_comp,
+        uint32_t rec_stride,
         uint32_t tid) {
     constexpr uint32_t kCp16PerRow = (kTTHeadDim * sizeof(half)) / 16u;
     static_assert(kCp16PerRow == 64u, "expected 64 cp.async chunks per f16 KV row");
@@ -10878,20 +10884,27 @@ __device__ __forceinline__ void tt_issue_kv_stage_cp_async(
 
     if (active && rr < raw_rows) {
         const uint32_t sr = row0 + rr;
-        const half *src = raw_kv + (uint64_t)(tile_base + sr) * kTTHeadDim;
-        tt_issue_cp_async_row(dst, rr, lane16, src, true);
+        const uint32_t raw_idx = tile_base + sr;
+        const bool live = raw_idx < n_mirror_rows;
+        const half *src = live ? raw_kv + (uint64_t)raw_idx * kTTHeadDim : NULL;
+        tt_issue_cp_async_row(dst, rr, lane16, src, live);
     }
 
     if (active && rr >= raw_rows && rr < nr) {
         uint32_t comp_id = 0u;
+        bool have_id = true;
         if (USE_SMEM_RECORDS) {
             comp_id = (uint32_t)rec_plane[rr].x;
         } else {
             const uint32_t ci = row0 + rr - raw_union_count;
-            comp_id = (uint32_t)union_records_tile[ci].x;
+            have_id = ci < rec_stride;
+            if (have_id) {
+                comp_id = (uint32_t)union_records_tile[ci].x;
+            }
         }
-        const half *src = comp_kv + (uint64_t)comp_id * kTTHeadDim;
-        tt_issue_cp_async_row(dst, rr, lane16, src, true);
+        const bool live = have_id && comp_id < n_comp;
+        const half *src = live ? comp_kv + (uint64_t)comp_id * kTTHeadDim : NULL;
+        tt_issue_cp_async_row(dst, rr, lane16, src, live);
     }
 
     if (active && rr >= nr) {
@@ -11187,7 +11200,9 @@ __global__ static void __launch_bounds__(512, 1) attention_tokentile_hmma_kernel
         uint32_t rec_stride,
         uint32_t n_tokens,
         uint32_t n_head,
-        uint32_t raw_row_min) {
+        uint32_t raw_row_min,
+        uint32_t n_mirror_rows,
+        uint32_t n_comp) {
     constexpr uint32_t kKvElems = tt_TokentileLayout<kTTStageRows>::ring_plane_elems;
     constexpr uint32_t kProbStride = tt_TokentileLayout<kTTStageRows>::prob_stride;
     const uint32_t tid = threadIdx.x;
@@ -11262,13 +11277,17 @@ __global__ static void __launch_bounds__(512, 1) attention_tokentile_hmma_kernel
             tile_base,
             raw_kv,
             comp_kv,
+            n_mirror_rows,
+            n_comp,
+            rec_stride,
             tid);
         tt_issue_record_stage_cp_async<kTTStageRows>(
             rec_ring,
             0u,
             nr0,
             raw_union_count,
-            union_records_tile);
+            union_records_tile,
+            rec_stride);
         if (kTTStageRows < n_score) {
             const uint32_t nr1 =
                 n_score - kTTStageRows < kTTStageRows ? n_score - kTTStageRows : kTTStageRows;
@@ -11277,7 +11296,8 @@ __global__ static void __launch_bounds__(512, 1) attention_tokentile_hmma_kernel
                 kTTStageRows,
                 nr1,
                 raw_union_count,
-                union_records_tile);
+                union_records_tile,
+                rec_stride);
         }
         tt_cp_async_commit();
         tt_cp_async_wait_group<0>();
@@ -11315,6 +11335,9 @@ __global__ static void __launch_bounds__(512, 1) attention_tokentile_hmma_kernel
                 tile_base,
                 raw_kv,
                 comp_kv,
+                n_mirror_rows,
+                n_comp,
+                rec_stride,
                 tid);
             const uint32_t prefetch_row0 = next_row0 + kTTStageRows;
             if (prefetch_row0 < n_score) {
@@ -11327,7 +11350,8 @@ __global__ static void __launch_bounds__(512, 1) attention_tokentile_hmma_kernel
                     prefetch_row0,
                     prefetch_nr,
                     raw_union_count,
-                    union_records_tile);
+                    union_records_tile,
+                    rec_stride);
             }
             tt_cp_async_commit();
         }
@@ -11429,6 +11453,8 @@ static int ds4_cuda_attn_tokentile_arch_ok(void) {
         (void)cudaGetLastError();
         return 0;
     }
+    /* ldmatrix/cp.async/HMMA exist from sm_80. The PTX must use .shared;
+     * without it Ampere treats the smem address as generic and IMA's. */
     return prop.major >= 8;
 }
 
@@ -17886,7 +17912,7 @@ static int attention_decode_batch_launch(
                        stream>>>(
                         (float *)heads->ptr, sinks, (const float *)q->ptr,
                         raw_mirror, comp_mirror, records, counts, rec_stride,
-                        n_tokens, n_head, raw_row_min);
+                        n_tokens, n_head, raw_row_min, n_mirror_rows, n_comp);
                 return cuda_ok(cudaGetLastError(),
                                "launch dense token-tile HMMA attention");
             }
@@ -18193,7 +18219,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                        stream>>>(
                         (float *)heads->ptr, sinks, (const float *)q->ptr,
                         raw_mirror, comp_mirror, records, counts, rec_stride,
-                        n_tokens, n_head, raw_row_min);
+                        n_tokens, n_head, raw_row_min, n_mirror_rows, n_comp);
                 return cuda_ok(cudaGetLastError(),
                                "launch token-tile HMMA attention");
             }
