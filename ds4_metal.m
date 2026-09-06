@@ -2403,7 +2403,7 @@ static int ds4_gpu_zero_prefix_prefill_mask_cache_enabled(void) {
         getenv("DS4_METAL_FLASH_ATTN_STAGE_PROFILE") != NULL) {
         return 0;
     }
-    return ds4_gpu_device_name_contains("M3");
+    return ds4_gpu_device_is_pre_m5_apple_silicon();
 }
 
 static ds4_gpu_zero_prefix_prefill_mask_cache_entry *
@@ -3803,7 +3803,8 @@ int ds4_gpu_decode_attn_rope_fuse_available(void) {
     if (g_rope_tail_inplace_pair_affine_pipeline == nil) return 0;
     if (getenv("DS4_METAL_DISABLE_INPLACE_ROPE_PAIR") != NULL) return 0;
     if (getenv("DS4_METAL_DISABLE_AFFINE_ROPE_PAIR") != NULL) return 0;
-    if (!ds4_gpu_device_name_contains("M3") && !ds4_gpu_device_name_contains("M5")) return 0;
+    if (!ds4_gpu_device_is_pre_m5_apple_silicon() &&
+        !ds4_gpu_device_is_m5_apple_silicon()) return 0;
     return 1;
 }
 
@@ -6115,8 +6116,8 @@ static int ds4_gpu_encode_rope_tail_inplace(
         getenv("DS4_METAL_DISABLE_INPLACE_ROPE_PAIR") == NULL &&
         args->mode == 0 && !args->src2 &&
         lane_compatible &&
-        (ds4_gpu_device_name_contains("M3") ||
-         (ds4_gpu_device_name_contains("M5") && n_tok == 1u));
+        (ds4_gpu_device_is_pre_m5_apple_silicon() ||
+         (ds4_gpu_device_is_m5_apple_silicon() && n_tok == 1u));
     const bool use_shared_coeff =
         use_inplace_pair &&
         g_rope_tail_inplace_pair_shared4_pipeline != nil &&
@@ -6132,8 +6133,8 @@ static int ds4_gpu_encode_rope_tail_inplace(
         g_rope_tail_inplace_pair_affine_pipeline != nil &&
         getenv("DS4_METAL_DISABLE_AFFINE_ROPE_PAIR") == NULL &&
         n_tok == 1u &&
-        (ds4_gpu_device_name_contains("M3") ||
-         ds4_gpu_device_name_contains("M5"));
+        (ds4_gpu_device_is_pre_m5_apple_silicon() ||
+         ds4_gpu_device_is_m5_apple_silicon());
 
     int32_t pos_stack[256];
     int32_t *pos = NULL;
@@ -21107,8 +21108,8 @@ int ds4_gpu_matmul_f16_pair_compressor_store_tensor(
         uint32_t                pos) {
     if (!g_initialized && !ds4_gpu_init()) return -1;
     if ((g_quality_mode ||
-         (!ds4_gpu_device_name_contains("M3") &&
-          !ds4_gpu_device_name_contains("M5"))) ||
+         (!ds4_gpu_device_is_pre_m5_apple_silicon() &&
+          !ds4_gpu_device_is_m5_apple_silicon())) ||
         getenv("DS4_METAL_DISABLE_COMPRESSOR_PAIR_PROJ") != NULL ||
         getenv("DS4_METAL_DISABLE_COMPRESSOR_STORE_ONE") != NULL) {
         return 0;
@@ -21959,7 +21960,7 @@ static int ds4_gpu_hc_rms_scale_project_mode(
         (in_dim == 16384u || in_dim == 28672u) && out_dim == 24u;
     if (!hard_shape) return 0;
 
-    if ((!ds4_gpu_device_name_contains("M3") &&
+    if ((!ds4_gpu_device_is_pre_m5_apple_silicon() &&
          (g_test_flags & DS4_GPU_TEST_HC_RMS_SCALE_PROJ) == 0u) ||
         getenv("DS4_METAL_DISABLE_HC_RMS_SCALE_PROJ") != NULL) {
         return 0;
@@ -23103,7 +23104,8 @@ int ds4_gpu_kv_rope_fp8_fuse_available(void) {
     if (g_rope_tail_inplace_pair_affine_pipeline == nil) return 0;
     if (getenv("DS4_METAL_DISABLE_INPLACE_ROPE_PAIR") != NULL) return 0;
     if (getenv("DS4_METAL_DISABLE_AFFINE_ROPE_PAIR") != NULL) return 0;
-    if (!ds4_gpu_device_name_contains("M3") && !ds4_gpu_device_name_contains("M5")) return 0;
+    if (!ds4_gpu_device_is_pre_m5_apple_silicon() &&
+        !ds4_gpu_device_is_m5_apple_silicon()) return 0;
     return 1;
 }
 
@@ -23363,7 +23365,7 @@ static int ds4_gpu_encode_compressor_score_with_ape(
     const uint32_t total_elems = (uint32_t)total_elems64;
 
     const bool use_fused =
-        ds4_gpu_device_name_contains("M3") &&
+        ds4_gpu_device_is_pre_m5_apple_silicon() &&
         getenv("DS4_METAL_DISABLE_COMPRESSOR_APE_ADD") == NULL;
     if (use_fused) {
         id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(
@@ -24122,7 +24124,7 @@ static int ds4_gpu_encode_concat_f32_dim1(
 static int ds4_gpu_compressor_pack_ratio4_fusion_mode(uint32_t head_dim) {
     const bool default_shape = head_dim == 128u || head_dim == 512u;
     if (getenv("DS4_METAL_DISABLE_COMPRESSOR_RATIO4_PACK_FUSION") != NULL ||
-        !(ds4_gpu_device_name_contains("M3") && default_shape)) {
+        !(ds4_gpu_device_is_pre_m5_apple_silicon() && default_shape)) {
         return 0;
     }
     if (g_dsv4_compressor_pack_ratio4_pipeline == nil) {
@@ -24168,7 +24170,7 @@ static int ds4_gpu_compressor_ratio4_direct_pool_mode(
 
     const bool default_shape = head_dim == 128u || head_dim == 512u;
     if (getenv("DS4_METAL_DISABLE_COMPRESSOR_RATIO4_DIRECT_POOL") != NULL ||
-        !(ds4_gpu_device_name_contains("M3") && default_shape)) {
+        !(ds4_gpu_device_is_pre_m5_apple_silicon() && default_shape)) {
         return 0;
     }
     if (g_dsv4_softmax_pool_ratio4_direct_pipeline == nil) {
@@ -27290,8 +27292,8 @@ static int ds4_gpu_encode_flash_kv_stage_f16(
         supported_shape && valid_grid && !g_quality_mode &&
         getenv("DS4_METAL_DISABLE_GATHERED_KV_STAGE") == NULL &&
         g_flash_kv_stage_f16_pipeline != nil &&
-        (ds4_gpu_device_name_contains("M3") ||
-         ds4_gpu_device_name_contains("M5"));
+        (ds4_gpu_device_is_pre_m5_apple_silicon() ||
+         ds4_gpu_device_is_m5_apple_silicon());
     const bool component_disabled = eligible &&
         (ds4_gpu_env_bool("DS4_METAL_DISABLE_CONTIG_F32_F16_COPY") > 0 ||
          ds4_gpu_env_bool("DS4_METAL_DISABLE_CONTIG_F16_F16_COPY") > 0);
@@ -29143,7 +29145,7 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
          getenv("DS4_METAL_DISABLE_M5_PACKED_ZERO_MASK") == NULL);
     const bool use_persistent_zero_mask =
         use_mask == 0u &&
-        (ds4_gpu_device_name_contains("M3") ||
+        (ds4_gpu_device_is_pre_m5_apple_silicon() ||
          m5_persistent_zero_mask) &&
         getenv("DS4_METAL_DISABLE_PERSISTENT_ZERO_ATTN_MASK") == NULL;
 
@@ -29174,7 +29176,7 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
     const bool has_kvpad = (n_keys % ncpsg) != 0;
     const bool use_shared_kvpad =
         has_kvpad &&
-        ds4_gpu_device_name_contains("M3") &&
+        ds4_gpu_device_is_pre_m5_apple_silicon() &&
         getenv("DS4_METAL_DISABLE_SHARED_KV_PAD") == NULL;
     const NSUInteger packed_threads = 8u * 32u;
     const NSUInteger packed_shared_bytes =
@@ -33915,7 +33917,7 @@ static int ds4_gpu_encode_router_select(
     const bool use_batch_weights_fusion =
         flash_router_fast_path && !g_quality_mode && n_tokens > 1u &&
         g_dsv4_router_weights_batch_pipeline != nil &&
-        ds4_gpu_device_name_contains("M3") &&
+        ds4_gpu_device_is_pre_m5_apple_silicon() &&
         getenv("DS4_METAL_DISABLE_ROUTER_WEIGHTS_BATCH_FUSION") == NULL &&
         getenv("DS4_METAL_DISABLE_ROUTER_SELECT_FUSION") == NULL;
     if (use_batch_weights_fusion) {
@@ -44971,7 +44973,7 @@ int ds4_gpu_output_hc_weights_tensor(
         const bool use_weights4 =
             weights4_shape && !g_quality_mode &&
             g_output_hc_weights4_pipeline != nil &&
-            (ds4_gpu_device_name_contains("M3") ||
+            (ds4_gpu_device_is_pre_m5_apple_silicon() ||
              (g_test_flags & DS4_GPU_TEST_OUTPUT_HC_WEIGHTS4) != 0u) &&
             g_output_hc_weights4_pipeline.maxTotalThreadsPerThreadgroup >= 2u;
         if (require_weights4 && weights4_shape && !use_weights4) {
