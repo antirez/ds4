@@ -2089,6 +2089,37 @@ static void agent_dsml_feed(agent_dsml_parser *p, const char *s, size_t n) {
     }
 }
 
+/* agent_dsml_feed()'s AGENT_DSML_SEARCH branch only transitions to
+ * AGENT_DSML_STRUCTURAL once search_tail's tail matches the COMPLETE start
+ * marker. If generation is cut off (token budget exhausted) while the model
+ * is a few bytes into emitting that marker, the parser is left stuck in
+ * AGENT_DSML_SEARCH forever -- indistinguishable, to the caller, from the
+ * model simply never attempting a tool call at all.  That silence is what
+ * made ds4-chat look unusable: the turn ends with no tool executed and no
+ * error, so nothing tells the user (or an orchestrating caller) that a read
+ * was attempted and lost.
+ *
+ * This checks whether the tail of search_tail is itself a genuine (possibly
+ * whole-buffer) PREFIX of the marker, so a caller that knows generation
+ * stopped on the token budget can treat it the same as the already-handled
+ * AGENT_DSML_STRUCTURAL/AGENT_DSML_PARAM_VALUE truncation case instead of
+ * silently discarding the turn. A single leading "<" matches every marker
+ * and both DSML and GLM syntaxes start with "<", so this is a deliberate
+ * over-match: the cost of a false positive is one extra model-visible
+ * "your tool call was cut short, retry" turn -- the same recovery already
+ * used for a genuinely unclosed call -- not a wrong answer. */
+static bool agent_dsml_search_tail_is_partial_start(const agent_dsml_parser *p) {
+    if (!p || !p->search_len) return false;
+    const char *start = p->syntax == AGENT_TOOL_SYNTAX_GLM ?
+        "<tool_call>" : "<｜DSML｜tool_calls>";
+    size_t start_len = strlen(start);
+    size_t max_k = start_len - 1 < p->search_len ? start_len - 1 : p->search_len;
+    for (size_t k = 1; k <= max_k; k++) {
+        if (!memcmp(p->search_tail + p->search_len - k, start, k)) return true;
+    }
+    return false;
+}
+
 /* ============================================================================
  * Assistant Markdown Rendering
  * ============================================================================
@@ -6916,6 +6947,63 @@ static char *agent_test_stream_capture(agent_tool_syntax syntax,
     return agent_tail_capture_take(&tail, NULL);
 }
 
+static void test_agent_dsml_search_tail_is_partial_start(void) {
+    /* The exact failure this session reproduced: budget runs out one byte
+     * into the DSML marker, parser never leaves AGENT_DSML_SEARCH. */
+    {
+        agent_dsml_parser p = { .syntax = AGENT_TOOL_SYNTAX_DSML, .state = AGENT_DSML_SEARCH };
+        const char *text = "The file contains one line.\n\n<";
+        agent_dsml_feed(&p, text, strlen(text));
+        AGENT_TEST_ASSERT(p.state == AGENT_DSML_SEARCH);
+        AGENT_TEST_ASSERT(agent_dsml_search_tail_is_partial_start(&p));
+        agent_dsml_parser_free(&p);
+    }
+
+    /* Cut a few bytes further into the marker, still short of the full
+     * "<｜DSML｜tool_calls>" match that would flip the parser to STRUCTURAL. */
+    {
+        agent_dsml_parser p = { .syntax = AGENT_TOOL_SYNTAX_DSML, .state = AGENT_DSML_SEARCH };
+        const char *text = "thinking done\n\n<｜DSML｜tool";
+        agent_dsml_feed(&p, text, strlen(text));
+        AGENT_TEST_ASSERT(p.state == AGENT_DSML_SEARCH);
+        AGENT_TEST_ASSERT(agent_dsml_search_tail_is_partial_start(&p));
+        agent_dsml_parser_free(&p);
+    }
+
+    /* GLM syntax, its own single marker. */
+    {
+        agent_dsml_parser p = { .syntax = AGENT_TOOL_SYNTAX_GLM, .state = AGENT_DSML_SEARCH };
+        const char *text = "ok\n\n<tool_ca";
+        agent_dsml_feed(&p, text, strlen(text));
+        AGENT_TEST_ASSERT(p.state == AGENT_DSML_SEARCH);
+        AGENT_TEST_ASSERT(agent_dsml_search_tail_is_partial_start(&p));
+        agent_dsml_parser_free(&p);
+    }
+
+    /* A complete marker flips state to STRUCTURAL before this function would
+     * ever be consulted by the caller (state != AGENT_DSML_SEARCH guards
+     * every call site) -- confirm that transition still happens on its own. */
+    {
+        agent_dsml_parser p = { .syntax = AGENT_TOOL_SYNTAX_GLM, .state = AGENT_DSML_SEARCH };
+        const char *text = "go\n\n<tool_call>";
+        agent_dsml_feed(&p, text, strlen(text));
+        AGENT_TEST_ASSERT(p.state == AGENT_DSML_STRUCTURAL);
+        agent_dsml_parser_free(&p);
+    }
+
+    /* Ordinary prose with no marker-prefix bytes at the tail: not flagged. */
+    {
+        agent_dsml_parser p = { .syntax = AGENT_TOOL_SYNTAX_DSML, .state = AGENT_DSML_SEARCH };
+        const char *text = "questa e' la risposta finale.";
+        agent_dsml_feed(&p, text, strlen(text));
+        AGENT_TEST_ASSERT(p.state == AGENT_DSML_SEARCH);
+        AGENT_TEST_ASSERT(!agent_dsml_search_tail_is_partial_start(&p));
+        agent_dsml_parser_free(&p);
+    }
+
+    AGENT_TEST_ASSERT(!agent_dsml_search_tail_is_partial_start(NULL));
+}
+
 static void test_agent_glm_tool_parser_single_arg(void) {
     const char *text =
         "prose before <tool_call>list"
@@ -7303,6 +7391,7 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_glm_template_policy();
     test_agent_edit_upto_prompt_is_opt_in();
     test_agent_glm_tools_prompt_is_native();
+    test_agent_dsml_search_tail_is_partial_start();
     test_agent_glm_tool_parser_single_arg();
     test_agent_glm_tool_parser_chunked_multi_arg();
     test_agent_glm_tool_parser_streams_param_state();
@@ -9368,6 +9457,20 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                    (dsml.state == AGENT_DSML_STRUCTURAL ||
                     dsml.state == AGENT_DSML_PARAM_VALUE))
         {
+            malformed_tool = true;
+            snprintf(dsml.error, sizeof(dsml.error),
+                     tool_syntax == AGENT_TOOL_SYNTAX_GLM ?
+                     "incomplete GLM tool call" :
+                     "incomplete DSML tool call");
+        } else if (!got_tool && !malformed_tool && !early_tool_error &&
+                   !interrupted && dsml.state == AGENT_DSML_SEARCH &&
+                   generated >= max_tokens &&
+                   agent_dsml_search_tail_is_partial_start(&dsml))
+        {
+            /* Budget ran out before the marker itself finished (e.g. cut
+             * after just "<"), so agent_dsml_feed() never left SEARCH state
+             * to notice.  Same recoverable-truncation treatment as the
+             * STRUCTURAL/PARAM_VALUE case above, not silence. */
             malformed_tool = true;
             snprintf(dsml.error, sizeof(dsml.error),
                      tool_syntax == AGENT_TOOL_SYNTAX_GLM ?

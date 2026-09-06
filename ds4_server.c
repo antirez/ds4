@@ -5262,6 +5262,33 @@ static const char *find_any_tool_end(const char *s) {
     return best;
 }
 
+/* find_any_tool_start() only matches a COMPLETE start marker, so it misses
+ * generation cut off (finish=length) mid-way through emitting the marker
+ * itself (e.g. the budget runs out right after "<" or "<｜DSML｜tool").  That
+ * gap left such fragments to fall through to ordinary content, silently
+ * showing the user a garbage partial tag instead of retrying the call.  This
+ * checks whether the tail of the buffer is a (possibly empty-suffix, non-
+ * empty) prefix of one of the known start markers, so callers can route a
+ * truncated-mid-marker generation into the same saw_tool_start recovery path
+ * used for "start seen, end missing". Caller must also require finish ==
+ * "length": a naturally stopped turn ending in "<" is real prose, not a cut
+ * tool call. */
+static bool text_tail_is_partial_tool_start(const char *text, size_t len) {
+    if (!text || !len) return false;
+    const char *markers[] = {
+        DS4_TOOL_CALLS_START, DS4_TOOL_CALLS_START_SHORT,
+        "<tool_calls>", "<tool_call>",
+    };
+    for (size_t m = 0; m < sizeof(markers)/sizeof(markers[0]); m++) {
+        size_t mlen = strlen(markers[m]);
+        size_t max_k = mlen - 1 < len ? mlen - 1 : len;
+        for (size_t k = 1; k <= max_k; k++) {
+            if (!memcmp(text + len - k, markers[m], k)) return true;
+        }
+    }
+    return false;
+}
+
 static void observe_tool_markers(const char *scan, bool *saw_start,
                                  bool *saw_end, bool *orphan_end) {
     if (!scan) return;
@@ -12718,6 +12745,19 @@ decode_again:
         snprintf(err, sizeof(err), "shutdown requested");
     }
 
+    /* saw_tool_start only latches on a COMPLETE start marker (observe_tool_
+     * markers -> find_any_tool_start).  When the token budget runs out before
+     * the marker itself finishes emitting (e.g. text ends in a bare "<"), the
+     * turn looks like ordinary short content instead of a truncated tool
+     * call, and is shown to the user as-is with no recovery.  finish=="length"
+     * plus a partial marker in the tail is the same signal, just caught one
+     * marker-byte earlier; fold it into saw_tool_start so it takes the same
+     * repair-or-retry path below. */
+    if (!saw_tool_start && !saw_tool_end && !strcmp(finish, "length") &&
+        text_tail_is_partial_tool_start(text.ptr, text.len)) {
+        saw_tool_start = true;
+    }
+
     if (j->req.kind == REQ_CHAT && j->req.has_tools &&
         saw_tool_start && !saw_tool_end && strcmp(finish, "error") != 0)
     {
@@ -16580,6 +16620,55 @@ static void test_dsml_repair_produces_parseable_calls(void) {
     buf_free(&repaired);
 }
 
+static void test_text_tail_is_partial_tool_start(void) {
+    /* The exact failure this session reproduced: budget runs out one byte
+     * into the DSML marker. */
+    const char *one_char = "The file contains one line.\n\n<";
+    TEST_ASSERT(text_tail_is_partial_tool_start(one_char, strlen(one_char)));
+
+    /* Cut off a few bytes into the full marker (still short of a complete
+     * DS4_TOOL_CALLS_START match, which find_any_tool_start would catch). */
+    char partial_marker[256];
+    snprintf(partial_marker, sizeof(partial_marker), "thinking done\n\n%.*s",
+             (int)(strlen(DS4_TOOL_CALLS_START) - 2), DS4_TOOL_CALLS_START);
+    TEST_ASSERT(text_tail_is_partial_tool_start(partial_marker, strlen(partial_marker)));
+
+    /* Short-form marker prefix. */
+    char short_marker[256];
+    snprintf(short_marker, sizeof(short_marker), "ok\n\n%.*s",
+             (int)(strlen(DS4_TOOL_CALLS_START_SHORT) - 3), DS4_TOOL_CALLS_START_SHORT);
+    TEST_ASSERT(text_tail_is_partial_tool_start(short_marker, strlen(short_marker)));
+
+    /* Plain-XML style prefix. */
+    const char *xml_prefix = "let me call it\n\n<tool_cal";
+    TEST_ASSERT(text_tail_is_partial_tool_start(xml_prefix, strlen(xml_prefix)));
+
+    /* A COMPLETE marker is find_any_tool_start's job, not this one: only
+     * k < strlen(marker) is checked, so a marker sitting exactly at the tail
+     * with nothing truncated after it is NOT flagged here (the caller only
+     * consults this function when saw_tool_start is already false, so the
+     * two never need to agree on the same text). */
+    const char *complete = "go\n\n" DS4_TOOL_CALLS_START;
+    TEST_ASSERT(!text_tail_is_partial_tool_start(complete, strlen(complete)));
+
+    /* A lone trailing "<" IS flagged (every marker starts with it) even
+     * though it can, rarely, be ordinary prose truncated mid-comparison
+     * ("se a<b" cut after "a<"). Accepted false-positive: the guard at the
+     * call site only fires on finish=="length" with tools enabled, and the
+     * cost is one extra model-visible "your tool call was cut off, retry"
+     * turn, the same recovery already used for a genuinely unclosed call. */
+    const char *ambiguous = "controlla se a<";
+    TEST_ASSERT(text_tail_is_partial_tool_start(ambiguous, strlen(ambiguous)));
+
+    /* Prose ending in a character no marker starts with must NOT be
+     * flagged. */
+    const char *plain = "questa e' la risposta finale.";
+    TEST_ASSERT(!text_tail_is_partial_tool_start(plain, strlen(plain)));
+
+    TEST_ASSERT(!text_tail_is_partial_tool_start("", 0));
+    TEST_ASSERT(!text_tail_is_partial_tool_start(NULL, 0));
+}
+
 static void test_tool_parse_failure_returns_recoverable_finish(void) {
     const char *generated =
         "trying a tool\n\n"
@@ -19458,6 +19547,7 @@ static void ds4_server_unit_tests_run(void) {
     test_parse_glm_tool_call_message();
     test_dsml_parser_recovers_loose_nested_parameters();
     test_dsml_repair_produces_parseable_calls();
+    test_text_tail_is_partial_tool_start();
     test_tool_parse_failure_returns_recoverable_finish();
     test_invalid_dsml_tool_error_suffix_includes_system_prompt();
     test_invalid_glm_tool_error_suffix();
