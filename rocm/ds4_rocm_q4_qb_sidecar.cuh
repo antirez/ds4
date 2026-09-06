@@ -5,6 +5,8 @@
 // attn_q_b matrix costs 64 MiB per layer, so admission happens once, before
 // prefill, with both an explicit cache budget and device-memory headroom.
 
+#include "../cuda/ds4_q4_dequant_vec.cuh"
+
 enum {
     DS4_ROCM_Q4_ATTN_Q_B_F16_CACHE_MAX_ENTRIES = 80u,
     DS4_ROCM_Q4_K_TYPE = 12u,

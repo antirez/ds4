@@ -150,6 +150,7 @@ static int g_cuda_disable_qkv_rms_fused;
 static int g_cuda_disable_q8_quant_warp_reduce;
 static int g_cuda_disable_q8_prefill_tiled;
 static int g_cuda_q8_prefill_quant_stats;
+static int g_cuda_disable_q4_prefill_dequant_vec;
 static int g_cuda_no_window_attention;
 static int g_cuda_decode_heads8_online;
 static int g_cuda_decode_score4;
@@ -362,6 +363,8 @@ static void cuda_decode_dispatch_env_refresh(void) {
         getenv("DS4_CUDA_DISABLE_Q8_PREFILL_TILED") != NULL;
     g_cuda_q8_prefill_quant_stats =
         getenv("DS4_CUDA_Q8_PREFILL_QUANT_STATS") != NULL;
+    g_cuda_disable_q4_prefill_dequant_vec =
+        getenv("DS4_CUDA_DISABLE_Q4_PREFILL_DEQUANT_VEC") != NULL;
     g_cuda_no_window_attention = getenv("DS4_CUDA_NO_WINDOW_ATTENTION") != NULL;
     g_cuda_decode_heads8_online = getenv("DS4_CUDA_DECODE_HEADS8_ONLINE") != NULL;
     g_cuda_decode_score4 = getenv("DS4_CUDA_DECODE_SCORE4") != NULL;
@@ -1060,6 +1063,8 @@ __global__ static void dequant_q4_K_to_f16_kernel(
         uint64_t in_dim,
         uint64_t out_dim,
         uint64_t blocks);
+
+#include "cuda/ds4_q4_dequant_vec.cuh"
 
 extern "C" int ds4_gpu_release_q4_attn_q_b_f16_sidecars(void);
 
@@ -43797,11 +43802,21 @@ extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
         }
         w_f16 = scratch;
         const uint64_t chunks = transient_weight_bytes / (16u * sizeof(__half));
-        dequant_q4_K_to_f16_kernel<<<
-            (unsigned)((chunks + 255u) / 256u), 256, 0, stream>>>(
-                scratch,
-                reinterpret_cast<const cuda_block_q4_K *>(source),
-                in_dim, out_dim, blocks);
+        if (ds4_q4_dequant::select(
+                in_dim, out_dim, n_tok, (uintptr_t)source, (uintptr_t)scratch,
+                g_n_gpus == 1 && g_cuda_is_gb10[0], g_quality_mode,
+                g_ssd_streaming_mode, g_cuda_disable_q4_prefill_dequant_vec)) {
+            ds4_q4_dequant_f16_vec16_kernel<<<
+                (unsigned)((chunks + 255u) / 256u), 256, 0, stream>>>(
+                    scratch, reinterpret_cast<const cuda_block_q4_K *>(source),
+                    out_dim * blocks);
+        } else {
+            dequant_q4_K_to_f16_kernel<<<
+                (unsigned)((chunks + 255u) / 256u), 256, 0, stream>>>(
+                    scratch,
+                    reinterpret_cast<const cuda_block_q4_K *>(source),
+                    in_dim, out_dim, blocks);
+        }
         const cudaError_t dequant_err = cudaGetLastError();
         if (dequant_err != cudaSuccess) {
             fprintf(stderr,

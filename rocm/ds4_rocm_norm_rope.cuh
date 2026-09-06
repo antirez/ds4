@@ -598,7 +598,7 @@ extern "C" uint64_t ds4_rocm_test_q4_qb_f32_epilogue_get_calls(void) {
     return __atomic_load_n(&g_rocm_q4_qb_f32_epilogue_calls, __ATOMIC_RELAXED);
 }
 
-static bool rocm_q4_qb_f32_epilogue_device(void) {
+static bool rocm_q4_qb_gfx1151_wave32_device(void) {
 #if defined(__HIP_PLATFORM_AMD__)
     int device = -1;
     if (cudaGetDevice(&device) != cudaSuccess) return false;
@@ -634,7 +634,7 @@ static int rocm_q4_qb_f32_epilogue_tensor(
     if (!ep::select(n_tok, n_head, head_dim, n_rot,
                     !disabled && !g_quality_mode && !g_ssd_streaming_mode &&
                         ep::shape(n_tok, n_head, head_dim, n_rot) &&
-                        rocm_q4_qb_f32_epilogue_device(),
+                        rocm_q4_qb_gfx1151_wave32_device(),
                     g_quality_mode, g_ssd_streaming_mode, disabled)) {
         return ds4_gpu_head_rms_norm_rope_tail_tensor(
             x, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig, inverse,
@@ -959,10 +959,19 @@ static int rocm_q4_attn_q_b_transient_f16_head_rms_rope_tail_tensor(
     }
 
     const uint64_t total_chunks = out_dim * (in_dim / 16u);
-    rocm_dequant_q4_K_attn_q_b_f16_kernel<<<
-        (uint32_t)((total_chunks + 255u) / 256u), 256>>>(
-            w_f16, (const cuda_block_q4_K *)w_q4,
-            in_dim, out_dim, blocks_per_row);
+    if (ds4_q4_dequant::select(
+            in_dim, out_dim, n_tok, (uintptr_t)w_q4, (uintptr_t)w_f16,
+            rocm_q4_qb_gfx1151_wave32_device(), g_quality_mode, g_ssd_streaming_mode,
+            getenv("DS4_ROCM_DISABLE_Q4_PREFILL_DEQUANT_VEC") != NULL)) {
+        ds4_q4_dequant_f16_vec16_kernel<<<
+            (uint32_t)((total_chunks + 255u) / 256u), 256>>>(
+                w_f16, (const cuda_block_q4_K *)w_q4, out_dim * blocks_per_row);
+    } else {
+        rocm_dequant_q4_K_attn_q_b_f16_kernel<<<
+            (uint32_t)((total_chunks + 255u) / 256u), 256>>>(
+                w_f16, (const cuda_block_q4_K *)w_q4,
+                in_dim, out_dim, blocks_per_row);
+    }
     cudaError_t launch_err = cudaGetLastError();
     if (launch_err != cudaSuccess) {
         fprintf(stderr,

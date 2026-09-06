@@ -105,6 +105,37 @@ test-cuda-q8-quantize: tests/test_cuda_q8_quantize
 bench-cuda-q8-prefill-quantize: tests/test_cuda_q8_quantize
 	./tests/test_cuda_q8_quantize --bench
 
+.PHONY: test-q4-prefill-dequant-host test-cuda-q4-prefill-dequant test-rocm-q4-prefill-dequant bench-cuda-q4-prefill-dequant bench-rocm-q4-prefill-dequant
+Q4_PREFILL_DEQUANT_HEADERS := cuda/ds4_q4_dequant_layout.h cuda/ds4_q4_dequant_vec.cuh
+
+tests/test_q4_prefill_dequant_host: tests/test_q4_prefill_dequant.cpp $(Q4_PREFILL_DEQUANT_HEADERS)
+	$(CXX) -O2 -Wall -Wextra -std=c++17 -o $@ $<
+
+test-q4-prefill-dequant-host: tests/test_q4_prefill_dequant_host
+	./tests/test_q4_prefill_dequant_host
+
+tests/test_cuda_q4_prefill_dequant: tests/test_q4_prefill_dequant.cpp $(Q4_PREFILL_DEQUANT_HEADERS)
+	@if [ -z "$(NVCC)" ] || ! command -v "$(NVCC)" >/dev/null 2>&1; then \
+		echo "error: native Q4 dequant tests require nvcc"; exit 1; fi
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -x cu -o $@ $<
+
+tests/test_rocm_q4_prefill_dequant: tests/test_q4_prefill_dequant.cpp $(Q4_PREFILL_DEQUANT_HEADERS)
+	@if [ -z "$(HIPCC)" ] || ! command -v "$(HIPCC)" >/dev/null 2>&1; then \
+		echo "error: native Q4 dequant tests require hipcc"; exit 1; fi
+	$(HIPCC) $(ROCM_CFLAGS) -std=c++17 -x hip -o $@ $<
+
+test-cuda-q4-prefill-dequant: tests/test_cuda_q4_prefill_dequant
+	./tests/test_cuda_q4_prefill_dequant
+
+test-rocm-q4-prefill-dequant: tests/test_rocm_q4_prefill_dequant
+	./tests/test_rocm_q4_prefill_dequant
+
+bench-cuda-q4-prefill-dequant: tests/test_cuda_q4_prefill_dequant
+	./tests/test_cuda_q4_prefill_dequant --bench
+
+bench-rocm-q4-prefill-dequant: tests/test_rocm_q4_prefill_dequant
+	./tests/test_rocm_q4_prefill_dequant --bench
+
 ifeq ($(UNAME_S),Darwin)
 .PHONY: metal-decode-schedule-bench metal-prefill-variant-bench metal-q4-dense-pair-bench metal-q4-prefill-pair-bench metal-q4-mm-tail-cull-bench metal-q4-attn-out-a-direct-bench metal-iq2-moe-tail-cull-bench metal-iq2-moe-top8-pair-bench check-mxfp4-half-lut test-mxfp4-metal
 .PHONY: test-metal-moe-prefill test-metal-dense-mpp
@@ -908,7 +939,7 @@ endif
 test-glm-attention: tests/test_glm_attention
 	./tests/test_glm_attention
 
-ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_glm53_vision_gpu.cuh ds4_deepseek4_vision_gpu.cuh ds4_image.h ds4_iq2_tables_cuda.inc cuda/mmq/ds4_mmq.h cuda/ds4_q8_quantize.cuh cuda/ds4_q8_prefill_layout.h
+ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_glm53_vision_gpu.cuh ds4_deepseek4_vision_gpu.cuh ds4_image.h ds4_iq2_tables_cuda.inc cuda/mmq/ds4_mmq.h cuda/ds4_q8_quantize.cuh cuda/ds4_q8_prefill_layout.h $(Q4_PREFILL_DEQUANT_HEADERS)
 	$(NVCC) $(NVCCFLAGS) -c -o $@ ds4_cuda.cu
 
 # Vendored mmq pieces (see cuda/mmq/VENDOR.md).  ds4_mmq.cu transitively
@@ -938,7 +969,7 @@ cuda/mmq/mmvq.o: cuda/mmq/mmvq.cu cuda/mmq/mmvq.cuh cuda/mmq/common.cuh cuda/mmq
 cuda/mmq/ds4_repack.o: cuda/mmq/ds4_repack.cu cuda/mmq/ds4_repack.h
 	$(NVCC) $(NVCCFLAGS) -std=c++17 -c -o $@ $<
 
-ds4_rocm.o: ds4_rocm.cu ds4_rocm.h ds4_rocm_memory.h ds4_linux_memory.h ds4_gpu.h ds4_glm53_vision_gpu.cuh ds4_deepseek4_vision_gpu.cuh ds4_image.h ds4_iq2_tables_cuda.inc $(ROCM_SRCS)
+ds4_rocm.o: ds4_rocm.cu ds4_rocm.h ds4_rocm_memory.h ds4_linux_memory.h ds4_gpu.h ds4_glm53_vision_gpu.cuh ds4_deepseek4_vision_gpu.cuh ds4_image.h ds4_iq2_tables_cuda.inc $(ROCM_SRCS) $(Q4_PREFILL_DEQUANT_HEADERS)
 	$(HIPCC) $(ROCM_CFLAGS) -c -o $@ ds4_rocm.cu
 
 cuda/mmq/ds4_ggml_stubs.rocm.o: cuda/mmq/ds4_ggml_stubs.cu cuda/mmq/ds4_ggml_stubs.h cuda/mmq/common.cuh cuda/mmq/vendors/hip.h ds4_rocm_memory.h ds4_linux_memory.h
@@ -1341,6 +1372,7 @@ clean:
 	rm -f tests/test_metal_q4_qb_token_pair
 	rm -f tests/test_q4_epilogue_host tests/test_cuda_q4_epilogue
 	rm -f tests/test_q8_quantize_host tests/test_cuda_q8_quantize
+	rm -f tests/test_q4_prefill_dequant_host tests/test_cuda_q4_prefill_dequant tests/test_rocm_q4_prefill_dequant
 	rm -f tests/test_metal_ssd_decode_kernels
 	rm -f speed-bench/metal_iq2_moe_top8_pair_bench
 	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/metal_q4_dense_pair_bench speed-bench/metal_q4_prefill_pair_bench speed-bench/metal_q4_mm_tail_cull_bench speed-bench/metal_q4_attn_out_a_direct_bench speed-bench/metal_iq2_moe_tail_cull_bench speed-bench/gpu_iq2_moe_prefill_bench_rocm speed-bench/gpu_iq2_moe_prefill_bench_cuda speed-bench/rocm_q4_prefill_bench speed-bench/cuda_q4_prefill_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_quantizer_indexer_q4 tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/bench_mxfp4_rocm tests/test_mxfp4_cuda tests/test_rocm_q4_dense_pair tests/test_metal_session_batch tests/test_metal_q4_streams tests/test_metal_q4_prefill_pair tests/test_metal_indexer_q4 tests/test_metal_q4_attn_exactn tests/test_metal_q4_attn_out_a_direct tests/test_metal_q4_qb_f16_cache tests/test_metal_exactn_oracle tests/test_metal_dspark_capture tests/test_metal_argmax_top1 tests/test_metal_iq2_midonly tests/test_metal_iq2_ssd_grouped_mm tests/test_metal_iq2_live_index tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_deepseek4_vision_image tests/test_prompt_prefix tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o cuda/mmq/*.o cuda/mmq/test/*.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o

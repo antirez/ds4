@@ -1,5 +1,9 @@
 ## Benchmarking
 
+For vectorized Q4 transient weight expansion on CUDA/GB10 and ROCm/gfx1151,
+see [the shared kernel oracle and A/B protocol](q4_prefill_dequant_vec.md).
+This candidate is independent of the earlier activation/epilogue changes.
+
 For the single-GB10 tiled Q8_0 activation producer used by eligible Q4/Q8
 prefill, see [the native three-way oracle and timing protocol](cuda_q8_prefill_tiled.md).
 The new prefill kernel preserves decode dispatch; GPU validation is pending.

@@ -35,6 +35,9 @@
 /tests/test_rocm_q4_decode_lane4
 /tests/test_q8_quantize_host
 /tests/test_cuda_q8_quantize
+/tests/test_q4_prefill_dequant_host
+/tests/test_cuda_q4_prefill_dequant
+/tests/test_rocm_q4_prefill_dequant
 /tests/test_q4_epilogue_host
 /tests/test_cuda_q4_epilogue
 /tests/test_metal_tp_spec

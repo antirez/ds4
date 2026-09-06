@@ -66,6 +66,30 @@ compares the three producers on GB10 using GPU events, not model throughput.
 on CPU, not CUDA compilation or GPU execution. See the
 [prefill measurement protocol](speed-bench/cuda_q8_prefill_tiled.md).
 
+## Q4 transient prefill weight expansion (CUDA / ROCm)
+
+The transient Q4 `attn_q_b` GEMM path has a vectorized Q4_K-to-F16 producer.
+It keeps 16 outputs/thread and the existing launch geometry, uses flat block
+addressing instead of runtime row division, loads one aligned 16-byte packed
+vector and writes two aligned 16-byte output vectors. This is a candidate,
+not a measured prefill gain; it does not reduce the 64 MiB expanded matrix.
+
+Default-on scope is K=1024, M=32768, N=256..8192, aligned/disjoint resident
+buffers, outside quality and SSD modes: a single GB10 on CUDA or gfx1151
+wave32 on ROCm. The existing transient-GEMM gates still apply (normally
+starting at 4096 tokens). Persistent sidecar prewarm/cache hits, direct Q4
+MMQ/WMMA, Q8, decode and GEMM/epilogue selection are unchanged.
+
+- `DS4_CUDA_DISABLE_Q4_PREFILL_DEQUANT_VEC=1`: keep the original CUDA scalar
+  dequantizer; read at CUDA initialization.
+- `DS4_ROCM_DISABLE_Q4_PREFILL_DEQUANT_VEC=1`: keep the original ROCm scalar
+  dequantizer; checked at transient dispatch.
+
+Both are **presence-based**: even `0` disables the candidate. Unset the
+rollback in a new process for the candidate arm. These are independent of
+the earlier CUDA Q8 producer and ROCm Q4 F32 epilogue rollbacks.
+See [native parity, timing and full-model acceptance](speed-bench/q4_prefill_dequant_vec.md).
+
 ## Metal Q8 dense decode reductions
 
 `DS4_METAL_DISABLE_Q8_MV_SINGLE_BARRIER=1` restores the two-barrier reduction

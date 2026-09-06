@@ -1015,6 +1015,12 @@ Do not use high-performance Hugging Face Xet mode while vLLM is resident.
   against the unset default; keep the older global warp rollback unset in
   both arms. Follow [the three-way measurement protocol](speed-bench/cuda_q8_prefill_tiled.md).
   CPU-only tests and a kernel-only speedup do not establish a Q4/Q8 TPS gain.
+- For transient Q4 weight expansion, run
+  `make test-cuda-q4-prefill-dequant CUDA_ARCH=sm_121` and
+  `make bench-cuda-q4-prefill-dequant CUDA_ARCH=sm_121`. Compare full-model
+  default/`DS4_CUDA_DISABLE_Q4_PREFILL_DEQUANT_VEC=1` with all earlier
+  activation/epilogue flags held fixed; follow the
+  [shared dequantization acceptance protocol](speed-bench/q4_prefill_dequant_vec.md).
 - On a single GB10 (`sm_121`), validate the imported Q2 decode fast paths with
   the AProjQ8/OutQ8 Flash GGUF.  Compare the default against a rollback process
   that sets all of:
@@ -1251,6 +1257,10 @@ a substitute for CUDA or Metal release testing.
   canaries. A REQUIRE-plus-DISABLE arm must fail before modifying output.
 - For the Q4 F32 `attn_q_b` epilogue candidate, run
   `make test-rocm-q4-qb-epilogue ROCM_ARCH=gfx1151 DS4_TEST_REQUIRE_ROCM_DEVICE=1`.
+  Also run `make test-rocm-q4-prefill-dequant ROCM_ARCH=gfx1151` and
+  `make bench-rocm-q4-prefill-dequant ROCM_ARCH=gfx1151` for vectorized
+  transient weight expansion. Compare full-model default against
+  `DS4_ROCM_DISABLE_Q4_PREFILL_DEQUANT_VEC=1`, keeping the epilogue arm fixed.
   Require bitwise finite-output parity and intact guards against the forced
   legacy kernel, including signed zero, YaRN/inverse RoPE, token boundaries,
   and quality/SSD/generic-API exclusions. NaN payloads are not compared, but
