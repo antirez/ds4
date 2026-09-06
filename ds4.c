@@ -41854,6 +41854,17 @@ static uint64_t glm_graph_memory_guard_budget_bytes(
         reserve_bytes >= budget_base ? 0 : budget_base - reserve_bytes;
     uint64_t budget = fraction_budget;
     if (reserve_bytes != 0 && reserve_budget < budget) budget = reserve_budget;
+/* DS4_NO_GPU builds never include ds4_gpu.h, so the Metal query is not even
+ * declared there; they keep wired_limit at 0 and fall back to the heuristics
+ * below, which is right for a build with no GPU to keep anything resident. */
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (wired_limit == 0) {
+        /* Without an explicit sysctl (it resets to 0 on reboot), Metal's
+         * recommended working set is the OS's own statement of how much
+         * memory may stay GPU-resident; trust it like a granted limit. */
+        wired_limit = ds4_gpu_recommended_working_set_size();
+    }
+#endif
     if (wired_limit != 0) {
         /* An explicitly raised iogpu.wired_limit_mb is the user granting
          * the GPU that much wired memory; it overrides the heuristics. */
