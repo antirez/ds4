@@ -12983,6 +12983,60 @@ static uint32_t ds4_effective_prefill_chunk(bool cuda_tensor_parallel,
     return cuda_tensor_parallel ? DS4_CUDA_TP_DEFAULT_PREFILL_CHUNK : 0;
 }
 
+/* Default prefill chunking shrinks as the prompt grows.
+ *
+ * A chunk's GPU cost scales with the context it attends against, so a chunk that
+ * is comfortable at 128k blows the macOS command-buffer watchdog at 271k.  Under
+ * tensor parallelism that kill is not survivable: it aborts the in-flight bulk
+ * RDMA gate and the client sees "tp: worker sync send failed".  A fixed ceiling
+ * only moves the context at which that happens, so the bound itself must scale.
+ *
+ * Chunk size is the right lever because it scales both halves of the wait that
+ * actually gets killed.  Serving submits prefill per LAYER, not per chunk
+ * (metal_graph_prefill_layer_major() splits whenever a progress callback is
+ * installed), and under TP a layer's buffer carries a wait on the gate event the
+ * peer signals, so it stays resident for the peer's work plus the round trip.
+ *
+ * The budget is an empirical envelope over measured pass/fail whole
+ * configurations, NOT a cost model: wall time is not monotone in the product
+ * (4096 ran 11.4 s/chunk at 80k but 7.0 s/chunk at 154k).  Re-measure before
+ * retuning, and do not extrapolate into untested regimes (notably 512 at 1M).
+ *   allow  4096 *  80333 = 3.29e8   (passed)
+ *   allow  4096 * 154390 = 6.32e8   (passed)
+ *   allow  2048 * 232306 = 4.76e8   (passed, zero faults over 782 s)
+ *   reject 4096 * 271180 = 1.11e9   (killed on its first chunk)
+ * 5<<27 = 6.71e8 sits just above the largest pass and 1.65x below the failure.
+ * An earlier 1<<29 rejected the proven 4096/154k point and cost ~45% of prefill
+ * throughput in the band where this workload sits, so do not tighten it without
+ * a hardware measurement.  Sizes round DOWN to a power of two, keeping the KV
+ * boundary aligned and the reachable set to chunks the graph paths already run:
+ *
+ *   prompt <=  163840 -> 4096      prompt <=  655360 -> 1024
+ *   prompt <=  327680 -> 2048      prompt <= 1310720 ->  512
+ *
+ * TP CONSTRAINT: both ranks must chunk identically or the per-layer gates stop
+ * pairing.  prompt_len is rank-identical by construction (ds4_session_sync()
+ * mirrors the exact token array to the worker) and the variant comes from the
+ * shared model shape.  Never derive this from anything rank-local (wall clock,
+ * load, free memory, measured throughput), and never from the allocated
+ * ctx_size: a 1M allocation would pin every prompt to the floor. */
+#define DS4_PREFILL_CHUNK_WORK_BUDGET (5ull << 27)
+#define DS4_PREFILL_CHUNK_MIN         512u
+
+/* Largest chunk that keeps one command buffer clear of the GPU watchdog for a
+ * prompt of `prompt_len` tokens.  RUNTIME ONLY -- never use this to size the
+ * prefill workspace (see ds4_prefill_cap_for_prompt).  Rounds down to a power of
+ * two so the only reachable sizes are ones the graph paths already run and the
+ * 2048-token KV boundary alignment still divides evenly. */
+static uint32_t ds4_prefill_watchdog_chunk(uint32_t prompt_len) {
+    const uint32_t base = DS4_MODEL_VARIANT == DS4_VARIANT_PRO ? 8192u : 4096u;
+    if (prompt_len == 0) return base;
+    const uint64_t budget = DS4_PREFILL_CHUNK_WORK_BUDGET / prompt_len;
+    uint32_t chunk = DS4_PREFILL_CHUNK_MIN;
+    while (chunk < base && (uint64_t)chunk * 2u <= budget) chunk *= 2u;
+    return chunk;
+}
+
 static uint32_t ds4_prefill_cap_for_prompt(int prompt_len,
                                            uint32_t requested_chunk) {
     if (prompt_len <= 0) return 1;
@@ -13000,6 +13054,16 @@ static uint32_t ds4_prefill_cap_for_prompt(int prompt_len,
                 cap = (uint32_t)v;
             }
         } else if (prompt_len > 4096) {
+            /* ALLOCATION sizing only: always the base ceiling, never the
+             * watchdog ladder.  Callers reach this with ctx_size (session and
+             * planner paths, e.g. ds4.c metal_graph_prefill_cap_for_prompt at
+             * session create), so applying the ladder here would evaluate it at
+             * the full 1M allocation and pin every prompt to the floor -- a
+             * measured ~25% prefill loss even on a 10k prompt that was never at
+             * watchdog risk.  The workspace is therefore sized for the largest
+             * chunk that can ever run, and the ladder is applied at RUNTIME
+             * against the real prompt length by
+             * metal_graph_prefill_watchdog_chunk(). */
             cap = DS4_MODEL_VARIANT == DS4_VARIANT_PRO ? 8192u : 4096u;
         }
     }
@@ -36865,6 +36929,22 @@ static bool metal_graph_prefill_chunked_range(
 
     uint32_t chunk_cap = g->prefill_cap;
     if (start != 0 && chunk_cap > g->raw_cap) chunk_cap = g->raw_cap;
+    /* Keep one command buffer clear of the GPU watchdog.  The workspace is
+     * sized for the base chunk, so this is where the ladder is actually
+     * applied, against the real prompt length rather than the allocated
+     * context.  Both TP ranks mirror the identical token array through
+     * ds4_session_sync(), so prompt->len is rank-identical and the two sides
+     * derive the same schedule -- required, or the per-layer gates stop
+     * pairing up.  An explicit --prefill-chunk / DS4_METAL_PREFILL_CHUNK has
+     * already been folded into g->prefill_cap, and clamping only ever
+     * shrinks, so an operator override still wins as an upper bound. */
+    if (prompt->len > 0) {
+        const uint32_t watchdog_cap =
+            ds4_prefill_watchdog_chunk((uint32_t)prompt->len);
+        if (watchdog_cap != 0 && watchdog_cap < chunk_cap) {
+            chunk_cap = watchdog_cap;
+        }
+    }
     if (chunk_cap == 0) return false;
 
     const bool profile =
@@ -37575,7 +37655,8 @@ static uint32_t metal_graph_raw_cap_for_context(int ctx_size, uint32_t prefill_c
 }
 
 /* Choose the prefill ubatch size. Whole-batch is fastest for normal prompts.
- * Long Flash prompts default to 4096-token chunks; PRO defaults to 8192. */
+ * Long prompts fall back to ds4_default_prefill_chunk(), which shrinks the
+ * chunk as the context grows to stay clear of the GPU watchdog. */
 static uint32_t metal_graph_prefill_cap_for_prompt(int prompt_len,
                                                    uint32_t prefill_chunk) {
     return ds4_prefill_cap_for_prompt(prompt_len, prefill_chunk);
@@ -62702,6 +62783,10 @@ uint32_t ds4_test_effective_prefill_chunk(bool cuda_tensor_parallel,
 uint32_t ds4_test_planner_prefill_cap(int prompt_len,
                                       uint32_t prefill_chunk) {
     return engine_planner_prefill_cap(prompt_len, prefill_chunk);
+}
+
+uint32_t ds4_test_prefill_watchdog_chunk(uint32_t prompt_len) {
+    return ds4_prefill_watchdog_chunk(prompt_len);
 }
 
 uint32_t ds4_test_planner_raw_cap(int ctx_size, uint32_t prefill_cap) {
