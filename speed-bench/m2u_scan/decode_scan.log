@@ -1,0 +1,78 @@
+==== PHASE A: prefix 2048 (q2 window, control 2/32) ====
+
+### A1 | control=2/32 candidate=3/32 prefix=2048 | 05:21:47
+metal-decode-schedule-bench: model=ds4flash.gguf prompt=speed-bench/promessi_sposi.txt prefix=2048 ctx=3072 warmup=16 measured=512 control=2/32 candidate=3/32 candidate_env=(none) include_selection=yes
+variant=control first_split=2 second_split=32 tokens=512 seconds=18.199436 tokens_per_second=28.1327
+variant=candidate first_split=3 second_split=32 tokens=512 seconds=18.210561 tokens_per_second=28.1156
+exact_rows=529 exact_floats=68389120 exact_selected_ids=528 vocab=129280
+### done A1 rc=0
+
+### A2 | control=2/32 candidate=2/28 prefix=2048 | 05:22:46
+metal-decode-schedule-bench: model=ds4flash.gguf prompt=speed-bench/promessi_sposi.txt prefix=2048 ctx=3072 warmup=16 measured=512 control=2/32 candidate=2/28 candidate_env=(none) include_selection=yes
+variant=control first_split=2 second_split=32 tokens=512 seconds=18.212724 tokens_per_second=28.1122
+variant=candidate first_split=2 second_split=28 tokens=512 seconds=18.217296 tokens_per_second=28.1052
+exact_rows=529 exact_floats=68389120 exact_selected_ids=528 vocab=129280
+### done A2 rc=0
+
+### A3 | control=2/32 candidate=2/36 prefix=2048 | 05:23:45
+metal-decode-schedule-bench: model=ds4flash.gguf prompt=speed-bench/promessi_sposi.txt prefix=2048 ctx=3072 warmup=16 measured=512 control=2/32 candidate=2/36 candidate_env=(none) include_selection=yes
+variant=control first_split=2 second_split=32 tokens=512 seconds=18.212724 tokens_per_second=28.1122
+variant=candidate first_split=2 second_split=36 tokens=512 seconds=18.213138 tokens_per_second=28.1116
+exact_rows=529 exact_floats=68389120 exact_selected_ids=528 vocab=129280
+### done A3 rc=0
+
+### A4 | control=2/32 candidate=2/24 prefix=2048 | 05:24:45
+metal-decode-schedule-bench: model=ds4flash.gguf prompt=speed-bench/promessi_sposi.txt prefix=2048 ctx=3072 warmup=16 measured=512 control=2/32 candidate=2/24 candidate_env=(none) include_selection=yes
+variant=control first_split=2 second_split=32 tokens=512 seconds=18.204921 tokens_per_second=28.1243
+variant=candidate first_split=2 second_split=24 tokens=512 seconds=18.207539 tokens_per_second=28.1202
+exact_rows=529 exact_floats=68389120 exact_selected_ids=528 vocab=129280
+### done A4 rc=0
+==== PHASE B: prefix 8192 (fallback 4/0, second-split sweep) ====
+
+### B1 | control=4/0 candidate=4/8 prefix=8192 | 05:25:44
+metal-decode-schedule-bench: model=ds4flash.gguf prompt=speed-bench/promessi_sposi.txt prefix=8192 ctx=9216 warmup=16 measured=512 control=4/0 candidate=4/8 candidate_env=(none) include_selection=yes
+variant=control first_split=4 second_split=0 tokens=512 seconds=18.751521 tokens_per_second=27.3045
+variant=candidate first_split=4 second_split=8 tokens=512 seconds=18.748005 tokens_per_second=27.3096
+exact_rows=529 exact_floats=68389120 exact_selected_ids=528 vocab=129280
+### done B1 rc=0
+
+### B2 | control=4/0 candidate=4/12 prefix=8192 | 05:27:19
+metal-decode-schedule-bench: model=ds4flash.gguf prompt=speed-bench/promessi_sposi.txt prefix=8192 ctx=9216 warmup=16 measured=512 control=4/0 candidate=4/12 candidate_env=(none) include_selection=yes
+variant=control first_split=4 second_split=0 tokens=512 seconds=18.787525 tokens_per_second=27.2521
+variant=candidate first_split=4 second_split=12 tokens=512 seconds=18.785370 tokens_per_second=27.2553
+exact_rows=529 exact_floats=68389120 exact_selected_ids=528 vocab=129280
+### done B2 rc=0
+
+### B3 | control=4/0 candidate=4/16 prefix=8192 | 05:28:54
+metal-decode-schedule-bench: model=ds4flash.gguf prompt=speed-bench/promessi_sposi.txt prefix=8192 ctx=9216 warmup=16 measured=512 control=4/0 candidate=4/16 candidate_env=(none) include_selection=yes
+variant=control first_split=4 second_split=0 tokens=512 seconds=18.802907 tokens_per_second=27.2298
+variant=candidate first_split=4 second_split=16 tokens=512 seconds=18.801413 tokens_per_second=27.2320
+exact_rows=529 exact_floats=68389120 exact_selected_ids=528 vocab=129280
+### done B3 rc=0
+
+### B4 | control=4/0 candidate=4/20 prefix=8192 | 05:30:29
+metal-decode-schedule-bench: model=ds4flash.gguf prompt=speed-bench/promessi_sposi.txt prefix=8192 ctx=9216 warmup=16 measured=512 control=4/0 candidate=4/20 candidate_env=(none) include_selection=yes
+variant=control first_split=4 second_split=0 tokens=512 seconds=18.802368 tokens_per_second=27.2306
+variant=candidate first_split=4 second_split=20 tokens=512 seconds=18.797126 tokens_per_second=27.2382
+exact_rows=529 exact_floats=68389120 exact_selected_ids=528 vocab=129280
+### done B4 rc=0
+
+### B5 | control=4/0 candidate=4/24 prefix=8192 | 05:32:04
+metal-decode-schedule-bench: model=ds4flash.gguf prompt=speed-bench/promessi_sposi.txt prefix=8192 ctx=9216 warmup=16 measured=512 control=4/0 candidate=4/24 candidate_env=(none) include_selection=yes
+variant=control first_split=4 second_split=0 tokens=512 seconds=18.785100 tokens_per_second=27.2556
+variant=candidate first_split=4 second_split=24 tokens=512 seconds=18.776333 tokens_per_second=27.2684
+exact_rows=529 exact_floats=68389120 exact_selected_ids=528 vocab=129280
+### done B5 rc=0
+
+### B6 | control=4/0 candidate=4/32 prefix=8192 | 05:33:39
+metal-decode-schedule-bench: model=ds4flash.gguf prompt=speed-bench/promessi_sposi.txt prefix=8192 ctx=9216 warmup=16 measured=512 control=4/0 candidate=4/32 candidate_env=(none) include_selection=yes
+variant=control first_split=4 second_split=0 tokens=512 seconds=18.783107 tokens_per_second=27.2585
+variant=candidate first_split=4 second_split=32 tokens=512 seconds=18.776576 tokens_per_second=27.2680
+exact_rows=529 exact_floats=68389120 exact_selected_ids=528 vocab=129280
+### done B6 rc=0
+==== SCAN PHASE 1 COMPLETE Sun Aug 30 05:35:14 CST 2026 ====
+metal-decode-schedule-bench: model=ds4flash.gguf prompt=speed-bench/promessi_sposi.txt prefix=8192 ctx=9216 warmup=16 measured=512 control=4/0 candidate=2/32 candidate_env=(none) include_selection=yes
+variant=control first_split=4 second_split=0 tokens=512 seconds=18.784983 tokens_per_second=27.2558
+variant=candidate first_split=2 second_split=32 tokens=512 seconds=18.739827 tokens_per_second=27.3215
+exact_rows=529 exact_floats=68389120 exact_selected_ids=528 vocab=129280
+### B7 done (forced 2/32 at long ctx)
