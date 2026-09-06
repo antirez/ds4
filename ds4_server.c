@@ -2028,7 +2028,8 @@ static bool parse_messages(const char **p, chat_msgs *msgs) {
         (*p)++;
         if (!msg.role) msg.role = xstrdup("user");
         if (!msg.content) msg.content = xstrdup("");
-        if (msg.images.len && strcmp(msg.role, "user")) goto fail;
+        if (msg.images.len && strcmp(msg.role, "user") &&
+            strcmp(msg.role, "tool") && strcmp(msg.role, "function")) goto fail;
         chat_msgs_push(msgs, msg);
         memset(&msg, 0, sizeof(msg));
         json_ws(p);
@@ -19351,6 +19352,46 @@ static void test_openai_inline_image_content(void) {
     buf_free(&json);
 }
 
+static void test_openai_tool_role_image_content(void) {
+    /* #933: a tool-result message carrying an inline image (the normal shape
+     * for coding agents attaching a screenshot as a tool result) must parse,
+     * matching the OpenAI wire format DeepSeek's own template already wraps
+     * in a user turn. Assistant/system images stay rejected. */
+    const char *accepted_roles[] = {"tool", "function", "user"};
+    for (size_t i = 0; i < sizeof(accepted_roles) / sizeof(accepted_roles[0]); i++) {
+        buf json = {0};
+        buf_puts(&json, "[{\"role\":\"");
+        buf_puts(&json, accepted_roles[i]);
+        buf_puts(&json, "\",\"content\":[{\"type\":\"text\",\"text\":\"result: \"},"
+            "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,");
+        buf_puts(&json, test_inline_png_base64);
+        buf_puts(&json, "\"}}]}]");
+        const char *p = json.ptr;
+        chat_msgs msgs = {0};
+        TEST_ASSERT(parse_messages(&p, &msgs));
+        TEST_ASSERT(msgs.len == 1);
+        TEST_ASSERT(msgs.v[0].images.len == 1);
+        chat_msgs_free(&msgs);
+        buf_free(&json);
+    }
+
+    const char *rejected_roles[] = {"assistant", "system"};
+    for (size_t i = 0; i < sizeof(rejected_roles) / sizeof(rejected_roles[0]); i++) {
+        buf json = {0};
+        buf_puts(&json, "[{\"role\":\"");
+        buf_puts(&json, rejected_roles[i]);
+        buf_puts(&json, "\",\"content\":[{\"type\":\"image_url\","
+            "\"image_url\":{\"url\":\"data:image/png;base64,");
+        buf_puts(&json, test_inline_png_base64);
+        buf_puts(&json, "\"}}]}]");
+        const char *p = json.ptr;
+        chat_msgs msgs = {0};
+        TEST_ASSERT(!parse_messages(&p, &msgs));
+        chat_msgs_free(&msgs);
+        buf_free(&json);
+    }
+}
+
 static void test_http_image_paths_and_urls_are_rejected(void) {
     const char *cases[] = {
         "[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\","
@@ -19488,6 +19529,7 @@ static void ds4_server_unit_tests_run(void) {
     test_thinking_canonical_with_tools_preserves_reasoning();
     test_thinking_canonical_non_thinking_mode_noop();
     test_openai_inline_image_content();
+    test_openai_tool_role_image_content();
     test_http_image_paths_and_urls_are_rejected();
     test_anthropic_inline_image_content();
     test_responses_inline_image_content();
