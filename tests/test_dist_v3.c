@@ -219,6 +219,25 @@ static void test_negotiation(void) {
     CHECK(ack.selected_caps == DS4_DIST_V3_CAP_BULK_DESC_V1);
     CHECK(ds4_dist_v3_u64_from_halves(ack.generation_hi,
                                      ack.generation_lo) == generation);
+
+    /* Rewind capability is selected only when BOTH sides offer it (an older
+     * worker or coordinator never does), and it survives the selection
+     * allow-list — a silently dropped bit would leave the coordinator
+     * believing the route cannot rewind. */
+    {
+        ds4_dist_v3_hello_ack rack;
+        ds4_dist_v3_hello_ext rw = worker, rc = coordinator;
+        rw.capabilities |= DS4_DIST_V3_CAP_REWIND_V1;
+        CHECK(ds4_dist_v3_negotiate(&rw, &rc, generation,
+                                    &rack, err, sizeof(err)) == 0);
+        CHECK((rack.selected_caps & DS4_DIST_V3_CAP_REWIND_V1) == 0);
+        rc.capabilities |= DS4_DIST_V3_CAP_REWIND_V1;
+        CHECK(ds4_dist_v3_negotiate(&rw, &rc, generation,
+                                    &rack, err, sizeof(err)) == 0);
+        CHECK((rack.selected_caps & DS4_DIST_V3_CAP_REWIND_V1) != 0);
+        CHECK(rack.selected_caps ==
+              (DS4_DIST_V3_CAP_BULK_DESC_V1 | DS4_DIST_V3_CAP_REWIND_V1));
+    }
     CHECK(ack.nhi_frame_size == 0 && ack.nhi_ring_size == 0 &&
           ack.nhi_max_payload == 0);
     CHECK(ds4_dist_v3_hello_ack_validate(&ack, &worker,
@@ -391,6 +410,43 @@ static void test_work_capability_validation(void) {
               DS4_DIST_V3_CAP_SPEC_DECODE_V1 |
                   DS4_DIST_V3_CAP_SPEC_EXACT_V1,
               err, sizeof(err)) == 0);
+
+    /* Rewind flags fail closed without DS4_DIST_V3_CAP_REWIND_V1 (an older
+     * worker never advertises it), never share a span, and never combine
+     * with speculative, multi-session or reset spans. */
+    static const uint32_t rewind_flags[] = {
+        DS4_DIST_WORK_F_REWIND_CAPTURE,
+        DS4_DIST_WORK_F_REWIND,
+    };
+    for (size_t i = 0; i < sizeof(rewind_flags) / sizeof(rewind_flags[0]); i++) {
+        CHECK(ds4_dist_v3_work_caps_validate(
+                  rewind_flags[i] | DS4_DIST_WORK_F_INPUT_HC |
+                      DS4_DIST_WORK_F_OUTPUT_LOGITS,
+                  DS4_DIST_V3_CAP_SPEC_DECODE_V1 |
+                      DS4_DIST_V3_CAP_MULTI_SESSION_V1,
+                  err, sizeof(err)) == -1);
+        CHECK(errno == EPROTO);
+        CHECK(strstr(err, "negotiated rewind capability") != NULL);
+        CHECK(ds4_dist_v3_work_caps_validate(
+                  rewind_flags[i] | DS4_DIST_WORK_F_INPUT_HC |
+                      DS4_DIST_WORK_F_OUTPUT_LOGITS,
+                  DS4_DIST_V3_CAP_REWIND_V1, err, sizeof(err)) == 0);
+        CHECK(ds4_dist_v3_work_caps_validate(
+                  rewind_flags[i] | DS4_DIST_WORK_F_SPEC_VERIFY,
+                  DS4_DIST_V3_CAP_REWIND_V1 | DS4_DIST_V3_CAP_SPEC_DECODE_V1,
+                  err, sizeof(err)) == -1);
+        CHECK(ds4_dist_v3_work_caps_validate(
+                  rewind_flags[i] | DS4_DIST_WORK_F_MULTI_SESSION,
+                  DS4_DIST_V3_CAP_REWIND_V1 | DS4_DIST_V3_CAP_MULTI_SESSION_V1,
+                  err, sizeof(err)) == -1);
+        CHECK(ds4_dist_v3_work_caps_validate(
+                  rewind_flags[i] | DS4_DIST_WORK_F_RESET_SESSION,
+                  DS4_DIST_V3_CAP_REWIND_V1, err, sizeof(err)) == -1);
+    }
+    CHECK(ds4_dist_v3_work_caps_validate(
+              DS4_DIST_WORK_F_REWIND_MASK,
+              DS4_DIST_V3_CAP_REWIND_V1, err, sizeof(err)) == -1);
+    CHECK(strstr(err, "cannot share") != NULL);
 }
 
 static void test_result_payload_limits(void) {
