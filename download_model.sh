@@ -174,6 +174,10 @@ Options:
 Environment:
   DS4_GGUF_DIR   Directory used for downloaded GGUF files.
                  Default: ./gguf
+  HF_ENDPOINT    Hugging Face host used for downloads. Useful where
+                 huggingface.co is slow or unreachable. The official Hugging
+                 Face CLI already honours it; this script applies it to the
+                 curl path too. Default: https://huggingface.co
 
 After main-model downloads the script updates:
   ./ds4flash.gguf -> <download directory>/<selected model>
@@ -393,7 +397,7 @@ download_one_hf() {
     fi
 
     echo "Downloading $file"
-    echo "from https://huggingface.co/$REPO"
+    echo "from ${HF_ENDPOINT:-https://huggingface.co}/$REPO"
     echo "using $HF_CMD download"
     echo "If the download stops, run the same command again to resume it."
 
@@ -420,7 +424,7 @@ download_one() {
     out="$OUT_DIR/$local_file"
     part="$out.part"
     aria2_part="$out.aria2"
-    url="https://huggingface.co/$REPO/resolve/main/$file"
+    url="${HF_ENDPOINT:-https://huggingface.co}/$REPO/resolve/main/$file"
 
     if needs_hf_download "$file"; then
         download_one_hf "$file"
@@ -441,7 +445,7 @@ download_one() {
     fi
 
     echo "Downloading $file"
-    echo "from https://huggingface.co/$REPO"
+    echo "from ${HF_ENDPOINT:-https://huggingface.co}/$REPO"
     echo "If the download stops, run the same command again to resume it."
 
     if [ -n "$TOKEN" ]; then
