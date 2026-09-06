@@ -2288,8 +2288,17 @@ static uint64_t cuda_model_cache_limit_bytes(void) {
         unsigned long long v = strtoull(env, &end, 10);
         if (end != env) gb = (uint64_t)v;
     }
-    if (gb == 0) return UINT64_MAX;
-    return gb * 1073741824ull;
+    if (gb != 0) return gb * 1073741824ull;
+    /* No explicit limit set: leave headroom for KV cache, prefill
+     * buffers, and the dynamic q8/fp16 cache instead of letting this
+     * arena grow unbounded until cudaMalloc starts failing mid-prefill
+     * (see issue #170: identical "arena alloc failed: out of memory"
+     * symptom, unbounded default was the unidentified root cause). */
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) return UINT64_MAX;
+    const uint64_t reserve = 4ull * 1073741824ull; /* 4 GiB safety margin */
+    if ((uint64_t)free_b <= reserve) return 0;
+    return (uint64_t)free_b - reserve;
 }
 
 static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
