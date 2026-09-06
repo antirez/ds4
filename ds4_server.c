@@ -9229,6 +9229,14 @@ struct server_slot {
     job *running;
     bool busy;
     bool prefill_waiting;
+    /* Dispatcher-owned (s->mu) view of the job occupying a busy slot: its
+     * identity, a copy of its prompt, and whether the client cancelled it
+     * (the slot then frees within one prefill quantum or one decode token).
+     * The job struct itself is stack-owned by the client thread and guarded
+     * by model_mu, so the dispatcher never dereferences slot->running. */
+    job *busy_job;
+    ds4_tokens busy_prompt;
+    bool draining;
 
     bool decode_pending;
     bool decode_in_flight;
@@ -13498,6 +13506,37 @@ static int job_slot_score(server *s, server_slot *slot, const job *j,
     return slot_reuse_score(common, resident);
 }
 
+static int tokens_common_prefix_len(const ds4_tokens *a, const ds4_tokens *b) {
+    if (!a || !b) return 0;
+    const int n = a->len < b->len ? a->len : b->len;
+    int i = 0;
+    while (i < n && a->v[i] == b->v[i]) i++;
+    return i;
+}
+
+/* A busy slot whose running job was cancelled frees within one prefill
+ * quantum (or one decode token). If it holds far more of this prompt than
+ * any free slot does, the job should wait for it: dispatching elsewhere
+ * would re-prefill the whole prompt AND evict a third conversation, while
+ * the wait is bounded by the quantum. The margin is one quantum so a small
+ * prompt (cheaper to rebuild than to wait) never waits. Observed on the
+ * pair: cancel a 3.3k-token request, resend within a second, and the resend
+ * rebuilt 18 s on the other slot with its home slot freeing 100 ms later. */
+static bool dispatch_should_wait_for_draining_slot_locked(server *s,
+                                                          const job *j,
+                                                          int best_score) {
+    if (!s || !j || j->req.image_count != 0) return false;
+    const int margin = server_prefill_quantum_for(s, false);
+    for (int i = 0; i < s->slot_count; i++) {
+        const server_slot *slot = &s->slots[i];
+        if (!slot->busy || !slot->draining || slot->busy_prompt.len <= 0) continue;
+        const int common = tokens_common_prefix_len(&slot->busy_prompt, &j->req.prompt);
+        const int alt = slot_reuse_score(common, slot->busy_prompt.len);
+        if (alt >= best_score + margin) return true;
+    }
+    return false;
+}
+
 static void dispatch_jobs_locked(server *s) {
     if (!s || !s->batched_mode) return;
     for (;;) {
@@ -13519,6 +13558,10 @@ static void dispatch_jobs_locked(server *s) {
                     best = &s->slots[i];
                 }
             }
+            if (best && required < 0 &&
+                dispatch_should_wait_for_draining_slot_locked(s, j, best_score)) {
+                continue; /* its home slot is about to free; let later jobs use the free one */
+            }
             if (best) {
                 chosen = j;
                 chosen_prev = prev;
@@ -13537,6 +13580,10 @@ static void dispatch_jobs_locked(server *s) {
         chosen->next = NULL;
         chosen_slot->assigned = chosen;
         chosen_slot->busy = true;
+        chosen_slot->busy_job = chosen;
+        chosen_slot->draining = false;
+        tokens_copy_prefix(&chosen_slot->busy_prompt, &chosen->req.prompt,
+                           chosen->req.prompt.len);
         pthread_cond_broadcast(&s->cv);
     }
 }
@@ -13606,6 +13653,9 @@ static void *slot_worker_main(void *arg) {
 
         pthread_mutex_lock(&s->mu);
         slot->busy = false;
+        slot->busy_job = NULL;
+        slot->busy_prompt.len = 0;
+        slot->draining = false;
         dispatch_jobs_locked(s);
         pthread_mutex_unlock(&s->mu);
     }
@@ -13975,12 +14025,23 @@ static void server_cancel_job(server *s, job *j) {
     if (!detached && s->batched_mode) {
         for (int i = 0; i < s->slot_count; i++) {
             server_slot *slot = &s->slots[i];
-            if (slot->assigned != j) continue;
-            slot->assigned = NULL;
-            slot->busy = false;
-            detached = true;
-            dispatch_jobs_locked(s);
-            break;
+            if (slot->assigned == j) {
+                slot->assigned = NULL;
+                slot->busy = false;
+                slot->busy_job = NULL;
+                slot->busy_prompt.len = 0;
+                slot->draining = false;
+                detached = true;
+                dispatch_jobs_locked(s);
+                break;
+            }
+            if (slot->busy_job == j) {
+                /* Running: it exits at its next checkpoint. Let the
+                 * dispatcher hold a resend of the same conversation for this
+                 * slot instead of rebuilding it elsewhere. */
+                slot->draining = true;
+                break;
+            }
         }
     }
     pthread_cond_broadcast(&s->cv);
@@ -14261,6 +14322,7 @@ static void server_close_resources(server *s) {
         live_tool_state_free(&slot->responses_live);
         live_tool_state_free(&slot->anthropic_live);
         visible_live_free(&slot->thinking_live);
+        ds4_tokens_free(&slot->busy_prompt);
         if (slot->session) ds4_session_free(slot->session);
     }
     if (s->tp_leader) ds4_tp_send_stop(s->tp_leader);
@@ -14921,6 +14983,55 @@ static void test_slot_reuse_score(void) {
     /* Defensive clamps. */
     TEST_ASSERT(slot_reuse_score(-5, 10) == slot_reuse_score(0, 10));
     TEST_ASSERT(slot_reuse_score(10, 5) == slot_reuse_score(10, 10));
+}
+
+static void test_dispatch_waits_for_draining_home_slot(void) {
+    server s = {0};
+    server_slot slots[2] = {0};
+    s.slots = slots;
+    s.slot_count = 2;
+    s.batched_mode = true;
+    /* s.engine == NULL -> server_prefill_quantum_for() yields the 2048 default. */
+    static int toks[4000];
+    for (int i = 0; i < 4000; i++) toks[i] = 100 + i;
+    job j;
+    memset(&j, 0, sizeof(j));
+    j.req.prompt.v = toks;
+    j.req.prompt.len = 3325;
+
+    /* Slot 0 is busy finishing a cancelled request for this very prompt; the
+     * only free slot holds an unrelated conversation (best_score -3000). */
+    slots[0].busy = true;
+    slots[0].draining = true;
+    tokens_copy_prefix(&slots[0].busy_prompt, &j.req.prompt, 3325);
+    TEST_ASSERT(dispatch_should_wait_for_draining_slot_locked(&s, &j, -3000));
+    /* Still busy but NOT cancelled: never wait behind a live generation. */
+    slots[0].draining = false;
+    TEST_ASSERT(!dispatch_should_wait_for_draining_slot_locked(&s, &j, -3000));
+    slots[0].draining = true;
+    /* The free slot already holds the conversation: no reason to wait. */
+    TEST_ASSERT(!dispatch_should_wait_for_draining_slot_locked(&s, &j, 3325));
+    /* Gap smaller than one prefill quantum: rebuilding is cheaper than waiting. */
+    j.req.prompt.len = 1000;
+    slots[0].busy_prompt.len = 1000;
+    TEST_ASSERT(!dispatch_should_wait_for_draining_slot_locked(&s, &j, -100));
+    j.req.prompt.len = 3325;
+    slots[0].busy_prompt.len = 3325;
+    /* Draining slot holds an unrelated prompt: nothing to wait for. */
+    static int other[4000];
+    for (int i = 0; i < 4000; i++) other[i] = 900000 + i;
+    ds4_tokens unrelated = { .v = other, .len = 3325, .cap = 4000 };
+    tokens_copy_prefix(&slots[0].busy_prompt, &unrelated, 3325);
+    TEST_ASSERT(!dispatch_should_wait_for_draining_slot_locked(&s, &j, -3000));
+    tokens_copy_prefix(&slots[0].busy_prompt, &j.req.prompt, 3325);
+    /* Multimodal requests keep today's behavior. */
+    j.req.image_count = 1;
+    TEST_ASSERT(!dispatch_should_wait_for_draining_slot_locked(&s, &j, -3000));
+    j.req.image_count = 0;
+    /* A slot that is busy but not marked draining, or idle, is ignored. */
+    slots[0].busy = false;
+    TEST_ASSERT(!dispatch_should_wait_for_draining_slot_locked(&s, &j, -3000));
+    ds4_tokens_free(&slots[0].busy_prompt);
 }
 
 static void test_batched_prefill_round_robin(void) {
@@ -19962,6 +20073,7 @@ static void test_metrics_text(void) {
 static void ds4_server_unit_tests_run(void) {
     test_metrics_text();
     test_slot_reuse_score();
+    test_dispatch_waits_for_draining_home_slot();
     test_batched_prefill_round_robin();
     test_mixed_prefill_quantum_option();
     test_multimodal_prefill_resume_frontier();
