@@ -96,6 +96,59 @@ GLM uses graph-selected prefill chunks and does not accept `--prefill-chunk`
 or an external `--mtp-model`. It currently requires `--power 100`.
 Directional steering is supported for GLM 5.3, not GLM 5.2.
 
+## Qwen 3.8 Flash Next
+
+Experimental, and Metal only: CUDA and ROCm refuse the model at load time.
+
+There is no download target. Qwen 3.8 Flash Next has to be converted from the
+official FP8 snapshot, and it produces two files: the model and a separate PLE
+sidecar holding the n-gram embedding table.
+
+```sh
+make -C gguf-tools libds4quants.dylib   # libds4quants.so on Linux
+python3 gguf-tools/qwen38_quantize.py \
+  --hf /path/to/Qwen3.8-Flash-Next-FP8 \
+  --tokenizer-template /path/to/chat_template.jinja \
+  --artifact q2 \
+  --out gguf/Qwen3.8-Flash-Next-DS4-Q2.gguf \
+  --ple-out gguf/Qwen3.8-Flash-Next-PLE-Q8.gguf
+```
+
+| File | Approximate size | Contents |
+| --- | ---: | --- |
+| main GGUF | 44 GiB | IQ2_XXS gate/up experts, MXFP4 down experts |
+| PLE sidecar | 51 GiB | Q8_0 n-gram embedding table |
+
+The down experts are MXFP4 because the 640-wide expert rows are not QK_K
+aligned. The sidecar is larger than the model and is read row by row, never
+resident.
+
+```sh
+./ds4 -m gguf/Qwen3.8-Flash-Next-DS4-Q2.gguf --ctx 8192 --nothink -p "Il mare e'"
+```
+
+The sidecar defaults to `gguf/Qwen3.8-Flash-Next-PLE-Q8.gguf`; set
+`DS4_QWEN38_PLE_PATH` to put it elsewhere. Model plus graph need about 45 GiB
+resident at `--ctx 8192`, and the KV cache is small enough that `--ctx 16384`
+costs only a couple of hundred MiB more, so both fit a 64 GB Apple Silicon
+machine with nothing else large running. The model has to stay resident, there
+is no SSD-streaming path for it, so that is the memory floor. Follow the
+[Metal](METAL.md) starting configuration.
+
+The model alternates Gated DeltaNet recurrent layers with QSA sparse-attention
+layers, replaces the plain residual with hyper-connections, and reads per-layer
+n-gram embeddings from the sidecar.
+
+Know the limits before using it:
+
+* **Context beyond about 2048 tokens diverges from the official model.** The
+  QSA layers run dense attention, which matches the model exactly only while
+  its own indexer would select every block, that is up to the 2048-token
+  indexer budget. The block indexer is not implemented.
+* SSD streaming, `--kv-disk-dir` and `--batched-session` are refused for this
+  model: serializing the recurrent and PLE session state is not written yet.
+* No MTP, no vision.
+
 ## Vision
 
 PNG and JPEG input works in the CLI, native agent, and HTTP server on Metal,

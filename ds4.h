@@ -303,6 +303,7 @@ bool ds4_engine_glm_layer_payload_bytes(ds4_engine *e,
 int ds4_engine_model_id(ds4_engine *e);
 bool ds4_engine_is_glm_dsa(ds4_engine *e);
 bool ds4_engine_is_glm53(ds4_engine *e);
+bool ds4_engine_is_qwen38(ds4_engine *e);
 const char *ds4_backend_name(ds4_backend backend);
 bool ds4_think_mode_enabled(ds4_think_mode mode);
 const char *ds4_think_mode_name(ds4_think_mode mode);
@@ -373,6 +374,26 @@ void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_thi
 char *ds4_token_text(ds4_engine *e, int token, size_t *len);
 int ds4_token_eos(ds4_engine *e);
 bool ds4_token_is_stop(ds4_engine *e, int token);
+
+/* Qwen 3.8 PLE (n-gram embedding) host-side hashing. The rolling context
+ * tracks the two previous token ids and the EOS-segment length; hashing a
+ * token yields the 16 absolute table row ids (8 bigram + 8 trigram heads).
+ * The hash parameters come from the loaded model's metadata;
+ * ds4_qwen38_ple_test_config exists for model-free unit tests. */
+typedef struct {
+    int prev1;
+    int prev2;
+    uint32_t segment_len;
+} ds4_qwen38_ple_ctx;
+
+void ds4_qwen38_ple_ctx_reset(ds4_qwen38_ple_ctx *ctx);
+void ds4_qwen38_ple_hash(const ds4_qwen38_ple_ctx *ctx, int token,
+                         uint64_t rows[16]);
+void ds4_qwen38_ple_ctx_push(ds4_qwen38_ple_ctx *ctx, int token);
+void ds4_qwen38_ple_test_config(const uint64_t multipliers[3],
+                                const uint64_t offsets[16],
+                                const uint64_t vocab_sizes[16],
+                                uint32_t eos_token_id);
 bool ds4_token_is_thinking_control(ds4_engine *e, int token);
 bool ds4_token_is_stop_for_think_mode(ds4_engine *e,
                                       int token,

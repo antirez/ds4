@@ -33213,6 +33213,24 @@ extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
 }
 #pragma GCC diagnostic pop
 
+/* Qwen 3.8 is a Metal-only model for now: its Gated DeltaNet, QSA,
+ * hyper-connection and PLE kernels have no CUDA counterpart yet.  The
+ * shared graph code references these entry points unconditionally, so
+ * keep link-level stubs here; model loading refuses Qwen 3.8 on this
+ * backend before any of them can be reached. */
+#define DS4_CUDA_QWEN38_UNAVAILABLE(name) extern "C" int name(...) { return 0; }
+
+DS4_CUDA_QWEN38_UNAVAILABLE(ds4_gpu_qwen38_add_sigmoid_rows)
+DS4_CUDA_QWEN38_UNAVAILABLE(ds4_gpu_qwen38_gdn)
+DS4_CUDA_QWEN38_UNAVAILABLE(ds4_gpu_qwen38_hc_combine)
+DS4_CUDA_QWEN38_UNAVAILABLE(ds4_gpu_qwen38_hc_group_norm)
+DS4_CUDA_QWEN38_UNAVAILABLE(ds4_gpu_qwen38_hc_inject)
+DS4_CUDA_QWEN38_UNAVAILABLE(ds4_gpu_qwen38_hc_mix_silu)
+DS4_CUDA_QWEN38_UNAVAILABLE(ds4_gpu_qwen38_ple_conv)
+DS4_CUDA_QWEN38_UNAVAILABLE(ds4_gpu_qwen38_ple_gate)
+DS4_CUDA_QWEN38_UNAVAILABLE(ds4_gpu_qwen38_qsa)
+DS4_CUDA_QWEN38_UNAVAILABLE(ds4_gpu_qwen38_router_select_tensor)
+
 #define DS4_GLM53_VISION_STREAM cuda_decode_stream()
 #include "ds4_glm53_vision_gpu.cuh"
 #include "ds4_deepseek4_vision_gpu.cuh"
