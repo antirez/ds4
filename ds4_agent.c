@@ -11184,9 +11184,11 @@ static int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *
                 w->cache_dir, strerror(errno));
         return -1;
     }
+    bool headless = getenv("DISPLAY") == NULL || getenv("DS4_HEADLESS") != NULL;
     ds4_web_config web_cfg = {
         .home_dir = getenv("HOME"),
         .port = 9333,
+        .headless = headless,
         .confirm = agent_web_confirm,
         .confirm_privdata = w,
         .log = agent_web_log,
