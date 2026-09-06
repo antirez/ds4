@@ -754,13 +754,15 @@ test-frontends: ds4_test ds4_agent_test
 	./ds4_test --server
 	./ds4_agent_test
 
+# Select model-compatible groups when checkpoint-specific fixtures are unavailable.
+# Empty DS4_TEST_ARGS retains the complete default suite.
 test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test test-session-state test-linux-memory \
 	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
 	tests/test_deepseek4_vision_image tests/test_prompt_prefix $(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
 	./ds4-eval --validate-cases
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
-	./ds4_test
+	./ds4_test $(DS4_TEST_ARGS)
 	./tests/test_layer_pack
 	./tests/test_engine_mgpu_placement
 	./tests/test_gpu_args

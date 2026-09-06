@@ -243,54 +243,40 @@ request-owned.
 
 ## Kernel and pack tests
 
-```sh
-make test-qwen4
-```
-
-The Metal fixture checks `Q4_K` routed-expert and `Q8_0` projection parity,
-Gated DeltaNet R4/R2/R1
-outputs and FP32 states at 1, 5, 17, 2048, and 8192 tokens with masks, exact
-single-query QSA scoring and ordered top-k for FP32/FP16/BF16 inputs through
-32768 pooled rows, streaming QSA top-k without a full score sheet, multimodal
-three-axis partial RoPE, and dense-causal QSA. The host fixture covers pack
-manifests, checksums, prefill policy, Qwen image resizing/patch order, contracted
-  M-RoPE tables, n-gram hashing, `Q4_1` PLE dequantization, bitwise pread/mmap parity for
-duplicate, reordered, and VM-page-crossing rows, and the two-slot asynchronous
-PLE stager lifecycle.
-
-Before handing off or releasing this branch on Apple Metal, run the complete
-model-independent regression gate:
+For the shipped `qwen4exp` engine, run the Metal kernel fixture and the
+model-independent frontend gate:
 
 ```sh
-make test-qwen4-release
+make test-qwen4-kernels
+make test DS4_TEST_ARGS="--server --metal-kernels"
+python3 gguf-tools/tests/test_qwen4_pack.py
+python3 speed-bench/test_qwen4_acceptance.py
+python3 speed-bench/test_qwen4_benchmark.py
 ```
 
-This target runs, in order:
+With the Qwen model and matching PLE sidecar available, include the snapshot
+and rewind checks:
 
-- `test-qwen4-release-core`: extractor and agent tests, model-free server tests
-  (including batched-session scheduling, cache, cancellation, API, GLM/Qwen
-  prompt, and tool-state fixtures), layer-pack and CPU placement tests, shared
-  GPU argument/CLI tests, sampling, Q4_K/MXFP4 CPU dot products, and a compile
-  check of the normal CLI/server/benchmark/agent binaries;
-- the existing `test-qwen4` aggregate without substituting or omitting any of
-  its host, Metal, pack-conversion, or acceptance-validator fixtures;
-- the model-free Metal kernel group from `ds4_test`;
-- the synthetic GLM 5.3 KDA/DSA primitive suite; and
-- the non-Qwen Metal MXFP4 exactness suite, including the checked-in half-LUT
-  verification.
+```sh
+DS4_TEST_MODEL=/pack/model.gguf DS4_TEST_PLE=/pack/ple.gguf \
+  make test DS4_TEST_ARGS="--server --metal-kernels --session-snapshot --session-rewind"
+DS4_TEST_MODEL=/pack/model.gguf DS4_TEST_PLE=/pack/ple.gguf DS4_TEST_GLM_MTP=1 \
+  ./ds4_test --session-snapshot --session-rewind
+```
 
-Every input in this aggregate is a checked-in deterministic fixture or a small
-synthetic tensor. It intentionally does not run the model-backed Metal session
-oracle, GLM vision engine, 16K golden generation, 29.8 GiB PLE sidecar, network
-server, or full-model performance/quality benchmarks. Those remain separate
-acceptance gates because they require checkpoint artifacts or dedicated
-hardware; this target must not turn their absence into a silent skip.
+`DS4_TEST_ARGS` selects the model-compatible `ds4_test` groups while keeping
+all other `make test` checks. Leaving it unset runs the full default suite,
+including DeepSeek checkpoint-specific fixtures; do not score a Qwen or
+Vision Exp model against the DeepSeek 0731 vectors.
 
-For GPU traces, capture `tests/test_qwen4_metal`; its command encoders are named
-for the Qwen `Q4_K` MoE and `Q8_0` projection stages, `Qwen Gated DeltaNet R4`,
-`Qwen QSA M=1 ... index scoring`, `Qwen QSA streaming top-k`, and the
-`Qwen vision ...` encoder stages. Full-model acceptance runs should remain
-uncaptured because capture changes residency and timing.
+`make test-qwen4-host` covers the superseded native `qwen4` engine retained
+for reference. Its `tests/test_qwen4_metal.c` fixture does not compile against
+the shipped engine. The old `test-qwen4` and `test-qwen4-release` aggregates
+are no longer Makefile targets. Full-model vision, continuation quality,
+performance, SSD, and distributed checks remain separate gates.
+
+The performance notes below include historical native-engine experiments;
+use the current Makefile targets and model-specific reports for validation.
 
 Set `DS4_QWEN4_PROFILE=1` on a small uncaptured run to print one consolidated
 per-forward timing line for embedding, total PLE work, CPU gather time,

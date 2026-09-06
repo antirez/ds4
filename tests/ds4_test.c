@@ -1,5 +1,6 @@
 #define DS4_SERVER_TEST
 #define DS4_SERVER_TEST_NO_MAIN
+#include <inttypes.h>
 #include "../ds4_server.c"
 #ifndef DS4_NO_GPU
 #include "../ds4_gpu.h"
@@ -193,15 +194,25 @@ static void test_session_rewind_replay(void) {
     }
     if (mtp) TEST_ASSERT(last_n == 2);   /* the one-token rewind below takes the snapshot path */
     TEST_ASSERT(ds4_session_pos(live) == replay.len);
+    if (mtp) TEST_ASSERT(ds4_session_top_logprobs(live, want, 8) == 8);
 
     /* rewind one token (snapshot path under MTP) and re-evaluate it */
     const int last = replay.v[replay.len - 1];
     ds4_session_rewind(live, replay.len - 1);
     TEST_ASSERT(ds4_session_pos(live) == replay.len - 1);
     TEST_ASSERT(ds4_session_eval(live, last, err, sizeof(err)) == 0);
-    TEST_ASSERT(ds4_session_sync(fresh, &replay, err, sizeof(err)) == 0);
+    /* Match the replay's prefill/decode split. A full-prefix prefill uses
+     * different floating-point accumulation than the final decode step. */
+    ds4_tokens prefix = replay;
+    prefix.len--;
+    if (!mtp) {
+        TEST_ASSERT(ds4_session_sync(fresh, &prefix, err, sizeof(err)) == 0);
+        TEST_ASSERT(ds4_session_eval(fresh, last, err, sizeof(err)) == 0);
+        TEST_ASSERT(ds4_session_top_logprobs(fresh, want, 8) == 8);
+    }
+    /* MTP restores row zero of the verifier snapshot: re-evaluating row one
+     * must reproduce its original logits, including the prior decode state. */
     TEST_ASSERT(ds4_session_top_logprobs(live, got, 8) == 8);
-    TEST_ASSERT(ds4_session_top_logprobs(fresh, want, 8) == 8);
     TEST_ASSERT(got[0].id == want[0].id);
     for (int i = 0; i < 8; i++) TEST_ASSERT(fabsf(got[i].logprob - want[i].logprob) < 2e-3f);
 
@@ -211,6 +222,15 @@ static void test_session_rewind_replay(void) {
     TEST_ASSERT(ds4_session_eval(live, replay.v[replay.len - 2], err, sizeof(err)) == 0);
     TEST_ASSERT(ds4_session_eval(live, last, err, sizeof(err)) == 0);
     TEST_ASSERT(ds4_session_pos(live) == replay.len);
+    ds4_session_free(fresh);
+    fresh = NULL;
+    TEST_ASSERT(ds4_session_create(&fresh, engine, 1024) == 0);
+    if (!fresh) goto cleanup;
+    prefix.len = replay.len - 2;
+    TEST_ASSERT(ds4_session_sync(fresh, &prefix, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_eval(fresh, replay.v[replay.len - 2], err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_eval(fresh, last, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_top_logprobs(fresh, want, 8) == 8);
     TEST_ASSERT(ds4_session_top_logprobs(live, got, 8) == 8);
     TEST_ASSERT(got[0].id == want[0].id);
     for (int i = 0; i < 8; i++) TEST_ASSERT(fabsf(got[i].logprob - want[i].logprob) < 2e-3f);
@@ -331,7 +351,7 @@ static void test_session_snapshot_roundtrip(void) {
         if (again.len == snapshot.len && memcmp(again.ptr, snapshot.ptr, again.len) != 0) {
             size_t first = 0;
             while (first < again.len && again.ptr[first] == snapshot.ptr[first]) first++;
-            fprintf(stderr, "ds4-test: snapshot round trip differs at byte %zu of %zu\n", first, again.len);
+            fprintf(stderr, "ds4-test: snapshot round trip differs at byte %zu of %" PRIu64 "\n", first, again.len);
             TEST_ASSERT(false);
         }
         ds4_session_snapshot_free(&again);

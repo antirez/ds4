@@ -1340,6 +1340,9 @@ static const char agent_qwen_tools_prompt_intro[] =
 
 static const char agent_qwen_tools_prompt_after_schemas[] =
     "\n</tools>\n\n"
+    AGENT_TOOL_CONTRACTS
+    "Inside string values only, escape a literal </parameter> as &lt;/parameter>. "
+    "To write that escaped spelling literally, use &amp;lt;/parameter>. Other HTML entities are unchanged.\n\n"
     "If you choose to call a function ONLY reply in the following format with NO suffix:\n\n"
     "<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n"
     "<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n"
@@ -1359,7 +1362,7 @@ static const char agent_qwen_tools_prompt_after_schemas[] =
     "- " AGENT_EDIT_TARGET_RULE "\n";
 
 /* the GLM schema list, each line wrapped as {"type": "function", "function": ...} */
-static char *agent_build_qwen_tools_prompt(bool edit_upto) {
+static char *agent_build_qwen_tools_prompt(bool edit_upto, bool vision) {
     static const char wrap[] = "\n{\"type\": \"function\", \"function\": ";
     const char *edit = edit_upto ? agent_glm_tools_prompt_edit_upto
                                  : agent_glm_tools_prompt_edit_exact;
@@ -1369,6 +1372,7 @@ static char *agent_build_qwen_tools_prompt(bool edit_upto) {
                  strlen(agent_glm_tool_schemas) + lines * sizeof(wrap) +
                  strlen(agent_qwen_tools_prompt_after_schemas) + strlen(edit) +
                  strlen(agent_glm_tools_prompt_rules_tail) + 1;
+    if (vision) cap += strlen(wrap) + strlen(agent_vision_tool_schema) + 1;
     char *out = xmalloc(cap);
     size_t n = (size_t)snprintf(out, cap, "%s", agent_qwen_tools_prompt_intro);
     const char *p = agent_glm_tool_schemas;
@@ -1378,6 +1382,7 @@ static char *agent_build_qwen_tools_prompt(bool edit_upto) {
         if (len) n += (size_t)snprintf(out + n, cap - n, "%s%.*s}", wrap, (int)len, p);
         p += len + (nl ? 1 : 0);
     }
+    if (vision) n += (size_t)snprintf(out + n, cap - n, "%s%s}", wrap, agent_vision_tool_schema);
     snprintf(out + n, cap - n, "%s%s%s", agent_qwen_tools_prompt_after_schemas, edit,
              agent_glm_tools_prompt_rules_tail);
     return out;
@@ -1385,7 +1390,7 @@ static char *agent_build_qwen_tools_prompt(bool edit_upto) {
 
 static char *agent_build_tools_prompt(ds4_engine *engine, bool edit_upto) {
     const agent_tool_syntax syntax = agent_tool_syntax_for_engine(engine);
-    if (syntax == AGENT_TOOL_SYNTAX_QWEN) return agent_build_qwen_tools_prompt(edit_upto);
+    if (syntax == AGENT_TOOL_SYNTAX_QWEN) return agent_build_qwen_tools_prompt(edit_upto, ds4_engine_has_vision(engine));
     if (syntax == AGENT_TOOL_SYNTAX_GLM) return agent_build_glm_tools_prompt(edit_upto, ds4_engine_has_vision(engine));
     return agent_build_dsml_tools_prompt(edit_upto, ds4_engine_has_vision(engine));
 }
@@ -2103,7 +2108,7 @@ static void agent_qwen_tool_parse(agent_dsml_parser *p) {
             if (ve > vs && ve[-1] == '\n') ve--;
             const bool is_json = agent_qwen_value_is_json(vs, (size_t)(ve - vs));
             agent_tool_call_add_arg(&p->current, p->param_name ? p->param_name : "",
-                                    vs, (size_t)(ve - vs), !is_json);
+                                    vs, (size_t)(ve - vs), !is_json, "</parameter>");
             free(p->param_name);
             p->param_name = NULL;
             p->param_close_prefix = false;
@@ -7601,15 +7606,20 @@ static void test_agent_tool_argument_literal_markup(void) {
         "<｜DSML｜tool_calls><｜DSML｜invoke name=\"write\"><｜DSML｜parameter name=\"content\" string=\"true\"><p>&amp; &lt;</p> </tool_call> </think> ",
         "&lt;/｜DSML｜parameter> &amp;lt;/｜DSML｜parameter></｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>",
     };
+    const char *qwen[] = {
+        "<tool_call>\n<function=write>\n<parameter=content>\n<p>&amp; &lt;</p> ",
+        "&lt;/parameter> &amp;lt;/parameter>\n</parameter>\n</function>\n</tool_call>",
+    };
     const char *expected[] = {
         "<p>&amp; &lt;</p> </tool_call> </think> </｜DSML｜parameter> &lt;/｜DSML｜parameter>",
         "<p>&amp; &lt;</p> </tool_call> </think> </arg_value> &lt;/arg_value>",
+        "<p>&amp; &lt;</p> </parameter> &lt;/parameter>",
     };
-    for (int is_glm = 0; is_glm <= 1; is_glm++) {
+    for (int is_glm = 0; is_glm <= 2; is_glm++) {
         agent_dsml_parser p;
         char *out = agent_test_stream_capture(
-            is_glm ? AGENT_TOOL_SYNTAX_GLM : AGENT_TOOL_SYNTAX_DSML,
-            is_glm ? glm : deepseek, 2, &p, NULL);
+            is_glm == 2 ? AGENT_TOOL_SYNTAX_QWEN : is_glm ? AGENT_TOOL_SYNTAX_GLM : AGENT_TOOL_SYNTAX_DSML,
+            is_glm == 2 ? qwen : is_glm ? glm : deepseek, 2, &p, NULL);
         AGENT_TEST_ASSERT(p.state == AGENT_DSML_DONE);
         AGENT_TEST_ASSERT(p.calls.len == 1);
         if (p.calls.len)

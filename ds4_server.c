@@ -6288,6 +6288,7 @@ static bool parse_qwen_generated_message_ex(const char *text,
                 return false;
             }
             char *value = qwen_strip_value_newlines(value_start, value_end);
+            if (!qwen_param_value_is_json(value)) ds4_tool_text_unescape(value, param_end);
             tool_call_json_args_add(&args, key, value, qwen_param_value_is_json(value) ? "false" : "true");
             free(key);
             free(value);
@@ -7030,6 +7031,11 @@ static const dsml_syntax glm_tool_syntax = {
     "<arg_key>", "</arg_key>", "<arg_value>", "</arg_value>",
 };
 
+static const dsml_syntax qwen_tool_syntax = {
+    "<tool_call>", "</tool_call>",
+    "<function=", "</function>", "<parameter=", "</parameter>",
+};
+
 typedef struct {
     dsml_track_mode mode;
     dsml_decode_state decode;
@@ -7237,12 +7243,14 @@ static void dsml_decode_tracker_update(dsml_decode_tracker *dt,
             size_t pos = 0;
             const dsml_syntax *syn = NULL;
             bool found;
-            if (dt->model_syntax == SERVER_MODEL_SYNTAX_GLM) {
+            if (dt->model_syntax == SERVER_MODEL_SYNTAX_GLM ||
+                dt->model_syntax == SERVER_MODEL_SYNTAX_QWEN) {
+                syn = dt->model_syntax == SERVER_MODEL_SYNTAX_QWEN ?
+                    &qwen_tool_syntax : &glm_tool_syntax;
                 const char *start = find_lit_bounded(raw + dt->pos,
-                    raw_len - dt->pos, glm_tool_syntax.tool_calls_start);
+                    raw_len - dt->pos, syn->tool_calls_start);
                 found = start != NULL;
                 if (found) {
-                    syn = &glm_tool_syntax;
                     pos = (size_t)(start - raw) + strlen(syn->tool_calls_start);
                 }
             } else {
@@ -7351,6 +7359,7 @@ structural:
                 }
                 size_t tag_after = (size_t)(tag_end - raw) + 1;
                 bool string_value = dt->model_syntax == SERVER_MODEL_SYNTAX_GLM ||
+                    dt->model_syntax == SERVER_MODEL_SYNTAX_QWEN ||
                     dsml_attr_is_string_true(raw, raw_len, tag_start, tag_after);
                 dt->pos = tag_after;
                 if (string_value) {
@@ -13199,7 +13208,6 @@ decode_again:
                 break;
             }
             token = toks[ti];
-            kept++;
             if (ds4_token_is_stop_for_think_mode(s->engine,
                                                  token,
                                                  j->req.think_mode)) {
@@ -13423,13 +13431,6 @@ decode_again:
                 trace_event(s, trace_id, "speculative boundary: kept=%d discarded=%d resample=%d",
                             kept, ntok - kept, resample);
             }
-        }
-        if (ntok - kept == 1 && !job_cancelled(j) && ds4_engine_is_qwen4(s->engine)) {
-            /* an accepted draft past the stop would desync the next prompt */
-            pthread_mutex_lock(&s->inference_mu);
-            ds4_session_rewind(slot->session, ds4_session_pos(slot->session) - 1);
-            pthread_mutex_unlock(&s->inference_mu);
-            trace_event(s, trace_id, "dropped the accepted draft token past the stop");
         }
         if (stop_decode) break;
     }
@@ -17004,7 +17005,7 @@ static void test_parse_qwen_tool_call_message(void) {
     const char *generated =
         "need bash\n</think>\n\nOK\n\n"
         "<tool_call>\n<function=bash>\n"
-        "<parameter=command>\necho hi\nsecond line\n</parameter>\n"
+        "<parameter=command>\necho hi\nsecond line &amp; &lt; &lt;/parameter> &amp;lt;/parameter>\n</parameter>\n"
         "<parameter=timeout>\n10\n</parameter>\n"
         "<parameter=opts>\n{\"a\": [1, 2]}\n</parameter>\n"
         "</function>\n</tool_call>\n"
@@ -17018,7 +17019,7 @@ static void test_parse_qwen_tool_call_message(void) {
     TEST_ASSERT(content && !strcmp(content, "OK"));
     TEST_ASSERT(calls.len == 2);
     TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "bash"));
-    TEST_ASSERT(strstr(calls.v[0].arguments, "\"command\": \"echo hi\\nsecond line\"") != NULL);
+    TEST_ASSERT(strstr(calls.v[0].arguments, "\"command\": \"echo hi\\nsecond line &amp; &lt; </parameter> &lt;/parameter>\"") != NULL);
     TEST_ASSERT(strstr(calls.v[0].arguments, "\"timeout\": 10") != NULL);
     TEST_ASSERT(strstr(calls.v[0].arguments, "\"opts\": {\"a\":[1,2]}") != NULL);
     TEST_ASSERT(calls.v[1].name && !strcmp(calls.v[1].name, "read"));
@@ -18919,6 +18920,27 @@ static void test_tool_control_text_inside_arguments(void) {
         tool_calls_free(&calls);
         buf_free(&raw);
     }
+}
+
+static void test_qwen_decode_tracker_markers(void) {
+    const char *raw = "<tool_call>\n<function=write>\n<parameter=content>\n"
+                      "literal </tool_call> </think> <think>\n"
+                      "</parameter>\n</function>\n</tool_call>";
+    dsml_decode_tracker tracker;
+    dsml_decode_tracker_init(&tracker);
+    tracker.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
+    bool start = false, end = false, orphan = false;
+    size_t len = strlen(raw);
+    for (size_t n = 1; n <= len; n++) {
+        dsml_decode_tracker_update(&tracker, raw, n);
+        char *prefix = xstrndup(raw, n);
+        observe_tool_markers(&tracker, prefix, &start, &end, &orphan);
+        free(prefix);
+        TEST_ASSERT(!end || n == len);
+        TEST_ASSERT(!orphan);
+    }
+    TEST_ASSERT(start && end);
+    TEST_ASSERT(tracker.mode == DSML_TRACK_DONE);
 }
 
 static void test_tool_body_escape_round_trip(void) {
@@ -20852,6 +20874,7 @@ static void ds4_server_unit_tests_run(void) {
     test_render_qwen_chat_prompt_text();
     test_render_qwen_tool_round_trip();
     test_qwen_tool_visible_checkpoint_boundary();
+    test_qwen_decode_tracker_markers();
     test_parse_qwen_tool_call_message();
     test_qwen_tool_checkpoint_round_trip();
     test_qwen_sampled_tool_text_after_think_renders_exactly();
