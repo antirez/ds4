@@ -3833,21 +3833,24 @@ static __global__ void mul_mat_q(
         }
     }
 
-    // Initialize the ids for writing back data with just the index.
-    // For regular matrix multiplications this is never changed.
-    // For MoE the correct indices are loaded from ids_dst.
+    // Dense write-back already accepts nullptr for the identity mapping.
+    // Avoid publishing and rereading an identity table for every dense CTA;
+    // routed tiles retain their shared map and its publication barriers.
     extern __shared__ int ids_dst_shared[]; // Stored at beginning of shared memory.
+    const int32_t * tile_ids = ids_dst ? ids_dst_shared : nullptr;
+    if (ids_dst) {
 #pragma unroll
-    for (int j0 = 0; j0 < mmq_x; j0 += nwarps*warp_size) {
-        const int j = j0 + threadIdx.y*warp_size + threadIdx.x;
+        for (int j0 = 0; j0 < mmq_x; j0 += nwarps*warp_size) {
+            const int j = j0 + threadIdx.y*warp_size + threadIdx.x;
 
-        if (j0 + nwarps*warp_size > mmq_x && j >= mmq_x) {
-            break;
+            if (j0 + nwarps*warp_size > mmq_x && j >= mmq_x) {
+                break;
+            }
+
+            ids_dst_shared[j] = j;
         }
-
-        ids_dst_shared[j] = j;
+        __syncthreads();
     }
-    __syncthreads();
 
     // On non-CDNA AMD or old CUDA the performance with stream-k was worse, use conventional tiling instead:
 #if (defined(GGML_USE_HIP) && !defined(CDNA)) || __CUDA_ARCH__ < GGML_CUDA_CC_VOLTA
@@ -3911,7 +3914,7 @@ static __global__ void mul_mat_q(
 
         constexpr bool fixup = false;
         mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
-            (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
+            (x, offset_x, y + offset_y, tile_ids, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
              tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z,
              blocks_per_ne00.z, x_soa, soa_blocks);
         return;
@@ -3998,7 +4001,7 @@ static __global__ void mul_mat_q(
 
         constexpr bool fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
         mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
-            (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
+            (x, offset_x, y + offset_y, tile_ids, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
              tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop,
              blocks_per_ne00.z, x_soa, soa_blocks);
 
@@ -4068,7 +4071,7 @@ static __global__ void mul_mat_q(
 
     constexpr bool fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
     mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
-        (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
+        (x, offset_x, y + offset_y, tile_ids, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
          tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop,
          blocks_per_ne00.z, x_soa, soa_blocks);
 }

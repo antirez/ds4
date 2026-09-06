@@ -23,6 +23,8 @@
 /tests/test_gpu_q8_bsum_host
 /tests/test_gpu_q8_bsum_host_mask32
 /tests/test_gpu_q8_bsum_host_cuda
+/tests/test_gpu_q8_max_host
+/tests/test_gpu_q8_max_host_fast
 /tests/test_metal_raw_kv_ring
 /tests/test_cuda_raw_kv_ring
 /tests/test_rocm_raw_kv_ring

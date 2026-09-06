@@ -187,6 +187,7 @@ test-gpu-raw-kv-ownership:
 	python3 tests/test_gpu_raw_kv_ownership.py
 
 .PHONY: test-gpu-q8-bsum-host test-cuda-q8-k-quantize test-rocm-q8-k-quantize test-cuda-q4-prefill-norm-host test-cuda-q4-prefill-norm test-cuda-q4-dequant-flat-host
+.PHONY: test-gpu-q8-max-host test-cuda-mmq-dense-ids-host test-rocm-q4-dequant-flat-host test-cuda-q4-dequant-flat test-rocm-q4-dequant-flat
 
 tests/test_gpu_q8_bsum_host: tests/test_gpu_q8_bsum_host.c cuda/ds4_q8_k_bsum.h
 	$(CC) -O2 -Wall -Wextra -Wno-unknown-pragmas -std=c11 -I. -o $@ $<
@@ -202,6 +203,19 @@ test-gpu-q8-bsum-host: tests/test_gpu_q8_bsum_host tests/test_gpu_q8_bsum_host_m
 	./tests/test_gpu_q8_bsum_host_mask32
 	./tests/test_gpu_q8_bsum_host_cuda
 
+tests/test_gpu_q8_max_host: tests/test_gpu_q8_max_host.c cuda/ds4_q8_k_reduce.h
+	$(CC) -O2 -Wall -Wextra -Wno-unknown-pragmas -std=c11 -I. -o $@ $<
+
+tests/test_gpu_q8_max_host_fast: tests/test_gpu_q8_max_host.c cuda/ds4_q8_k_reduce.h
+	$(CC) -O3 -ffast-math -Wall -Wextra -Wno-unknown-pragmas -std=c11 -DDS4_TEST_MASK_BITS=32 -DDS4_TEST_UNDEFINED_MASK -I. -o $@ $<
+
+test-gpu-q8-max-host: tests/test_gpu_q8_max_host tests/test_gpu_q8_max_host_fast
+	./tests/test_gpu_q8_max_host
+	./tests/test_gpu_q8_max_host_fast
+
+test-cuda-mmq-dense-ids-host:
+	python3 tests/test_cuda_mmq_dense_ids.py
+
 test-cuda-q8-k-quantize:
 	NVCC="$(NVCC)" NVCCFLAGS="$(NVCCFLAGS)" python3 tests/test_gpu_q8_quantize.py --backend cuda
 
@@ -216,6 +230,15 @@ test-cuda-q4-prefill-norm:
 
 test-cuda-q4-dequant-flat-host:
 	python3 tests/test_cuda_q4_dequant_flat.py
+
+test-rocm-q4-dequant-flat-host:
+	python3 tests/test_cuda_q4_dequant_flat.py --backend rocm
+
+test-cuda-q4-dequant-flat:
+	NVCC="$(NVCC)" NVCCFLAGS="$(NVCCFLAGS)" python3 tests/test_cuda_q4_dequant_flat.py --gpu
+
+test-rocm-q4-dequant-flat:
+	HIPCC="$(HIPCC)" ROCM_CFLAGS="$(ROCM_CFLAGS)" python3 tests/test_cuda_q4_dequant_flat.py --backend rocm --gpu
 
 ifeq ($(UNAME_S),Darwin)
 .PHONY: metal-decode-schedule-bench metal-prefill-variant-bench metal-q4-dense-pair-bench metal-q4-prefill-pair-bench metal-q4-mm-tail-cull-bench metal-q4-attn-out-a-direct-bench metal-iq2-moe-tail-cull-bench metal-iq2-moe-top8-pair-bench check-mxfp4-half-lut test-mxfp4-metal
@@ -1024,7 +1047,7 @@ endif
 test-glm-attention: tests/test_glm_attention
 	./tests/test_glm_attention
 
-ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_glm53_vision_gpu.cuh ds4_deepseek4_vision_gpu.cuh ds4_image.h ds4_iq2_tables_cuda.inc cuda/mmq/ds4_mmq.h cuda/ds4_q8_quantize.cuh cuda/ds4_q8_prefill_layout.h cuda/ds4_q4_prefill_reduce.h cuda/ds4_q8_k_bsum.h $(Q4_PREFILL_DEQUANT_HEADERS)
+ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_glm53_vision_gpu.cuh ds4_deepseek4_vision_gpu.cuh ds4_image.h ds4_iq2_tables_cuda.inc cuda/mmq/ds4_mmq.h cuda/ds4_q8_quantize.cuh cuda/ds4_q8_prefill_layout.h cuda/ds4_q4_prefill_reduce.h cuda/ds4_q8_k_bsum.h cuda/ds4_q8_k_reduce.h $(Q4_PREFILL_DEQUANT_HEADERS)
 	$(NVCC) $(NVCCFLAGS) -c -o $@ ds4_cuda.cu
 
 # Vendored mmq pieces (see cuda/mmq/VENDOR.md).  ds4_mmq.cu transitively
@@ -1054,7 +1077,7 @@ cuda/mmq/mmvq.o: cuda/mmq/mmvq.cu cuda/mmq/mmvq.cuh cuda/mmq/common.cuh cuda/mmq
 cuda/mmq/ds4_repack.o: cuda/mmq/ds4_repack.cu cuda/mmq/ds4_repack.h
 	$(NVCC) $(NVCCFLAGS) -std=c++17 -c -o $@ $<
 
-ds4_rocm.o: ds4_rocm.cu ds4_rocm.h ds4_rocm_memory.h ds4_linux_memory.h ds4_gpu.h ds4_glm53_vision_gpu.cuh ds4_deepseek4_vision_gpu.cuh ds4_image.h ds4_iq2_tables_cuda.inc cuda/ds4_q8_k_bsum.h $(ROCM_SRCS) $(Q4_PREFILL_DEQUANT_HEADERS)
+ds4_rocm.o: ds4_rocm.cu ds4_rocm.h ds4_rocm_memory.h ds4_linux_memory.h ds4_gpu.h ds4_glm53_vision_gpu.cuh ds4_deepseek4_vision_gpu.cuh ds4_image.h ds4_iq2_tables_cuda.inc cuda/ds4_q8_k_bsum.h cuda/ds4_q8_k_reduce.h $(ROCM_SRCS) $(Q4_PREFILL_DEQUANT_HEADERS)
 	$(HIPCC) $(ROCM_CFLAGS) -c -o $@ ds4_rocm.cu
 
 cuda/mmq/ds4_ggml_stubs.rocm.o: cuda/mmq/ds4_ggml_stubs.cu cuda/mmq/ds4_ggml_stubs.h cuda/mmq/common.cuh cuda/mmq/vendors/hip.h ds4_rocm_memory.h ds4_linux_memory.h
@@ -1522,6 +1545,7 @@ test-quality-api: tests/test_quality_api.c gguf-tools/quality-testing/score_offi
 	./tests/test_quality_api
 
 clean:
+	rm -f tests/test_gpu_q8_max_host tests/test_gpu_q8_max_host_fast
 	rm -f tests/test_gpu_q8_bsum_host tests/test_gpu_q8_bsum_host_mask32 tests/test_gpu_q8_bsum_host_cuda
 	rm -f tests/test_metal_raw_kv_ring tests/test_cuda_raw_kv_ring tests/test_rocm_raw_kv_ring tests/test_rocm_iq2_prefill
 	rm -f tests/test_q4_prefill_reduce_host tests/test_q4_prefill_reduce_host_fast tests/test_cuda_q4_prefill_reduce

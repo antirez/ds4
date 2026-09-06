@@ -31,11 +31,14 @@ enum {
     IN_DIM = 4096u,
     OUT0_DIM = 1024u,
     OUT1_DIM = 512u,
-    MAX_TOKENS = 128u,
+    /* Guard the largest batch and fit the rejected K8192/N160 input. */
+    MAX_TOKENS = 320u,
     TEST_STREAMS = 2u,
 };
 
-static const uint32_t k_tokens[] = {32u, 64u, 96u, 128u};
+static const uint32_t k_tokens[] = {
+    32u, 64u, 96u, 128u, 160u, 192u, 224u, 256u,
+};
 static const float k_poison = -12345.25f;
 
 typedef struct {
@@ -355,7 +358,7 @@ static void test_default_scope(fixture *f) {
         const int rc = ds4_gpu_matmul_q4_K_pair_tensor(
             f->candidate[0][0], f->candidate[0][1], f->model, f->model_size,
             f->weight_offset[0], f->weight_offset[1], IN_DIM,
-            OUT0_DIM, OUT1_DIM, f->x[0], 32u);
+            OUT0_DIM, OUT1_DIM, f->x[0], 256u);
         if (rc != 0) fail("default pair ignored an explicit opt-out");
         if (unsetenv(disable_flags[i])) fail("restore disable flag");
     }
@@ -387,22 +390,33 @@ static void test_alias_rejection(fixture *f) {
     fprintf(stderr, "Metal Q4 prefill pair alias rejection: PASS\n");
 }
 
-/* The optimized tile changes neither the admitted token range nor the
- * output alignment contract. Rejection must leave caller buffers untouched. */
+/* Only the measured M32 shape extends past 128 tokens. Rejection must leave
+ * caller buffers untouched, including a complete tile past the new cap. */
 static void test_ineligible_shapes(fixture *f) {
-    const uint32_t cases[][3] = {
-        {9u, OUT0_DIM, OUT1_DIM}, {31u, OUT0_DIM, OUT1_DIM},
-        {33u, OUT0_DIM, OUT1_DIM}, {127u, OUT0_DIM, OUT1_DIM},
-        {129u, OUT0_DIM, OUT1_DIM}, {32u, OUT0_DIM-1u, OUT1_DIM},
-        {32u, OUT0_DIM, OUT1_DIM-1u},
+    const uint32_t cases[][4] = {
+        {9u, IN_DIM, OUT0_DIM, OUT1_DIM},
+        {31u, IN_DIM, OUT0_DIM, OUT1_DIM},
+        {33u, IN_DIM, OUT0_DIM, OUT1_DIM},
+        {127u, IN_DIM, OUT0_DIM, OUT1_DIM},
+        {129u, IN_DIM, OUT0_DIM, OUT1_DIM},
+        {255u, IN_DIM, OUT0_DIM, OUT1_DIM},
+        {257u, IN_DIM, OUT0_DIM, OUT1_DIM},
+        {288u, IN_DIM, OUT0_DIM, OUT1_DIM},
+        {160u, IN_DIM, OUT1_DIM, OUT1_DIM},
+        {256u, IN_DIM, OUT1_DIM, OUT1_DIM},
+        /* All weights/activations fit the fixture. The legacy token cap must
+         * reject this before its 2.5 MiB RHS could exceed the 2 MiB scratch. */
+        {160u, 8192u, OUT0_DIM / 2u, OUT1_DIM / 2u},
+        {32u, IN_DIM, OUT0_DIM-1u, OUT1_DIM},
+        {32u, IN_DIM, OUT0_DIM, OUT1_DIM-1u},
     };
     set_pair_controls(true, false, false);
     for (size_t i = 0; i < sizeof(cases)/sizeof(cases[0]); i++) {
         poison_outputs(f, 0u);
         const int rc = ds4_gpu_matmul_q4_K_pair_tensor(
             f->candidate[0][0], f->candidate[0][1], f->model, f->model_size,
-            f->weight_offset[0], f->weight_offset[1], IN_DIM,
-            cases[i][1], cases[i][2], f->x[0], cases[i][0]);
+            f->weight_offset[0], f->weight_offset[1], cases[i][1],
+            cases[i][2], cases[i][3], f->x[0], cases[i][0]);
         if (rc != 0) fail("ineligible pair did not fall back");
         check_tensor_all_poison(f->candidate[0][0], output_count(0u), "shape-out0");
         check_tensor_all_poison(f->candidate[0][1], output_count(1u), "shape-out1");
@@ -468,7 +482,7 @@ static void test_required_failure_is_local(fixture *f) {
 }
 
 static void test_two_stream_async(fixture *f) {
-    static const uint32_t stream_tokens[TEST_STREAMS] = {96u, 128u};
+    static const uint32_t stream_tokens[TEST_STREAMS] = {224u, 256u};
     set_pair_controls(true, false, true);
     for (uint32_t stream = 0; stream < TEST_STREAMS; stream++) {
         poison_outputs(f, stream);
@@ -502,7 +516,7 @@ static void test_two_stream_async(fixture *f) {
     }
     fprintf(stderr,
             "Metal Q4 prefill pair async streams: PASS streams=2 "
-            "tokens=96,128 scratch_isolation=bitwise\n");
+            "tokens=224,256 scratch_isolation=bitwise\n");
 }
 
 int main(void) {
@@ -533,7 +547,7 @@ int main(void) {
     test_two_stream_async(&f);
     fixture_destroy(&f);
     fprintf(stderr,
-            "test_metal_q4_prefill_pair PASS tokens=32,64,96,128 "
+            "test_metal_q4_prefill_pair PASS tokens=32,64,96,128,160,192,224,256 "
             "bitwise=1 require=1 alias=1 ssd_spans=1 streams=2 "
             "unretained=%s\n",
             getenv("DS4_METAL_UNRETAINED_COMMAND_BUFFERS") ? "on" : "off");

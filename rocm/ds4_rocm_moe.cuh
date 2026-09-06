@@ -707,6 +707,7 @@ __device__ static float quarter_warp_sum_f32(float v, uint32_t lane8) {
 }
 
 #include "../cuda/ds4_q8_k_bsum.h"
+#include "../cuda/ds4_q8_k_reduce.h"
 
 __global__ static void q8_K_quantize_kernel(cuda_block_q8_K *out, const float *x, uint32_t in_dim, uint32_t n_rows) {
     uint32_t b = blockIdx.x;
@@ -723,12 +724,26 @@ __global__ static void q8_K_quantize_kernel(cuda_block_q8_K *out, const float *x
     abs_part[tid] = tid < CUDA_QK_K ? fabsf(v) : 0.0f;
     val_part[tid] = v;
     __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride && abs_part[tid + stride] > abs_part[tid]) {
-            abs_part[tid] = abs_part[tid + stride];
-            val_part[tid] = val_part[tid + stride];
+    if (n_rows > 8u) {
+        // Preserve the signed-maximum operand tree, including ties. Only
+        // lanes 0..31 participate on both wave32 and wave64; all 256 threads
+        // still publish leaves and observe the winner through CTA fences.
+        if (tid < 32u) {
+            const ds4_q8_K_maximum best = ds4_q8_K_max_first_warp(abs_part, tid);
+            if (tid == 0u) {
+                abs_part[0] = best.magnitude;
+                val_part[0] = val_part[best.index];
+            }
         }
         __syncthreads();
+    } else {
+        for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (tid < stride && abs_part[tid + stride] > abs_part[tid]) {
+                abs_part[tid] = abs_part[tid + stride];
+                val_part[tid] = val_part[tid + stride];
+            }
+            __syncthreads();
+        }
     }
     float amax = abs_part[0];
     if (amax == 0.0f) {

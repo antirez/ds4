@@ -970,7 +970,7 @@ static int rocm_q4_attn_q_b_transient_f16_head_rms_rope_tail_tensor(
         rocm_dequant_q4_K_attn_q_b_f16_kernel<<<
             (uint32_t)((total_chunks + 255u) / 256u), 256>>>(
                 w_f16, (const cuda_block_q4_K *)w_q4,
-                in_dim, out_dim, blocks_per_row);
+                in_dim, out_dim);
     }
     cudaError_t launch_err = cudaGetLastError();
     if (launch_err != cudaSuccess) {

@@ -55,11 +55,12 @@ enum {
 enum {
     DS4_METAL_MPP_DIRECT_RHS_SMEM = 2u * 64u * 32u * sizeof(uint16_t),
     /* One fixed-capacity, stream-local sidecar avoids replacing a buffer that
-     * an unretained/in-flight command buffer may still reference.  8192 is
-     * above every currently supported q_a/KV input width; 128 is the largest
-     * exact token tile admitted by the experimental pair path. */
+     * an unretained/in-flight command buffer may still reference.  The legacy
+     * 8192x128 capacity also fits the measured 4096x256 M32 pair shape:
+     * both admission gates bound in_dim*n_tok*sizeof(uint16_t) to this size. */
     DS4_METAL_Q4_PAIR_RHS_MAX_IN = 8192u,
     DS4_METAL_Q4_PAIR_RHS_MAX_TOKENS = 128u,
+    DS4_METAL_Q4_PAIR_M32_MAX_TOKENS = 256u,
     DS4_METAL_Q4_PAIR_RHS_BYTES =
         DS4_METAL_Q4_PAIR_RHS_MAX_IN *
         DS4_METAL_Q4_PAIR_RHS_MAX_TOKENS * sizeof(uint16_t),
@@ -24087,8 +24088,13 @@ static int ds4_gpu_try_q4_K_prefill_pair_f16_rhs(
         uint64_t weight0_offset, uint64_t weight1_offset,
         uint64_t in_dim, uint64_t out0_dim, uint64_t out1_dim,
         const ds4_gpu_tensor *x, uint64_t n_tok) {
+    const bool use_m32 =
+        ds4_gpu_q4_K_prefill_pair_m32_shape(in_dim, out0_dim, out1_dim);
+    const uint64_t max_tokens = use_m32
+        ? DS4_METAL_Q4_PAIR_M32_MAX_TOKENS
+        : DS4_METAL_Q4_PAIR_RHS_MAX_TOKENS;
     const bool exact_tokens =
-        n_tok >= 32u && n_tok <= DS4_METAL_Q4_PAIR_RHS_MAX_TOKENS &&
+        n_tok >= 32u && n_tok <= max_tokens &&
         (n_tok % 32u) == 0u;
     if (!out0 || !out1 || !model_map || !x || !exact_tokens ||
         !ds4_gpu_device_is_pre_m5_apple_silicon() ||
@@ -24128,8 +24134,6 @@ static int ds4_gpu_try_q4_K_prefill_pair_f16_rhs(
     }
 
     @autoreleasepool {
-        const bool use_m32 =
-            ds4_gpu_q4_K_prefill_pair_m32_shape(in_dim, out0_dim, out1_dim);
         const NSUInteger tile_m = use_m32 ? 32u : 64u;
         uint64_t inner0 = 0u;
         uint64_t inner1 = 0u;
@@ -24235,7 +24239,7 @@ int ds4_gpu_matmul_q4_K_pair_tensor(
         getenv("DS4_METAL_DISABLE_Q4_DENSE_PAIR") != NULL;
     const bool default_pair_shape =
         ds4_gpu_q4_K_prefill_pair_m32_shape(in_dim, out0_dim, out1_dim) &&
-        n_tok >= 32u && n_tok <= DS4_METAL_Q4_PAIR_RHS_MAX_TOKENS &&
+        n_tok >= 32u && n_tok <= DS4_METAL_Q4_PAIR_M32_MAX_TOKENS &&
         (n_tok % 32u) == 0u;
     const bool pair_requested =
         !global_pair_disabled && pair_disable != 1 &&

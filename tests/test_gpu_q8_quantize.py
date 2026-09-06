@@ -1,8 +1,8 @@
-"""Native CUDA/HIP oracle for the production Q8_K register-bsum change.
+"""Native CUDA/HIP oracle for the exact Q8_K prefill reductions.
 
-Both arms execute on the GPU: the reference retains the former global-byte
-bsum loop. All preceding scale/quantization code is shared so compiler-specific
-rounding is held constant. Run --backend cuda or --backend hip on that host;
+Both arms execute on the GPU: the reference retains the former shared signed-
+maximum tree and global-byte bsum loop. Scale/quantization arithmetic is shared
+so compiler-specific rounding is held constant. Run --backend cuda or hip;
 --emit writes the standalone source without claiming a native compilation.
 """
 import argparse
@@ -32,6 +32,17 @@ def kernel(backend):
         raise ValueError("unterminated production quantizer")
     return source[start:end]
 
+
+LEGACY_MAX_REDUCTION = r"""
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride && abs_part[tid + stride] > abs_part[tid]) {
+            abs_part[tid] = abs_part[tid + stride];
+            val_part[tid] = val_part[tid + stride];
+        }
+        __syncthreads();
+    }
+"""
 
 LEGACY_TAIL = r"""
     if (tid < CUDA_QK_K) {
@@ -68,6 +79,7 @@ PREAMBLE = r"""
 #define GPU(name) cuda##name
 #endif
 #include "cuda/ds4_q8_k_bsum.h"
+#include "cuda/ds4_q8_k_reduce.h"
 enum { CUDA_QK_K = 256, GUARD = 4 };
 typedef struct { float d; int8_t qs[256]; int16_t bsums[16]; } cuda_block_q8_K;
 static_assert(sizeof(cuda_block_q8_K) == 292, "Q8_K ABI");
@@ -100,7 +112,9 @@ static int run_case(uint32_t k, uint32_t rows, unsigned pattern,
             if (pattern == 0) v = 0.0f;
             else if (pattern == 1) v = (i & 1u ? -127.0f : 127.0f) * scale;
             else if (pattern == 2) v = ((int)(random_u32(&seed) % 16383u) - 8191) * scale / 64.0f;
-            else v = ((int)(i % 255u) - 127) * scale * 0.5f;
+            else if (pattern == 3) v = ((int)(i % 255u) - 127) * scale * 0.5f;
+            else if (pattern == 4) v = 0.0f;
+            else v = ldexpf((i & 1u) ? -1.0f : 1.0f, -145 + (int)(i % 17u));
             x[b * CUDA_QK_K + i] = v;
         }
         /* Equal-magnitude opposite signs exercise the canonical tie tree;
@@ -108,6 +122,17 @@ static int run_case(uint32_t k, uint32_t rows, unsigned pattern,
         if (pattern == 3) {
             x[b * CUDA_QK_K + 0] = -127.0f * scale;
             x[b * CUDA_QK_K + 128] = 127.0f * scale;
+        }
+        if (pattern == 4) {
+            // The stride-halving tree prefers 128 to 64 on this tie.
+            // A smallest-index argmax would select the opposite sign.
+            x[b * CUDA_QK_K + 128] = 127.0f * scale;
+            x[b * CUDA_QK_K + 64] = -127.0f * scale;
+        }
+        if (pattern == 5) {
+            // Subnormal leaves with a finite normal maximum avoid reciprocal
+            // overflow; both GPU arms retain the configured FTZ behavior.
+            x[b * CUDA_QK_K + b % CUDA_QK_K] = scale;
         }
     }
     float *gx = NULL;
@@ -153,14 +178,16 @@ int main(void) {
     GPU(Stream_t) stream;
     CHECK(GPU(StreamCreate)(&stream));
     const uint32_t ks[] = {256, 512, 1024, 4096, 8192};
-    const uint32_t ns[] = {1, 9, 17, 128};
+    const uint32_t ns[] = {1, 8, 9, 17, 128, 512};
     unsigned cases = 0;
     for (unsigned k = 0; k < sizeof(ks) / sizeof(ks[0]); k++)
     for (unsigned n = 0; n < sizeof(ns) / sizeof(ns[0]); n++)
-    for (unsigned p = 0; p < 4; p++) {
+    for (unsigned p = 0; p < 6; p++) {
         if (!run_case(ks[k], ns[n], p, stream)) return 1;
         cases++;
     }
+    if (!run_case(8192u, 4096u, 4u, stream)) return 1;
+    cases++;
     CHECK(GPU(StreamDestroy)(stream));
     printf("Q8_K native parity PASS: %u cases, full bytes/guards/source/non-default stream\n", cases);
     return 0;
@@ -171,9 +198,15 @@ int main(void) {
 def source_for(backend):
     actual = kernel(backend)
     marker = "    int qv = 0;"
-    if actual.count(marker) != 1 or actual.count("ds4_q8_K_bsum16(") != 1:
+    if (actual.count(marker) != 1 or actual.count("ds4_q8_K_bsum16(") != 1 or
+            actual.count("ds4_q8_K_max_first_warp(") != 1):
         raise ValueError("update native reference extraction for changed quantizer")
-    reference = actual[:actual.index(marker)] + LEGACY_TAIL
+    first_fence = actual.index("    __syncthreads();")
+    maximum = actual.index("    float amax = abs_part[0];")
+    reference = (actual[:first_fence] + LEGACY_MAX_REDUCTION +
+                 actual[maximum:actual.index(marker)] + LEGACY_TAIL)
+    if "ds4_q8_K_max_first_warp" in reference:
+        raise ValueError("reference must retain the independent legacy maximum tree")
     reference = reference.replace("q8_K_quantize_kernel", "q8_K_quantize_reference", 1)
     return PREAMBLE + actual + "\n" + reference + DRIVER
 

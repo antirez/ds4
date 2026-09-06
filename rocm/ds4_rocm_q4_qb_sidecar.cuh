@@ -378,38 +378,33 @@ __global__ static void rocm_dequant_q4_K_attn_q_b_f16_kernel(
         __half *dst,
         const cuda_block_q4_K *src,
         uint64_t in_dim,
-        uint64_t out_dim,
-        uint64_t blocks_per_row) {
+        uint64_t out_dim) {
     const uint64_t chunk =
         (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     const uint64_t chunks_per_row = in_dim / 16u;
     const uint64_t total_chunks = out_dim * chunks_per_row;
     if (chunk >= total_chunks) return;
 
-    const uint64_t row = chunk / chunks_per_row;
-    const uint64_t col0 = (chunk - row * chunks_per_row) * 16u;
-    const uint64_t block_in_row = col0 / CUDA_QK_K;
-    const uint32_t within0 = (uint32_t)(col0 % CUDA_QK_K);
-    const cuda_block_q4_K *xb =
-        src + row * blocks_per_row + block_in_row;
+    // Both callers supply packed rows with K divisible by 256. Flattening
+    // the 16-value chunks avoids row division; one chunk has one scale/min.
+    const cuda_block_q4_K *xb = src + (chunk >> 4u);
+    const uint32_t group = (uint32_t)((chunk >> 1u) & 7u);
+    const uint32_t byte0 = (group >> 1u) * 32u +
+                           (uint32_t)(chunk & 1u) * 16u;
     const float d = __half2float(
         __ushort_as_half((unsigned short)xb->d));
     const float dmin = __half2float(
         __ushort_as_half((unsigned short)xb->dmin));
+    uint8_t scale = 0;
+    uint8_t minimum = 0;
+    rocm_q4_attn_q_b_get_scale_min(group, xb->scales, &scale, &minimum);
 
 #pragma unroll
     for (uint32_t k = 0; k < 16u; k++) {
-        const uint32_t within = within0 + k;
-        const uint32_t group = within >> 5u;
-        uint8_t scale = 0;
-        uint8_t minimum = 0;
-        rocm_q4_attn_q_b_get_scale_min(
-            group, xb->scales, &scale, &minimum);
-        const uint8_t packed =
-            xb->qs[(group >> 1u) * 32u + (within & 31u)];
+        const uint8_t packed = xb->qs[byte0 + k];
         const uint32_t q =
             (group & 1u) ? (packed >> 4u) : (packed & 0x0fu);
-        dst[row * in_dim + col0 + k] =
+        dst[chunk * 16u + k] =
             __float2half(d * (float)scale * (float)q -
                          dmin * (float)minimum);
     }
@@ -1121,14 +1116,13 @@ extern "C" int ds4_gpu_prepare_q4_attn_q_b_f16_sidecars(
         const ds4_gpu_q4_attn_q_b_f16_sidecar_desc *desc =
             &descs[miss_indices[mi]];
         sidecar_ptrs[mi] = (__half *)((char *)arena + arena_offset);
-        const uint64_t blocks_per_row = desc->in_dim / CUDA_QK_K;
         const uint64_t total_chunks =
             desc->out_dim * (desc->in_dim / 16u);
         rocm_dequant_q4_K_attn_q_b_f16_kernel<<<
             (uint32_t)((total_chunks + 255u) / 256u), 256>>>(
                 sidecar_ptrs[mi],
                 (const cuda_block_q4_K *)weight_ptrs[mi],
-                desc->in_dim, desc->out_dim, blocks_per_row);
+                desc->in_dim, desc->out_dim);
         err = cudaGetLastError();
         if (err != cudaSuccess) {
             fprintf(stderr,
