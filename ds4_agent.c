@@ -7388,6 +7388,8 @@ static char *agent_tool_edit(agent_worker *w, const agent_tool_call *call) {
     const char *new_text = agent_tool_arg_value(call, "new");
     if (!old || !old[0]) return xstrdup("Tool error: edit requires non-empty old text\n");
     if (!new_text) return xstrdup("Tool error: edit requires new text\n");
+    if (strstr(new_text, "[upto]"))
+        return xstrdup("Tool error: new text must not contain the [upto] anchor marker\n");
 
     char err[256];
     char *data = NULL;
