@@ -27,6 +27,17 @@ workloads still affect memory use.
 
 ## Build your own GGUF
 
+For calibrated IQ2_XXS gate/up experts with MXFP4 down projections, embedded
+MTP and external PLE, use the [two-stage BF16 build](../gguf-tools/README.md#qwen38-iq2_xxs-experiment).
+Its main GGUF is 50.34 GB; the Q4_1 PLE sidecar is required separately.
+Context buffers, runtime allocations and resident PLE pages also consume
+memory. File size alone does not establish whether it fits a 64 GB Mac.
+See the [quality and memory measurements](../speed-bench/qwen38-iq2-quality.md)
+for the comparison with Q4_K, Q4_0 and Q8.
+
+The older recipes below keep PLE inside the main GGUF, so their file sizes
+are not directly comparable with the external-PLE builds.
+
 Build the
 GGUF from the Hugging Face checkpoint with the converter in `gguf-tools/`;
 the stock `ggml-org` Q8_0 GGUF also loads once its two parts are merged with
@@ -60,9 +71,10 @@ are too narrow for 256-value blocks and go to MXFP4. The first matching
 `--tensor-type` wins, and the MTP block's experts (`blk.48`) stay MXFP4
 because an importance matrix collected with llama.cpp never sees them. Keep
 the `hc_=f16` override: the Q8_0 base type would otherwise requantize the
-hyper-connection mixers, which slows prefill. Q2K is the better two-bit
-choice unless the last few GB matter. All need a Mac with more unified memory
-than the file size.
+hyper-connection mixers, which slows prefill. Q2_K and IQ2_XXS trade size
+against quantization error; compare measured quality for the specific recipe.
+These inline-PLE builds need additional memory beyond the file size for
+context and runtime buffers.
 
 ```sh
 ./ds4 -m gguf/Qwen3.8-Flash-Next-Q8.gguf --ctx 32768

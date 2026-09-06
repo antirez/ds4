@@ -14,6 +14,47 @@ The important pieces are:
 - `quality-testing/`: prompts and scripts used to compare local GGUF variants
   against official DeepSeek V4 Flash continuations.
 
+## Qwen3.8 IQ2_XXS experiment
+
+`qwen4_iq2.py` builds a mixed IQ2_XXS/MXFP4 model with external PLE and
+embedded MTP. It quantizes the 48 trunk layers' gate/up experts directly from
+the official BF16 checkpoint using the same pinned imatrix as the Q4_K pack.
+It then copies every other tensor from an existing combined Q4_K `qwen4exp`
+GGUF, including MXFP4 down projections, dense/control weights and MTP.
+This isolates the gate/up precision change for a quality comparison.
+
+The Python environment needs NumPy and `huggingface_hub`. Build the existing
+native quantizer library with `make -C gguf-tools quants-shared`, then run:
+
+```sh
+python3 gguf-tools/qwen4_iq2.py quantize \
+  --source /path/to/official-bf16-checkpoint \
+  --imatrix /path/to/imatrix_unsloth.gguf_file \
+  --library gguf-tools/libds4quants.dylib \
+  --experts-dir /path/to/iq2-experts --threads 8
+
+python3 gguf-tools/qwen4_iq2.py assemble \
+  --template /path/to/combined-q4k-mtp-pleext.gguf \
+  --experts-dir /path/to/iq2-experts \
+  --out /path/to/Qwen3.8-Flash-Next-IQ2XXSImatrix-MXFP4Down-MTP.gguf
+```
+
+The first stage can run beside the source checkpoint on another machine;
+transfer the complete experts directory, including `experts.json`, for
+assembly. Repeating the first command verifies completed tensors before
+resuming. Assembly refuses existing outputs and verifies every written tensor
+before publishing the completed GGUF and its JSON manifest.
+
+The main model is approximately 50.3 GB, excluding the required external PLE
+sidecar and runtime allocations. Use the same Q4_1 PLE sidecar as the Q4_K
+model. Quantization changes model outputs; fitting the weights on disk does
+not establish a 64 GB runtime fit or acceptable reasoning quality. Compare
+with the same evaluator settings using `ds4-eval --suite hard --ple FILE`.
+The [completed comparison](../speed-bench/qwen38-iq2-quality.md) records
+36/50 hard-suite passes, the BF16 probability drift, a 64K-context memory
+sweep and an ordinary/MTP greedy parity check. IQ2 is a candidate for a
+64 GB memory budget, pending validation on that hardware.
+
 ## Build
 
 ```sh
