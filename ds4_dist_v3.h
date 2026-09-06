@@ -38,6 +38,22 @@
  * accept it only when DS4_DIST_V3_CAP_MULTI_SESSION_V1 was negotiated, so
  * mixed-version links fail closed in both directions. */
 #define DS4_DIST_WORK_F_MULTI_SESSION        0x00000400u
+/* DeepSeek live-prefix rewind (strict-prefix resend / regenerate). Both ride
+ * on an ordinary single-session span and, like F_MULTI_SESSION, are kept OUT
+ * of F_VALID_MASK so legacy peers reject them and current workers accept them
+ * only when DS4_DIST_V3_CAP_REWIND_V1 was negotiated.
+ *   F_REWIND_CAPTURE: before evaluating this span, snapshot the worker's
+ *     rewind frontier at the span's pos0 (the coordinator captured its own
+ *     layers at the same position).
+ *   F_REWIND: before evaluating this span, restore the retained frontier
+ *     captured at pos0 and truncate the worker timeline to pos0; the span
+ *     then re-evaluates the final prompt token. A worker without a matching
+ *     frontier rejects the span, and the coordinator falls back to a full
+ *     transcript rebuild (today's behavior). */
+#define DS4_DIST_WORK_F_REWIND_CAPTURE       0x00000800u
+#define DS4_DIST_WORK_F_REWIND               0x00001000u
+#define DS4_DIST_WORK_F_REWIND_MASK \
+    (DS4_DIST_WORK_F_REWIND_CAPTURE | DS4_DIST_WORK_F_REWIND)
 #define DS4_DIST_WORK_F_SPEC_MASK \
     (DS4_DIST_WORK_F_SPEC_VERIFY | DS4_DIST_WORK_F_SPEC_ROLLBACK | \
      DS4_DIST_WORK_F_OUTPUT_DRAFTS | DS4_DIST_WORK_F_OUTPUT_ALL_LOGITS | \
@@ -66,6 +82,11 @@
  * speculative extensions: a coordinator must not set the flag unless this
  * bit was selected for the route. */
 #define DS4_DIST_V3_CAP_MULTI_SESSION_V1 0x00000040u
+/* DeepSeek rewind frontier retention on the worker (F_REWIND_CAPTURE /
+ * F_REWIND WORK flags). Opt-in per link like the speculative extensions: a
+ * coordinator must not set the flags unless this bit was selected for a
+ * single-worker route. */
+#define DS4_DIST_V3_CAP_REWIND_V1        0x00000020u
 #define DS4_DIST_V3_CAP_NHI_V1 \
     (DS4_DIST_V3_CAP_BULK_DESC_V1 | \
      DS4_DIST_V3_CAP_NHI_CPU_COPY_V1 | \

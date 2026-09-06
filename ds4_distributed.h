@@ -107,6 +107,19 @@ int ds4_dist_session_eval(
 /* True when the route's worker negotiated row-batched decode spans. */
 bool ds4_dist_session_batch_cap(ds4_dist_session *d);
 
+/* DeepSeek live-prefix rewind over the route (see ds4_dist_v3.h,
+ * F_REWIND_CAPTURE / F_REWIND). Supported only on a single-worker route
+ * whose worker negotiated DS4_DIST_V3_CAP_REWIND_V1. The request_* calls
+ * arm the worker-side capture / restore for the next span that starts at
+ * `pos`; ds4_session_capture_rewind_frontier / ds4_session_rewind_frontier
+ * (ds4.c) call them after handling the coordinator's own layer slice. A
+ * request the next span cannot honor is dropped (plain rebuild path). */
+bool ds4_dist_session_rewind_supported(ds4_dist_session *d);
+bool ds4_dist_session_request_rewind_capture(ds4_dist_session *d, uint32_t pos);
+bool ds4_dist_session_request_rewind(ds4_dist_session *d, uint32_t pos);
+bool ds4_dist_session_rewind_pending(const ds4_dist_session *d);
+void ds4_dist_session_rewind_clear(ds4_dist_session *d);
+
 /* Coordinator local layer range for this dist session. */
 int ds4_dist_session_local_layers(const ds4_dist_session *d,
                                   uint32_t *start,

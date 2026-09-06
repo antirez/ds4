@@ -15896,6 +15896,25 @@ typedef struct {
     ds4_gpu_tensor *spec_prefix1_attn_state_score[DS4_MAX_LAYER];
     ds4_gpu_tensor *spec_prefix1_index_state_kv[DS4_MAX_LAYER];
     ds4_gpu_tensor *spec_prefix1_index_state_score[DS4_MAX_LAYER];
+    /* Rewind-frontier checkpoint (DeepSeek only). spec_* is overwritten every
+     * speculative span, so it cannot hold a frontier across a request; these
+     * persistent copies store the compressor carry rings plus the full raw SWA
+     * ring, letting a later strict-prefix rewind restore the exact KV state
+     * and re-evaluate instead of rebuilding. */
+    ds4_gpu_tensor *rewind_attn_state_kv[DS4_MAX_LAYER];
+    ds4_gpu_tensor *rewind_attn_state_score[DS4_MAX_LAYER];
+    ds4_gpu_tensor *rewind_index_state_kv[DS4_MAX_LAYER];
+    ds4_gpu_tensor *rewind_index_state_score[DS4_MAX_LAYER];
+    ds4_gpu_tensor *rewind_raw_kv[DS4_MAX_LAYER];
+    ds4_dist_mtp_frontier rewind_frontier;
+    uint32_t rewind_frontier_pos;
+    /* hash_bytes() of checkpoint tokens [0, rewind_frontier_pos) at capture:
+     * a frontier is only restorable onto the SAME token prefix. A rebuild,
+     * payload load or reset that lands a different conversation at the same
+     * position must never inherit it. */
+    uint64_t rewind_frontier_hash;
+    bool rewind_frontier_valid;
+    const char *rewind_reason; /* last capture/restore refusal, diagnostic */
     ds4_gpu_tensor *spec_logits;
     uint32_t layer_n_comp[DS4_MAX_LAYER];
     uint32_t layer_n_index_comp[DS4_MAX_LAYER];
@@ -16776,6 +16795,13 @@ static void metal_graph_free(ds4_gpu_graph *g) {
         ds4_gpu_tensor_free(g->spec_prefix1_attn_state_score[il]);
         ds4_gpu_tensor_free(g->spec_prefix1_index_state_kv[il]);
         ds4_gpu_tensor_free(g->spec_prefix1_index_state_score[il]);
+    }
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        ds4_gpu_tensor_free(g->rewind_attn_state_kv[il]);
+        ds4_gpu_tensor_free(g->rewind_attn_state_score[il]);
+        ds4_gpu_tensor_free(g->rewind_index_state_kv[il]);
+        ds4_gpu_tensor_free(g->rewind_index_state_score[il]);
+        ds4_gpu_tensor_free(g->rewind_raw_kv[il]);
     }
     /* Class P decode-step scratch + decode HC group free across
      * all tier slots. hc_pre / hc_post / hc_comb are VIEWS of hc_split — free
@@ -18286,6 +18312,7 @@ static bool metal_graph_alloc_raw_cap(
          metal_graph_cuda_greedy_splitkv_fallback_requested()) ||
         (metal_graph_cuda_greedy_vec4_requested() &&
          metal_graph_cuda_greedy_vec4_fallback_requested());
+    const bool enable_rewind = DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK4;
     if (g->cuda_tp_decode && metal_graph_cuda_tp_partner_tier(0) < 0) {
         fprintf(stderr,
                 "ds4: CUDA tensor parallelism requires an even multi-GPU placement; "
@@ -18469,6 +18496,10 @@ static bool metal_graph_alloc_raw_cap(
                     layer_tp_partner,
                     (uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
         }
+        if (enable_rewind) {
+            g->rewind_raw_kv[il] = ds4_gpu_tensor_alloc_ptr_on(
+                    layer_tier, (uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
+        }
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio != 0) {
             const uint32_t coff = ratio == 4 ? 2u : 1u;
@@ -18488,6 +18519,12 @@ static bool metal_graph_alloc_raw_cap(
             }
             g->layer_attn_state_kv[il] = ds4_gpu_tensor_alloc_ptr_on(layer_tier, attn_width * attn_rows * sizeof(float));
             g->layer_attn_state_score[il] = ds4_gpu_tensor_alloc_ptr_on(layer_tier, attn_width * attn_rows * sizeof(float));
+            if (enable_rewind) {
+                g->rewind_attn_state_kv[il] =
+                    ds4_gpu_tensor_alloc_ptr_on(layer_tier, attn_width * attn_rows * sizeof(float));
+                g->rewind_attn_state_score[il] =
+                    ds4_gpu_tensor_alloc_ptr_on(layer_tier, attn_width * attn_rows * sizeof(float));
+            }
             if (enable_frontier_snapshot) {
                 g->spec_attn_state_kv[il] =
                     ds4_gpu_tensor_alloc_ptr_on(layer_tier, attn_width * attn_rows * sizeof(float));
@@ -18524,6 +18561,12 @@ static bool metal_graph_alloc_raw_cap(
                         (uint64_t)g->layer_comp_cap[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
                 g->layer_index_state_kv[il] = ds4_gpu_tensor_alloc_ptr_on(layer_tier, index_width * index_rows * sizeof(float));
                 g->layer_index_state_score[il] = ds4_gpu_tensor_alloc_ptr_on(layer_tier, index_width * index_rows * sizeof(float));
+                if (enable_rewind) {
+                    g->rewind_index_state_kv[il] =
+                        ds4_gpu_tensor_alloc_ptr_on(layer_tier, index_width * index_rows * sizeof(float));
+                    g->rewind_index_state_score[il] =
+                        ds4_gpu_tensor_alloc_ptr_on(layer_tier, index_width * index_rows * sizeof(float));
+                }
                 if (enable_frontier_snapshot) {
                     g->spec_index_state_kv[il] =
                         ds4_gpu_tensor_alloc_ptr_on(layer_tier, index_width * index_rows * sizeof(float));
@@ -18767,6 +18810,9 @@ static bool metal_graph_alloc_raw_cap(
         if (layer_cache_ok && g->cuda_tp_attn_cache_dup) {
             layer_cache_ok = g->layer_raw_cache_tp[il] != NULL;
         }
+        if (layer_cache_ok && enable_rewind) {
+            layer_cache_ok = g->rewind_raw_kv[il] != NULL;
+        }
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (layer_cache_ok && ratio != 0) {
             layer_cache_ok = g->layer_attn_comp_cache[il] != NULL &&
@@ -18777,6 +18823,9 @@ static bool metal_graph_alloc_raw_cap(
                              (!enable_frontier_snapshot ||
                               (g->spec_attn_state_kv[il] != NULL &&
                                g->spec_attn_state_score[il] != NULL)) &&
+                             (!enable_rewind ||
+                              (g->rewind_attn_state_kv[il] != NULL &&
+                               g->rewind_attn_state_score[il] != NULL)) &&
                              (!enable_prefix1_snapshot ||
                               (g->spec_prefix1_attn_state_kv[il] != NULL &&
                                g->spec_prefix1_attn_state_score[il] != NULL));
@@ -18788,6 +18837,9 @@ static bool metal_graph_alloc_raw_cap(
                              (!enable_frontier_snapshot ||
                               (g->spec_index_state_kv[il] != NULL &&
                                g->spec_index_state_score[il] != NULL)) &&
+                             (!enable_rewind ||
+                              (g->rewind_index_state_kv[il] != NULL &&
+                               g->rewind_index_state_score[il] != NULL)) &&
                              (!enable_prefix1_snapshot ||
                               (g->spec_prefix1_index_state_kv[il] != NULL &&
                                g->spec_prefix1_index_state_score[il] != NULL));
@@ -57407,6 +57459,220 @@ static void session_greedy_splitkv_reset(ds4_session *s) {
     s->greedy_splitkv_anchor_len = 0;
     spec_frontier_free(&s->greedy_splitkv_anchor);
 }
+
+/* ---- Rewind-frontier checkpoint (DeepSeek only) ------------------------
+ *
+ * spec_* is transient (overwritten every speculative span) so a frontier that
+ * must survive an entire request needs its own buffers.  Capture snapshots the
+ * compressor carry rings, the raw SWA ring and the row counters at the current
+ * checkpoint; rewind_frontier restores them and truncates the timeline to the
+ * same position so the caller can re-evaluate the next token.  Both refuse
+ * CPU/GLM so the GLM path keeps using ds4_session_rewind unchanged. */
+
+bool ds4_session_capture_rewind_frontier(ds4_session *s) {
+    if (!s || !s->engine || ds4_session_is_cpu(s) || ds4_session_is_glm(s)) {
+        return false;
+    }
+    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK4) return false;
+    ds4_gpu_graph *g = &s->graph;
+    if (!s->checkpoint_valid || !metal_graph_dspark_cache_current_window_valid(g)) {
+        g->rewind_reason = "checkpoint-or-window-invalid"; return false;
+    }
+
+    g->rewind_frontier = (ds4_dist_mtp_frontier){0};
+    g->rewind_frontier.mtp_n_raw = g->mtp_n_raw;
+    g->rewind_frontier.dspark_cache_start = g->dspark_cache_start;
+    g->rewind_frontier.dspark_cache_token_start = g->dspark_cache_token_start;
+    g->rewind_frontier.dspark_cache_len = g->dspark_cache_len;
+
+    const ds4_weights *w = &s->engine->weights;
+    g->rewind_reason = NULL;
+    bool ok = ds4_gpu_begin_commands() != 0;
+    if (!ok) g->rewind_reason = "begin-commands";
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        if (il >= DS4_DIST_MTP_FRONTIER_MAX_LAYER) { g->rewind_reason = "layer-cap"; ok = false; break; }
+        if (!weights_layer_has_required(&w->layer[il], il)) continue;
+        g->rewind_frontier.n_comp[il] = g->layer_n_comp[il];
+        g->rewind_frontier.n_index_comp[il] = g->layer_n_index_comp[il];
+
+        /* Raw SWA ring: copy the whole ring so a later decode that slides it
+         * past the captured window cannot vitiate the frontier. */
+        const uint64_t rb = ds4_gpu_tensor_bytes(g->layer_raw_cache[il]);
+        if (g->rewind_raw_kv[il]) {
+            ok = ds4_gpu_tensor_copy(g->rewind_raw_kv[il], 0,
+                                     g->layer_raw_cache[il], 0, rb) != 0;
+            if (!ok) g->rewind_reason = "raw-copy";
+        } else {
+            g->rewind_reason = "no-raw-buffer";
+            ok = false;
+        }
+
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        const uint64_t ab = ds4_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
+        if (g->rewind_attn_state_kv[il] && g->rewind_attn_state_score[il]) {
+            ok = ok &&
+                 ds4_gpu_tensor_copy(g->rewind_attn_state_kv[il], 0,
+                                     g->layer_attn_state_kv[il], 0, ab) != 0 &&
+                 ds4_gpu_tensor_copy(g->rewind_attn_state_score[il], 0,
+                                     g->layer_attn_state_score[il], 0, ab) != 0;
+        } else {
+            ok = false;
+        }
+        if (ok && ratio == 4) {
+            const uint64_t ib = ds4_gpu_tensor_bytes(g->layer_index_state_kv[il]);
+            if (g->rewind_index_state_kv[il] && g->rewind_index_state_score[il]) {
+                ok = ok &&
+                     ds4_gpu_tensor_copy(g->rewind_index_state_kv[il], 0,
+                                         g->layer_index_state_kv[il], 0, ib) != 0 &&
+                     ds4_gpu_tensor_copy(g->rewind_index_state_score[il], 0,
+                                         g->layer_index_state_score[il], 0, ib) != 0;
+            } else {
+                ok = false;
+            }
+        }
+    }
+    if (ok) {
+        ok = ds4_gpu_end_commands() != 0;
+        if (!ok) g->rewind_reason = "end-commands";
+    } else {
+        (void)ds4_gpu_synchronize();
+        if (!g->rewind_reason) g->rewind_reason = "state-copy";
+    }
+    if (!ok) {
+        g->rewind_frontier_valid = false;
+        g->rewind_frontier.valid = false;
+        return false;
+    }
+
+    g->rewind_frontier.valid = true;
+    g->rewind_frontier_pos = (uint32_t)s->checkpoint.len;
+    g->rewind_frontier_hash = hash_bytes(s->checkpoint.v,
+                                         (uint64_t)s->checkpoint.len * sizeof(s->checkpoint.v[0]));
+    g->rewind_frontier_valid = true;
+    /* Pipeline coordinator: ask the worker to snapshot its own slice at the
+     * same position on the next span (ds4_distributed.c). No capable worker
+     * means no rewind for this session, so drop the local frontier too. */
+    if (s->distributed &&
+        !ds4_dist_session_request_rewind_capture(s->distributed, g->rewind_frontier_pos)) {
+        g->rewind_frontier_valid = false;
+        g->rewind_frontier.valid = false;
+        g->rewind_reason = "dist-route-unsupported";
+        return false;
+    }
+    g->rewind_reason = NULL;
+    return true;
+}
+
+bool ds4_session_rewind_frontier(ds4_session *s, uint32_t pos) {
+    if (!s || !s->engine || ds4_session_is_cpu(s) || ds4_session_is_glm(s)) {
+        return false;
+    }
+    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK4) return false;
+    ds4_gpu_graph *g = &s->graph;
+    if (!g->rewind_frontier_valid || !g->rewind_frontier.valid) {
+        /* Keep the reason recorded by whoever dropped the frontier. */
+        if (!g->rewind_reason) g->rewind_reason = "no-frontier(never-captured)";
+        return false;
+    }
+    if (pos != g->rewind_frontier_pos) { g->rewind_reason = "pos-mismatch"; return false; }
+    if ((uint32_t)s->checkpoint.len < pos) { g->rewind_reason = "checkpoint-short"; return false; }
+    if (hash_bytes(s->checkpoint.v, (uint64_t)pos * sizeof(s->checkpoint.v[0])) !=
+        g->rewind_frontier_hash) {
+        g->rewind_frontier_valid = false;
+        g->rewind_frontier.valid = false;
+        g->rewind_reason = "token-hash";
+        return false;
+    }
+    if (s->distributed && !ds4_dist_session_rewind_supported(s->distributed)) {
+        g->rewind_reason = "dist-route-unsupported";
+        return false;
+    }
+
+    const ds4_dist_mtp_frontier *f = &g->rewind_frontier;
+    if (!metal_graph_dspark_cache_window_valid(g,
+                                               f->dspark_cache_token_start,
+                                               f->dspark_cache_start,
+                                               f->dspark_cache_len)) {
+        g->rewind_reason = "window";
+        return false;
+    }
+
+    g->rewind_reason = NULL;
+    bool ok = ds4_gpu_begin_commands() != 0;
+    if (!ok) g->rewind_reason = "begin-commands";
+    g->mtp_n_raw = f->mtp_n_raw;
+    if (ok) {
+        ok = metal_graph_dspark_cache_set_window(g,
+                                                 f->dspark_cache_token_start,
+                                                 f->dspark_cache_len);
+    }
+    const ds4_weights *w = &s->engine->weights;
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        if (il >= DS4_DIST_MTP_FRONTIER_MAX_LAYER) { g->rewind_reason = "layer-cap"; ok = false; break; }
+        if (!weights_layer_has_required(&w->layer[il], il)) continue;
+        g->layer_n_comp[il] = f->n_comp[il];
+        g->layer_n_index_comp[il] = f->n_index_comp[il];
+
+        const uint64_t rb = ds4_gpu_tensor_bytes(g->layer_raw_cache[il]);
+        if (g->rewind_raw_kv[il]) {
+            ok = ds4_gpu_tensor_copy(g->layer_raw_cache[il], 0,
+                                     g->rewind_raw_kv[il], 0, rb) != 0;
+        } else {
+            ok = false;
+        }
+
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        const uint64_t ab = ds4_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
+        if (g->rewind_attn_state_kv[il] && g->rewind_attn_state_score[il]) {
+            ok = ok &&
+                 ds4_gpu_tensor_copy(g->layer_attn_state_kv[il], 0,
+                                     g->rewind_attn_state_kv[il], 0, ab) != 0 &&
+                 ds4_gpu_tensor_copy(g->layer_attn_state_score[il], 0,
+                                     g->rewind_attn_state_score[il], 0, ab) != 0;
+        } else {
+            ok = false;
+        }
+        if (ok && ratio == 4) {
+            const uint64_t ib = ds4_gpu_tensor_bytes(g->layer_index_state_kv[il]);
+            if (g->rewind_index_state_kv[il] && g->rewind_index_state_score[il]) {
+                ok = ok &&
+                     ds4_gpu_tensor_copy(g->layer_index_state_kv[il], 0,
+                                         g->rewind_index_state_kv[il], 0, ib) != 0 &&
+                     ds4_gpu_tensor_copy(g->layer_index_state_score[il], 0,
+                                         g->rewind_index_state_score[il], 0, ib) != 0;
+            } else {
+                ok = false;
+            }
+        }
+    }
+    if (ok) {
+        ok = ds4_gpu_end_commands() != 0;
+        if (!ok) g->rewind_reason = "end-commands";
+    } else {
+        (void)ds4_gpu_synchronize();
+        if (!g->rewind_reason) g->rewind_reason = "state-copy";
+    }
+    if (!ok) return false;
+
+    if (!ds4_session_dist_timeline_truncate(s, pos)) { g->rewind_reason = "truncate"; return false; }
+    session_greedy_splitkv_reset(s);
+    /* The live state now equals the retained frontier, and the copies were
+     * only read from, so the frontier stays valid: a repeated resend of the
+     * same prompt (client retry loops) rewinds again without a rebuild. The
+     * position + token-prefix hash checks above still guard staleness, and
+     * on the worker this is what keeps its slice restorable after the
+     * coordinator re-captures at the same position. */
+    /* Pipeline coordinator: the worker restores its slice on the next span
+     * at `pos` (F_REWIND). If it cannot, that span fails and the coordinator
+     * replays the transcript, so the caller still gets a correct result. */
+    if (s->distributed) {
+        (void)ds4_dist_session_request_rewind(s->distributed, pos);
+    }
+    return true;
+}
+
 #else /* DS4_NO_GPU */
 
 int ds4_session_dist_mtp_draft(ds4_session *s, int token, uint32_t pos,
@@ -57458,6 +57724,16 @@ bool ds4_session_dist_frontier_restore(ds4_session *s,
 
 bool ds4_session_dist_timeline_truncate(ds4_session *s, uint32_t len) {
     (void)s; (void)len;
+    return false;
+}
+
+bool ds4_session_capture_rewind_frontier(ds4_session *s) {
+    (void)s;
+    return false;
+}
+
+bool ds4_session_rewind_frontier(ds4_session *s, uint32_t pos) {
+    (void)s; (void)pos;
     return false;
 }
 #endif
@@ -57934,6 +58210,14 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         payload_set_err(err, errlen, "invalid session payload load");
         return 1;
     }
+    /* A restored snapshot replaces the live conversation; any rewind frontier
+     * captured for the previous one is meaningless afterwards. */
+#ifndef DS4_NO_GPU
+    if (s->graph.rewind_frontier_valid) s->graph.rewind_reason = "dropped-by-payload-load";
+    s->graph.rewind_frontier_valid = false;
+    s->graph.rewind_frontier.valid = false;
+#endif
+    if (s->distributed) ds4_dist_session_rewind_clear(s->distributed);
     if (s->distributed) {
         return ds4_dist_session_load_payload(s->distributed, s, fp, payload_bytes, err, errlen);
     }
@@ -65992,6 +66276,21 @@ void ds4_engine_tp_unbind(ds4_engine *e) {
 bool ds4_engine_is_glm_dsa(ds4_engine *e) {
     (void)e;
     return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA;
+}
+
+const char *ds4_session_rewind_reason(ds4_session *s) {
+#ifndef DS4_NO_GPU
+    if (s && s->graph.rewind_reason) return s->graph.rewind_reason;
+#else
+    (void)s;
+#endif
+    return "unavailable";
+}
+
+bool ds4_engine_supports_frontier_rewind(ds4_engine *e) {
+    if (!e) return false;
+    if (e->backend == DS4_BACKEND_CPU) return false;
+    return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK4;
 }
 
 void ds4_engine_close(ds4_engine *e) {
@@ -78633,7 +78932,11 @@ void ds4_session_invalidate(ds4_session *s) {
     ds4_session_dspark_capture_invalidate(s);
 #ifndef DS4_NO_GPU
     ds4_session_glm_reset_dense_cache(s);
+    if (s->graph.rewind_frontier_valid) s->graph.rewind_reason = "dropped-by-session-invalidate";
+    s->graph.rewind_frontier_valid = false;
+    s->graph.rewind_frontier.valid = false;
 #endif
+    if (s->distributed) ds4_dist_session_rewind_clear(s->distributed);
 }
 
 void ds4_session_rewind(ds4_session *s, int pos) {
@@ -78717,6 +79020,79 @@ bool ds4_test_dspark_prefix_capture(ds4_engine *engine, const ds4_tokens *prompt
         }
     }
     ds4_session_free(spec);
+    ds4_session_free(ref);
+    return ok;
+}
+
+bool ds4_test_frontier_rewind_api_null(void) {
+    if (ds4_engine_supports_frontier_rewind(NULL)) return false;
+    if (ds4_session_capture_rewind_frontier(NULL)) return false;
+    if (ds4_session_rewind_frontier(NULL, 0)) return false;
+    return true;
+}
+
+/* Exactness: a strict-prefix rewind must reproduce the same continuation a
+ * fresh session produces when re-evaluating from the prefix. Slide the raw
+ * SWA ring well past the captured window (SLIDE_N > raw_cap) so the test only
+ * passes if the raw ring copy was restored, not merely left in place. */
+bool ds4_test_frontier_rewind_exactness(ds4_engine *engine, const ds4_tokens *prompt) {
+    if (!engine || !prompt || prompt->len < 2) return false;
+    if (!ds4_engine_supports_frontier_rewind(engine)) return false;
+
+    const int P = prompt->len;
+    const int last_token = prompt->v[P - 1];
+    const uint32_t rewind_pos = (uint32_t)(P - 1);
+    enum { SLIDE_N = 160, CHECK_M = 12 };
+    int ref_tokens[CHECK_M];
+    int rew_tokens[CHECK_M];
+    bool ok = false;
+    ds4_session *ref = NULL;
+    ds4_session *rew = NULL;
+    char err[160] = {0};
+    ds4_tokens prefix = *prompt;
+    prefix.len = P - 1;
+
+    if (ds4_session_create(&ref, engine, 32768) != 0 ||
+        ds4_session_create(&rew, engine, 32768) != 0) {
+        goto done;
+    }
+
+    /* Reference: P-1 -> final prompt token -> M decode steps. */
+    if (ds4_session_sync(ref, &prefix, err, sizeof(err)) != 0) goto done;
+    if (ds4_session_eval(ref, last_token, err, sizeof(err)) != 0) goto done;
+    for (int i = 0; i < CHECK_M; i++) {
+        ref_tokens[i] = ds4_session_argmax(ref);
+        if (ref_tokens[i] < 0) goto done;
+        if (ds4_session_eval(ref, ref_tokens[i], err, sizeof(err)) != 0) goto done;
+    }
+
+    /* Subject: capture at P-1, advance, slide the raw ring, rewind, repeat. */
+    if (ds4_session_sync(rew, &prefix, err, sizeof(err)) != 0) goto done;
+    if (!ds4_session_capture_rewind_frontier(rew)) goto done;
+    if (ds4_session_eval(rew, last_token, err, sizeof(err)) != 0) goto done;
+    for (int i = 0; i < SLIDE_N; i++) {
+        const int t = ds4_session_argmax(rew);
+        if (t < 0) goto done;
+        if (ds4_session_eval(rew, t, err, sizeof(err)) != 0) goto done;
+    }
+    if (!ds4_session_rewind_frontier(rew, rewind_pos)) goto done;
+    if (ds4_session_eval(rew, last_token, err, sizeof(err)) != 0) goto done;
+    for (int i = 0; i < CHECK_M; i++) {
+        rew_tokens[i] = ds4_session_argmax(rew);
+        if (rew_tokens[i] < 0) goto done;
+        if (ds4_session_eval(rew, rew_tokens[i], err, sizeof(err)) != 0) goto done;
+    }
+
+    for (int i = 0; i < CHECK_M; i++) {
+        if (rew_tokens[i] != ref_tokens[i]) {
+            fprintf(stderr, "ds4-test: frontier rewind diverges at step %d: got %d want %d\n",
+                    i, rew_tokens[i], ref_tokens[i]);
+            goto done;
+        }
+    }
+    ok = true;
+done:
+    ds4_session_free(rew);
     ds4_session_free(ref);
     return ok;
 }

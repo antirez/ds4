@@ -467,6 +467,16 @@ struct ds4_dist_session {
     uint64_t spec_cycles;
     uint64_t spec_proposed;
     uint64_t spec_accepted;
+    /* DeepSeek live-prefix rewind: the worker snapshots / restores its own
+     * layer slice on the next single-session span whose pos0 matches the
+     * requested position (piggybacked on the ordinary sync span, the same
+     * way F_SPEC_ROLLBACK rides the re-eval span). A pending request that the
+     * next span cannot honor is dropped, which leaves the session on the
+     * plain rebuild path. */
+    bool rewind_capture_pending;
+    uint32_t rewind_capture_pos;
+    bool rewind_pending;
+    uint32_t rewind_pos;
 };
 
 typedef struct {
@@ -2122,7 +2132,8 @@ static ds4_dist_v3_hello_ext dist_v3_local_offer(
     offer.capabilities = DS4_DIST_V3_CAP_BULK_DESC_V1 |
                          DS4_DIST_V3_CAP_SPEC_DECODE_V1 |
                          DS4_DIST_V3_CAP_SPEC_EXACT_V1 |
-                         DS4_DIST_V3_CAP_MULTI_SESSION_V1;
+                         DS4_DIST_V3_CAP_MULTI_SESSION_V1 |
+                         DS4_DIST_V3_CAP_REWIND_V1;
     offer.transport_policy = policy == DS4_DIST_TRANSPORT_NHI
         ? DS4_DIST_V3_POLICY_REQUIRE_NHI : DS4_DIST_V3_POLICY_AUTO;
     if (nhi) {
@@ -6730,6 +6741,74 @@ int ds4_dist_session_route_ready(ds4_dist_session *d, char *err, size_t errlen) 
     return 1;
 }
 
+/* =====================================================================
+ * DeepSeek live-prefix rewind over the distributed route
+ * =====================================================================
+ *
+ * The coordinator captures / restores its own layer slice in ds4.c
+ * (ds4_session_capture_rewind_frontier / ds4_session_rewind_frontier) and
+ * asks the worker to do the same for its slice by flagging the next span
+ * that starts at the rewind position. Only a single-worker route that
+ * negotiated DS4_DIST_V3_CAP_REWIND_V1 qualifies; anything else reports
+ * "unsupported" so the session never captures and the server keeps the
+ * full-rebuild path (identical to today).
+ */
+bool ds4_dist_session_rewind_supported(ds4_dist_session *d) {
+    if (!d || !d->plan_ready || d->plan.count != 1u) return false;
+    const ds4_dist_route_entry *only = &d->plan.entry[0];
+    if ((only->caps & DS4_DIST_V3_CAP_REWIND_V1) == 0) return false;
+    if ((only->flags & DS4_DIST_ROUTE_F_OUTPUT_LOGITS) == 0) return false;
+    return true;
+}
+
+void ds4_dist_session_rewind_clear(ds4_dist_session *d) {
+    if (!d) return;
+    d->rewind_capture_pending = false;
+    d->rewind_capture_pos = 0;
+    d->rewind_pending = false;
+    d->rewind_pos = 0;
+}
+
+bool ds4_dist_session_request_rewind_capture(ds4_dist_session *d, uint32_t pos) {
+    if (!ds4_dist_session_rewind_supported(d)) return false;
+    d->rewind_capture_pending = true;
+    d->rewind_capture_pos = pos;
+    return true;
+}
+
+bool ds4_dist_session_request_rewind(ds4_dist_session *d, uint32_t pos) {
+    if (!ds4_dist_session_rewind_supported(d)) return false;
+    d->rewind_capture_pending = false;
+    d->rewind_pending = true;
+    d->rewind_pos = pos;
+    return true;
+}
+
+bool ds4_dist_session_rewind_pending(const ds4_dist_session *d) {
+    return d && (d->rewind_capture_pending || d->rewind_pending);
+}
+
+/* Flags for the span that starts at pos0; consumes the pending request.
+ * A request the span cannot honor (different start position, or the route
+ * lost the capability) is dropped so it can never attach to a later,
+ * unrelated span. */
+static uint32_t dist_session_take_rewind_flags(ds4_dist_session *d, uint32_t pos0) {
+    uint32_t flags = 0;
+    if (!d) return 0;
+    const bool supported = ds4_dist_session_rewind_supported(d);
+    if (d->rewind_pending) {
+        if (supported && d->rewind_pos == pos0) flags |= DS4_DIST_WORK_F_REWIND;
+        d->rewind_pending = false;
+    }
+    if (d->rewind_capture_pending) {
+        if (supported && flags == 0 && d->rewind_capture_pos == pos0) {
+            flags |= DS4_DIST_WORK_F_REWIND_CAPTURE;
+        }
+        d->rewind_capture_pending = false;
+    }
+    return flags;
+}
+
 int ds4_dist_session_sync(
         ds4_dist_session *d,
         ds4_session *owner,
@@ -6757,7 +6836,13 @@ int ds4_dist_session_sync(
         }
         const uint32_t pos0 = (uint32_t)checkpoint->len;
         const uint32_t suffix = (uint32_t)prompt->len - pos0;
-        if (dist_coordinator_can_pipeline_prefill(&d->state, &d->plan, owner, suffix, chunk_cap)) {
+        /* A pending rewind capture/restore must ride the first span of this
+         * sync, so take the chunked path (the pipelined prefill fans spans
+         * out and cannot flag exactly one). Production rewinds re-sync a
+         * single token, so this costs nothing there. */
+        const bool rewind_span = ds4_dist_session_rewind_pending(d);
+        if (!rewind_span &&
+            dist_coordinator_can_pipeline_prefill(&d->state, &d->plan, owner, suffix, chunk_cap)) {
             int prefill_rc = dist_coordinator_prefill_prompt_pipelined(&d->state,
                                                                        owner,
                                                                        &d->plan,
@@ -6796,6 +6881,7 @@ int ds4_dist_session_sync(
         while (pos < (uint32_t)prompt->len) {
             const uint32_t remaining = (uint32_t)prompt->len - pos;
             const uint32_t chunk = remaining < chunk_cap ? remaining : chunk_cap;
+            const uint32_t rewind_flags = dist_session_take_rewind_flags(d, pos);
             int eval_rc = dist_coordinator_eval_span(&d->state,
                                                      owner,
                                                      &d->plan,
@@ -6805,7 +6891,7 @@ int ds4_dist_session_sync(
                                                      d->session_id,
                                                      d->request_id++,
                                                      false,
-                                                     0,
+                                                     rewind_flags,
                                                      false,
                                                      NULL,
                                                      logits,
@@ -6814,6 +6900,15 @@ int ds4_dist_session_sync(
                                                      err,
                                                      errlen);
             if (eval_rc != 0) {
+                if (rewind_flags != 0) {
+                    /* Rare and worth seeing: the rebuild below keeps the
+                     * request correct but silently loses the fast path. */
+                    fprintf(stderr,
+                            "ds4: distributed coordinator: worker %s at %u rejected (%s); rebuilding from transcript\n",
+                            (rewind_flags & DS4_DIST_WORK_F_REWIND) ? "rewind" : "rewind capture",
+                            pos, err && err[0] ? err : "(no detail)");
+                }
+                ds4_dist_session_rewind_clear(d);
                 if (dist_coordinator_rebuild_from_transcript(&d->state,
                                                              owner,
                                                              &d->plan,
@@ -6882,6 +6977,8 @@ int ds4_dist_session_eval(
     }
     if (dist_session_ensure_route(d, err, errlen) != 0) return 1;
 
+    const uint32_t rewind_flags =
+        dist_session_take_rewind_flags(d, (uint32_t)checkpoint->len);
     int rc = dist_coordinator_eval_span(&d->state,
                                         owner,
                                         &d->plan,
@@ -6891,7 +6988,7 @@ int ds4_dist_session_eval(
                                         d->session_id,
                                         d->request_id++,
                                         false,
-                                        0,
+                                        rewind_flags,
                                         false,
                                         NULL,
                                         logits,
@@ -6900,6 +6997,7 @@ int ds4_dist_session_eval(
                                         err,
                                         errlen);
     if (rc != 0) {
+        ds4_dist_session_rewind_clear(d);
         ds4_tokens transcript = {0};
         ds4_tokens_copy(&transcript, checkpoint);
         ds4_tokens_push(&transcript, token);
@@ -10246,8 +10344,13 @@ static int dist_worker_process_work_message(
         return dist_worker_reject_received_work(upstream, message,
                                                 request_id, err);
     }
+    /* F_MULTI_SESSION and the rewind flags are deliberately outside
+     * F_VALID_MASK (legacy peers reject them outright); this worker accepts
+     * them here and lets ds4_dist_v3_work_caps_validate enforce that the
+     * matching capability was negotiated. */
     if ((work.flags & ~(DS4_DIST_WORK_F_VALID_MASK |
-                        DS4_DIST_WORK_F_MULTI_SESSION)) != 0) {
+                        DS4_DIST_WORK_F_MULTI_SESSION |
+                        DS4_DIST_WORK_F_REWIND_MASK)) != 0) {
         return dist_worker_reject_received_work(
             upstream, message, request_id, "invalid distributed WORK flags");
     }
@@ -10463,6 +10566,16 @@ static int dist_worker_process_work_message(
     const bool produce_hidden = !local_output_logits && !final_ack_only;
     const bool spec_verify = (work.flags & DS4_DIST_WORK_F_SPEC_VERIFY) != 0;
     const bool spec_rollback = (work.flags & DS4_DIST_WORK_F_SPEC_ROLLBACK) != 0;
+    const bool rewind_capture = (work.flags & DS4_DIST_WORK_F_REWIND_CAPTURE) != 0;
+    const bool rewind_restore = (work.flags & DS4_DIST_WORK_F_REWIND) != 0;
+    /* Flag combinations were already vetted by ds4_dist_v3_work_caps_validate;
+     * the rewind frontier covers exactly this worker's slice, so it only
+     * makes sense on the final hop of a single-worker route. */
+    if ((rewind_capture || rewind_restore) && has_next) {
+        free(route_blob);
+        free(tokens);
+        return dist_worker_upstream_send_work_error(upstream, request_id, "rewind WORK requires a single-worker route");
+    }
     const bool output_drafts = (work.flags & DS4_DIST_WORK_F_OUTPUT_DRAFTS) != 0;
     const bool output_all_logits = (work.flags & DS4_DIST_WORK_F_OUTPUT_ALL_LOGITS) != 0;
     const bool spec_commit = (work.flags & DS4_DIST_WORK_F_SPEC_COMMIT) != 0;
@@ -10674,6 +10787,24 @@ static int dist_worker_process_work_message(
         session->token_hash_valid = false;
         session->frontier.valid = false;
     }
+    if (rewind_restore) {
+        /* Live-prefix rewind: restore the frontier retained at pos0 and
+         * truncate the timeline there so the hash block below recomputes
+         * over the truncated prefix and this span re-evaluates the final
+         * prompt token. Refusing (no matching frontier) makes the
+         * coordinator replay the transcript, so a refusal is always safe. */
+        if (!ds4_session_rewind_frontier(session->session, work.pos0)) {
+            pthread_mutex_unlock(&state->mu);
+            if (!input_hc_uses_wire) free(input_hc);
+            if (!result_mapped) free(result);
+            dist_tx_bulk_plan_abort(upstream->transport, &result_tx_plan);
+            free(route_blob);
+            free(tokens);
+            return dist_worker_upstream_send_work_error(upstream, request_id, "worker rewind frontier restore failed");
+        }
+        session->token_hash_valid = false;
+        session->frontier.valid = false;
+    }
     if ((work.flags & DS4_DIST_WORK_F_RESET_SESSION) != 0) {
         session->token_hash = DS4_DIST_TOKEN_HASH_INIT;
         session->token_hash_valid = true;
@@ -10706,6 +10837,19 @@ static int dist_worker_process_work_message(
         return dist_worker_reject_received_work(
             upstream, message, request_id,
             "worker KV prefix hash mismatch");
+    }
+    if (rewind_capture) {
+        /* The prefix hash just proved this slice sits at exactly pos0 with
+         * the coordinator's tokens: snapshot it as the rewind checkpoint
+         * before the span advances. Failure is non-fatal here (the span
+         * still runs); it only means a later F_REWIND will be refused and
+         * the coordinator rebuilds instead. */
+        if (!ds4_session_capture_rewind_frontier(session->session) &&
+            getenv("DS4_DIST_REWIND_LOG")) {
+            fprintf(stderr,
+                    "ds4: dist worker: rewind frontier capture at %u failed\n",
+                    work.pos0);
+        }
     }
     if (spec_verify) {
         if (!ds4_session_dist_frontier_snapshot(session->session,

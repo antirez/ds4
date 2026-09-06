@@ -12211,13 +12211,28 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                    "Anthropic continuation state is not available; retry by replaying the full messages history");
         return;
     } else if (cached == 0 && live_vision_match) {
+        const bool engine_glm = ds4_engine_is_glm_dsa(s->engine);
+        const bool can_rewind = engine_glm ||
+            ds4_engine_supports_frontier_rewind(s->engine);
         const int rewind_to = live_prefix_rewind_target(
-            ds4_engine_is_glm_dsa(s->engine), old_pos,
-            j->req.prompt.len, common);
+            can_rewind, old_pos, j->req.prompt.len, common);
         if (rewind_to >= 0) {
+            bool rewind_ok = false;
             pthread_mutex_lock(&s->inference_mu);
-            ds4_session_rewind(slot->session, rewind_to);
-            const bool rewind_valid =
+            if (engine_glm) {
+                /* Plain per-row KV: attempt the truncation; the validity
+                 * check below decides (byte-identical GLM behavior). */
+                ds4_session_rewind(slot->session, rewind_to);
+                rewind_ok = true;
+            } else {
+                /* DeepSeek pooled compressors: restore the frontier captured
+                 * at prompt_len-1 (ds4.c). Returns false when no matching
+                 * frontier exists, so the caller rebuilds exactly as GLM does
+                 * when its rollback state is stale. */
+                rewind_ok = ds4_session_rewind_frontier(slot->session,
+                                                        (uint32_t)rewind_to);
+            }
+            const bool rewind_valid = rewind_ok &&
                 ds4_session_common_prefix(slot->session, &j->req.prompt) ==
                     rewind_to &&
                 (!multimodal ||
@@ -12230,12 +12245,16 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                 cache_source = "memory-rewind";
                 cache_diag.rewind_to = rewind_to;
                 server_log(DS4_LOG_KVCACHE,
-                           "ds4-server: rewound GLM live prefix from %d to %d; final prompt token will be reevaluated",
+                           "ds4-server: rewound %s live prefix from %d to %d; final prompt token will be reevaluated",
+                           engine_glm ? "GLM" : "DeepSeek",
                            old_pos, rewind_to);
             } else {
                 server_log(DS4_LOG_KVCACHE,
-                           "ds4-server: GLM live prefix rewind from %d to %d requires rebuild",
-                           old_pos, rewind_to);
+                           "ds4-server: %s live prefix rewind from %d to %d requires rebuild%s%s",
+                           engine_glm ? "GLM" : "DeepSeek",
+                           old_pos, rewind_to,
+                           engine_glm ? "" : " reason=",
+                           engine_glm ? "" : ds4_session_rewind_reason(slot->session));
             }
         } else {
             cached = common == old_pos && j->req.prompt.len >= old_pos ? common : 0;
@@ -12441,6 +12460,45 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             suppressed_continued_last = -1;
         }
         ds4_tokens_free(&prefix);
+    }
+
+    /* Capture a DeepSeek rewind frontier at prompt_len-1 so a later
+     * strict-prefix resend restores the KV and re-evaluates the final prompt
+     * token instead of rebuilding the whole prefix. Split the last prompt
+     * token out of the main sync: advance to len-1, snapshot the frontier,
+     * then let the sync below re-evaluate that single token (capture pos ==
+     * rewind pos, matching ds4_session_rewind_frontier). Skip multimodal
+     * (vision KV is not part of the frontier), fully-cached requests
+     * (nothing new to snapshot), and platform continuations whose effective
+     * prompt includes hidden tokens not present in j->req.prompt (capture pos
+     * would differ from the rewind target). A failed capture is non-fatal:
+     * it only disables the fast resend path for that slot. */
+    if (!multimodal &&
+        ds4_engine_supports_frontier_rewind(s->engine) &&
+        prompt_for_sync->len == j->req.prompt.len &&
+        prompt_for_sync->len >= 2 &&
+        cached < prompt_for_sync->len)
+    {
+        ds4_tokens frontier_prefix = {0};
+        tokens_copy_prefix(&frontier_prefix, prompt_for_sync,
+                           prompt_for_sync->len - 1);
+        const int frontier_rc = server_session_sync(s, slot, &frontier_prefix,
+                                                    err, sizeof(err));
+        ds4_tokens_free(&frontier_prefix);
+        if (frontier_rc == 0) {
+            pthread_mutex_lock(&s->inference_mu);
+            const bool captured = ds4_session_capture_rewind_frontier(slot->session);
+            pthread_mutex_unlock(&s->inference_mu);
+            server_log(DS4_LOG_KVCACHE,
+                       captured ? "ds4-server: rewind frontier captured at %d%s"
+                                : "ds4-server: rewind frontier capture at %d skipped reason=%s",
+                       prompt_for_sync->len - 1,
+                       captured ? "" : ds4_session_rewind_reason(slot->session));
+        } else {
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: rewind frontier capture at %d skipped: prefix sync rc=%d",
+                       prompt_for_sync->len - 1, frontier_rc);
+        }
     }
 
     int prompt_sync_rc = multimodal ?
@@ -18325,12 +18383,30 @@ static void test_model_metadata_clamps_completion_to_context(void) {
 }
 
 static void test_live_prefix_rewind_target(void) {
+    /* The bool argument is now (ds4_engine_is_glm_dsa() ||
+     * ds4_engine_supports_frontier_rewind()), so the true cases cover the
+     * shared GLM/DeepSeek rewind math without a model. */
     TEST_ASSERT(live_prefix_rewind_target(true, 17, 8, 8) == 7);
     TEST_ASSERT(live_prefix_rewind_target(true, 49826, 48379, 48379) == 48378);
+    TEST_ASSERT(live_prefix_rewind_target(true, 5, 3, 3) == 2);
+    TEST_ASSERT(live_prefix_rewind_target(true, 128, 64, 64) == 63);
     TEST_ASSERT(live_prefix_rewind_target(false, 17, 8, 8) == -1);
     TEST_ASSERT(live_prefix_rewind_target(true, 17, 8, 7) == -1);
     TEST_ASSERT(live_prefix_rewind_target(true, 8, 8, 8) == -1);
     TEST_ASSERT(live_prefix_rewind_target(true, 17, 1, 1) == -1);
+    /* prompt longer than live (extends, never rewinds) */
+    TEST_ASSERT(live_prefix_rewind_target(true, 3, 4, 3) == -1);
+    /* prompt diverges from live before its end (common != prompt_len) */
+    TEST_ASSERT(live_prefix_rewind_target(true, 17, 12, 10) == -1);
+}
+
+static void test_frontier_rewind_api_fail_closed(void) {
+    /* The new DeepSeek predicates must be NULL-safe and fail closed (mirrors
+     * ds4_test_frontier_rewind_api_null in ds4.c); the model-backed exactness
+     * test exercises the non-NULL path. Keeps the --server test model-free. */
+    TEST_ASSERT(!ds4_engine_supports_frontier_rewind(NULL));
+    TEST_ASSERT(!ds4_session_capture_rewind_frontier(NULL));
+    TEST_ASSERT(!ds4_session_rewind_frontier(NULL, 0));
 }
 
 static void test_client_socket_nonblocking_flag(void) {
@@ -19986,6 +20062,7 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_history_validation_handles_large_replays();
     test_model_metadata_clamps_completion_to_context();
     test_live_prefix_rewind_target();
+    test_frontier_rewind_api_fail_closed();
     test_client_socket_nonblocking_flag();
     test_client_disconnect_probe();
     test_cancelled_progress_callback_is_inert();

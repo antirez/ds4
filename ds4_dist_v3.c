@@ -38,6 +38,19 @@ int ds4_dist_v3_work_caps_validate(
         (selected_caps & DS4_DIST_V3_CAP_MULTI_SESSION_V1) == 0)
         return v3_fail(EPROTO, err, errlen,
                        "multi-session WORK requires negotiated multi-session capability");
+    if ((work_flags & DS4_DIST_WORK_F_REWIND_MASK) != 0 &&
+        (selected_caps & DS4_DIST_V3_CAP_REWIND_V1) == 0)
+        return v3_fail(EPROTO, err, errlen,
+                       "rewind WORK requires negotiated rewind capability");
+    if ((work_flags & DS4_DIST_WORK_F_REWIND_MASK) == DS4_DIST_WORK_F_REWIND_MASK)
+        return v3_fail(EPROTO, err, errlen,
+                       "rewind capture and restore cannot share a WORK span");
+    if ((work_flags & DS4_DIST_WORK_F_REWIND_MASK) != 0 &&
+        (work_flags & (DS4_DIST_WORK_F_SPEC_MASK |
+                       DS4_DIST_WORK_F_MULTI_SESSION |
+                       DS4_DIST_WORK_F_RESET_SESSION)) != 0)
+        return v3_fail(EPROTO, err, errlen,
+                       "rewind WORK cannot combine with speculative, multi-session or reset flags");
     return 0;
 }
 
@@ -426,7 +439,8 @@ int ds4_dist_v3_negotiate(
     ack->selected_caps = common_caps & (DS4_DIST_V3_CAP_BULK_DESC_V1 |
                                         DS4_DIST_V3_CAP_SPEC_DECODE_V1 |
                                         DS4_DIST_V3_CAP_SPEC_EXACT_V1 |
-                                        DS4_DIST_V3_CAP_MULTI_SESSION_V1);
+                                        DS4_DIST_V3_CAP_MULTI_SESSION_V1 |
+                                        DS4_DIST_V3_CAP_REWIND_V1);
     ds4_dist_v3_u64_to_halves(generation,
                               &ack->generation_hi, &ack->generation_lo);
     if (both_nhi) {

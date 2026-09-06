@@ -314,6 +314,7 @@ bool ds4_engine_glm_layer_payload_bytes(ds4_engine *e,
  * Pro and later shapes must use nonzero ids. */
 int ds4_engine_model_id(ds4_engine *e);
 bool ds4_engine_is_glm_dsa(ds4_engine *e);
+bool ds4_engine_supports_frontier_rewind(ds4_engine *e);
 bool ds4_engine_is_glm53(ds4_engine *e);
 bool ds4_engine_is_distributed(const ds4_engine *e);
 const char *ds4_backend_name(ds4_backend backend);
@@ -438,6 +439,14 @@ typedef enum {
  * state is refilled from scratch. */
 #define DS4_SESSION_SYNC_INTERRUPTED 2
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen);
+/* DeepSeek rewind-frontier checkpoint: snapshot the current KV frontier
+ * (compressor carry rings + raw SWA window) and later restore it to rewind a
+ * strict-prefix request instead of rebuilding. GPU + DeepSeek only; both
+ * return false when the feature is unavailable so callers rebuild. */
+bool ds4_session_capture_rewind_frontier(ds4_session *s);
+bool ds4_session_rewind_frontier(ds4_session *s, uint32_t pos);
+/* Why the last capture/rewind on this session was refused (diagnostic). */
+const char *ds4_session_rewind_reason(ds4_session *s);
 int ds4_session_sync_multimodal(ds4_session *s,
                                 const ds4_tokens *prompt,
                                 const ds4_vision_span *images,
