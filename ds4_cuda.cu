@@ -1831,6 +1831,15 @@ static float *cuda_q8_f32_ptr(
 static int cuda_ok(cudaError_t err, const char *what) {
     if (err == cudaSuccess) return 1;
     fprintf(stderr, "ds4: CUDA %s failed: %s\n", what, cudaGetErrorString(err));
+    /* Fatal CUDA errors leave this process's context unusable. */
+    if (err == cudaErrorIllegalAddress ||
+        err == cudaErrorLaunchFailure ||
+        err == cudaErrorAssert) {
+        fprintf(stderr,
+                "ds4: fatal CUDA context error; exiting\n");
+        fflush(stderr);
+        _Exit(EXIT_FAILURE);
+    }
     return 0;
 }
 
