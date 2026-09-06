@@ -1,5 +1,9 @@
 <p align="center">
-  <img src="logo.svg" alt="DwarfStar logo" width="220">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="logo-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="logo.svg">
+    <img src="logo.svg" alt="DwarfStar logo" width="220">
+  </picture>
 </p>
 
 **DwarfStar** is a small native inference engine optimized first for
