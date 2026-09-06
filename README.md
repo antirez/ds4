@@ -38,6 +38,41 @@ QA-style chats.
 * Using two 128 GB Macs connected with RDMA, you can run 4-bit DeepSeek Flash or GLM 5.3 Flash with tensor parallelism. Larger GLM 5.2 quants need larger machines, such as Mac Studios.
 * You can also use pipeline paralellism to glue together multiple systems to sum their RAM and run larger models.
 
+## Quickstart
+
+This gets you from a clean checkout to a running model. The example uses the
+2-bit imatrix Flash GGUF, which fits machines with 96/128 GB of RAM. See
+[Model Weights](#model-weights) for other quants and the larger PRO model, and
+[Running models larger than RAM](#running-models-larger-than-ram) for SSD
+streaming on smaller machines.
+
+```sh
+# 1. Build for your platform.
+make                  # macOS (Metal) — the primary target
+# make cuda-spark     # Linux CUDA, DGX Spark / GB10
+# make cuda-generic   # Linux CUDA, other local CUDA GPUs
+# make cpu            # CPU-only diagnostics build (see warning below)
+
+# 2. Download a model. This pulls several tens of GB into ./gguf/ and points
+#    ./ds4flash.gguf at it. Downloads resume, so it is safe to re-run.
+./download_model.sh q2-imatrix
+
+# 3. Run a one-shot prompt...
+./ds4 -p "Explain Redis streams in one paragraph." --nothink
+
+# 4. ...or start the interactive chat (multi-turn, /help for commands).
+./ds4
+
+# 5. ...or start an OpenAI/Anthropic-compatible HTTP server on :8080.
+./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192
+```
+
+`./ds4flash.gguf` is the default model path for all binaries; pass `-m` to pick
+another GGUF from `./gguf/`. The CLI defaults to thinking mode; use `--nothink`
+for direct answers. Run `./ds4 --help` and `./ds4-server --help` for the full
+flag list. On macOS, **do not use the `cpu` build for inference**: current macOS
+versions have a virtual-memory bug that crashes the kernel on the CPU path.
+
 ## Motivations
 
 * Capable open-weight models now fit on high-end personal machines.
