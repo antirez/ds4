@@ -148,6 +148,8 @@ static int g_xdev_force_cuda_peer;
 static int g_xdev_force_host_bounce;
 static int g_cuda_disable_qkv_rms_fused;
 static int g_cuda_disable_q8_quant_warp_reduce;
+static int g_cuda_disable_q8_prefill_tiled;
+static int g_cuda_q8_prefill_quant_stats;
 static int g_cuda_no_window_attention;
 static int g_cuda_decode_heads8_online;
 static int g_cuda_decode_score4;
@@ -356,6 +358,10 @@ static void cuda_decode_dispatch_env_refresh(void) {
     g_cuda_disable_qkv_rms_fused = getenv("DS4_CUDA_DISABLE_QKV_RMS_FUSED") != NULL;
     g_cuda_disable_q8_quant_warp_reduce =
         getenv("DS4_CUDA_DISABLE_Q8_QUANT_WARP_REDUCE") != NULL;
+    g_cuda_disable_q8_prefill_tiled =
+        getenv("DS4_CUDA_DISABLE_Q8_PREFILL_TILED") != NULL;
+    g_cuda_q8_prefill_quant_stats =
+        getenv("DS4_CUDA_Q8_PREFILL_QUANT_STATS") != NULL;
     g_cuda_no_window_attention = getenv("DS4_CUDA_NO_WINDOW_ATTENTION") != NULL;
     g_cuda_decode_heads8_online = getenv("DS4_CUDA_DECODE_HEADS8_ONLINE") != NULL;
     g_cuda_decode_score4 = getenv("DS4_CUDA_DECODE_SCORE4") != NULL;
@@ -10722,6 +10728,21 @@ __device__ __forceinline__ static int32_t dot_i8x32_aligned_int4(
 
 static inline bool cuda_q8_quant_warp_reduce_enabled(void) {
     return !g_quality_mode && !g_cuda_disable_q8_quant_warp_reduce;
+}
+
+static inline bool cuda_q8_quant_prefill_tiled_enabled(
+        uint64_t logical_tokens, uint64_t in_dim, int logical_tier) {
+    const bool enabled = ds4_cuda_q8_prefill::select(
+        logical_tokens, in_dim,
+        g_n_gpus == 1 && logical_tier >= 0 && logical_tier < DS4_MAX_GPUS &&
+            g_cuda_is_gb10[logical_tier],
+        g_quality_mode, g_cuda_disable_q8_quant_warp_reduce,
+        g_cuda_disable_q8_prefill_tiled);
+    if (enabled && g_cuda_q8_prefill_quant_stats) {
+        fprintf(stderr, "ds4: CUDA Q8_0 prefill tiled selected tokens=%llu K=%llu\n",
+                (unsigned long long)logical_tokens, (unsigned long long)in_dim);
+    }
+    return enabled;
 }
 
 __global__ static void matmul_q8_0_preq_kernel(
@@ -21203,7 +21224,8 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     dim3 qgrid((unsigned)blocks, (unsigned)n_tok, 1);
     ds4_cuda_launch_q8_0_quantize(
         cuda_q8_quant_warp_reduce_enabled(), qgrid, cuda_decode_stream(),
-        xq, xscale, (const float *)x->ptr, in_dim, blocks);
+        xq, xscale, (const float *)x->ptr, in_dim, blocks,
+        cuda_q8_quant_prefill_tiled_enabled(n_tok, in_dim, logical_tier));
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 quantize launch")) return 0;
     if (n_tok == 1) {
         matmul_q8_0_preq_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256, 0, cuda_decode_stream()>>>(
@@ -21440,7 +21462,8 @@ extern "C" int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
     const dim3 qgrid((unsigned)slice_blocks, (unsigned)n_tok, 1u);
     ds4_cuda_launch_q8_0_quantize(
         cuda_q8_quant_warp_reduce_enabled(), qgrid, 0,
-        xq, xscale, (const float *)x->ptr, in_count, slice_blocks);
+        xq, xscale, (const float *)x->ptr, in_count, slice_blocks,
+        cuda_q8_quant_prefill_tiled_enabled(n_tok, in_count, logical_tier));
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0_kslice quantize launch")) return 0;
     const dim3 grid(((unsigned)out_dim + 7u) / 8u,
                     (unsigned)n_tok, 1u);
@@ -21718,7 +21741,8 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
     dim3 qgrid((unsigned)blocks, (unsigned)n_tok, 1);
     ds4_cuda_launch_q8_0_quantize(
         cuda_q8_quant_warp_reduce_enabled(), qgrid, cuda_decode_stream(),
-        xq, xscale, (const float *)x->ptr, in_dim, blocks);
+        xq, xscale, (const float *)x->ptr, in_dim, blocks,
+        cuda_q8_quant_prefill_tiled_enabled(n_tok, in_dim, logical_tier));
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 pair quantize launch")) return 0;
     if (n_tok != 1) {
         if (force_decode_warp &&
@@ -25673,7 +25697,8 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
         dim3 qgrid((unsigned)blocks_a, (unsigned)x_rows, 1);
         ds4_cuda_launch_q8_0_quantize(
             cuda_q8_quant_warp_reduce_enabled(), qgrid, cuda_decode_stream(),
-            xq, xscale, (const float *)heads->ptr, group_dim, blocks_a);
+            xq, xscale, (const float *)heads->ptr, group_dim, blocks_a,
+            cuda_q8_quant_prefill_tiled_enabled(n_tokens, group_dim, logical_tier));
         if (!cuda_ok(cudaGetLastError(), "attention_output_q8_a prequant launch")) return 0;
         int grouped_mma_done = 0;
         if (n_tokens >= 8u) {

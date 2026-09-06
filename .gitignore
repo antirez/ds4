@@ -55,6 +55,9 @@
 /tests/test_rocm_q4_dense_pair
 /tests/test_rocm_q4_lds_host
 /tests/test_rocm_q4_wmma_load_host
+/tests/test_rocm_q4_qb_epilogue_host
+/tests/test_rocm_q4_qb_epilogue_host_fast
+/tests/test_rocm_q4_qb_epilogue
 /tests/test_glm53_vision_engine
 /tests/test_glm_attention
 /tests/test_glm_attention_rocm

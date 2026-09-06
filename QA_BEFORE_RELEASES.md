@@ -1007,6 +1007,14 @@ Do not use high-performance Hugging Face Xet mode while vLLM is resident.
   receiving explicit permission to use `192.168.60.250` for this QA pass.
 - Run:
   `make cuda-regression`.
+- On GB10, run `make test-cuda-q8-quantize CUDA_ARCH=sm_121` and
+  `make bench-cuda-q8-prefill-quantize CUDA_ARCH=sm_121` before accepting the
+  default-on tiled prefill activation producer. Require bitwise parity of
+  bytes/scales for large batches, guard/tail safety and graph replay. Then
+  compare model prefill/decode with `DS4_CUDA_DISABLE_Q8_PREFILL_TILED=1`
+  against the unset default; keep the older global warp rollback unset in
+  both arms. Follow [the three-way measurement protocol](speed-bench/cuda_q8_prefill_tiled.md).
+  CPU-only tests and a kernel-only speedup do not establish a Q4/Q8 TPS gain.
 - On a single GB10 (`sm_121`), validate the imported Q2 decode fast paths with
   the AProjQ8/OutQ8 Flash GGUF.  Compare the default against a rollback process
   that sets all of:
@@ -1241,6 +1249,15 @@ a substitute for CUDA or Metal release testing.
   counts covering a partial tile and the 128-token production chunk. Require
   bitwise dense, pair, Q4-attention-B, and Q8-attention-B parity with intact
   canaries. A REQUIRE-plus-DISABLE arm must fail before modifying output.
+- For the Q4 F32 `attn_q_b` epilogue candidate, run
+  `make test-rocm-q4-qb-epilogue ROCM_ARCH=gfx1151 DS4_TEST_REQUIRE_ROCM_DEVICE=1`.
+  Require bitwise finite-output parity and intact guards against the forced
+  legacy kernel, including signed zero, YaRN/inverse RoPE, token boundaries,
+  and quality/SSD/generic-API exclusions. NaN payloads are not compared, but
+  non-finite classification must agree. The host-only mapping/tree test is
+  not HIP/GPU validation. Run the native benchmark and the fixed-4096-chunk
+  model default/rollback A/B described in
+  `speed-bench/rocm_q4_qb_f32_epilogue.md` before claiming any throughput win.
 - Keep ROCm grouped attention-A decode opt-in until a model A/B wins. Its
   fail-closed test uses `DS4_ROCM_ENABLE_Q4_GROUPED_ATTN_A=1`,
   `DS4_ROCM_REQUIRE_Q4_GROUPED_ATTN_A=1`, and

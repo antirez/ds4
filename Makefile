@@ -80,7 +80,7 @@ tests/test_quantizer_indexer_q4: tests/test_quantizer_indexer_q4.c gguf-tools/qu
 test-quantizer-indexer-q4: gguf-tools/deepseek4-quantize tests/test_quantizer_indexer_q4
 	./tests/test_quantizer_indexer_q4 ./gguf-tools/deepseek4-quantize
 
-.PHONY: test-q8-quantize-host test-cuda-q8-quantize
+.PHONY: test-q8-quantize-host test-cuda-q8-quantize bench-cuda-q8-prefill-quantize
 .PHONY: test-q4-epilogue-host test-cuda-q4-epilogue
 tests/test_q4_epilogue_host: tests/test_cuda_q4_epilogue.cpp cuda/mmq/ds4_q4_mmvq_epilogue.h
 	$(CXX) -O2 -Wall -Wextra -std=c++17 -o $@ $<
@@ -88,17 +88,22 @@ tests/test_q4_epilogue_host: tests/test_cuda_q4_epilogue.cpp cuda/mmq/ds4_q4_mmv
 test-q4-epilogue-host: tests/test_q4_epilogue_host
 	./tests/test_q4_epilogue_host
 
-tests/test_q8_quantize_host: tests/test_cuda_q8_quantize.cpp
+tests/test_q8_quantize_host: tests/test_cuda_q8_quantize.cpp cuda/ds4_q8_prefill_layout.h
 	$(CXX) -O2 -Wall -Wextra -std=c++17 -o $@ $<
 
 test-q8-quantize-host: tests/test_q8_quantize_host
 	./tests/test_q8_quantize_host
 
-tests/test_cuda_q8_quantize: tests/test_cuda_q8_quantize.cpp cuda/ds4_q8_quantize.cuh
+tests/test_cuda_q8_quantize: tests/test_cuda_q8_quantize.cpp cuda/ds4_q8_quantize.cuh cuda/ds4_q8_prefill_layout.h
+	@if [ -z "$(NVCC)" ] || ! command -v "$(NVCC)" >/dev/null 2>&1; then \
+		echo "error: CUDA q8 quantizer tests require nvcc and a CUDA host"; exit 1; fi
 	$(NVCC) $(NVCCFLAGS) -std=c++17 -x cu -o $@ $<
 
 test-cuda-q8-quantize: tests/test_cuda_q8_quantize
 	./tests/test_cuda_q8_quantize
+
+bench-cuda-q8-prefill-quantize: tests/test_cuda_q8_quantize
+	./tests/test_cuda_q8_quantize --bench
 
 ifeq ($(UNAME_S),Darwin)
 .PHONY: metal-decode-schedule-bench metal-prefill-variant-bench metal-q4-dense-pair-bench metal-q4-prefill-pair-bench metal-q4-mm-tail-cull-bench metal-q4-attn-out-a-direct-bench metal-iq2-moe-tail-cull-bench metal-iq2-moe-top8-pair-bench check-mxfp4-half-lut test-mxfp4-metal
@@ -136,6 +141,9 @@ help:
 	@echo "  make test-rocm-q4-prefill Run ROCm Q4 tiled-prefill parity/canary oracle"
 	@echo "  make test-rocm-q4-lds-host Check Q4 prefill LDS addressing and fence schedule without HIP"
 	@echo "  make test-rocm-q4-wmma-load-host Check Q4 K64 float4 loader policy/addressing without HIP"
+	@echo "  make test-rocm-q4-qb-epilogue-host Check Q4 F32 epilogue mapping/reduction without HIP"
+	@echo "  make test-rocm-q4-qb-epilogue Run the gfx1151 F32 RMSNorm/RoPE parity oracle"
+	@echo "  make bench-rocm-q4-qb-epilogue Time the F32 epilogue default/rollback with HIP events"
 	@echo "  make metal-decode-schedule-bench  Build the balanced Metal decode schedule benchmark"
 	@echo "  make metal-prefill-variant-bench  Build the balanced Metal prefill variant benchmark"
 	@echo "  make metal-q4-dense-pair-bench  Build the resident Q4 decode pair kernel benchmark"
@@ -900,7 +908,7 @@ endif
 test-glm-attention: tests/test_glm_attention
 	./tests/test_glm_attention
 
-ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_glm53_vision_gpu.cuh ds4_deepseek4_vision_gpu.cuh ds4_image.h ds4_iq2_tables_cuda.inc cuda/mmq/ds4_mmq.h cuda/ds4_q8_quantize.cuh
+ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_glm53_vision_gpu.cuh ds4_deepseek4_vision_gpu.cuh ds4_image.h ds4_iq2_tables_cuda.inc cuda/mmq/ds4_mmq.h cuda/ds4_q8_quantize.cuh cuda/ds4_q8_prefill_layout.h
 	$(NVCC) $(NVCCFLAGS) -c -o $@ ds4_cuda.cu
 
 # Vendored mmq pieces (see cuda/mmq/VENDOR.md).  ds4_mmq.cu transitively
@@ -985,6 +993,46 @@ tests/test_rocm_q4_wmma_load_host: tests/test_rocm_q4_wmma_load_host.cpp rocm/ds
 
 test-rocm-q4-wmma-load-host: tests/test_rocm_q4_wmma_load_host
 	./tests/test_rocm_q4_wmma_load_host
+
+.PHONY: test-rocm-q4-qb-epilogue-host test-rocm-q4-qb-epilogue bench-rocm-q4-qb-epilogue
+tests/test_rocm_q4_qb_epilogue_host: tests/test_rocm_q4_qb_epilogue_host.cpp rocm/ds4_rocm_q4_qb_epilogue_layout.cuh
+	$(CXX) -O2 -Wall -Wextra -std=c++17 -fno-fast-math -ffp-contract=off -I. -o $@ $<
+
+# ROCm uses Clang FP pragmas; exercise them under fast-math even without HIP.
+ROCM_Q4_EPILOGUE_HOST_CLANG ?= clang++
+tests/test_rocm_q4_qb_epilogue_host_fast: tests/test_rocm_q4_qb_epilogue_host.cpp rocm/ds4_rocm_q4_qb_epilogue_layout.cuh
+	$(ROCM_Q4_EPILOGUE_HOST_CLANG) -O3 -Wall -Wextra -std=c++17 -ffast-math -fno-finite-math-only -I. -o $@ $<
+
+test-rocm-q4-qb-epilogue-host: tests/test_rocm_q4_qb_epilogue_host tests/test_rocm_q4_qb_epilogue_host_fast
+	./tests/test_rocm_q4_qb_epilogue_host
+	./tests/test_rocm_q4_qb_epilogue_host_fast
+
+tests/test_rocm_q4_qb_epilogue.o: tests/test_rocm_q4_qb_epilogue.cpp ds4_gpu.h rocm/ds4_rocm_q4_qb_epilogue_layout.cuh
+	$(HIPCC) $(ROCM_CFLAGS) -DDS4_ROCM_BUILD -std=c++17 -fno-fast-math -I. -c -o $@ $<
+
+tests/test_rocm_q4_qb_epilogue: tests/test_rocm_q4_qb_epilogue.o ds4_image.o ds4_rocm.o $(ROCM_MMQ_OBJS) ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
+
+ROCM_Q4_EPILOGUE_TEST_ARGS ?=
+test-rocm-q4-qb-epilogue:
+	@epilogue_hipcc="$(strip $(HIPCC))"; \
+	if [ -z "$$epilogue_hipcc" ]; then epilogue_hipcc="$$(command -v hipcc 2>/dev/null || true)"; fi; \
+	epilogue_probe="$${epilogue_hipcc%% *}"; \
+	if [ -z "$$epilogue_probe" ] || ! command -v "$$epilogue_probe" >/dev/null 2>&1; then \
+		if [ -n "$(strip $(DS4_TEST_REQUIRE_ROCM_DEVICE))" ] && [ "$(strip $(DS4_TEST_REQUIRE_ROCM_DEVICE))" != "0" ]; then \
+			echo "ROCm Q4 F32 epilogue: FAIL (hipcc not found, device required)"; exit 1; \
+		fi; \
+		echo "ROCm Q4 F32 epilogue: SKIP (hipcc not found)"; exit 0; \
+	fi; \
+	$(MAKE) --no-print-directory tests/test_rocm_q4_qb_epilogue HIPCC="$$epilogue_hipcc" || exit $$?; \
+	DS4_TEST_REQUIRE_ROCM_DEVICE="$(strip $(DS4_TEST_REQUIRE_ROCM_DEVICE))" \
+		./tests/test_rocm_q4_qb_epilogue $(ROCM_Q4_EPILOGUE_TEST_ARGS); \
+	rc=$$?; \
+	if [ $$rc -eq 77 ]; then echo "ROCm Q4 F32 epilogue: SKIP (no HIP device)"; exit 0; fi; \
+	exit $$rc
+
+bench-rocm-q4-qb-epilogue:
+	$(MAKE) test-rocm-q4-qb-epilogue ROCM_Q4_EPILOGUE_TEST_ARGS="--bench $(ROCM_Q4_EPILOGUE_TEST_ARGS)"
 
 .PHONY: test-rocm-q4-decode-host
 tests/test_rocm_q4_decode_host: tests/test_rocm_q4_decode_host.cpp rocm/ds4_rocm_q4_decode.cuh
@@ -1078,6 +1126,8 @@ test-strix-rocm-q4-parity:
 test-strix-rocm-q4-prefill:
 	$(MAKE) --no-print-directory -B test-rocm-q4-parity ROCM_ARCH=gfx1151 \
 		DS4_TEST_REQUIRE_ROCM_DEVICE=1 ROCM_Q4_TEST_ARGS=--prefill
+	$(MAKE) --no-print-directory test-rocm-q4-qb-epilogue ROCM_ARCH=gfx1151 \
+		DS4_TEST_REQUIRE_ROCM_DEVICE=1
 
 test-strix-rocm-q4-prefill-long:
 	$(MAKE) --no-print-directory -B test-rocm-q4-parity ROCM_ARCH=gfx1151 \
@@ -1283,6 +1333,7 @@ test-quality-api: tests/test_quality_api.c gguf-tools/quality-testing/score_offi
 	./tests/test_quality_api
 
 clean:
+	rm -f tests/test_rocm_q4_qb_epilogue_host tests/test_rocm_q4_qb_epilogue_host_fast tests/test_rocm_q4_qb_epilogue
 	rm -f tests/test_rocm_q4_decode_host
 	rm -f tests/test_rocm_q4_decode_lane4
 	rm -f tests/test_rocm_q4_lds_host

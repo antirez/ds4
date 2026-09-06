@@ -1,5 +1,14 @@
 ## Benchmarking
 
+For the single-GB10 tiled Q8_0 activation producer used by eligible Q4/Q8
+prefill, see [the native three-way oracle and timing protocol](cuda_q8_prefill_tiled.md).
+The new prefill kernel preserves decode dispatch; GPU validation is pending.
+
+For the gfx1151 Q4 F32 `attn_q_b` RMSNorm/RoPE epilogue candidate, see
+[scope, native parity tests and default/rollback timing](rocm_q4_qb_f32_epilogue.md).
+The change is default-on only for the documented F32-GEMM prefill scope;
+GPU validation and model-throughput evidence are still pending.
+
 Here we collect prefill and generation speed obtained with different hardware.
 
 Run `ds4-bench` as:

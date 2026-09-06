@@ -3,6 +3,7 @@
 // shared-memory oracle; true only changes the independent 32-lane Q8_0 max.
 // Include from CUDA translation units after cuda_runtime.h and math.h.
 #pragma once
+#include "ds4_q8_prefill_layout.h"
 
 template<bool WARP_REDUCE>
 __device__ __forceinline__ static float ds4_cuda_q8_0_warp_amax(
@@ -58,6 +59,31 @@ __global__ static void quantize_q8_0_f32_kernel(
     } else {
         dst[threadIdx.x] = 0;
     }
+}
+
+// Large prefill: amortize CTA scheduling over eight contiguous Q8_0 blocks.
+// Keep the legacy shared-memory comparison tree (not the decode shuffle
+// specialization), retain each input in a register, and write the same ABI.
+// A final tile may contain dummy warps: they MUST reach every block barrier.
+__global__ static void quantize_q8_0_prefill_tiled_kernel(
+        int8_t *xq, float *xscale, const float *x,
+        uint64_t in_dim, uint64_t blocks) {
+    namespace layout = ds4_cuda_q8_prefill;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint64_t b = layout::quant_block(blockIdx.x, threadIdx.x);
+    const uint64_t row = blockIdx.y;
+    const uint64_t i = b * 32u + lane;
+    const bool live = b < blocks && i < in_dim;
+    const float v = live ? x[row * in_dim + i] : 0.0f;
+    __shared__ float vals[layout::threads];
+    const float amax = ds4_cuda_q8_0_warp_amax<false>(fabsf(v), vals);
+    const float d = amax / 127.0f;
+    const float id = d != 0.0f ? 1.0f / d : 0.0f;
+    if (b >= blocks) return; // No barriers remain.
+    if (lane == 0u) xscale[row * blocks + b] = d;
+    int q = live ? (int)lrintf(v * id) : 0;
+    q = q > 127 ? 127 : (q < -128 ? -128 : q);
+    xq[(row * blocks + b) * 32u + lane] = (int8_t)q;
 }
 
 template<bool WARP_REDUCE>
@@ -178,8 +204,14 @@ __global__ static void q8_K_q8_0_quantize_kernel(
 static inline void ds4_cuda_launch_q8_0_quantize(
         bool warp_reduce, dim3 grid, cudaStream_t stream,
         int8_t *xq, float *xscale, const float *x,
-        uint64_t in_dim, uint64_t blocks) {
-    if (warp_reduce) {
+        uint64_t in_dim, uint64_t blocks, bool prefill_tiled = false) {
+    if (prefill_tiled) {
+        const dim3 tiled_grid((unsigned)ds4_cuda_q8_prefill::tiles(blocks),
+                              grid.y, grid.z);
+        quantize_q8_0_prefill_tiled_kernel<<<
+            tiled_grid, ds4_cuda_q8_prefill::threads, 0, stream>>>(
+                xq, xscale, x, in_dim, blocks);
+    } else if (warp_reduce) {
         quantize_q8_0_f32_kernel<true><<<grid, 32, 0, stream>>>(
             xq, xscale, x, in_dim, blocks);
     } else {

@@ -24,23 +24,47 @@ changing them.  Unless a row says otherwise:
 
 ## CUDA Q8 activation quantization
 
+Large prefill on a single GB10 now has a separate Q8_0 producer: for 256..8192
+logical tokens and K=256..16384, it processes eight contiguous quantization
+blocks per 256-thread CTA using the original shared-memory comparison tree.
+It retains input values in registers and reduces CTA count by up to 8x, not
+kernel time or model latency by 8x. GPU validation and throughput are pending.
+It is used only where the ordinary raw Q8_0 producer already ran; MMQ Q8_1,
+GEMM/cache selection, exact-decode entry points and group-slice kernels are
+unchanged. Packed attention groups do not count as additional logical tokens.
+
+`DS4_CUDA_DISABLE_Q8_PREFILL_TILED=1` rolls back only this candidate to the
+previous dispatch, keeping decode shuffles. It is presence-based: unset it
+to test the candidate; even `0` disables it. Quality mode, unsupported shapes,
+other GPUs and multi-GPU execution retain the previous path. No new scratch,
+transfer or synchronization is added to the host dispatch.
+
 `DS4_CUDA_DISABLE_Q8_QUANT_WARP_REDUCE=1` restores the shared-memory
-32-lane maximum reduction. Unset uses warp shuffles by default outside quality
-mode, removing six block barriers from ordinary/group-slice Q8_0 quantization
-and seven from the Q8_0 phase of the dual Q8_K/Q8_0 producer. The signed-max
-Q8_K phase, rounding, padding, grid, thread count, and launch stream are unchanged.
+32-thread maximum-reduction kernel, including its original grid. It takes
+precedence over the new prefill candidate. Otherwise, calls outside the tiled
+scope still use warp shuffles outside quality mode, removing six block barriers
+from ordinary/group-slice Q8_0 quantization and seven from the Q8_0 phase of
+the dual Q8_K/Q8_0 producer. The signed-max Q8_K phase is unchanged.
 
 This affects raw Q8_0 activation producers in decode and prefill (resident or
 SSD) and eligible dual-producer MoE calls, including Q4 models. It does not
 change the separate MMQ Q8_1 producer, weight quantization, or ROCm. The flag
-is presence-based (even `0` rolls back) and is read at CUDA initialization;
-use separate processes for A/B tests.
+is presence-based (even `0` rolls back). All three controls in this section
+are read at CUDA initialization; use separate processes for A/B tests.
+
+`DS4_CUDA_Q8_PREFILL_QUANT_STATS=1` logs every admitted tiled dispatch before
+launch. Use a separate untimed diagnostic run: selection is not proof of
+successful GPU execution or speed. No lines means the candidate was not selected.
 
 `make test-cuda-q8-quantize CUDA_ARCH=sm_121` builds a standalone GPU oracle
-for both production specializations; replace the architecture with the tester's
-GPU target. It checks exact quantized bytes/scales, group slicing, buffer guards,
-the dual producer, and graph replay. `make test-q8-quantize-host` only checks the
-reduction topology and rounding on CPU, not CUDA compilation or GPU execution.
+for the three production kernels; replace the architecture for parity testing
+on other CUDA GPUs. It checks exact quantized bytes/scales, group slicing,
+unaligned views, buffer guards, tails, the dual producer and graph replay,
+including large prefill batches. `make bench-cuda-q8-prefill-quantize CUDA_ARCH=sm_121`
+compares the three producers on GB10 using GPU events, not model throughput.
+`make test-q8-quantize-host` checks admission, mapping and reduction/rounding
+on CPU, not CUDA compilation or GPU execution. See the
+[prefill measurement protocol](speed-bench/cuda_q8_prefill_tiled.md).
 
 ## Metal Q8 dense decode reductions
 
@@ -156,6 +180,8 @@ The detailed Metal A/B contracts and expected oracle counters live in
 
 | Variable | Default behavior and purpose |
 | --- | --- |
+| `DS4_ROCM_DISABLE_Q4_QB_F32_EPILOGUE=1` | Restore the legacy 256-thread RMSNorm/RoPE epilogue after Q4 cached/transient F16 GEMMs with F32 output. Unset or `0`/`false`/`no`/`off` permits one wave32 per head only on gfx1151, N=256–4096, 64 heads, head_dim=512, n_rot=64, outside quality and SSD modes. Empty or any other non-false value disables. Q8, direct-Q4 WMMA, decode, F16 output, GEMM and cache selection are unchanged. GPU parity and timing are pending. |
+| `DS4_ROCM_Q4_QB_F32_EPILOGUE_STATS=1` | Report `wave32_calls` at process exit for successful optimized epilogue enqueues. Any defined value requests the report when the Q4 F32 wrapper is reached; absence of a report can mean that another path owns the projection. This is dispatch evidence, not GPU completion or speed evidence; use a separate diagnostic run. |
 | `DS4_ROCM_ENABLE_Q4_DECODE_LANE4=1` | Opt into the experimental standalone Q4_K Q-b decode kernel at K=1024, M=32768, N=1–8 on wave32/wave64 outside quality mode. Uses four lanes per row and preserves the canonical Q8_K quantizer. Any defined value requests it; GPU parity and timing are pending. |
 | `DS4_ROCM_DISABLE_Q4_DECODE_LANE4=1` | Dominant rollback to eight lanes per row. Any defined value, including `0` or empty, disables the candidate. Prefill, dense pairs and grouped attention are unchanged. |
 | `DS4_ROCM_REQUIRE_Q4_DECODE_LANE4=1` | Also requests the candidate and makes standalone API calls fail before enqueue on unsupported shapes/devices or rollback. This is a focused oracle assertion, not a model-wide setting: other Q4 projections are outside its scope. |
