@@ -45620,6 +45620,12 @@ static bool glm_graph_use_flash_attention_prefill(uint32_t n_tokens) {
 
 static DS4_MAYBE_UNUSED bool glm_graph_use_dense_compact_attention_prefill(
         uint32_t n_tokens) {
+    /* The dense compact path scores the shared latent cache directly and
+     * carries no separate RoPE contribution, so it is only exact for models
+     * whose DSA cache row has no RoPE tail (GLM-5.3 Flash, n_rot == 0).
+     * Models with n_rot == 64 (GLM-5.2, full GLM-5.3) must keep the indexed
+     * kernel, which adds the rotated RoPE term from k_rope_cache. */
+    if (DS4_N_ROT != 0u) return false;
     if (!glm_graph_use_flash_attention_prefill(n_tokens)) return false;
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
     /* The CUDA GEMM setup crosses over the scalar online kernel near 256
