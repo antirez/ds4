@@ -1401,7 +1401,12 @@ static const char *repl_glm_reasoning_effort_text(ds4_think_mode mode) {
 static void repl_chat_build_think_prefix(ds4_engine *engine,
                                          ds4_think_mode mode,
                                          ds4_tokens *prefix) {
-    if (ds4_engine_is_glm_dsa(engine)) {
+    if (ds4_engine_is_qwen38(engine)) {
+        /* The official Qwen 3.8 template only injects a reasoning-effort
+         * system instruction for xhigh; default thinking carries none. */
+        if (mode == DS4_THINK_MAX)
+            ds4_chat_append_max_effort_prefix(engine, prefix);
+    } else if (ds4_engine_is_glm_dsa(engine)) {
         const char *effort = repl_glm_reasoning_effort_text(mode);
         if (effort) ds4_chat_append_message(engine, prefix, "system", effort);
     } else if (mode == DS4_THINK_MAX) {
@@ -1513,7 +1518,9 @@ static int repl_chat_set_ctx(ds4_engine *engine, repl_chat *chat, int ctx_size) 
 }
 
 static bool repl_chat_assistant_turn_uses_eos(ds4_engine *engine) {
-    return !ds4_engine_is_glm_dsa(engine);
+    /* Qwen 3.8 shares the GLM family for graph infra, but its ChatML turns
+     * close on the sampled <|im_end|> like the DeepSeek transcripts do. */
+    return !ds4_engine_is_glm_dsa(engine) || ds4_engine_is_qwen38(engine);
 }
 
 /* Run one interactive turn.  The transcript is tentatively extended with user

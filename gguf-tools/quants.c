@@ -368,6 +368,73 @@ static size_t ds4q_quantize_q8_0(const float *src, void *dst, int64_t start,
     return (size_t)nrows * row_size;
 }
 
+/* MXFP4: 32-value blocks with one shared E8M0 power-of-two scale and 16
+ * packed FP4 (E2M1) codes. Matches the ds4 engine decode: low nibble of
+ * qs[j] is element j, high nibble is element j+16, and the E8M0 byte maps
+ * through the same value grid {0, .5, 1, 1.5, 2, 3, 4, 6} with sign. */
+static const float ds4q_mxfp4_values[16] = {
+     0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
+    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f,
+};
+
+static float ds4q_e8m0_to_f32(uint8_t e) {
+    const uint32_t bits = e == 0 ? 0x00400000u : (uint32_t)e << 23;
+    return ds4q_f32_from_bits(bits);
+}
+
+static uint8_t ds4q_mxfp4_nearest(float value, float d) {
+    float best = fabsf(value - d * ds4q_mxfp4_values[0]);
+    uint8_t index = 0;
+    for (uint8_t i = 1; i < 16; i++) {
+        const float err = fabsf(value - d * ds4q_mxfp4_values[i]);
+        if (err < best) {
+            best = err;
+            index = i;
+        }
+    }
+    return index;
+}
+
+static size_t ds4q_quantize_mxfp4(const float *src, void *dst, int64_t start,
+                                  int64_t nrows, int64_t ncols) {
+    const int64_t qk = 32;
+    const size_t row_size = ds4q_row_size(DS4Q_TYPE_MXFP4, ncols);
+    const int64_t start_row = start / ncols;
+    uint8_t *out = (uint8_t *)dst + (size_t)start_row * row_size;
+    const int64_t nblocks = nrows * (ncols / qk);
+
+    for (int64_t b = 0; b < nblocks; b++) {
+        const float *x = src + start + (size_t)b * qk;
+        float amax = 0.0f;
+        for (int j = 0; j < qk; j++) {
+            const float av = fabsf(x[j]);
+            if (av > amax) amax = av;
+        }
+
+        uint8_t e = 0;
+        if (amax > 0.0f) {
+            /* Largest grid value is 6 = 1.5 * 2^2: place amax two octaves
+             * below its own exponent so the grid covers the block, then
+             * bias into E8M0. */
+            int exponent = ilogbf(amax) - 2;
+            if (exponent < -127) exponent = -127;
+            if (exponent > 127) exponent = 127;
+            e = (uint8_t)(exponent + 127);
+        }
+        const float d = ds4q_e8m0_to_f32(e);
+
+        out[0] = e;
+        uint8_t *qs = out + 1;
+        for (int j = 0; j < qk / 2; j++) {
+            const uint8_t lo = ds4q_mxfp4_nearest(x[j], d);
+            const uint8_t hi = ds4q_mxfp4_nearest(x[j + qk / 2], d);
+            qs[j] = (uint8_t)(lo | (hi << 4));
+        }
+        out += 1 + qk / 2;
+    }
+    return (size_t)nrows * row_size;
+}
+
 static void ds4q_write_q8_k_block(const float *x, uint8_t *y) {
     enum { d_off = 0, qs_off = 4, bsums_off = 260 };
     int8_t qs[QK_K];
@@ -1125,6 +1192,10 @@ size_t ds4q_quantize_chunk(ds4q_type type, const float *src, void *dst,
     }
     if (type == DS4Q_TYPE_IQ2_XXS) {
         return ds4q_quantize_iq2_xxs(src, dst, start, nrows, ncols, imatrix);
+    }
+    if (type == DS4Q_TYPE_MXFP4) {
+        (void)imatrix;
+        return ds4q_quantize_mxfp4(src, dst, start, nrows, ncols);
     }
     (void)src;
     (void)dst;
