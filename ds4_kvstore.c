@@ -183,6 +183,7 @@ uint8_t ds4_kvstore_reason_code(const char *reason) {
 }
 
 const char *ds4_kvstore_key_kind(uint8_t ext_flags) {
+    if (ext_flags & DS4_KVSTORE_EXT_VISION_IDENTITY) return "vision-token-text";
     if (ext_flags & DS4_KVSTORE_EXT_RESPONSES_VISIBLE) return "responses-visible";
     if (ext_flags & DS4_KVSTORE_EXT_THINKING_VISIBLE) return "thinking-visible";
     return "token-text";
@@ -843,7 +844,8 @@ static bool kv_cache_file_text_matches(const char *path, const char sha[41],
 static bool kv_cache_existing_compatible(ds4_kvstore *kc, const char *path,
                                          const char sha[41],
                                          const char *text, size_t text_len,
-                                         int model_id, int quant_bits, int ctx_size) {
+                                         int model_id, int quant_bits,
+                                         int ctx_size, uint8_t ext_flags) {
     if (access(path, F_OK) != 0) return false;
     ds4_kvstore_entry e = {0};
     if (!ds4_kvstore_read_entry_file(path, sha, &e)) return false;
@@ -851,6 +853,8 @@ static bool kv_cache_existing_compatible(ds4_kvstore *kc, const char *path,
                       (!kc->reject_different_quant ||
                        e.quant_bits == (uint8_t)quant_bits) &&
                       e.ctx_size <= (uint32_t)ctx_size &&
+                      ((e.ext_flags ^ ext_flags) &
+                       DS4_KVSTORE_EXT_VISION_IDENTITY) == 0 &&
                       kv_cache_file_text_matches(path, sha, text, text_len);
     ds4_kvstore_entry_free(&e);
     if (!compatible) {
@@ -993,10 +997,13 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     ds4_kvstore_sha1_bytes_hex(text, text_len, sha);
     char *path = ds4_kvstore_path_for_sha(kc, sha);
     const uint8_t reason_code = ds4_kvstore_reason_code(reason);
+    uint8_t ext_flags = trailer_est_bytes > 0 && hooks ? hooks->ext_flag : 0;
+    if (text_override) ext_flags |= cache_text_ext;
 
     if (kv_cache_existing_compatible(kc, path, sha, text, text_len,
                                      model_id,
-                                     quant_bits, ds4_session_ctx(session))) {
+                                     quant_bits, ds4_session_ctx(session),
+                                     ext_flags)) {
         kv_cache_rewrite_trailer(kc, path, text, hooks);
         free(text);
         free(path);
@@ -1071,8 +1078,6 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
 
     const uint64_t now = (uint64_t)time(NULL);
     uint8_t h[DS4_KVSTORE_FIXED_HEADER];
-    uint8_t ext_flags = trailer_est_bytes > 0 && hooks ? hooks->ext_flag : 0;
-    if (text_override) ext_flags |= cache_text_ext;
     ds4_kvstore_fill_header(h, (uint8_t)model_id, (uint8_t)quant_bits,
                             reason_code, ext_flags,
                             (uint32_t)store_tokens.len, 0,
@@ -1187,8 +1192,12 @@ bool ds4_kvstore_maybe_store_continued(ds4_kvstore *kc,
     return false;
 }
 
-int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
-                                 int model_id, int quant_bits, int ctx_size) {
+int ds4_kvstore_find_text_prefix_filtered(ds4_kvstore *kc,
+                                          const char *prompt_text,
+                                          int model_id, int quant_bits,
+                                          int ctx_size,
+                                          uint8_t required_ext_flags,
+                                          uint8_t forbidden_ext_flags) {
     if (!prompt_text) return -1;
     const size_t prompt_bytes = strlen(prompt_text);
     kv_cache_refresh(kc);
@@ -1198,6 +1207,8 @@ int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
         if (e->text_bytes > prompt_bytes || e->text_bytes > SIZE_MAX) continue;
         if ((int)e->tokens < kc->opt.min_tokens) continue;
         if (e->model_id != (uint8_t)model_id) continue;
+        if ((e->ext_flags & required_ext_flags) != required_ext_flags) continue;
+        if ((e->ext_flags & forbidden_ext_flags) != 0) continue;
         if ((uint32_t)ctx_size < e->ctx_size) continue;
         if (kc->reject_different_quant && e->quant_bits != (uint8_t)quant_bits) continue;
         if (best >= 0) {
@@ -1212,14 +1223,24 @@ int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
     return best;
 }
 
-int ds4_kvstore_try_load_text(ds4_kvstore *kc,
-                              ds4_engine *engine,
-                              ds4_session *session,
-                              const char *prompt_text,
-                              ds4_tokens *effective_prompt,
-                              ds4_kvstore_load_result *result,
-                              const ds4_kvstore_trailer_hooks *hooks,
-                              bool responses_protocol) {
+int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
+                                 int model_id, int quant_bits, int ctx_size) {
+    return ds4_kvstore_find_text_prefix_filtered(
+        kc, prompt_text, model_id, quant_bits, ctx_size, 0,
+        DS4_KVSTORE_EXT_VISION_IDENTITY);
+}
+
+int ds4_kvstore_try_load_text_filtered(
+        ds4_kvstore *kc,
+        ds4_engine *engine,
+        ds4_session *session,
+        const char *prompt_text,
+        ds4_tokens *effective_prompt,
+        ds4_kvstore_load_result *result,
+        const ds4_kvstore_trailer_hooks *hooks,
+        bool responses_protocol,
+        uint8_t required_ext_flags,
+        uint8_t forbidden_ext_flags) {
     if (result) memset(result, 0, sizeof(*result));
     if (effective_prompt) effective_prompt->len = 0;
     if (!kc->enabled || !prompt_text) return 0;
@@ -1227,8 +1248,9 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
     if (quant_bits != 2 && quant_bits != 4) return 0;
     const int model_id = ds4_engine_model_id(engine);
     const size_t prompt_bytes = strlen(prompt_text);
-    int idx = ds4_kvstore_find_text_prefix(kc, prompt_text, model_id, quant_bits,
-                                           ds4_session_ctx(session));
+    int idx = ds4_kvstore_find_text_prefix_filtered(
+        kc, prompt_text, model_id, quant_bits, ds4_session_ctx(session),
+        required_ext_flags, forbidden_ext_flags);
     if (idx < 0) return 0;
 
     ds4_kvstore_entry e = kc->entry[idx];
@@ -1248,6 +1270,10 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
         if (hdr.model_id != (uint8_t)model_id) {
             header_ok = false;
             fail_reason = "cached checkpoint was written for a different model";
+        } else if ((hdr.ext_flags & required_ext_flags) != required_ext_flags ||
+                   (hdr.ext_flags & forbidden_ext_flags) != 0) {
+            header_ok = false;
+            fail_reason = "cached checkpoint has the wrong key kind";
         } else if ((uint64_t)text_bytes > prompt_bytes) {
             header_ok = false;
             fail_reason = "cached text is longer than prompt";
@@ -1337,6 +1363,19 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
     free(cached_text);
     free(path);
     return loaded;
+}
+
+int ds4_kvstore_try_load_text(ds4_kvstore *kc,
+                              ds4_engine *engine,
+                              ds4_session *session,
+                              const char *prompt_text,
+                              ds4_tokens *effective_prompt,
+                              ds4_kvstore_load_result *result,
+                              const ds4_kvstore_trailer_hooks *hooks,
+                              bool responses_protocol) {
+    return ds4_kvstore_try_load_text_filtered(
+        kc, engine, session, prompt_text, effective_prompt, result, hooks,
+        responses_protocol, 0, DS4_KVSTORE_EXT_VISION_IDENTITY);
 }
 
 void ds4_kvstore_load_result_free(ds4_kvstore_load_result *result) {

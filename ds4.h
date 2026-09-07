@@ -184,7 +184,12 @@ typedef struct {
     uint32_t height;
     uint32_t content_width;
     uint32_t content_height;
+    /* Decoded source-image identity, used for live same-engine matching. */
     uint8_t fingerprint[32];
+    /* Exact vectors supplied to the language model, including DeepSeek's
+     * vision-sidecar sentinel vectors. Used for process-boundary cache keys. */
+    uint8_t state_fingerprint[32];
+    bool state_fingerprint_valid;
 } ds4_vision_embedding;
 
 typedef struct {
@@ -433,8 +438,19 @@ int ds4_session_sync_multimodal(ds4_session *s,
 bool ds4_session_vision_state_matches(const ds4_session *s,
                                       const ds4_vision_span *images,
                                       size_t image_count);
+/* Inspect the exact conditioning-state identities of the live checkpoint. */
+size_t ds4_session_vision_identity_count(const ds4_session *s);
+bool ds4_session_vision_identity(const ds4_session *s, size_t index,
+                                 uint32_t *token_start,
+                                 uint32_t *token_count,
+                                 uint8_t state_fingerprint[32]);
+/* Attach already-verified request identities after restoring a disk payload.
+ * Every image must end at or before the restored token frontier. */
+bool ds4_session_restore_vision_identities(ds4_session *s,
+                                           const ds4_vision_span *images,
+                                           size_t image_count);
 /* True while a session contains, or is actively syncing, image-conditioned
- * state. Such state must not be written to the text-keyed disk KV cache. */
+ * state. Such state needs an image-identity-aware disk cache key. */
 bool ds4_session_has_vision_state(const ds4_session *s);
 bool ds4_session_rewrite_requires_rebuild(int live_len, int canonical_len, int common);
 ds4_session_rewrite_result ds4_session_rewrite_from_common(
