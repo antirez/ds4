@@ -10201,13 +10201,17 @@ struct server_slot {
     job *running;
     bool busy;
     bool prefill_waiting;
-    /* Dispatcher-owned (s->mu) view of the job occupying a busy slot: its
-     * identity, a copy of its prompt, and whether the client cancelled it
-     * (the slot then frees within one prefill quantum or one decode token).
-     * The job struct itself is stack-owned by the client thread and guarded
-     * by model_mu, so the dispatcher never dereferences slot->running. */
+    /* Dispatcher-owned (s->mu) view of the job occupying (or, once idle, the
+     * job that last occupied) this slot: its identity while busy, a copy of
+     * its prompt, and whether the client cancelled it (the slot then frees
+     * within one prefill quantum or one decode token). The prompt copy is
+     * kept after completion so job_slot_score can tell a continuation of the
+     * slot's conversation (new prompt starts with the last prompt) from a
+     * divergence. The job struct itself is stack-owned by the client thread
+     * and guarded by model_mu, so the dispatcher never dereferences
+     * slot->running. */
     job *busy_job;
-    ds4_tokens busy_prompt;
+    ds4_tokens busy_prompt; /* prompt of the current or most recent job */
     bool draining;
 
     bool decode_pending;
@@ -14907,10 +14911,38 @@ static int job_required_slot_locked(server *s, const job *j) {
  * has common == resident and always scores highest; a new conversation
  * prefers an empty slot (0) over evicting anything larger than twice its
  * shared preamble. Ties still resolve to the lowest slot id. */
+static int tokens_common_prefix_len(const ds4_tokens *a, const ds4_tokens *b) {
+    if (!a || !b) return 0;
+    const int n = a->len < b->len ? a->len : b->len;
+    int i = 0;
+    while (i < n && a->v[i] == b->v[i]) i++;
+    return i;
+}
+
 static int slot_reuse_score(int common, int resident) {
     if (common < 0) common = 0;
     if (resident < common) resident = common;
     return common - (resident - common);
+}
+
+/* A continuation of the slot's own conversation reuses the WHOLE checkpoint,
+ * not just the token-level common prefix: with thinking enabled the live
+ * checkpoint holds prompt + hidden reasoning + reply while the next prompt
+ * carries only the visible reply, so the raw common prefix stops at the
+ * previous prompt boundary and the reasoning tokens look like loss. Scoring
+ * them as loss made a reasoning-heavy turn (generation longer than its
+ * prompt) lose its home slot to any slot holding a smaller or earlier state
+ * of the same conversation, and the conversation then ping-ponged between
+ * the two slots, re-prefilling on every hop (observed on the pair during a
+ * Terminal-Bench run, 2026-09-06). The server's thinking-visible /
+ * memory-token paths resume such a continuation from the full checkpoint,
+ * so when the new prompt starts with the prompt this slot last served, its
+ * reuse is the resident length. */
+static int slot_dispatch_score(int common, int resident, int last_prompt_len) {
+    if (common < 0) common = 0;
+    if (resident < common) resident = common;
+    if (last_prompt_len > 0 && common >= last_prompt_len) return resident;
+    return slot_reuse_score(common, resident);
 }
 
 static int job_slot_score(server *s, server_slot *slot, const job *j,
@@ -14949,15 +14981,15 @@ static int job_slot_score(server *s, server_slot *slot, const job *j,
                                           j->req.images, j->req.image_count)) {
         common = ds4_session_common_prefix(slot->session, &j->req.prompt);
     }
-    return slot_reuse_score(common, resident);
-}
-
-static int tokens_common_prefix_len(const ds4_tokens *a, const ds4_tokens *b) {
-    if (!a || !b) return 0;
-    const int n = a->len < b->len ? a->len : b->len;
-    int i = 0;
-    while (i < n && a->v[i] == b->v[i]) i++;
-    return i;
+    /* The retained prompt copy only proves a continuation if the new prompt
+     * really starts with it (the session may have been rebuilt from disk
+     * with different content since). */
+    int last_prompt_len = 0;
+    if (slot->busy_prompt.len > 0 &&
+        tokens_common_prefix_len(&slot->busy_prompt, &j->req.prompt) == slot->busy_prompt.len) {
+        last_prompt_len = slot->busy_prompt.len;
+    }
+    return slot_dispatch_score(common, resident, last_prompt_len);
 }
 
 /* A busy slot whose running job was cancelled frees within one prefill
@@ -15104,7 +15136,7 @@ static void *slot_worker_main(void *arg) {
         pthread_mutex_lock(&s->mu);
         slot->busy = false;
         slot->busy_job = NULL;
-        slot->busy_prompt.len = 0;
+        /* busy_prompt is kept: it identifies the conversation now resident. */
         slot->draining = false;
         dispatch_jobs_locked(s);
         pthread_mutex_unlock(&s->mu);
@@ -16469,6 +16501,32 @@ static void test_slot_reuse_score(void) {
     /* Defensive clamps. */
     TEST_ASSERT(slot_reuse_score(-5, 10) == slot_reuse_score(0, 10));
     TEST_ASSERT(slot_reuse_score(10, 5) == slot_reuse_score(10, 10));
+}
+
+static void test_slot_dispatch_score_continuation(void) {
+    /* Reasoning-heavy turn: prompt 4000, checkpoint 12000 (8000 hidden
+     * thinking + reply). The next turn's prompt starts with the 4000-token
+     * previous prompt, so the home slot must score as full reuse... */
+    TEST_ASSERT(slot_dispatch_score(4000, 12000, 4000) == 12000);
+    /* ...and beat a slot holding an earlier, smaller state of the same
+     * conversation (prompt 2000, checkpoint 2500), which is also a
+     * continuation base but reuses less. */
+    TEST_ASSERT(slot_dispatch_score(4000, 12000, 4000) > slot_dispatch_score(2000, 2500, 2000));
+    /* Without continuation evidence the old reuse-minus-loss score applies
+     * (this is the case that ping-ponged: home -4000 vs the other slot's
+     * 1500, so the conversation migrated). */
+    TEST_ASSERT(slot_dispatch_score(4000, 12000, 0) == -4000);
+    TEST_ASSERT(slot_dispatch_score(2000, 2500, 0) == 1500);
+    /* A different conversation sharing only the 675-token preamble with a
+     * slot whose last prompt was 3000 tokens is a divergence, not a
+     * continuation: loss-scored, and it loses to an empty slot. */
+    TEST_ASSERT(slot_dispatch_score(675, 12000, 3000) == slot_reuse_score(675, 12000));
+    TEST_ASSERT(slot_dispatch_score(675, 12000, 3000) < slot_dispatch_score(0, 0, 0));
+    /* Identical resend (strict prefix of the checkpoint) is a continuation. */
+    TEST_ASSERT(slot_dispatch_score(3000, 3160, 3000) == 3160);
+    /* Empty slot stays 0; clamps hold. */
+    TEST_ASSERT(slot_dispatch_score(0, 0, 0) == 0);
+    TEST_ASSERT(slot_dispatch_score(-1, 5, 0) == slot_reuse_score(0, 5));
 }
 
 static void test_dispatch_waits_for_draining_home_slot(void) {
@@ -22730,6 +22788,7 @@ static void ds4_server_unit_tests_run(void) {
     test_server_image_embedding_cache();
     test_metrics_text();
     test_slot_reuse_score();
+    test_slot_dispatch_score_continuation();
     test_dispatch_waits_for_draining_home_slot();
     test_batched_prefill_round_robin();
     test_mixed_prefill_quantum_option();
