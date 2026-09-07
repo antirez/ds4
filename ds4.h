@@ -441,6 +441,12 @@ ds4_session_rewrite_result ds4_session_rewrite_from_common(
         ds4_session *s, const ds4_tokens *prompt, int common,
         char *err, size_t errlen);
 int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt);
+bool ds4_session_checkpoint_valid(const ds4_session *s);
+/* Test helpers (ds4-test): allocate a session shell holding only the given
+ * checkpoint tokens, for server-side routing/probe unit tests.  Not usable
+ * for inference; free with ds4_session_free_test_checkpoint(). */
+ds4_session *ds4_session_new_test_checkpoint(const int *tokens, int n);
+void ds4_session_free_test_checkpoint(ds4_session *s);
 int ds4_session_argmax(ds4_session *s);
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id);
 int ds4_session_argmax_ignoring_eos(ds4_session *s,
