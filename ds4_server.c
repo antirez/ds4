@@ -781,6 +781,11 @@ typedef struct {
     ds4_tokens prompt;
     ds4_vision_span *images;
     size_t image_count;
+    /* A stable, non-model copy of prompt_text used only to bind a live
+     * multimodal continuation.  The parser gives each incoming data URL a
+     * fresh private marker, so prompt_text itself cannot be compared across
+     * two otherwise identical image requests. */
+    char *visible_prompt_text;
     char *model;
     bool model_from_request;
     stop_list stops;
@@ -980,6 +985,7 @@ static void request_free(request *r) {
     for (size_t i = 0; i < r->image_count; i++)
         ds4_vision_embedding_free(&r->images[i].embedding);
     free(r->images);
+    free(r->visible_prompt_text);
     free(r->model);
     for (int i = 0; i < r->stops.len; i++) free(r->stops.v[i]);
     free(r->stops.v);
@@ -3088,6 +3094,57 @@ static DS4_SERVER_MAYBE_UNUSED char *render_chat_prompt_text(
                                               tool_orders, think_mode);
 }
 
+/* prompt_text contains random per-request image sentinels while the real
+ * prompt contains only the vision token spans.  Keep a separate stable text
+ * representation for live-continuation matching: it records the encoder
+ * fingerprint and token span at each sentinel, but is never tokenized or sent
+ * to the model. */
+static bool request_build_visible_prompt_text(request *r,
+                                              server_image_input *const *inputs,
+                                              size_t count) {
+    if (!r || !r->prompt_text) return false;
+    free(r->visible_prompt_text);
+    r->visible_prompt_text = NULL;
+    if (count == 0) {
+        r->visible_prompt_text = xstrdup(r->prompt_text);
+        return true;
+    }
+    if (!inputs || r->image_count != count) return false;
+
+    static const char hex[] = "0123456789abcdef";
+    buf visible = {0};
+    const char *cursor = r->prompt_text;
+    for (size_t i = 0; i < count; i++) {
+        const char *marker = inputs[i] ? inputs[i]->marker : NULL;
+        const char *at = marker ? strstr(cursor, marker) : NULL;
+        if (!at) {
+            buf_free(&visible);
+            return false;
+        }
+        buf_append(&visible, cursor, (size_t)(at - cursor));
+        buf_puts(&visible, "\036DS4_VISION_");
+        for (size_t j = 0; j < sizeof(r->images[i].embedding.fingerprint); j++) {
+            const uint8_t byte = r->images[i].embedding.fingerprint[j];
+            buf_putc(&visible, hex[byte >> 4]);
+            buf_putc(&visible, hex[byte & 15]);
+        }
+        char span[64];
+        snprintf(span, sizeof(span), "_%u_%u\037",
+                 r->images[i].token_start,
+                 r->images[i].embedding.token_count);
+        buf_puts(&visible, span);
+        cursor = at + strlen(marker);
+    }
+    buf_puts(&visible, cursor);
+    r->visible_prompt_text = buf_take(&visible);
+    return r->visible_prompt_text != NULL;
+}
+
+static const char *request_visible_prompt_text(const request *r) {
+    return r && r->visible_prompt_text ? r->visible_prompt_text :
+        (r && r->prompt_text ? r->prompt_text : NULL);
+}
+
 static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
                                                request *r,
                                                const chat_msgs *msgs,
@@ -3096,7 +3153,7 @@ static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
     for (int i = 0; msgs && i < msgs->len; i++) count += msgs->v[i].images.len;
     if (count == 0) {
         ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
-        return true;
+        return request_build_visible_prompt_text(r, NULL, 0);
     }
     if (count > 16) {
         snprintf(err, errlen, "too many images; at most 16 are allowed");
@@ -3151,6 +3208,7 @@ static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
         cursor = marker + strlen(inputs[i]->marker);
     }
     if (ok) ds4_tokenize_rendered_chat(e, cursor, &r->prompt);
+    if (ok) ok = request_build_visible_prompt_text(r, inputs, count);
 
 done:
     for (size_t i = 0; i < count; i++)
@@ -9099,6 +9157,10 @@ typedef struct {
     int live_tokens;
     char *visible_text;
     size_t visible_len;
+    /* Byte position in request::prompt_text that corresponds to visible_len.
+     * These differ only for the stable fingerprint sentinels used to compare
+     * repeated image data URLs. */
+    size_t raw_visible_len;
 } visible_live_state;
 
 struct server_slot {
@@ -9428,6 +9490,7 @@ static void visible_live_clear_locked(visible_live_state *st) {
     free(st->visible_text);
     st->visible_text = NULL;
     st->visible_len = 0;
+    st->raw_visible_len = 0;
     st->live_tokens = 0;
     st->valid = false;
 }
@@ -9446,12 +9509,14 @@ static void thinking_live_clear(server *s, server_slot *slot) {
 }
 
 static void thinking_live_remember(server *s, server_slot *slot,
-                                   const char *visible_text) {
+                                   const char *visible_text,
+                                   size_t raw_visible_len) {
     if (!s || !slot || !visible_text || !visible_text[0]) return;
     pthread_mutex_lock(&s->tool_mu);
     visible_live_clear_locked(&slot->thinking_live);
     slot->thinking_live.visible_text = xstrdup(visible_text);
     slot->thinking_live.visible_len = strlen(visible_text);
+    slot->thinking_live.raw_visible_len = raw_visible_len;
     slot->thinking_live.live_tokens = ds4_session_pos(slot->session);
     slot->thinking_live.valid = true;
     pthread_mutex_unlock(&s->tool_mu);
@@ -10536,20 +10601,24 @@ static int thinking_live_visible_prefix_prompt(server *s, server_slot *slot,
                                                const request *req,
                                                int live_pos,
                                                ds4_tokens *effective_prompt) {
-    if (!s || !slot || !req || !req->prompt_text || !effective_prompt) return 0;
+    const char *visible_prompt = request_visible_prompt_text(req);
+    if (!s || !slot || !req || !req->prompt_text || !visible_prompt ||
+        !effective_prompt) return 0;
     if (req->kind != REQ_CHAT || req->api == API_RESPONSES) return 0;
 
-    const size_t prompt_len = strlen(req->prompt_text);
-    size_t visible_len = 0;
+    const size_t prompt_len = strlen(visible_prompt);
+    const size_t raw_prompt_len = strlen(req->prompt_text);
+    size_t raw_visible_len = 0;
     pthread_mutex_lock(&s->tool_mu);
     bool ok = slot->thinking_live.valid &&
               slot->thinking_live.live_tokens == live_pos &&
               slot->thinking_live.visible_text &&
               slot->thinking_live.visible_len < prompt_len &&
-              byte_prefix_match(req->prompt_text, prompt_len,
+              slot->thinking_live.raw_visible_len < raw_prompt_len &&
+              byte_prefix_match(visible_prompt, prompt_len,
                                 slot->thinking_live.visible_text,
                                 slot->thinking_live.visible_len);
-    if (ok) visible_len = slot->thinking_live.visible_len;
+    if (ok) raw_visible_len = slot->thinking_live.raw_visible_len;
     pthread_mutex_unlock(&s->tool_mu);
     if (!ok) return 0;
 
@@ -10557,7 +10626,7 @@ static int thinking_live_visible_prefix_prompt(server *s, server_slot *slot,
     if (!live_tokens || live_tokens->len != live_pos) return 0;
 
     build_prompt_from_exact_prefix_and_text_suffix(
-        s->engine, live_tokens, req->prompt_text + visible_len,
+        s->engine, live_tokens, req->prompt_text + raw_visible_len,
         effective_prompt);
     return live_tokens->len;
 }
@@ -11546,6 +11615,38 @@ static char *build_tool_checkpoint_suffix(const request *r, const char *content,
     return buf_take(&suffix);
 }
 
+/* Build the assistant turn as a Chat Completions client will render it on the
+ * following request.  Pi returns reasoning_content to the caller, but the
+ * DeepSeek renderer deliberately omits that reasoning for ordinary final
+ * answers without tool context.  Tool schemas, an earlier tool turn, or an
+ * emitted tool call make the renderer preserve it instead. */
+static bool chat_replay_preserves_reasoning(const request *r,
+                                            const tool_calls *calls) {
+    return r && (r->has_tools || r->prompt_preserves_reasoning ||
+                 (calls && calls->len > 0));
+}
+
+static char *build_chat_replay_assistant_suffix(const request *r,
+                                                const char *content,
+                                                const char *reasoning,
+                                                const tool_calls *calls) {
+    const server_model_syntax syntax =
+        r ? r->model_syntax : SERVER_MODEL_SYNTAX_DEEPSEEK;
+    const bool preserve_reasoning = chat_replay_preserves_reasoning(r, calls);
+    buf suffix = {0};
+    if (r && ds4_think_mode_enabled(r->think_mode)) {
+        if (preserve_reasoning) buf_puts(&suffix, reasoning ? reasoning : "");
+        buf_puts(&suffix, "</think>");
+    }
+    buf_puts(&suffix, content ? content : "");
+    append_tool_calls_text_for_syntax(&suffix, syntax, calls,
+                                      r ? &r->tool_orders : NULL);
+    if (syntax != SERVER_MODEL_SYNTAX_GLM) {
+        buf_puts(&suffix, "<｜end▁of▁sentence｜>");
+    }
+    return buf_take(&suffix);
+}
+
 static char *build_responses_visible_assistant_suffix(const request *r,
                                                       const char *content,
                                                       const char *reasoning,
@@ -11574,6 +11675,92 @@ static char *build_responses_visible_assistant_suffix(const request *r,
         buf_puts(&suffix, "<｜end▁of▁sentence｜>");
     }
     return buf_take(&suffix);
+}
+
+/* A Chat Completions client such as pi replays a parsed assistant message, not
+ * the exact sampled DSML and hidden-thinking bytes held in KV.  For a verified
+ * live image state, the rendered Chat transcript is nevertheless an unambiguous
+ * continuation contract: retain it as a byte key and append only the new user
+ * suffix to the authoritative sampled frontier on the next request.
+ *
+ * This deliberately remains memory-only.  Disk checkpoints do not carry
+ * image identity, whereas generate_job_inner additionally verifies every
+ * image fingerprint and span before it calls the visible-prefix fast path. */
+static void remember_multimodal_chat_checkpoint(
+        server *s, server_slot *slot, const job *j, const char *ctx,
+        uint64_t trace_id, const char *content, const char *reasoning,
+        const tool_calls *calls, const char *finish,
+        const thinking_state *thinking) {
+    if (!s || !slot || !j || j->req.kind != REQ_CHAT ||
+        j->req.api == API_RESPONSES || j->req.image_count == 0 ||
+        !finish || !strcmp(finish, "error") || !strcmp(finish, "length")) {
+        thinking_live_clear(s, slot);
+        return;
+    }
+    /* A custom stop sequence can fire while still inside reasoning, before
+     * </think>.  The live KV then remains in an unclosed think block, so
+     * recording a closed visible assistant turn would let the next same-image
+     * request append the user message inside the unfinished reasoning.  Drop
+     * the checkpoint instead. */
+    if (thinking && thinking->inside) {
+        thinking_live_clear(s, slot);
+        return;
+    }
+    const char *base = request_visible_prompt_text(&j->req);
+    if (!base || !j->req.prompt_text) {
+        thinking_live_clear(s, slot);
+        return;
+    }
+    /* Match Pi's next rendered prompt, rather than the richer raw sampled KV
+     * frontier.  In the no-tool case this specifically excludes hidden
+     * reasoning_content, which Pi reports but the DeepSeek renderer omits. */
+    char *suffix = build_chat_replay_assistant_suffix(
+        &j->req, content, reasoning, calls);
+    if (!suffix) {
+        thinking_live_clear(s, slot);
+        return;
+    }
+    size_t base_len = strlen(base);
+    size_t raw_base_len = strlen(j->req.prompt_text);
+    /* A pending DeepSeek turn ends in <think>.  When Pi replays a normal
+     * no-tool assistant answer, render_deepseek_chat_prompt_text() replaces
+     * that pending tag with </think>; it does not render <think></think>.
+     * Drop the stale opening tag before appending the replay suffix so the
+     * byte key equals the next rendered transcript.  GLM intentionally keeps
+     * its opening <think> and appends the close tag, so it is excluded. */
+    const char *open_think = "<think>";
+    const size_t open_think_len = strlen(open_think);
+    if (j->req.model_syntax == SERVER_MODEL_SYNTAX_DEEPSEEK &&
+        ds4_think_mode_enabled(j->req.think_mode) &&
+        !chat_replay_preserves_reasoning(&j->req, calls)) {
+        if (base_len < open_think_len ||
+            memcmp(base + base_len - open_think_len,
+                   open_think, open_think_len) != 0) {
+            thinking_live_clear(s, slot);
+            free(suffix);
+            return;
+        }
+        /* Keep the raw checkpoint boundary aligned with the visible key: the
+         * visible text dropped this pending tag, so the replay offset must too,
+         * or the next same-image request starts tokenizing seven bytes into
+         * the new user suffix (potentially mid-UTF-8) and corrupts the
+         * continuation. */
+        base_len -= open_think_len;
+        raw_base_len -= open_think_len;
+    }
+    buf visible = {0};
+    buf_append(&visible, base, base_len);
+    buf_puts(&visible, suffix);
+    const size_t raw_len = raw_base_len + strlen(suffix);
+    thinking_live_remember(s, slot, visible.ptr ? visible.ptr : "", raw_len);
+    server_log(DS4_LOG_KVCACHE,
+               "ds4-server: multimodal chat live checkpoint remembered ctx=%s live=%d visible=%zu raw=%zu",
+               ctx, ds4_session_pos(slot->session), visible.len, raw_len);
+    trace_event(s, trace_id,
+                "multimodal chat live checkpoint remembered: live=%d visible=%zu raw=%zu",
+                ds4_session_pos(slot->session), visible.len, raw_len);
+    buf_free(&visible);
+    free(suffix);
 }
 
 /* In thinking mode without tools, old assistant reasoning is intentionally not
@@ -11616,7 +11803,7 @@ static void remember_thinking_checkpoint(server *s, server_slot *slot,
     char *visible = build_toolless_thinking_visible_text(&j->req, content);
     if (!visible) return;
 
-    thinking_live_remember(s, slot, visible);
+    thinking_live_remember(s, slot, visible, strlen(visible));
     server_log(DS4_LOG_KVCACHE,
                "ds4-server: thinking live checkpoint remembered ctx=%s live=%d visible=%zu",
                ctx, ds4_session_pos(slot->session), strlen(visible));
@@ -13153,7 +13340,12 @@ decode_again:
         canonicalize_tool_checkpoint(s, slot, j, ctx_span, trace_id,
                                      parsed_content ? parsed_content : "",
                                      parsed_reasoning, &parsed_calls);
-        thinking_live_clear(s, slot);
+    }
+    if (j->req.image_count != 0) {
+        remember_multimodal_chat_checkpoint(
+            s, slot, j, ctx_span, trace_id,
+            parsed_content ? parsed_content : "", parsed_reasoning,
+            &parsed_calls, final_finish, &thinking);
     } else if (parsed_calls.len) {
         thinking_live_clear(s, slot);
     } else if (!parsed_calls.len &&
@@ -16446,6 +16638,80 @@ static void test_parse_short_dsml_and_canonical_suffix(void) {
     request_free(&r);
 }
 
+static void test_chat_replay_suffix_matches_reasoning_visibility(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.think_mode = DS4_THINK_HIGH;
+
+    char *suffix = build_chat_replay_assistant_suffix(
+        &r, "visible answer", "hidden reasoning", NULL);
+    TEST_ASSERT(!strcmp(suffix,
+                        "</think>visible answer<｜end▁of▁sentence｜>"));
+    free(suffix);
+
+    /* The pending DeepSeek turn already contains <think>.  A future Pi replay
+     * replaces that tag with </think>, so appending the suffix directly would
+     * produce the wrong <think></think> byte sequence. */
+    chat_msgs first = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("first request");
+    chat_msgs_push(&first, user);
+    char *pending = render_chat_prompt_text(&first, NULL, NULL, DS4_THINK_HIGH);
+    const size_t pending_len = strlen(pending);
+    TEST_ASSERT(pending_len >= 7 &&
+                !memcmp(pending + pending_len - 7, "<think>", 7));
+    r.prompt_text = xstrdup(pending);
+    suffix = build_chat_replay_assistant_suffix(
+        &r, "visible answer", "hidden reasoning", NULL);
+    buf checkpoint = {0};
+    buf_append(&checkpoint, pending, pending_len - 7);
+    buf_puts(&checkpoint, suffix);
+    free(suffix);
+
+    chat_msgs replay = {0};
+    chat_msg replay_user = {0};
+    replay_user.role = xstrdup("user");
+    replay_user.content = xstrdup("first request");
+    chat_msgs_push(&replay, replay_user);
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    assistant.reasoning = xstrdup("hidden reasoning");
+    assistant.content = xstrdup("visible answer");
+    chat_msgs_push(&replay, assistant);
+    chat_msg next_user = {0};
+    next_user.role = xstrdup("user");
+    next_user.content = xstrdup("strict append-only request");
+    chat_msgs_push(&replay, next_user);
+    char *future = render_chat_prompt_text(&replay, NULL, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(!strncmp(checkpoint.ptr, future, checkpoint.len));
+    free(future);
+    buf_free(&checkpoint);
+    free(pending);
+    chat_msgs_free(&first);
+    chat_msgs_free(&replay);
+    free(r.prompt_text);
+    r.prompt_text = NULL;
+
+    r.has_tools = true;
+    suffix = build_chat_replay_assistant_suffix(
+        &r, "visible answer", "hidden reasoning", NULL);
+    TEST_ASSERT(!strcmp(suffix,
+                        "hidden reasoning</think>visible answer"
+                        "<｜end▁of▁sentence｜>"));
+    free(suffix);
+
+    r.has_tools = false;
+    r.prompt_preserves_reasoning = true;
+    suffix = build_chat_replay_assistant_suffix(
+        &r, "visible answer", "hidden reasoning", NULL);
+    TEST_ASSERT(!strcmp(suffix,
+                        "hidden reasoning</think>visible answer"
+                        "<｜end▁of▁sentence｜>"));
+    free(suffix);
+    request_free(&r);
+}
+
 static void test_parse_glm_tool_call_message(void) {
     const char *generated =
         "<think>need bash</think>OK\n\n"
@@ -19669,6 +19935,39 @@ static void test_thinking_canonical_non_thinking_mode_noop(void) {
 static const char test_inline_png_base64[] =
     "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAFUlEQVR4nGP8z8DQwMDAwMAEIkAYABglAYOd/VRoAAAAAElFTkSuQmCC";
 
+static void test_visible_prompt_text_normalizes_image_markers(void) {
+    request a, b;
+    request_init(&a, REQ_CHAT, 32);
+    request_init(&b, REQ_CHAT, 32);
+    server_image_input image_a = {0};
+    server_image_input image_b = {0};
+    snprintf(image_a.marker, sizeof(image_a.marker), "\036DS4_IMAGE_a\037");
+    snprintf(image_b.marker, sizeof(image_b.marker), "\036DS4_IMAGE_b\037");
+    a.prompt_text = xstrdup("before \036DS4_IMAGE_a\037 after");
+    b.prompt_text = xstrdup("before \036DS4_IMAGE_b\037 after");
+    a.images = xmalloc(sizeof(a.images[0]));
+    b.images = xmalloc(sizeof(b.images[0]));
+    memset(a.images, 0, sizeof(a.images[0]));
+    memset(b.images, 0, sizeof(b.images[0]));
+    a.image_count = b.image_count = 1;
+    a.images[0].token_start = b.images[0].token_start = 12;
+    a.images[0].embedding.token_count = b.images[0].embedding.token_count = 64;
+    for (size_t i = 0; i < sizeof(a.images[0].embedding.fingerprint); i++) {
+        a.images[0].embedding.fingerprint[i] = (uint8_t)i;
+        b.images[0].embedding.fingerprint[i] = (uint8_t)i;
+    }
+    server_image_input *inputs_a[] = {&image_a};
+    server_image_input *inputs_b[] = {&image_b};
+    TEST_ASSERT(request_build_visible_prompt_text(&a, inputs_a, 1));
+    TEST_ASSERT(request_build_visible_prompt_text(&b, inputs_b, 1));
+    TEST_ASSERT(a.visible_prompt_text != NULL && b.visible_prompt_text != NULL);
+    TEST_ASSERT(!strcmp(a.visible_prompt_text, b.visible_prompt_text));
+    TEST_ASSERT(strstr(a.visible_prompt_text, "DS4_VISION_") != NULL);
+    TEST_ASSERT(strstr(a.visible_prompt_text, "DS4_IMAGE_a") == NULL);
+    request_free(&a);
+    request_free(&b);
+}
+
 static void test_openai_inline_image_content(void) {
     buf json = {0};
     buf_puts(&json,
@@ -19794,6 +20093,7 @@ static void ds4_server_unit_tests_run(void) {
     test_openai_tool_stream_handles_multiple_calls();
     test_streaming_holds_partial_utf8();
     test_parse_short_dsml_and_canonical_suffix();
+    test_chat_replay_suffix_matches_reasoning_visibility();
     test_parse_glm_tool_call_message();
     test_dsml_parser_recovers_loose_nested_parameters();
     test_dsml_repair_produces_parseable_calls();
@@ -19832,6 +20132,7 @@ static void ds4_server_unit_tests_run(void) {
     test_thinking_canonical_multi_turn();
     test_thinking_canonical_with_tools_preserves_reasoning();
     test_thinking_canonical_non_thinking_mode_noop();
+    test_visible_prompt_text_normalizes_image_markers();
     test_openai_inline_image_content();
     test_http_image_paths_and_urls_are_rejected();
     test_anthropic_inline_image_content();
