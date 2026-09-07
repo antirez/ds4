@@ -695,8 +695,12 @@ tests/test_prompt_prefix.o: tests/test_prompt_prefix.c ds4_prompt_prefix.h
 tests/test_prompt_prefix: tests/test_prompt_prefix.o ds4_prompt_prefix.o
 	$(CC) $(CFLAGS) -o $@ $^
 
+.PHONY: test-server-cancel-rebuild
+test-server-cancel-rebuild:
+	python3 tests/test_server_cancel_rebuild.py
+
 .PHONY: test-frontends
-test-frontends: ds4_test ds4_agent_test
+test-frontends: ds4_test ds4_agent_test test-server-cancel-rebuild
 	./ds4_test --server
 	./ds4_agent_test
 
