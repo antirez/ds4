@@ -25,6 +25,11 @@ The C test runner is `ds4_test`. Running it without arguments is equivalent to
 make test
 ```
 
+`make test` also runs the model-free unit tests first: `./ds4-eval
+--self-test-extractors` (answer-extractor golden cases) and `./ds4_agent_test`
+(edit anchor matcher golden cases). Both run without loading a model, so they
+work with no GGUF present.
+
 Useful narrower checks:
 
 ```sh
