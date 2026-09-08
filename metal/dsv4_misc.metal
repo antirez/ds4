@@ -5834,7 +5834,8 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads8(
 
 // Each simdgroup owns two heads and updates both from one staged K/V row.
 // This doubles row reuse without increasing the 256-thread workgroup.
-kernel void kernel_dsv4_indexed_mixed_attention_heads16_dual(
+template <uint row_block>
+kernel void kernel_dsv4_indexed_mixed_attention_heads16_dual_impl(
         constant ds4_metal_args_dsv4_indexed_attention &args,
         device const char *q,
         device const char *raw_kv,
@@ -5885,18 +5886,27 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads16_dual(
     const uint first = max(first_raw_pos, window_first);
     const uint last = min(qpos, raw_last_pos);
     if (first <= last) {
-        for (uint pos = first; pos <= last; pos++) {
-            const uint logical = pos - first_raw_pos;
-            const uint row = (args.raw_start + logical)%args.raw_cap;
-            device const float4 *src = (device const float4 *)(raw_kv +
-                (uint64_t)row*args.raw_row_stride);
-            if (tid < 128) kv_shared[tid] = (half4)src[tid];
+        for (uint base = first; base <= last; base += row_block) {
+            const uint rows = min(row_block, last - base + 1u);
+            for (uint off = tid; off < rows * 128u; off += 256u) {
+                const uint rr = off / 128u;
+                const uint col = off - rr * 128u;
+                const uint logical = base + rr - first_raw_pos;
+                const uint row = (args.raw_start + logical) % args.raw_cap;
+                device const float4 *src = (device const float4 *)(raw_kv +
+                    (uint64_t)row * args.raw_row_stride);
+                kv_shared[off] = (half4)src[col];
+            }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            dsv4_attend_shared_h4_row(kv_shared, qa0, qa1, qa2, qa3,
-                args.scale, lane, Ma, Sa, ao0, ao1, ao2, ao3);
-            if (head1 < args.n_head) {
-                dsv4_attend_shared_h4_row(kv_shared, qb0, qb1, qb2, qb3,
-                    args.scale, lane, Mb, Sb, bo0, bo1, bo2, bo3);
+            for (uint rr = 0u; rr < rows; rr++) {
+                dsv4_attend_shared_h4_row_at(kv_shared, rr,
+                    qa0, qa1, qa2, qa3,
+                    args.scale, lane, Ma, Sa, ao0, ao1, ao2, ao3);
+                if (head1 < args.n_head) {
+                    dsv4_attend_shared_h4_row_at(kv_shared, rr,
+                        qb0, qb1, qb2, qb3,
+                        args.scale, lane, Mb, Sb, bo0, bo1, bo2, bo3);
+                }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
@@ -5905,20 +5915,29 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads16_dual(
     const uint visible = min((qpos + 1u)/args.ratio, args.n_comp);
     device const int32_t *row_topk = (device const int32_t *)(topk +
         (uint64_t)token*args.topk_token_stride);
-    for (uint i = 0; i < args.top_k; i++) {
-        const int32_t idx = row_topk[i];
-        if (idx < 0) continue;
-        if ((uint)idx >= visible) break;
-        if (tid < 128) {
-            kv_shared[tid] = dsv4_load_cache_h4(comp_kv,
-                args.comp_row_stride, (uint)idx, tid, args.comp_kv_f16 != 0u);
+    for (uint base = 0u; base < args.top_k; base += row_block) {
+        const uint rows = min(row_block, args.top_k - base);
+        for (uint off = tid; off < rows * 128u; off += 256u) {
+            const uint rr = off / 128u;
+            const uint col = off - rr * 128u;
+            const int32_t idx = row_topk[base + rr];
+            kv_shared[off] = (idx >= 0 && (uint)idx < visible) ?
+                dsv4_load_cache_h4(comp_kv, args.comp_row_stride,
+                    (uint)idx, col, args.comp_kv_f16 != 0u) :
+                half4(0.0h);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        dsv4_attend_shared_h4_row(kv_shared, qa0, qa1, qa2, qa3,
-            args.scale, lane, Ma, Sa, ao0, ao1, ao2, ao3);
-        if (head1 < args.n_head) {
-            dsv4_attend_shared_h4_row(kv_shared, qb0, qb1, qb2, qb3,
-                args.scale, lane, Mb, Sb, bo0, bo1, bo2, bo3);
+        for (uint rr = 0u; rr < rows; rr++) {
+            const int32_t idx = row_topk[base + rr];
+            if (idx < 0 || (uint)idx >= visible) continue;
+            dsv4_attend_shared_h4_row_at(kv_shared, rr,
+                qa0, qa1, qa2, qa3,
+                args.scale, lane, Ma, Sa, ao0, ao1, ao2, ao3);
+            if (head1 < args.n_head) {
+                dsv4_attend_shared_h4_row_at(kv_shared, rr,
+                    qb0, qb1, qb2, qb3,
+                    args.scale, lane, Mb, Sb, bo0, bo1, bo2, bo3);
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -5942,6 +5961,20 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads16_dual(
         db[lane + 64] = bo2*ib; db[lane + 96] = bo3*ib;
     }
 }
+
+typedef decltype(kernel_dsv4_indexed_mixed_attention_heads16_dual_impl<1u>)
+        dsv4_indexed_mixed_attention_heads16_dual_t;
+
+template [[host_name("kernel_dsv4_indexed_mixed_attention_heads16_dual")]]
+kernel dsv4_indexed_mixed_attention_heads16_dual_t
+kernel_dsv4_indexed_mixed_attention_heads16_dual_impl<1u>;
+
+// The 16-row specialization keeps attention arithmetic in chronological row
+// order but amortizes each pair of threadgroup barriers across a full cache
+// block. It mirrors the proven decode row-blocking scheme for dual-head prefill.
+template [[host_name("kernel_dsv4_indexed_mixed_attention_heads16_dual_rb16")]]
+kernel dsv4_indexed_mixed_attention_heads16_dual_t
+kernel_dsv4_indexed_mixed_attention_heads16_dual_impl<16u>;
 
 // Decode specialization of kernel_dsv4_indexed_mixed_attention_heads8.
 // Generation attends one token at a time, so the ratio-4 indexed path spends a
