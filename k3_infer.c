@@ -231,6 +231,7 @@ struct k3_context {
     int gguf_resident;
     int gguf_static_resident;
     uint8_t gguf_static_layers[K3_N_LAYER];
+    int gguf_prefill_hotness;
     int gguf_readahead_done;
     int speculative_enabled;
     k3_hidden_hook_fn hidden_hook;
@@ -1378,13 +1379,12 @@ static int map_gguf_layer_spans(const k3_context *ctx,
         errcap);
 }
 
-static int prefetch_gguf_selected_experts(
+static int begin_gguf_selected_experts(
         k3_context *ctx,
         const k3_layer *layer,
-        uint32_t rows,
         char *err,
         size_t errcap) {
-    if (!ctx || !layer || !layer->shard || rows == 0) return 0;
+    if (!ctx || !layer || !layer->shard) return 0;
     const int32_t *ids =
         ds4_gpu_tensor_contents(ctx->scratch.selected_ids);
     if (!ids) {
@@ -1393,16 +1393,13 @@ static int prefetch_gguf_selected_experts(
                   layer->index);
         return 0;
     }
-    bool selected[K3_N_EXPERT] = {false};
-    const uint64_t count = (uint64_t)rows * K3_N_EXPERT_USED;
-    for (uint64_t i = 0; i < count; i++) {
+    for (uint32_t i = 0; i < K3_N_EXPERT_USED; i++) {
         if (ids[i] < 0 || ids[i] >= K3_N_EXPERT) {
             set_error(err, errcap,
                       "K3 layer %u selected invalid expert %d",
                       layer->index, ids[i]);
             return 0;
         }
-        selected[(uint32_t)ids[i]] = true;
     }
 
     const k3_st_tensor *stacks[] = {
@@ -1410,69 +1407,31 @@ static int prefetch_gguf_selected_experts(
         layer->expert_up,
         layer->expert_down,
     };
-    if (rows == 1u) {
-        for (uint32_t i = 0; i < 3; i++) {
-            if (!stacks[i] ||
-                stacks[i]->size % K3_N_EXPERT != 0) {
-                set_error(err, errcap,
-                          "K3 layer %u GGUF expert stack is invalid",
-                          layer->index);
-                return 0;
-            }
-        }
-        const ds4_gpu_stream_expert_table table = {
-            .model_map = k3_st_map_base(ctx->globals.shard),
-            .model_size = k3_st_file_size(ctx->globals.shard),
-            .layer = layer->index,
-            .n_total_expert = K3_N_EXPERT,
-            .gate_offset = stacks[0]->offset,
-            .up_offset = stacks[1]->offset,
-            .down_offset = stacks[2]->offset,
-            .gate_expert_bytes =
-                stacks[0]->size / K3_N_EXPERT,
-            .down_expert_bytes =
-                stacks[2]->size / K3_N_EXPERT,
-        };
-        if (!table.model_map ||
-            !ds4_gpu_stream_expert_cache_begin_selected_load(
-                &table, ids, K3_N_EXPERT_USED)) {
-            set_error(err, errcap,
-                      "K3 layer %u selected expert staging failed",
-                      layer->index);
-            return 0;
-        }
-        return 1;
-    }
-    for (uint32_t stack = 0;
-         stack < sizeof(stacks) / sizeof(stacks[0]);
-         stack++) {
-        const k3_st_tensor *tensor = stacks[stack];
-        if (!tensor || tensor->size % K3_N_EXPERT != 0) {
+    for (uint32_t i = 0; i < 3; i++) {
+        if (!stacks[i] || stacks[i]->size % K3_N_EXPERT != 0) {
             set_error(err, errcap,
                       "K3 layer %u GGUF expert stack is invalid",
                       layer->index);
             return 0;
         }
-        const uint64_t expert_bytes = tensor->size / K3_N_EXPERT;
-        for (uint32_t begin = 0; begin < K3_N_EXPERT;) {
-            while (begin < K3_N_EXPERT && !selected[begin]) begin++;
-            if (begin == K3_N_EXPERT) break;
-            uint32_t end = begin + 1u;
-            while (end < K3_N_EXPERT && selected[end]) end++;
-            const uint64_t run_count = end - begin;
-            if (expert_bytes > UINT64_MAX / run_count ||
-                expert_bytes * begin > UINT64_MAX - tensor->offset ||
-                !k3_st_prefetch(
-                    layer->shard,
-                    tensor->offset + expert_bytes * begin,
-                    expert_bytes * run_count,
-                    false,
-                    err,
-                    errcap)) {
-                return 0;
-            }
-            begin = end;
-        }
+    }
+    const ds4_gpu_stream_expert_table table = {
+        .model_map = k3_st_map_base(ctx->globals.shard),
+        .model_size = k3_st_file_size(ctx->globals.shard),
+        .layer = layer->index,
+        .n_total_expert = K3_N_EXPERT,
+        .gate_offset = stacks[0]->offset,
+        .up_offset = stacks[1]->offset,
+        .down_offset = stacks[2]->offset,
+        .gate_expert_bytes = stacks[0]->size / K3_N_EXPERT,
+        .down_expert_bytes = stacks[2]->size / K3_N_EXPERT,
+    };
+    if (!table.model_map ||
+        !ds4_gpu_stream_expert_cache_begin_selected_load(
+            &table, ids, K3_N_EXPERT_USED)) {
+        set_error(err, errcap,
+                  "K3 layer %u selected expert staging failed", layer->index);
+        return 0;
     }
     return 1;
 }
@@ -4122,9 +4081,10 @@ static int run_moe_ffn(k3_context *ctx,
         return 0;
     }
     if (ctx->model->gguf) {
-        if (!ctx->gguf_resident &&
-            !prefetch_gguf_selected_experts(
-                ctx, layer, rows, err, errcap)) {
+        /* Batched prefill already reads unique experts in parallel below.
+         * Serial read advice here duplicates I/O and delays those reads. */
+        if (!ctx->gguf_resident && rows == 1u &&
+            !begin_gguf_selected_experts(ctx, layer, err, errcap)) {
             return 0;
         }
         const k3_st_tensor *gate_weights = layer->expert_gate;
@@ -4826,6 +4786,13 @@ static int evaluate(k3_context *ctx,
     k3_context *owner = execution_owner(ctx);
     const int resident_readahead =
         ctx->gguf_resident && !owner->gguf_readahead_done;
+    if (ctx->model->gguf && !ctx->gguf_resident) {
+        /* Prompt counts can dwarf decode counts and preserve stale experts.
+         * Keep cached weights, but start measuring reuse for generation. */
+        if (!prefill && owner->gguf_prefill_hotness)
+            ds4_gpu_stream_expert_cache_reset_route_hotness();
+        owner->gguf_prefill_hotness = prefill;
+    }
     const int stage_static =
         !ctx->model->gguf && ctx->static_staging && rows == 1u;
     const uint32_t first_layer = ctx->layer_start;
@@ -5394,6 +5361,23 @@ int k3_context_create(k3_context **out,
          */
         if (routed_layers != 0 && cache_slots < K3_N_EXPERT) {
             cache_slots = K3_N_EXPERT;
+        }
+        /* Static weights are reused at every step. Give the cache the space
+         * left after those weights, including with larger prefill scratch.
+         * Account for the page-aligned slab slots, not just tensor bytes. */
+        uint64_t offsets[K3_N_LAYER + 5], sizes[K3_N_LAYER + 5], static_bytes;
+        uint32_t spans;
+        const long page_value = sysconf(_SC_PAGESIZE);
+        if (routed_layers != 0 && page_value > 0 &&
+            getenv("K3_DISABLE_GGUF_STATIC_RESIDENCY") == NULL &&
+            gguf_resident_spans(ctx, 0, offsets, sizes, &spans, &static_bytes) &&
+            resident_budget > static_bytes) {
+            const uint64_t page = (uint64_t)page_value;
+            const uint64_t slot_bytes = (expert_bytes + page - 1u) & ~(page - 1u);
+            uint64_t slots = (resident_budget - static_bytes) / slot_bytes;
+            const uint64_t maximum = (uint64_t)routed_layers * K3_N_EXPERT;
+            if (slots > maximum) slots = maximum;
+            if (slots >= K3_N_EXPERT) cache_slots = (uint32_t)slots;
         }
         ds4_gpu_set_streaming_expert_cache_expert_bytes(expert_bytes);
         ds4_gpu_set_streaming_expert_cache_budget(cache_slots);

@@ -15,6 +15,11 @@ The GGUF is 799.783 GiB. It streams from SSD automatically when its local
 weights cannot fit safely in memory. The router still selects all 16 experts;
 streaming changes where the weights live, not the computation.
 
+On a 128 GiB Mac, the runtime keeps the non-routed weights resident when they
+fit, then uses the remaining safe budget for an expert cache. With less free
+memory it keeps only some layers' non-routed weights resident. This is automatic;
+no cache or residency flags are needed.
+
 Routed gate/up weights use IQ2_XXS and routed down weights use Q2_K.
 Shared experts remain MXFP4, latent up projections use Q8_0, and attention,
 embeddings, the output head, routers, and norms retain higher precision.
