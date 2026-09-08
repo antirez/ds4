@@ -229,6 +229,7 @@ struct k3_context {
     int pinned_static;
     int q8_static;
     int gguf_resident;
+    int gguf_static_resident;
     int gguf_readahead_done;
     int speculative_enabled;
     k3_hidden_hook_fn hidden_hook;
@@ -1656,6 +1657,7 @@ static uint64_t resident_all_layers_capacity(const k3_context *ctx) {
 
 static int gguf_resident_spans(
         const k3_context *ctx,
+        int              include_experts,
         uint64_t         *offsets,
         uint64_t         *sizes,
         uint32_t         *count,
@@ -1690,9 +1692,11 @@ static int gguf_resident_spans(
 } while (0)
     for (uint32_t i = ctx->layer_start; i <= ctx->layer_end; i++) {
         ADD_GGUF_SPAN(ctx->layers[i]->static_offset,
-                      ctx->layers[i]->layer_size);
+                      include_experts ? ctx->layers[i]->layer_size
+                                      : ctx->layers[i]->static_size);
     }
-    if (ctx->layer_start == 0u) {
+    /* Streaming reads only the input token rows, not the 2 GiB table. */
+    if (include_experts && ctx->layer_start == 0u) {
         ADD_GGUF_SPAN(ctx->globals.token_embedding->offset,
                       ctx->globals.token_embedding->size);
     }
@@ -1747,7 +1751,7 @@ static int try_pin_resident_gguf(k3_context *ctx,
     uint32_t count = 0;
     uint64_t total = 0;
     if (!gguf_resident_spans(
-            ctx, offsets, sizes, &count, &total)) {
+            ctx, 1, offsets, sizes, &count, &total)) {
         set_error(err, errcap, "invalid K3 GGUF residency spans");
         return 0;
     }
@@ -1785,6 +1789,30 @@ static int try_pin_resident_gguf(k3_context *ctx,
             ctx->has_output ? ":output" : "",
             (double)total / 1073741824.0);
     return 1;
+}
+
+/* Keep the weights touched by every token out of the SSD working set. Charge
+ * the entire lazy expert cache before pinning, not just its current contents. */
+static void try_pin_gguf_static(k3_context *ctx, uint64_t budget,
+                                uint64_t expert_cache_bytes) {
+    if (!ctx->model->gguf || ctx->gguf_resident ||
+        getenv("K3_DISABLE_GGUF_STATIC_RESIDENCY") != NULL ||
+        budget <= expert_cache_bytes) return;
+    uint64_t offsets[K3_N_LAYER + 5] = {0};
+    uint64_t sizes[K3_N_LAYER + 5] = {0};
+    uint32_t count = 0;
+    uint64_t total = 0;
+    if (!gguf_resident_spans(ctx, 0, offsets, sizes, &count, &total) ||
+        total > budget - expert_cache_bytes) return;
+    const void *base = k3_st_map_base(ctx->globals.shard);
+    if (!base || !k3_gpu_pin_model_spans(base,
+            k3_st_file_size(ctx->globals.shard), offsets, sizes, count)) return;
+    ctx->gguf_static_resident = 1;
+    ctx->resident_static_bytes = total;
+    fprintf(stderr, "k3: pinned %.3f GiB of static GGUF weights; "
+                    "%.3f GiB reserved for streamed experts\n",
+            (double)total / 1073741824.0,
+            (double)expert_cache_bytes / 1073741824.0);
 }
 
 static int load_resident_lm_head(k3_context *ctx,
@@ -3276,7 +3304,7 @@ static int map_global_tensors(k3_context *ctx,
         set_error(err, errcap, "invalid K3 global tensor mapping request");
         return 0;
     }
-    if (ctx->gguf_resident) return 1;
+    if (ctx->gguf_resident || ctx->gguf_static_resident) return 1;
     const k3_global_weights *g = &ctx->globals;
     if (embedding) {
         return map_range(
@@ -4137,6 +4165,7 @@ static int run_moe_ffn(k3_context *ctx,
             return 0;
         }
         if (output_prefetch && !ctx->resident_lm_head.data &&
+            !ctx->gguf_static_resident &&
             !ctx->gguf_resident &&
             !output_prefetch_start(
                 output_prefetch,
@@ -4809,6 +4838,8 @@ static int evaluate(k3_context *ctx,
                true,
                err,
                errcap))
+        : ctx->gguf_static_resident
+        ? 1
         : ctx->model->gguf
         ? k3_layer_prefetch_start(
               &current_load,
@@ -4872,7 +4903,8 @@ static int evaluate(k3_context *ctx,
         const int layer_resident =
             ctx->q8_static || ctx->resident_static_slots[i].data != NULL;
         if (ctx->model->gguf &&
-            (!ctx->gguf_resident || resident_readahead)) {
+            ((!ctx->gguf_resident && !ctx->gguf_static_resident) ||
+             resident_readahead)) {
             k3_layer *loaded = NULL;
             if (!k3_layer_load_join(
                     current_load, &loaded, err, errcap) ||
@@ -4912,7 +4944,8 @@ static int evaluate(k3_context *ctx,
                 ctx->q8_static ||
                 ctx->resident_static_slots[i + 1u].data != NULL;
             const int need_next_load = ctx->model->gguf
-                ? (!ctx->gguf_resident || resident_readahead)
+                ? ((!ctx->gguf_resident && !ctx->gguf_static_resident) ||
+                   resident_readahead)
                 : !next_resident;
             if (need_next_load) {
                 const int next_started = ctx->gguf_resident
@@ -5008,7 +5041,8 @@ static int evaluate(k3_context *ctx,
             ? 1
             : ctx->model->gguf
             ? map_gguf_layer_spans(
-                  ctx, layer, !use_static_slot, err, errcap)
+                  ctx, layer, !use_static_slot && !ctx->gguf_static_resident,
+                  err, errcap)
             : ctx->pinned_static && layer_resident && !ctx->q8_static
             ? 1
             : use_static_slot
@@ -5176,6 +5210,8 @@ static int evaluate(k3_context *ctx,
                 "layers_execute=%.6f s output=%.6f s total=%.6f s\n",
                 ctx->gguf_resident
                     ? "gguf-resident"
+                    : ctx->gguf_static_resident
+                    ? "gguf-static-resident"
                     : ctx->q8_static
                     ? "q8-resident"
                     : ctx->resident_static
@@ -5292,6 +5328,7 @@ int k3_context_create(k3_context **out,
         k3_context_destroy(ctx);
         return 0;
     }
+    uint64_t gguf_expert_cache_bytes = 0;
     if (ctx->model->gguf && !ctx->gguf_resident) {
         const k3_st_tensor *gate = ctx->layers[1]->expert_gate;
         const k3_st_tensor *down = ctx->layers[1]->expert_down;
@@ -5335,6 +5372,7 @@ int k3_context_create(k3_context **out,
         }
         ds4_gpu_set_streaming_expert_cache_expert_bytes(expert_bytes);
         ds4_gpu_set_streaming_expert_cache_budget(cache_slots);
+        gguf_expert_cache_bytes = (uint64_t)cache_slots * expert_bytes;
         fprintf(stderr,
                 "k3: GGUF expert staging/cache enabled: %u slots "
                 "(at least one full routed layer), up to %.2f GiB\n",
@@ -5344,6 +5382,7 @@ int k3_context_create(k3_context **out,
     } else {
         ds4_gpu_set_streaming_expert_cache_budget(0);
     }
+    try_pin_gguf_static(ctx, resident_budget, gguf_expert_cache_bytes);
     const uint64_t head_capacity =
         ctx->has_output ? resident_lm_head_capacity(ctx) : 0;
     const uint64_t all_layers_capacity =
@@ -5399,7 +5438,7 @@ int k3_context_create(k3_context **out,
         layer_resident_budget >= speculative_capacity) {
         layer_resident_budget -= speculative_capacity;
     }
-    if (!want_q8_static && !ctx->gguf_resident &&
+    if (!want_q8_static && !ctx->gguf_resident && !ctx->gguf_static_resident &&
         head_capacity != 0 &&
         layer_resident_budget >= head_capacity) {
         if (!load_resident_lm_head(ctx, err, errcap)) {
@@ -5499,6 +5538,7 @@ int k3_context_clone(k3_context **out,
     ctx->pinned_static = owner->pinned_static;
     ctx->q8_static = owner->q8_static;
     ctx->gguf_resident = owner->gguf_resident;
+    ctx->gguf_static_resident = owner->gguf_static_resident;
     ctx->speculative_enabled = owner->speculative_enabled;
     ctx->resident_static_bytes = owner->resident_static_bytes;
     memcpy(ctx->static_slots, owner->static_slots, sizeof(ctx->static_slots));

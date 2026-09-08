@@ -182,6 +182,9 @@ tests/test_k3_gguf_slice.o: tests/test_k3_gguf_slice.c k3_infer.h k3_model.h
 tests/test_k3_gguf_slice: tests/test_k3_gguf_slice.o k3_infer.o k3_model.o k3_safetensors.o ds4_metal.o ds4_image.o
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
+tests/test_k3_stream: tests/test_k3_stream.c $(CORE_OBJS)
+	$(CC) $(CFLAGS) -fno-finite-math-only -o $@ $^ $(METAL_LDLIBS)
+
 test-k3-gguf: ds4 tests/test_k3_gguf tests/test_k3_tokenizer tests/test_k3_gguf_metal_map tests/test_k3_gguf_slice
 	./tests/test_k3_gguf "$(K3_GGUF)"
 	./tests/test_k3_tokenizer "$(K3_GGUF)"
@@ -1446,6 +1449,7 @@ clean:
 	rm -f tests/test_qwen4_ngrams
 	rm -f tests/test_qwen4_ngram_state
 	rm -f tests/test_web_recovery
+	rm -f tests/test_k3_stream
 	rm -f tests/test_metal_ssd_experts
 	rm -f tests/test_metal_command_memory
 	rm -f tests/test_deepseek41_metal

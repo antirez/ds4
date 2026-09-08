@@ -33,6 +33,7 @@
 /tests/test_k3_gguf
 /tests/test_k3_gguf_metal_map
 /tests/test_k3_gguf_slice
+/tests/test_k3_stream
 /tests/test_metal_session_batch
 /tests/test_metal_tp_spec
 /tests/test_metal_tp_cancel
