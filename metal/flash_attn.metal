@@ -304,7 +304,8 @@ template<
     short DV,
     short Q,
     short C,
-    short NSG>
+    short NSG,
+    short STATIC_MIXED_RATIO = 0>
 void kernel_flash_attn_ext_impl(
         constant ds4_metal_args_flash_attn_ext & args,
         device const char * q,
@@ -429,7 +430,36 @@ void kernel_flash_attn_ext_impl(
             slope = pow(base, exph);
         }
 
-        for (int ic0 = 0; ; ++ic0) {
+        int first_block = 0;
+        int raw_end_block = 0;
+        int comp_first_block = 0;
+        int comp_end_block = 0;
+        if (STATIC_MIXED_RATIO != 0) {
+            /* The square static mask exposes two ordered intervals: the
+             * union of this query tile's 128-row raw windows, then its
+             * visible compressed prefix. Every omitted block is entirely
+             * masked, so it never updates softmax state in the legacy loop. */
+            constexpr int ratio = STATIC_MIXED_RATIO ? STATIC_MIXED_RATIO : 1;
+            const int query_end = min(args.ne01, (int)iq1 + Q);
+            first_block = max(0, (int)iq1 + 1 - 128) / C;
+            raw_end_block = (query_end + C - 1) / C;
+            comp_first_block = args.ne01 / C;
+            comp_end_block = (args.ne01 + query_end / ratio + C - 1) / C;
+            FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
+                pm2[jj] += first_block * (C / 2);
+            }
+        }
+
+        for (int ic0 = first_block; ; ++ic0) {
+            if (STATIC_MIXED_RATIO != 0) {
+                if (ic0 == raw_end_block && ic0 < comp_first_block) {
+                    FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
+                        pm2[jj] += (comp_first_block - ic0) * (C / 2);
+                    }
+                    ic0 = comp_first_block;
+                }
+                if (ic0 >= comp_end_block) break;
+            }
             int ic = ic0*C;
             if (ic >= args.ne11) {
                 break;
@@ -888,7 +918,8 @@ template<
     short DK,
     short DV,
     short Q  = OP_FLASH_ATTN_EXT_NQPSG,
-    short C  = OP_FLASH_ATTN_EXT_NCPSG>
+    short C  = OP_FLASH_ATTN_EXT_NCPSG,
+    short STATIC_MIXED_RATIO = 0>
 kernel void kernel_flash_attn_ext(
         constant ds4_metal_args_flash_attn_ext & args,
         device const char * q,
@@ -903,11 +934,17 @@ kernel void kernel_flash_attn_ext(
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort  tiisg[[thread_index_in_simdgroup]],
         ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
+    if (STATIC_MIXED_RATIO != 0) {
+        constexpr int ratio = STATIC_MIXED_RATIO ? STATIC_MIXED_RATIO : 1;
+        if (!FC_flash_attn_ext_has_mask || C != 64 || Q != 8 ||
+            args.ne01 % C != 0 ||
+            args.ne11 != args.ne01 + args.ne01 / ratio) return;
+    }
 #define FWD_TMPL q_t, q4_t, q8x8_t, k_t, k4x4_t, k8x8_t, v_t, v4x4_t, v8x8_t, qk_t, qk8x8_t, s_t, s2_t, s8x8_t, o_t, o4_t, o8x8_t, kd4x4_t, nl_k, deq_k, vd4x4_t, nl_v, deq_v, DK, DV, Q, C
 #define FWD_ARGS args, q, k, v, mask, sinks, pad, blk, dst, shmem_f16, tgpig, tiisg, sgitg
     switch (FC_flash_attn_ext_nsg) {
-        case 4: kernel_flash_attn_ext_impl<FWD_TMPL, 4>(FWD_ARGS); break;
-        case 8: kernel_flash_attn_ext_impl<FWD_TMPL, 8>(FWD_ARGS); break;
+        case 4: kernel_flash_attn_ext_impl<FWD_TMPL, 4, STATIC_MIXED_RATIO>(FWD_ARGS); break;
+        case 8: kernel_flash_attn_ext_impl<FWD_TMPL, 8, STATIC_MIXED_RATIO>(FWD_ARGS); break;
     }
 #undef FWD_TMPL
 #undef FWD_ARGS
@@ -927,6 +964,10 @@ typedef decltype(kernel_flash_attn_ext<FA_NONVEC_TYPES, half4x4, 1, dequantize_f
 // Host-visible prefill FlashAttention variant for DS4's 512-wide F16 K/V rows.
 template [[host_name("kernel_flash_attn_ext_f16_dk512_dv512")]]
 kernel flash_attn_ext_dk512_t kernel_flash_attn_ext<FA_NONVEC_TYPES, half4x4, 1, dequantize_f16, half4x4, 1, dequantize_f16, 512, 512>;
+template [[host_name("kernel_flash_attn_ext_f16_dk512_dv512_static_r4")]]
+kernel flash_attn_ext_dk512_t kernel_flash_attn_ext<FA_NONVEC_TYPES, half4x4, 1, dequantize_f16, half4x4, 1, dequantize_f16, 512, 512, 8, 64, 4>;
+template [[host_name("kernel_flash_attn_ext_f16_dk512_dv512_static_r128")]]
+kernel flash_attn_ext_dk512_t kernel_flash_attn_ext<FA_NONVEC_TYPES, half4x4, 1, dequantize_f16, half4x4, 1, dequantize_f16, 512, 512, 8, 64, 128>;
 
 // Host-visible prefill FlashAttention variant for GLM's 256-wide F16 K/V rows.
 template [[host_name("kernel_flash_attn_ext_f16_dk256_dv256")]]
@@ -1678,6 +1719,323 @@ static inline void ds4_flash_attn_vec_packed8_reduce_f16_512(
 
         /* lane is now the legacy split index and each physical simdgroup
          * reduces four output columns through the identical simd_sum tree. */
+        for (short out_lane = (short)sgitg; out_lane < NW; out_lane += NSG) {
+            const float4 materialized =
+                (float4)partial_plane[(uint)lane * 33u + (uint)out_lane];
+            const float4 reduced = simd_sum(materialized * reduce_ms);
+            if (lane == 0) {
+                dst4[quadrant * NW + out_lane] = reduced * reduce_inv;
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+
+struct ds4_metal_args_flash_kv_direct {
+    uint raw_cap;
+    uint raw_start;
+    uint n_raw;
+    uint pad0;
+};
+
+/* Direct-read sibling of ds4_flash_attn_vec_packed8_reduce_f16_512 for
+ * gathered decode: skips the contiguous F16 K/V staging dispatch entirely
+ * and computes each row's source inline.  Logical rows below n_raw read the
+ * F32 raw ring (single conditional wrap subtract, then float4 -> half4 ->
+ * float4 exactly like kernel_dsv4_flash_kv_stage_f16 followed by the F16
+ * consumer, so the half bits are identical), rows at/above n_raw read the
+ * F16 compressed cache in place (same bits as the ushort4 transport), and
+ * rows past ne11 take an in-place zero row with a -MAXHALF mask, matching
+ * the fused pad writes bit-for-bit.  Invalid rows still execute their dot
+ * and lo += 0.0h * weight accumulations (never skipped), the
+ * simd_max(sm[lane]) > -MAXHALF block-skip gate is unchanged, and the whole
+ * reduction topology (simd_sum trees, 8 simdgroups x 32 virtual splits,
+ * 33-column partial plane) is untouched. */
+static inline void ds4_flash_attn_vec_packed8_reduce_f16_512_direct_kv(
+        constant ds4_metal_args_flash_attn_ext_vec & args,
+        device const char * q,
+        device const char * raw_kv,
+        device const char * comp_kv,
+        device const char * mask,
+        device const char * sinks,
+        constant ds4_metal_args_flash_kv_direct & kv,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint head,
+        ushort tiisg,
+        ushort sgitg) {
+    constexpr short NW = 32;
+    constexpr short C = 32;
+    constexpr short NSG = 8;
+    constexpr short NWG = 32;
+    constexpr short DK4 = 128;
+    constexpr short DV4 = 128;
+    constexpr short SH = 128;
+
+    /* Same 24,448-byte dynamic layout as the staged variant. */
+    threadgroup half4 *q_shared = (threadgroup half4 *)shmem;
+    threadgroup half *score_banks =
+        (threadgroup half *)(q_shared + DK4);
+    threadgroup volatile float *weights =
+        (threadgroup volatile float *)(score_banks + NSG * SH);
+    threadgroup volatile float *stats = weights + NWG * C;
+    threadgroup volatile float *sink_scale = stats + 2 * NWG;
+    threadgroup volatile float4 *partial_plane =
+        (threadgroup volatile float4 *)(sink_scale + NWG);
+
+    const short lane = (short)tiisg;
+    threadgroup half *bank = score_banks + (short)sgitg * SH;
+    threadgroup float *ss = (threadgroup float *)bank;
+    threadgroup half *sm = bank + 2 * C;
+
+    device const float4 *q4 =
+        (device const float4 *)(q + (uint64_t)head * args.nb02);
+    if (sgitg == 0) {
+        for (short i = lane; i < DK4; i += NW) {
+            q_shared[i] = (half4)q4[i];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (short iwg = (short)sgitg; iwg < NWG; iwg += NSG) {
+        float S = 0.0f;
+        float M = -FLT_MAX / 2;
+        float out_scale = 1.0f;
+        const int ic_original = (int)iwg * C;
+
+        weights[(uint)iwg * C + (uint)lane] = 0.0f;
+        ss[lane] = 0.0f;
+        sm[lane] = (half)0.0h;
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (ic_original < args.ne11) {
+            device const half *pm = (device const half *)mask;
+            const int ic = ic_original;
+
+            /* In-place tail: rows past ne11 take the pad mask bits 0xfbff
+             * (-MAXHALF), exactly as the fused pad dispatch wrote them. */
+            const uint mrow = (uint)ic + (uint)lane;
+            sm[lane] = mrow < (uint)args.ne11
+                ? pm[mrow]
+                : as_type<half>((ushort)0xfbffu);
+            if (simd_max(sm[lane]) > -MAXHALF) {
+                threadgroup const half4 *pq4 = q_shared;
+                pq4 += lane;
+
+                /* Per-block fast paths: a 32-row block almost never mixes
+                 * sources, so only the raw/comp-straddling, ring-wrapping or
+                 * tail block pays per-row addressing.  The fast loops keep
+                 * the staged kernel's exact load walk; the raw path inserts
+                 * the same float4 -> half4 -> float4 conversion the staging
+                 * dispatch + F16 consumer performed. */
+                const uint blk_first = (uint)ic;
+                const uint blk_last = (uint)ic + (uint)(C - 1);
+                const bool all_valid = (uint)ic + (uint)C <= (uint)args.ne11;
+                const bool all_raw = blk_last < kv.n_raw;
+                const bool raw_no_wrap =
+                    kv.raw_start + blk_last < kv.raw_cap;
+
+                float lane_mqk = 0.0f;
+                if (all_valid && all_raw && raw_no_wrap) {
+                    device const float4 *pk4f =
+                        (device const float4 *)(raw_kv +
+                            (uint64_t)(kv.raw_start + blk_first) * 2048u);
+                    pk4f += lane;
+                    FOR_UNROLL (short cc = 0; cc < C; ++cc) {
+                        float mqk = 0.0f;
+                        FOR_UNROLL (short ii = 0; ii < DK4 / NW; ++ii) {
+                            mqk += dot((float4)(half4)pk4f[cc * DK4 + ii * NW],
+                                       (float4)pq4[ii * NW]);
+                        }
+                        mqk = simd_sum(mqk);
+                        if (lane == cc) {
+                            lane_mqk = mqk;
+                        }
+                    }
+                } else if (all_valid && blk_first >= kv.n_raw) {
+                    device const half4 *pk4 =
+                        (device const half4 *)(comp_kv +
+                            (uint64_t)(blk_first - kv.n_raw) * 1024u);
+                    pk4 += lane;
+                    FOR_UNROLL (short cc = 0; cc < C; ++cc) {
+                        float mqk = 0.0f;
+                        FOR_UNROLL (short ii = 0; ii < DK4 / NW; ++ii) {
+                            mqk += dot((float4)pk4[cc * DK4 + ii * NW],
+                                       (float4)pq4[ii * NW]);
+                        }
+                        mqk = simd_sum(mqk);
+                        if (lane == cc) {
+                            lane_mqk = mqk;
+                        }
+                    }
+                } else {
+                    FOR_UNROLL (short cc = 0; cc < C; ++cc) {
+                        /* Per-row base: a packed 32-row block can straddle
+                         * the raw/comp boundary and the ring wrap. */
+                        const uint r = (uint)ic + (uint)cc;
+                        float mqk = 0.0f;
+                        if (r < (uint)args.ne11 && r < kv.n_raw) {
+                            uint phys = kv.raw_start + r;
+                            if (phys >= kv.raw_cap) phys -= kv.raw_cap;
+                            device const float4 *row4 =
+                                (device const float4 *)(raw_kv +
+                                    (uint64_t)phys * 2048u);
+                            FOR_UNROLL (short ii = 0; ii < DK4 / NW; ++ii) {
+                                mqk += dot((float4)(half4)row4[ii * NW + lane],
+                                           (float4)pq4[ii * NW]);
+                            }
+                        } else if (r < (uint)args.ne11) {
+                            device const half4 *row4 =
+                                (device const half4 *)(comp_kv +
+                                    (uint64_t)(r - kv.n_raw) * 1024u);
+                            FOR_UNROLL (short ii = 0; ii < DK4 / NW; ++ii) {
+                                mqk += dot((float4)row4[ii * NW + lane],
+                                           (float4)pq4[ii * NW]);
+                            }
+                        } else {
+                            /* Pad rows were zero; execute the same dot so
+                             * the signed-zero products match the staged
+                             * path. */
+                            FOR_UNROLL (short ii = 0; ii < DK4 / NW; ++ii) {
+                                mqk += dot(float4(0.0f), (float4)pq4[ii * NW]);
+                            }
+                        }
+                        mqk = simd_sum(mqk);
+                        if (lane == cc) {
+                            lane_mqk = mqk;
+                        }
+                    }
+                }
+
+                ss[lane] = fma(lane_mqk, args.scale,
+                               (float)sm[lane]);
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+
+                const float old_m = M;
+                const float score = ss[lane];
+                M = simd_max(max(M, score));
+                const float ms = exp(old_m - M);
+                const float vs = exp(score - M);
+                S = S * ms + simd_sum(vs);
+                ss[lane] = vs;
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+
+                weights[(uint)iwg * C + (uint)lane] = ss[lane];
+            }
+
+            if (FC_flash_attn_ext_vec_has_sinks && iwg == 0) {
+                const float old_m = M;
+                const float sink = lane == 0
+                    ? ((device const float *)sinks)[head]
+                    : -FLT_MAX / 2;
+                M = simd_max(max(M, sink));
+                const float ms = exp(old_m - M);
+                const float vs = exp(sink - M);
+                S = S * ms + simd_sum(vs);
+                out_scale = ms;
+            }
+        } else if (FC_flash_attn_ext_vec_has_sinks && iwg == 0) {
+            const float old_m = M;
+            const float sink = lane == 0
+                ? ((device const float *)sinks)[head]
+                : -FLT_MAX / 2;
+            M = simd_max(max(M, sink));
+            const float ms = exp(old_m - M);
+            const float vs = exp(sink - M);
+            S = S * ms + simd_sum(vs);
+            out_scale = ms;
+        }
+
+        if (lane == 0) {
+            stats[2 * (uint)iwg + 0] = S;
+            stats[2 * (uint)iwg + 1] = M;
+            sink_scale[(uint)iwg] = out_scale;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const short split = lane;
+    float reduce_S = stats[2 * (uint)split + 0];
+    float reduce_M = stats[2 * (uint)split + 1];
+    const float reduce_max = simd_max(reduce_M);
+    const float reduce_ms = exp(reduce_M - reduce_max);
+    reduce_S = simd_sum(reduce_S * reduce_ms);
+    const float reduce_inv =
+        reduce_S == 0.0f ? 0.0f : 1.0f / reduce_S;
+
+    device float4 *dst4 =
+        (device float4 *)(dst +
+                          (uint64_t)head * 512u * sizeof(float));
+
+    for (short quadrant = 0; quadrant < 4; ++quadrant) {
+        for (short iwg = (short)sgitg; iwg < NWG; iwg += NSG) {
+            float4 lo = float4(0.0f);
+            const int ic_original = (int)iwg * C;
+            if (ic_original < args.ne11) {
+                const int ic = ic_original;
+
+                threadgroup volatile float *split_weights =
+                    weights + (uint)iwg * C;
+                const short oc = quadrant * NW + lane;
+                /* Same per-block fast paths as the QK pass. */
+                const uint blk_first = (uint)ic;
+                const uint blk_last = (uint)ic + (uint)(C - 1);
+                const bool all_valid = (uint)ic + (uint)C <= (uint)args.ne11;
+                const bool all_raw = blk_last < kv.n_raw;
+                const bool raw_no_wrap =
+                    kv.raw_start + blk_last < kv.raw_cap;
+                if (all_valid && all_raw && raw_no_wrap) {
+                    device const float4 *pv4f =
+                        (device const float4 *)(raw_kv +
+                            (uint64_t)(kv.raw_start + blk_first) * 2048u);
+                    FOR_UNROLL (short cc = 0; cc < C; ++cc) {
+                        lo += (float4)(half4)pv4f[cc * DV4 + oc] *
+                              float4(split_weights[cc]);
+                    }
+                } else if (all_valid && blk_first >= kv.n_raw) {
+                    device const half4 *pv4 =
+                        (device const half4 *)(comp_kv +
+                            (uint64_t)(blk_first - kv.n_raw) * 1024u);
+                    FOR_UNROLL (short cc = 0; cc < C; ++cc) {
+                        lo += float4(pv4[cc * DV4 + oc]) *
+                              float4(split_weights[cc]);
+                    }
+                } else {
+                FOR_UNROLL (short cc = 0; cc < C; ++cc) {
+                    /* Same per-row source selection as the QK pass; invalid
+                     * rows contribute +0.0f * weight, never a skipped
+                     * iteration. */
+                    const uint r = (uint)ic + (uint)cc;
+                    float4 vv = float4(0.0f);
+                    if (r < (uint)args.ne11 && r < kv.n_raw) {
+                        uint phys = kv.raw_start + r;
+                        if (phys >= kv.raw_cap) phys -= kv.raw_cap;
+                        vv = (float4)(half4)((device const float4 *)(raw_kv +
+                                (uint64_t)phys * 2048u))[oc];
+                    } else if (r < (uint)args.ne11) {
+                        vv = (float4)((device const half4 *)(comp_kv +
+                                (uint64_t)(r - kv.n_raw) * 1024u))[oc];
+                    }
+                    lo += vv * float4(split_weights[cc]);
+                }
+                }
+
+                float4 acc = float4(0.0f);
+                acc += lo;
+                if (iwg == 0) {
+                    acc *= sink_scale[0];
+                }
+                lo = acc;
+            }
+            partial_plane[(uint)iwg * 33u + (uint)lane] = lo;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
         for (short out_lane = (short)sgitg; out_lane < NW; out_lane += NSG) {
             const float4 materialized =
                 (float4)partial_plane[(uint)lane * 33u + (uint)out_lane];

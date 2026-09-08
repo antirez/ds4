@@ -77,7 +77,7 @@ static int check_case(const void *model, uint64_t model_size,
             model, model_size, 0, up_off, down_off, mxfp4 ? 39 : 16, mxfp4 ? 39 : 10,
             MID * gate_row, gate_row, OUTPUT * down_row, down_row,
             INPUT, MID, OUTPUT, it, wt, EXPERTS, SELECTED, 7.0f,
-            xt, 0, tokens, &half_mid, true);
+            xt, 0, tokens, &half_mid, false, true);
         ok = ok && half_mid == (tokens >= 32);
         for (int i = 0; i < 5 && ok; i++) {
             /* Tiny kernels leave unowned intermediates untouched; the fused
@@ -182,7 +182,8 @@ static int check_static_batch(void) {
             ok = xr && ir && wr && ds4_gpu_routed_moe_one_tensor(
                 out, gate, up, mid, down, model, bytes, 0, tensor, 2 * tensor,
                 39, 39, expert, row, expert, down_row, D, H, D,
-                ir, wr, E, SELECTED, 7.0f, xr, NULL, 0, true) &&
+                ir, wr, E, SELECTED, 7.0f, xr, NULL, 0, true,
+                NULL, NULL, NULL, NULL, NULL) &&
                 ds4_gpu_tensor_read(out, 0, reference + r * D, D * sizeof(float));
             ds4_gpu_tensor_free(xr);
             ds4_gpu_tensor_free(ir);
@@ -197,7 +198,7 @@ static int check_static_batch(void) {
                  ds4_gpu_routed_moe_batch_tensor(
                     out, gate, up, mid, down, model, bytes, 0, tensor, 2 * tensor,
                     39, 39, expert, row, expert, down_row, D, H, D,
-                    it, wt, E, SELECTED, 7.0f, xt, 0, n, &half_mid, true) &&
+                    it, wt, E, SELECTED, 7.0f, xt, 0, n, &half_mid, false, true) &&
                  !half_mid && ds4_gpu_tensor_read(out, 0, actual, n * D * sizeof(float));
             for (uint32_t j = 0; j < n * D && ok; j++)
                 ok = isfinite(actual[j]) && isfinite(reference[j]) && actual[j] == reference[j];

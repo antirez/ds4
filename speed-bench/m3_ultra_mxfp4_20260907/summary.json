@@ -1,0 +1,42 @@
+{
+  "prefill_samples": {
+    "main-r1": [639.66, 584.77, 577.77, 570.98],
+    "branch-r1": [661.65, 607.97, 600.13, 593.13],
+    "branch-r2": [662.10, 608.13, 600.01, 593.19],
+    "main-r2": [639.93, 584.99, 577.14, 571.91]
+  },
+  "prefill_tps": {
+    "2048": {"main": 639.80, "branch": 661.88, "delta_pct": 3.45},
+    "4096": {"main": 584.88, "branch": 608.05, "delta_pct": 3.96},
+    "6144": {"main": 577.46, "branch": 600.07, "delta_pct": 3.92},
+    "8192": {"main": 571.44, "branch": 593.16, "delta_pct": 3.80}
+  },
+  "prefill_pooled_tps": {"main": 592.26, "branch": 614.63, "delta_pct": 3.78},
+  "gen_tps_mean": {
+    "2048": {"main": 43.20, "branch": 43.36},
+    "4096": {"main": 39.38, "branch": 39.34},
+    "6144": {"main": 38.96, "branch": 39.09},
+    "8192": {"main": 38.67, "branch": 38.73}
+  },
+  "gen_steady_tps_mean": {
+    "2048": {"main": 43.20, "branch": 43.36, "delta_pct": 0.38},
+    "4096": {"main": 39.41, "branch": 39.38, "delta_pct": -0.09},
+    "6144": {"main": 38.96, "branch": 39.09, "delta_pct": 0.33},
+    "8192": {"main": 38.67, "branch": 38.73, "delta_pct": 0.17}
+  },
+  "first_token_ms": {
+    "2048": {"main": [24.427, 24.903], "branch": [24.336, 24.645]}
+  },
+  "decode_cli_greedy": {
+    "argv_prompt": "Write a short story about a lighthouse keeper.",
+    "main_tps": [43.13, 43.18],
+    "branch_tps": [45.74, 45.66],
+    "delta_pct": 5.88,
+    "transcript_md5_all_runs": "db0c504c8203618552e685bd2c701e4f"
+  },
+  "frontier_logits_validation": {
+    "frontiers": 2,
+    "files_identical": true,
+    "note": "untimed runs, ctx 2048/4096, gen 16, --dump-frontier-logits-dir; byte-identical between builds"
+  }
+}

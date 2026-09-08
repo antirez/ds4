@@ -692,6 +692,233 @@ kernel void kernel_dsv4_hc_expand4(
     }
 }
 
+// Batch attention-output tail specialization for the exact pre-M5 legacy
+// Q8_0 matmul tile:
+//
+//     attn_out      = attn_low @ Wob
+//     after_attn_hc = HCPost(attn_out, residual_hc, split)
+//
+// The matrix body is the aligned Q8_0/F32 specialization of kernel_mul_mm,
+// kept in the same load/dequantize/MMA order.  Its 64x32 F32 result is staged
+// through threadgroup memory before the scalar HC=4 epilogue, preserving the
+// materialized F32 boundary and kernel_dsv4_hc_expand4's statement order while
+// removing the global attn_out write/read and the standalone HC dispatch.
+kernel void kernel_dsv4_attn_out_q8_mm_hc_expand4_batch(
+        constant ds4_metal_args_mul_mm          & mm [[buffer(0)]],
+        device  const char * weight                  [[buffer(1)]],
+        device  const char * input                   [[buffer(2)]],
+        device  const char * residual                [[buffer(3)]],
+        device  const char * post                    [[buffer(4)]],
+        device  const char * comb                    [[buffer(5)]],
+        device        char * dst                     [[buffer(6)]],
+        constant ds4_metal_args_dsv4_hc_expand & hc [[buffer(7)]],
+        threadgroup   char * shmem                   [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiitg [[thread_index_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    constexpr int NR0 = 64;
+    constexpr int NR1 = 32;
+    constexpr int NK = 32;
+    constexpr int NL0 = NK / 16;
+    constexpr int NL1 = NK / 8;
+
+    if (hc.n_hc != 4 || mm.ne0 != hc.n_embd || mm.ne1 != hc.n_tokens ||
+        mm.ne00 != 8192 || mm.ne0 != 4096 || (mm.ne1 & 31) != 0) {
+        return;
+    }
+
+    threadgroup half * sa = (threadgroup half *)shmem;
+    threadgroup half * sb = (threadgroup half *)(shmem + 4096);
+
+    const int im = tgpig.z;
+    const int r0 = tgpig.y * NR0;
+    const int r1 = tgpig.x * NR1;
+    const short lr0 = (short)tiitg / NL0;
+    const short lr1 = (short)tiitg / NL1;
+    const short il0 = tiitg % NL0;
+    short il = il0;
+
+    const int i12 = im % mm.ne12;
+    const int i13 = im / mm.ne12;
+    const uint64_t offset0 =
+        (i12 / mm.r2) * mm.nb02 + (i13 / mm.r3) * mm.nb03;
+    const short offset1 = il0 / 2;
+    device const block_q8_0 * x =
+        (device const block_q8_0 *)(weight + mm.nb01 * (r0 + lr0) + offset0) +
+        offset1;
+
+    const short iy = 8 * (tiitg % NL1);
+    device const float * y = (device const float *)(input +
+        mm.nb13 * i13 + mm.nb12 * i12 + mm.nb11 * (r1 + lr1) + mm.nb10 * iy);
+
+    simdgroup_half8x8 ma[4];
+    simdgroup_half8x8 mb[2];
+    simdgroup_float8x8 mc[8];
+    FOR_UNROLL (short i = 0; i < 8; ++i) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    }
+
+    for (int loop_k = 0; loop_k < mm.ne00; loop_k += NK) {
+        half4x4 temp_a;
+        dequantize_q8_0(x, il, temp_a);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        FOR_UNROLL (short i = 0; i < 16; ++i) {
+            const short sx = 2 * il0 + i / 8;
+            const short sy = (tiitg / NL0) / 8;
+            const short lx = (tiitg / NL0) % 8;
+            const short ly = i % 8;
+            const short ib = 8 * sx + sy;
+            *(sa + 64 * ib + 8 * ly + lx) = temp_a[i / 4][i % 4];
+        }
+
+        const short sx = tiitg % NL1;
+        const short sy = (tiitg / NL1) / 8;
+        const short ly = (tiitg / NL1) % 8;
+        const short ib = 4 * sx + sy;
+        *(threadgroup half2x4 *)(sb + 64 * ib + 8 * ly) =
+            (half2x4)(*((device float2x4 *)y));
+
+        il = (il + 2 < 2) ? il + 2 : il % 2;
+        x = (il < 2) ? x + 1 : x;
+        y += NK;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half * lsma = sa + 4 * 64 * (sgitg % 2);
+        threadgroup const half * lsmb = sb + 2 * 64 * (sgitg / 2);
+
+        FOR_UNROLL (short ik = 0; ik < NK / 8; ++ik) {
+            simdgroup_barrier(mem_flags::mem_none);
+            FOR_UNROLL (short i = 0; i < 4; ++i) {
+                simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            FOR_UNROLL (short i = 0; i < 2; ++i) {
+                simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            FOR_UNROLL (short i = 0; i < 8; ++i) {
+                simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
+            }
+            lsma += 8 * 64;
+            lsmb += 4 * 64;
+        }
+    }
+
+    // Every simdgroup must finish its final sa/sb reads before the same 8 KiB
+    // allocation is reused as the row-major F32 output tile.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup float * tile = (threadgroup float *)shmem;
+    threadgroup float * tile_sg =
+        tile + 32 * (sgitg & 1) + 16 * (sgitg >> 1) * NR0;
+    FOR_UNROLL (short i = 0; i < 8; ++i) {
+        simdgroup_store(mc[i],
+                        tile_sg + 8 * (i % 4) + 8 * NR0 * (i / 4),
+                        NR0, 0, false);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint e = tiitg; e < (uint)(NR0 * NR1); e += 128u) {
+        const int64_t t = r1 + e / NR0;
+        const int64_t d = r0 + e % NR0;
+        const float block_v = tile[e];
+
+        const float rv0 = *((device const float *)(residual +
+            d * hc.nb_res0 + 0 * hc.nb_res1 + t * hc.nb_res2));
+        const float rv1 = *((device const float *)(residual +
+            d * hc.nb_res0 + 1 * hc.nb_res1 + t * hc.nb_res2));
+        const float rv2 = *((device const float *)(residual +
+            d * hc.nb_res0 + 2 * hc.nb_res1 + t * hc.nb_res2));
+        const float rv3 = *((device const float *)(residual +
+            d * hc.nb_res0 + 3 * hc.nb_res1 + t * hc.nb_res2));
+
+        for (int64_t dst_hc = 0; dst_hc < 4; ++dst_hc) {
+            float acc = block_v * *((device const float *)(post +
+                dst_hc * hc.nb_post0 + t * hc.nb_post1));
+            acc += *((device const float *)(comb +
+                dst_hc * hc.nb_comb0 + 0 * hc.nb_comb1 + t * hc.nb_comb2)) * rv0;
+            acc += *((device const float *)(comb +
+                dst_hc * hc.nb_comb0 + 1 * hc.nb_comb1 + t * hc.nb_comb2)) * rv1;
+            acc += *((device const float *)(comb +
+                dst_hc * hc.nb_comb0 + 2 * hc.nb_comb1 + t * hc.nb_comb2)) * rv2;
+            acc += *((device const float *)(comb +
+                dst_hc * hc.nb_comb0 + 3 * hc.nb_comb1 + t * hc.nb_comb2)) * rv3;
+            *((device float *)(dst + d * hc.nb0 + dst_hc * hc.nb1 +
+                               t * hc.nb2)) = acc;
+        }
+    }
+}
+
+// Batch routed-FFN tail specialization:
+//
+//     routed_out = sum(expert_down[0..5])
+//     next_hc    = HCPost(routed_out + shared_out, residual_hc, split)
+//
+// The scalar statements intentionally mirror kernel_dsv4_moe_sum6_f32 and
+// kernel_dsv4_hc_expand4 in their original order.  The intermediate routed
+// row is dead on the admitted graph path, so consuming the six expert rows
+// here removes its global write/read and the standalone sum dispatch.
+kernel void kernel_dsv4_moe_sum6_hc_expand4(
+        constant ds4_metal_args_dsv4_hc_expand & args,
+        device  const char * expert_down,
+        device  const char * residual,
+        device  const char * post,
+        device  const char * comb,
+        device  const char * shared_out,
+        device        char * dst,
+        uint gid [[thread_position_in_grid]]) {
+    if (args.n_hc != 4) {
+        return;
+    }
+
+    const int64_t n_elem = args.n_embd * args.n_tokens;
+    if ((int64_t) gid >= n_elem) {
+        return;
+    }
+
+    const int64_t d = ((int64_t) gid) % args.n_embd;
+    const int64_t t = ((int64_t) gid) / args.n_embd;
+    device const float *s = (device const float *)(expert_down +
+        (uint64_t)t * 6u * (uint64_t)args.n_embd * sizeof(float));
+
+    float block_v = s[d];
+    block_v += s[(uint64_t)args.n_embd + d];
+    block_v += s[2u * (uint64_t)args.n_embd + d];
+    block_v += s[3u * (uint64_t)args.n_embd + d];
+    block_v += s[4u * (uint64_t)args.n_embd + d];
+    block_v += s[5u * (uint64_t)args.n_embd + d];
+    block_v += *((device const float *)(shared_out +
+        d*args.nb_add0 + t*args.nb_add1));
+
+    const float r0 = *((device const float *)(residual +
+        d*args.nb_res0 + 0*args.nb_res1 + t*args.nb_res2));
+    const float r1 = *((device const float *)(residual +
+        d*args.nb_res0 + 1*args.nb_res1 + t*args.nb_res2));
+    const float r2 = *((device const float *)(residual +
+        d*args.nb_res0 + 2*args.nb_res1 + t*args.nb_res2));
+    const float r3 = *((device const float *)(residual +
+        d*args.nb_res0 + 3*args.nb_res1 + t*args.nb_res2));
+
+    for (int64_t dst_hc = 0; dst_hc < 4; ++dst_hc) {
+        float acc = block_v * *((device const float *)(post +
+            dst_hc*args.nb_post0 + t*args.nb_post1));
+
+        acc += *((device const float *)(comb + dst_hc*args.nb_comb0 +
+            0*args.nb_comb1 + t*args.nb_comb2)) * r0;
+        acc += *((device const float *)(comb + dst_hc*args.nb_comb0 +
+            1*args.nb_comb1 + t*args.nb_comb2)) * r1;
+        acc += *((device const float *)(comb + dst_hc*args.nb_comb0 +
+            2*args.nb_comb1 + t*args.nb_comb2)) * r2;
+        acc += *((device const float *)(comb + dst_hc*args.nb_comb0 +
+            3*args.nb_comb1 + t*args.nb_comb2)) * r3;
+
+        *((device float *)(dst + d*args.nb0 + dst_hc*args.nb1 +
+            t*args.nb2)) = acc;
+    }
+}
+
 // Decode-time FFN tail fusion:
 //
 //     shared_out = shared_mid @ Wshared_down

@@ -58,6 +58,11 @@ struct ds4_metal_args_dsv4_head_norm_rope {
     float beta_slow;
 };
 
+struct ds4_metal_args_dsv4_batch_qkv_finalize {
+    uint32_t raw_cap;
+    uint32_t raw_pos0;
+};
+
 static float rope_yarn_ramp(const float low, const float high, const int i0) {
     const float y = (i0 / 2 - low) / max(0.001f, high - low);
     return 1.0f - min(1.0f, max(0.0f, y));
@@ -420,6 +425,101 @@ kernel void kernel_dsv4_head_rms_norm_rope_tail_f32(
         const float x1 = xs[i0 + 1] * scale;
         xs[i0] = x0 * cos_theta - x1 * sin_theta;
         xs[i0 + 1] = x0 * sin_theta + x1 * cos_theta;
+    }
+}
+
+// KV half of the batch finalizer as a separate PSO. The host can dispatch it
+// concurrently with the unchanged Q-head norm/RoPE PSO, retaining that PSO's
+// exact compiled arithmetic. The KV PSO collapses the four post-q_b KV
+// dispatches; together the active path turns five serial dispatches into two
+// concurrent dispatches.
+kernel void kernel_dsv4_batch_kv_rope_fp8_store_f32(
+        constant ds4_metal_args_dsv4_rope_tail & args,
+        constant ds4_metal_args_dsv4_batch_qkv_finalize & store,
+        device const int32_t * positions,
+        device float * kvraw,
+        device float * raw_cache,
+        threadgroup float * scratch [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]]) {
+    const int i1 = tgpig.x;
+    const int i2 = tgpig.y;
+    const int n_nope = (int)args.ne00 - args.n_dims;
+    if (args.mode != 0 || n_nope < 0) {
+        return;
+    }
+
+    device float *kv = (device float *)((device char *)kvraw +
+        (uint64_t)i2 * args.nb02 + (uint64_t)i1 * args.nb01);
+
+    float corr_dims[2];
+    rope_yarn_corr_dims(args.n_dims, args.n_ctx_orig, args.freq_base,
+                        args.beta_fast, args.beta_slow, corr_dims);
+    const float theta_base = (float)positions[i2];
+    const float inv_ndims = -1.f / args.n_dims;
+
+    for (int r = tid; r < args.n_dims; r += ntg.x) {
+        if ((r & 1) != 0) {
+            continue;
+        }
+#ifdef DS4_METAL_ROPE_EXP2_LOG2
+        const float theta =
+            theta_base * exp2(inv_ndims * (float)r * log2(args.freq_base));
+#else
+        const float theta =
+            theta_base * pow(args.freq_base, inv_ndims * r);
+#endif
+        float cos_theta;
+        float sin_theta;
+        rope_yarn(theta, args.freq_scale, corr_dims, r,
+                  args.ext_factor, args.attn_factor,
+                  &cos_theta, &sin_theta);
+        if (args.inverse) {
+            sin_theta = -sin_theta;
+        }
+
+        const int j0 = n_nope + r;
+        const int j1 = j0 + 1;
+        const float x0 = kv[j0];
+        const float x1 = kv[j1];
+        kv[j0] = x0 * cos_theta - x1 * sin_theta;
+        kv[j1] = x0 * sin_theta + x1 * cos_theta;
+    }
+
+    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+
+    device float *raw = raw_cache +
+        (uint64_t)((store.raw_pos0 + (uint)i2) % store.raw_cap) *
+        (uint64_t)args.ne00;
+    for (int off = 0; off < n_nope; off += 64) {
+        float v = 0.0f;
+        if (off + (int)tid < n_nope) {
+            v = kv[off + tid];
+            scratch[tid] = abs(v);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = 32; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                scratch[tid] = max(scratch[tid], scratch[tid + stride]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        const float amax = max(scratch[0], 1.0e-4f);
+        const float fp8_scale = exp2(ceil(log2(amax / 448.0f)));
+        if (off + (int)tid < n_nope) {
+            const float q = dsv4_e4m3fn_dequant(
+                clamp(v / fp8_scale, -448.0f, 448.0f)) * fp8_scale;
+            kv[off + tid] = q;
+            raw[off + tid] = (float)((half)q);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (int i = n_nope + (int)tid; i < args.ne00; i += 64) {
+        raw[i] = (float)((half)kv[i]);
     }
 }
 
@@ -866,6 +966,67 @@ kernel void kernel_dsv4_flash_attn_vec_packed32_reduce_rope_f16_dk512_dv512(
 
     ds4_flash_attn_vec_packed8_reduce_f16_512(
         args, q, k, v, mask, sinks, pad, dst, shmem,
+        head, tiisg, sgitg);
+
+    /* Same producer/consumer boundary as the current reduce+RoPE kernel. */
+    threadgroup_barrier(mem_flags::mem_device);
+
+    const int n_nope = rope.head_dim - rope.n_dims;
+    device char * row = dst + (uint64_t)head * rope.row_bytes;
+    ds4_rope_tail_pair_affine_row(rope,
+                                  (device const char *)row,
+                                  row,
+                                  n_nope,
+                                  rope.pos0,
+                                  tiitg,
+                                  32u * 32u);
+}
+
+// Direct-KV sibling of the packed32 reduce+RoPE decode kernel above: reads
+// the F32 raw ring and F16 compressed cache in place (see
+// ds4_flash_attn_vec_packed8_reduce_f16_512_direct_kv in flash_attn.metal)
+// so the gathered KV staging dispatch is skipped entirely.
+kernel void kernel_dsv4_flash_attn_vec_packed32_reduce_rope_f16_dk512_dv512_direct_kv(
+        constant ds4_metal_args_flash_attn_ext_vec & args [[buffer(0)]],
+        device const char * q                         [[buffer(1)]],
+        device const char * raw_kv                    [[buffer(2)]],
+        device const char * comp_kv                   [[buffer(3)]],
+        device const char * mask                      [[buffer(4)]],
+        device const char * sinks                     [[buffer(5)]],
+        constant ds4_metal_args_flash_kv_direct & kv  [[buffer(6)]],
+        device       char * dst                       [[buffer(7)]],
+        constant ds4_metal_args_dsv4_rope_affine_pair & rope
+                                                        [[buffer(8)]],
+        threadgroup char * shmem [[threadgroup(0)]],
+        uint head       [[threadgroup_position_in_grid]],
+        ushort tiitg    [[thread_index_in_threadgroup]],
+        ushort tiisg    [[thread_index_in_simdgroup]],
+        ushort sgitg    [[simdgroup_index_in_threadgroup]]) {
+    /* Same uniform specialization guard as the staged packed32 kernel; nb11
+     * / nb21 remain the F16 compressed row stride (raw rows are a fixed
+     * 2048-byte F32 stride inside the helper). */
+    if (!FC_flash_attn_ext_vec_has_mask ||
+        !FC_flash_attn_ext_vec_has_sinks ||
+         FC_flash_attn_ext_vec_has_bias ||
+         FC_flash_attn_ext_vec_has_scap ||
+         FC_flash_attn_ext_vec_nsg != 1 ||
+         FC_flash_attn_ext_vec_nwg != 32 ||
+         FC_flash_attn_ext_vec_ns10 != 512 ||
+         FC_flash_attn_ext_vec_ns20 != 512 ||
+         args.ne01 != 1 || args.ne02 != 64 || args.ne03 != 1 ||
+         args.ne_12_2 != 1 || args.ne_12_3 != 1 ||
+         args.ne31 != 1 || args.ne32 != 1 || args.ne33 != 1 ||
+         args.ne11 <= 0 || args.ne11 > 1024 || head >= (uint)args.ne02 ||
+         args.nb02 != 2048 || args.nb11 != 1024 || args.nb21 != 1024 ||
+         kv.n_raw == 0 || kv.n_raw > (uint)args.ne11 ||
+         kv.raw_cap < kv.n_raw || kv.raw_start >= kv.raw_cap ||
+         rope.head_dim != 512 || rope.n_dims != 64 ||
+         rope.row_bytes != 2048 || rope.inverse == 0) {
+        return;
+    }
+
+    ds4_flash_attn_vec_packed8_reduce_f16_512_direct_kv(
+        args, q, raw_kv, comp_kv, mask, sinks, kv, dst, shmem,
         head, tiisg, sgitg);
 
     /* Same producer/consumer boundary as the current reduce+RoPE kernel. */

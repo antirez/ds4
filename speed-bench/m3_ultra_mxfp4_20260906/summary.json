@@ -1,0 +1,578 @@
+{
+  "scope": "PR954: 2048\u20138192 context, 2048-token increments, 128 greedy non-EOS tokens per frontier",
+  "run_order": [
+    "main-r1.csv",
+    "branch-r1.csv",
+    "branch-r2.csv",
+    "main-r2.csv"
+  ],
+  "notes": [
+    "No statistical significance claim; two runs per variant.",
+    "Prefill measures only each new interval; the 2K row is the initial prefill.",
+    "Primary generation throughput includes host selection/loop overhead; steady throughput times eval calls after the first token.",
+    "All throughput pooling is total equal work divided by reconstructed elapsed time, using rounded CSV rates.",
+    "gen_first_ms is an arithmetic mean and lower is better; positive throughput deltas are better.",
+    "CSV kvcache_bytes is the saved snapshot length, not total KV allocation; a final zero is expected.",
+    "ds4-bench uses classic evaluation, not the session-chain API."
+  ],
+  "raw_per_run": [
+    {
+      "file": "main-r1.csv",
+      "variant": "main",
+      "rows": [
+        {
+          "ctx_tokens": 2048,
+          "prefill_tokens": 2048,
+          "prefill_tps": 641.97,
+          "gen_tokens": 128,
+          "gen_tps": 42.77,
+          "gen_first_ms": 70.602,
+          "gen_steady_tokens": 127,
+          "gen_steady_tps": 43.52,
+          "kvcache_bytes": 52184460
+        },
+        {
+          "ctx_tokens": 4096,
+          "prefill_tokens": 2048,
+          "prefill_tps": 586.96,
+          "gen_tokens": 128,
+          "gen_tps": 39.6,
+          "gen_first_ms": 24.401,
+          "gen_steady_tokens": 127,
+          "gen_steady_tps": 39.64,
+          "kvcache_bytes": 80373132
+        },
+        {
+          "ctx_tokens": 6144,
+          "prefill_tokens": 2048,
+          "prefill_tps": 579.66,
+          "gen_tokens": 128,
+          "gen_tps": 39.37,
+          "gen_first_ms": 26.217,
+          "gen_steady_tokens": 127,
+          "gen_steady_tps": 39.43,
+          "kvcache_bytes": 108561804
+        },
+        {
+          "ctx_tokens": 8192,
+          "prefill_tokens": 2048,
+          "prefill_tps": 572.78,
+          "gen_tokens": 128,
+          "gen_tps": 39.06,
+          "gen_first_ms": 25.488,
+          "gen_steady_tokens": 127,
+          "gen_steady_tps": 39.1,
+          "kvcache_bytes": 0
+        }
+      ]
+    },
+    {
+      "file": "branch-r1.csv",
+      "variant": "branch",
+      "rows": [
+        {
+          "ctx_tokens": 2048,
+          "prefill_tokens": 2048,
+          "prefill_tps": 662.35,
+          "gen_tokens": 128,
+          "gen_tps": 43.67,
+          "gen_first_ms": 24.196,
+          "gen_steady_tokens": 127,
+          "gen_steady_tps": 43.75,
+          "kvcache_bytes": 52184460
+        },
+        {
+          "ctx_tokens": 4096,
+          "prefill_tokens": 2048,
+          "prefill_tps": 609.3,
+          "gen_tokens": 128,
+          "gen_tps": 39.77,
+          "gen_first_ms": 24.256,
+          "gen_steady_tokens": 127,
+          "gen_steady_tps": 39.81,
+          "kvcache_bytes": 80373132
+        },
+        {
+          "ctx_tokens": 6144,
+          "prefill_tokens": 2048,
+          "prefill_tps": 601.19,
+          "gen_tokens": 128,
+          "gen_tps": 39.5,
+          "gen_first_ms": 26.041,
+          "gen_steady_tokens": 127,
+          "gen_steady_tps": 39.55,
+          "kvcache_bytes": 108561804
+        },
+        {
+          "ctx_tokens": 8192,
+          "prefill_tokens": 2048,
+          "prefill_tps": 594.28,
+          "gen_tokens": 128,
+          "gen_tps": 39.19,
+          "gen_first_ms": 25.342,
+          "gen_steady_tokens": 127,
+          "gen_steady_tps": 39.23,
+          "kvcache_bytes": 0
+        }
+      ]
+    },
+    {
+      "file": "branch-r2.csv",
+      "variant": "branch",
+      "rows": [
+        {
+          "ctx_tokens": 2048,
+          "prefill_tokens": 2048,
+          "prefill_tps": 663.98,
+          "gen_tokens": 128,
+          "gen_tps": 43.67,
+          "gen_first_ms": 24.514,
+          "gen_steady_tokens": 127,
+          "gen_steady_tps": 43.75,
+          "kvcache_bytes": 52184460
+        },
+        {
+          "ctx_tokens": 4096,
+          "prefill_tokens": 2048,
+          "prefill_tps": 609.42,
+          "gen_tokens": 128,
+          "gen_tps": 39.75,
+          "gen_first_ms": 24.263,
+          "gen_steady_tokens": 127,
+          "gen_steady_tps": 39.78,
+          "kvcache_bytes": 80373132
+        },
+        {
+          "ctx_tokens": 6144,
+          "prefill_tokens": 2048,
+          "prefill_tps": 601.27,
+          "gen_tokens": 128,
+          "gen_tps": 39.46,
+          "gen_first_ms": 25.951,
+          "gen_steady_tokens": 127,
+          "gen_steady_tps": 39.51,
+          "kvcache_bytes": 108561804
+        },
+        {
+          "ctx_tokens": 8192,
+          "prefill_tokens": 2048,
+          "prefill_tps": 594.39,
+          "gen_tokens": 128,
+          "gen_tps": 39.14,
+          "gen_first_ms": 25.348,
+          "gen_steady_tokens": 127,
+          "gen_steady_tps": 39.19,
+          "kvcache_bytes": 0
+        }
+      ]
+    },
+    {
+      "file": "main-r2.csv",
+      "variant": "main",
+      "rows": [
+        {
+          "ctx_tokens": 2048,
+          "prefill_tokens": 2048,
+          "prefill_tps": 642.3,
+          "gen_tokens": 128,
+          "gen_tps": 43.52,
+          "gen_first_ms": 24.414,
+          "gen_steady_tokens": 127,
+          "gen_steady_tps": 43.6,
+          "kvcache_bytes": 52184460
+        },
+        {
+          "ctx_tokens": 4096,
+          "prefill_tokens": 2048,
+          "prefill_tps": 587.01,
+          "gen_tokens": 128,
+          "gen_tps": 39.64,
+          "gen_first_ms": 24.279,
+          "gen_steady_tokens": 127,
+          "gen_steady_tps": 39.68,
+          "kvcache_bytes": 80373132
+        },
+        {
+          "ctx_tokens": 6144,
+          "prefill_tokens": 2048,
+          "prefill_tps": 579.47,
+          "gen_tokens": 128,
+          "gen_tps": 39.36,
+          "gen_first_ms": 26.159,
+          "gen_steady_tokens": 127,
+          "gen_steady_tps": 39.42,
+          "kvcache_bytes": 108561804
+        },
+        {
+          "ctx_tokens": 8192,
+          "prefill_tokens": 2048,
+          "prefill_tps": 573.01,
+          "gen_tokens": 128,
+          "gen_tps": 39.05,
+          "gen_first_ms": 26.171,
+          "gen_steady_tokens": 127,
+          "gen_steady_tps": 39.1,
+          "kvcache_bytes": 0
+        }
+      ]
+    }
+  ],
+  "per_frontier": [
+    {
+      "ctx_tokens": 2048,
+      "prefill_tokens": 2048,
+      "gen_tokens": 128,
+      "gen_steady_tokens": 127,
+      "main": {
+        "prefill_tps": {
+          "value": 642.1349576023733,
+          "aggregation": "equal_work_harmonic_mean",
+          "min": 641.97,
+          "max": 642.3
+        },
+        "gen_tps": {
+          "value": 43.14174064202109,
+          "aggregation": "equal_work_harmonic_mean",
+          "min": 42.77,
+          "max": 43.52
+        },
+        "gen_steady_tps": {
+          "value": 43.55996326905418,
+          "aggregation": "equal_work_harmonic_mean",
+          "min": 43.52,
+          "max": 43.6
+        },
+        "gen_first_ms": {
+          "value": 47.508,
+          "aggregation": "arithmetic_mean",
+          "min": 24.414,
+          "max": 70.602
+        }
+      },
+      "branch": {
+        "prefill_tps": {
+          "value": 663.1639984016043,
+          "aggregation": "equal_work_harmonic_mean",
+          "min": 662.35,
+          "max": 663.98
+        },
+        "gen_tps": {
+          "value": 43.67,
+          "aggregation": "equal_work_harmonic_mean",
+          "min": 43.67,
+          "max": 43.67
+        },
+        "gen_steady_tps": {
+          "value": 43.75,
+          "aggregation": "equal_work_harmonic_mean",
+          "min": 43.75,
+          "max": 43.75
+        },
+        "gen_first_ms": {
+          "value": 24.355,
+          "aggregation": "arithmetic_mean",
+          "min": 24.196,
+          "max": 24.514
+        }
+      },
+      "branch_vs_main_pct": {
+        "prefill_tps": 3.27486310319407,
+        "gen_tps": 1.224473908835222,
+        "gen_steady_tps": 0.4362646721532526,
+        "gen_first_ms": -48.734949903174204
+      }
+    },
+    {
+      "ctx_tokens": 4096,
+      "prefill_tokens": 2048,
+      "gen_tokens": 128,
+      "gen_steady_tokens": 127,
+      "main": {
+        "prefill_tps": {
+          "value": 586.9849989352368,
+          "aggregation": "equal_work_harmonic_mean",
+          "min": 586.96,
+          "max": 587.01
+        },
+        "gen_tps": {
+          "value": 39.61998990408884,
+          "aggregation": "equal_work_harmonic_mean",
+          "min": 39.6,
+          "max": 39.64
+        },
+        "gen_steady_tps": {
+          "value": 39.65998991427131,
+          "aggregation": "equal_work_harmonic_mean",
+          "min": 39.64,
+          "max": 39.68
+        },
+        "gen_first_ms": {
+          "value": 24.34,
+          "aggregation": "arithmetic_mean",
+          "min": 24.279,
+          "max": 24.401
+        }
+      },
+      "branch": {
+        "prefill_tps": {
+          "value": 609.3599940921623,
+          "aggregation": "equal_work_harmonic_mean",
+          "min": 609.3,
+          "max": 609.42
+        },
+        "gen_tps": {
+          "value": 39.759997484909455,
+          "aggregation": "equal_work_harmonic_mean",
+          "min": 39.75,
+          "max": 39.77
+        },
+        "gen_steady_tps": {
+          "value": 39.79499434602337,
+          "aggregation": "equal_work_harmonic_mean",
+          "min": 39.78,
+          "max": 39.81
+        },
+        "gen_first_ms": {
+          "value": 24.259500000000003,
+          "aggregation": "arithmetic_mean",
+          "min": 24.256,
+          "max": 24.263
+        }
+      },
+      "branch_vs_main_pct": {
+        "prefill_tps": 3.8118512734588883,
+        "gen_tps": 0.35337611432901816,
+        "gen_steady_tps": 0.3404046043478326,
+        "gen_first_ms": -0.33073130649136084
+      }
+    },
+    {
+      "ctx_tokens": 6144,
+      "prefill_tokens": 2048,
+      "gen_tokens": 128,
+      "gen_steady_tokens": 127,
+      "main": {
+        "prefill_tps": {
+          "value": 579.5649844279762,
+          "aggregation": "equal_work_harmonic_mean",
+          "min": 579.47,
+          "max": 579.66
+        },
+        "gen_tps": {
+          "value": 39.36499936491807,
+          "aggregation": "equal_work_harmonic_mean",
+          "min": 39.36,
+          "max": 39.37
+        },
+        "gen_steady_tps": {
+          "value": 39.42499936588459,
+          "aggregation": "equal_work_harmonic_mean",
+          "min": 39.42,
+          "max": 39.43
+        },
+        "gen_first_ms": {
+          "value": 26.188,
+          "aggregation": "arithmetic_mean",
+          "min": 26.159,
+          "max": 26.217
+        }
+      },
+      "branch": {
+        "prefill_tps": {
+          "value": 601.2299973387888,
+          "aggregation": "equal_work_harmonic_mean",
+          "min": 601.19,
+          "max": 601.27
+        },
+        "gen_tps": {
+          "value": 39.47998986828774,
+          "aggregation": "equal_work_harmonic_mean",
+          "min": 39.46,
+          "max": 39.5
+        },
+        "gen_steady_tps": {
+          "value": 39.529989881102956,
+          "aggregation": "equal_work_harmonic_mean",
+          "min": 39.51,
+          "max": 39.55
+        },
+        "gen_first_ms": {
+          "value": 25.996000000000002,
+          "aggregation": "arithmetic_mean",
+          "min": 25.951,
+          "max": 26.041
+        }
+      },
+      "branch_vs_main_pct": {
+        "prefill_tps": 3.7381507670267045,
+        "gen_tps": 0.2921135659210705,
+        "gen_steady_tps": 0.2663044182803942,
+        "gen_first_ms": -0.7331602260577275
+      }
+    },
+    {
+      "ctx_tokens": 8192,
+      "prefill_tokens": 2048,
+      "gen_tokens": 128,
+      "gen_steady_tokens": 127,
+      "main": {
+        "prefill_tps": {
+          "value": 572.8949769154906,
+          "aggregation": "equal_work_harmonic_mean",
+          "min": 572.78,
+          "max": 573.01
+        },
+        "gen_tps": {
+          "value": 39.054999359877094,
+          "aggregation": "equal_work_harmonic_mean",
+          "min": 39.05,
+          "max": 39.06
+        },
+        "gen_steady_tps": {
+          "value": 39.1,
+          "aggregation": "equal_work_harmonic_mean",
+          "min": 39.1,
+          "max": 39.1
+        },
+        "gen_first_ms": {
+          "value": 25.8295,
+          "aggregation": "arithmetic_mean",
+          "min": 25.488,
+          "max": 26.171
+        }
+      },
+      "branch": {
+        "prefill_tps": {
+          "value": 594.3349949102779,
+          "aggregation": "equal_work_harmonic_mean",
+          "min": 594.28,
+          "max": 594.39
+        },
+        "gen_tps": {
+          "value": 39.16498404187413,
+          "aggregation": "equal_work_harmonic_mean",
+          "min": 39.14,
+          "max": 39.19
+        },
+        "gen_steady_tps": {
+          "value": 39.20998979852078,
+          "aggregation": "equal_work_harmonic_mean",
+          "min": 39.19,
+          "max": 39.23
+        },
+        "gen_first_ms": {
+          "value": 25.345,
+          "aggregation": "arithmetic_mean",
+          "min": 25.342,
+          "max": 25.348
+        }
+      },
+      "branch_vs_main_pct": {
+        "prefill_tps": 3.7423993678949774,
+        "gen_tps": 0.28161486058049245,
+        "gen_steady_tps": 0.2813038325339523,
+        "gen_first_ms": -1.8757622098763083
+      }
+    }
+  ],
+  "per_frontier_delta_ranges": {
+    "prefill_tps": {
+      "min_pct": 3.27486310319407,
+      "max_pct": 3.8118512734588883,
+      "higher_is_better": true,
+      "regressed_frontiers": []
+    },
+    "gen_tps": {
+      "min_pct": 0.28161486058049245,
+      "max_pct": 1.224473908835222,
+      "higher_is_better": true,
+      "regressed_frontiers": []
+    },
+    "gen_steady_tps": {
+      "min_pct": 0.2663044182803942,
+      "max_pct": 0.4362646721532526,
+      "higher_is_better": true,
+      "regressed_frontiers": []
+    },
+    "gen_first_ms": {
+      "min_pct": -48.734949903174204,
+      "max_pct": -0.33073130649136084,
+      "higher_is_better": false,
+      "regressed_frontiers": []
+    }
+  },
+  "pooled": {
+    "main": {
+      "timed_frontier_samples": 8,
+      "prefill_tps": 594.1877657815694,
+      "total_prefill_tokens": 16384,
+      "estimated_prefill_seconds": 27.57377540153352,
+      "gen_tps": 40.2303646486336,
+      "total_gen_tokens": 1024,
+      "estimated_gen_seconds": 25.45341084883205,
+      "gen_steady_tps": 40.35868662393908,
+      "total_gen_steady_tokens": 1016,
+      "estimated_gen_steady_seconds": 25.174258257387184,
+      "gen_first_ms": 30.966375
+    },
+    "branch": {
+      "timed_frontier_samples": 8,
+      "prefill_tps": 615.8774630635164,
+      "total_prefill_tokens": 16384,
+      "estimated_prefill_seconds": 26.602694501114243,
+      "gen_tps": 40.43989657210332,
+      "total_gen_tokens": 1024,
+      "estimated_gen_seconds": 25.321528658567008,
+      "gen_steady_tps": 40.49120479874834,
+      "total_gen_steady_tokens": 1016,
+      "estimated_gen_steady_seconds": 25.091868840400778,
+      "gen_first_ms": 24.988875
+    },
+    "branch_vs_main_pct": {
+      "prefill_tps": 3.650310311155147,
+      "gen_tps": 0.5208302865254755,
+      "gen_steady_tps": 0.3283510587053229,
+      "gen_first_ms": -19.303195805127338
+    }
+  },
+  "validation": {
+    "status": "finite_float32_bit_exact",
+    "scope": "four prefill frontier dumps only; not per-decode logits or token sequences",
+    "prefill_float32_values": 517120,
+    "matching_frontier_argmax_ids": 4,
+    "generated_text": {
+      "status": "byte_identical",
+      "scope": "decoded text only; not a token-ID or per-decode-logit equality assertion",
+      "generated_tokens_per_frontier_per_variant": 128,
+      "total_bytes": 1632,
+      "frontiers": [
+        {"ctx_tokens": 2048, "bytes": 437, "sha256": "483d0dc8e300fa8c15dac4b197f649e903cf7089d7673454accc00c9e415d9c4"},
+        {"ctx_tokens": 4096, "bytes": 400, "sha256": "43e1152713880e4f6431aa09a52b49596a9fe77a62e89ae26425c4a55bb097b3"},
+        {"ctx_tokens": 6144, "bytes": 413, "sha256": "5f7e023d2085396cfc91f21b26987815bfad5bc7ab64e121fad1a0a5ff61ae23"},
+        {"ctx_tokens": 8192, "bytes": 382, "sha256": "64183b39fa9e4a04e2e3aa4b83860b52b55ea289d28d8b94bcaa372dea8d8506"}
+      ]
+    },
+    "frontiers": [
+      {
+        "ctx_tokens": 2048,
+        "float32_values": 129280,
+        "argmax_id": 668
+      },
+      {
+        "ctx_tokens": 4096,
+        "float32_values": 129280,
+        "argmax_id": 201
+      },
+      {
+        "ctx_tokens": 6144,
+        "float32_values": 129280,
+        "argmax_id": 16997
+      },
+      {
+        "ctx_tokens": 8192,
+        "float32_values": 129280,
+        "argmax_id": 77179
+      }
+    ]
+  }
+}
