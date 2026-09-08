@@ -230,6 +230,7 @@ struct k3_context {
     int q8_static;
     int gguf_resident;
     int gguf_static_resident;
+    uint8_t gguf_static_layers[K3_N_LAYER];
     int gguf_readahead_done;
     int speculative_enabled;
     k3_hidden_hook_fn hidden_hook;
@@ -1802,12 +1803,36 @@ static void try_pin_gguf_static(k3_context *ctx, uint64_t budget,
     uint64_t sizes[K3_N_LAYER + 5] = {0};
     uint32_t count = 0;
     uint64_t total = 0;
-    if (!gguf_resident_spans(ctx, 0, offsets, sizes, &count, &total) ||
-        total > budget - expert_cache_bytes) return;
+    if (!gguf_resident_spans(ctx, 0, offsets, sizes, &count, &total)) return;
+    const uint32_t layers = ctx->layer_end - ctx->layer_start + 1u;
+    const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
+    uint64_t remaining = budget - expert_cache_bytes;
+    uint32_t kept = 0;
+    uint8_t selected[K3_N_LAYER] = {0};
+    uint64_t kept_offsets[K3_N_LAYER + 5], kept_sizes[K3_N_LAYER + 5];
+    total = 0;
+    /* The output head is read in full every step. Keep its complete group
+     * first, then as many static layers as fit. Other layers still stream. */
+    for (uint32_t i = count; i-- > 0;) {
+        const uint64_t bytes =
+            (sizes[i] + (offsets[i] & (page - 1u)) + page - 1u) & ~(page - 1u);
+        if (bytes > remaining) {
+            if (i >= layers) return;
+            continue;
+        }
+        kept_offsets[kept] = offsets[i];
+        kept_sizes[kept++] = sizes[i];
+        remaining -= bytes;
+        total += bytes;
+        if (i < layers) selected[ctx->layer_start + i] = 1;
+    }
+    if (!kept) return;
     const void *base = k3_st_map_base(ctx->globals.shard);
     if (!base || !k3_gpu_pin_model_spans(base,
-            k3_st_file_size(ctx->globals.shard), offsets, sizes, count)) return;
+            k3_st_file_size(ctx->globals.shard),
+            kept_offsets, kept_sizes, kept)) return;
     ctx->gguf_static_resident = 1;
+    memcpy(ctx->gguf_static_layers, selected, sizeof(selected));
     ctx->resident_static_bytes = total;
     fprintf(stderr, "k3: pinned %.3f GiB of static GGUF weights; "
                     "%.3f GiB reserved for streamed experts\n",
@@ -4838,7 +4863,7 @@ static int evaluate(k3_context *ctx,
                true,
                err,
                errcap))
-        : ctx->gguf_static_resident
+        : ctx->gguf_static_layers[first_layer]
         ? 1
         : ctx->model->gguf
         ? k3_layer_prefetch_start(
@@ -4903,7 +4928,7 @@ static int evaluate(k3_context *ctx,
         const int layer_resident =
             ctx->q8_static || ctx->resident_static_slots[i].data != NULL;
         if (ctx->model->gguf &&
-            ((!ctx->gguf_resident && !ctx->gguf_static_resident) ||
+            ((!ctx->gguf_resident && !ctx->gguf_static_layers[i]) ||
              resident_readahead)) {
             k3_layer *loaded = NULL;
             if (!k3_layer_load_join(
@@ -4944,7 +4969,7 @@ static int evaluate(k3_context *ctx,
                 ctx->q8_static ||
                 ctx->resident_static_slots[i + 1u].data != NULL;
             const int need_next_load = ctx->model->gguf
-                ? ((!ctx->gguf_resident && !ctx->gguf_static_resident) ||
+                ? ((!ctx->gguf_resident && !ctx->gguf_static_layers[i + 1u]) ||
                    resident_readahead)
                 : !next_resident;
             if (need_next_load) {
@@ -5041,7 +5066,7 @@ static int evaluate(k3_context *ctx,
             ? 1
             : ctx->model->gguf
             ? map_gguf_layer_spans(
-                  ctx, layer, !use_static_slot && !ctx->gguf_static_resident,
+                  ctx, layer, !use_static_slot && !ctx->gguf_static_layers[i],
                   err, errcap)
             : ctx->pinned_static && layer_resident && !ctx->q8_static
             ? 1
@@ -5539,6 +5564,8 @@ int k3_context_clone(k3_context **out,
     ctx->q8_static = owner->q8_static;
     ctx->gguf_resident = owner->gguf_resident;
     ctx->gguf_static_resident = owner->gguf_static_resident;
+    memcpy(ctx->gguf_static_layers, owner->gguf_static_layers,
+           sizeof(ctx->gguf_static_layers));
     ctx->speculative_enabled = owner->speculative_enabled;
     ctx->resident_static_bytes = owner->resident_static_bytes;
     memcpy(ctx->static_slots, owner->static_slots, sizeof(ctx->static_slots));
