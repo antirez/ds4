@@ -490,7 +490,7 @@ tests/test_ssd_cache: tests/test_ssd_cache.c ds4_ssd.c ds4_ssd.h
 test-ssd-cache: tests/test_ssd_cache
 	./tests/test_ssd_cache
 
-ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_glm53_vision_gpu.cuh ds4_deepseek4_vision_gpu.cuh ds4_image.h ds4_iq2_tables_cuda.inc cuda/mmq/ds4_mmq.h
+ds4_cuda.o: ds4_cuda.cu cuda/ds4_f16_compressor.cuh ds4_gpu.h ds4_gpu_mgpu.h ds4_glm53_vision_gpu.cuh ds4_deepseek4_vision_gpu.cuh ds4_image.h ds4_iq2_tables_cuda.inc cuda/mmq/ds4_mmq.h
 	$(NVCC) $(NVCCFLAGS) -c -o $@ ds4_cuda.cu
 
 # Vendored mmq pieces (see cuda/mmq/VENDOR.md).  ds4_mmq.cu transitively
@@ -758,6 +758,29 @@ ds4.o ds4_cpu.o ds4_agent.o ds4_agent_cpu.o ds4_server.o ds4_server_cpu.o \
 ds4_test.o ds4_agent_test.o \
 ds4_cpu_test_hooks.o ds4_cuda_test_hooks.o tests/test_session_state.o \
 tests/test_session_state_gpu.o: ds4_tool_text.h
+
+# GB10 decode validation; see docs/CUDA_GB10_DECODE.md for scope and limits.
+F16_COMPRESSOR_DEPS := tests/test_cuda_f16_compressor.py tests/test_cuda_f16_compressor.cpp \
+	tests/kernel_source.py ds4_cuda.cu cuda/ds4_f16_compressor.cuh
+.PHONY: test-cuda-f16-compressor-host test-cuda-f16-compressor bench-cuda-f16-compressor
+test-cuda-f16-compressor-host: $(F16_COMPRESSOR_DEPS) tests/test_cuda_f16_compressor_policy.py
+	python3 tests/test_cuda_f16_compressor.py
+	python3 tests/test_cuda_f16_compressor_policy.py
+
+test-cuda-f16-compressor: $(F16_COMPRESSOR_DEPS)
+	NVCC="$(NVCC)" NVCCFLAGS="$(NVCCFLAGS)" python3 tests/test_cuda_f16_compressor.py --cuda
+
+bench-cuda-f16-compressor: $(F16_COMPRESSOR_DEPS)
+	NVCC="$(NVCC)" NVCCFLAGS="$(NVCCFLAGS)" python3 tests/test_cuda_f16_compressor.py --cuda --bench
+
+Q8_HC_ALIGNED_DEPS := tests/test_cuda_q8_hc_aligned.py tests/test_cuda_q8_hc_aligned.cpp \
+	tests/kernel_source.py ds4_cuda.cu
+.PHONY: test-cuda-q8-hc-aligned-host test-cuda-q8-hc-aligned
+test-cuda-q8-hc-aligned-host: $(Q8_HC_ALIGNED_DEPS)
+	python3 tests/test_cuda_q8_hc_aligned.py
+
+test-cuda-q8-hc-aligned: $(Q8_HC_ALIGNED_DEPS)
+	NVCC="$(NVCC)" NVCCFLAGS="$(NVCCFLAGS)" python3 tests/test_cuda_q8_hc_aligned.py --cuda
 
 clean:
 	rm -f tests/test_metal_ssd_experts

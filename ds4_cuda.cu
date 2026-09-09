@@ -381,6 +381,20 @@ struct cuda_q8_f32_range {
     int device_id;          /* physical CUDA device id; 0 in single-tier */
 };
 
+struct cuda_f16_pair_chunk32_range {
+    const void *host_base;
+    uint64_t weight0_offset;
+    uint64_t weight1_offset;
+    uint64_t in_dim;
+    uint32_t width;
+    __half2 *device_ptr;
+    int device_id;
+};
+static std::vector<cuda_f16_pair_chunk32_range> g_f16_pair_chunk32_ranges;
+static std::mutex g_f16_pair_chunk32_mutex;
+static uint64_t g_f16_pair_chunk32_bytes;
+static int g_f16_pair_chunk32_disabled_after_oom;
+
 enum cuda_derived_kind {
     CUDA_DERIVED_IQ2_XXS_ALIGNED_MOE = 4,
     CUDA_DERIVED_Q8_0_ALIGNED_DENSE = 5,
@@ -2539,7 +2553,27 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
     return 1;
 }
 
+static void cuda_f16_pair_chunk32_release_all(void) {
+    std::lock_guard<std::mutex> lock(g_f16_pair_chunk32_mutex);
+    if (!g_f16_pair_chunk32_ranges.empty()) {
+        /* Captured consumers must not retain the immutable cache pointers
+         * across model changes. cudaFree drains their submitted device work. */
+        ds4_gpu_decode_graphs_invalidate();
+        int previous_device = -1;
+        (void)cudaGetDevice(&previous_device);
+        for (const cuda_f16_pair_chunk32_range &r : g_f16_pair_chunk32_ranges) {
+            (void)cudaSetDevice(r.device_id);
+            (void)cudaFree(r.device_ptr);
+        }
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        g_f16_pair_chunk32_ranges.clear();
+    }
+    g_f16_pair_chunk32_bytes = 0;
+    g_f16_pair_chunk32_disabled_after_oom = 0;
+}
+
 static void cuda_model_range_release_all(void) {
+    cuda_f16_pair_chunk32_release_all();
     for (const cuda_model_range &r : g_model_ranges) {
         if (r.host_registered && r.registered_base) {
             (void)cudaHostUnregister(r.registered_base);
@@ -4891,6 +4925,79 @@ __global__ static void matmul_f16_pair_ordered_chunks_kernel(
     }
 }
 
+#include "cuda/ds4_f16_compressor.cuh"
+
+/* The caller holds g_f16_pair_chunk32_mutex through the consumer enqueue.
+ * Entries are immutable and never evicted during decode. The bounded cache
+ * is released with the model ranges, after graph invalidation. */
+static int cuda_f16_pair_chunk32_get(
+        const void *model_map,
+        uint64_t weight0_offset,
+        uint64_t weight1_offset,
+        const __half *w0,
+        const __half *w1,
+        uint64_t in_dim,
+        uint32_t width,
+        int device_id,
+        cudaStream_t stream,
+        const __half2 **out) {
+    *out = NULL;
+    for (const cuda_f16_pair_chunk32_range &r : g_f16_pair_chunk32_ranges) {
+        if (r.host_base == model_map && r.weight0_offset == weight0_offset &&
+            r.weight1_offset == weight1_offset && r.in_dim == in_dim &&
+            r.width == width && r.device_id == device_id) {
+            *out = r.device_ptr;
+            return 1;
+        }
+    }
+    if (g_f16_pair_chunk32_disabled_after_oom || g_decode_graph_capturing) {
+        return 0;
+    }
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess ||
+        capture != cudaStreamCaptureStatusNone) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    if (in_dim == 0u || in_dim % 256u != 0u ||
+        (uint64_t)width > SIZE_MAX / sizeof(__half2) / in_dim) return 0;
+    const size_t count = (size_t)width * in_dim;
+    const uint64_t bytes = count * sizeof(__half2);
+    const uint64_t cache_limit = 1ull << 30;
+    if (bytes > cache_limit || g_f16_pair_chunk32_bytes > cache_limit - bytes) {
+        return 0;
+    }
+    __half2 *device_ptr = NULL;
+    cudaError_t err = cudaMalloc(&device_ptr, (size_t)bytes);
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: CUDA F16 compressor transpose disabled after "
+                "allocation failure (%.2f MiB): %s\n",
+                (double)bytes / 1048576.0, cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        g_f16_pair_chunk32_disabled_after_oom = 1;
+        return 0;
+    }
+    f16_pair_chunk32_repack_kernel<<<
+        (unsigned)((count + 255u) / 256u), 256, 0, stream>>>(
+            device_ptr, w0, w1, in_dim, width);
+    err = cudaGetLastError();
+    /* Publish only completed immutable weights. A later capture or another
+     * stream may consume the cached address without inheriting this stream. */
+    if (err == cudaSuccess) err = cudaStreamSynchronize(stream);
+    if (err != cudaSuccess) {
+        (void)cudaFree(device_ptr);
+        (void)cudaGetLastError();
+        return -1;
+    }
+    g_f16_pair_chunk32_ranges.push_back({
+        model_map, weight0_offset, weight1_offset, in_dim, width,
+        device_ptr, device_id});
+    g_f16_pair_chunk32_bytes += bytes;
+    *out = device_ptr;
+    return 1;
+}
+
 __global__ static void matmul_f32_kernel(
         float *out,
         const float *w,
@@ -4996,6 +5103,21 @@ __device__ __forceinline__ static int32_t dot_i8_block(const int8_t *a, const in
     if (use_dp4a && n == 32u) return dot_i8x32_dp4a(a, b);
     int32_t dot = 0;
     for (uint64_t i = 0; i < n; i++) dot += (int32_t)a[i] * (int32_t)b[i];
+    return dot;
+}
+
+__device__ __forceinline__ static int32_t dot_i8x32_aligned_int4(
+        const int4 &a0, const int4 &a1, const int8_t *b) {
+    const int32_t *bi = (const int32_t *)b;
+    int32_t dot = 0;
+    dot = __dp4a(a0.x, bi[0], dot);
+    dot = __dp4a(a0.y, bi[1], dot);
+    dot = __dp4a(a0.z, bi[2], dot);
+    dot = __dp4a(a0.w, bi[3], dot);
+    dot = __dp4a(a1.x, bi[4], dot);
+    dot = __dp4a(a1.y, bi[5], dot);
+    dot = __dp4a(a1.z, bi[6], dot);
+    dot = __dp4a(a1.w, bi[7], dot);
     return dot;
 }
 
@@ -5569,6 +5691,74 @@ __global__ static void matmul_q8_0_hc_expand_preq_warp8_kernel(
         const int8_t *xqb = xq + b * 32;
         int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
         acc += __half2float(*scale_h) * xscale[b] * (float)dot;
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0) {
+        const uint32_t d = (uint32_t)row;
+        block_out[d] = acc;
+        float block_v = acc;
+        if (has_owned_slots) {
+            const float routed = moe_owned_packed_combine_row(
+                    owned_home_slots,
+                    owned_peer_packed,
+                    owned_selected,
+                    d,
+                    (uint32_t)out_dim,
+                    owned_expert_split);
+            block_v = __fadd_rn(block_v, routed);
+        } else if (has_add) {
+            float add_v = block_add[d];
+            if (has_add2) add_v += block_add2[d];
+            block_v += add_v;
+        }
+        const float *post = split + n_hc;
+        const float *comb = split + 2u * n_hc;
+        for (uint32_t dst_hc = 0; dst_hc < n_hc; dst_hc++) {
+            float hc_acc = block_v * post[dst_hc];
+            for (uint32_t src_hc = 0; src_hc < n_hc; src_hc++) {
+                const float comb_v = comb[dst_hc + (uint64_t)src_hc * n_hc];
+                const float res_v = residual_hc[(uint64_t)src_hc * n_embd + d];
+                hc_acc += comb_v * res_v;
+            }
+            out_hc[(uint64_t)dst_hc * n_embd + d] = hc_acc;
+        }
+    }
+}
+
+/* The aligned artifact changes only weight loads: preserve the raw kernel's
+ * Q8_0 activation scales, lane/block order and fused HC epilogue. */
+__global__ static void matmul_q8_0_hc_expand_aligned_preq_warp8_kernel(
+        float *out_hc,
+        float *block_out,
+        const float *block_add,
+        const float *block_add2,
+        const float *owned_home_slots,
+        const float *owned_peer_packed,
+        const int32_t *owned_selected,
+        const float *residual_hc,
+        const float *split,
+        const int4 *w_qs,
+        const __half *w_dq,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t out_dim,
+        uint32_t n_embd,
+        uint32_t n_hc,
+        uint64_t blocks,
+        int has_add,
+        int has_add2,
+        int has_owned_slots,
+        uint32_t owned_expert_split) {
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    if (row >= out_dim) return;
+    const uint64_t rbase = row * blocks;
+    float acc = 0.0f;
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        const int4 w0 = w_qs[(rbase + b) * 2u];
+        const int4 w1 = w_qs[(rbase + b) * 2u + 1u];
+        const int32_t dot = dot_i8x32_aligned_int4(w0, w1, xq + b * 32u);
+        acc += __half2float(w_dq[rbase + b]) * xscale[b] * (float)dot;
     }
     acc = warp_sum_f32(acc);
     if (lane == 0) {
@@ -15706,6 +15896,33 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_decode_rows_exact_tensor(
                    "q8_0 pair decode rows exact warp launch");
 }
 
+/* GB10 builds these artifacts during model setup. Lookup never allocates or
+ * repacks while a decode graph is being captured; missing artifacts retain
+ * the canonical raw-weight implementation. */
+static const char *cuda_q8_hc_aligned_weight_ptr(
+        const void *model_map,
+        uint64_t weight_offset,
+        uint64_t weight_bytes,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        int logical_tier,
+        int use_dp4a) {
+    if (g_n_gpus != 1 || logical_tier != 0 || !g_cuda_is_gb10[0] ||
+        !model_map || !use_dp4a || !cuda_aligned_q8_enabled() ||
+        getenv("DS4_CUDA_NO_Q8_FUSED_ALIGNED") != NULL ||
+        in_dim == 0u || out_dim == 0u ||
+        in_dim > INT_MAX || out_dim > INT_MAX ||
+        (in_dim % 1024u) != 0u || (out_dim % 128u) != 0u) {
+        return NULL;
+    }
+    const uint64_t aligned_bytes =
+        ds4_mmq_q8_0_aligned_bytes((int)out_dim, (int)in_dim);
+    return aligned_bytes ? cuda_derived_weight_ptr(
+        model_map, weight_offset, weight_bytes,
+        CUDA_DERIVED_Q8_0_ALIGNED_DENSE,
+        in_dim, out_dim, 1u, aligned_bytes) : NULL;
+}
+
 static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
         ds4_gpu_tensor       *out_hc,
         ds4_gpu_tensor       *block_out,
@@ -15753,19 +15970,54 @@ static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
         return 0;
     }
     const int logical_tier = ds4_tensor_device_idx(out_hc);
+    if (logical_tier < 0 || logical_tier >= g_n_gpus) return 0;
     const char *wptr = cuda_resolve_weight_ptr(model_map, weight_offset, weight_bytes, logical_tier, label ? label : "q8_0_hc_expand");
     if (!wptr) return 0;
 
     const uint64_t xq_bytes = blocks * 32u;
     const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
     const uint64_t tmp_bytes = scale_offset + blocks * sizeof(float);
+    /* Capture may only reuse the scratch warmed by the preceding eager pass.
+     * Growing it would free pointers baked into existing graphs. */
+    const bool scratch_ready = g_n_gpus == 1
+        ? g_cuda_tmp && g_cuda_tmp_bytes >= tmp_bytes
+        : g_gpu[logical_tier].scratch &&
+          g_gpu[logical_tier].scratch_bytes >= tmp_bytes;
+    if (g_decode_graph_capturing && !scratch_ready) return 0;
     void *tmp = cuda_tmp_alloc_on(logical_tier, tmp_bytes, "q8_0 hc expand prequant");
     if (!tmp) return 0;
     int8_t *xq = (int8_t *)tmp;
     float *xscale = (float *)((char *)tmp + scale_offset);
     const int use_dp4a = cuda_q8_use_dp4a();
+    const char *aligned = cuda_q8_hc_aligned_weight_ptr(
+        model_map, weight_offset, weight_bytes, in_dim, out_dim,
+        logical_tier, use_dp4a);
     quantize_q8_0_f32_kernel<<<(unsigned)blocks, 32, 0, cuda_decode_stream()>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand quantize launch")) return 0;
+    if (aligned) {
+        const uint64_t nblk = out_dim * blocks;
+        const uint64_t dq_bytes = (nblk * sizeof(__half) + 63u) & ~63ull;
+        matmul_q8_0_hc_expand_aligned_preq_warp8_kernel<<<
+            ((unsigned)out_dim + 7u) / 8u, 256, 0, cuda_decode_stream()>>>(
+                (float *)out_hc->ptr,
+                (float *)block_out->ptr,
+                block_add ? (const float *)block_add->ptr : (const float *)block_out->ptr,
+                block_add2 ? (const float *)block_add2->ptr : (const float *)block_out->ptr,
+                owned_home_slots ? (const float *)owned_home_slots->ptr : NULL,
+                owned_peer_packed ? (const float *)owned_peer_packed->ptr : NULL,
+                owned_selected ? (const int32_t *)owned_selected->ptr : NULL,
+                (const float *)residual_hc->ptr,
+                (const float *)split->ptr,
+                (const int4 *)(aligned + dq_bytes),
+                (const __half *)aligned,
+                xq, xscale, out_dim, n_embd, n_hc, blocks,
+                block_add ? 1 : 0,
+                block_add2 ? 1 : 0,
+                owned_home_slots ? 1 : 0,
+                owned_expert_split);
+        /* A failed submitted writer is an error, never a raw-path retry. */
+        return cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand aligned launch");
+    }
     matmul_q8_0_hc_expand_preq_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256, 0, cuda_decode_stream()>>>(
             (float *)out_hc->ptr,
             (float *)block_out->ptr,
@@ -16172,6 +16424,14 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
     return cuda_ok(cudaGetLastError(), "matmul_f16_pair_ordered_chunks launch");
 }
 
+static bool cuda_f16_compressor_ranges_overlap(
+        const void *a, uint64_t a_bytes, const void *b, uint64_t b_bytes) {
+    if (a_bytes == 0u || b_bytes == 0u) return false;
+    const uintptr_t aa = (uintptr_t)a;
+    const uintptr_t bb = (uintptr_t)b;
+    return aa <= bb ? bb - aa < a_bytes : aa - bb < b_bytes;
+}
+
 extern "C" int ds4_gpu_matmul_f16_pair_compressor_store_tensor(
         ds4_gpu_tensor *out_kv,
         ds4_gpu_tensor *out_score,
@@ -16188,22 +16448,112 @@ extern "C" int ds4_gpu_matmul_f16_pair_compressor_store_tensor(
         const ds4_gpu_tensor *x,
         uint32_t ratio,
         uint32_t pos) {
-    (void)out_kv;
-    (void)out_score;
-    (void)state_kv;
-    (void)state_score;
-    (void)model_map;
-    (void)model_size;
-    (void)weight_kv_offset;
-    (void)weight_score_offset;
-    (void)ape_offset;
-    (void)ape_type;
-    (void)in_dim;
-    (void)width;
-    (void)x;
-    (void)ratio;
-    (void)pos;
-    return 0;
+    if (g_quality_mode || g_n_gpus != 1 || !g_cuda_is_gb10[0] ||
+        getenv("DS4_CUDA_NO_F16_PAIR_COMPRESSOR_STORE") != NULL ||
+        getenv("DS4_CUDA_NO_F16_PAIR_MATMUL") != NULL ||
+        getenv("DS4_CUDA_SERIAL_F16_MATMUL") != NULL ||
+        getenv("DS4_CUDA_SERIAL_ROUTER") != NULL ||
+        getenv("DS4_CUDA_NO_ORDERED_F16_MATMUL") != NULL) return 0;
+    /* The automatic path in ff749b84 covered these Flash/Pro decode shapes.
+     * Keep every other device, shape and quality path on the current fallback. */
+    if (in_dim != 4096u ||
+        !((ratio == 4u && (width == 256u || width == 1024u)) ||
+          (ratio == 128u && width == 512u))) return 0;
+    if (!out_kv || !out_score || !state_kv || !state_score || !x ||
+        !out_kv->ptr || !out_score->ptr || !state_kv->ptr ||
+        !state_score->ptr || !x->ptr || !model_map ||
+        (ape_type != 0u && ape_type != 1u)) return -1;
+
+    const uint64_t weight_bytes = (uint64_t)width * in_dim * sizeof(__half);
+    const uint64_t output_bytes = (uint64_t)width * sizeof(float);
+    const uint64_t input_bytes = in_dim * sizeof(float);
+    const uint64_t ape_bytes = (uint64_t)width * ratio *
+        (ape_type == 1u ? sizeof(__half) : sizeof(float));
+    const uint64_t state_bytes = (uint64_t)width * ratio *
+        (ratio == 4u ? 2u : 1u) * sizeof(float);
+    if (weight_kv_offset > model_size ||
+        weight_bytes > model_size - weight_kv_offset ||
+        weight_score_offset > model_size ||
+        weight_bytes > model_size - weight_score_offset ||
+        ape_offset > model_size || ape_bytes > model_size - ape_offset ||
+        x->bytes < input_bytes || out_kv->bytes < output_bytes ||
+        out_score->bytes < output_bytes || state_kv->bytes < state_bytes ||
+        state_score->bytes < state_bytes) return -1;
+
+    const int logical_tier = ds4_tensor_device_idx(out_kv);
+    if (logical_tier != 0 || ds4_tensor_device_idx(out_score) != logical_tier ||
+        ds4_tensor_device_idx(state_kv) != logical_tier ||
+        ds4_tensor_device_idx(state_score) != logical_tier ||
+        ds4_tensor_device_idx(x) != logical_tier) return 0;
+    const int device_id = g_gpu[logical_tier].device_id;
+    int active_device = -1;
+    if (cudaGetDevice(&active_device) != cudaSuccess ||
+        active_device != device_id) {
+        (void)cudaGetLastError();
+        return -1;
+    }
+    const void *writes[] = {out_kv->ptr, out_score->ptr,
+                            state_kv->ptr, state_score->ptr};
+    const uint64_t write_bytes[] = {output_bytes, output_bytes,
+                                    state_bytes, state_bytes};
+    for (unsigned i = 0; i < 4u; ++i) {
+        if (cuda_f16_compressor_ranges_overlap(
+                writes[i], write_bytes[i], x->ptr, input_bytes)) return 0;
+        for (unsigned j = i + 1u; j < 4u; ++j) {
+            if (cuda_f16_compressor_ranges_overlap(
+                    writes[i], write_bytes[i], writes[j], write_bytes[j])) {
+                return 0;
+            }
+        }
+    }
+    const __half *w_kv = (const __half *)cuda_resolve_weight_ptr(
+        model_map, weight_kv_offset, weight_bytes, logical_tier,
+        "f16 compressor kv");
+    const __half *w_score = (const __half *)cuda_resolve_weight_ptr(
+        model_map, weight_score_offset, weight_bytes, logical_tier,
+        "f16 compressor score");
+    const void *ape = cuda_resolve_weight_ptr(
+        model_map, ape_offset, ape_bytes, logical_tier, "compressor ape");
+    if (!w_kv || !w_score || !ape) return -1;
+    const void *reads[] = {w_kv, w_score, ape};
+    const uint64_t read_bytes[] = {weight_bytes, weight_bytes, ape_bytes};
+    for (unsigned i = 0; i < 4u; ++i) {
+        for (unsigned j = 0; j < 3u; ++j) {
+            if (cuda_f16_compressor_ranges_overlap(
+                    writes[i], write_bytes[i], reads[j], read_bytes[j])) {
+                return 0;
+            }
+        }
+    }
+
+    const cudaStream_t stream = cuda_decode_stream();
+    std::lock_guard<std::mutex> lock(g_f16_pair_chunk32_mutex);
+    const __half2 *w_pair = NULL;
+    if (getenv("DS4_CUDA_NO_F16_PAIR_COMPRESSOR_TRANSPOSE") == NULL &&
+        getenv("DS4_CUDA_NO_F16_PAIR_COMPRESSOR_TRANSPOSE_PREFETCH8") == NULL) {
+        const int cached = cuda_f16_pair_chunk32_get(
+            model_map, weight_kv_offset, weight_score_offset, w_kv, w_score,
+            in_dim, width, device_id, stream, &w_pair);
+        if (cached < 0) return -1;
+    }
+    if (w_pair) {
+        matmul_f16_pair_compressor_store_chunk32_prefetch8_kernel<<<
+            width, 32, 0, stream>>>(
+                (float *)out_kv->ptr, (float *)out_score->ptr,
+                (float *)state_kv->ptr, (float *)state_score->ptr,
+                w_pair, (const float *)x->ptr, ape, ape_type,
+                in_dim, width, ratio, pos);
+    } else {
+        matmul_f16_pair_compressor_store_ordered_chunks_kernel<<<
+            width, 32, 0, stream>>>(
+                (float *)out_kv->ptr, (float *)out_score->ptr,
+                (float *)state_kv->ptr, (float *)state_score->ptr,
+                w_kv, w_score, (const float *)x->ptr, ape, ape_type,
+                in_dim, width, ratio, pos);
+    }
+    /* A writer has been submitted: failures cannot replay the pair+store. */
+    return cuda_ok(cudaGetLastError(), "f16 pair compressor/store launch")
+        ? 1 : -1;
 }
 
 extern "C" int ds4_gpu_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
