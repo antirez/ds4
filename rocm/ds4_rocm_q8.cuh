@@ -286,6 +286,60 @@ __global__ static void matmul_q8_0_preq_batch_warp8_kernel(
     if (lane == 0) out[tok * out_dim + row] = acc;
 }
 
+/* Reuse packed Q8 weights across two activation rows, with the same
+ * per-token integer dots and wave reduction as ordinary prequant decode. */
+__global__ static void matmul_q8_0_preq_batch_warp8_tok2_kernel(
+        float *out,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t blocks,
+        int use_dp4a) {
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    if (row >= out_dim) return;
+
+    const unsigned char *wr = w + row * blocks * 34u;
+    const int8_t *xqr0 = xq;
+    const int8_t *xqr1 = xq + blocks * 32u;
+    const float *xsr0 = xscale;
+    const float *xsr1 = xscale + blocks;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        const uint64_t i0 = b * 32u;
+        const uint64_t bn = in_dim - i0 < 32u ? in_dim - i0 : 32u;
+        const __half *scale_h = (const __half *)(wr + b * 34u);
+        const int8_t *qs = (const int8_t *)(wr + b * 34u + 2u);
+        const int8_t *xqb0 = xqr0 + b * 32u;
+        const int8_t *xqb1 = xqr1 + b * 32u;
+        int dot0 = 0;
+        int dot1 = 0;
+        if (use_dp4a && bn == 32u) {
+#pragma unroll
+            for (uint32_t i = 0; i < 32u; i += 4u) {
+                const int32_t w4 = load_i8x4_i32_unaligned(qs + i);
+                dot0 = __dp4a(w4, load_i8x4_i32_aligned(xqb0 + i), dot0);
+                dot1 = __dp4a(w4, load_i8x4_i32_aligned(xqb1 + i), dot1);
+            }
+        } else {
+            dot0 = dot_i8_block(qs, xqb0, bn, use_dp4a);
+            dot1 = dot_i8_block(qs, xqb1, bn, use_dp4a);
+        }
+        const float ws = __half2float(*scale_h);
+        acc0 += ws * xsr0[b] * (float)dot0;
+        acc1 += ws * xsr1[b] * (float)dot1;
+    }
+    acc0 = warp_sum_f32(acc0);
+    acc1 = warp_sum_f32(acc1);
+    if (lane == 0) {
+        out[row] = acc0;
+        out[out_dim + row] = acc1;
+    }
+}
+
 __device__ static float q8_0_scale_scalar(const unsigned char *blk) {
     const uint16_t bits = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8);
     return __half2float(__ushort_as_half((unsigned short)bits));
