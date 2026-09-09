@@ -177,6 +177,10 @@ int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
+/* A model fd must back the associated read-only, whole-file mapping at offset
+ * zero. Keep the file immutable and the fd valid while the backend uses it;
+ * CUDA may discard mapped pages and reload their original bytes from the file.
+ * Do not associate anonymous buffers or privately modified mappings with an fd. */
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map);
 int ds4_gpu_build_derived_artifacts(const void *model_map, uint64_t model_size,

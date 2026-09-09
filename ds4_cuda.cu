@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -2106,17 +2107,21 @@ static void cuda_model_discard_source_pages_impl(
         uint64_t offset,
         uint64_t bytes,
         bool force) {
-#if defined(POSIX_MADV_DONTNEED)
+#if defined(__linux__) && defined(MADV_DONTNEED)
+    /* Unlike glibc's POSIX_MADV_DONTNEED no-op, MADV_DONTNEED can destroy
+     * anonymous/COW data. Only the immutable model-file mapping may refault. */
     if ((!force && getenv("DS4_CUDA_KEEP_MODEL_PAGES") != NULL) ||
-        !model_map || bytes == 0 || offset > model_size) return;
+        !model_map || g_model_fd < 0 || model_map != g_model_fd_host_base ||
+        model_size > g_model_file_size || bytes == 0 || offset >= model_size) return;
     if (bytes > model_size - offset) bytes = model_size - offset;
     const long page_sz_l = sysconf(_SC_PAGESIZE);
-    const uint64_t page_sz = page_sz_l > 0 ? (uint64_t)page_sz_l : 4096u;
-    const uintptr_t h0 = (uintptr_t)((const char *)model_map + offset);
-    const uintptr_t h1 = h0 + bytes;
-    const uintptr_t p0 = h0 & ~(uintptr_t)(page_sz - 1u);
-    const uintptr_t p1 = (h1 + page_sz - 1u) & ~(uintptr_t)(page_sz - 1u);
-    if (p1 > p0) (void)posix_madvise((void *)p0, (size_t)(p1 - p0), POSIX_MADV_DONTNEED);
+    if (page_sz_l <= 0) return;
+    const uint64_t page_sz = (uint64_t)page_sz_l;
+    const uintptr_t base = (uintptr_t)model_map;
+    if (base % page_sz != 0 || model_size > UINTPTR_MAX - base) return;
+    const uint64_t start = offset - offset % page_sz;
+    /* madvise rounds the length up, including the file's final partial page. */
+    (void)madvise((void *)(base + start), (size_t)(offset + bytes - start), MADV_DONTNEED);
 #else
     (void)model_map;
     (void)model_size;
@@ -2396,9 +2401,9 @@ static int cuda_model_copy_to_device_streamed(
             (void)cudaGetLastError();
             return 0;
         }
+        /* This uploader also serves transient experts. Preserve its existing
+         * file advice, but leave mmap reclamation to the persistent opt-in. */
         cuda_model_drop_file_pages(offset + copied, n);
-        cuda_model_discard_source_pages(model_map, model_size,
-                                        offset + copied, n);
         copied += n;
         chunk_idx++;
     }
@@ -2633,21 +2638,23 @@ static int cuda_stream_hot_cache_load_locked(
                 "persistent down expert copy")) {
         return 0;
     }
-    if (getenv("DS4_CUDA_DROP_PERSISTENT_SOURCE_PAGES") != NULL) {
-        cuda_model_drop_file_pages_impl(
+    if (getenv("DS4_CUDA_DROP_PERSISTENT_SOURCE_PAGES") != NULL &&
+        g_model_fd >= 0 && table->model_map == g_model_fd_host_base &&
+        table->model_size <= g_model_file_size) {
+        cuda_model_discard_source_pages_impl(
+                table->model_map, table->model_size,
                 gate_src, table->gate_expert_bytes, true);
-        cuda_model_drop_file_pages_impl(
+        cuda_model_discard_source_pages_impl(
+                table->model_map, table->model_size,
                 up_src, table->gate_expert_bytes, true);
-        cuda_model_drop_file_pages_impl(
+        cuda_model_discard_source_pages_impl(
+                table->model_map, table->model_size,
                 down_src, table->down_expert_bytes, true);
-        cuda_model_discard_source_pages_impl(
-                table->model_map, table->model_size,
+        cuda_model_drop_file_pages_impl(
                 gate_src, table->gate_expert_bytes, true);
-        cuda_model_discard_source_pages_impl(
-                table->model_map, table->model_size,
+        cuda_model_drop_file_pages_impl(
                 up_src, table->gate_expert_bytes, true);
-        cuda_model_discard_source_pages_impl(
-                table->model_map, table->model_size,
+        cuda_model_drop_file_pages_impl(
                 down_src, table->down_expert_bytes, true);
     }
 
@@ -2888,8 +2895,9 @@ static const char *cuda_model_range_ptr_from_fd(
             (void)cudaGetLastError();
             return NULL;
         }
+        /* Registration may currently describe a different support model. */
+        cuda_model_discard_source_pages(model_map, g_model_file_size, offset + copied, n);
         cuda_model_drop_file_pages(offset + copied, n);
-        cuda_model_discard_source_pages(model_map, g_model_registered_size, offset + copied, n);
         copied += n;
         cuda_model_load_progress_note(g_model_range_bytes + copied);
         chunk_idx++;

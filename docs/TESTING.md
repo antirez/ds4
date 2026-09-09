@@ -15,7 +15,12 @@ Model-free checks include:
 make ds4_test ds4_agent_test test-session-state
 ./ds4_test --server
 ./ds4_agent_test
+python3 tests/test_cuda_source_pages.py
 ```
+
+The source-page test runs on Linux without CUDA or a GPU. It verifies mmap
+reclamation and refaulted bytes plus caller policy/order with CUDA stubs; it does
+not establish GPU throughput or filesystem page-cache eviction under load.
 
 On Metal, small GPU tensor tests are available without loading a full GGUF:
 

@@ -73,6 +73,22 @@ Leave expert preloading enabled for normal use. `--ssd-streaming-cold` and
 `--ssd-streaming-preload-experts N` are mainly useful for controlled measurements.
 See [benchmarking](PERFORMANCE.md) and the [release QA guide](../QA_BEFORE_RELEASES.md).
 
+## CUDA/Linux source-page reclamation
+
+`DS4_CUDA_KEEP_MODEL_PAGES=1` disables normal source-page and file-cache discard.
+`DS4_CUDA_DROP_PERSISTENT_SOURCE_PAGES=1` overrides that policy for experts
+successfully copied into CUDA's persistent cache: it releases their mapping pages
+before advising file-cache eviction. Transient expert uploads retain their
+existing file-cache advice but do not discard the source mapping.
+
+Both variables are presence-based: unset them to disable them; setting either to
+`0` still enables it. Reclamation applies only to the read-only, whole-file
+mapping associated with the model fd. Keep the GGUF unchanged while it is loaded.
+It is best-effort: pinned pages or other mappings can prevent eviction, and lower
+mapping RSS alone does not prove lower file-cache residency. Measure memory and
+inference throughput together, since later cache misses may read pages from
+storage again.
+
 ## M5 Max measurements
 
 On a 128 GB M5 Max, with automatic cache sizing and no speculative decoding:
