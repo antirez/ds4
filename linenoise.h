@@ -44,6 +44,7 @@ extern "C" {
 #endif
 
 #include <stddef.h> /* For size_t. */
+#include <stdint.h>
 
 extern char *linenoiseEditMore;
 
@@ -91,6 +92,11 @@ struct linenoiseState {
     size_t queued_input_len;
     size_t queued_input_pos;
     size_t queued_input_cap;
+    char pending_key[32]; /* Incomplete UTF-8 or escape sequence. */
+    size_t pending_key_len;
+    char *paste_buf;
+    size_t paste_len, paste_cap, paste_match;
+    int paste_active, paste_overflowed;
 };
 
 typedef struct linenoiseCompletions {
@@ -113,6 +119,15 @@ void linenoiseEditSetLayoutCallback(struct linenoiseState *l,
 void linenoiseEditStop(struct linenoiseState *l);
 void linenoiseHide(struct linenoiseState *l);
 void linenoiseShow(struct linenoiseState *l);
+/* UI-thread-only buffered updates; nested updates share one terminal frame. */
+void linenoiseBeginUpdate(int fd);
+void linenoiseEndUpdate(void);
+int linenoiseWrite(int fd, const char *text, size_t len);
+/* Repaint only the footer if its geometry and absolute cursor are known. */
+int linenoiseRefreshStatus(struct linenoiseState *l);
+size_t linenoiseUtf8Decode(const char *text, size_t len, uint32_t *cp);
+int linenoiseCharacterWidth(uint32_t cp);
+size_t linenoiseNextGrapheme(const char *text, size_t len, int *width);
 
 /* Blocking API. */
 char *linenoise(const char *prompt);

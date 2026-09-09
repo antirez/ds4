@@ -1,0 +1,15 @@
+# Binary Heap Push (Insert) — Pseudocode
+
+```
+function PUSH(heap, value):
+    // 1. Add the new element at the end
+    APPEND(heap.array, value)
+    index = LENGTH(heap.array) - 1
+
+    // 2. Sift up: restore heap property by swapping with parent
+    while index > 0:
+        parent = FLOOR((index - 1) / 2)
+        if heap.array[index] <= heap.array[parent]:   // min-heap
+            break
+        SWAP(heap.array[index], heap.array[parent])
+        index = parent

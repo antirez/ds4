@@ -1,1 +1,1 @@
-This is an excellent and fundamental question about how language models actually "think." The short answer is: **because the model
+To understand why tiny differences in logits can completely change a greedy continuation, you have to look at how **greed

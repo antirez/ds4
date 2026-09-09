@@ -1,0 +1,6 @@
+Here are three invariants for a tokenizer special-token table, written in a formal, implementation-agnostic style.
+
+---
+
+### Invariant 1: Uniqueness of Token Strings
+**Statement:** Every special token string in the table must be unique. No two distinct special tokens may share the same string representation

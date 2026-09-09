@@ -1,0 +1,11 @@
+# Three Invariants for a Special-Token Table
+
+**1. ID uniqueness and disjointness**
+Every special token maps to a distinct token ID, and no special-token ID collides with any ID in the regular vocabulary:
+```
+∀ (name₁, id₁), (name₂, id₂) ∈ specials: name₁ = name₂ ⟺ id₁ = id₂
+∀ (name, id) ∈ specials, ∀ v ∈ vocab: id ≠ v.id
+```
+
+**2. Range containment**
+All special-token IDs fall within the model's valid vocabulary range `[

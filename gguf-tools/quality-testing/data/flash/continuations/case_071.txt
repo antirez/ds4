@@ -1,1 +1,1 @@
-Questa è una domanda fondamentale in informatica. La risposta breve è: **perché permettono di us
+La ricerca di appartenenza (cioè verificare se un elemento è presente in una collezione) diventa molto

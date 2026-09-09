@@ -126,7 +126,7 @@ def request_vector(api_key: str, prompt: str) -> dict:
         raise RuntimeError(f"DeepSeek API HTTP {e.code}: {body}") from e
 
 
-def normalize_record(prompt_spec: dict, response: dict) -> dict:
+def normalize_record(prompt_spec: dict, response: dict, checkpoint: str) -> dict:
     choice = response["choices"][0]
     logprob_items = choice.get("logprobs", {}).get("content", []) or []
     steps = []
@@ -160,6 +160,7 @@ def normalize_record(prompt_spec: dict, response: dict) -> dict:
         "schema": "ds4-official-logprobs-v1",
         "source": "deepseek-official-api",
         "model": MODEL,
+        "checkpoint": checkpoint,
         "endpoint": ENDPOINT,
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "id": prompt_spec["id"],
@@ -189,6 +190,7 @@ def hex_bytes(values: list[int]) -> str:
 def write_compact_fixture(root: Path, manifest: dict) -> None:
     lines = [
         "# ds4-official-logprob-vectors-v1",
+        f"# checkpoint {manifest['checkpoint']}",
         "# case <id> <ctx> <steps> <prompt-file>",
         "# step <index> <selected-hex> <top-count>",
         "# top <token-hex> <official-logprob>",
@@ -219,7 +221,15 @@ def write_compact_fixture(root: Path, manifest: dict) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--out", default="tests/test-vectors", help="output directory")
+    parser.add_argument(
+        "--checkpoint",
+        required=True,
+        help="checkpoint label used in the fixture directory, for example 0731",
+    )
+    parser.add_argument(
+        "--out",
+        help="output directory (default: tests/test-vectors/flash-CHECKPOINT)",
+    )
     parser.add_argument("--only", action="append", help="fetch only the named prompt id")
     args = parser.parse_args()
 
@@ -228,7 +238,7 @@ def main() -> int:
         print("DEEPSEEK_API_KEY is required", file=sys.stderr)
         return 2
 
-    root = Path(args.out)
+    root = Path(args.out or f"tests/test-vectors/flash-{args.checkpoint}")
     prompt_dir = root / "prompts"
     official_dir = root / "official"
     prompt_dir.mkdir(parents=True, exist_ok=True)
@@ -239,6 +249,7 @@ def main() -> int:
         "schema": "ds4-test-vector-manifest-v1",
         "source": "deepseek-official-api",
         "model": MODEL,
+        "checkpoint": args.checkpoint,
         "endpoint": ENDPOINT,
         "top_logprobs": TOP_LOGPROBS,
         "max_tokens": MAX_TOKENS,
@@ -252,7 +263,7 @@ def main() -> int:
         prompt_path.write_text(spec["prompt"], encoding="utf-8")
 
         response = request_vector(api_key, spec["prompt"])
-        record = normalize_record(spec, response)
+        record = normalize_record(spec, response, args.checkpoint)
         out_path = official_dir / f"{spec['id']}.official.json"
         out_path.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         manifest["prompts"].append(

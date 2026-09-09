@@ -1,5 +1,6 @@
 Here's pseudocode for a binary heap push (insert) operation:
 
+## Binary Heap Push Operation
+
 ```
-function push(heap, value):
-    //
+PUSH(

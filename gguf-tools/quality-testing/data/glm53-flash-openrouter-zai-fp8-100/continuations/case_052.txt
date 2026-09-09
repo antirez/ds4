@@ -1,0 +1,13 @@
+# Online Softmax nell'Attenzione
+
+## Il problema
+
+Nell'attenzione serve calcolare:
+
+$$\text{softmax}(q \cdot k_i) = \frac{e^{q \cdot k_i}}{\sum_j e^{q \cdot k_j}}$$
+
+Il problema: per calcolare il denominatore servono **tutti** i punteggi $s_j = q \cdot k_j$ prima di poter normalizzare. Con sequenze lunghe, non puoi tenere in memoria tutti i punteggi contemporaneamente.
+
+## L'idea dell'online softmax
+
+Elabor

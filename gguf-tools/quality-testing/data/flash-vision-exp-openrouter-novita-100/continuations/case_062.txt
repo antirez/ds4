@@ -1,0 +1,3 @@
+**Eventual consistency** is a consistency model used in distributed databases that guarantees that *if no new updates are made to a given data item, eventually all reads will return the last updated value*. 
+
+In simpler terms: **If you stop writing to the database, all the replicas will eventually catch up and agree on

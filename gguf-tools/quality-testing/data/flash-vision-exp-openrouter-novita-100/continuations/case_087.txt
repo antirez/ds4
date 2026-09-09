@@ -1,0 +1,5 @@
+Here are three examples of useful server metrics, broken down by what they measure and why they matter:
+
+**1. CPU Utilization (Percentage)**
+- **What it measures:** The percentage of time the CPU is actively processing instructions versus being idle.
+- **Why it’s useful:** This is the primary indicator of compute

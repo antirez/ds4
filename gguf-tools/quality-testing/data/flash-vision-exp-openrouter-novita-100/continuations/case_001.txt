@@ -1,0 +1,10 @@
+Here's a concise design for a TCP echo server that handles slow clients:
+
+## Architecture Overview
+
+**Core Principle:** Non-blocking I/O with event-driven architecture to prevent slow clients from blocking fast ones.
+
+## Components
+
+### 1. **Event Loop (Reactor Pattern)**
+- Use `epoll` (

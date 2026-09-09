@@ -1,0 +1,15 @@
+# B-Tree Insertion
+
+## Background
+
+A B-tree of minimum degree *t* has these properties:
+- Every node has at most **2t − 1** keys
+- Every internal node has at least **t − 1** keys (except the root)
+- The root has at least **1** key (unless the tree is empty)
+- All leaves are at the same depth
+
+Insertion must maintain these invariants, which is where splits come in.
+
+## The Key Idea: Split Before Descending
+
+The classic (CLRS-style) insertion does a **single downward pass**, proactively splitting any

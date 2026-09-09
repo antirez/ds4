@@ -1,0 +1,1 @@
+At its core, a greedy continuation is determined by taking the **argmax** (the token with the highest logit

@@ -1,1 +1,1 @@
-A good benchmark should measure **the specific, relevant performance or outcome you aim to improve, under realistic and reproducible conditions.**
+A good benchmark should measure **something meaningful and specific that directly correlates with the real-world performance, quality, or capability that

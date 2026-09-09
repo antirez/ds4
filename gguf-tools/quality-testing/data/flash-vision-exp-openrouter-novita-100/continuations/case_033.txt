@@ -1,0 +1,3 @@
+In un server di rete, **backpressure** (contropressione) è un meccanismo di controllo del flusso che impedisce al sistema di essere sopraffatto da un volume di dati superiore alla sua capacità di elaborazione.
+
+In pratica, funziona come un **sistema di fren

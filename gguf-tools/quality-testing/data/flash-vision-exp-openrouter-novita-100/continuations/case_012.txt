@@ -1,0 +1,3 @@
+Ti aiuto a confrontare **mmap** (memory-mapped files) e **copia completa** (read/write tradizionale) per il caricamento dei pesi di un modello su macOS. Questo è un tema cruciale per le performance di inferenza e training.
+
+## 1. Panoram

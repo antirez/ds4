@@ -1,0 +1,12 @@
+# Calibration Data in Neural Network Quantization
+
+## What It Is
+
+Calibration data is a small, representative sample of real inputs (typically hundreds to thousands of examples) used during **post-training quantization (PTQ)** to estimate the statistical properties of network activations.
+
+## Why It's Needed
+
+Quantization maps continuous values to a discrete set of levels. While weights are directly available, the ranges of **activations** depend on the input data. Calibration data lets you observe actual activation distributions to determine:
+
+- **Dynamic range** — min/max values per layer or channel
+- **Percentiles/clipping thresholds** — e.g

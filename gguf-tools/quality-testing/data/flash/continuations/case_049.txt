@@ -1,1 +1,1 @@
-This is an excellent question that gets to the heart of how to properly test and understand a language model's capabilities. Evaluating
+Evaluating 50 prompts is more informative than evaluating just one favorite prompt for several critical reasons. It moves the assessment from

@@ -151,6 +151,7 @@ static float ds4q_make_qkx2_quants(int n, int nmax, const float *x, const float 
         return scale;
     }
     for (int is = 0; is <= nstep; is++) {
+        if (max <= min) break;
         iscale = (rmin + rdelta * is + nmax) / (max - min);
         float sum_l = 0, sum_l2 = 0, sum_xl = 0;
         for (int i = 0; i < n; i++) {
@@ -224,6 +225,7 @@ static float ds4q_make_qkx3_quants(int n, int nmax, const float *x, const float 
         return scale;
     }
     for (int is = 0; is <= nstep; is++) {
+        if (max <= min) break;
         iscale = (rmin + rdelta * is + nmax) / (max - min);
         float sum_l = 0, sum_l2 = 0, sum_xl = 0;
         for (int i = 0; i < n; i++) {

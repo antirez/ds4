@@ -1,0 +1,7 @@
+# Cinque misure iniziali per decode lento a contesto lungo
+
+1. **Misurare le metriche base**: tokens/secondo generati, TTFT (time to first token), lunghezza del contesto e della risposta, per quantificare il problema e stabilire un baseline confrontabile.
+
+2. **Verificare l'utilizzo delle risorse hardware**: GPU utilizzazione, memoria (VRAM/HBM), bandwidth — il decode è tipicamente memory-bound, quindi controllare se la KV cache sta causando swap o pressione sulla memoria.
+
+3. **Controllare la

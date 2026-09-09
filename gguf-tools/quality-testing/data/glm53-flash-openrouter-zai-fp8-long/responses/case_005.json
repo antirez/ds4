@@ -1,0 +1,54 @@
+{
+  "id": "gen-1788630700-zaegl3gqWU22kvvgLkON",
+  "object": "chat.completion",
+  "created": 1788630700,
+  "model": "z-ai/glm-5.3-flash",
+  "provider": "Z.AI",
+  "system_fingerprint": null,
+  "service_tier": null,
+  "choices": [
+    {
+      "index": 0,
+      "logprobs": null,
+      "finish_reason": "length",
+      "native_finish_reason": "length",
+      "message": {
+        "role": "assistant",
+        "content": "## Session State\n\nThe session lives in the worker thread and is represented by several cooperating pieces:\n\n- **`ds4_session *session`** — the live engine session object; the worker owns it exclusively.\n- **`ds4_tokens transcript`** — the token transcript backing the session, plus `session_dirty` flagging unsaved state and `user_activity` for save/compact heuristics.\n- **Session metadata**: `session_sha[41]` (hash/identifier), `session_title`, `session_created_at`, and `legacy_session_path_to",
+        "refusal": null,
+        "reasoning": "Explain session/tool state, identify two ownership/lifetime constraints.",
+        "reasoning_details": [
+          {
+            "type": "reasoning.text",
+            "text": "Explain session/tool state, identify two ownership/lifetime constraints.",
+            "format": "unknown",
+            "index": 0
+          }
+        ]
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 6176,
+    "completion_tokens": 128,
+    "total_tokens": 6304,
+    "cost": 0.00031856,
+    "is_byok": false,
+    "prompt_tokens_details": {
+      "cached_tokens": 2944,
+      "cache_write_tokens": 0,
+      "audio_tokens": 0,
+      "video_tokens": 0
+    },
+    "cost_details": {
+      "upstream_inference_cost": 0.00031856,
+      "upstream_inference_prompt_cost": 0.00028656,
+      "upstream_inference_completions_cost": 3.2e-05
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 13,
+      "image_tokens": 0,
+      "audio_tokens": 0
+    }
+  }
+}

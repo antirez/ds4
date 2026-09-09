@@ -1,0 +1,5 @@
+Ti spiego il **ring buffer** (o buffer circolare) in modo completo, con particolare attenzione alla gestione delle sovrascritture.
+
+## Cos'è un Ring Buffer
+
+Un ring buffer è una struttura dati **ad accesso FIFO** (First-In, First-Out) che util

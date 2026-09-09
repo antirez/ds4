@@ -1,0 +1,18 @@
+# Mediana di tre numeri
+
+```python
+def mediana(a, b, c):
+    return sorted([a, b, c])[1]
+```
+
+**Esempio d'uso:**
+
+```python
+print(mediana(3, 1, 2))   # Output: 2
+print(mediana(10, 5, 8))  # Output: 8
+print(mediana(7, 7, 3))   # Output: 7
+```
+
+## Alternativa senza ordinamento
+
+Se preferisci evitare `sorted`, puoi usare

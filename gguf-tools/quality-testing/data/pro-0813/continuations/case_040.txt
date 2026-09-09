@@ -1,0 +1,3 @@
+Here are the first five measurements to take when investigating generation slowdown at long context:
+
+1. **Time to first token (

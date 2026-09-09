@@ -1,0 +1,8 @@
+# Progetto: Server TCP Echo con Gestione Client Lenti
+
+## Obiettivo
+Server echo che gestisce più client simultanei, inclusi client lenti (lettura lenta o connessioni inattive), senza bloccare gli altri.
+
+## Architettura
+- **Modello**: I/O multiplexing con `epoll` (Linux) o `kqueue`/`select` come fallback.
+- **Linguaggio**: C (o Python con `selectors`

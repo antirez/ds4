@@ -1,0 +1,54 @@
+{
+  "id": "gen-1787762099-XfzrJkkOYYzwd0lXrNmK",
+  "object": "chat.completion",
+  "created": 1787762099,
+  "model": "z-ai/glm-5.3-flash",
+  "provider": "Z.AI",
+  "system_fingerprint": null,
+  "service_tier": null,
+  "choices": [
+    {
+      "index": 0,
+      "logprobs": null,
+      "finish_reason": "length",
+      "native_finish_reason": "length",
+      "message": {
+        "role": "assistant",
+        "content": "# Progetto: Server TCP Echo con Gestione Client Lenti\n\n## Obiettivo\nServer echo che gestisce più client simultanei, inclusi client lenti (lettura lenta o connessioni inattive), senza bloccare gli altri.\n\n## Architettura\n- **Modello**: I/O multiplexing con `epoll` (Linux) o `kqueue`/`select` come fallback.\n- **Linguaggio**: C (o Python con `selectors`",
+        "refusal": null,
+        "reasoning": "User wants a concise project for a TCP echo server handling slow clients. Write in Italian, concise design doc.",
+        "reasoning_details": [
+          {
+            "type": "reasoning.text",
+            "text": "User wants a concise project for a TCP echo server handling slow clients. Write in Italian, concise design doc.",
+            "format": "unknown",
+            "index": 0
+          }
+        ]
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 28,
+    "completion_tokens": 128,
+    "total_tokens": 156,
+    "cost": 3.41e-05,
+    "is_byok": false,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "cache_write_tokens": 0,
+      "audio_tokens": 0,
+      "video_tokens": 0
+    },
+    "cost_details": {
+      "upstream_inference_cost": 3.41e-05,
+      "upstream_inference_prompt_cost": 2.1e-06,
+      "upstream_inference_completions_cost": 3.2e-05
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 22,
+      "image_tokens": 0,
+      "audio_tokens": 0
+    }
+  }
+}

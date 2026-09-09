@@ -1,0 +1,5 @@
+This is a great question that touches on the fundamental difference between **virtual memory** and **physical memory**. 
+
+The short answer is: **`mmap` reserves a range of virtual address space, but it does not allocate physical RAM or page table entries for that range until the memory is actually accessed.**
+
+Here is the

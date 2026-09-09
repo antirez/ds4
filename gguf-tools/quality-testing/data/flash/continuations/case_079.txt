@@ -1,1 +1,3 @@
-Ecco una checklist sintetica per la revisione della **lifetime della memoria** in una Pull Request (focus
+# Checklist per la revisione della lifetime di memoria in una PR
+
+## 1. **Analisi dei riferimenti

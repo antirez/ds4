@@ -1,0 +1,10 @@
+# Il Trie (albero di prefissi)
+
+Un **trie** (o albero di prefissi) è una struttura ad albero che rappresenta un insieme di stringhe memorizzando i caratteri lungo i percorsi dalla radice alle foglie.
+
+## Struttura
+
+- **Radice**: nodo iniziale, corrisponde alla stringa vuota
+- **Archi**: etichettati con caratteri
+- **Nodi**: rappresentano il prefisso dato dal percorso radice→nodo
+- **Nodi marcati** (spesso con un flag booleano): indic

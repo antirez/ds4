@@ -1,0 +1,51 @@
+{
+  "schema": "ds4-test-vector-manifest-v1",
+  "source": "deepseek-official-api",
+  "model": "deepseek-v4-flash",
+  "checkpoint": "0731",
+  "endpoint": "https://api.deepseek.com/chat/completions",
+  "top_logprobs": 20,
+  "max_tokens": 4,
+  "prompts": [
+    {
+      "id": "short_italian_fact",
+      "kind": "short",
+      "prompt_file": "prompts/short_italian_fact.txt",
+      "official_file": "official/short_italian_fact.official.json",
+      "prompt_chars": 57,
+      "steps": 4
+    },
+    {
+      "id": "short_code_completion",
+      "kind": "short",
+      "prompt_file": "prompts/short_code_completion.txt",
+      "official_file": "official/short_code_completion.official.json",
+      "prompt_chars": 102,
+      "steps": 1
+    },
+    {
+      "id": "short_reasoning_plain",
+      "kind": "short",
+      "prompt_file": "prompts/short_reasoning_plain.txt",
+      "official_file": "official/short_reasoning_plain.official.json",
+      "prompt_chars": 51,
+      "steps": 1
+    },
+    {
+      "id": "long_memory_archive",
+      "kind": "long",
+      "prompt_file": "prompts/long_memory_archive.txt",
+      "official_file": "official/long_memory_archive.official.json",
+      "prompt_chars": 18503,
+      "steps": 4
+    },
+    {
+      "id": "long_code_audit",
+      "kind": "long",
+      "prompt_file": "prompts/long_code_audit.txt",
+      "official_file": "official/long_code_audit.official.json",
+      "prompt_chars": 18851,
+      "steps": 4
+    }
+  ]
+}

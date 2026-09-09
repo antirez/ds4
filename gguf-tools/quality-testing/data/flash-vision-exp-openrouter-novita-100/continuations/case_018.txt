@@ -1,0 +1,1 @@
+Per capire perché il **prefill** (la fase in cui il modello elabora l'intero prompt in input) può essere **più veloce** del **decode** (la generazione di un singolo token alla volta), dobbiamo analizzare come funziona l'hardware GPU e

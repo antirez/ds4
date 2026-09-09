@@ -1,0 +1,54 @@
+{
+  "id": "gen-1787762358-IWFq8HMxp6kdjXG6NuqK",
+  "object": "chat.completion",
+  "created": 1787762358,
+  "model": "z-ai/glm-5.3-flash",
+  "provider": "Z.AI",
+  "system_fingerprint": null,
+  "service_tier": null,
+  "choices": [
+    {
+      "index": 0,
+      "logprobs": null,
+      "finish_reason": "length",
+      "native_finish_reason": "length",
+      "message": {
+        "role": "assistant",
+        "content": "Il vantaggio principale della cache è **la velocità di accesso ai dati**.\n\nLa frase completa potrebbe essere:\n\n*\"Il vantaggio principale della cache è la sua elevata velocità di accesso, poiché memorizza i dati più frequentemente utilizzati in una memoria temporanea molto più rapida rispetto alla memoria principale.\"*\n\n**Perché la cache è vantaggiosa:**\n- Riduce i tempi di accesso ai dati (la cache è molto più veloce della RAM o del disco)\n- Migliora le prestazioni complessive del sistema\n-",
+        "refusal": null,
+        "reasoning": "Complete: \"Il vantaggio principale della cache è...\"",
+        "reasoning_details": [
+          {
+            "type": "reasoning.text",
+            "text": "Complete: \"Il vantaggio principale della cache è...\"",
+            "format": "unknown",
+            "index": 0
+          }
+        ]
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 24,
+    "completion_tokens": 128,
+    "total_tokens": 152,
+    "cost": 3.38e-05,
+    "is_byok": false,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "cache_write_tokens": 0,
+      "audio_tokens": 0,
+      "video_tokens": 0
+    },
+    "cost_details": {
+      "upstream_inference_cost": 3.38e-05,
+      "upstream_inference_prompt_cost": 1.8e-06,
+      "upstream_inference_completions_cost": 3.2e-05
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 11,
+      "image_tokens": 0,
+      "audio_tokens": 0
+    }
+  }
+}

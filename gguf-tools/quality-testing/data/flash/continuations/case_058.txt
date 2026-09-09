@@ -1,1 +1,5 @@
-Ecco una checklist strutturata per validare che un modello quantizzato (es. GPTQ, AWQ,
+# Checklist per la Validazione di Modelli Quantizzati
+
+## 1. Preparazione e Configurazione
+
+-

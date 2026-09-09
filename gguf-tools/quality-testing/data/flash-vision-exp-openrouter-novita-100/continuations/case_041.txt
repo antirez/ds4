@@ -1,0 +1,3 @@
+To understand why **small logit differences** can completely change a greedy continuation, you have to look at how a language model makes a decision. 
+
+The short answer is: **Greedy decoding is a "winner-take-all" system.** It doesn't care *how much* better the top token is,

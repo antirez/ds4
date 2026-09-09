@@ -1,1 +1,1 @@
-Nella quantizzazione low-bit (a bassa precisione) dei modelli di deep learning, una **matrice
+Per capire cos'è una **matrice di importanza** nella quantizzazione low-bit, dobbiamo prima

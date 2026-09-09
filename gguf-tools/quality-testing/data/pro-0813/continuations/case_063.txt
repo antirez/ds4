@@ -1,0 +1,4 @@
+Here's a classic example using POSIX threads where two threads increment a shared counter without synchronization:
+
+```c
+#include <

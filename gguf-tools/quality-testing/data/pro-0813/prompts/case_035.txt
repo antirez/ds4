@@ -1,0 +1,1 @@
+Spiega come funziona un ring buffer e come evitare sovrascritture.

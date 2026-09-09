@@ -1,8 +1,9 @@
 # Directional Steering
 
 Directional steering is a runtime activation edit for DS4. A steering file is a
-flat `f32` matrix with one normalized 4096-wide direction per layer. During
-inference, ds4 can apply the edit after attention outputs, FFN outputs, or both:
+flat `f32` matrix with one normalized hidden-width direction per normal
+transformer layer. During inference, ds4 can apply the edit after attention
+outputs, FFN outputs, or both:
 
 ```text
 y = y - scale * direction[layer] * dot(direction[layer], y)
@@ -11,10 +12,17 @@ y = y - scale * direction[layer] * dot(direction[layer], y)
 Positive scale removes the represented direction. Negative scale amplifies it.
 With no steering file or zero scales, ds4 follows the normal inference path.
 
+The file shape depends on the model:
+
+- DeepSeek V4 Flash: `43 x 4096`.
+- GLM 5.3 Flash: `45 x 4096`. The separate MTP predictor layer is omitted.
+
+GLM 5.2 steering is not implemented.
+
 ## Runtime Options
 
 ```text
---dir-steering-file FILE   load a 43 x 4096 f32 direction file
+--dir-steering-file FILE   load one f32 direction per normal model layer
 --dir-steering-ffn F       apply steering after FFN outputs; default is 1 when a file is provided
 --dir-steering-attn F      apply steering after attention outputs; default is 0
 ```
@@ -22,6 +30,27 @@ With no steering file or zero scales, ds4 follows the normal inference path.
 The FFN output is usually the best first target because it is late enough in
 each layer to represent behavior, style, and topic signals. Attention steering
 is available for experiments, but it can be more fragile.
+
+## GLM 5.3 Example
+
+Build a GLM 5.3 direction from paired target and control prompt lists:
+
+```sh
+python3 dir-steering/tools/build_direction.py \
+  --profile glm-5.3-flash \
+  --ds4 ./ds4 \
+  --model gguf/GLM-5.3-Flash-Q2.gguf \
+  --good-file /path/to/target-prompts.txt \
+  --bad-file /path/to/control-prompts.txt \
+  --out dir-steering/out/glm53-direction.json \
+  --component ffn_out \
+  --ctx 512
+```
+
+Generated `.f32` vectors are local artifacts and are not stored in the
+repository. GLM 5.3 steering works with `--mtp`, `ds4-server`, native session
+batching, and two-Mac tensor parallelism. For tensor parallelism, pass the same
+steering file and scales to both the worker and coordinator.
 
 ## Verbosity Example
 
@@ -39,6 +68,7 @@ Build the vector:
 
 ```sh
 python3 dir-steering/tools/build_direction.py \
+  --profile deepseek-v4-flash \
   --ds4 ./ds4 \
   --model ds4flash.gguf \
   --good-file dir-steering/examples/succinct.txt \

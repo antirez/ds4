@@ -6,6 +6,7 @@
 #include <hipcub/hipcub.hpp>
 #include <rocwmma/rocwmma-version.hpp>
 #include <rocwmma/rocwmma.hpp>
+#include "ds4_rocm_memory.h"
 
 #define cudaError_t hipError_t
 #define cudaStream_t hipStream_t
@@ -30,9 +31,9 @@
 #define cudaFuncSetAttribute(func, attr, value) hipFuncSetAttribute((const void *)(func), (attr), (value))
 #define cudaMemLocationTypeDevice hipMemLocationTypeDevice
 
-#define cudaMalloc hipMalloc
-#define cudaMallocHost hipHostMalloc
-#define cudaMallocManaged hipMallocManaged
+#define cudaMalloc ds4_rocm_malloc
+#define cudaMallocHost ds4_rocm_malloc_host
+#define cudaMallocManaged ds4_rocm_malloc_managed
 #define cudaFree hipFree
 #define cudaFreeHost hipFreeHost
 #define cudaMemset hipMemset
@@ -41,7 +42,7 @@
 #define cudaMemcpyHostToDevice hipMemcpyHostToDevice
 #define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
 #define cudaMemcpyDeviceToDevice hipMemcpyDeviceToDevice
-#define cudaMemGetInfo hipMemGetInfo
+#define cudaMemGetInfo ds4_rocm_mem_get_info
 #define cudaMemsetAsync hipMemsetAsync
 
 #define cudaHostRegister hipHostRegister

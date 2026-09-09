@@ -1,1 +1,3 @@
-This is a great question because calibration data is one of the most critical, yet often misunderstood, components of neural network quantization
+To understand the role of calibration data in neural network quantization, it helps to first understand what quantization does. 
+
+Quantization

@@ -1,4 +1,4 @@
 Here's a tiny Python function that returns the median of three numbers:
 
 ```python
-def median_of_three(a,
+def median3(a, b,

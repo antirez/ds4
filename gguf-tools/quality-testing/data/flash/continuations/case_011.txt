@@ -1,3 +1,4 @@
-Ecco un progetto conciso per un server TCP echo con gestione di client lenti:
+# Progetto: Server TCP Echo con Client Lenti
 
-## Architettura
+## Obiettivo
+Implementare un server TCP echo che gest

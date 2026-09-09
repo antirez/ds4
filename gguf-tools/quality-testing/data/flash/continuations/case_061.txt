@@ -1,3 +1,1 @@
-This is a great question because it gets at the core of why we organize data.
-
-The reason sorted arrays make membership tests
+To understand why sorted arrays make membership tests faster with binary search, it helps to compare them to the **linear search**

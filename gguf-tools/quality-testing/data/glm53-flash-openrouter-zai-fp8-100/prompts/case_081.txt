@@ -1,0 +1,1 @@
+Complete this C comment: /* This lock protects

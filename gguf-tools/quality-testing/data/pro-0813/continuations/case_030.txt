@@ -1,0 +1,1 @@
+La **ricerca binaria del punto di inserimento** è una variante della ricerca binaria classica che,

@@ -1,1 +1,4 @@
-Here's a comprehensive comparison of memory-mapped (mmap) model weights versus copying all weights into private buffers on macOS
+Here's a comprehensive comparison of mmaped model weights versus copying all weights into private buffers on macOS:
+
+## Memory Management
+

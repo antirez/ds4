@@ -1,1 +1,1 @@
-Ecco tre invarianti per una tabella di token speciali (ad esempio in un parser o in un sistema di
+Ecco tre invarianti per una tabella di token speciali, pensate per un sistema di gestione di aut

@@ -1,0 +1,7 @@
+Ecco un formato sicuro e strutturato per salvare l'header di un checkpoint modello, progettato per garantire integrità, versioning e compatibilità:
+
+## **Formato Header Checkpoint (JSON + Hash)**
+
+```json
+{
+  "format_version": "1.0.0

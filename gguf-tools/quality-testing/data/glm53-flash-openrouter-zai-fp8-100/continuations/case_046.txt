@@ -1,0 +1,12 @@
+# Router in Mixture-of-Experts (MoE) Layers
+
+The **router** (also called a gating network) is the core component that makes MoE layers work. Its role is to decide which expert(s) should process each input token.
+
+## Key Functions
+
+**1. Expert Selection**
+- For each token, the router computes scores (typically via a small linear layer + softmax) over all available experts
+- It then selects the top-k experts (commonly k=1 or 2) to process that token
+
+**2. Sparse Computation**
+- Instead of running every token through all experts, only the

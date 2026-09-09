@@ -1,3 +1,1 @@
-Here is the best way to understand a confidence interval in plain language.
-
-Imagine you want to know the **average height**
+Imagine you’re trying to guess how many jellybeans are in a giant jar. You don’t want to count

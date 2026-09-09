@@ -1,0 +1,3 @@
+To understand **online softmax** in attention, let's first strip away all the complex math and look at it as a **running tally** problem.
+
+Here is the core idea: **You want to calculate the softmax of a list of numbers, but you don't want to store the whole list. You want

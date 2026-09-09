@@ -1,1 +1,3 @@
-Here is a safe and robust format for storing a model checkpoint header, designed for clarity, extensibility, and error prevention
+Here's a safe format for storing a model checkpoint header that balances security, flexibility, and compatibility:
+
+## Recommended Format:

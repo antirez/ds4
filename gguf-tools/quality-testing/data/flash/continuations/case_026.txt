@@ -1,4 +1,3 @@
-Here is a brief, structured plan for testing long-context prompt chunking.
+Here is a brief, actionable plan for testing long-context prompt chunking, structured in four phases.
 
-### Goal
-Validate that chunking a
+**Goal:**

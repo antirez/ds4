@@ -1,0 +1,1 @@
+Derive why RMSNorm needs a sum of squares and a scaling pass.

@@ -1,0 +1,8 @@
+# Why Tokenizers Must Treat Special Tags Carefully
+
+Special tags (like `<|endoftext|>`, `[CLS]`, `<s>`, `[SEP]`, or chat template markers) require careful handling for several key reasons:
+
+## 1. They Must Be Atomic
+Special tokens should be recognized as **single, indivisible units** rather than being split into subwords or characters. If `<|endoftext|>` gets tokenized as `<`, `|`, `end`, `of`, `text`, `|`, the model loses the special semantic meaning attached to that token.
+
+## 2. Preventing

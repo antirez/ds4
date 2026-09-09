@@ -1,0 +1,6 @@
+A trie (also called a prefix tree) represents a set of strings by organizing them in a tree structure where:
+
+## Core Structure
+
+1. **Nodes represent prefixes** - Each node corresponds to a prefix shared by multiple strings in the set
+2. **Edges represent characters** - Each edge from a parent

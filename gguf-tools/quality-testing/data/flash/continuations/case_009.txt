@@ -1,5 +1,3 @@
-Here are three invariants for a special-token table used in a tokenizer:
+Here are three invariants for a tokenizer special-token table:
 
----
-
-### 1. **Un
+## 1. **Uniqueness Invariant

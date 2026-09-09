@@ -1,0 +1,10 @@
+# Grouped MoE Expert Execution and Prefill Performance
+
+## Background
+
+In Mixture-of-Experts (MoE) models, each layer has many experts, but only a few are activated per token. During **prefill** (processing the prompt), you're handling thousands of tokens at once — so collectively, *all* experts typically get activated by *some* token.
+
+## Why Grouping Helps
+
+### 1. Amortizing weight loading across tokens
+Each expert has large weight matrices. Naively executing experts one token-group at a time means reloading expert weights repeatedly from HBM. By **grouping tokens that

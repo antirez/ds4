@@ -1,1 +1,1 @@
-Per confrontare due quantizzazioni (ad esempio, due modelli di compressione di un segnale, due
+Per confrontare due quantizzazioni in modo affidabile, **non ci si deve mai fidare di una singola

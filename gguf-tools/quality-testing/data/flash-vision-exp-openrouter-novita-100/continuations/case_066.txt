@@ -1,0 +1,16 @@
+# Testing Command-Line Parsers with Edge Cases
+
+## 1. Core Testing Strategy
+
+### Basic Structure
+```python
+# Example test structure
+def test_parser():
+    # Test valid inputs
+    # Test invalid inputs
+    # Test boundary conditions
+    # Test combinations
+    pass
+```
+
+##
