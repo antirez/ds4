@@ -67024,6 +67024,12 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             start = s->checkpoint.len;
             resumed_checkpoint = true;
             s->mtp_draft_valid = false;
+            if (prompt->len > start) {
+                /* Prompt rows do not populate the private nextn KV window. */
+                s->glm_mtp_have = 0;
+                s->glm_mtp_rollback_valid = false;
+                s->glm_mtp_min_pos = 0;
+            }
         } else {
             s->checkpoint.len = 0;
             s->checkpoint_valid = false;
@@ -68825,6 +68831,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         if (!s->glm_spec_inside) {
             s->glm_mtp_rollback_valid = false;
             s->glm_mtp_have = 0;
+            s->glm_mtp_min_pos = 0;
         }
         const uint32_t pos = (uint32_t)s->checkpoint.len;
         const bool updates_dense =
