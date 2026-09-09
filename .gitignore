@@ -32,6 +32,8 @@
 /tests/test_mxfp4_cuda
 /tests/test_mxfp4_dot
 /tests/test_mxfp4_metal
+/tests/test_mxfp4_rocm
+/tests/test_prompt_prefix
 /tests/test_q4k_dot
 /tests/test_sampling
 /tests/test_quality_api
@@ -41,12 +43,16 @@
 /tests/test_session_state_gpu
 /tests/test_tp_commands
 /tests/test_glm53_kda
+/tests/test_glm53_kda_rocm
 /tests/test_glm53_vision_engine
+/tests/test_glm53_vision_prompt
 /tests/test_glm_attention
 /tests/test_glm_attention_rocm
 /tests/test_linux_memory
 /tests/test_rocm_memory
 /tests/test_deepseek4_vision_image
+/speed-bench/metal_decode_schedule_bench
+/speed-bench/metal_prefill_variant_bench
 *.o
 *.dSYM/
 __pycache__/
