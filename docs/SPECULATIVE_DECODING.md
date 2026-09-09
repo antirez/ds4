@@ -78,3 +78,16 @@ different hardware or execution configurations.
 
 Session-batched serving uses ordinary target decoding instead of combining
 DSpark/MTP with the session batch. See [serving](SERVER.md#multiple-sessions).
+
+## Immediate Session Rewind
+
+On resident, text-only, non-TP Metal DSpark sessions, `ds4_session_rewind()`
+can reuse one existing compressor snapshot from the last fully accepted
+greedy-verifier block, including default opportunistic sampling. It replays
+only the retained tail instead of rebuilding the full prefix, without allocating
+another tensor snapshot or saving logits.
+
+The fast path requires a still-usable snapshot and cache history, with at least
+one retained token after the snapshot to regenerate logits. On a miss, DeepSeek
+still removes discarded history and invalidates the checkpoint; sync the retained
+prefix before further evaluation, using multimodal sync for image-conditioned state.

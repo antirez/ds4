@@ -54444,6 +54444,11 @@ struct ds4_session {
     float *glm_mtp_hc;
     float *glm_mtp_logits0;
     ds4_spec_frontier greedy_splitkv_anchor;
+    /* Weak handle to graph.spec_* storage, not a second tensor snapshot.
+     * end == 0 expires it; recoverable positions are (start, end). */
+    ds4_spec_frontier dspark_rollback;
+    int dspark_rollback_start;
+    int dspark_rollback_end;
 #endif
     ds4_kv_cache cpu_cache;
     ds4_cpu_decode_scratch cpu_scratch;
@@ -55401,7 +55406,16 @@ static bool ds4_session_is_cpu(const ds4_session *s) {
     return s && s->engine && s->engine->backend == DS4_BACKEND_CPU;
 }
 
+static void ds4_session_dspark_rollback_invalidate(ds4_session *s) {
+#ifndef DS4_NO_GPU
+    if (s) s->dspark_rollback_end = 0;
+#else
+    (void)s;
+#endif
+}
+
 static void ds4_session_dspark_capture_invalidate(ds4_session *s) {
+    ds4_session_dspark_rollback_invalidate(s);
 #ifndef DS4_NO_GPU
     if (!s) return;
     s->dspark_draft_valid = false;
@@ -55871,6 +55885,7 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
                                    const int *tokens, uint32_t n_tokens,
                                    uint32_t layer_start, uint32_t layer_end,
                                    char *err, size_t errlen) {
+    ds4_session_dspark_rollback_invalidate(s);
     if (!s || !fp || !tokens ||
         !ds4_layer_payload_range_valid(layer_start, layer_end)) {
         payload_set_err(err, errlen, "invalid session layer payload load");
@@ -56400,6 +56415,9 @@ static void spec_frontier_free(ds4_spec_frontier *f) {
 }
 
 static bool spec_frontier_snapshot(ds4_spec_frontier *f, ds4_session *s) {
+    /* All writers of the shared snapshot tensors pass here, including failed
+     * saves. Sessions follow the existing serialized graph execution rule. */
+    ds4_session_dspark_rollback_invalidate(s);
     memset(f, 0, sizeof(*f));
     ds4_gpu_graph *g = &s->graph;
     if (!metal_graph_dspark_cache_current_window_valid(g)) return false;
@@ -56993,6 +57011,7 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
 }
 
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen) {
+    ds4_session_dspark_rollback_invalidate(s);
     if (!s || !fp) {
         payload_set_err(err, errlen, "invalid session payload load");
         return 1;
@@ -58302,6 +58321,7 @@ static bool ds4_session_greedy_splitkv_replay_exact(
 #endif
 
 int ds4_session_eval_argmax(ds4_session *s, int token, char *err, size_t errlen) {
+    ds4_session_dspark_rollback_invalidate(s);
     if (!s) return -1;
     if (ds4_session_is_cpu(s) || ds4_session_is_glm(s)) {
         if (ds4_session_eval(s, token, err, errlen) != 0) return -1;
@@ -66135,6 +66155,7 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                                  float *logits,
                                  char *err,
                                  size_t errlen) {
+    ds4_session_dspark_rollback_invalidate(s);
     if (!s || !s->engine) {
         if (errlen) snprintf(err, errlen, "missing layer-slice session");
         return 1;
@@ -66900,6 +66921,7 @@ int ds4_session_sync_multimodal(
 }
 
 static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
+    ds4_session_dspark_rollback_invalidate(s);
     if (!s || !prompt) {
         snprintf(err, errlen, "missing session or prompt");
         return 1;
@@ -68729,6 +68751,7 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
 static bool ds4_session_prepare_dspark_draft(ds4_session *s,
                                              int token,
                                              uint32_t pos) {
+    ds4_session_dspark_rollback_invalidate(s);
     ds4_gpu_graph *g = &s->graph;
     const int exec_tier =
         g->dspark_exec_tier >= 0 && g->dspark_exec_tier < DS4_MAX_GPUS
@@ -68769,6 +68792,7 @@ static void ds4_session_prepare_support_draft(ds4_session *s,
 
 static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                      char *err, size_t errlen) {
+    ds4_session_dspark_rollback_invalidate(s);
     if (!s) return 1;
     if (s->distributed) {
         if (!s->checkpoint_valid) {
@@ -70432,6 +70456,8 @@ int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
     if (e->backend == DS4_BACKEND_CUDA) {
         return ds4_sessions_eval_batch_cuda(items, count, err, errlen);
     }
+    for (int i = 0; i < count; i++)
+        ds4_session_dspark_rollback_invalidate(items[i].session);
     if (ds4_sessions_eval_batch_metal_supported(items, count, e)) {
         return ds4_sessions_eval_batch_metal(items, count, e, err, errlen);
     }
@@ -70502,6 +70528,9 @@ int ds4_sessions_eval_batch_with_prefill(
         return ds4_sessions_eval_batch_with_prefill_cuda(
                 items, count, prefill_session, prefill_prompt, err, errlen);
     }
+    ds4_session_dspark_rollback_invalidate(prefill_session);
+    for (int i = 0; i < count; i++)
+        ds4_session_dspark_rollback_invalidate(items[i].session);
     if (ds4_sessions_eval_batch_with_prefill_metal_supported(
                 items, count, prefill_session, prefill_prompt)) {
         return ds4_sessions_eval_batch_with_prefill_metal(
@@ -70801,6 +70830,18 @@ static int ds4_session_eval_dspark_speculative_argmax(
                     "ds4: DSpark spec direct-full drafted=%d accepted=%d\n",
                     draft_n,
                     n_accept);
+        }
+        /* Verification only appends KV rows and writes separate captures; it
+         * leaves the saved compressor tensors and DSpark draft ring intact.
+         * Require enough raw-ring slack to replay from this actual frontier. */
+        const uint32_t oldest = (uint32_t)start > s->graph.raw_window ?
+            (uint32_t)start - s->graph.raw_window : 0;
+        if (e->backend == DS4_BACKEND_METAL && !e->tp.active && !e->ssd_streaming &&
+            !s->distributed && !ds4_session_has_vision_state(s) &&
+            draft_n > 1 && (uint32_t)s->checkpoint.len - oldest <= s->graph.raw_cap) {
+            s->dspark_rollback = frontier;
+            s->dspark_rollback_start = start;
+            s->dspark_rollback_end = s->checkpoint.len;
         }
         spec_frontier_free(&frontier);
         if (getenv("DS4_DSPARK_CYCLE_TRACE") && stats_enabled)
@@ -75448,6 +75489,22 @@ void ds4_session_rewind(ds4_session *s, int pos) {
 #ifndef DS4_NO_GPU
     if (s->checkpoint_valid && ds4_session_is_glm(s)) {
         state_ok = !s->glm_graph.glm53 || ds4_session_glm_mtp_rewind(s, pos);
+    }
+    if (s->checkpoint_valid && !s->engine->tp.active &&
+        s->dspark_rollback_end == s->checkpoint.len &&
+        pos > s->dspark_rollback_start) {
+        const int start = s->dspark_rollback_start;
+        ds4_session_dspark_capture_invalidate(s);
+        state_ok = spec_frontier_restore(&s->dspark_rollback, s);
+        s->checkpoint.len = start;
+        /* Replay at least one token: the snapshot contains no saved logits.
+         * Do not propose drafts or expose a partially restored checkpoint. */
+        for (int i = start; state_ok && i < pos; i++) {
+            state_ok = metal_graph_eval_token_raw_swa(
+                &s->graph, &s->engine->model, &s->engine->weights,
+                s->checkpoint.v[i], (uint32_t)i, s->logits);
+            if (state_ok) s->checkpoint.len++;
+        }
     }
 #endif
     s->checkpoint.len = pos;
