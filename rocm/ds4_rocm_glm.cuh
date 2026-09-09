@@ -457,6 +457,21 @@ extern "C" int ds4_gpu_matmul_q4_K_tensor(
     const char *weight = cuda_model_range_ptr(
         model_map, weight_offset, weight_bytes, "GLM-5.3 Q4_K matrix");
     if (!weight) return 0;
+    // GLM-5.3 KDA Q/K bulk projection. MMQ uses 32-value Q8_1
+    // activation scales instead of this entry's 256-value Q8_K scales.
+    // Keep quality, streaming, small-row and other-model arithmetic intact.
+    if (g_glm_model && !g_quality_mode && !g_ssd_streaming_mode &&
+        ds4_rocm_is_gfx1151() && in_dim == 4096u && out_dim == 8192u &&
+        n_rows >= 128u && n_rows <= 2048u) {
+        const int rc = ds4_mmq_q4_K_dense(
+            weight, (const float *)x->ptr, (float *)out->ptr,
+            (int)out_dim, (int)n_rows, (int)in_dim, (cudaStream_t)0);
+        if (rc != 0) {
+            fprintf(stderr, "ds4: GLM-5.3 Q4_K MMQ failed (%d)\n", rc);
+            return 0;
+        }
+        return 1;
+    }
     cuda_block_q8_K *xq = (cuda_block_q8_K *)cuda_tmp_alloc(
         xq_bytes,
         "GLM-5.3 Q4_K activations");
