@@ -388,16 +388,17 @@ static double ds4_cubic(double x, double a) {
     return 0.0;
 }
 
-/* A tap weight depends only on the output coordinate and on which source
- * sample it lands on, never on the pixel being accumulated, so ds4_cubic()
- * was evaluated once per contributing pixel for a value that repeats across
- * every output row and column. One weight row per output sample removes the
- * repeated evaluation while keeping the accumulation identical, term by term
- * and in the same order, so the filtered image is unchanged bit for bit. */
+/* Bicubic resampling is separable: a tap weight is wx*wy and the clamped
+ * support box is the product of two independent 1D ranges, so filtering rows
+ * first and columns after computes the same normalized average with kx+ky
+ * taps per output pixel instead of kx*ky. Tap positions and weights depend
+ * only on the output coordinate, so both axes precompute them once instead of
+ * evaluating ds4_cubic() for every contributing source pixel. */
 typedef struct {
     int    *first;    /* First source sample feeding each output sample. */
     int    *count;    /* Taps per output sample, after edge clamping. */
     double *weight;   /* max_taps weights per output sample. */
+    double *sum;      /* Tap sum per output sample, used to normalize. */
     int     max_taps;
 } ds4_resize_taps;
 
@@ -405,6 +406,7 @@ static void ds4_resize_taps_free(ds4_resize_taps *taps) {
     free(taps->first);
     free(taps->count);
     free(taps->weight);
+    free(taps->sum);
     memset(taps, 0, sizeof(*taps));
 }
 
@@ -421,8 +423,9 @@ static int ds4_resize_taps_build(
     taps->max_taps = (int)(2.0 * support) + 2;
     taps->first = malloc((size_t)dst_n * sizeof(*taps->first));
     taps->count = malloc((size_t)dst_n * sizeof(*taps->count));
+    taps->sum = malloc((size_t)dst_n * sizeof(*taps->sum));
     taps->weight = malloc((size_t)dst_n * taps->max_taps * sizeof(*taps->weight));
-    if (!taps->first || !taps->count || !taps->weight) {
+    if (!taps->first || !taps->count || !taps->sum || !taps->weight) {
         ds4_resize_taps_free(taps);
         return 0;
     }
@@ -433,16 +436,19 @@ static int ds4_resize_taps_build(
         if (i0 < 0) i0 = 0;
         if (i1 > (int)src_n) i1 = (int)src_n;
         double *weight = taps->weight + (size_t)d * taps->max_taps;
+        double total = 0;
         for (int i = i0; i < i1; i++) {
             weight[i - i0] = ds4_cubic(((double)i + 0.5 - center) * filter, -0.5);
+            total += weight[i - i0];
         }
         taps->first[d] = i0;
         taps->count[d] = i1 - i0;
+        taps->sum[d] = total;
     }
     return 1;
 }
 
-/* Returns 0 only when the tap tables cannot be allocated. */
+/* Returns 0 only when the tap tables or the row cache cannot be allocated. */
 static int ds4_resize_rgb_bicubic(
         const uint8_t *src,
         uint32_t src_width,
@@ -458,37 +464,72 @@ static int ds4_resize_rgb_bicubic(
         return 0;
     }
 
+    /* Row-filtered source lines are kept in a ring sized for the widest
+     * vertical window. The window start grows with dy, so the ring only ever
+     * moves forward and each source row is filtered once even though
+     * neighboring output rows share it. */
+    size_t row_values = (size_t)dst_width * 3;
+    int ring_rows = ytaps.max_taps;
+    double *ring = malloc((size_t)ring_rows * row_values * sizeof(*ring));
+    double *acc = malloc(row_values * sizeof(*acc));
+    if (!ring || !acc) {
+        free(ring);
+        free(acc);
+        ds4_resize_taps_free(&xtaps);
+        ds4_resize_taps_free(&ytaps);
+        return 0;
+    }
+    int cached_first = 0, cached_count = 0;
+
     for (uint32_t dy = 0; dy < dst_height; dy++) {
-        const double *weight_y = ytaps.weight + (size_t)dy * ytaps.max_taps;
-        int y0 = ytaps.first[dy], taps_y = ytaps.count[dy];
-        for (uint32_t dx = 0; dx < dst_width; dx++) {
-            const double *weight_x = xtaps.weight + (size_t)dx * xtaps.max_taps;
-            int x0 = xtaps.first[dx], taps_x = xtaps.count[dx];
-            double sum[3] = {0, 0, 0};
-            double weight_sum = 0;
-            for (int ky = 0; ky < taps_y; ky++) {
-                double wy = weight_y[ky];
-                const uint8_t *row =
-                    src + ((size_t)(y0 + ky) * src_width + (uint32_t)x0) * 3;
-                for (int kx = 0; kx < taps_x; kx++) {
-                    double weight = weight_x[kx] * wy;
-                    const uint8_t *pixel = row + (size_t)kx * 3;
-                    sum[0] += pixel[0] * weight;
-                    sum[1] += pixel[1] * weight;
-                    sum[2] += pixel[2] * weight;
-                    weight_sum += weight;
+        int y0 = ytaps.first[dy];
+        int y1 = y0 + ytaps.count[dy];
+        if (cached_first < y0) {
+            cached_count -= y0 - cached_first;
+            if (cached_count < 0) cached_count = 0;
+            cached_first = y0;
+        }
+        while (cached_first + cached_count < y1) {
+            int sy = cached_first + cached_count;
+            const uint8_t *src_row = src + (size_t)sy * src_width * 3;
+            double *out = ring + (size_t)(sy % ring_rows) * row_values;
+            for (uint32_t dx = 0; dx < dst_width; dx++) {
+                const double *weight = xtaps.weight + (size_t)dx * xtaps.max_taps;
+                const uint8_t *pixel = src_row + (size_t)xtaps.first[dx] * 3;
+                double red = 0, green = 0, blue = 0;
+                for (int k = 0; k < xtaps.count[dx]; k++, pixel += 3) {
+                    red += weight[k] * pixel[0];
+                    green += weight[k] * pixel[1];
+                    blue += weight[k] * pixel[2];
                 }
+                out[dx * 3 + 0] = red;
+                out[dx * 3 + 1] = green;
+                out[dx * 3 + 2] = blue;
             }
-            float *pixel = dst + ((size_t)dy * dst_stride + dx) * 3;
+            cached_count++;
+        }
+
+        memset(acc, 0, row_values * sizeof(*acc));
+        const double *weight_y = ytaps.weight + (size_t)dy * ytaps.max_taps;
+        for (int k = 0; k < ytaps.count[dy]; k++) {
+            const double *row = ring + (size_t)((y0 + k) % ring_rows) * row_values;
+            for (size_t i = 0; i < row_values; i++) acc[i] += weight_y[k] * row[i];
+        }
+
+        float *out = dst + (size_t)dy * dst_stride * 3;
+        for (uint32_t dx = 0; dx < dst_width; dx++) {
+            double weight_sum = xtaps.sum[dx] * ytaps.sum[dy];
             for (unsigned c = 0; c < 3; c++) {
-                double value = round(sum[c] / weight_sum);
+                double value = round(acc[dx * 3 + c] / weight_sum);
                 if (value < 0.0) value = 0.0;
                 if (value > 255.0) value = 255.0;
-                pixel[c] = (float)value;
+                out[dx * 3 + c] = (float)value;
             }
         }
     }
 
+    free(ring);
+    free(acc);
     ds4_resize_taps_free(&xtaps);
     ds4_resize_taps_free(&ytaps);
     return 1;
