@@ -47515,14 +47515,15 @@ static bool glm_graph_mtp_matmul(
  * hidden h[pos] (g->cur for GLM-5.2, g->hc_cur for GLM-5.3) and next_token
  * (= token[pos+1]), writes the nextn KV at slot pos, and returns the
  * drafted token[pos+2] by greedy argmax. Clobbers the decode scratch. */
-static bool glm_graph_mtp_step(
+static bool glm_graph_mtp_step_impl(
         ds4_glm_gpu_graph *g,
         const ds4_model   *model,
         const ds4_weights *weights,
         int                next_token,
         uint32_t           pos,
         uint32_t           min_pos,
-        int               *draft_out) {
+        int               *draft_out,
+        bool               cache_only) {
     if (!g || !model || !weights || !draft_out) return false;
     if (DS4_N_NEXTN_PREDICT == 0) return false;
     const uint32_t cache_cap = glm_graph_mtp_cache_cap(g);
@@ -47725,6 +47726,20 @@ static bool glm_graph_mtp_step(
                                                      DS4_N_KV_LORA,
                                                      DS4_N_ROT,
                                                      glm_graph_compact_cache_is_f16()) != 0;
+    /* The first accepted MTP step only needs to publish its private KV row.
+     * Complete that prefix before the caller uploads the next hidden row. */
+    if (cache_only) {
+        DS4_GLM_MTP_STAGE("cache_end");
+        if (ok) ok = ds4_gpu_end_commands() != 0;
+        else (void)ds4_gpu_synchronize();
+        ds4_gpu_tensor_free(enorm_view);
+        ds4_gpu_tensor_free(hnorm_view);
+        if (!ok) {
+            fprintf(stderr, "ds4: glm mtp cache step failed at stage '%s' (pos %u)\n",
+                    mtp_stage, pos);
+        }
+        return ok;
+    }
     DS4_GLM_MTP_STAGE("qk_low");
     if (ok) ok = ds4_gpu_glm_qk_lowrank_typed_tensor(g->qk_low,
                                                      g->q,
@@ -47928,6 +47943,39 @@ static bool glm_graph_mtp_step(
     }
     *draft_out = best;
     return true;
+}
+
+static bool glm_graph_mtp_step(
+        ds4_glm_gpu_graph *g,
+        const ds4_model *model,
+        const ds4_weights *weights,
+        int next_token,
+        uint32_t pos,
+        uint32_t min_pos,
+        int *draft_out) {
+    return glm_graph_mtp_step_impl(g, model, weights, next_token, pos,
+                                    min_pos, draft_out, false);
+}
+
+static bool glm_graph_mtp_accepted_first_step(
+        ds4_glm_gpu_graph *g,
+        const ds4_model *model,
+        const ds4_weights *weights,
+        int next_token,
+        uint32_t pos,
+        uint32_t min_pos,
+        int *draft_out,
+        bool greedy) {
+    bool cache_only = false;
+#ifdef DS4_ROCM_BUILD
+    cache_only = greedy && g && g->glm53 && !g->ssd_streaming &&
+                 !g->placement && g->tp_world <= 1 &&
+                 ds4_gpu_dspark_gfx1151_fast_path() != 0;
+#else
+    (void)greedy;
+#endif
+    return glm_graph_mtp_step_impl(g, model, weights, next_token, pos,
+                                    min_pos, draft_out, cache_only);
 }
 
 static bool glm_graph_forward_token(
@@ -65903,8 +65951,9 @@ static int ds4_session_glm_spec_cycle_impl(
         const bool cu =
             ds4_gpu_tensor_write(target_hidden, 0, s->glm_mtp_hc,
                                  hc_row_bytes) != 0 &&
-            glm_graph_mtp_step(g, &e->model, &e->weights, d, pos,
-                               s->glm_mtp_min_pos, &dummy) &&
+            glm_graph_mtp_accepted_first_step(g, &e->model, &e->weights, d, pos,
+                                             s->glm_mtp_min_pos, &dummy,
+                                             !exact_sampling && temperature <= 0.0f) &&
             ds4_gpu_tensor_write(target_hidden,
                                  0,
                                  s->glm_mtp_hc + hc_row_values,
