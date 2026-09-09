@@ -729,6 +729,7 @@ typedef struct {
     /* Distinguish the Responses hosted tool from a normal function that
      * happens to be named "tool_search". */
     bool responses_tool_search;
+    char *parameters;
     char **prop;
     int len;
     int cap;
@@ -906,6 +907,7 @@ static void tool_schema_order_free(tool_schema_order *o) {
     free(o->name);
     free(o->wire_name);
     free(o->namespace);
+    free(o->parameters);
     for (int i = 0; i < o->len; i++) free(o->prop[i]);
     free(o->prop);
     memset(o, 0, sizeof(*o));
@@ -1687,7 +1689,8 @@ static void tool_schema_orders_add_json_wire(tool_schema_orders *orders,
                 goto done;
             }
             parse_schema_properties(schema, &order);
-            free(schema);
+            free(order.parameters);
+            order.parameters = schema;
         } else if (!json_skip_value(&p)) {
             free(key);
             goto done;
@@ -5740,11 +5743,138 @@ static void trim_const_span(const char **start, const char **end) {
     while (*end > *start && isspace((unsigned char)(*end)[-1])) (*end)--;
 }
 
+/* GLM's XML has no DSML string flag. Only use a JSON literal when the
+ * request's property type disambiguates it; "001" and "true" may be text.
+ * This is type recovery, not schema validation. Unknown schemas stay text. */
+static unsigned glm_type_mask(const char *type) {
+    if (!strcmp(type, "integer")) return 1;
+    if (!strcmp(type, "number")) return 1 | 2;
+    if (!strcmp(type, "boolean")) return 4;
+    if (!strcmp(type, "null")) return 8;
+    if (!strcmp(type, "array")) return 16;
+    if (!strcmp(type, "object")) return 32;
+    return 64; /* Strings and unknown types must not be coerced. */
+}
+
+static unsigned glm_property_types(const char *schema) {
+    json_args fields = {0};
+    unsigned types = 0;
+    if (!json_args_parse(schema, &fields)) return 64;
+    int i = json_args_find_unused(&fields, "type");
+    if (i >= 0) {
+        const json_arg *arg = &fields.v[i];
+        if (arg->is_string) {
+            types = glm_type_mask(arg->value);
+        } else {
+            const char *p = arg->value;
+            json_ws(&p);
+            if (*p == '[') {
+                p++;
+                for (;;) {
+                    char *type = NULL;
+                    if (!json_string(&p, &type)) { types = 64; break; }
+                    types |= glm_type_mask(type);
+                    free(type);
+                    json_ws(&p);
+                    if (*p != ',') break;
+                    p++;
+                }
+                if (*p != ']') types = 64;
+            }
+        }
+    }
+    json_args_free(&fields);
+    return types ? types : 64;
+}
+
+/* The request reader intentionally accepts strtod extensions. Generated
+ * literals must additionally obey JSON's lexical rules before copying them
+ * verbatim into API arguments (including numbers inside arrays/objects). */
+static bool glm_json_literal_valid(const char *value) {
+    const char *end = value;
+    if (!json_skip_value(&end)) return false;
+    json_ws(&end);
+    if (*end) return false;
+    const char *p = value;
+    while (*p) {
+        json_ws(&p);
+        if (!*p) break;
+        if (*p == '"') {
+            const char *start = p;
+            char *text = NULL;
+            if (!json_string(&p, &text)) return false;
+            free(text);
+            for (; start < p; start++)
+                if ((unsigned char)*start < 0x20) return false;
+        } else if (strchr("{}[],:", *p)) {
+            p++;
+        } else if (!strncmp(p, "true", 4)) {
+            p += 4;
+        } else if (!strncmp(p, "false", 5)) {
+            p += 5;
+        } else if (!strncmp(p, "null", 4)) {
+            p += 4;
+        } else {
+            if (*p == '-') p++;
+            if (*p == '0') p++;
+            else {
+                if (*p < '1' || *p > '9') return false;
+                while (*p >= '0' && *p <= '9') p++;
+            }
+            if (*p == '.') {
+                p++;
+                if (*p < '0' || *p > '9') return false;
+                while (*p >= '0' && *p <= '9') p++;
+            }
+            if (*p == 'e' || *p == 'E') {
+                p++;
+                if (*p == '+' || *p == '-') p++;
+                if (*p < '0' || *p > '9') return false;
+                while (*p >= '0' && *p <= '9') p++;
+            }
+            if (*p && !strchr(" \t\r\n,]}", *p)) return false;
+        }
+    }
+    return true;
+}
+
+static bool glm_arg_is_json(json_args *properties, const char *key,
+                            const char *value) {
+    int i = json_args_find_unused(properties, key);
+    if (i < 0 || properties->v[i].is_string) return false;
+    unsigned types = glm_property_types(properties->v[i].value);
+    if (types & 64 || !glm_json_literal_valid(value)) return false;
+    const char *p = value;
+    json_ws(&p);
+    unsigned kind = 0;
+    if (*p == '[') kind = 16;
+    else if (*p == '{') kind = 32;
+    else if (*p == 't' || *p == 'f') kind = 4;
+    else if (*p == 'n') kind = 8;
+    else if (*p == '-' || (*p >= '0' && *p <= '9'))
+        kind = strpbrk(p, ".eE") ? 2 : 1;
+    return (types & kind) != 0;
+}
+
+static void glm_tool_properties(const tool_schema_orders *orders,
+                                 const char *name, json_args *properties) {
+    const tool_schema_order *order = tool_schema_orders_find(orders, name);
+    if (!order || !order->parameters) return;
+    json_args schema = {0};
+    if (json_args_parse(order->parameters, &schema)) {
+        int i = json_args_find_unused(&schema, "properties");
+        if (i >= 0 && !schema.v[i].is_string)
+            json_args_parse(schema.v[i].value, properties);
+    }
+    json_args_free(&schema);
+}
+
 static bool parse_glm_generated_message_ex(const char *text,
                                            bool require_thinking_closed,
                                            char **content_out,
                                            char **reasoning_out,
-                                           tool_calls *calls) {
+                                           tool_calls *calls,
+                                                  const tool_schema_orders *orders) {
     static const char tool_start[] = "<tool_call>";
     static const char tool_end[] = "</tool_call>";
     static const char arg_key_start[] = "<arg_key>";
@@ -5801,6 +5931,8 @@ static bool parse_glm_generated_message_ex(const char *text,
         char *name = xstrndup(name_start, (size_t)(name_end - name_start));
         p = name_end;
 
+        json_args properties = {0};
+        glm_tool_properties(orders, name, &properties);
         buf args = {0};
         for (;;) {
             p = skip_ascii_ws(p);
@@ -5810,6 +5942,7 @@ static bool parse_glm_generated_message_ex(const char *text,
             }
             if (strncmp(p, arg_key_start, strlen(arg_key_start)) != 0) {
                 free(name);
+                json_args_free(&properties);
                 buf_free(&args);
                 return false;
             }
@@ -5817,6 +5950,7 @@ static bool parse_glm_generated_message_ex(const char *text,
             const char *key_end = strstr(p, arg_key_end);
             if (!key_end || key_end > close) {
                 free(name);
+                json_args_free(&properties);
                 buf_free(&args);
                 return false;
             }
@@ -5833,6 +5967,7 @@ static bool parse_glm_generated_message_ex(const char *text,
             if (strncmp(p, arg_value_start, strlen(arg_value_start)) != 0) {
                 free(name);
                 free(key);
+                json_args_free(&properties);
                 buf_free(&args);
                 return false;
             }
@@ -5841,19 +5976,22 @@ static bool parse_glm_generated_message_ex(const char *text,
             if (!value_end || value_end > close) {
                 free(name);
                 free(key);
+                json_args_free(&properties);
                 buf_free(&args);
                 return false;
             }
             char *raw_value = xstrndup(p, (size_t)(value_end - p));
             char *value = xstrdup(raw_value);
             ds4_tool_text_unescape(value, arg_value_end);
-            tool_call_json_args_add(&args, key, value, "true");
+            tool_call_json_args_add(&args, key, value,
+                glm_arg_is_json(&properties, key, value) ? "false" : "true");
             free(key);
             free(raw_value);
             free(value);
             p = value_end + strlen(arg_value_end);
         }
 
+        json_args_free(&properties);
         tool_call tc = {0};
         tc.name = name;
         buf wrapped = {0};
@@ -5889,11 +6027,12 @@ static bool parse_generated_message_ex_for_syntax(server_model_syntax syntax,
                                                   bool require_thinking_closed,
                                                   char **content_out,
                                                   char **reasoning_out,
-                                                  tool_calls *calls) {
+                                                  tool_calls *calls,
+                                                  const tool_schema_orders *orders) {
     if (syntax == SERVER_MODEL_SYNTAX_GLM) {
         return parse_glm_generated_message_ex(text, require_thinking_closed,
                                               content_out, reasoning_out,
-                                              calls);
+                                              calls, orders);
     }
     return parse_deepseek_generated_message_ex(text, require_thinking_closed,
                                                content_out, reasoning_out,
@@ -5911,7 +6050,7 @@ static DS4_SERVER_MAYBE_UNUSED bool parse_generated_message_ex(
                                                  require_thinking_closed,
                                                  content_out,
                                                  reasoning_out,
-                                                 calls);
+                                                 calls, NULL);
 }
 
 /* Try to repair a truncated DSML block.
@@ -5998,7 +6137,8 @@ static bool parse_generated_message_for_response_for_syntax(server_model_syntax 
                                                             char **content_out,
                                                             char **reasoning_out,
                                                             tool_calls *calls,
-                                                            bool *recovered_out) {
+                                                            bool *recovered_out,
+                                                  const tool_schema_orders *orders) {
     if (recovered_out) *recovered_out = false;
 
     bool parsed_ok = parse_generated_message_ex_for_syntax(syntax,
@@ -6006,7 +6146,7 @@ static bool parse_generated_message_for_response_for_syntax(server_model_syntax 
                                                            require_thinking_closed,
                                                            content_out,
                                                            reasoning_out,
-                                                           calls);
+                                                           calls, orders);
     if (parsed_ok) return true;
 
     free(*content_out);
@@ -6044,7 +6184,7 @@ static DS4_SERVER_MAYBE_UNUSED bool parse_generated_message_for_response(
     return parse_generated_message_for_response_for_syntax(
         SERVER_MODEL_SYNTAX_DEEPSEEK, text, has_tools, saw_tool_start,
         require_thinking_closed, finish_io, err, errlen, content_out,
-        reasoning_out, calls, recovered_out);
+        reasoning_out, calls, recovered_out, NULL);
 }
 
 static void append_json_object_string(buf *b, const char *json) {
@@ -11278,7 +11418,7 @@ static bool complete_tool_call_inside_thinking(server_model_syntax syntax,
     char *content = NULL, *reasoning = NULL;
     tool_calls calls = {0};
     bool complete = parse_generated_message_ex_for_syntax(syntax, start, false,
-        &content, &reasoning, &calls) && calls.len > 0;
+        &content, &reasoning, &calls, NULL) && calls.len > 0;
     free(content);
     free(reasoning);
     tool_calls_free(&calls);
@@ -13135,7 +13275,7 @@ decode_again:
             char *test_reasoning = NULL;
             bool repair_ok = parse_generated_message_ex_for_syntax(
                 j->req.model_syntax, repaired.ptr, false,
-                &test_content, &test_reasoning, &test_calls);
+                &test_content, &test_reasoning, &test_calls, NULL);
             free(test_content);
             free(test_reasoning);
             if (repair_ok && test_calls.len > 0) {
@@ -13248,7 +13388,7 @@ decode_again:
             &parsed_content,
             &parsed_reasoning,
             &parsed_calls,
-            &recovered_tool_parse_failure);
+            &recovered_tool_parse_failure, &j->req.tool_orders);
         if (!parsed_ok && recovered_tool_parse_failure && j->req.has_tools && saw_tool_start) {
             /* parse_generated_message failed even though DSML was present.
              * Semantic repair is intentionally avoided: if the parser cannot
@@ -15941,7 +16081,9 @@ static void test_openai_glm_tool_stream_suppresses_raw_tool_call(void) {
     r.think_mode = DS4_THINK_NONE;
     r.has_tools = true;
     r.model_syntax = SERVER_MODEL_SYNTAX_GLM;
-    r.tool_orders = make_bash_order();
+    tool_schema_orders_add_json(&r.tool_orders,
+        "{\"name\":\"bash\",\"parameters\":{\"type\":\"object\",\"properties\":{"
+        "\"command\":{\"type\":\"string\"},\"timeout\":{\"type\":\"integer\"}}}}");
 
     TEST_ASSERT(sse_chunk(sv[0], &r, "chatcmpl_glm_tool", NULL, NULL));
 
@@ -15951,6 +16093,7 @@ static void test_openai_glm_tool_stream_suppresses_raw_tool_call(void) {
         "Before.\n\n"
         "<tool_call>bash"
         "<arg_key>command</arg_key><arg_value>pwd</arg_value>"
+        "<arg_key>timeout</arg_key><arg_value>10</arg_value>"
         "</tool_call>";
     TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_glm_tool", &st,
                                          raw, strlen(raw), false));
@@ -15960,8 +16103,9 @@ static void test_openai_glm_tool_stream_suppresses_raw_tool_call(void) {
     tool_calls calls = {0};
     TEST_ASSERT(parse_generated_message_ex_for_syntax(
         SERVER_MODEL_SYNTAX_GLM, raw, false,
-        &parsed_content, &parsed_reasoning, &calls));
+        &parsed_content, &parsed_reasoning, &calls, &r.tool_orders));
     TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(strstr(calls.v[0].arguments, "\"timeout\": 10") != NULL);
     TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_glm_tool", &st,
                                        raw, strlen(raw), &calls,
                                        "tool_calls", 10, 4));
@@ -16736,6 +16880,75 @@ static void test_parse_short_dsml_and_canonical_suffix(void) {
     request_free(&r);
 }
 
+static void test_glm_tool_argument_types(void) {
+    struct { const char *schema, *value, *expected; } cases[] = {
+        {"{\"type\":\"integer\"}", "40", "40"},
+        {"{\"type\":\"integer\"}", "-40", "-40"},
+        {"{\"type\":\"integer\"}", "9007199254740993", "9007199254740993"},
+        {"{\"type\":\"number\"}", " -1.25e+3 ", "-1.25e+3"},
+        {"{\"type\":\"boolean\"}", "true", "true"},
+        {"{\"type\":\"boolean\"}", "false", "false"},
+        {"{\"type\":\"null\"}", "null", "null"},
+        {"{\"type\":[\"integer\",\"null\"]}", "40", "40"},
+        {"{\"type\":[\"integer\",\"null\"]}", "null", "null"},
+        {"{\"type\":\"array\"}", "[1, true, {\"x\": null}]", "[1,true,{\"x\":null}]"},
+        {"{\"type\":\"object\"}", "{\"x\": [2, false]}", "{\"x\":[2,false]}"},
+        {"{\"type\":\"string\"}", "001", "\"001\""},
+        {"{\"type\":\"string\"}", "40", "\"40\""},
+        {"{\"type\":\"string\"}", "true", "\"true\""},
+        {"{\"type\":\"string\"}", "null", "\"null\""},
+        {"{\"type\":\"string\"}", "[1,2]", "\"[1,2]\""},
+        {"{\"type\":\"string\"}", " x\ny ", "\" x\\ny \""},
+        {"{\"type\":[\"string\",\"integer\"]}", "40", "\"40\""},
+        {"{}", "40", "\"40\""},
+        {"{\"$ref\":\"#/$defs/value\"}", "40", "\"40\""},
+        {"{\"type\":\"integer\"}", "001", "\"001\""},
+        {"{\"type\":\"integer\"}", "1.5", "\"1.5\""},
+        {"{\"type\":\"number\"}", "+1", "\"+1\""},
+        {"{\"type\":\"number\"}", "0x10", "\"0x10\""},
+        {"{\"type\":\"number\"}", "NaN", "\"NaN\""},
+        {"{\"type\":\"number\"}", "Infinity", "\"Infinity\""},
+        {"{\"type\":\"number\"}", "1.", "\"1.\""},
+        {"{\"type\":\"number\"}", "1e", "\"1e\""},
+        {"{\"type\":\"boolean\"}", "True", "\"True\""},
+        {"{\"type\":\"boolean\"}", "1", "\"1\""},
+        {"{\"type\":\"array\"}", "[1,]", "\"[1,]\""},
+        {"{\"type\":\"array\"}", "[NaN]", "\"[NaN]\""},
+        {"{\"type\":\"array\"}", "[01]", "\"[01]\""},
+        {"{\"type\":\"array\"}", "[] trailing", "\"[] trailing\""},
+        {"{\"type\":\"object\"}", "{\"x\":Infinity}", "\"{\\\"x\\\":Infinity}\""},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        tool_schema_orders orders = {0};
+        buf schema = {0}, raw = {0}, expected = {0};
+        buf_printf(&schema, "{\"name\":\"report\",\"parameters\":{\"type\":\"object\","
+                   "\"properties\":{\"value\":%s}}}", cases[i].schema);
+        tool_schema_orders_add_json(&orders, schema.ptr);
+        buf_printf(&raw, "<tool_call>report<arg_key>value</arg_key>"
+                   "<arg_value>%s</arg_value></tool_call>", cases[i].value);
+        buf_printf(&expected, "{\"value\": %s}", cases[i].expected);
+        char *content = NULL, *reasoning = NULL;
+        tool_calls calls = {0};
+        const char *finish = "tool_calls";
+        bool recovered = false;
+        TEST_ASSERT(parse_generated_message_for_response_for_syntax(
+            SERVER_MODEL_SYNTAX_GLM, raw.ptr, true, true, false, &finish,
+            NULL, 0, &content, &reasoning, &calls, &recovered, &orders));
+        TEST_ASSERT(calls.len == 1);
+        if (calls.len == 1) {
+            TEST_ASSERT(!strcmp(calls.v[0].arguments, expected.ptr));
+            TEST_ASSERT(!strcmp(calls.raw_tool_text, raw.ptr));
+        }
+        free(content);
+        free(reasoning);
+        tool_calls_free(&calls);
+        tool_schema_orders_free(&orders);
+        buf_free(&schema);
+        buf_free(&raw);
+        buf_free(&expected);
+    }
+}
+
 static void test_parse_glm_tool_call_message(void) {
     const char *generated =
         "<think>need bash</think>OK\n\n"
@@ -16749,7 +16962,7 @@ static void test_parse_glm_tool_call_message(void) {
 
     TEST_ASSERT(parse_generated_message_ex_for_syntax(
         SERVER_MODEL_SYNTAX_GLM, generated, true,
-        &content, &reasoning, &calls));
+        &content, &reasoning, &calls, NULL));
     TEST_ASSERT(reasoning && !strcmp(reasoning, "need bash"));
     TEST_ASSERT(content && !strcmp(content, "OK"));
     TEST_ASSERT(calls.len == 1);
@@ -17104,7 +17317,7 @@ static void test_incomplete_tool_call_keeps_stop_reason(void) {
             TEST_ASSERT(!parse_generated_message_for_response_for_syntax(
                 glm ? SERVER_MODEL_SYNTAX_GLM : SERVER_MODEL_SYNTAX_DEEPSEEK,
                 raw[glm], true, true, false, &finish, err, sizeof(err),
-                &content, &reasoning, &calls, &recovered));
+                &content, &reasoning, &calls, &recovered, NULL));
             TEST_ASSERT(!strcmp(finish, reasons[i]));
             TEST_ASSERT(recovered && calls.len == 0);
             TEST_ASSERT(content && !strcmp(content, raw[glm]));
@@ -17263,7 +17476,7 @@ static void test_glm_tool_checkpoint_suffix_is_canonical(void) {
     tool_calls calls = {0};
     TEST_ASSERT(parse_generated_message_ex_for_syntax(
         SERVER_MODEL_SYNTAX_GLM, generated, false,
-        &content, &reasoning, &calls));
+        &content, &reasoning, &calls, NULL));
     TEST_ASSERT(calls.len == 1);
 
     request r;
@@ -18103,7 +18316,7 @@ static void test_tool_control_text_inside_arguments(void) {
         tool_calls calls = {0};
         char *content = NULL, *reasoning = NULL;
         TEST_ASSERT(parse_generated_message_ex_for_syntax(tracker.model_syntax,
-            raw.ptr, true, &content, &reasoning, &calls));
+            raw.ptr, true, &content, &reasoning, &calls, NULL));
         TEST_ASSERT(calls.len == 1);
         TEST_ASSERT(reasoning && !strcmp(reasoning, "reason"));
         if (calls.len) {
@@ -18157,7 +18370,7 @@ static void test_tool_body_escape_round_trip(void) {
         append_tool_calls_text_for_syntax(&raw, syntax, &original, NULL);
         char *content = NULL, *reasoning = NULL;
         TEST_ASSERT(parse_generated_message_ex_for_syntax(syntax, raw.ptr, false,
-            &content, &reasoning, &parsed));
+            &content, &reasoning, &parsed, NULL));
         TEST_ASSERT(parsed.len == 1);
         if (parsed.len) {
             json_args args = {0};
@@ -20223,6 +20436,7 @@ static void ds4_server_unit_tests_run(void) {
     test_openai_tool_stream_handles_multiple_calls();
     test_streaming_holds_partial_utf8();
     test_parse_short_dsml_and_canonical_suffix();
+    test_glm_tool_argument_types();
     test_parse_glm_tool_call_message();
     test_dsml_parser_recovers_loose_nested_parameters();
     test_dsml_repair_produces_parseable_calls();
