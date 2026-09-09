@@ -21116,6 +21116,9 @@ int ds4_gpu_matmul_f16_pair_compressor_store_tensor(
             mv_dispatch.smem = 32u * 4u * sizeof(float);
         }
         mv_args.nr0 = mv_dispatch.nr0;
+        // Fused projection/state store reduces KV and score in separate
+        // planes so both partial sets need only one threadgroup barrier.
+        mv_dispatch.smem = 2u * 32u * (NSUInteger)mv_dispatch.nr0 * sizeof(float);
         ds4_gpu_dsv4_compressor_store_one_args store_args = {
             .width = width,
             .ratio = ratio,
@@ -21299,7 +21302,7 @@ int ds4_gpu_matmul_f16_quad_compressor_store_tensor(
         [enc setBuffer:state0scbuf offset:ds4_gpu_tensor_offset(state0_score) atIndex:15];
         [enc setBuffer:state1kvbuf offset:ds4_gpu_tensor_offset(state1_kv) atIndex:16];
         [enc setBuffer:state1scbuf offset:ds4_gpu_tensor_offset(state1_score) atIndex:17];
-        [enc setThreadgroupMemoryLength:32u * 2u * sizeof(float) atIndex:0];
+        [enc setThreadgroupMemoryLength:2u * 32u * 2u * sizeof(float) atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(
                 ((NSUInteger)width0 + (NSUInteger)width1 + 1u) / 2u, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];

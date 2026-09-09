@@ -759,7 +759,7 @@ ds4_test.o ds4_agent_test.o \
 ds4_cpu_test_hooks.o ds4_cuda_test_hooks.o tests/test_session_state.o \
 tests/test_session_state_gpu.o: ds4_tool_text.h
 
-# GB10 decode validation; see docs/CUDA_GB10_DECODE.md for scope and limits.
+# Decode validation; see docs/CUDA_GB10_DECODE.md for backend scope and limits.
 F16_COMPRESSOR_DEPS := tests/test_cuda_f16_compressor.py tests/test_cuda_f16_compressor.cpp \
 	tests/kernel_source.py ds4_cuda.cu cuda/ds4_f16_compressor.cuh
 .PHONY: test-cuda-f16-compressor-host test-cuda-f16-compressor bench-cuda-f16-compressor
@@ -781,6 +781,25 @@ test-cuda-q8-hc-aligned-host: $(Q8_HC_ALIGNED_DEPS)
 
 test-cuda-q8-hc-aligned: $(Q8_HC_ALIGNED_DEPS)
 	NVCC="$(NVCC)" NVCCFLAGS="$(NVCCFLAGS)" python3 tests/test_cuda_q8_hc_aligned.py --cuda
+
+ROCM_F16_COMPRESSOR_DEPS := tests/test_rocm_f16_compressor.py tests/test_rocm_f16_compressor.cpp \
+	tests/kernel_source.py rocm/ds4_rocm_common.cuh rocm/ds4_rocm_matmul.cuh \
+	rocm/ds4_rocm_compressor.cuh rocm/ds4_rocm_q8.cuh rocm/ds4_rocm_norm_rope.cuh
+.PHONY: test-rocm-f16-compressor-host test-rocm-f16-compressor bench-rocm-f16-compressor
+test-rocm-f16-compressor-host: $(ROCM_F16_COMPRESSOR_DEPS) tests/test_rocm_f16_compressor_policy.py
+	python3 tests/test_rocm_f16_compressor.py
+	python3 tests/test_rocm_f16_compressor_policy.py
+
+test-rocm-f16-compressor: $(ROCM_F16_COMPRESSOR_DEPS)
+	HIPCC="$(HIPCC)" ROCM_CFLAGS="$(ROCM_CFLAGS)" python3 tests/test_rocm_f16_compressor.py --rocm
+
+bench-rocm-f16-compressor: $(ROCM_F16_COMPRESSOR_DEPS)
+	HIPCC="$(HIPCC)" ROCM_CFLAGS="$(ROCM_CFLAGS)" python3 tests/test_rocm_f16_compressor.py --rocm --bench
+
+.PHONY: test-metal-decode-fusions
+test-metal-decode-fusions: tests/test_metal_decode_fusions.py tests/test_metal_decode_fusions.m \
+	tests/kernel_source.py metal/dense.metal metal/dsv4_hc.metal
+	python3 tests/test_metal_decode_fusions.py
 
 clean:
 	rm -f tests/test_metal_ssd_experts

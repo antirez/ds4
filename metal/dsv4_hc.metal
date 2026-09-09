@@ -766,17 +766,14 @@ kernel void kernel_dsv4_shared_down_hc_expand4_q8_0(
     threadgroup float *shmem_f32[NR0];
     FOR_UNROLL(short row = 0; row < NR0; ++row) {
         shmem_f32[row] = (threadgroup float *)shmem + NW * row;
-        if (sgitg == 0) {
-            shmem_f32[row][tiisg] = 0.0f;
-        }
         sumf[row] = simd_sum(sumf[row]);
-    }
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    FOR_UNROLL(short row = 0; row < NR0; ++row) {
+        // Partial sums own [0, NSG); only the first SIMD group clears
+        // [NSG, NW). Disjoint writers need one publication barrier.
         if (tiisg == 0) {
             shmem_f32[row][sgitg] = sumf[row];
+        }
+        if (sgitg == 0 && tiisg >= NSG) {
+            shmem_f32[row][tiisg] = 0.0f;
         }
     }
 
@@ -886,17 +883,14 @@ kernel void kernel_dsv4_q8_hc_expand4_q8_0(
     threadgroup float *shmem_f32[NR0];
     FOR_UNROLL(short row = 0; row < NR0; ++row) {
         shmem_f32[row] = (threadgroup float *)shmem + NW * row;
-        if (sgitg == 0) {
-            shmem_f32[row][tiisg] = 0.0f;
-        }
         sumf[row] = simd_sum(sumf[row]);
-    }
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    FOR_UNROLL(short row = 0; row < NR0; ++row) {
+        // Partial sums own [0, NSG); only the first SIMD group clears
+        // [NSG, NW). Disjoint writers need one publication barrier.
         if (tiisg == 0) {
             shmem_f32[row][sgitg] = sumf[row];
+        }
+        if (sgitg == 0 && tiisg >= NSG) {
+            shmem_f32[row][tiisg] = 0.0f;
         }
     }
 
@@ -995,17 +989,14 @@ kernel void kernel_dsv4_q8_hc_expand4_q8_0_vec_hc(
     threadgroup float *shmem_f32[NR0];
     FOR_UNROLL(short row = 0; row < NR0; ++row) {
         shmem_f32[row] = (threadgroup float *)shmem + NW * row;
-        if (sgitg == 0) {
-            shmem_f32[row][tiisg] = 0.0f;
-        }
         sumf[row] = simd_sum(sumf[row]);
-    }
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    FOR_UNROLL(short row = 0; row < NR0; ++row) {
+        // Partial sums own [0, NSG); only the first SIMD group clears
+        // [NSG, NW). Disjoint writers need one publication barrier.
         if (tiisg == 0) {
             shmem_f32[row][sgitg] = sumf[row];
+        }
+        if (sgitg == 0 && tiisg >= NSG) {
+            shmem_f32[row][tiisg] = 0.0f;
         }
     }
 

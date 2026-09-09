@@ -1367,14 +1367,13 @@ template [[host_name("kernel_mul_mv_f16_f32_4")]] kernel mul_mv_t_t_4 kernel_mul
 // scores.  This paired variant keeps the exact dense F16 row-reduction shape
 // for each matrix, but shares one dispatch and one activation stream.
 template<short NR0, typename args_t>
-void kernel_mul_mv_f16_f32_pair_4_impl(
+void kernel_mul_mv_f16_f32_pair_accum_4_impl(
         args_t args,
         device const char * src0_a,
         device const char * src0_b,
         device const char * src1,
-        device       char * dst_a,
-        device       char * dst_b,
-        threadgroup  char * shmem,
+        thread float * sum_a,
+        thread float * sum_b,
         uint3  tgpig,
         ushort tiisg,
         ushort sgitg) {
@@ -1411,9 +1410,6 @@ void kernel_mul_mv_f16_f32_pair_4_impl(
         ax_b [row] = (device const half  *) ((device char *) src0_b + offset0);
         ax4_b[row] = (device const half4 *) ((device char *) src0_b + offset0);
     }
-
-    float sum_a[NR0] = { 0.f };
-    float sum_b[NR0] = { 0.f };
 
     const short ix = tiisg/(NW/NF);
     const short il = tiisg%(NW/NF);
@@ -1456,6 +1452,31 @@ void kernel_mul_mv_f16_f32_pair_4_impl(
         }
     }
 
+}
+
+// Keep the ordinary pair's reduction as the reference path. The fused
+// compressor below shares only its unchanged dot-product accumulation.
+template<short NR0, typename args_t>
+void kernel_mul_mv_f16_f32_pair_4_impl(
+        args_t args,
+        device const char * src0_a,
+        device const char * src0_b,
+        device const char * src1,
+        device       char * dst_a,
+        device       char * dst_b,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    float sum_a[NR0] = { 0.f };
+    float sum_b[NR0] = { 0.f };
+    kernel_mul_mv_f16_f32_pair_accum_4_impl<NR0>(
+            args, src0_a, src0_b, src1, sum_a, sum_b,
+            tgpig, tiisg, sgitg);
+
+    const int r0 = tgpig.x*NR0;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
     device float * dst_a_f32 = (device float *) dst_a + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
     device float * dst_b_f32 = (device float *) dst_b + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
 
@@ -1497,11 +1518,80 @@ kernel void kernel_mul_mv_f16_f32_pair_4(
             args, src0_a, src0_b, src1, dst_a, dst_b, shmem, tgpig, tiisg, sgitg);
 }
 
-// Decode compressor projection plus recurrent-state append. The paired
-// matvec remains unchanged and still materializes both F32 outputs. After a
-// device-memory barrier, the first NR0 threads reload those exact stored bits
-// and perform the same state write and score+APE addition as
-// kernel_dsv4_compressor_store_one.
+// Both projections keep the reference simd_sum trees. Each SIMD group owns
+// one partial slot; group zero initializes only the unused slots, so all
+// writes are disjoint and one barrier makes both planes ready to reduce.
+// The output owner also appends the same FP32 totals to recurrent state:
+// diagnostics remain materialized without a device barrier or reload.
+template<short NR0, typename args_t>
+void kernel_mul_mv_f16_f32_pair_compressor_store_4_impl(
+        args_t args,
+        constant ds4_metal_args_compressor_pair_store & store,
+        device const char * src0_a,
+        device const char * src0_b,
+        device const char * src1,
+        device       char * dst_a,
+        device       char * dst_b,
+        device const char * ape,
+        device       float * state_kv,
+        device       float * state_score,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    constexpr short NW = N_SIMDWIDTH;
+    const short NSG = FC_mul_mv_nsg;
+    float sum_a[NR0] = { 0.f };
+    float sum_b[NR0] = { 0.f };
+    kernel_mul_mv_f16_f32_pair_accum_4_impl<NR0>(
+            args, src0_a, src0_b, src1, sum_a, sum_b,
+            tgpig, tiisg, sgitg);
+
+    threadgroup float * shared = (threadgroup float *)shmem;
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        threadgroup float * sha = shared + NW * row;
+        threadgroup float * shb = shared + NW * (NR0 + row);
+        sum_a[row] = simd_sum(sum_a[row]);
+        sum_b[row] = simd_sum(sum_b[row]);
+        if (tiisg == 0) {
+            sha[sgitg] = sum_a[row];
+            shb[sgitg] = sum_b[row];
+        }
+        if (sgitg == 0 && tiisg >= NSG) {
+            sha[tiisg] = 0.0f;
+            shb[tiisg] = 0.0f;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int r0 = tgpig.x * NR0;
+    const uint64_t out_base = (uint64_t)tgpig.z * args.ne0 * args.ne1 +
+                             (uint64_t)tgpig.y * args.ne0;
+    device float * out_a = (device float *)dst_a + out_base;
+    device float * out_b = (device float *)dst_b + out_base;
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        const float total_a = simd_sum(shared[NW * row + tiisg]);
+        const float total_b = simd_sum(shared[NW * (NR0 + row) + tiisg]);
+        const uint col = (uint)(r0 + row);
+        if (tiisg == 0 && sgitg == 0 && col < (uint)args.ne01) {
+            out_a[col] = total_a;
+            out_b[col] = total_b;
+            if (col < store.width && store.ratio != 0u) {
+                const uint pos_mod = store.pos % store.ratio;
+                const uint dst_row = store.ratio == 4u
+                    ? store.ratio + pos_mod : pos_mod;
+                const uint dst = dst_row * store.width + col;
+                const uint ape_i = pos_mod * store.width + col;
+                const float ape_v = store.ape_type == 1u
+                    ? (float)((device const half *)ape)[ape_i]
+                    : ((device const float *)ape)[ape_i];
+                state_kv[dst] = total_a;
+                state_score[dst] = total_b + ape_v;
+            }
+        }
+    }
+}
+
 kernel void kernel_mul_mv_f16_f32_pair_compressor_store_4(
         constant ds4_metal_args_mul_mv & args,
         constant ds4_metal_args_compressor_pair_store & store,
@@ -1518,36 +1608,18 @@ kernel void kernel_mul_mv_f16_f32_pair_compressor_store_4(
         ushort tiitg [[thread_index_in_threadgroup]],
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    kernel_mul_mv_f16_f32_pair_4_disp<constant ds4_metal_args_mul_mv &>(
-            args, src0_a, src0_b, src1, dst_a, dst_b,
-            shmem, tgpig, tiisg, sgitg);
-
-    threadgroup_barrier(mem_flags::mem_device);
-
-    if (tiitg >= args.nr0 || store.width == 0u || store.ratio == 0u) {
-        return;
+    switch (args.nr0) {
+        case 2:
+            kernel_mul_mv_f16_f32_pair_compressor_store_4_impl<2>(
+                    args, store, src0_a, src0_b, src1, dst_a, dst_b,
+                    ape, state_kv, state_score, shmem, tgpig, tiisg, sgitg);
+            break;
+        case 4:
+            kernel_mul_mv_f16_f32_pair_compressor_store_4_impl<4>(
+                    args, store, src0_a, src0_b, src1, dst_a, dst_b,
+                    ape, state_kv, state_score, shmem, tgpig, tiisg, sgitg);
+            break;
     }
-    const uint col = tgpig.x * (uint)args.nr0 + tiitg;
-    if (col >= store.width) return;
-
-    const uint pos_mod = store.pos % store.ratio;
-    const uint dst_row = store.ratio == 4u ? store.ratio + pos_mod : pos_mod;
-    const uint dst = dst_row * store.width + col;
-    const uint ape_i = pos_mod * store.width + col;
-
-    device volatile const float * projected_kv =
-            (device volatile const float *)dst_a;
-    device volatile const float * projected_score =
-            (device volatile const float *)dst_b;
-    float ape_v;
-    if (store.ape_type == 1u) {
-        ape_v = (float)(((device const half *)ape)[ape_i]);
-    } else {
-        ape_v = ((device const float *)ape)[ape_i];
-    }
-
-    state_kv[dst] = projected_kv[col];
-    state_score[dst] = projected_score[col] + ape_v;
 }
 
 // Decode compressor + indexer-compressor projection in one dispatch.  Both
@@ -1595,50 +1667,16 @@ kernel void kernel_mul_mv_f16_f32_quad_compressor_store_4(
     largs.ne01 = second ? (int32_t)store1.width : (int32_t)store0.width;
 
     if (!second) {
-        kernel_mul_mv_f16_f32_pair_4_impl<NR0>(
-                largs, src0_a0, src0_b0, src1, dst_a0, dst_b0,
+        kernel_mul_mv_f16_f32_pair_compressor_store_4_impl<NR0>(
+                largs, store0, src0_a0, src0_b0, src1, dst_a0, dst_b0,
+                ape0, state0_kv, state0_score,
                 shmem, local_tgpig, tiisg, sgitg);
     } else {
-        kernel_mul_mv_f16_f32_pair_4_impl<NR0>(
-                largs, src0_a1, src0_b1, src1, dst_a1, dst_b1,
+        kernel_mul_mv_f16_f32_pair_compressor_store_4_impl<NR0>(
+                largs, store1, src0_a1, src0_b1, src1, dst_a1, dst_b1,
+                ape1, state1_kv, state1_score,
                 shmem, local_tgpig, tiisg, sgitg);
     }
-
-    threadgroup_barrier(mem_flags::mem_device);
-
-    // State append: identical to the paired store kernel, scoped to the
-    // range this threadgroup just projected (its own outputs only).
-    constant ds4_metal_args_compressor_pair_store & store = second ? store1 : store0;
-    if (tiitg >= NR0 || store.width == 0u || store.ratio == 0u) {
-        return;
-    }
-    const uint col = local_tgpig.x * (uint)NR0 + tiitg;
-    if (col >= store.width) return;
-
-    const uint pos_mod = store.pos % store.ratio;
-    const uint dst_row = store.ratio == 4u ? store.ratio + pos_mod : pos_mod;
-    const uint dst = dst_row * store.width + col;
-    const uint ape_i = pos_mod * store.width + col;
-
-    device volatile const float * projected_kv = second
-        ? (device volatile const float *)dst_a1
-        : (device volatile const float *)dst_a0;
-    device volatile const float * projected_score = second
-        ? (device volatile const float *)dst_b1
-        : (device volatile const float *)dst_b0;
-    device const char * ape = second ? ape1 : ape0;
-    device float * state_kv = second ? state1_kv : state0_kv;
-    device float * state_score = second ? state1_score : state0_score;
-
-    float ape_v;
-    if (store.ape_type == 1u) {
-        ape_v = (float)(((device const half *)ape)[ape_i]);
-    } else {
-        ape_v = ((device const float *)ape)[ape_i];
-    }
-
-    state_kv[dst] = projected_kv[col];
-    state_score[dst] = projected_score[col] + ape_v;
 }
 
 /* Decode-only fusion: one dispatch covers the q_a/kv Q8 pair projection and
@@ -1648,8 +1686,7 @@ kernel void kernel_mul_mv_f16_f32_quad_compressor_store_4(
  * NSG=4 cohorts per threadgroup, each an exact replica of
  * kernel_mul_mv_q8_0_f32_pair (same per-lane K walk and reduction tree, cf.
  * kernel_dsv4_router_shared_gate_up_q8_0); the compressor ranges run
- * kernel_mul_mv_f16_f32_pair_4_impl<2> and the paired store epilogue
- * verbatim, so every output bit matches the two separate dispatches. */
+ * the same paired compressor helper as the standalone fused dispatch. */
 kernel void kernel_dsv4_qkv_pair_quad_compressor_store_q8_0(
         constant ds4_metal_args_mul_mv & args0,
         constant ds4_metal_args_mul_mv & args1,
@@ -1809,50 +1846,16 @@ kernel void kernel_dsv4_qkv_pair_quad_compressor_store_q8_0(
     largs.ne01 = second ? (int32_t)store1.width : (int32_t)store0.width;
 
     if (!second) {
-        kernel_mul_mv_f16_f32_pair_4_impl<NR0>(
-                largs, cw0a, cw0b, src1, cdst_a0, cdst_b0,
+        kernel_mul_mv_f16_f32_pair_compressor_store_4_impl<NR0>(
+                largs, store0, cw0a, cw0b, src1, cdst_a0, cdst_b0,
+                ape0, state0_kv, state0_score,
                 shmem, local_tgpig, tiisg, sgitg);
     } else {
-        kernel_mul_mv_f16_f32_pair_4_impl<NR0>(
-                largs, cw1a, cw1b, src1, cdst_a1, cdst_b1,
+        kernel_mul_mv_f16_f32_pair_compressor_store_4_impl<NR0>(
+                largs, store1, cw1a, cw1b, src1, cdst_a1, cdst_b1,
+                ape1, state1_kv, state1_score,
                 shmem, local_tgpig, tiisg, sgitg);
     }
-
-    threadgroup_barrier(mem_flags::mem_device);
-
-    // State append: identical to the paired store kernel, scoped to the
-    // range this threadgroup just projected (its own outputs only).
-    constant ds4_metal_args_compressor_pair_store & store = second ? store1 : store0;
-    if (tiitg >= NR0 || store.width == 0u || store.ratio == 0u) {
-        return;
-    }
-    const uint col = local_tgpig.x * (uint)NR0 + tiitg;
-    if (col >= store.width) return;
-
-    const uint pos_mod = store.pos % store.ratio;
-    const uint dst_row = store.ratio == 4u ? store.ratio + pos_mod : pos_mod;
-    const uint dst = dst_row * store.width + col;
-    const uint ape_i = pos_mod * store.width + col;
-
-    device volatile const float * projected_kv = second
-        ? (device volatile const float *)cdst_a1
-        : (device volatile const float *)cdst_a0;
-    device volatile const float * projected_score = second
-        ? (device volatile const float *)cdst_b1
-        : (device volatile const float *)cdst_b0;
-    device const char * ape = second ? ape1 : ape0;
-    device float * state_kv = second ? state1_kv : state0_kv;
-    device float * state_score = second ? state1_score : state0_score;
-
-    float ape_v;
-    if (store.ape_type == 1u) {
-        ape_v = (float)(((device const half *)ape)[ape_i]);
-    } else {
-        ape_v = ((device const float *)ape)[ape_i];
-    }
-
-    state_kv[dst] = projected_kv[col];
-    state_score[dst] = projected_score[col] + ape_v;
 }
 
 template<typename T0, typename T1, typename args_t>

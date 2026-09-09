@@ -20,6 +20,7 @@
 #include <unordered_map>
 #include <vector>
 #include <algorithm>
+#include <mutex>
 
 #include "cuda/mmq/ds4_mmq.h"
 #include "cuda/mmq/ds4_repack.h"

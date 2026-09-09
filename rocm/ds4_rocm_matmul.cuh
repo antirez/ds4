@@ -1208,6 +1208,12 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
     return cuda_ok(cudaGetLastError(), "matmul_f16_pair_ordered_chunks launch");
 }
 
+static bool cuda_f16_compressor_ranges_overlap(
+        const void *a, uint64_t a_bytes, const void *b, uint64_t b_bytes) {
+    const uintptr_t ap = (uintptr_t)a, bp = (uintptr_t)b;
+    return ap <= bp ? bp - ap < a_bytes : ap - bp < b_bytes;
+}
+
 extern "C" int ds4_gpu_matmul_f16_pair_compressor_store_tensor(
         ds4_gpu_tensor *out_kv,
         ds4_gpu_tensor *out_score,
@@ -1224,22 +1230,69 @@ extern "C" int ds4_gpu_matmul_f16_pair_compressor_store_tensor(
         const ds4_gpu_tensor *x,
         uint32_t ratio,
         uint32_t pos) {
-    (void)out_kv;
-    (void)out_score;
-    (void)state_kv;
-    (void)state_score;
-    (void)model_map;
-    (void)model_size;
-    (void)weight_kv_offset;
-    (void)weight_score_offset;
-    (void)ape_offset;
-    (void)ape_type;
-    (void)in_dim;
-    (void)width;
-    (void)x;
-    (void)ratio;
-    (void)pos;
-    return 0;
+    /* The production shared-X pair is tuned for these gfx1151 decode shapes.
+     * Preserve quality/reference arithmetic and the existing diagnostic path. */
+    if (g_quality_mode || cuda_runtime_config()->graph_dump ||
+        !ds4_rocm_is_gfx1151() || in_dim != 4096u ||
+        !((ratio == 4u && (width == 256u || width == 1024u)) ||
+          (ratio == 128u && width == 512u)) ||
+        (ape_type != 0u && ape_type != 1u)) return 0;
+    if (!model_map) return -1;
+    const uint64_t weight_bytes = (uint64_t)width * in_dim * sizeof(__half);
+    const uint64_t output_bytes = (uint64_t)width * sizeof(float);
+    const uint64_t input_bytes = in_dim * sizeof(float);
+    const uint64_t state_bytes = (uint64_t)width * ratio *
+        (ratio == 4u ? 2u : 1u) * sizeof(float);
+    const uint64_t ape_bytes = (uint64_t)width * ratio *
+        (ape_type == 1u ? sizeof(__half) : sizeof(float));
+    if (!cuda_tensor_has_bytes(x, input_bytes) ||
+        !cuda_tensor_has_bytes(out_kv, output_bytes) ||
+        !cuda_tensor_has_bytes(out_score, output_bytes) ||
+        !cuda_tensor_has_bytes(state_kv, state_bytes) ||
+        !cuda_tensor_has_bytes(state_score, state_bytes) ||
+        !cuda_model_range_fits(model_size, weight_kv_offset, weight_bytes) ||
+        !cuda_model_range_fits(model_size, weight_score_offset, weight_bytes) ||
+        !cuda_model_range_fits(model_size, ape_offset, ape_bytes)) return -1;
+
+    const void *writes[] = {out_kv->ptr, out_score->ptr,
+                           state_kv->ptr, state_score->ptr};
+    const uint64_t write_bytes[] = {output_bytes, output_bytes,
+                                   state_bytes, state_bytes};
+    for (unsigned i = 0; i < 4u; ++i) {
+        if (cuda_f16_compressor_ranges_overlap(
+                writes[i], write_bytes[i], x->ptr, input_bytes)) return 0;
+        for (unsigned j = i + 1u; j < 4u; ++j) {
+            if (cuda_f16_compressor_ranges_overlap(
+                    writes[i], write_bytes[i], writes[j], write_bytes[j])) return 0;
+        }
+    }
+    const __half *w_kv = (const __half *)cuda_model_range_ptr(
+        model_map, weight_kv_offset, weight_bytes, "f16 compressor kv");
+    const __half *w_score = (const __half *)cuda_model_range_ptr(
+        model_map, weight_score_offset, weight_bytes, "f16 compressor score");
+    const void *ape = cuda_model_range_ptr(
+        model_map, ape_offset, ape_bytes, "compressor ape");
+    if (!w_kv || !w_score || !ape) return -1;
+    const void *reads[] = {w_kv, w_score, ape};
+    const uint64_t read_bytes[] = {weight_bytes, weight_bytes, ape_bytes};
+    for (unsigned i = 0; i < 4u; ++i) {
+        for (unsigned j = 0; j < 3u; ++j) {
+            if (cuda_f16_compressor_ranges_overlap(
+                    writes[i], write_bytes[i], reads[j], read_bytes[j])) return 0;
+        }
+    }
+    const uint32_t rows_per_block = 32u;
+    matmul_f16_pair_compressor_store_sharedx_w32_kernel<<<
+        (width + rows_per_block - 1u) / rows_per_block,
+        rows_per_block * 32u, (size_t)in_dim * sizeof(float)>>>(
+            (float *)out_kv->ptr, (float *)out_score->ptr, w_kv, w_score,
+            (const float *)x->ptr, (uint32_t)in_dim, width,
+            (float *)state_kv->ptr, (float *)state_score->ptr,
+            ape, ape_type, ratio, pos);
+    /* Once the writer is submitted, a launch failure is fatal: never replay
+     * the fallback against state that may already have been updated. */
+    return cuda_ok(cudaGetLastError(), "f16 pair compressor/store sharedx launch")
+        ? 1 : -1;
 }
 
 extern "C" int ds4_gpu_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
