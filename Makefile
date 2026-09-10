@@ -82,6 +82,8 @@ help:
 	@echo "  make cpu          Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
 	@echo "  make test         Build and run tests"
 	@echo "  make metal-decode-schedule-bench  Build the balanced Metal decode schedule benchmark"
+	@echo "  make bench-metal-f16-decode      Compare baseline/current F16 shaders; CSV and JSON in /tmp"
+	@echo "  make metal-decode-profile        Build the real-session Metal dispatch profiler"
 	@echo "  make metal-prefill-variant-bench  Build the balanced Metal prefill variant benchmark"
 	@echo "  make check-mxfp4-half-lut  Verify the checked-in MXFP4 half LUT matches the generator"
 	@echo "  make test-mxfp4-metal  Check the MXFP4 half LUT, then run Metal MXFP4 exactness tests"
@@ -129,6 +131,15 @@ speed-bench/metal_decode_schedule_bench: speed-bench/metal_decode_schedule_bench
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
 metal-decode-schedule-bench: speed-bench/metal_decode_schedule_bench
+
+speed-bench/metal_decode_profile.o: speed-bench/metal_decode_profile.c ds4.h ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+speed-bench/metal_decode_profile: speed-bench/metal_decode_profile.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+.PHONY: metal-decode-profile
+metal-decode-profile: speed-bench/metal_decode_profile
 
 speed-bench/metal_prefill_variant_bench.o: speed-bench/metal_prefill_variant_bench.c ds4.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
@@ -798,10 +809,25 @@ bench-rocm-f16-compressor: $(ROCM_F16_COMPRESSOR_DEPS)
 
 .PHONY: test-metal-decode-fusions
 test-metal-decode-fusions: tests/test_metal_decode_fusions.py tests/test_metal_decode_fusions.m \
-	tests/kernel_source.py metal/dense.metal metal/dsv4_hc.metal
+	tests/metal_decode_test_support.h tests/kernel_source.py metal/dense.metal metal/dsv4_hc.metal
 	python3 tests/test_metal_decode_fusions.py
 
+.PHONY: bench-metal-f16-decode test-metal-decode-profile test-metal-timeline
+METAL_F16_BENCH_ARGS ?= --output /tmp/ds4-metal-f16-bench
+bench-metal-f16-decode: speed-bench/metal_f16_decode_bench.py speed-bench/metal_f16_decode_bench.m \
+	tests/metal_decode_test_support.h tests/test_metal_decode_fusions.py tests/kernel_source.py \
+	metal/dense.metal metal/dsv4_hc.metal
+	python3 speed-bench/metal_f16_decode_bench.py $(METAL_F16_BENCH_ARGS)
+
+test-metal-decode-profile: speed-bench/metal_decode_profile.py tests/test_metal_decode_profile.py
+	python3 tests/test_metal_decode_profile.py
+
+test-metal-timeline: tests/test_metal_timeline.py tests/test_metal_timeline.m ds4_metal.m \
+	ds4_gpu.h $(METAL_SRCS) ds4_image.o
+	python3 tests/test_metal_timeline.py
+
 clean:
+	rm -f speed-bench/metal_decode_profile
 	rm -f tests/test_metal_ssd_experts
 	rm -f tests/test_cuda_q8_scratch
 	rm -f tests/test_cuda_dspark_moe

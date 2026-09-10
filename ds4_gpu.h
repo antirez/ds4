@@ -79,6 +79,10 @@ int ds4_gpu_flush_encoder(void);
 int ds4_gpu_flush_commands(void);
 int ds4_gpu_commands_active(void);
 #ifdef __APPLE__
+/* Annotate the existing encoder timeline, between completed session calls.
+ * Returns 1 when active, 0 when disabled/unsupported, -1 for an invalid phase
+ * or an open batch. Does not flush commands or enable profiling. */
+int ds4_gpu_timeline_set_phase(const char *phase, uint32_t position);
 int ds4_gpu_parallel_ffn_finish(void);
 void ds4_gpu_parallel_ffn_abort(void);
 int ds4_gpu_parallel_ffn_start(

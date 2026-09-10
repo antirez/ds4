@@ -16,9 +16,12 @@ from kernel_source import extract_function
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def shader_source():
-    dense = (ROOT / 'metal/dense.metal').read_text()
-    hc = (ROOT / 'metal/dsv4_hc.metal').read_text()
+def shader_source(dense=None, hc=None):
+    """Extract current or explicitly supplied shader sources without rewriting kernels."""
+    if dense is None:
+        dense = (ROOT / 'metal/dense.metal').read_text()
+    if hc is None:
+        hc = (ROOT / 'metal/dsv4_hc.metal').read_text()
     prefix = '''#include <metal_stdlib>
 using namespace metal;
 #define QK8_0 32

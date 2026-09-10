@@ -82,11 +82,26 @@ typedef struct {
     uint32_t count;
     uint32_t cap;
     uint64_t seq;
+    uint32_t position;
+    uint32_t dropped;
+    char phase[16];
 }
 @end
 @implementation DS4TimelineBatch
 - (void)dealloc { free(recs); }
 @end
+
+/* Bind records to their encoder, not to the latest global batch. Owned
+ * encoders (including the keepalive thread) must not modify a traced pass. */
+@interface DS4TimelineEncoderRecord : NSObject {
+@public
+    DS4TimelineBatch *batch;
+    uint32_t index;
+}
+@end
+@implementation DS4TimelineEncoderRecord
+@end
+static char g_timeline_encoder_record_key;
 
 static BOOL g_timeline_enabled;
 static FILE *g_timeline_file;
@@ -96,6 +111,19 @@ static uint64_t g_timeline_seq;
 static NSMutableDictionary<NSNumber *, NSString *> *g_timeline_pso_names;
 static id<MTLCounterSet> g_timeline_counter_set;
 static BOOL g_timeline_encoder_hooked;
+static char g_timeline_phase[16] = "setup";
+static uint32_t g_timeline_position;
+
+int ds4_gpu_timeline_set_phase(const char *phase, uint32_t position) {
+    if (!g_timeline_enabled) return 0;
+    if (g_batch_cb || !phase || !phase[0] || strlen(phase) >= sizeof(g_timeline_phase))
+        return -1;
+    for (const char *p = phase; *p; ++p)
+        if ((*p < 'a' || *p > 'z') && *p != '_') return -1;
+    snprintf(g_timeline_phase, sizeof(g_timeline_phase), "%s", phase);
+    g_timeline_position = position;
+    return 1;
+}
 
 static void ds4_gpu_timeline_note_pso_name(id pso, NSString *name) {
     if (!g_timeline_enabled || !pso || !name) return;
@@ -117,10 +145,11 @@ static void ds4_gpu_timeline_note_pso_name(id pso, NSString *name) {
 - (void)ds4_tl_dispatchThreads:(MTLSize)threads threadsPerThreadgroup:(MTLSize)tpt;
 @end
 
-static ds4_timeline_rec *ds4_gpu_timeline_current_rec(void) {
-    DS4TimelineBatch *b = g_timeline_batch;
-    if (!b || b->count == 0) return NULL;
-    return &b->recs[b->count - 1];
+static ds4_timeline_rec *ds4_gpu_timeline_current_rec(id encoder) {
+    DS4TimelineEncoderRecord *tag = objc_getAssociatedObject(
+        encoder, &g_timeline_encoder_record_key);
+    if (!tag || tag->index >= tag->batch->count) return NULL;
+    return &tag->batch->recs[tag->index];
 }
 
 @implementation NSObject (DS4TimelineSwizzle)
@@ -143,7 +172,7 @@ static ds4_timeline_rec *ds4_gpu_timeline_current_rec(void) {
 }
 - (void)ds4_tl_setComputePipelineState:(id<MTLComputePipelineState>)pso {
     [self ds4_tl_setComputePipelineState:pso];
-    ds4_timeline_rec *rec = ds4_gpu_timeline_current_rec();
+    ds4_timeline_rec *rec = ds4_gpu_timeline_current_rec(self);
     if (!rec) return;
     NSString *name = nil;
     pthread_mutex_lock(&g_timeline_mutex);
@@ -160,7 +189,7 @@ static ds4_timeline_rec *ds4_gpu_timeline_current_rec(void) {
 }
 - (void)ds4_tl_dispatchThreadgroups:(MTLSize)tg threadsPerThreadgroup:(MTLSize)tpt {
     [self ds4_tl_dispatchThreadgroups:tg threadsPerThreadgroup:tpt];
-    ds4_timeline_rec *rec = ds4_gpu_timeline_current_rec();
+    ds4_timeline_rec *rec = ds4_gpu_timeline_current_rec(self);
     if (!rec) return;
     if (rec->n_dispatch == 0) {
         rec->tg[0] = (uint32_t)tg.width; rec->tg[1] = (uint32_t)tg.height; rec->tg[2] = (uint32_t)tg.depth;
@@ -170,7 +199,7 @@ static ds4_timeline_rec *ds4_gpu_timeline_current_rec(void) {
 }
 - (void)ds4_tl_dispatchThreads:(MTLSize)threads threadsPerThreadgroup:(MTLSize)tpt {
     [self ds4_tl_dispatchThreads:threads threadsPerThreadgroup:tpt];
-    ds4_timeline_rec *rec = ds4_gpu_timeline_current_rec();
+    ds4_timeline_rec *rec = ds4_gpu_timeline_current_rec(self);
     if (!rec) return;
     if (rec->n_dispatch == 0) {
         rec->tg[0] = (uint32_t)((threads.width + tpt.width - 1) / (tpt.width ? tpt.width : 1));
@@ -232,6 +261,7 @@ static void ds4_gpu_timeline_probe(id<MTLDevice> device) {
     fprintf(g_timeline_file, "# ds4 encoder timeline; slide=0x%llx pid=%d\n",
             (unsigned long long)_dyld_get_image_vmaddr_slide(0), (int)getpid());
     fprintf(g_timeline_file, "# B <seq> <n_encoders> <gpu_start_ns> <gpu_end_ns>\n");
+    fprintf(g_timeline_file, "# C <seq> <phase> <position> <dropped_encoders>\n");
     fprintf(g_timeline_file, "# E <seq> <idx> <start_ns> <end_ns> <dur_us> <gap_us> <caller_unslid> <n_dispatch> <tg> <tpt> <kernel>\n");
     fflush(g_timeline_file);
     fprintf(stderr, "ds4: encoder timeline -> %s\n", path);
@@ -252,6 +282,8 @@ static void ds4_gpu_timeline_hook_encoder(id<MTLComputeCommandEncoder> enc) {
 static void ds4_gpu_timeline_resolve(DS4TimelineBatch *b, id<MTLCommandBuffer> cb) {
     if (!b || !g_timeline_file) return;
     pthread_mutex_lock(&g_timeline_mutex);
+    fprintf(g_timeline_file, "C %llu %s %u %u\n", (unsigned long long)b->seq,
+            b->phase, b->position, b->dropped);
     fprintf(g_timeline_file, "B %llu %u %.0f %.0f\n", (unsigned long long)b->seq, b->count,
             cb.GPUStartTime * 1e9, cb.GPUEndTime * 1e9);
     uint64_t prev_end = 0;
@@ -289,12 +321,26 @@ static void ds4_gpu_timeline_attach(id<MTLCommandBuffer> cb) {
     b->samples = [NSMutableArray array];
     b->cap = 1024;
     b->recs = calloc(b->cap, sizeof(ds4_timeline_rec));
+    if (!b->recs) b->cap = 0;
     b->count = 0;
     b->seq = ++g_timeline_seq;
+    b->position = g_timeline_position;
+    snprintf(b->phase, sizeof(b->phase), "%s", g_timeline_phase);
     g_timeline_batch = b;
     [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
         ds4_gpu_timeline_resolve(b, done);
     }];
+}
+
+static BOOL ds4_gpu_timeline_reserve_record(DS4TimelineBatch *b) {
+    if (b->count < b->cap) return YES;
+    const uint32_t cap = b->cap ? b->cap * 2u : 1024u;
+    if (cap <= b->cap) return NO;
+    ds4_timeline_rec *recs = realloc(b->recs, (size_t)cap * sizeof(*recs));
+    if (!recs) return NO;
+    b->recs = recs;
+    b->cap = cap;
+    return YES;
 }
 
 static id<MTLComputeCommandEncoder> ds4_gpu_timeline_new_encoder(
@@ -311,15 +357,16 @@ static id<MTLComputeCommandEncoder> ds4_gpu_timeline_new_encoder(
         NSError *error = nil;
         id<MTLCounterSampleBuffer> sb = [g_device newCounterSampleBufferWithDescriptor:d error:&error];
         if (!sb) {
+            b->dropped++;
             fprintf(stderr, "ds4: timeline sample buffer failed: %s\n",
                     [[error localizedDescription] UTF8String]);
             return nil;
         }
         [b->samples addObject:sb];
     }
-    if (b->count == b->cap) {
-        b->cap *= 2;
-        b->recs = realloc(b->recs, (size_t)b->cap * sizeof(ds4_timeline_rec));
+    if (!ds4_gpu_timeline_reserve_record(b)) {
+        b->dropped++;
+        return nil;
     }
     const uint32_t slot = (b->count % per_buffer) * 2u;
     MTLComputePassDescriptor *pd = [MTLComputePassDescriptor computePassDescriptor];
@@ -329,7 +376,12 @@ static id<MTLComputeCommandEncoder> ds4_gpu_timeline_new_encoder(
     att.startOfEncoderSampleIndex = slot;
     att.endOfEncoderSampleIndex = slot + 1u;
     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoderWithDescriptor:pd];
-    if (!enc) return nil;
+    if (!enc) { b->dropped++; return nil; }
+    DS4TimelineEncoderRecord *tag = [DS4TimelineEncoderRecord new];
+    tag->batch = b;
+    tag->index = b->count;
+    objc_setAssociatedObject(enc, &g_timeline_encoder_record_key, tag,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     ds4_timeline_rec *rec = &b->recs[b->count++];
     memset(rec, 0, sizeof(*rec));
     rec->caller = caller;
@@ -351,12 +403,12 @@ static id<MTLBlitCommandEncoder> ds4_gpu_blit_encoder(id<MTLCommandBuffer> cb, c
         d.sampleCount = DS4_TIMELINE_SAMPLES_PER_BUFFER;
         NSError *error = nil;
         id<MTLCounterSampleBuffer> sb = [g_device newCounterSampleBufferWithDescriptor:d error:&error];
-        if (!sb) return [cb blitCommandEncoder];
+        if (!sb) { b->dropped++; return [cb blitCommandEncoder]; }
         [b->samples addObject:sb];
     }
-    if (b->count == b->cap) {
-        b->cap *= 2;
-        b->recs = realloc(b->recs, (size_t)b->cap * sizeof(ds4_timeline_rec));
+    if (!ds4_gpu_timeline_reserve_record(b)) {
+        b->dropped++;
+        return [cb blitCommandEncoder];
     }
     const uint32_t slot = (b->count % per_buffer) * 2u;
     MTLBlitPassDescriptor *pd = [MTLBlitPassDescriptor blitPassDescriptor];
@@ -365,7 +417,7 @@ static id<MTLBlitCommandEncoder> ds4_gpu_blit_encoder(id<MTLCommandBuffer> cb, c
     att.startOfEncoderSampleIndex = slot;
     att.endOfEncoderSampleIndex = slot + 1u;
     id<MTLBlitCommandEncoder> enc = [cb blitCommandEncoderWithDescriptor:pd];
-    if (!enc) return [cb blitCommandEncoder];
+    if (!enc) { b->dropped++; return [cb blitCommandEncoder]; }
     ds4_timeline_rec *rec = &b->recs[b->count++];
     memset(rec, 0, sizeof(*rec));
     rec->caller = (uintptr_t)__builtin_return_address(0);
@@ -10122,6 +10174,7 @@ int ds4_gpu_commit_and_wait_selected_readback(uint64_t event_value, const char *
             [g_transient_buffers removeAllObjects];
             return 0;
         }
+        ds4_gpu_timeline_attach(g_batch_cb);
         return 1;
     }
 
@@ -11387,6 +11440,7 @@ static int ds4_gpu_signal_batch_and_wait_event(const char *label) {
             [g_transient_buffers removeAllObjects];
             return 0;
         }
+        ds4_gpu_timeline_attach(g_batch_cb);
         return 1;
     } else {
         ds4_gpu_close_batch_encoder();

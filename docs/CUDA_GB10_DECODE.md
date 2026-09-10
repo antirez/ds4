@@ -136,6 +136,13 @@ weights and do not establish a model token/s gain, or performance on M3/M5.
 The direct shader benchmark also exercises kernels whose existing host gates
 may select other paths on M1.
 
+The [reproducible benchmark and real-decode profiler](METAL_DECODE_PROFILING.md)
+now ship in the repository. They compare actual baseline/current shader
+sources, save raw samples and provenance, and identify F16 versus compound
+dispatches in the model's existing Metal timeline. This addresses the missing
+reproduction tool noted in the [external M5 Max report](https://github.com/evanwtf/local-llm/issues/274#issuecomment-5608344436),
+which passed the bitwise tests but found no clear end-to-end speedup.
+
 ## ROCm: fuse the F16 compressor state write
 
 On gfx1151, the existing shared-X F16 pair kernel now has a variant that also
