@@ -474,6 +474,18 @@ tests/test_deepseek4_vision_image.o: tests/test_deepseek4_vision_image.c ds4_ima
 tests/test_deepseek4_vision_image: tests/test_deepseek4_vision_image.o ds4_image.o
 	$(CC) $(CFLAGS) -o $@ $^ -lm
 
+# Model-free exactness screens for the isolated M3 Ultra fork experiments.
+ifeq ($(UNAME_S),Darwin)
+GLM53_FORK_TESTS := tests/test_glm53_router_shared tests/test_glm53_topk_fast tests/test_glm53_q8_inputs
+$(GLM53_FORK_TESTS): %: %.c ds4_metal.o ds4_image.o ds4_gpu.h
+	$(CC) $(CFLAGS) -I. $< ds4_metal.o ds4_image.o -o $@ $(METAL_LDLIBS)
+.PHONY: test-glm53-fork
+test-glm53-fork: $(GLM53_FORK_TESTS)
+	./tests/test_glm53_router_shared
+	./tests/test_glm53_topk_fast
+	./tests/test_glm53_q8_inputs
+endif
+
 ifeq ($(UNAME_S),Darwin)
 $(GLM53_KDA_TEST): tests/test_glm53_kda.o ds4_metal.o ds4_image.o
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)

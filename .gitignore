@@ -67,3 +67,7 @@ __pycache__/
 /misc/
 .*.swp
 .DS_Store
+
+/tests/test_glm53_router_shared
+/tests/test_glm53_topk_fast
+/tests/test_glm53_q8_inputs
