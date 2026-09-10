@@ -10363,6 +10363,32 @@ static const char *find_next_dsml_tool_block(const char *p, const char **end_out
         best = s;
         best_end = e + strlen(forms[i].end);
     }
+    /* GLM has no enclosing tool_calls tag. Its generated-message parser
+     * remembers consecutive tool_call elements as one exact block, including
+     * two leading newlines (if present) and whitespace after the final call.
+     * Match those same bounds or the by_block lookup silently loses every GLM
+     * ID when a checkpoint is written. */
+    const char *glm = strstr(p, "<tool_call>");
+    if (glm) {
+        const char *start = glm;
+        if (glm - p >= 2 && glm[-2] == '\n' && glm[-1] == '\n') start -= 2;
+        if (!best || start < best) {
+            const char *end = NULL;
+            const char *call = glm;
+            for (;;) {
+                const char *close = strstr(call + sizeof("<tool_call>") - 1,
+                                           "</tool_call>");
+                if (!close) { end = NULL; break; }
+                end = skip_ascii_ws(close + sizeof("</tool_call>") - 1);
+                if (strncmp(end, "<tool_call>", sizeof("<tool_call>") - 1)) break;
+                call = end;
+            }
+            if (end) {
+                best = start;
+                best_end = end;
+            }
+        }
+    }
     if (end_out) *end_out = best_end;
     return best;
 }
@@ -19601,6 +19627,87 @@ static void test_kv_tool_map_filters_by_dsml_text(void) {
     pthread_mutex_destroy(&dst.tool_mu);
 }
 
+static void test_glm_kv_tool_map_roundtrip_exact_blocks(void) {
+    const char *leading[] = {"", "\n", "\n\n", "\n\n\n"};
+    for (int variant = 0; variant < 8; ++variant) {
+        const bool multiple = variant >= 4;
+        buf generated = {0};
+        buf_puts(&generated, "<think>need shell</think>");
+        buf_puts(&generated, leading[variant % 4]);
+        buf_puts(&generated, "<tool_call>Bash\n<arg_key>command</arg_key>"
+                            "<arg_value>printf café</arg_value></tool_call>");
+        if (multiple) {
+            buf_puts(&generated, "\n \t<tool_call>Read\n<arg_key>file_path</arg_key>"
+                                "<arg_value>/tmp/a.py</arg_value></tool_call>");
+        }
+        if (variant % 2) buf_puts(&generated, "\n \t");
+
+        char *content = NULL, *reasoning = NULL;
+        tool_calls sampled = {0};
+        TEST_ASSERT(parse_generated_message_ex_for_syntax(SERVER_MODEL_SYNTAX_GLM,
+                    generated.ptr, true, &content, &reasoning, &sampled));
+        TEST_ASSERT(sampled.len == (multiple ? 2 : 1));
+        server src = {0}, dst = {0};
+        pthread_mutex_init(&src.tool_mu, NULL);
+        pthread_mutex_init(&dst.tool_mu, NULL);
+        assign_tool_call_ids(&src, &sampled, API_ANTHROPIC);
+        tool_memory_remember(&src, &sampled);
+        tool_memory_put(&src, "toolu_absent", "<tool_call>Absent</tool_call>");
+
+        chat_msgs msgs = {0};
+        chat_msg assistant = {0};
+        assistant.role = xstrdup("assistant");
+        assistant.content = xstrdup(content ? content : "");
+        assistant.reasoning = xstrdup(reasoning ? reasoning : "");
+        for (int i = 0; i < sampled.len; ++i) {
+            tool_call tc = {.id = xstrdup(sampled.v[i].id),
+                            .name = xstrdup(sampled.v[i].name),
+                            .arguments = xstrdup(sampled.v[i].arguments)};
+            tool_calls_push(&assistant.calls, tc);
+        }
+        chat_msgs_push(&msgs, assistant);
+        tool_memory_attach_to_messages(&src, &msgs, NULL);
+        char *expected = render_glm_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH);
+        TEST_ASSERT(strstr(expected, sampled.raw_tool_text) != NULL);
+
+        /* Repetition must not serialize the same IDs twice; an unrelated block
+         * in tool memory must not leak into this checkpoint's sidecar. */
+        buf checkpoint = {0};
+        buf_puts(&checkpoint, expected);
+        buf_puts(&checkpoint, "<|observation|>done");
+        buf_puts(&checkpoint, expected);
+        FILE *fp = tmpfile();
+        TEST_ASSERT(fp != NULL);
+        uint64_t estimated = 0, written = 0;
+        TEST_ASSERT(kv_tool_map_serialized_size(&src, checkpoint.ptr, &estimated));
+        TEST_ASSERT(kv_tool_map_write(&src, fp, checkpoint.ptr, &written));
+        TEST_ASSERT(written > 0 && estimated == written);
+        TEST_ASSERT((uint64_t)ftell(fp) == written);
+        rewind(fp);
+        TEST_ASSERT(kv_tool_map_load_from_pos(&dst, fp, NULL) == sampled.len);
+        TEST_ASSERT(!tool_memory_has_id(&dst, "toolu_absent"));
+
+        /* A fresh server must replay the identical bytes, not regenerate the
+         * canonical newline or split a multi-call block into separate maps. */
+        free(msgs.v[0].calls.raw_tool_text);
+        msgs.v[0].calls.raw_tool_text = NULL;
+        tool_replay_stats stats = {0};
+        tool_memory_attach_to_messages(&dst, &msgs, &stats);
+        TEST_ASSERT(stats.disk == 1 && stats.canonical == 0 && stats.missing_ids == 0);
+        TEST_ASSERT(msgs.v[0].calls.raw_tool_text &&
+                    !strcmp(msgs.v[0].calls.raw_tool_text, sampled.raw_tool_text));
+        char *actual = render_glm_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH);
+        TEST_ASSERT(!strcmp(expected, actual));
+
+        free(expected); free(actual); free(content); free(reasoning);
+        fclose(fp);
+        buf_free(&checkpoint); buf_free(&generated);
+        chat_msgs_free(&msgs); tool_calls_free(&sampled);
+        tool_memory_free(&src.tool_mem); tool_memory_free(&dst.tool_mem);
+        pthread_mutex_destroy(&src.tool_mu); pthread_mutex_destroy(&dst.tool_mu);
+    }
+}
+
 static void test_kv_tool_map_restores_before_prompt_render(void) {
     char tmpl[] = "/tmp/ds4-kv-tool-map-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -20749,6 +20856,7 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_body_escape_round_trip();
     test_tool_memory_max_ids_prunes_oldest();
     test_kv_tool_map_filters_by_dsml_text();
+    test_glm_kv_tool_map_roundtrip_exact_blocks();
     test_kv_tool_map_restores_before_prompt_render();
     test_thinking_checkpoint_canonical_matches_future_prompt();
     test_thinking_canonical_empty_content();
