@@ -1,0 +1,57 @@
+{
+  "hardware": {
+    "chip": "Apple M3 Ultra",
+    "gpu_cores": 80,
+    "memory_bytes": 549755813888,
+    "model": "Mac15,14",
+    "macOS": "26.5.2 (25F84)"
+  },
+  "source_validation": {
+    "run": "01M24PAZH0HS08TZVK7WA4XD19",
+    "outcome": "passed",
+    "review": "passed, no findings",
+    "lint": "passed, no findings",
+    "reviewed_head": "8ad81dd02c6dd10db33a04e4d657162de6a494e8",
+    "merge_commit": "b4f26df3c7238eb2d2b13f27a52b60c87b483b76",
+    "complete_trees_equal": true,
+    "model_tested_source": "0f211542950428f2469c0976a1ecf459abc6feab",
+    "original_model_full_logit_byte_equality_contexts": [
+      2048,
+      8192,
+      62174,
+      300000
+    ],
+    "exactness_reference": "224e7669abac9fa64580e71a9a1581fa0c852d2a",
+    "does_not_claim_exactness_to_main": true,
+    "merge_tree": "5f682af49021b99b36559cca45f3198096b49e35",
+    "reviewed_tree": "5f682af49021b99b36559cca45f3198096b49e35"
+  },
+  "fresh_builds": {
+    "main": {
+      "exit_code": 0,
+      "command": [
+        "make",
+        "-j12",
+        "ds4-bench"
+      ],
+      "compiler_warnings": 0,
+      "log_sha256": "a270abf6ddd02822f62377fc45b8f831f3b0097365c74566aec21735d23e7692"
+    },
+    "new": {
+      "exit_code": 0,
+      "command": [
+        "make",
+        "-j12",
+        "ds4-bench",
+        "ds4-server",
+        "ds4_test",
+        "tests/test_glm53_kda",
+        "tests/test_glm53_router_shared",
+        "tests/test_glm53_topk_fast",
+        "tests/test_glm53_q8_inputs"
+      ],
+      "compiler_warnings": 0,
+      "log_sha256": "841111365f0c8d4a44eedff722dca6f77f131060b97df846968f36a346a448e4"
+    }
+  }
+}

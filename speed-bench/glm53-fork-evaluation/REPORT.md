@@ -1,8 +1,10 @@
 # M3 Ultra fork evaluation — 2026-09-09
 
+The validated experiment was merged into `glm53flash-metal-exact` at `b4f26df3c7238eb2d2b13f27a52b60c87b483b76`. See [the original-Q4_K integration comparison](Q4_K_MERGE.md) for fresh generation and prefill measurements against current main and the previous branch tip. This report preserves the broader experiment's separate model campaigns and historical evidence.
+
 Three decode adaptations produced repeatable gains while preserving every captured logit byte. Router/shared fusion improves short decode by about 1.6%. The final build improves original-model decode at 300K by 6.3% with router plus DSA, and the existing KDA-Q8 model at 8K by 3.7% with router plus mixed inputs, measured from restored prefixes. These are comparisons within each unchanged model, not a quality comparison between models.
 
-Experimental branch: `glm53flash-metal-fork-eval`, based on `glm53flash-metal-exact` at `224e7669abac9fa64580e71a9a1581fa0c852d2a`. The source fork is [IngeniousIdiocy/ds4 at 95eb218](https://github.com/IngeniousIdiocy/ds4/tree/95eb218614868284fb6a9350b4be9f32c0d57575). Final source checked against full model traces and repeated timing: `0f211542950428f2469c0976a1ecf459abc6feab`. Earlier records at `fa00a42` and server follow-up `70befc3` remain in the evidence directory for provenance. The experiment is local; the user's working branch remains at the pushed baseline.
+Experimental branch: `glm53flash-metal-fork-eval`, based on `glm53flash-metal-exact` at `224e7669abac9fa64580e71a9a1581fa0c852d2a`. The source fork is [IngeniousIdiocy/ds4 at 95eb218](https://github.com/IngeniousIdiocy/ds4/tree/95eb218614868284fb6a9350b4be9f32c0d57575). Final source checked against full model traces and repeated timing: `0f211542950428f2469c0976a1ecf459abc6feab`. Earlier records at `fa00a42` and server follow-up `70befc3` remain in the evidence directory for provenance. The merge preserves the reviewed experiment's complete file tree and commit history.
 
 ## Measured decode results
 
@@ -54,7 +56,7 @@ The DSA prototype adds histogram narrowing and a bounded candidate sort before o
 
 The mixed KDA fold handles Q8 Q/K/V plus BF16 f_a/g_a/beta and retains the existing dependent f_b/g_b pair. Each output uses its original dot-product helper. SSD streaming, tensor parallelism, incompatible types/shapes and diagnostic ablation/repetition retain their prior paths.
 
-DSA and mixed KDA are experimental opt-ins (`DS4_GLM_ENABLE_TOPK_FAST=1`, `DS4_GLM_ENABLE_KDA_Q8_INPUTS=1`). Router fusion has `DS4_METAL_DISABLE_GLM53_ROUTER_SHARED=1` as its rollback. The experiment is isolated from the working production branch.
+DSA and mixed KDA remain experimental opt-ins (`DS4_GLM_ENABLE_TOPK_FAST=1`, `DS4_GLM_ENABLE_KDA_Q8_INPUTS=1`). Router fusion has `DS4_METAL_DISABLE_GLM53_ROUTER_SHARED=1` as its rollback. Integration preserves these defaults and guards.
 
 ## Method and provenance
 
@@ -122,3 +124,5 @@ Roll back router fusion with `DS4_METAL_DISABLE_GLM53_ROUTER_SHARED=1`. Leave th
 ### Review
 
 Two complete source reviews identified the checkpoint, non-finite and GPU recovery issues described above. All findings were fixed in preserved commits and the final build passed the executable checks. Both post-fix re-review rounds hit the runner's 30-minute limit, so neither run produced a successful pipeline outcome. The final review is scoped to the last fix delta from `88f6f005` plus its evidence; rebase, duplicate model tests and publication remain disabled. This section records that review history, separately from the measured results and manual test outcomes.
+
+The subsequent no-mistakes run `01M24PAZH0HS08TZVK7WA4XD19` passed source review and lint with no findings at `8ad81dd`. Its review covered the final fix delta after the earlier complete reviews. Production sources are identical to model-tested `0f211542`; `8ad81dd` adds evidence only. Manual kernel, model, recovery, server and prefix-oracle checks passed as recorded above. Rebase, duplicate pipeline tests, document generation, push, PR and CI were skipped in that validation run.
