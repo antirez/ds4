@@ -10368,10 +10368,11 @@ static const char *find_next_dsml_tool_block(const char *p, const char **end_out
      * two leading newlines (if present) and whitespace after the final call.
      * Match those same bounds or the by_block lookup silently loses every GLM
      * ID when a checkpoint is written. */
-    const char *glm = strstr(p, "<tool_call>");
-    if (glm) {
+    for (const char *glm = strstr(p, "<tool_call>");
+         glm; glm = strstr(glm + 1, "<tool_call>")) {
         const char *start = glm;
         if (glm - p >= 2 && glm[-2] == '\n' && glm[-1] == '\n') start -= 2;
+        if (best && start >= best) break;
         if (!best || start < best) {
             const char *end = NULL;
             const char *call = glm;
@@ -10386,8 +10387,11 @@ static const char *find_next_dsml_tool_block(const char *p, const char **end_out
             if (end) {
                 best = start;
                 best_end = end;
+                break;
             }
         }
+        /* An incomplete literal in user text cannot rule out later remembered
+         * calls, especially zero-argument calls with no closing value wrapper. */
     }
     if (end_out) *end_out = best_end;
     return best;
@@ -19633,25 +19637,34 @@ static void test_glm_kv_tool_map_roundtrip_exact_blocks(void) {
         "",
         "<|user|>quote <tool_call> literally<|assistant|>",
         "<|user|>quote <tool_call><arg_value> literally<|assistant|>",
+        "<|user|>quote <tool_call><arg_key> literally<|assistant|>",
     };
     const char *values[] = {
         "printf café",
         "printf '</tool_call>' café",
+        NULL, /* Calls with no arguments have no wrapper closing delimiter. */
     };
-    for (int variant = 0; variant < 48; ++variant) {
+    for (int variant = 0; variant < 96; ++variant) {
         const int leading_variant = variant % 4;
         const bool multiple = ((variant / 4) % 2) != 0;
         const int edge_variant = variant / 8;
         buf generated = {0};
         buf_puts(&generated, "<think>need shell</think>");
         buf_puts(&generated, leading[leading_variant]);
-        buf_puts(&generated, "<tool_call>Bash\n<arg_key>command</arg_key>"
-                            "<arg_value>");
-        buf_puts(&generated, values[edge_variant % 2]);
-        buf_puts(&generated, "</arg_value></tool_call>");
+        const char *value = values[edge_variant % 3];
+        if (value) {
+            buf_puts(&generated, "<tool_call>Bash\n<arg_key>command</arg_key>"
+                                "<arg_value>");
+            buf_puts(&generated, value);
+            buf_puts(&generated, "</arg_value></tool_call>");
+        } else {
+            buf_puts(&generated, "<tool_call>Ping</tool_call>");
+        }
         if (multiple) {
-            buf_puts(&generated, "\n \t<tool_call>Read\n<arg_key>file_path</arg_key>"
-                                "<arg_value>/tmp/a.py</arg_value></tool_call>");
+            buf_puts(&generated, value
+                ? "\n \t<tool_call>Read\n<arg_key>file_path</arg_key>"
+                  "<arg_value>/tmp/a.py</arg_value></tool_call>"
+                : "\n \t<tool_call>Pong</tool_call>");
         }
         if (variant % 2) buf_puts(&generated, "\n \t");
 
@@ -19686,7 +19699,7 @@ static void test_glm_kv_tool_map_roundtrip_exact_blocks(void) {
         /* Repetition must not serialize the same IDs twice; an unrelated block
          * in tool memory must not leak into this checkpoint's sidecar. */
         buf checkpoint = {0};
-        buf_puts(&checkpoint, prefixes[edge_variant / 2]);
+        buf_puts(&checkpoint, prefixes[edge_variant / 3]);
         buf_puts(&checkpoint, expected);
         buf_puts(&checkpoint, "<|observation|>done");
         buf_puts(&checkpoint, expected);
