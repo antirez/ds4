@@ -698,6 +698,8 @@ static void random_tool_id(char *dst, size_t dstlen, api_style api) {
 typedef struct server server;
 static void server_inference_lock(server *s);
 static void server_inference_unlock(server *s);
+static bool server_default_thinking_enabled(const server *s);
+static ds4_think_mode server_default_think_mode(const server *s);
 static bool server_encode_image(server *s, const server_image_input *input,
                                 ds4_vision_embedding *out,
                                 char *err, size_t errlen);
@@ -1111,26 +1113,40 @@ static bool parse_output_config_effort(const char **p, ds4_think_mode *effort) {
     return true;
 }
 
+static bool str_ends_with(const char *str, const char *suffix) {
+    if (!str || !suffix) return false;
+    size_t str_len = strlen(str);
+    size_t suffix_len = strlen(suffix);
+    if (suffix_len > str_len) return false;
+    return !strcmp(str + str_len - suffix_len, suffix);
+}
+
 static bool model_alias_disables_thinking(const char *model) {
-    return model &&
-           (!strcmp(model, "deepseek-chat") ||
-            !strcmp(model, "glm-5.2-chat") ||
-            !strcmp(model, "glm-5.2-no-think") ||
-            !strcmp(model, "glm-5.2-nothink") ||
-            !strcmp(model, "zai/glm-5.2-chat") ||
-            !strcmp(model, "glm-5.3-flash-chat") ||
-            !strcmp(model, "glm-5.3-flash-no-think") ||
-            !strcmp(model, "glm-5.3-flash-nothink") ||
-            !strcmp(model, "zai/glm-5.3-flash-chat"));
+    if (!model) return false;
+    if (str_ends_with(model, "-no-think") ||
+        str_ends_with(model, "-nothink") ||
+        str_ends_with(model, "-chat")) {
+        return true;
+    }
+    return !strcmp(model, "deepseek-chat") ||
+           !strcmp(model, "glm-5.2-chat") ||
+           !strcmp(model, "glm-5.2-no-think") ||
+           !strcmp(model, "glm-5.2-nothink") ||
+           !strcmp(model, "zai/glm-5.2-chat") ||
+           !strcmp(model, "glm-5.3-flash-chat") ||
+           !strcmp(model, "glm-5.3-flash-no-think") ||
+           !strcmp(model, "glm-5.3-flash-nothink") ||
+           !strcmp(model, "zai/glm-5.3-flash-chat");
 }
 
 static bool model_alias_enables_thinking(const char *model) {
-    return model &&
-           (!strcmp(model, "deepseek-reasoner") ||
-            !strcmp(model, "glm-5.2-reasoner") ||
-            !strcmp(model, "zai/glm-5.2-reasoner") ||
-            !strcmp(model, "glm-5.3-flash-reasoner") ||
-            !strcmp(model, "zai/glm-5.3-flash-reasoner"));
+    if (!model) return false;
+    if (str_ends_with(model, "-reasoner")) return true;
+    return !strcmp(model, "deepseek-reasoner") ||
+           !strcmp(model, "glm-5.2-reasoner") ||
+           !strcmp(model, "zai/glm-5.2-reasoner") ||
+           !strcmp(model, "glm-5.3-flash-reasoner") ||
+           !strcmp(model, "zai/glm-5.3-flash-reasoner");
 }
 
 static server_model_syntax server_model_syntax_for_engine(ds4_engine *engine) {
@@ -3546,8 +3562,8 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     bool got_messages = false;
     bool tool_choice_none = false;
     bool got_thinking = false;
-    bool thinking_enabled = true;
-    ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
+    bool thinking_enabled = server_default_thinking_enabled(s);
+    ds4_think_mode reasoning_effort = server_default_think_mode(s);
     chat_msgs msgs = {0};
     char *tool_schemas = NULL;
 
@@ -3739,8 +3755,8 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     bool got_messages = false;
     bool tool_choice_none = false;
     bool got_thinking = false;
-    bool thinking_enabled = true;
-    ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
+    bool thinking_enabled = server_default_thinking_enabled(s);
+    ds4_think_mode reasoning_effort = server_default_think_mode(s);
     chat_msgs msgs = {0};
     char *system = NULL;
     char *tool_schemas = NULL;
@@ -4722,8 +4738,8 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     bool got_input = false;
     bool tool_choice_none = false;
     bool got_thinking = false;
-    bool thinking_enabled = true;
-    ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
+    bool thinking_enabled = server_default_thinking_enabled(s);
+    ds4_think_mode reasoning_effort = server_default_think_mode(s);
     chat_msgs msgs = {0};
     buf loaded_tool_schemas = {0};
     char *instructions = NULL;
@@ -5019,15 +5035,15 @@ static bool parse_prompt(const char **p, char **out) {
     return true;
 }
 
-static bool parse_completion_request(ds4_engine *e, const char *body, int def_tokens,
+static bool parse_completion_request(ds4_engine *e, server *s, const char *body, int def_tokens,
                                      int ctx_size, request *r, char *err, size_t errlen) {
     request_init(r, REQ_COMPLETION, def_tokens);
     r->model_syntax = server_model_syntax_for_engine(e);
     const char *p = body;
     char *prompt = NULL;
     bool got_thinking = false;
-    bool thinking_enabled = true;
-    ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
+    bool thinking_enabled = server_default_thinking_enabled(s);
+    ds4_think_mode reasoning_effort = server_default_think_mode(s);
 
     json_ws(&p);
     if (*p != '{') goto bad;
@@ -9315,6 +9331,9 @@ struct server {
     server_image_cache image_cache; /* Protected by inference_mu. */
     bool disable_exact_dsml_tool_replay;
     bool enable_cors;
+    bool default_thinking_enabled;
+    ds4_think_mode default_think_mode;
+    const char *alias;
     pthread_mutex_t tool_mu;
     pthread_mutex_t kv_mu;
     pthread_mutex_t inference_mu;
@@ -9344,6 +9363,14 @@ static void server_inference_lock(server *s) {
 
 static void server_inference_unlock(server *s) {
     pthread_mutex_unlock(&s->inference_mu);
+}
+
+static bool server_default_thinking_enabled(const server *s) {
+    return s ? s->default_thinking_enabled : true;
+}
+
+static ds4_think_mode server_default_think_mode(const server *s) {
+    return s ? s->default_think_mode : DS4_THINK_HIGH;
 }
 
 /* The caller holds inference_mu across cache lookup and encoder execution. */
@@ -13911,19 +13938,64 @@ static bool send_model(server *s, int fd, const char *id) {
     return ok;
 }
 
+/* Model ids the server advertises for an engine family.  GLM-5.3 and GLM-5.2
+ * share DS4_MODEL_FAMILY_GLM_DSA, so the family alone is not enough: a 5.3
+ * engine must advertise glm-5.3 ids or a model picker would report 5.2.
+ * Kept free of the engine so the mapping is directly testable. */
+static const char *const *server_model_ids_for_family(bool glm53, bool glm_dsa,
+                                                      size_t *count) {
+    static const char *const glm53_ids[] = {
+        "glm-5.3-flash", "glm-5.3-flash-chat", "glm-5.3-flash-reasoner"
+    };
+    static const char *const glm52_ids[] = {
+        "glm-5.2", "glm-5.2-chat", "glm-5.2-reasoner"
+    };
+    static const char *const deepseek_ids[] = {
+        "deepseek-v4-flash", "deepseek-v4-pro"
+    };
+    if (glm53) {
+        *count = sizeof(glm53_ids) / sizeof(glm53_ids[0]);
+        return glm53_ids;
+    }
+    if (glm_dsa) {
+        *count = sizeof(glm52_ids) / sizeof(glm52_ids[0]);
+        return glm52_ids;
+    }
+    *count = sizeof(deepseek_ids) / sizeof(deepseek_ids[0]);
+    return deepseek_ids;
+}
+
+/* Model IDs advertised for the running engine.  One list drives both the
+ * catalogue and the alias-deduplication check, so adding a model cannot leave
+ * the two halves of send_models() disagreeing. */
+static const char *const *server_builtin_model_ids(server *s, size_t *count) {
+    return server_model_ids_for_family(ds4_engine_is_glm53(s->engine),
+                                       ds4_engine_is_glm_dsa(s->engine),
+                                       count);
+}
+
 static bool send_models(server *s, int fd) {
+    size_t count = 0;
+    const char *const *ids = server_builtin_model_ids(s, &count);
+    const char *alias = (s->alias && s->alias[0]) ? s->alias : NULL;
+    bool alias_is_builtin = false;
+    for (size_t i = 0; alias && i < count; i++) {
+        if (!strcmp(alias, ids[i])) {
+            alias_is_builtin = true;
+            break;
+        }
+    }
     buf b = {0};
     buf_puts(&b, "{\"object\":\"list\",\"data\":[");
-    if (ds4_engine_is_glm_dsa(s->engine)) {
-        append_model_json(&b, s, "glm-5.2");
-        buf_putc(&b, ',');
-        append_model_json(&b, s, "glm-5.2-chat");
-        buf_putc(&b, ',');
-        append_model_json(&b, s, "glm-5.2-reasoner");
-    } else {
-        append_model_json(&b, s, "deepseek-v4-flash");
-        buf_putc(&b, ',');
-        append_model_json(&b, s, "deepseek-v4-pro");
+    bool first = true;
+    if (alias && !alias_is_builtin) {
+        append_model_json(&b, s, alias);
+        first = false;
+    }
+    for (size_t i = 0; i < count; i++) {
+        if (!first) buf_putc(&b, ',');
+        append_model_json(&b, s, ids[i]);
+        first = false;
     }
     buf_puts(&b, "]}\n");
     bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
@@ -14061,7 +14133,8 @@ static void *client_main(void *arg) {
     const size_t model_path_prefix_len = strlen(model_path_prefix);
     if (!strcmp(hr.method, "GET") &&
         !strncmp(hr.path, model_path_prefix, model_path_prefix_len) &&
-        server_model_alias_known(hr.path + model_path_prefix_len))
+        (server_model_alias_known(hr.path + model_path_prefix_len) ||
+         (s->alias && !strcmp(hr.path + model_path_prefix_len, s->alias))))
     {
         send_model(s, fd, hr.path + model_path_prefix_len);
         http_request_free(&hr);
@@ -14082,7 +14155,7 @@ static void *client_main(void *arg) {
         ok = parse_responses_request(s->engine, s, hr.body, s->default_tokens,
                                      ctx_size, &req, err, sizeof(err));
     } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/completions")) {
-        ok = parse_completion_request(s->engine, hr.body, s->default_tokens,
+        ok = parse_completion_request(s->engine, s, hr.body, s->default_tokens,
                                       ctx_size, &req, err, sizeof(err));
     } else {
         http_error(fd, s->enable_cors, 404, "unknown endpoint");
@@ -14193,6 +14266,9 @@ typedef struct {
     bool enable_cors;
     int batched_sessions;
     int mixed_prefill_quantum;
+    bool default_thinking_enabled;
+    ds4_think_mode default_think_mode;
+    const char *alias;
 } server_config;
 
 static int parse_int_arg(const char *s, const char *opt) {
@@ -14335,6 +14411,9 @@ static server_config parse_options(int argc, char **argv) {
         .default_tokens = 393216,
         .tool_memory_max_ids = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS,
         .mixed_prefill_quantum = 128,
+        .default_thinking_enabled = true,
+        .default_think_mode = DS4_THINK_HIGH,
+        .alias = NULL,
     };
     c.kv_cache = kv_cache_default_options();
 
@@ -14421,6 +14500,33 @@ static server_config parse_options(int argc, char **argv) {
             c.host = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--port")) {
             c.port = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--reasoning") || !strcmp(arg, "--thinking")) {
+            const char *val = need_arg(&i, argc, argv, arg);
+            if (!strcmp(val, "off") || !strcmp(val, "false") || !strcmp(val, "0")) {
+                /* Flip only the default.  Forcing the effort to NONE here would
+                 * make think_mode_from_enabled() ignore a client that opts back
+                 * in via a -reasoner alias or an explicit thinking:true. */
+                c.default_thinking_enabled = false;
+            } else if (!strcmp(val, "on") || !strcmp(val, "true") || !strcmp(val, "1")) {
+                c.default_thinking_enabled = true;
+                if (c.default_think_mode == DS4_THINK_NONE) c.default_think_mode = DS4_THINK_HIGH;
+            } else {
+                server_log(DS4_LOG_DEFAULT, "ds4-server: %s must be 'on' or 'off'", arg);
+                exit(2);
+            }
+        } else if (!strcmp(arg, "--no-thinking")) {
+            c.default_thinking_enabled = false;
+        } else if (!strcmp(arg, "--reasoning-effort")) {
+            const char *val = need_arg(&i, argc, argv, arg);
+            ds4_think_mode effort = DS4_THINK_HIGH;
+            if (!parse_reasoning_effort_name(val, &effort)) {
+                server_log(DS4_LOG_DEFAULT, "ds4-server: invalid reasoning effort: %s", val);
+                exit(2);
+            }
+            c.default_think_mode = effort;
+            if (effort == DS4_THINK_NONE) c.default_thinking_enabled = false;
+        } else if (!strcmp(arg, "--alias")) {
+            c.alias = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--cors")) {
             c.enable_cors = true;
         } else if (!strcmp(arg, "--trace")) {
@@ -14700,6 +14806,9 @@ int main(int argc, char **argv) {
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
+    s.default_thinking_enabled = cfg.default_thinking_enabled;
+    s.default_think_mode = cfg.default_think_mode;
+    s.alias = cfg.alias;
     s.slots = xmalloc((size_t)slot_count * sizeof(*s.slots));
     memset(s.slots, 0, (size_t)slot_count * sizeof(*s.slots));
     if (s.batched_mode) {
@@ -14939,6 +15048,91 @@ static void test_mixed_prefill_quantum_option(void) {
     TEST_ASSERT(server_prefill_quantum_for(&s, true) == 2048);
     s.mixed_prefill_quantum = defaults.mixed_prefill_quantum;
     TEST_ASSERT(server_prefill_quantum_for(&s, true) == 128);
+}
+
+static void test_server_reasoning_options(void) {
+    char *off_argv[] = {"ds4-server", "--reasoning", "off", "--alias", "local-glm-5.3-flash-q2"};
+    server_config cfg_off = parse_options(5, off_argv);
+    TEST_ASSERT(!cfg_off.default_thinking_enabled);
+    /* The effort stays at its default so a client can opt back in. */
+    TEST_ASSERT(cfg_off.default_think_mode == DS4_THINK_HIGH);
+    TEST_ASSERT(cfg_off.alias && !strcmp(cfg_off.alias, "local-glm-5.3-flash-q2"));
+
+    server s_off = {0};
+    s_off.default_thinking_enabled = cfg_off.default_thinking_enabled;
+    s_off.default_think_mode = cfg_off.default_think_mode;
+    s_off.alias = cfg_off.alias;
+    TEST_ASSERT(!server_default_thinking_enabled(&s_off));
+    TEST_ASSERT(server_default_think_mode(&s_off) == DS4_THINK_HIGH);
+    ds4_think_mode computed_mode = think_mode_from_enabled(
+        server_default_thinking_enabled(&s_off),
+        server_default_think_mode(&s_off));
+    TEST_ASSERT(computed_mode == DS4_THINK_NONE);
+    /* A client that opts back in via a -reasoner alias or thinking:true must
+     * get a usable mode instead of being silently pinned to NONE. */
+    TEST_ASSERT(think_mode_from_enabled(true, server_default_think_mode(&s_off)) ==
+                DS4_THINK_HIGH);
+
+    /* Render GLM prompt under non-thinking mode */
+    chat_msgs msgs = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("Hello");
+    chat_msgs_push(&msgs, user);
+    char *prompt = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_GLM, &msgs, NULL, NULL, computed_mode);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(strstr(prompt, "<|assistant|><think></think>") != NULL);
+    TEST_ASSERT(strstr(prompt, "Reasoning Effort:") == NULL);
+    free(prompt);
+    chat_msgs_free(&msgs);
+
+    char *no_think_argv[] = {"ds4-server", "--no-thinking"};
+    server_config cfg_no_think = parse_options(2, no_think_argv);
+    TEST_ASSERT(!cfg_no_think.default_thinking_enabled);
+    TEST_ASSERT(cfg_no_think.default_think_mode == DS4_THINK_HIGH);
+
+    char *think_on_argv[] = {"ds4-server", "--thinking", "on"};
+    server_config cfg_think_on = parse_options(3, think_on_argv);
+    TEST_ASSERT(cfg_think_on.default_thinking_enabled);
+    TEST_ASSERT(cfg_think_on.default_think_mode == DS4_THINK_HIGH);
+
+    char *think_off_argv[] = {"ds4-server", "--thinking", "off"};
+    server_config cfg_think_off = parse_options(3, think_off_argv);
+    TEST_ASSERT(!cfg_think_off.default_thinking_enabled);
+    TEST_ASSERT(cfg_think_off.default_think_mode == DS4_THINK_HIGH);
+
+    char *effort_argv[] = {"ds4-server", "--reasoning-effort", "max"};
+    server_config cfg_effort = parse_options(3, effort_argv);
+    TEST_ASSERT(cfg_effort.default_thinking_enabled);
+    TEST_ASSERT(cfg_effort.default_think_mode == DS4_THINK_MAX);
+
+    /* Off keeps whatever effort was configured, so a client opting back in
+     * gets that effort rather than a hard-coded HIGH. */
+    char *off_effort_argv[] = {"ds4-server", "--reasoning", "off",
+                               "--reasoning-effort", "max"};
+    server_config cfg_off_effort = parse_options(5, off_effort_argv);
+    TEST_ASSERT(!cfg_off_effort.default_thinking_enabled);
+    TEST_ASSERT(cfg_off_effort.default_think_mode == DS4_THINK_MAX);
+    TEST_ASSERT(think_mode_from_enabled(true, cfg_off_effort.default_think_mode) ==
+                DS4_THINK_MAX);
+    TEST_ASSERT(think_mode_from_enabled(cfg_off_effort.default_thinking_enabled,
+                                        cfg_off_effort.default_think_mode) ==
+                DS4_THINK_NONE);
+
+    /* An explicit effort of "none" is a deliberate opt-out and stays one. */
+    char *effort_none_argv[] = {"ds4-server", "--reasoning-effort", "none"};
+    server_config cfg_effort_none = parse_options(3, effort_none_argv);
+    TEST_ASSERT(!cfg_effort_none.default_thinking_enabled);
+    TEST_ASSERT(cfg_effort_none.default_think_mode == DS4_THINK_NONE);
+    TEST_ASSERT(think_mode_from_enabled(true, cfg_effort_none.default_think_mode) ==
+                DS4_THINK_NONE);
+
+    TEST_ASSERT(model_alias_disables_thinking("local-glm-5.3-flash-q2-chat"));
+    TEST_ASSERT(model_alias_disables_thinking("local-glm-5.3-flash-q2-no-think"));
+    TEST_ASSERT(model_alias_enables_thinking("local-glm-5.3-flash-q2-reasoner"));
+    TEST_ASSERT(!model_alias_disables_thinking("local-glm-5.3-flash-q2-chatbot"));
+    TEST_ASSERT(!model_alias_disables_thinking("local-chat-assistant"));
 }
 
 static void test_multimodal_prefill_resume_frontier(void) {
@@ -18346,7 +18540,7 @@ static void test_request_parsers_reject_malformed_duplicate_owned_fields(void) {
     TEST_ASSERT(!ok);
     if (ok) request_free(&r);
 
-    ok = parse_completion_request(NULL,
+    ok = parse_completion_request(NULL, NULL,
         "{\"prompt\":\"hello\",\"prompt\":\"bad\\q\",\"max_tokens\":1}",
         1, 100, &r, err, sizeof(err));
     TEST_ASSERT(!ok);
@@ -18568,6 +18762,87 @@ static void test_live_prefix_rewind_target(void) {
     TEST_ASSERT(live_prefix_rewind_target(true, 17, 8, 7) == -1);
     TEST_ASSERT(live_prefix_rewind_target(true, 8, 8, 8) == -1);
     TEST_ASSERT(live_prefix_rewind_target(true, 17, 1, 1) == -1);
+}
+
+static void test_server_builtin_model_ids(void) {
+    server srv = {0};
+    size_t count = 0;
+    const char *const *ids = server_builtin_model_ids(&srv, &count);
+    TEST_ASSERT(ids != NULL);
+    TEST_ASSERT(count >= 2);
+    for (size_t i = 0; i < count; i++) {
+        TEST_ASSERT(ids[i] && ids[i][0]);
+        for (size_t j = i + 1; j < count; j++) {
+            TEST_ASSERT(strcmp(ids[i], ids[j]) != 0);
+        }
+    }
+}
+
+/* GLM-5.3 and GLM-5.2 share a family, so the catalogue has to distinguish them
+ * by variant; advertising glm-5.2 from a 5.3 engine misreports the model. */
+static void test_model_catalog_matches_loaded_variant(void) {
+    size_t count = 0;
+
+    const char *const *glm53 = server_model_ids_for_family(true, true, &count);
+    TEST_ASSERT(count == 3);
+    TEST_ASSERT(!strcmp(glm53[0], "glm-5.3-flash"));
+    TEST_ASSERT(!strcmp(glm53[1], "glm-5.3-flash-chat"));
+    TEST_ASSERT(!strcmp(glm53[2], "glm-5.3-flash-reasoner"));
+
+    const char *const *glm52 = server_model_ids_for_family(false, true, &count);
+    TEST_ASSERT(count == 3);
+    TEST_ASSERT(!strcmp(glm52[0], "glm-5.2"));
+    TEST_ASSERT(!strcmp(glm52[1], "glm-5.2-chat"));
+    TEST_ASSERT(!strcmp(glm52[2], "glm-5.2-reasoner"));
+
+    const char *const *deepseek = server_model_ids_for_family(false, false, &count);
+    TEST_ASSERT(count == 2);
+    TEST_ASSERT(!strcmp(deepseek[0], "deepseek-v4-flash"));
+    TEST_ASSERT(!strcmp(deepseek[1], "deepseek-v4-pro"));
+
+    /* Every advertised id must also be accepted as an explicit request. */
+    for (size_t i = 0; i < 3; i++) {
+        TEST_ASSERT(server_model_alias_known(glm53[i]));
+        TEST_ASSERT(server_model_alias_known(glm52[i]));
+    }
+    TEST_ASSERT(server_model_alias_known(deepseek[0]));
+    TEST_ASSERT(server_model_alias_known(deepseek[1]));
+}
+
+static int count_occurrences(const char *hay, const char *needle) {
+    int n = 0;
+    for (const char *p = hay; needle[0] && (p = strstr(p, needle)) != NULL; p++)
+        n++;
+    return n;
+}
+
+/* Exercise the real /v1/models body: the catalogue must stay valid JSON and a
+ * built-in alias must not be advertised twice. */
+static void test_send_models_json_shape(void) {
+    int sv[2] = {-1, -1};
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return;
+    server srv = {0};
+    srv.ctx_size = 4096;
+    srv.default_tokens = 1024;
+    size_t count = 0;
+    const char *const *ids = server_builtin_model_ids(&srv, &count);
+    char needle[96];
+    snprintf(needle, sizeof(needle), "\"id\":\"%s\"", ids[0]);
+    srv.alias = (char *)ids[0];
+    TEST_ASSERT(send_models(&srv, sv[0]));
+    char resp[16384];
+    ssize_t n = recv(sv[1], resp, sizeof(resp) - 1, 0);
+    close(sv[0]);
+    close(sv[1]);
+    TEST_ASSERT(n > 0);
+    if (n <= 0) return;
+    resp[n] = '\0';
+    const char *body = strstr(resp, "\r\n\r\n");
+    body = body ? body + 4 : resp;
+    TEST_ASSERT(body[0] == '{');
+    TEST_ASSERT(strstr(body, "]}\n") != NULL);
+    TEST_ASSERT(count_occurrences(body, "\"id\":") == (int)count);
+    TEST_ASSERT(count_occurrences(body, needle) == 1);
 }
 
 static void test_client_socket_nonblocking_flag(void) {
@@ -20173,6 +20448,7 @@ static void ds4_server_unit_tests_run(void) {
     test_server_image_embedding_cache();
     test_batched_prefill_round_robin();
     test_mixed_prefill_quantum_option();
+    test_server_reasoning_options();
     test_multimodal_prefill_resume_frontier();
     test_batched_live_continuation_slot_binding();
     test_request_defaults_use_min_p_filtering();
@@ -20277,6 +20553,9 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_history_validation_handles_large_replays();
     test_model_metadata_clamps_completion_to_context();
     test_live_prefix_rewind_target();
+    test_server_builtin_model_ids();
+    test_model_catalog_matches_loaded_variant();
+    test_send_models_json_shape();
     test_client_socket_nonblocking_flag();
     test_client_disconnect_probe();
     test_cancelled_progress_callback_is_inert();

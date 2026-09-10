@@ -343,6 +343,10 @@ static void print_server_api(FILE *fp, const help_colors *c) {
     title(fp, c, "HTTP API");
     opt(fp, c, "--host HOST", "Bind address. Default: 127.0.0.1");
     opt(fp, c, "--port N", "Bind port. Default: 8000");
+    opt(fp, c, "--alias NAME", "Additional advertised model alias in /v1/models.");
+    opt(fp, c, "--reasoning ON|OFF", "Default thinking state when request omits it (synonym: --thinking).");
+    opt(fp, c, "--no-thinking", "Shortcut for --reasoning off.");
+    opt(fp, c, "--reasoning-effort EFFORT", "Default effort: none, minimal, low, medium, high, xhigh, max.");
     opt(fp, c, "--cors", "Add Access-Control-Allow-* headers for browser JS clients.");
     opt(fp, c, "--trace FILE", "Write prompts, cache decisions, output, and tool calls.");
     opt(fp, c, "--batched-session N", "Keep N resident sessions and batch decode-ready requests.");
