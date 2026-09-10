@@ -35,7 +35,7 @@ These confirmation runs are recorded separately in `reviewed-timing.json`; they 
 - Router/shared: 240 poisoned synthetic cases, including tied logits, NaN/Inf bias, counter reuse, and all output tensors. Every captured model logit matches at 2K, 8K, 62,174 and 300,000 tokens.
 - DSA: 720 poisoned cases with finite signed scores, ties among winners and at the cut, non-finite values, subnormals, candidate overflow and host-gate limits. 100 accepted fast calls, 380 GPU fallbacks, 240 host refusals. Every captured model logit matches at 62,174 and 300,000. The real-model run accepted 5,479 of 5,632 calls (97.28%); fallback preserved original results.
 - Mixed Q8/BF16 KDA: 120 poisoned cases compare all six complete projection outputs against separate existing matvecs. Full logits match at 2K, 8K and 62,174 on the existing KDA-Q8 model.
-- Checkpoint maps: the upstream eight-case GLM regression produces 40 failed assertions before the fix. The final regression covers 96 combinations of whitespace, one/two calls, argument-bearing/zero-argument calls, literal closing tags in arguments, and opening tags in earlier prompt text. The server suite passes and fresh tool-map replay renders exactly the original prompt bytes.
+- Checkpoint maps: the upstream eight-case GLM regression produces 40 failed assertions before the fix. The final regression covers 96 combinations of whitespace, one/two calls, argument-bearing/zero-argument calls, literal closing tags in arguments, and opening tags in earlier prompt text. An additional 4,096-opener case exercises the real serializer, restores the later remembered block, and bounds scan work linearly in the checkpoint text. The server suite passes and fresh tool-map replay renders exactly the original prompt bytes.
 
 ## Scope of the adaptations
 
@@ -82,6 +82,8 @@ A late refusal test caught the host compiler folding away a NaN check under `-ff
 The final checkpoint regression also reproduces 80 failed assertions when an incomplete literal argument wrapper in earlier prompt text hides a later zero-argument call. Scanning now continues from the next opening tag when a candidate has no structural end. The full server suite passes after that follow-up; the inference and shader files are identical to the model-tested commit.
 
 Review also found an inherited exact-attention edge case: invalid selected row IDs loaded row zero before multiplying by zero, allowing NaN/Inf in row zero to poison a result. Invalid rows now stage literal zeros. A GPU regression compares this case against the generic path. This deliberately fixes exceptional invalid-row behavior; ordinary model traces still match the old baseline byte for byte. The complete kernel/model suite passes with all three corrections.
+
+The incremental review found that a failed command buffer could leave partial router arrivals or a half-filled DSA candidate set in reusable storage. Failure invalidation now gives every registered graph counter fresh backing and retires the shared DSA scratch without CPU-mutating buffers still retained by in-flight work. Model-free recovery regressions poison 100 of 144 router arrivals and the exact stale-512 plus current-512 DSA acceptance case, then compare the next complete outputs with the original references. The selector finisher's unused second pool-expansion mode was removed; the graph continues to use the existing separate expansion. These recovery-only changes do not alter finite arithmetic and are not included in the `fa00a42` full-model provenance above.
 
 ## Reproducing the checks
 

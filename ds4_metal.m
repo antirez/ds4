@@ -536,6 +536,7 @@ static id<MTLComputePipelineState> g_dsv4_router_finalize_weights_one_simd_pipel
 static id<MTLComputePipelineState> g_dsv4_router_transform_finalize_weights_one_simd_pipeline;
 static id<MTLComputePipelineState> g_dsv4_router_select_visual_batch_pipeline;
 static NSCache<NSString *, id<MTLBuffer>> *g_dsv4_completion_cache;
+static NSHashTable *g_glm53_router_completion_tensors;
 static __weak id<MTLBuffer> g_dsv4_hc_producer_last_mix_buffer;
 static NSUInteger g_dsv4_hc_producer_last_mix_offset;
 static id<MTLBuffer> g_dsv4_hc_producer_last_completion;
@@ -702,6 +703,12 @@ static id<MTLBuffer> g_router_weight_sum_buffer;
 static id<MTLBuffer> g_indexer_head_scores_buffer;
 static id<MTLBuffer> g_indexer_topk_buffer;
 static id<MTLBuffer> g_glm53_topk_scratch;
+enum {
+    DS4_GLM53_TOPK_FAST_HIST_OFFSET = 256u,
+    DS4_GLM53_TOPK_FAST_CAND_OFFSET = 33024u,
+    DS4_GLM53_TOPK_FAST_INDIRECT_OFFSET = 41216u,
+    DS4_GLM53_TOPK_FAST_BYTES = 41312u,
+};
 static uint64_t g_glm53_router_shared_calls, g_glm53_q8_inputs_calls;
 static bool ds4_gpu_glm53_tuning_available(void);
 static void ds4_glm53_topk_report(void) {
@@ -713,6 +720,21 @@ static void ds4_glm53_topk_report(void) {
 int ds4_gpu_test_glm53_topk_stats(uint32_t *out, uint32_t count) {
     if (!g_glm53_topk_scratch || !out || count != 15u) return 0;
     memcpy(out, [g_glm53_topk_scratch contents], count * sizeof(uint32_t));
+    return 1;
+}
+int ds4_gpu_test_glm53_topk_poison_recovery_state(void) {
+    if (!g_glm53_topk_scratch) return 0;
+    uint32_t *ctrl = [g_glm53_topk_scratch contents];
+    uint32_t *hist = (uint32_t *)((uint8_t *)ctrl + DS4_GLM53_TOPK_FAST_HIST_OFFSET);
+    uint32_t *cand = (uint32_t *)((uint8_t *)ctrl + DS4_GLM53_TOPK_FAST_CAND_OFFSET);
+    memset(hist, 0, 8192u * sizeof(uint32_t));
+    ctrl[0] = 0u;
+    ctrl[1] = 512u;
+    hist[0xbf800400u >> 19] = 512u;
+    for (uint32_t i = 0; i < 512u; i++) {
+        cand[2u * i] = 0xbf800400u + i;
+        cand[2u * i + 1u] = i;
+    }
     return 1;
 }
 static id<MTLBuffer> g_indexed_topk_buffer;
@@ -1406,6 +1428,27 @@ static void ds4_gpu_invalidate_completion_counters(void) {
     g_dsv4_hc_producer_last_mix_buffer = nil;
     g_dsv4_hc_producer_last_mix_offset = 0;
     g_dsv4_hc_producer_last_completion = nil;
+    for (DS4MetalTensor *counter in g_glm53_router_completion_tensors) {
+        id<MTLBuffer> old = counter.buffer;
+        if (old) [g_transient_buffers addObject:old];
+        id<MTLBuffer> fresh = nil;
+        if (counter.offset <= (uint64_t)NSUIntegerMax - sizeof(uint32_t)) {
+            fresh = [g_device newBufferWithLength:(NSUInteger)counter.offset + sizeof(uint32_t)
+                                          options:MTLResourceStorageModeShared];
+        }
+        counter.buffer = fresh;
+        if (fresh) {
+            *((uint32_t *)((uint8_t *)[fresh contents] + counter.offset)) = 0u;
+        }
+    }
+    if (g_glm53_topk_scratch) {
+        [g_transient_buffers addObject:g_glm53_topk_scratch];
+        g_glm53_topk_scratch = nil;
+    }
+}
+
+void ds4_gpu_test_invalidate_completion_counters(void) {
+    ds4_gpu_invalidate_completion_counters();
 }
 
 static int ds4_gpu_wait_command_buffer(id<MTLCommandBuffer> cb, const char *label) {
@@ -6910,15 +6953,18 @@ int ds4_gpu_init(void) {
         g_pipeline_cache = [NSMutableDictionary dictionary];
         g_dsv4_completion_cache = [NSCache new];
         g_dsv4_completion_cache.countLimit = 256u;
+        g_glm53_router_completion_tensors = [NSHashTable weakObjectsHashTable];
         g_transient_buffers = [NSMutableArray array];
         g_pending_cbs = [NSMutableArray array];
         if (!g_model_buffer_cache || !g_q4_expert_table_cache ||
             !g_q4_expert_layer_residency_cache ||
             !g_pipeline_cache || !g_dsv4_completion_cache ||
+            !g_glm53_router_completion_tensors ||
             !g_transient_buffers || !g_pending_cbs) {
             fprintf(stderr, "ds4: Metal bookkeeping allocation failed\n");
             g_pending_cbs = nil;
             g_transient_buffers = nil;
+            g_glm53_router_completion_tensors = nil;
             g_dsv4_completion_cache = nil;
             g_pipeline_cache = nil;
             g_q4_expert_layer_residency_cache = nil;
@@ -11781,6 +11827,7 @@ void ds4_gpu_cleanup(void) {
         g_dsv4_hc_producer_last_mix_offset = 0;
         [g_dsv4_completion_cache removeAllObjects];
         g_dsv4_completion_cache = nil;
+        g_glm53_router_completion_tensors = nil;
         g_dsv4_router_weights_one_pipeline = nil;
         g_glm_router_select_one_pipeline = nil;
         g_glm_kv_lora_rms_norm_pipeline = nil;
@@ -19185,7 +19232,6 @@ static int ds4_gpu_indexer_topk_tensor_impl(
         // function's original sort/merge chain, including its tie/NaN behavior.
         typedef struct {
             uint32_t n_comp, top_k, hist_bits, cand_cap;
-            uint32_t pool_size, index_topk, output_width, pos0;
             uint32_t fb_count, pad0, fb_grid[16];
         } ds4_glm53_topk_args;
         ds4_glm53_topk_args fa = { .n_comp=n_comp, .top_k=top_k,
@@ -19197,7 +19243,6 @@ static int ds4_gpu_indexer_topk_tensor_impl(
             ds4_gpu_glm53_tuning_available() && !g_batch_encoder_concurrent &&
             n_tokens == 1u && top_k == 512u && n_comp >= 12288u;
         id<MTLComputePipelineState> hist_pipe = nil, gather_pipe = nil, finish_pipe = nil;
-        enum { fast_hist=256u, fast_cand=33024u, fast_ind=41216u, fast_bytes=41312u };
         if (use_fast) {
             fa.fb_grid[0]=(uint32_t)npr; fa.fb_grid[1]=1u; fa.fb_count=1u;
             int32_t flen = block_top_k;
@@ -19217,8 +19262,8 @@ static int ds4_gpu_indexer_topk_tensor_impl(
                 finish_pipe.maxTotalThreadsPerThreadgroup>=1024u;
         }
         if (use_fast && !g_glm53_topk_scratch) {
-            g_glm53_topk_scratch=[g_device newBufferWithLength:fast_bytes options:MTLResourceStorageModeShared];
-            if (g_glm53_topk_scratch) memset([g_glm53_topk_scratch contents],0,fast_bytes);
+            g_glm53_topk_scratch=[g_device newBufferWithLength:DS4_GLM53_TOPK_FAST_BYTES options:MTLResourceStorageModeShared];
+            if (g_glm53_topk_scratch) memset([g_glm53_topk_scratch contents],0,DS4_GLM53_TOPK_FAST_BYTES);
             else use_fast=false;
         }
 
@@ -19236,7 +19281,7 @@ static int ds4_gpu_indexer_topk_tensor_impl(
             [fe setBytes:&fa length:sizeof(fa) atIndex:0];
             [fe setBuffer:scorebuf offset:ds4_gpu_tensor_offset(scores) atIndex:1];
             [fe setBuffer:g_glm53_topk_scratch offset:0 atIndex:2];
-            [fe setBuffer:g_glm53_topk_scratch offset:fast_hist atIndex:3];
+            [fe setBuffer:g_glm53_topk_scratch offset:DS4_GLM53_TOPK_FAST_HIST_OFFSET atIndex:3];
             [fe setThreadgroupMemoryLength:32768u atIndex:0];
             [fe dispatchThreadgroups:MTLSizeMake(fast_tgs,1,1) threadsPerThreadgroup:MTLSizeMake(1024,1,1)];
             ds4_gpu_end_compute_encoder(cb,fe);
@@ -19245,8 +19290,8 @@ static int ds4_gpu_indexer_topk_tensor_impl(
             [fe setBytes:&fa length:sizeof(fa) atIndex:0];
             [fe setBuffer:scorebuf offset:ds4_gpu_tensor_offset(scores) atIndex:1];
             [fe setBuffer:g_glm53_topk_scratch offset:0 atIndex:2];
-            [fe setBuffer:g_glm53_topk_scratch offset:fast_hist atIndex:3];
-            [fe setBuffer:g_glm53_topk_scratch offset:fast_cand atIndex:4];
+            [fe setBuffer:g_glm53_topk_scratch offset:DS4_GLM53_TOPK_FAST_HIST_OFFSET atIndex:3];
+            [fe setBuffer:g_glm53_topk_scratch offset:DS4_GLM53_TOPK_FAST_CAND_OFFSET atIndex:4];
             [fe setThreadgroupMemoryLength:4112u atIndex:0];
             [fe dispatchThreadgroups:MTLSizeMake(fast_tgs,1,1) threadsPerThreadgroup:MTLSizeMake(1024,1,1)];
             ds4_gpu_end_compute_encoder(cb,fe);
@@ -19254,11 +19299,10 @@ static int ds4_gpu_indexer_topk_tensor_impl(
             [fe setComputePipelineState:finish_pipe];
             [fe setBytes:&fa length:sizeof(fa) atIndex:0];
             [fe setBuffer:g_glm53_topk_scratch offset:0 atIndex:1];
-            [fe setBuffer:g_glm53_topk_scratch offset:fast_hist atIndex:2];
-            [fe setBuffer:g_glm53_topk_scratch offset:fast_cand atIndex:3];
+            [fe setBuffer:g_glm53_topk_scratch offset:DS4_GLM53_TOPK_FAST_HIST_OFFSET atIndex:2];
+            [fe setBuffer:g_glm53_topk_scratch offset:DS4_GLM53_TOPK_FAST_CAND_OFFSET atIndex:3];
             [fe setBuffer:selbuf offset:ds4_gpu_tensor_offset(selected) atIndex:4];
-            [fe setBuffer:selbuf offset:ds4_gpu_tensor_offset(selected) atIndex:5];
-            [fe setBuffer:g_glm53_topk_scratch offset:fast_ind atIndex:6];
+            [fe setBuffer:g_glm53_topk_scratch offset:DS4_GLM53_TOPK_FAST_INDIRECT_OFFSET atIndex:5];
             [fe setThreadgroupMemoryLength:16384u atIndex:0];
             [fe dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(1024,1,1)];
             ds4_gpu_end_compute_encoder(cb,fe);
@@ -19275,7 +19319,7 @@ static int ds4_gpu_indexer_topk_tensor_impl(
         [enc setThreadgroupMemoryLength:smem atIndex:0];
         if (use_fast) {
             [enc dispatchThreadgroupsWithIndirectBuffer:g_glm53_topk_scratch
-                 indirectBufferOffset:fast_ind+12u*fb_slot++
+                 indirectBufferOffset:DS4_GLM53_TOPK_FAST_INDIRECT_OFFSET+12u*fb_slot++
                  threadsPerThreadgroup:MTLSizeMake((NSUInteger)nth,1,1)];
         } else {
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)npr * n_tokens, 1, 1)
@@ -19323,7 +19367,7 @@ static int ds4_gpu_indexer_topk_tensor_impl(
                  atIndex:3];
             if (use_fast) {
                 [enc dispatchThreadgroupsWithIndirectBuffer:g_glm53_topk_scratch
-                     indirectBufferOffset:fast_ind+12u*fb_slot++
+                     indirectBufferOffset:DS4_GLM53_TOPK_FAST_INDIRECT_OFFSET+12u*fb_slot++
                      threadsPerThreadgroup:MTLSizeMake(merge_threads,1,1)];
             } else {
             [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)nm * n_tokens, 1, 1)
@@ -38329,6 +38373,8 @@ int ds4_gpu_glm53_router_shared_exact(
     }
     id<MTLComputePipelineState> pipeline = ds4_gpu_get_mul_mv_pipeline("kernel_glm53_router_shared_exact", 8);
     if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 256u) return 0;
+    [g_glm53_router_completion_tensors addObject:ds4_gpu_tensor_obj(counter)];
+    [g_transient_buffers addObject:outs[4]];
     ds4_gpu_q8_0_matvec_args rargs = ds4_gpu_make_f32_mv_args(4096u,288u,1u);
     ds4_gpu_q8_0_matvec_args sargs = ds4_gpu_make_q8_0_mv_args(4096u,2048u);
     rargs.nr0=2; sargs.nr0=2;

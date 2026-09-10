@@ -48,7 +48,23 @@ int main(void) {
         if(stats[4]==before[4]){skips++;need(n==8192||n==131073,"unexpected skip");}
         else {need(stats[4]==before[4]+1,"call count");if(stats[5]>before[5]){accepts++;need(kind==0||kind==1||kind==2||kind==10||kind==11,"unsafe accept");}else rejects++;}
     }
+    const uint32_t recovery_n=12288u;
+    for(uint32_t i=0;i<recovery_n;i++) x[i]=-1.0f;
+    for(uint32_t i=0;i<K;i++) x[recovery_n-K+i]=bits(0x3f800000u+i);
+    need(ds4_gpu_tensor_write(scores,0,x,recovery_n*4),"recovery write");
+    need(ds4_gpu_indexer_topk_tensor(out,scores,recovery_n,1,K),"recovery reference");
+    need(ds4_gpu_tensor_read(out,0,a,sizeof(a)),"recovery reference read");
+    need(ds4_gpu_test_glm53_topk_poison_recovery_state(),"poison stale 512 candidates");
+    need(ds4_gpu_glm53_indexer_topk_tensor(out,scores,recovery_n,1,K),"poisoned selector");
+    need(ds4_gpu_tensor_read(out,0,b,sizeof(b)),"poisoned selector read");
+    need(memcmp(a,b,sizeof(a))!=0,"stale 512 candidates reproduce contamination");
+    need(ds4_gpu_test_glm53_topk_poison_recovery_state(),"repoison stale 512 candidates");
+    ds4_gpu_test_invalidate_completion_counters();
+    memset(b,0xa5,sizeof(b));need(ds4_gpu_tensor_write(out,0,b,sizeof(b)),"recovery output poison");
+    need(ds4_gpu_glm53_indexer_topk_tensor(out,scores,recovery_n,1,K),"recovered selector");
+    need(ds4_gpu_tensor_read(out,0,b,sizeof(b)),"recovered selector read");
+    need(memcmp(a,b,sizeof(a))==0,"failure invalidation drops stale selector state");
     need(accepts>80&&rejects>160&&skips==240,"non-vacuous acceptance/fallback/host gates");
-    printf("GLM DSA top-k exact PASS: 720 poisoned draws, accepted=%u fallback=%u host-skipped=%u\n",accepts,rejects,skips);
+    printf("GLM DSA top-k exact PASS: 720 poisoned draws, recovery, accepted=%u fallback=%u host-skipped=%u\n",accepts,rejects,skips);
     ds4_gpu_tensor_free(scores);ds4_gpu_tensor_free(out);ds4_gpu_cleanup();free(x);return 0;
 }

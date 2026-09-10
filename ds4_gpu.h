@@ -3306,6 +3306,8 @@ int ds4_gpu_glm53_indexer_topk_tensor(ds4_gpu_tensor *selected,
         uint32_t n_tokens, uint32_t top_k);
 /* Call only after synchronizing. Reports cumulative selector telemetry. */
 int ds4_gpu_test_glm53_topk_stats(uint32_t *out, uint32_t count);
+int ds4_gpu_test_glm53_topk_poison_recovery_state(void);
+void ds4_gpu_test_invalidate_completion_counters(void);
 
 int ds4_gpu_glm53_kda_inputs_q8_bf16(
         ds4_gpu_tensor *const outputs[6], const uint64_t weight_offsets[6],

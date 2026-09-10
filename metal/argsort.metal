@@ -363,10 +363,6 @@ struct ds4_metal_args_glm53_topk_fast {
     uint32_t top_k;           // winners to emit (512 for the DSA pool select)
     uint32_t hist_bits;       // radix digit width for the single narrowing pass
     uint32_t cand_cap;        // candidate buffer capacity (entries)
-    uint32_t pool_size;       // GLM-5.3 index pool size (4)
-    uint32_t index_topk;      // 2048
-    uint32_t output_width;    // 2051
-    uint32_t pos0;
     uint32_t fb_count;        // fallback dispatches whose grid this path gates
     uint32_t pad0;
     uint32_t fb_grid[16];     // (x,y) per fallback dispatch, in encode order
@@ -534,18 +530,15 @@ kernel void kernel_glm53_topk_fast_gather(
 /* One threadgroup.  Sorts the narrowed candidates descending by (key, index) -
  * a total order, so the result is deterministic regardless of the gather's
  * atomic arrival order - checks the acceptance predicate, and on acceptance
- * writes the ordered pool list and runs the pool expansion with the body
- * copied verbatim from kernel_argsort_merge_fused_f32_i32_desc above, so the
- * 2,051-slot list and its `visible % 4` tail sentinels are produced by the
- * same arithmetic.  It also writes the fallback dispatches' threadgroup counts
- * (zero when accepted) and clears the scratch for the next call. */
+ * writes the ordered pool list. It also writes the fallback dispatches'
+ * threadgroup counts (zero when accepted) and clears the scratch for the next
+ * call. */
 kernel void kernel_glm53_topk_fast_finish(
         constant ds4_metal_args_glm53_topk_fast & args,
         device atomic_uint * ctrl,
         device uint        * hist,
         device const uint2 * cand,
         device int32_t     * out_idx,
-        device uint32_t    * raw,
         device uint32_t    * indirect,
         threadgroup uint2  * shmem [[threadgroup(0)]],
         ushort3 tpitg [[thread_position_in_threadgroup]],
@@ -625,28 +618,6 @@ kernel void kernel_glm53_topk_fast_finish(
     if (accept) {
         for (uint i = tid; i < args.top_k; i += nth)
             out_idx[i] = (int32_t)s[i].y;
-        threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
-        // verbatim pool expansion (see kernel_argsort_merge_fused_f32_i32_desc)
-        if (args.output_width != 0u && args.pool_size != 0u) {
-            device const uint32_t *pool_sel = (device const uint32_t *)out_idx;
-            for (uint slot = tid; slot < args.output_width; slot += nth) {
-                uint value = 0xffffffffu;
-                if (slot < args.index_topk) {
-                    const uint pool_slot = slot / args.pool_size;
-                    if (pool_slot < args.top_k) {
-                        value = pool_sel[pool_slot] * args.pool_size + slot % args.pool_size;
-                    }
-                } else {
-                    const uint tail_slot = slot - args.index_topk;
-                    const uint visible = args.pos0 + 1u;
-                    const uint tail_count = visible % args.pool_size;
-                    if (tail_slot < tail_count) {
-                        value = visible - tail_count + tail_slot;
-                    }
-                }
-                raw[slot] = value;
-            }
-        }
     }
 
     // fallback dispatch grids: zero when accepted, the real grid otherwise

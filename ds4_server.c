@@ -9389,6 +9389,7 @@ typedef struct {
     size_t max_bytes;
     uint64_t clock;
     uint64_t scan_clock;
+    uint64_t last_scan_steps;
 } tool_memory;
 
 /* Image markers have request-local nonces. Normalize only actual marker spans
@@ -10338,63 +10339,57 @@ static char *path_join(const char *dir, const char *name) {
 
 
 
-static const char *find_next_dsml_tool_block(const char *p, const char **end_out) {
-    struct block_form {
-        const char *start;
-        const char *end;
-    } forms[] = {
-        {"\n\n" DS41_TOOL_CALLS_START, DS41_TOOL_CALLS_END},
-        {DS41_TOOL_CALLS_START, DS41_TOOL_CALLS_END},
-        {"\n\n" DS4_TOOL_CALLS_START, DS4_TOOL_CALLS_END},
-        {DS4_TOOL_CALLS_START, DS4_TOOL_CALLS_END},
-        {"\n\n" DS4_TOOL_CALLS_START_SHORT, DS4_TOOL_CALLS_END_SHORT},
-        {DS4_TOOL_CALLS_START_SHORT, DS4_TOOL_CALLS_END_SHORT},
-        {"\n\n<tool_calls>", "</tool_calls>"},
-        {"<tool_calls>", "</tool_calls>"},
-    };
+static bool tool_memory_block_boundary_matches(const char *text,
+                                               const char *limit,
+                                               const char *start,
+                                               const tool_memory_block *block) {
+    const char *raw = block->dsml;
+    size_t len = block->len;
+    if (len < 2) return false;
+    if (raw[0] == '<' && start >= text + 2 &&
+        start[-2] == '\n' && start[-1] == '\n') return false;
 
-    const char *best = NULL;
-    const char *best_end = NULL;
-    for (size_t i = 0; i < sizeof(forms) / sizeof(forms[0]); i++) {
-        const char *s = strstr(p, forms[i].start);
-        if (!s || (best && s >= best)) continue;
-        const char *e = strstr(s, forms[i].end);
-        if (!e) continue;
-        best = s;
-        best_end = e + strlen(forms[i].end);
+    if (len >= 2 && raw[0] == '\n' && raw[1] == '\n') {
+        raw += 2;
+        len -= 2;
     }
-    /* GLM has no enclosing tool_calls tag. Its generated-message parser
-     * remembers consecutive tool_call elements as one exact block, including
-     * two leading newlines (if present) and whitespace after the final call.
-     * Match those same bounds or the by_block lookup silently loses every GLM
-     * ID when a checkpoint is written. */
-    for (const char *glm = strstr(p, "<tool_call>");
-         glm; glm = strstr(glm + 1, "<tool_call>")) {
-        const char *start = glm;
-        if (glm - p >= 2 && glm[-2] == '\n' && glm[-1] == '\n') start -= 2;
-        if (best && start >= best) break;
-        if (!best || start < best) {
-            const char *end = NULL;
-            const char *call = glm;
-            for (;;) {
-                const char *close = find_tool_structural_text(
-                    call + sizeof("<tool_call>") - 1, "</tool_call>", false);
-                if (!close) { end = NULL; break; }
-                end = skip_ascii_ws(close + sizeof("</tool_call>") - 1);
-                if (strncmp(end, "<tool_call>", sizeof("<tool_call>") - 1)) break;
-                call = end;
-            }
-            if (end) {
-                best = start;
-                best_end = end;
-                break;
-            }
+    if (len < sizeof("<tool_call>") - 1 ||
+        memcmp(raw, "<tool_call>", sizeof("<tool_call>") - 1)) return true;
+
+    const char *end = start + block->len;
+    if (end < limit && isspace((unsigned char)*end)) return false;
+    return (size_t)(limit - end) < sizeof("<tool_call>") - 1 ||
+           memcmp(end, "<tool_call>", sizeof("<tool_call>") - 1);
+}
+
+static const char *find_next_tool_memory_block(tool_memory *memory,
+                                                const char *text,
+                                                const char *p,
+                                                const char *limit,
+                                                tool_memory_block **block_out,
+                                                uint64_t *steps) {
+    if (block_out) *block_out = NULL;
+    if (!memory->by_block) return NULL;
+    for (; p < limit; p++) {
+        if (steps) (*steps)++;
+        if (*p != '<' &&
+            !(*p == '\n' && limit - p >= 3 && p[1] == '\n' && p[2] == '<')) {
+            continue;
         }
-        /* An incomplete literal in user text cannot rule out later remembered
-         * calls, especially zero-argument calls with no closing value wrapper. */
+        size_t matched = 0;
+        size_t examined = 0;
+        void *value = raxFindLongestPrefix(
+            memory->by_block, (unsigned char *)p, (size_t)(limit - p),
+            &matched, &examined);
+        if (steps) *steps += examined;
+        if (value == raxNotFound || matched == 0) continue;
+        tool_memory_block *block = value;
+        if (matched != block->len ||
+            !tool_memory_block_boundary_matches(text, limit, p, block)) continue;
+        if (block_out) *block_out = block;
+        return p;
     }
-    if (end_out) *end_out = best_end;
-    return best;
+    return NULL;
 }
 
 
@@ -10405,29 +10400,36 @@ static bool kv_tool_map_measure_locked(server *s, const char *text,
     uint64_t bytes = KV_TOOL_MAP_HEADER;
     uint64_t scan = ++s->tool_mem.scan_clock;
     const char *p = text;
+    const char *limit = text + strlen(text);
+    uint64_t steps = 0;
     for (;;) {
-        const char *end = NULL;
-        const char *start = find_next_dsml_tool_block(p, &end);
-        if (!start || !end) break;
-        tool_memory_block *b =
-            tool_memory_find_block_locked(&s->tool_mem, start, (size_t)(end - start));
+        tool_memory_block *b = NULL;
+        const char *start = find_next_tool_memory_block(
+            &s->tool_mem, text, p, limit, &b, &steps);
+        if (!start || !b) break;
         if (b && b->seen != scan) {
             b->seen = scan;
             for (tool_memory_entry *e = b->entries; e; e = e->block_next) {
                 size_t id_len = strlen(e->id);
                 size_t dsml_len = b->len;
                 if (id_len > UINT32_MAX || dsml_len > UINT32_MAX) continue;
-                if (count == UINT32_MAX) return false;
+                if (count == UINT32_MAX) {
+                    s->tool_mem.last_scan_steps = steps;
+                    return false;
+                }
                 if (UINT64_MAX - bytes < 8u ||
                     UINT64_MAX - bytes - 8u < (uint64_t)id_len ||
-                    UINT64_MAX - bytes - 8u - (uint64_t)id_len < (uint64_t)dsml_len)
+                    UINT64_MAX - bytes - 8u - (uint64_t)id_len < (uint64_t)dsml_len) {
+                    s->tool_mem.last_scan_steps = steps;
                     return false;
+                }
                 count++;
                 bytes += 8u + (uint64_t)id_len + (uint64_t)dsml_len;
             }
         }
-        p = b ? end : start + 1;
+        p = start + b->len;
     }
+    s->tool_mem.last_scan_steps = steps;
     if (count == 0) bytes = 0;
     if (count_out) *count_out = count;
     if (bytes_out) *bytes_out = bytes;
@@ -10473,12 +10475,13 @@ static bool kv_tool_map_write(server *s, FILE *fp, const char *text,
 
     uint64_t scan = ++s->tool_mem.scan_clock;
     const char *p = text;
+    const char *limit = text + strlen(text);
+    uint64_t steps = 0;
     for (;;) {
-        const char *end = NULL;
-        const char *start = find_next_dsml_tool_block(p, &end);
-        if (!start || !end || !ok) break;
-        tool_memory_block *b =
-            tool_memory_find_block_locked(&s->tool_mem, start, (size_t)(end - start));
+        tool_memory_block *b = NULL;
+        const char *start = find_next_tool_memory_block(
+            &s->tool_mem, text, p, limit, &b, &steps);
+        if (!start || !b || !ok) break;
         if (b && b->seen != scan) {
             b->seen = scan;
             for (tool_memory_entry *e = b->entries; ok && e; e = e->block_next) {
@@ -10493,8 +10496,9 @@ static bool kv_tool_map_write(server *s, FILE *fp, const char *text,
                      fwrite(b->dsml, 1, dsml_len, fp) == dsml_len;
             }
         }
-        p = b ? end : start + 1;
+        p = start + b->len;
     }
+    s->tool_mem.last_scan_steps = steps;
     pthread_mutex_unlock(&s->tool_mu);
 
     if (ok && written_bytes) *written_bytes = bytes;
@@ -19735,6 +19739,58 @@ static void test_glm_kv_tool_map_roundtrip_exact_blocks(void) {
     }
 }
 
+static void test_glm_kv_tool_map_adversarial_scan_is_bounded(void) {
+    const char *raw = "\n\n<tool_call>Ping</tool_call>";
+    server src = {0}, dst = {0};
+    pthread_mutex_init(&src.tool_mu, NULL);
+    pthread_mutex_init(&dst.tool_mu, NULL);
+    tool_memory_put(&src, "call_linear", raw);
+
+    buf checkpoint = {0};
+    buf_puts(&checkpoint, raw);
+    buf_puts(&checkpoint, "<tool_call>GroupedLiteral</tool_call>");
+    for (int i = 0; i < 4096; i++) {
+        if (i % 3 == 0) buf_puts(&checkpoint, "<tool_call>");
+        else if (i % 3 == 1) buf_puts(&checkpoint, "<tool_call><arg_key>");
+        else buf_puts(&checkpoint, "<tool_call><arg_value>");
+    }
+    buf_puts(&checkpoint, raw);
+
+    uint64_t estimated = 0;
+    TEST_ASSERT(kv_tool_map_serialized_size(&src, checkpoint.ptr, &estimated));
+    TEST_ASSERT(estimated > 0);
+    TEST_ASSERT(src.tool_mem.last_scan_steps > 0);
+    TEST_ASSERT(src.tool_mem.last_scan_steps <= (uint64_t)checkpoint.len * 4u);
+
+    FILE *fp = tmpfile();
+    TEST_ASSERT(fp != NULL);
+    uint64_t written = 0;
+    TEST_ASSERT(kv_tool_map_write(&src, fp, checkpoint.ptr, &written));
+    TEST_ASSERT(written == estimated);
+    rewind(fp);
+    TEST_ASSERT(kv_tool_map_load_from_pos(&dst, fp, NULL) == 1);
+
+    chat_msgs msgs = {0};
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    tool_call call = {.id = xstrdup("call_linear"),
+                      .name = xstrdup("Ping"),
+                      .arguments = xstrdup("{}")};
+    tool_calls_push(&assistant.calls, call);
+    chat_msgs_push(&msgs, assistant);
+    tool_memory_attach_to_messages(&dst, &msgs, NULL);
+    TEST_ASSERT(msgs.v[0].calls.raw_tool_text != NULL);
+    TEST_ASSERT(!strcmp(msgs.v[0].calls.raw_tool_text, raw));
+
+    chat_msgs_free(&msgs);
+    fclose(fp);
+    buf_free(&checkpoint);
+    tool_memory_free(&src.tool_mem);
+    tool_memory_free(&dst.tool_mem);
+    pthread_mutex_destroy(&src.tool_mu);
+    pthread_mutex_destroy(&dst.tool_mu);
+}
+
 static void test_kv_tool_map_restores_before_prompt_render(void) {
     char tmpl[] = "/tmp/ds4-kv-tool-map-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -20884,6 +20940,7 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_memory_max_ids_prunes_oldest();
     test_kv_tool_map_filters_by_dsml_text();
     test_glm_kv_tool_map_roundtrip_exact_blocks();
+    test_glm_kv_tool_map_adversarial_scan_is_bounded();
     test_kv_tool_map_restores_before_prompt_render();
     test_thinking_checkpoint_canonical_matches_future_prompt();
     test_thinking_canonical_empty_content();

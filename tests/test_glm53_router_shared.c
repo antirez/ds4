@@ -78,6 +78,22 @@ int main(void) {
             }
         }
     }
+    uint32_t partial_arrivals=100u;
+    require(ds4_gpu_tensor_write(out[4],0,&partial_arrivals,sizeof(partial_arrivals)),
+            "poison partial router arrivals");
+    ds4_gpu_test_invalidate_completion_counters();
+    for (int i=0;i<6;i++) {
+        if (i!=4) {
+            memset(observed[i],0xa5,sizes[i]);
+            require(ds4_gpu_tensor_write(out[i],0,observed[i],sizes[i]),"recovery output poison");
+        }
+    }
+    require(ds4_gpu_glm53_router_shared_exact(out[0],out[1],out[2],out[3],out[4],out[5],
+        model,BYTES,ROUTER,BIAS,GATE,UP,x,1.0f,10.0f)==1,"recovered fused dispatch");
+    for (int i=0;i<6;i++) {
+        require(ds4_gpu_tensor_read(out[i],0,observed[i],sizes[i]),"recovered fused read");
+        require(memcmp(expected[i],observed[i],sizes[i])==0,"failure invalidation restores complete outputs");
+    }
     const char *disabled[] = {"DS4_METAL_DISABLE_GLM53_FLASH_TUNING",
         "DS4_METAL_DISABLE_M3_ULTRA_GLM53_DECODE", "DS4_METAL_DISABLE_GLM53_ROUTER_TOP8"};
     for (unsigned i=0;i<sizeof(disabled)/sizeof(disabled[0]);i++) {
@@ -106,6 +122,6 @@ int main(void) {
         model,BYTES,ROUTER,BIAS,GATE,UP,x,1.0f,10.0f)==0,"rollback refusal");
     for (int i=0;i<6;i++) { ds4_gpu_tensor_free(out[i]);free(expected[i]);free(observed[i]); }
     ds4_gpu_tensor_free(x);ds4_gpu_cleanup();munmap(model,BYTES);
-    puts("GLM router/shared exact: PASS (240 poisoned draws, ties, NaN/Inf bias, counter reuse)");
+    puts("GLM router/shared exact: PASS (240 poisoned draws, failure recovery, counter reuse)");
     return 0;
 }
