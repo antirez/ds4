@@ -1,0 +1,33 @@
+{
+  "kernel_commands": [
+    [
+      "./tests/test_glm53_router_shared"
+    ],
+    [
+      "./tests/test_glm53_topk_fast"
+    ],
+    [
+      "./tests/test_glm53_q8_inputs"
+    ],
+    [
+      "./tests/test_glm53_kda"
+    ],
+    [
+      "./ds4_test",
+      "--metal-kernels",
+      "--server"
+    ]
+  ],
+  "original_contexts": [
+    2048,
+    8192,
+    62174,
+    300000
+  ],
+  "q8_contexts": [
+    2048,
+    8192,
+    62174
+  ],
+  "every_logit": "byte exact"
+}

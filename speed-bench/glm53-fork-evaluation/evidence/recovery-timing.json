@@ -1,0 +1,458 @@
+[
+  {
+    "tag": "recovery-timing-original-0-baseline",
+    "arm": "baseline",
+    "command": [
+      "./campaign-bench",
+      "-m",
+      "/Users/jw/ds4/gguf/GLM-5.3-Flash-Q4_K.gguf",
+      "--prompt-file",
+      "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/baseline/speed-bench/promessi_sposi.txt",
+      "--ctx-start",
+      "62174",
+      "--ctx-max",
+      "300000",
+      "--step-incr",
+      "237826",
+      "--ctx-alloc",
+      "301000",
+      "--gen-tokens",
+      "256",
+      "--show-output",
+      "--csv",
+      "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/runs/recovery-timing-original-0-baseline.csv"
+    ],
+    "runtime_overrides": {
+      "DS4_BENCH_FORCE_SNAPSHOT": "1",
+      "DS4_GLM_ENABLE_TOPK_FAST": "1",
+      "DS4_GLM_ENABLE_KDA_Q8_INPUTS": "1",
+      "DS4_BENCH_LOAD_PREFIX": "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/prefix-long"
+    },
+    "wall_seconds": 24.51257610321045,
+    "rows": [
+      {
+        "ctx_tokens": "62174",
+        "prefill_tokens": "62174",
+        "prefill_tps": "0.00",
+        "gen_tokens": "256",
+        "gen_tps": "25.71",
+        "gen_first_ms": "66.503",
+        "gen_steady_tokens": "255",
+        "gen_steady_tps": "25.80",
+        "kvcache_bytes": "1641741076"
+      },
+      {
+        "ctx_tokens": "300000",
+        "prefill_tokens": "237826",
+        "prefill_tps": "0.00",
+        "gen_tokens": "256",
+        "gen_tps": "23.31",
+        "gen_first_ms": "44.057",
+        "gen_steady_tokens": "255",
+        "gen_steady_tps": "23.33",
+        "kvcache_bytes": "0"
+      }
+    ],
+    "trace_instrumented": false,
+    "prefix_loaded": true
+  },
+  {
+    "tag": "recovery-timing-original-1-recovery-arm",
+    "arm": "recovery-arm",
+    "command": [
+      "./campaign-bench",
+      "-m",
+      "/Users/jw/ds4/gguf/GLM-5.3-Flash-Q4_K.gguf",
+      "--prompt-file",
+      "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/baseline/speed-bench/promessi_sposi.txt",
+      "--ctx-start",
+      "62174",
+      "--ctx-max",
+      "300000",
+      "--step-incr",
+      "237826",
+      "--ctx-alloc",
+      "301000",
+      "--gen-tokens",
+      "256",
+      "--show-output",
+      "--csv",
+      "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/runs/recovery-timing-original-1-recovery-arm.csv"
+    ],
+    "runtime_overrides": {
+      "DS4_BENCH_FORCE_SNAPSHOT": "1",
+      "DS4_GLM_ENABLE_TOPK_FAST": "1",
+      "DS4_GLM_ENABLE_KDA_Q8_INPUTS": "1",
+      "DS4_BENCH_LOAD_PREFIX": "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/prefix-long"
+    },
+    "wall_seconds": 23.777446031570435,
+    "rows": [
+      {
+        "ctx_tokens": "62174",
+        "prefill_tokens": "62174",
+        "prefill_tps": "0.00",
+        "gen_tokens": "256",
+        "gen_tps": "26.35",
+        "gen_first_ms": "66.622",
+        "gen_steady_tokens": "255",
+        "gen_steady_tps": "26.45",
+        "kvcache_bytes": "1641741076"
+      },
+      {
+        "ctx_tokens": "300000",
+        "prefill_tokens": "237826",
+        "prefill_tps": "0.00",
+        "gen_tokens": "256",
+        "gen_tps": "24.77",
+        "gen_first_ms": "43.530",
+        "gen_steady_tokens": "255",
+        "gen_steady_tps": "24.80",
+        "kvcache_bytes": "0"
+      }
+    ],
+    "trace_instrumented": false,
+    "prefix_loaded": true
+  },
+  {
+    "tag": "recovery-timing-original-2-recovery-arm",
+    "arm": "recovery-arm",
+    "command": [
+      "./campaign-bench",
+      "-m",
+      "/Users/jw/ds4/gguf/GLM-5.3-Flash-Q4_K.gguf",
+      "--prompt-file",
+      "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/baseline/speed-bench/promessi_sposi.txt",
+      "--ctx-start",
+      "62174",
+      "--ctx-max",
+      "300000",
+      "--step-incr",
+      "237826",
+      "--ctx-alloc",
+      "301000",
+      "--gen-tokens",
+      "256",
+      "--show-output",
+      "--csv",
+      "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/runs/recovery-timing-original-2-recovery-arm.csv"
+    ],
+    "runtime_overrides": {
+      "DS4_BENCH_FORCE_SNAPSHOT": "1",
+      "DS4_GLM_ENABLE_TOPK_FAST": "1",
+      "DS4_GLM_ENABLE_KDA_Q8_INPUTS": "1",
+      "DS4_BENCH_LOAD_PREFIX": "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/prefix-long"
+    },
+    "wall_seconds": 23.83070421218872,
+    "rows": [
+      {
+        "ctx_tokens": "62174",
+        "prefill_tokens": "62174",
+        "prefill_tps": "0.00",
+        "gen_tokens": "256",
+        "gen_tps": "26.36",
+        "gen_first_ms": "65.998",
+        "gen_steady_tokens": "255",
+        "gen_steady_tps": "26.46",
+        "kvcache_bytes": "1641741076"
+      },
+      {
+        "ctx_tokens": "300000",
+        "prefill_tokens": "237826",
+        "prefill_tps": "0.00",
+        "gen_tokens": "256",
+        "gen_tps": "24.77",
+        "gen_first_ms": "41.469",
+        "gen_steady_tokens": "255",
+        "gen_steady_tps": "24.79",
+        "kvcache_bytes": "0"
+      }
+    ],
+    "trace_instrumented": false,
+    "prefix_loaded": true
+  },
+  {
+    "tag": "recovery-timing-original-3-baseline",
+    "arm": "baseline",
+    "command": [
+      "./campaign-bench",
+      "-m",
+      "/Users/jw/ds4/gguf/GLM-5.3-Flash-Q4_K.gguf",
+      "--prompt-file",
+      "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/baseline/speed-bench/promessi_sposi.txt",
+      "--ctx-start",
+      "62174",
+      "--ctx-max",
+      "300000",
+      "--step-incr",
+      "237826",
+      "--ctx-alloc",
+      "301000",
+      "--gen-tokens",
+      "256",
+      "--show-output",
+      "--csv",
+      "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/runs/recovery-timing-original-3-baseline.csv"
+    ],
+    "runtime_overrides": {
+      "DS4_BENCH_FORCE_SNAPSHOT": "1",
+      "DS4_GLM_ENABLE_TOPK_FAST": "1",
+      "DS4_GLM_ENABLE_KDA_Q8_INPUTS": "1",
+      "DS4_BENCH_LOAD_PREFIX": "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/prefix-long"
+    },
+    "wall_seconds": 24.70562195777893,
+    "rows": [
+      {
+        "ctx_tokens": "62174",
+        "prefill_tokens": "62174",
+        "prefill_tps": "0.00",
+        "gen_tokens": "256",
+        "gen_tps": "25.70",
+        "gen_first_ms": "66.538",
+        "gen_steady_tokens": "255",
+        "gen_steady_tps": "25.79",
+        "kvcache_bytes": "1641741076"
+      },
+      {
+        "ctx_tokens": "300000",
+        "prefill_tokens": "237826",
+        "prefill_tps": "0.00",
+        "gen_tokens": "256",
+        "gen_tps": "23.29",
+        "gen_first_ms": "43.891",
+        "gen_steady_tokens": "255",
+        "gen_steady_tps": "23.31",
+        "kvcache_bytes": "0"
+      }
+    ],
+    "trace_instrumented": false,
+    "prefix_loaded": true
+  },
+  {
+    "tag": "recovery-timing-q8-0-baseline",
+    "arm": "baseline",
+    "command": [
+      "./campaign-bench",
+      "-m",
+      "/Users/jw/ds4/gguf/GLM-5.3-Flash-Q4_K-kdaQ8.gguf",
+      "--prompt-file",
+      "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/baseline/speed-bench/promessi_sposi.txt",
+      "--ctx-start",
+      "2048",
+      "--ctx-max",
+      "8192",
+      "--step-mul",
+      "4",
+      "--ctx-alloc",
+      "16384",
+      "--gen-tokens",
+      "256",
+      "--show-output",
+      "--csv",
+      "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/runs/recovery-timing-q8-0-baseline.csv"
+    ],
+    "runtime_overrides": {
+      "DS4_BENCH_FORCE_SNAPSHOT": "1",
+      "DS4_GLM_ENABLE_TOPK_FAST": "1",
+      "DS4_GLM_ENABLE_KDA_Q8_INPUTS": "1",
+      "DS4_BENCH_LOAD_PREFIX": "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/prefix-q8-short"
+    },
+    "wall_seconds": 18.748250722885132,
+    "rows": [
+      {
+        "ctx_tokens": "2048",
+        "prefill_tokens": "2048",
+        "prefill_tps": "0.00",
+        "gen_tokens": "256",
+        "gen_tps": "30.65",
+        "gen_first_ms": "34.102",
+        "gen_steady_tokens": "255",
+        "gen_steady_tps": "30.68",
+        "kvcache_bytes": "202327452"
+      },
+      {
+        "ctx_tokens": "8192",
+        "prefill_tokens": "6144",
+        "prefill_tps": "0.00",
+        "gen_tokens": "256",
+        "gen_tps": "30.35",
+        "gen_first_ms": "33.734",
+        "gen_steady_tokens": "255",
+        "gen_steady_tps": "30.38",
+        "kvcache_bytes": "0"
+      }
+    ],
+    "trace_instrumented": false,
+    "prefix_loaded": true
+  },
+  {
+    "tag": "recovery-timing-q8-1-recovery-arm",
+    "arm": "recovery-arm",
+    "command": [
+      "./campaign-bench",
+      "-m",
+      "/Users/jw/ds4/gguf/GLM-5.3-Flash-Q4_K-kdaQ8.gguf",
+      "--prompt-file",
+      "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/baseline/speed-bench/promessi_sposi.txt",
+      "--ctx-start",
+      "2048",
+      "--ctx-max",
+      "8192",
+      "--step-mul",
+      "4",
+      "--ctx-alloc",
+      "16384",
+      "--gen-tokens",
+      "256",
+      "--show-output",
+      "--csv",
+      "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/runs/recovery-timing-q8-1-recovery-arm.csv"
+    ],
+    "runtime_overrides": {
+      "DS4_BENCH_FORCE_SNAPSHOT": "1",
+      "DS4_GLM_ENABLE_TOPK_FAST": "1",
+      "DS4_GLM_ENABLE_KDA_Q8_INPUTS": "1",
+      "DS4_BENCH_LOAD_PREFIX": "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/prefix-q8-short"
+    },
+    "wall_seconds": 18.30306315422058,
+    "rows": [
+      {
+        "ctx_tokens": "2048",
+        "prefill_tokens": "2048",
+        "prefill_tps": "0.00",
+        "gen_tokens": "256",
+        "gen_tps": "31.78",
+        "gen_first_ms": "32.757",
+        "gen_steady_tokens": "255",
+        "gen_steady_tps": "31.82",
+        "kvcache_bytes": "202327452"
+      },
+      {
+        "ctx_tokens": "8192",
+        "prefill_tokens": "6144",
+        "prefill_tps": "0.00",
+        "gen_tokens": "256",
+        "gen_tps": "31.47",
+        "gen_first_ms": "32.543",
+        "gen_steady_tokens": "255",
+        "gen_steady_tps": "31.51",
+        "kvcache_bytes": "0"
+      }
+    ],
+    "trace_instrumented": false,
+    "prefix_loaded": true
+  },
+  {
+    "tag": "recovery-timing-q8-2-recovery-arm",
+    "arm": "recovery-arm",
+    "command": [
+      "./campaign-bench",
+      "-m",
+      "/Users/jw/ds4/gguf/GLM-5.3-Flash-Q4_K-kdaQ8.gguf",
+      "--prompt-file",
+      "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/baseline/speed-bench/promessi_sposi.txt",
+      "--ctx-start",
+      "2048",
+      "--ctx-max",
+      "8192",
+      "--step-mul",
+      "4",
+      "--ctx-alloc",
+      "16384",
+      "--gen-tokens",
+      "256",
+      "--show-output",
+      "--csv",
+      "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/runs/recovery-timing-q8-2-recovery-arm.csv"
+    ],
+    "runtime_overrides": {
+      "DS4_BENCH_FORCE_SNAPSHOT": "1",
+      "DS4_GLM_ENABLE_TOPK_FAST": "1",
+      "DS4_GLM_ENABLE_KDA_Q8_INPUTS": "1",
+      "DS4_BENCH_LOAD_PREFIX": "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/prefix-q8-short"
+    },
+    "wall_seconds": 18.299734830856323,
+    "rows": [
+      {
+        "ctx_tokens": "2048",
+        "prefill_tokens": "2048",
+        "prefill_tps": "0.00",
+        "gen_tokens": "256",
+        "gen_tps": "31.78",
+        "gen_first_ms": "33.261",
+        "gen_steady_tokens": "255",
+        "gen_steady_tps": "31.82",
+        "kvcache_bytes": "202327452"
+      },
+      {
+        "ctx_tokens": "8192",
+        "prefill_tokens": "6144",
+        "prefill_tps": "0.00",
+        "gen_tokens": "256",
+        "gen_tps": "31.44",
+        "gen_first_ms": "33.078",
+        "gen_steady_tokens": "255",
+        "gen_steady_tps": "31.48",
+        "kvcache_bytes": "0"
+      }
+    ],
+    "trace_instrumented": false,
+    "prefix_loaded": true
+  },
+  {
+    "tag": "recovery-timing-q8-3-baseline",
+    "arm": "baseline",
+    "command": [
+      "./campaign-bench",
+      "-m",
+      "/Users/jw/ds4/gguf/GLM-5.3-Flash-Q4_K-kdaQ8.gguf",
+      "--prompt-file",
+      "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/baseline/speed-bench/promessi_sposi.txt",
+      "--ctx-start",
+      "2048",
+      "--ctx-max",
+      "8192",
+      "--step-mul",
+      "4",
+      "--ctx-alloc",
+      "16384",
+      "--gen-tokens",
+      "256",
+      "--show-output",
+      "--csv",
+      "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/runs/recovery-timing-q8-3-baseline.csv"
+    ],
+    "runtime_overrides": {
+      "DS4_BENCH_FORCE_SNAPSHOT": "1",
+      "DS4_GLM_ENABLE_TOPK_FAST": "1",
+      "DS4_GLM_ENABLE_KDA_Q8_INPUTS": "1",
+      "DS4_BENCH_LOAD_PREFIX": "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/prefix-q8-short"
+    },
+    "wall_seconds": 18.94218611717224,
+    "rows": [
+      {
+        "ctx_tokens": "2048",
+        "prefill_tokens": "2048",
+        "prefill_tps": "0.00",
+        "gen_tokens": "256",
+        "gen_tps": "30.60",
+        "gen_first_ms": "34.896",
+        "gen_steady_tokens": "255",
+        "gen_steady_tps": "30.64",
+        "kvcache_bytes": "202327452"
+      },
+      {
+        "ctx_tokens": "8192",
+        "prefill_tokens": "6144",
+        "prefill_tps": "0.00",
+        "gen_tokens": "256",
+        "gen_tps": "30.30",
+        "gen_first_ms": "33.616",
+        "gen_steady_tokens": "255",
+        "gen_steady_tps": "30.33",
+        "kvcache_bytes": "0"
+      }
+    ],
+    "trace_instrumented": false,
+    "prefix_loaded": true
+  }
+]

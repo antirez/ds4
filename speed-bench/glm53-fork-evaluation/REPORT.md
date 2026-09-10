@@ -1,8 +1,8 @@
 # M3 Ultra fork evaluation — 2026-09-09
 
-Three decode adaptations produced repeatable gains while preserving every captured logit byte. Router/shared fusion improves short decode by about 1.6%; adding DSA selection improves original-model decode at 300K by 6.1% overall. Router plus mixed KDA inputs improves the existing KDA-Q8 model at 8K by 3.4% overall. These are comparisons within each unchanged model, not a quality comparison between models.
+Three decode adaptations produced repeatable gains while preserving every captured logit byte. Router/shared fusion improves short decode by about 1.6%. The final build improves original-model decode at 300K by 6.3% with router plus DSA, and the existing KDA-Q8 model at 8K by 3.7% with router plus mixed inputs, measured from restored prefixes. These are comparisons within each unchanged model, not a quality comparison between models.
 
-Experimental branch: `glm53flash-metal-fork-eval`, based on `glm53flash-metal-exact` at `224e7669abac9fa64580e71a9a1581fa0c852d2a`. The source fork is [IngeniousIdiocy/ds4 at 95eb218](https://github.com/IngeniousIdiocy/ds4/tree/95eb218614868284fb6a9350b4be9f32c0d57575). GPU source checked against full model traces: `fa00a42d4c98d2defea04f031c8eb3dba3d4ea1d`. Server-only follow-up `70befc3` extends checkpoint scanning and passes the complete server suite; it changes no inference or shader source. The experiment is local; the user's working branch remains at the pushed baseline.
+Experimental branch: `glm53flash-metal-fork-eval`, based on `glm53flash-metal-exact` at `224e7669abac9fa64580e71a9a1581fa0c852d2a`. The source fork is [IngeniousIdiocy/ds4 at 95eb218](https://github.com/IngeniousIdiocy/ds4/tree/95eb218614868284fb6a9350b4be9f32c0d57575). Final source checked against full model traces and repeated timing: `0f211542950428f2469c0976a1ecf459abc6feab`. Earlier records at `fa00a42` and server follow-up `70befc3` remain in the evidence directory for provenance. The experiment is local; the user's working branch remains at the pushed baseline.
 
 ## Measured decode results
 
@@ -21,14 +21,23 @@ Original short comparisons use three runs per arm; long and Q8 comparisons use t
 
 At 62,174 on KDA-Q8, mixed input fusion adds 0.54 tok/s over router alone: 29.995 → 30.535 (+1.8%), two runs per arm. DSA is disabled in the Q8 timing comparisons to isolate input fusion. All three adapters together pass Q8 trace checks through 62,174; there is no paired timing of that combination or Q8 test at 300K.
 
-The final reviewed source was also retimed after its attention invalid-row repair. An uninstrumented ABBA run, two processes per arm with the same saved original-model prefixes, confirms the combined router/DSA result:
+An intermediate build at `fa00a42`, after the attention invalid-row repair, was also retimed. An uninstrumented ABBA run, two processes per arm with the same saved original-model prefixes, confirmed the combined router/DSA result:
 
-| Original-model context | Baseline mean | Final reviewed mean | Gain |
+| Original-model context | Baseline mean | Intermediate mean | Gain |
 |---|---:|---:|---:|
 | 62,174 | 25.750 | 26.415 | +2.58% |
 | 300,000 | 23.340 | 24.790 | +6.21% |
 
 These confirmation runs are recorded separately in `reviewed-timing.json`; they are not pooled with the earlier component screens. Both arms became slightly faster in the later run, while the incremental gain remained consistent.
+
+The final failure-recovery and checkpoint-scan fixes at `0f211542` retain the gains. Each row below uses two processes per arm in ABBA order, 256 greedy steps and identical restored prefixes; trace and dispatch-stat instrumentation are off. These measurements are recorded in `recovery-timing.json` and are not pooled with earlier runs.
+
+| Final confirmation | Baseline mean | Final mean | Gain |
+|---|---:|---:|---:|
+| Original, 62,174 — router + DSA | 25.705 | 26.355 | +2.53% |
+| Original, 300,000 — router + DSA | 23.300 | 24.770 | +6.31% |
+| KDA-Q8, 2,048 — router + inputs | 30.625 | 31.780 | +3.77% |
+| KDA-Q8, 8,192 — router + inputs | 30.325 | 31.455 | +3.73% |
 
 ## Exactness evidence
 
@@ -57,7 +66,7 @@ Full-logit capture uses a campaign-only wrapper around the public session API. I
 
 Fresh processes run from separate immutable copies of the source and binaries. All DS4_, MTL_ and ASTRA_ environment overrides are cleared before explicit experiment controls are set. `frozen-arm-manifest.json` hashes every shader, relevant source and binary. Full commands, overrides and raw CSV rows are in the campaign JSON files.
 
-Local campaign: `/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810`. Complete logits, raw logs and prefix snapshots stay in that directory. Compact manifests, wrapper script and timing data are supplied beside this report in `evidence/`. `reviewed-arm-manifest.json` records the final tested commit, and `reviewed-trace-comparisons.json` records the final full-logit byte comparisons and hashes. The component table uses separately frozen experimental arms before the review corrections described below; the confirmation table uses the final source. Instrumented model runs are excluded from all throughput comparisons.
+Local campaign: `/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810`. Complete logits, raw logs and prefix snapshots stay in that directory. Compact manifests, wrapper script and timing data are supplied beside this report in `evidence/`. `recovery-arm-manifest.json` records the final tested commit, and `recovery-trace-comparisons.json` records its full-logit byte comparisons and hashes. Files prefixed `reviewed-` describe the intermediate `fa00a42` build. The component table uses separately frozen experimental arms before the review corrections described below; the final confirmation table uses `0f211542`. Instrumented model runs are excluded from all throughput comparisons.
 
 This is one prompt on one M3 Ultra, with two or three repetitions per arm. It establishes local incremental gains, not statistical confidence across workloads or a universal speedup. Session continuation and recurrent-state fixtures were tested; this campaign does not claim a byte comparison of every persistent state buffer. No distributed hardware or SSD-streaming model campaign was run.
 
@@ -75,7 +84,7 @@ On the router-only adapter, three runs per arm measured **27.01 off / 27.00 on a
 
 ### Combined checks
 
-The final reviewed build at `fa00a42` passes all three model-free experiment tests, the existing GLM KDA/attention tests, the Metal kernel suite and server suite. CPU session-state and TP command tests also pass. Every full logit matches the original baseline at 2K, 8K, 62,174 and 300,000 with the combined adapters enabled. The unchanged KDA-Q8 model matches at 2K, 8K and 62,174. Coverage logs report 21,504 router fusions and 5,632 DSA attempts for the original long run; the Q8 long run reports 10,752 router fusions, 8,704 mixed-input fusions and 2,816 DSA attempts.
+The final build at `0f211542` passes all three model-free experiment tests, the existing GLM KDA/attention tests, the Metal kernel suite and server suite. CPU session-state and TP command tests also pass. Every full logit matches the original baseline at 2K, 8K, 62,174 and 300,000 with the combined adapters enabled. The unchanged KDA-Q8 model matches at 2K, 8K and 62,174. Coverage logs report 21,504 router fusions and 5,632 DSA attempts for the original long run; the Q8 long run reports 10,752 router fusions, 8,704 mixed-input fusions and 2,816 DSA attempts.
 
 A late refusal test caught the host compiler folding away a NaN check under `-ffast-math`. Volatile integer exponent checks preserve that guard. The checkpoint regression was extended beyond the fork's original eight cases: a literal closing tag inside an argument must use the same structural-tag matcher as the parser, and opening tags in earlier prompt text require retrying inside an unmatched candidate span.
 
@@ -83,7 +92,7 @@ The final checkpoint regression also reproduces 80 failed assertions when an inc
 
 Review also found an inherited exact-attention edge case: invalid selected row IDs loaded row zero before multiplying by zero, allowing NaN/Inf in row zero to poison a result. Invalid rows now stage literal zeros. A GPU regression compares this case against the generic path. This deliberately fixes exceptional invalid-row behavior; ordinary model traces still match the old baseline byte for byte. The complete kernel/model suite passes with all three corrections.
 
-The incremental review found that a failed command buffer could leave partial router arrivals or a half-filled DSA candidate set in reusable storage. Failure invalidation now gives every registered graph counter fresh backing and retires the shared DSA scratch without CPU-mutating buffers still retained by in-flight work. Model-free recovery regressions poison 100 of 144 router arrivals and the exact stale-512 plus current-512 DSA acceptance case, then compare the next complete outputs with the original references. The selector finisher's unused second pool-expansion mode was removed; the graph continues to use the existing separate expansion. These recovery-only changes do not alter finite arithmetic and are not included in the `fa00a42` full-model provenance above.
+The incremental review found that a failed command buffer could leave partial router arrivals or a half-filled DSA candidate set in reusable storage. Failure invalidation now gives every registered graph counter fresh backing and retires the shared DSA scratch without CPU-mutating buffers still retained by in-flight work. Model-free recovery regressions poison 100 of 144 router arrivals and the exact stale-512 plus current-512 DSA acceptance case, then compare the next complete outputs with the original references. The selector finisher's unused second pool-expansion mode was removed; the graph continues to use the existing separate expansion. The fixed build at `0f211542` passes the complete kernel/server suite, every full-model logit comparison, and the repeated timing confirmation above. The new radix-tree prefix lookup also passes a 30,000-query brute-force oracle with insertion/removal, binary and empty keys, null values and nested prefixes; its standalone source and result are in the evidence directory.
 
 ## Reproducing the checks
 
@@ -112,4 +121,4 @@ Roll back router fusion with `DS4_METAL_DISABLE_GLM53_ROUTER_SHARED=1`. Leave th
 
 ### Review
 
-Independent no-mistakes review found the structural checkpoint and invalid-row defects described above; the host non-finite refusal failure was supplied from the local regression. The fixes were committed in `fa00a42` and passed the final manual checks. The first automated run then hit its 30-minute limit during re-review, so it did not produce a successful review outcome. Its commits were recovered intact. Source review and lint are being retried with the explicit incremental range `224e766..HEAD`; rebase, duplicate test execution and publication stages are disabled. The measured results and manual checks above are independent of that runner outcome.
+Two complete source reviews identified the checkpoint, non-finite and GPU recovery issues described above. All findings were fixed in preserved commits and the final build passed the executable checks. Both post-fix re-review rounds hit the runner's 30-minute limit, so neither run produced a successful pipeline outcome. The final review is scoped to the last fix delta from `88f6f005` plus its evidence; rebase, duplicate model tests and publication remain disabled. This section records that review history, separately from the measured results and manual test outcomes.
