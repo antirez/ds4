@@ -1,0 +1,13 @@
+{
+  "commit": "70befc3b6ce39bf84d2672e1f197950298dfbe88",
+  "model_checked_commit": "fa00a42d4c98d2defea04f031c8eb3dba3d4ea1d",
+  "inference_and_shader_sources_identical": true,
+  "server_command": [
+    "./ds4_test",
+    "--server"
+  ],
+  "before_failure_count": 80,
+  "after": "passed",
+  "roundtrip_cases": 96,
+  "server_source_sha256": "70f1998711abffd44c1e398cf92832bd9ff0e47d0632c97001c26762c957cdca"
+}

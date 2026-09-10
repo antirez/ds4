@@ -1,0 +1,230 @@
+[
+  {
+    "tag": "reviewed-timing-0-baseline",
+    "arm": "baseline",
+    "command": [
+      "./campaign-bench",
+      "-m",
+      "/Users/jw/ds4/gguf/GLM-5.3-Flash-Q4_K.gguf",
+      "--prompt-file",
+      "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/baseline/speed-bench/promessi_sposi.txt",
+      "--ctx-start",
+      "62174",
+      "--ctx-max",
+      "300000",
+      "--step-incr",
+      "237826",
+      "--ctx-alloc",
+      "301000",
+      "--gen-tokens",
+      "256",
+      "--show-output",
+      "--csv",
+      "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/runs/reviewed-timing-0-baseline.csv"
+    ],
+    "runtime_overrides": {
+      "DS4_BENCH_FORCE_SNAPSHOT": "1",
+      "DS4_GLM_ENABLE_TOPK_FAST": "1",
+      "DS4_GLM_ENABLE_KDA_Q8_INPUTS": "1",
+      "DS4_BENCH_LOAD_PREFIX": "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/prefix-long"
+    },
+    "wall_seconds": 24.410566091537476,
+    "rows": [
+      {
+        "ctx_tokens": "62174",
+        "prefill_tokens": "62174",
+        "prefill_tps": "0.00",
+        "gen_tokens": "256",
+        "gen_tps": "25.77",
+        "gen_first_ms": "67.075",
+        "gen_steady_tokens": "255",
+        "gen_steady_tps": "25.87",
+        "kvcache_bytes": "1641741076"
+      },
+      {
+        "ctx_tokens": "300000",
+        "prefill_tokens": "237826",
+        "prefill_tps": "0.00",
+        "gen_tokens": "256",
+        "gen_tps": "23.36",
+        "gen_first_ms": "44.048",
+        "gen_steady_tokens": "255",
+        "gen_steady_tps": "23.38",
+        "kvcache_bytes": "0"
+      }
+    ],
+    "trace_instrumented": false,
+    "prefix_loaded": true
+  },
+  {
+    "tag": "reviewed-timing-1-reviewed-arm",
+    "arm": "reviewed-arm",
+    "command": [
+      "./campaign-bench",
+      "-m",
+      "/Users/jw/ds4/gguf/GLM-5.3-Flash-Q4_K.gguf",
+      "--prompt-file",
+      "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/baseline/speed-bench/promessi_sposi.txt",
+      "--ctx-start",
+      "62174",
+      "--ctx-max",
+      "300000",
+      "--step-incr",
+      "237826",
+      "--ctx-alloc",
+      "301000",
+      "--gen-tokens",
+      "256",
+      "--show-output",
+      "--csv",
+      "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/runs/reviewed-timing-1-reviewed-arm.csv"
+    ],
+    "runtime_overrides": {
+      "DS4_BENCH_FORCE_SNAPSHOT": "1",
+      "DS4_GLM_ENABLE_TOPK_FAST": "1",
+      "DS4_GLM_ENABLE_KDA_Q8_INPUTS": "1",
+      "DS4_BENCH_LOAD_PREFIX": "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/prefix-long"
+    },
+    "wall_seconds": 23.755571126937866,
+    "rows": [
+      {
+        "ctx_tokens": "62174",
+        "prefill_tokens": "62174",
+        "prefill_tps": "0.00",
+        "gen_tokens": "256",
+        "gen_tps": "26.42",
+        "gen_first_ms": "67.043",
+        "gen_steady_tokens": "255",
+        "gen_steady_tps": "26.53",
+        "kvcache_bytes": "1641741076"
+      },
+      {
+        "ctx_tokens": "300000",
+        "prefill_tokens": "237826",
+        "prefill_tps": "0.00",
+        "gen_tokens": "256",
+        "gen_tps": "24.79",
+        "gen_first_ms": "44.708",
+        "gen_steady_tokens": "255",
+        "gen_steady_tps": "24.82",
+        "kvcache_bytes": "0"
+      }
+    ],
+    "trace_instrumented": false,
+    "prefix_loaded": true
+  },
+  {
+    "tag": "reviewed-timing-2-reviewed-arm",
+    "arm": "reviewed-arm",
+    "command": [
+      "./campaign-bench",
+      "-m",
+      "/Users/jw/ds4/gguf/GLM-5.3-Flash-Q4_K.gguf",
+      "--prompt-file",
+      "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/baseline/speed-bench/promessi_sposi.txt",
+      "--ctx-start",
+      "62174",
+      "--ctx-max",
+      "300000",
+      "--step-incr",
+      "237826",
+      "--ctx-alloc",
+      "301000",
+      "--gen-tokens",
+      "256",
+      "--show-output",
+      "--csv",
+      "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/runs/reviewed-timing-2-reviewed-arm.csv"
+    ],
+    "runtime_overrides": {
+      "DS4_BENCH_FORCE_SNAPSHOT": "1",
+      "DS4_GLM_ENABLE_TOPK_FAST": "1",
+      "DS4_GLM_ENABLE_KDA_Q8_INPUTS": "1",
+      "DS4_BENCH_LOAD_PREFIX": "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/prefix-long"
+    },
+    "wall_seconds": 23.736918926239014,
+    "rows": [
+      {
+        "ctx_tokens": "62174",
+        "prefill_tokens": "62174",
+        "prefill_tps": "0.00",
+        "gen_tokens": "256",
+        "gen_tps": "26.41",
+        "gen_first_ms": "66.738",
+        "gen_steady_tokens": "255",
+        "gen_steady_tps": "26.51",
+        "kvcache_bytes": "1641741076"
+      },
+      {
+        "ctx_tokens": "300000",
+        "prefill_tokens": "237826",
+        "prefill_tps": "0.00",
+        "gen_tokens": "256",
+        "gen_tps": "24.79",
+        "gen_first_ms": "41.348",
+        "gen_steady_tokens": "255",
+        "gen_steady_tps": "24.81",
+        "kvcache_bytes": "0"
+      }
+    ],
+    "trace_instrumented": false,
+    "prefix_loaded": true
+  },
+  {
+    "tag": "reviewed-timing-3-baseline",
+    "arm": "baseline",
+    "command": [
+      "./campaign-bench",
+      "-m",
+      "/Users/jw/ds4/gguf/GLM-5.3-Flash-Q4_K.gguf",
+      "--prompt-file",
+      "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/baseline/speed-bench/promessi_sposi.txt",
+      "--ctx-start",
+      "62174",
+      "--ctx-max",
+      "300000",
+      "--step-incr",
+      "237826",
+      "--ctx-alloc",
+      "301000",
+      "--gen-tokens",
+      "256",
+      "--show-output",
+      "--csv",
+      "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/runs/reviewed-timing-3-baseline.csv"
+    ],
+    "runtime_overrides": {
+      "DS4_BENCH_FORCE_SNAPSHOT": "1",
+      "DS4_GLM_ENABLE_TOPK_FAST": "1",
+      "DS4_GLM_ENABLE_KDA_Q8_INPUTS": "1",
+      "DS4_BENCH_LOAD_PREFIX": "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/prefix-long"
+    },
+    "wall_seconds": 24.665980100631714,
+    "rows": [
+      {
+        "ctx_tokens": "62174",
+        "prefill_tokens": "62174",
+        "prefill_tps": "0.00",
+        "gen_tokens": "256",
+        "gen_tps": "25.73",
+        "gen_first_ms": "65.264",
+        "gen_steady_tokens": "255",
+        "gen_steady_tps": "25.82",
+        "kvcache_bytes": "1641741076"
+      },
+      {
+        "ctx_tokens": "300000",
+        "prefill_tokens": "237826",
+        "prefill_tps": "0.00",
+        "gen_tokens": "256",
+        "gen_tps": "23.32",
+        "gen_first_ms": "43.602",
+        "gen_steady_tokens": "255",
+        "gen_steady_tps": "23.34",
+        "kvcache_bytes": "0"
+      }
+    ],
+    "trace_instrumented": false,
+    "prefix_loaded": true
+  }
+]
