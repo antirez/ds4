@@ -309,3 +309,36 @@ kernel glm53_mul_mm_bf16_t kernel_mul_mm<
         half, half2x4, simdgroup_half8x8,
         glm53_bf16_block16, 1, glm53_dequantize_bf16,
         half, half4x4, float, float2x4>;
+
+/* Mixed Q8 QKV + BF16 gate inputs share a dispatch, retaining each original
+ * projection helper and its reduction order. Inspired by the M3 Ultra fork's
+ * projection fold; this accepts our existing mixed model without requantizing. */
+kernel void kernel_glm53_kda_inputs_q8_bf16(
+        device const char *wq, device const char *wk, device const char *wv,
+        device const ushort *wf, device const ushort *wg, device const ushort *wb,
+        device const float *x,
+        device float *oq, device float *ok, device float *ov,
+        device float *of, device float *og, device float *ob,
+        constant ds4_metal_args_mul_mv &args,
+        threadgroup char *scratch [[threadgroup(0)]],
+        uint group [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    if (group < 12288u) {
+        const uint slot=group/4096u;
+        device const char *w=slot==0u?wq:slot==1u?wk:wv;
+        device float *o=slot==0u?oq:slot==1u?ok:ov;
+        kernel_mul_mv_q8_0_f32_impl<2, constant ds4_metal_args_mul_mv &>(
+            args,w,(device const char *)x,(device char *)o,scratch,
+            uint3(group%4096u,0u,0u),lane,sg);
+    } else {
+        uint row=(group-12288u)*4u+sg;
+        if (row>=320u) return;
+        device const ushort *w; device float *o;
+        if(row<128u){w=wf;o=of;}
+        else if(row<256u){row-=128u;w=wg;o=og;}
+        else{row-=256u;w=wb;o=ob;}
+        const float sum=glm53_mul_mv_bf16_f32_row_sum(4096u,w,x,row,0u,lane);
+        if(lane==0u)o[row]=sum;
+    }
+}

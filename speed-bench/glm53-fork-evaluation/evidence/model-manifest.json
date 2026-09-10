@@ -1,0 +1,18 @@
+{
+  "GLM-5.3-Flash-Q4_K.gguf": {
+    "path": "/Users/jw/ds4/gguf/GLM-5.3-Flash-Q4_K.gguf",
+    "size": 190875526464,
+    "inode": 5214537,
+    "mtime_ns": 1788307683582753100,
+    "first_16_MiB_sha256": "f2328025a6b096a86c41b47fe14a0781602f30e31454ec892ec28c00cd1df2b4",
+    "full_file_hash": null
+  },
+  "GLM-5.3-Flash-Q4_K-kdaQ8.gguf": {
+    "path": "/Users/jw/ds4/gguf/GLM-5.3-Flash-Q4_K-kdaQ8.gguf",
+    "size": 186597336384,
+    "inode": 5217760,
+    "mtime_ns": 1788320393204786307,
+    "first_16_MiB_sha256": "1df172c32ffee43d09a60bbcd21e33e235e680eb8aff43307d256fd8e612853c",
+    "full_file_hash": null
+  }
+}

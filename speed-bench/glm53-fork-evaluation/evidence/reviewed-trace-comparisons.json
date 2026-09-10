@@ -1,0 +1,33 @@
+{
+  "candidate_commit": "fa00a42d4c98d2defea04f031c8eb3dba3d4ea1d",
+  "comparisons": [
+    {
+      "baseline": "baseline-trace-short",
+      "candidate": "reviewed-original-short",
+      "bytes": 159838224,
+      "sha256": "c4e6deec9517242a373bbe9691f18a813b43b7a9de3eab60c777c6203c45958f",
+      "byte_equal": true
+    },
+    {
+      "baseline": "baseline-trace-long",
+      "candidate": "reviewed-original-long",
+      "bytes": 318437392,
+      "sha256": "4bdcdb756e224919b9c37a282d070f62167914f9217f9b87d56fc1877ee50b55",
+      "byte_equal": true
+    },
+    {
+      "baseline": "q8-baseline-trace-short",
+      "candidate": "reviewed-q8-short",
+      "bytes": 159838224,
+      "sha256": "ed1e63dd49f42ffa25f169592f1293f3214cdec209b22fa6d9ca672cb987e291",
+      "byte_equal": true
+    },
+    {
+      "baseline": "q8-baseline-trace-long",
+      "candidate": "reviewed-q8-long",
+      "bytes": 159218696,
+      "sha256": "63a280e37e0efd75e751e40d965af9024fb4b9c443d23cbe9c5d82ef85b51026",
+      "byte_equal": true
+    }
+  ]
+}

@@ -3476,9 +3476,7 @@ kernel void kernel_glm_attention_indexed_decode_exact_weights(
  * 128-byte row slices and one weight, three stages ahead of use, and parks
  * them in double-buffered threadgroup memory, so the scattered row reads are
  * in flight while the fma chains run.  Those chains are the generic kernel's,
- * row after row in selection order; a row past cache_cap (or past the end of
- * the last stage) contributes fma(0, kv[0], acc), which leaves acc unchanged
- * bit for bit, where the generic kernel skips it. */
+ * row after row in selection order. */
 #define DS4_GLM_EXACT_LORA_STAGE 32u
 #define DS4_GLM_EXACT_LORA_AHEAD 3u
 kernel void kernel_glm_attention_indexed_decode_exact_lora(
@@ -3521,8 +3519,11 @@ kernel void kernel_glm_attention_indexed_decode_exact_lora(
         const uint s0_ = (k) * stage; \
         const uint s_ = s0_ + kv_r; \
         const uint row_ = s_ < n ? selected[s_] : 0u; \
-        const uint safe_ = row_ < args.cache_cap ? row_ : 0u; \
-        kvq[slot] = *(device const uint4 *)(cache + (uint64_t)safe_ * args.kv_lora_dim + c0 + kv_chunk * 8u); \
+        if (s_ < n && row_ < args.cache_cap) { \
+            kvq[slot] = *(device const uint4 *)(cache + (uint64_t)row_ * args.kv_lora_dim + c0 + kv_chunk * 8u); \
+        } else { \
+            kvq[slot] = uint4(0u); \
+        } \
         const uint sw_ = s0_ + w_r; \
         const uint hh_ = head0 + w_h; \
         wq[slot] = (sw_ < n && hh_ < args.n_head) \
@@ -5476,16 +5477,16 @@ kernel void kernel_glm_router_select_one(
 }
 
 // GLM-5.3's 288 experts fit in nine registers per lane of one SIMDgroup.
-kernel void kernel_glm_router_select_top8(
+static inline void ds4_glm_router_select_top8_impl(
         constant ds4_metal_args_glm_router_select_one & args,
         device const float *logits,
         device const float *bias,
         device int32_t *selected,
         device float *weights,
         device float *probs,
-        threadgroup float *scratch [[threadgroup(0)]],
-        uint token [[threadgroup_position_in_grid]],
-        uint lane [[thread_index_in_simdgroup]]) {
+        threadgroup float *scratch,
+        uint token,
+        uint lane) {
     threadgroup float *scores = scratch;
     threadgroup int32_t *idx = (threadgroup int32_t *)(scratch + 512u);
     device const float *token_logits = logits + (ulong)token * args.n_expert;
@@ -5553,6 +5554,69 @@ kernel void kernel_glm_router_select_top8(
         sum = max(sum, 6.103515625e-5f);
         token_weights[lane] = token_probs[(uint)token_selected[lane]] / sum * args.expert_weight_scale;
     }
+}
+
+kernel void kernel_glm_router_select_top8(
+        constant ds4_metal_args_glm_router_select_one & args,
+        device const float *logits,
+        device const float *bias,
+        device int32_t *selected,
+        device float *weights,
+        device float *probs,
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint token [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_simdgroup]]) {
+    ds4_glm_router_select_top8_impl(args, logits, bias, selected, weights,
+                                  probs, scratch, token, lane);
+}
+
+
+// Adapted from IngeniousIdiocy/ds4 95eb218, MIT: one grid carries the
+// F32 GLM router and two virtual four-SIMDgroup shared-expert cohorts.
+// The current top-eight body is retained, including its exceptional fallback.
+kernel void kernel_glm53_router_shared_exact(
+        constant ds4_metal_args_mul_mv & rargs,
+        constant ds4_metal_args_mul_mv & sargs,
+        constant ds4_metal_args_glm_router_select_one & args,
+        device const char *rw, device const char *gw, device const char *uw,
+        device const char *x, device char *logits, device const float *bias,
+        device int32_t *selected, device float *weights, device float *probs,
+        device atomic_uint *counter, device char *mid,
+        constant float &clamp_value,
+        threadgroup char *scratch [[threadgroup(0)]],
+        uint3 tg [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    if (tg.x >= 144u) {
+        const ushort cohort = sg >> 2;
+        uint3 vtg = tg;
+        vtg.x = (tg.x - 144u) * 2u + cohort;
+        kernel_dsv4_shared_gate_up_swiglu_q8_0_impl<2, false, 4>(
+            sargs, gw, uw, x, mid, mid, mid, clamp_value,
+            scratch + cohort * 512u, vtg, lane, sg & 3u);
+        return;
+    }
+    kernel_mul_mv_t_t_4_impl<float, float4, float, float4, 2,
+                             constant ds4_metal_args_mul_mv &, true>(
+        rargs, rw, x, logits, scratch, tg, lane, sg);
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    threadgroup uint elected;
+    if (tid == 0u) {
+        elected = atomic_fetch_add_explicit(counter, 1u, memory_order_relaxed) == 143u;
+        if (elected) atomic_store_explicit(counter, 0u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!elected) return;
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    device atomic_uint *slots = (device atomic_uint *)logits;
+    for (uint i = tid; i < 288u; i += 256u)
+        ((device float *)logits)[i] = as_type<float>(atomic_load_explicit(slots+i, memory_order_relaxed));
+    threadgroup_barrier(mem_flags::mem_device);
+    if (sg == 0u)
+        ds4_glm_router_select_top8_impl(args, (device const float *)logits,
+            bias, selected, weights, probs, (threadgroup float *)scratch, 0u, lane);
 }
 
 // Batched Flash-router weight finalization after selection is already known.
