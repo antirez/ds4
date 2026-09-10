@@ -423,11 +423,55 @@ static void check_split_dsa_attention(uint8_t *model, size_t model_bytes,
         }
     }
 
+    const uint32_t poisoned_n = 33u;
+    for (uint32_t j = 0; j < SA_LORA; j++) {
+        kv_bits[j] = (j & 1u) ? 0x7c00u : 0x7e00u;
+    }
+    for (uint32_t s = 0; s < poisoned_n; s++) {
+        sel[s] = 1u + (s * 7919u) % (SA_CAP - 1u);
+    }
+    sel[5] = UINT32_MAX;
+    sel[19] = SA_CAP + 3u;
+    require_ok(ds4_gpu_tensor_write(
+                   kv_gpu, 0, kv_bits,
+                   (uint64_t)SA_ROWS * SA_LORA * sizeof(uint16_t)) &&
+               ds4_gpu_tensor_write(
+                   sel_gpu, 0, sel,
+                   (uint64_t)poisoned_n * sizeof(uint32_t)),
+               "nonfinite row-zero attention input write");
+    require_ok(ds4_gpu_glm_attention_indexed_decode_tensor(
+        heads_gpu, q_gpu, low_gpu, kv_gpu, rope_gpu, model, model_bytes,
+        value_offset, sel_gpu, poisoned_n, SA_CAP, true, SA_HEADS, SA_LORA,
+        SA_NOPE, 0, SA_VALUE, 0, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f),
+        "nonfinite row-zero generic attention");
+    require_ok(ds4_gpu_tensor_read(
+                   heads_gpu, 0, gen,
+                   (uint64_t)SA_HEADS * SA_VALUE * sizeof(float)),
+               "nonfinite row-zero generic attention read");
+    require_ok(ds4_gpu_glm_attention_indexed_decode_exact_tensor(
+        heads_gpu, exact_scores_gpu, exact_lora_gpu, exact_denom_gpu,
+        low_gpu, kv_gpu, model, model_bytes, value_offset, sel_gpu, poisoned_n,
+        SA_CAP, true, SA_HEADS, SA_LORA, SA_NOPE, 0, SA_VALUE),
+        "nonfinite row-zero exact attention");
+    require_ok(ds4_gpu_tensor_read(
+                   heads_gpu, 0, exact,
+                   (uint64_t)SA_HEADS * SA_VALUE * sizeof(float)),
+               "nonfinite row-zero exact attention read");
+    for (uint32_t i = 0; i < SA_HEADS * SA_VALUE; i++) {
+        require_ok(isfinite(gen[i]) && isfinite(exact[i]),
+                   "invalid rows exclude nonfinite row zero");
+    }
+    require_ok(memcmp(exact, gen,
+                      (size_t)SA_HEADS * SA_VALUE * sizeof(float)) == 0,
+               "nonfinite row-zero exact attention matches generic");
+
     /* GLM 5.2's selections are always in range and it ran the unchecked
      * variant before GLM 5.3 was admitted; decode now passes false for every
      * GLM model, which is free of numerical consequence only if the two
      * variants perform identical arithmetic on valid rows. */
-    for (uint32_t s = 0; s < 2048u; s++) sel[s] = (s * 7919u) % SA_CAP;
+    for (uint32_t s = 0; s < 2048u; s++) {
+        sel[s] = 1u + (s * 7919u) % (SA_CAP - 1u);
+    }
     require_ok(ds4_gpu_tensor_write(sel_gpu, 0, sel, 2048u * sizeof(uint32_t)),
                "all-valid selection write");
     for (int assume_valid = 0; assume_valid < 2; assume_valid++) {

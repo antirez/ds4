@@ -86,10 +86,15 @@ int main(void) {
             model,BYTES,ROUTER,BIAS,GATE,UP,x,1.0f,10.0f)==0,"aggregate rollback refusal");
         unsetenv(disabled[i]);
     }
-    uint32_t nonfinite_bits=0x7fc00123u; float nonfinite;
-    memcpy(&nonfinite,&nonfinite_bits,sizeof(nonfinite));
-    require(ds4_gpu_glm53_router_shared_exact(out[0],out[1],out[2],out[3],out[4],out[5],
-        model,BYTES,ROUTER,BIAS,GATE,UP,x,nonfinite,10.0f)==0,"NaN scale refusal");
+    const uint32_t nonfinite_bits[]={0x7fc00123u,0x7f800000u,0xff800000u};
+    for (unsigned i=0;i<sizeof(nonfinite_bits)/sizeof(nonfinite_bits[0]);i++) {
+        float nonfinite;
+        memcpy(&nonfinite,&nonfinite_bits[i],sizeof(nonfinite));
+        require(ds4_gpu_glm53_router_shared_exact(out[0],out[1],out[2],out[3],out[4],out[5],
+            model,BYTES,ROUTER,BIAS,GATE,UP,x,nonfinite,10.0f)==0,"nonfinite scale refusal");
+        require(ds4_gpu_glm53_router_shared_exact(out[0],out[1],out[2],out[3],out[4],out[5],
+            model,BYTES,ROUTER,BIAS,GATE,UP,x,1.0f,nonfinite)==0,"nonfinite clamp refusal");
+    }
     require(ds4_gpu_glm53_router_shared_exact(out[0],out[1],out[2],out[3],out[4],out[5],
         model,BYTES,ROUTER,BIAS,GATE,BYTES-1,x,1.0f,10.0f)==0,"late model range refusal");
     ds4_gpu_set_ssd_streaming(true);

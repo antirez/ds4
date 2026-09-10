@@ -10376,8 +10376,8 @@ static const char *find_next_dsml_tool_block(const char *p, const char **end_out
             const char *end = NULL;
             const char *call = glm;
             for (;;) {
-                const char *close = strstr(call + sizeof("<tool_call>") - 1,
-                                           "</tool_call>");
+                const char *close = find_tool_structural_text(
+                    call + sizeof("<tool_call>") - 1, "</tool_call>", false);
                 if (!close) { end = NULL; break; }
                 end = skip_ascii_ws(close + sizeof("</tool_call>") - 1);
                 if (strncmp(end, "<tool_call>", sizeof("<tool_call>") - 1)) break;
@@ -10422,7 +10422,7 @@ static bool kv_tool_map_measure_locked(server *s, const char *text,
                 bytes += 8u + (uint64_t)id_len + (uint64_t)dsml_len;
             }
         }
-        p = end;
+        p = b ? end : start + 1;
     }
     if (count == 0) bytes = 0;
     if (count_out) *count_out = count;
@@ -10489,7 +10489,7 @@ static bool kv_tool_map_write(server *s, FILE *fp, const char *text,
                      fwrite(b->dsml, 1, dsml_len, fp) == dsml_len;
             }
         }
-        p = end;
+        p = b ? end : start + 1;
     }
     pthread_mutex_unlock(&s->tool_mu);
 
@@ -19629,13 +19629,26 @@ static void test_kv_tool_map_filters_by_dsml_text(void) {
 
 static void test_glm_kv_tool_map_roundtrip_exact_blocks(void) {
     const char *leading[] = {"", "\n", "\n\n", "\n\n\n"};
-    for (int variant = 0; variant < 8; ++variant) {
-        const bool multiple = variant >= 4;
+    const char *prefixes[] = {
+        "",
+        "<|user|>quote <tool_call> literally<|assistant|>",
+        "<|user|>quote <tool_call><arg_value> literally<|assistant|>",
+    };
+    const char *values[] = {
+        "printf café",
+        "printf '</tool_call>' café",
+    };
+    for (int variant = 0; variant < 48; ++variant) {
+        const int leading_variant = variant % 4;
+        const bool multiple = ((variant / 4) % 2) != 0;
+        const int edge_variant = variant / 8;
         buf generated = {0};
         buf_puts(&generated, "<think>need shell</think>");
-        buf_puts(&generated, leading[variant % 4]);
+        buf_puts(&generated, leading[leading_variant]);
         buf_puts(&generated, "<tool_call>Bash\n<arg_key>command</arg_key>"
-                            "<arg_value>printf café</arg_value></tool_call>");
+                            "<arg_value>");
+        buf_puts(&generated, values[edge_variant % 2]);
+        buf_puts(&generated, "</arg_value></tool_call>");
         if (multiple) {
             buf_puts(&generated, "\n \t<tool_call>Read\n<arg_key>file_path</arg_key>"
                                 "<arg_value>/tmp/a.py</arg_value></tool_call>");
@@ -19673,6 +19686,7 @@ static void test_glm_kv_tool_map_roundtrip_exact_blocks(void) {
         /* Repetition must not serialize the same IDs twice; an unrelated block
          * in tool memory must not leak into this checkpoint's sidecar. */
         buf checkpoint = {0};
+        buf_puts(&checkpoint, prefixes[edge_variant / 2]);
         buf_puts(&checkpoint, expected);
         buf_puts(&checkpoint, "<|observation|>done");
         buf_puts(&checkpoint, expected);

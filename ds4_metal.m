@@ -38300,9 +38300,10 @@ int ds4_gpu_glm53_router_shared_exact(
         getenv("DS4_METAL_DISABLE_M3_ULTRA_GLM53_DECODE") ||
         getenv("DS4_METAL_DISABLE_GLM53_ROUTER_TOP8") ||
         getenv("DS4_METAL_DISABLE_GLM53_ROUTER_SHARED")) return 0;
-    uint32_t scale_bits, clamp_bits;
-    memcpy(&scale_bits, &scale, sizeof(scale_bits));
-    memcpy(&clamp_bits, &clamp, sizeof(clamp_bits));
+    union { float f; uint32_t u; } scale_value = {.f = scale};
+    union { float f; uint32_t u; } clamp_value = {.f = clamp};
+    volatile uint32_t scale_bits = scale_value.u;
+    volatile uint32_t clamp_bits = clamp_value.u;
     const ds4_gpu_mv_dispatch q8 = ds4_gpu_make_q8_0_mv_dispatch();
     if (q8.nr0 != 2 || q8.nsg != 4 || !model_map ||
         (scale_bits & 0x7f800000u) == 0x7f800000u ||

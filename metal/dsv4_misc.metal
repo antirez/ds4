@@ -3476,9 +3476,7 @@ kernel void kernel_glm_attention_indexed_decode_exact_weights(
  * 128-byte row slices and one weight, three stages ahead of use, and parks
  * them in double-buffered threadgroup memory, so the scattered row reads are
  * in flight while the fma chains run.  Those chains are the generic kernel's,
- * row after row in selection order; a row past cache_cap (or past the end of
- * the last stage) contributes fma(0, kv[0], acc), which leaves acc unchanged
- * bit for bit, where the generic kernel skips it. */
+ * row after row in selection order. */
 #define DS4_GLM_EXACT_LORA_STAGE 32u
 #define DS4_GLM_EXACT_LORA_AHEAD 3u
 kernel void kernel_glm_attention_indexed_decode_exact_lora(
@@ -3521,8 +3519,11 @@ kernel void kernel_glm_attention_indexed_decode_exact_lora(
         const uint s0_ = (k) * stage; \
         const uint s_ = s0_ + kv_r; \
         const uint row_ = s_ < n ? selected[s_] : 0u; \
-        const uint safe_ = row_ < args.cache_cap ? row_ : 0u; \
-        kvq[slot] = *(device const uint4 *)(cache + (uint64_t)safe_ * args.kv_lora_dim + c0 + kv_chunk * 8u); \
+        if (s_ < n && row_ < args.cache_cap) { \
+            kvq[slot] = *(device const uint4 *)(cache + (uint64_t)row_ * args.kv_lora_dim + c0 + kv_chunk * 8u); \
+        } else { \
+            kvq[slot] = uint4(0u); \
+        } \
         const uint sw_ = s0_ + w_r; \
         const uint hh_ = head0 + w_h; \
         wq[slot] = (sw_ < n && hh_ < args.n_head) \
