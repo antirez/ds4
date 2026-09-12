@@ -353,6 +353,16 @@ tests/test_mxfp4_cuda: tests/test_mxfp4_cuda.cu $(MMQ_OBJS)
 
 test-mxfp4-cuda: tests/test_mxfp4_cuda
 	./tests/test_mxfp4_cuda
+
+tests/test_cuda_visual_attention: tests/test_cuda_visual_attention.cu ds4_cuda.o ds4_image.o $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -I. -o $@ $^ $(CUDA_LDLIBS)
+
+.PHONY: test-cuda-visual-attention
+test-cuda-visual-attention: tests/test_cuda_visual_attention
+	./tests/test_cuda_visual_attention
+	./tests/test_cuda_visual_attention --fractional
+	./tests/test_cuda_visual_attention --boundaries
+	./tests/test_cuda_visual_attention --memory
 endif
 
 ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_linux_memory.h ds4_engram.h
@@ -849,6 +859,7 @@ clean:
 	rm -f tests/test_cuda_q8_scratch
 	rm -f tests/test_cuda_dspark_moe
 	rm -f tests/test_quality_api
+	rm -f tests/test_cuda_visual_attention
 	rm -f tests/test_linux_memory tests/test_rocm_memory
 	rm -f tests/test_glm_attention tests/test_glm_attention_rocm
 	rm -f tests/test_ssd_cache tests/test_engram
