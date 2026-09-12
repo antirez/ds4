@@ -2645,14 +2645,21 @@ static void test_metal_contiguous_f32_f16_roundtrip_exact(void) {
         uint32_t n;
         uint32_t src_offset;
         uint32_t dst_offset;
+        uint32_t padding;
     } copy_case;
     static const copy_case cases[] = {
-        { 1,  0,  0 },
-        { 3,  4,  2 },
-        { 4, 16,  8 },
-        { 5, 12,  6 },
-        { 17, 20, 10 },
-        { 65,  4,  2 },
+        { 1,  0,  0, 16 },
+        { 3,  4,  2, 16 },
+        { 4, 16,  8, 16 },
+        { 5, 12,  6, 16 },
+        { 17, 20, 10, 16 },
+        { 65,  4,  2, 16 },
+        { 1,  0,  0, 0 },
+        { 2,  0,  0, 0 },
+        { 3,  0,  0, 0 },
+        { 1,  4,  2, 0 },
+        { 2,  4,  2, 0 },
+        { 3,  4,  2, 0 },
     };
     const char *env_name = "DS4_METAL_DISABLE_CONTIG_F32_F16_COPY";
     char *saved_env = test_save_env(env_name);
@@ -2666,9 +2673,9 @@ static void test_metal_contiguous_f32_f16_roundtrip_exact(void) {
     for (size_t ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ci++) {
         const uint32_t n = cases[ci].n;
         const uint64_t src_bytes = cases[ci].src_offset +
-                                   (uint64_t)n * sizeof(float) + 16u;
+                                   (uint64_t)n * sizeof(float) + cases[ci].padding;
         const uint64_t half_bytes = cases[ci].dst_offset +
-                                    (uint64_t)n * sizeof(uint16_t) + 16u;
+                                    (uint64_t)n * sizeof(uint16_t) + cases[ci].padding;
         const uint32_t raw_cap = 3;
         const uint32_t raw_row = 1;
         const uint64_t raw_bytes =
@@ -6910,6 +6917,23 @@ static void test_run_entry(const ds4_test_entry *entry) {
 }
 
 int main(int argc, char **argv) {
+    if (argc == 4 && (!strcmp(argv[1], "--ds41-render") ||
+                      !strcmp(argv[1], "--ds41-render-anthropic"))) {
+        ds4_think_mode mode;
+        if (!ds4_think_mode_parse_level(argv[2], &mode)) return 2;
+        const char *json = argv[3];
+        chat_msgs msgs = {0};
+        const bool anthropic = !strcmp(argv[1], "--ds41-render-anthropic");
+        if (!(anthropic ? parse_anthropic_messages(&json, &msgs) : parse_messages(&json, &msgs))) {
+            chat_msgs_free(&msgs);
+            return 2;
+        }
+        char *text = render_chat_prompt_text_for_syntax(SERVER_MODEL_SYNTAX_DEEPSEEK41,
+                                                       &msgs, NULL, NULL, mode);
+        fputs(text, stdout);
+        free(text); chat_msgs_free(&msgs);
+        return 0;
+    }
     bool run_all = argc == 1;
     bool selected[sizeof(test_entries) / sizeof(test_entries[0])] = {0};
 

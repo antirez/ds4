@@ -1,0 +1,253 @@
+{
+  "id": "edb6b1e2-df57-4b20-b751-74d5e24129c4",
+  "object": "chat.completion",
+  "created": 1789046363,
+  "model": "deepseek-flash",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "074"
+      },
+      "logprobs": {
+        "content": [
+          {
+            "token": "074",
+            "logprob": -9.655906e-06,
+            "bytes": [
+              48,
+              55,
+              52
+            ],
+            "top_logprobs": [
+              {
+                "token": "074",
+                "logprob": -9.655906e-06,
+                "bytes": [
+                  48,
+                  55,
+                  52
+                ]
+              },
+              {
+                "token": "74",
+                "logprob": -11.558468,
+                "bytes": [
+                  55,
+                  52
+                ]
+              },
+              {
+                "token": "2",
+                "logprob": -16.721664,
+                "bytes": [
+                  50
+                ]
+              },
+              {
+                "token": "Based",
+                "logprob": -17.214651,
+                "bytes": [
+                  66,
+                  97,
+                  115,
+                  101,
+                  100
+                ]
+              },
+              {
+                "token": "The",
+                "logprob": -17.231533,
+                "bytes": [
+                  84,
+                  104,
+                  101
+                ]
+              },
+              {
+                "token": "740",
+                "logprob": -17.77529,
+                "bytes": [
+                  55,
+                  52,
+                  48
+                ]
+              },
+              {
+                "token": "073",
+                "logprob": -17.88488,
+                "bytes": [
+                  48,
+                  55,
+                  51
+                ]
+              },
+              {
+                "token": "Ware",
+                "logprob": -18.47595,
+                "bytes": [
+                  87,
+                  97,
+                  114,
+                  101
+                ]
+              },
+              {
+                "token": "<｜｜end▁of▁sentence｜｜>",
+                "logprob": -18.965462,
+                "bytes": [
+                  60,
+                  239,
+                  189,
+                  156,
+                  239,
+                  189,
+                  156,
+                  101,
+                  110,
+                  100,
+                  226,
+                  150,
+                  129,
+                  111,
+                  102,
+                  226,
+                  150,
+                  129,
+                  115,
+                  101,
+                  110,
+                  116,
+                  101,
+                  110,
+                  99,
+                  101,
+                  239,
+                  189,
+                  156,
+                  239,
+                  189,
+                  156,
+                  62
+                ]
+              },
+              {
+                "token": "000",
+                "logprob": -18.991869,
+                "bytes": [
+                  48,
+                  48,
+                  48
+                ]
+              },
+              {
+                "token": "0",
+                "logprob": -19.163572,
+                "bytes": [
+                  48
+                ]
+              },
+              {
+                "token": " ",
+                "logprob": -19.218107,
+                "bytes": [
+                  32
+                ]
+              },
+              {
+                "token": "072",
+                "logprob": -19.252354,
+                "bytes": [
+                  48,
+                  55,
+                  50
+                ]
+              },
+              {
+                "token": "076",
+                "logprob": -19.370394,
+                "bytes": [
+                  48,
+                  55,
+                  54
+                ]
+              },
+              {
+                "token": "Record",
+                "logprob": -19.686146,
+                "bytes": [
+                  82,
+                  101,
+                  99,
+                  111,
+                  114,
+                  100
+                ]
+              },
+              {
+                "token": "Let",
+                "logprob": -20.085072,
+                "bytes": [
+                  76,
+                  101,
+                  116
+                ]
+              },
+              {
+                "token": "ware",
+                "logprob": -20.114758,
+                "bytes": [
+                  119,
+                  97,
+                  114,
+                  101
+                ]
+              },
+              {
+                "token": "075",
+                "logprob": -20.167458,
+                "bytes": [
+                  48,
+                  55,
+                  53
+                ]
+              },
+              {
+                "token": "002",
+                "logprob": -20.390282,
+                "bytes": [
+                  48,
+                  48,
+                  50
+                ]
+              },
+              {
+                "token": "Sure",
+                "logprob": -20.510757,
+                "bytes": [
+                  83,
+                  117,
+                  114,
+                  101
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 511,
+    "completion_tokens": 1,
+    "total_tokens": 512,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    },
+    "prompt_cache_hit_tokens": 0,
+    "prompt_cache_miss_tokens": 511
+  },
+  "system_fingerprint": "aeb56401ca74e127821c4f9126dcb669"
+}

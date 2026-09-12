@@ -177,6 +177,12 @@ int ds4_tp_send_mixed_batch(ds4_tp *tp, uint64_t prefill_session_id,
 int ds4_tp_send_command_ack(ds4_tp *tp, uint64_t session_id, int status);
 int ds4_tp_wait_command_ack(ds4_tp *tp, uint64_t session_id,
                             const char *operation, char *err, size_t errlen);
+int ds4_tp_wait_command_status(ds4_tp *tp, uint64_t session_id, int *status,
+                               const char *operation, char *err, size_t errlen);
+/* Both ranks call at matching prefill boundaries. Cancellation is agreed
+ * here, never sampled independently while either rank is inside a GPU gate. */
+int ds4_tp_sync_checkpoint(ds4_tp *tp, uint32_t point, int current, int total,
+                            bool requested, bool *cancelled);
 int ds4_tp_send_stop(ds4_tp *tp);
 
 /* Worker: blocks for the next mirrored command.  Frame types below; for
@@ -205,6 +211,7 @@ typedef enum {
     DS4_TP_FRAME_RDMA_WARM = 19,
     DS4_TP_FRAME_RDMA_POSTED = 20,
     DS4_TP_FRAME_GLM_MTP = 21,
+    DS4_TP_FRAME_SYNC_CHECKPOINT = 22,
 } ds4_tp_frame_type;
 
 typedef struct {

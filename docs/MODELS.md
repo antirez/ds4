@@ -43,6 +43,76 @@ path, including pipeline execution for models too large for one host.
 
 To build weights rather than download them, see [GGUF tools](../gguf-tools/README.md).
 
+## DeepSeek V4.1 Flash
+
+V4.1 Flash text and vision inference work on Metal. It needs its own GGUF,
+tokenizer and inference graph; V4 Flash weights and DSpark
+support files are not interchangeable with it.
+
+| Target | File size | Main weights |
+| --- | ---: | ---: |
+| `ds41f-q2` | 341 GiB | 152 GiB |
+| `ds41f-q4` | 483 GiB | 294 GiB |
+
+Both use imatrix-calibrated routed experts and include 189 GiB of Engram
+tables. Engram rows are read directly from the file as needed in every mode,
+never loaded as a resident table. Keep the GGUF on a fast local SSD.
+
+On one 128 GB Mac, use SSD streaming. Leave the expert cache budget automatic:
+
+```sh
+./download_model.sh ds41f-q2
+./ds4 -m gguf/DeepSeek-V4.1-Flash-Q2.gguf \
+  --ssd-streaming --ctx 32768
+```
+
+Use `ds4-agent` or `ds4-server` with the same model and memory options.
+`--think-level 25` sets reasoning effort explicitly; the range is 1 to 100,
+with 0 disabling thinking. `/think 25` changes it in the CLI or native agent.
+`--think` selects 75 and `--think-max` selects 100.
+
+For two 128 GB Macs, follow the [TP/RDMA setup](DISTRIBUTED.md), passing this
+GGUF with `-m` on both ranks and omitting `--ssd-streaming`. Each rank holds
+about 81 GiB of main weights, plus context and runtime buffers. Both machines
+need the complete GGUF on disk. A 256 GB or larger Mac can instead hold all
+main weights; full residency has been tested on an M3 Ultra with 512 GB.
+
+Q4 needs SSD streaming on smaller Macs, or a 512 GB Mac for full residency.
+It does not fit resident TP across two 128 GB Macs. Download it with
+`./download_model.sh ds41f-q4` and select `gguf/DeepSeek-V4.1-Flash-Q4.gguf`.
+The download comes in two parts; the script joins and verifies them automatically.
+Allow another 37 GiB of free disk space while joining. Rerun the command to resume an
+interrupted download or join.
+
+Large SSD prefills process layers in wide batches, overlapping computation
+with the next layer's reads. Short appends keep using the expert cache.
+Resident and TP inference also batch continued prefills automatically.
+
+For concurrent serving, see [session batching](SERVER.md#multiple-sessions).
+Each slot needs its own context memory; start with `--ctx 4096` before
+increasing both context and slot count. DSpark, pipeline execution and
+non-Metal backends are not implemented for V4.1.
+
+Scalar, batched and tensor-parallel execution are not numerically identical.
+Q4 batched prefill shows a small probability-score loss on the short official
+continuation test, with unchanged overall top-token agreement. See the
+[QA results](../QA_BEFORE_RELEASES.md#17-deepseek-v41-flash-metal) for details
+and remaining differences.
+
+For images, download the matching encoder and add it to the same command:
+
+```sh
+./download_model.sh ds41f-vision
+./ds4-agent -m gguf/DeepSeek-V4.1-Flash-Q2.gguf \
+  --ssd-streaming --vision gguf/DeepSeek-V4.1-Flash-Vision.gguf
+```
+
+Vision works with SSD streaming, full residency and two-Mac TP. Pass the encoder
+on both TP ranks. Use `/read image.png` in `ds4`, `view_image` in `ds4-agent`,
+or the [server image API](SERVER.md#images). V4 Flash vision encoders do not
+work with V4.1. See [conversion](../gguf-tools/README.md#convert-deepseek-v41-flash)
+to build the GGUFs from safetensors.
+
 ## GLM 5.3 Flash
 
 | Target | Approximate file size | Use |
@@ -100,6 +170,7 @@ Directional steering is supported for GLM 5.3, not GLM 5.2.
 
 PNG and JPEG input works in the CLI, native agent, and HTTP server on Metal,
 single-GPU CUDA, and ROCm. The encoder must match the model.
+V4.1 Flash is currently Metal-only; its setup is [above](#deepseek-v41-flash).
 
 ### DeepSeek Flash Vision Experimental
 

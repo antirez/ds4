@@ -203,6 +203,60 @@ static void test_streaming_file_tools(void) {
     free(text);
 }
 
+static void test_shell_spawn(void) {
+    agent_worker w = {0};
+    pthread_mutex_init(&w.mu, NULL);
+    w.wake_fd[0] = w.wake_fd[1] = -1;
+    char err[256], cwd[PATH_MAX];
+    AGENT_TEST_ASSERT(getcwd(cwd, sizeof(cwd)) != NULL);
+    setenv("DS4_TEST_SHELL_ENV", "inherited", 1);
+    for (int closed_stdio = 0; closed_stdio <= 1; closed_stdio++) {
+        int saved[3];
+        if (closed_stdio) {
+            fflush(NULL);
+            for (int i = 0; i < 3; i++) {
+                saved[i] = fcntl(i, F_DUPFD_CLOEXEC, 3);
+                AGENT_TEST_ASSERT(saved[i] >= 0);
+                if (saved[i] < 0) exit(1);
+            }
+            for (int i = 0; i < 3; i++) close(i);
+        }
+        agent_bash_job *job = agent_bash_start(&w,
+            "read line || printf 'stdin-eof\\n'; pwd; "
+            "printf 'env=%s\\n' \"$DS4_TEST_SHELL_ENV\"; "
+            "printf 'stderr-captured\\n' >&2; sleep 0.1; exit 23",
+            5, err, sizeof(err));
+        bool group_ok = job && getpgid(job->pid) == job->pid;
+        double start = now_sec();
+        while (job && agent_bash_is_running(job) && now_sec() - start < 6)
+            usleep(10000);
+        bool finished = false;
+        char *obs = job ? agent_bash_observation(job, true, &finished) : NULL;
+        if (job) {
+            unlink(job->path);
+            agent_bash_remove_job(&w, job);
+        }
+        if (closed_stdio) {
+            for (int i = 0; i < 3; i++) {
+                if (dup2(saved[i], i) < 0) _exit(1);
+                close(saved[i]);
+            }
+        }
+        AGENT_TEST_ASSERT(group_ok && finished && obs);
+        if (obs) {
+            AGENT_TEST_ASSERT(strstr(obs, "exit_status=23"));
+            AGENT_TEST_ASSERT(strstr(obs, "stdin-eof"));
+            AGENT_TEST_ASSERT(strstr(obs, cwd));
+            AGENT_TEST_ASSERT(strstr(obs, "env=inherited"));
+            AGENT_TEST_ASSERT(strstr(obs, "stderr-captured"));
+        }
+        free(obs);
+    }
+    unsetenv("DS4_TEST_SHELL_ENV");
+    free(w.out);
+    pthread_mutex_destroy(&w.mu);
+}
+
 static void test_background_jobs(void) {
     agent_worker w = {0};
     pthread_mutex_init(&w.mu, NULL);
@@ -741,14 +795,131 @@ static void test_compaction_boundaries(void) {
     AGENT_TEST_ASSERT(agent_compact_image_boundary(NULL, 0, false, 77) == 77);
 }
 
+static int test_v41_thinking(const char *model) {
+    ds4_engine_options opt = {.model_path = model, .backend = DS4_BACKEND_METAL,
+        .ssd_streaming = true, .ssd_streaming_cache_experts = 512,
+        .context_size = 256, .power_percent = 100};
+    agent_config cfg = {.gen = {.ctx_size = 256, .think_mode = DS4_THINK_HIGH}};
+    agent_worker w = {.cfg = &cfg, .initialized = true,
+        .wake_fd = {-1, -1}, .status = {.state = AGENT_WORKER_IDLE}};
+    pthread_mutex_init(&w.mu, NULL);
+    AGENT_TEST_ASSERT(ds4_engine_open(&w.engine, &opt) == 0);
+    if (!w.engine) return 1;
+    AGENT_TEST_ASSERT(ds4_session_create(&w.session, w.engine, 256) == 0);
+    if (!w.session) { ds4_engine_close(w.engine); return 1; }
+    /* Simulate a restored session whose effort differs from the CLI default. */
+    agent_numeric_think_prefix(w.engine, DS4_THINK_MAX, &w.transcript);
+    ds4_tokens suffix = {0};
+    ds4_tokenize_text(w.engine, "System text.\n\n", &suffix);
+    ds4_chat_append_message(w.engine, &suffix, "user", "Hello");
+    ds4_chat_append_message(w.engine, &suffix, "assistant", "Hello again.");
+    const int first_image_offset = w.transcript.len;
+    for (int i = 0; i < suffix.len; i++) ds4_tokens_push(&w.transcript, suffix.v[i]);
+    w.images = calloc(1, sizeof(*w.images));
+    w.image_count = 1;
+    w.images[0].token_start = (uint32_t)first_image_offset;
+    const int levels[] = {25, 0, 100, 1, 75, 75, 0};
+    for (size_t i = 0; i < sizeof(levels) / sizeof(*levels); i++) {
+        char err[160] = {0};
+        AGENT_TEST_ASSERT(ds4_session_sync(w.session, &w.transcript, err, sizeof(err)) == 0);
+        const int before = w.transcript.len;
+        w.requested_think = (ds4_think_mode)(DS4_THINK_LEVEL_BASE + levels[i]);
+        const bool changed = effective_think_mode(&cfg) != w.requested_think;
+        w.think_requested = true;
+        AGENT_TEST_ASSERT(!worker_is_idle(&w));
+        AGENT_TEST_ASSERT(!worker_submit(&w, "must wait"));
+        worker_apply_requested_think(&w);
+        AGENT_TEST_ASSERT(worker_is_idle(&w));
+        AGENT_TEST_ASSERT(ds4_session_pos(w.session) == (changed ? 0 : before));
+        ds4_tokens expected = {0};
+        agent_numeric_think_prefix(w.engine, w.requested_think, &expected);
+        AGENT_TEST_ASSERT(w.images[0].token_start == (uint32_t)expected.len);
+        for (int j = 0; j < suffix.len; j++) ds4_tokens_push(&expected, suffix.v[j]);
+        AGENT_TEST_ASSERT(w.transcript.len == expected.len &&
+                           ds4_tokens_starts_with(&w.transcript, &expected));
+        ds4_tokens_free(&expected);
+    }
+    cfg.gen.raw_prompt = true;
+    w.requested_think = DS4_THINK_MAX;
+    worker_apply_requested_think(&w);
+    AGENT_TEST_ASSERT(ds4_think_mode_level(cfg.gen.think_mode) == 0);
+    AGENT_TEST_ASSERT(strstr(w.out, "requires a V4.1 chat session"));
+    cfg.gen.raw_prompt = false;
+    while (w.transcript.len < 250) ds4_tokens_push(&w.transcript, ds4_token_eos(w.engine));
+    worker_apply_requested_think(&w);
+    AGENT_TEST_ASSERT(ds4_think_mode_level(cfg.gen.think_mode) == 0 && w.transcript.len == 250);
+    AGENT_TEST_ASSERT(strstr(w.out, "no context room"));
+    free(w.out); free(w.images);
+    ds4_tokens_free(&suffix); ds4_tokens_free(&w.transcript);
+    ds4_session_free(w.session); ds4_engine_close(w.engine);
+    pthread_mutex_destroy(&w.mu);
+    puts("V4.1 agent thinking levels, restored prefix, cache invalidation: done");
+    return agent_test_failures ? 1 : 0;
+}
+
+static void test_v41_tool_syntax(void) {
+    const char text[] =
+        "<think>Plan.</think>\n\n<｜DSML｜ calls>\n"
+        "<｜DSML｜ invoke name=\"write\">\n"
+        "<｜DSML｜ parameter name=\"path\" string=\"true\">a.txt</｜DSML｜ parameter>\n"
+        "<｜DSML｜ parameter name=\"content\" string=\"true\">x </think> "
+        "&lt;/｜DSML｜ parameter> &amp;lt;/｜DSML｜ parameter></｜DSML｜ parameter>\n"
+        "</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"list\">\n"
+        "<｜DSML｜ parameter name=\"path\" string=\"true\">.</｜DSML｜ parameter>\n"
+        "</｜DSML｜ invoke>\n</｜DSML｜ calls>";
+    const char expected[] = "x </think> </｜DSML｜ parameter> &lt;/｜DSML｜ parameter>";
+    for (size_t split = 0; split < sizeof(text); split++) {
+        char *first = xstrndup(text, split);
+        const char *chunks[] = {first, text + split};
+        agent_dsml_parser p;
+        char *out = agent_test_stream_capture(AGENT_TOOL_SYNTAX_DSML41, chunks, 2, &p, NULL);
+        AGENT_TEST_ASSERT(p.state == AGENT_DSML_DONE && p.calls.len == 2);
+        if (p.state != AGENT_DSML_DONE || p.calls.len != 2) {
+            fprintf(stderr, "V4.1 split=%zu state=%d calls=%d error=%s raw=%s\n",
+                    split, p.state, p.calls.len, p.error, p.raw ? p.raw : "(none)");
+            free(first); free(out); agent_dsml_parser_free(&p);
+            break;
+        }
+        if (p.calls.len == 2) {
+            AGENT_TEST_ASSERT(!strcmp(p.calls.v[0].name, "write"));
+            AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&p.calls.v[0], "path"), "a.txt"));
+            AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&p.calls.v[0], "content"), expected));
+            AGENT_TEST_ASSERT(!strcmp(p.calls.v[1].name, "list"));
+        }
+        AGENT_TEST_ASSERT(!strstr(out, "<｜DSML｜ calls>"));
+        AGENT_TEST_ASSERT(p.raw && strstr(p.raw, "<｜DSML｜ calls>") == p.raw);
+        free(first); free(out); agent_dsml_parser_free(&p);
+    }
+    const char *inside[] = {"<think><｜DSML｜ calls><｜DSML｜ invoke name=\"list\">"
+        "</｜DSML｜ invoke></｜DSML｜ calls></think>Done"};
+    agent_dsml_parser p;
+    bool early = false;
+    char *out = agent_test_stream_capture(AGENT_TOOL_SYNTAX_DSML41, inside, 1, &p, &early);
+    AGENT_TEST_ASSERT(early && p.calls.len == 0 && strstr(out, "tool call ignored"));
+    free(out); agent_dsml_parser_free(&p);
+    for (int upto = 0; upto < 2; upto++) {
+        char *old = agent_build_dsml_tools_prompt(upto, false);
+        char *prompt = agent_dsml41_tools_prompt(old);
+        AGENT_TEST_ASSERT(strstr(prompt, "<｜DSML｜ calls>"));
+        AGENT_TEST_ASSERT(strstr(prompt, "&amp;lt;/｜DSML｜ parameter>"));
+        AGENT_TEST_ASSERT(!strstr(prompt, "｜DSML｜tool_calls") &&
+                           !strstr(prompt, "｜DSML｜invoke") &&
+                           !strstr(prompt, "｜DSML｜parameter"));
+        free(old); free(prompt);
+    }
+}
+
 int main(int argc, char **argv) {
+    if (argc == 3 && !strcmp(argv[1], "--think-fixture")) return test_v41_thinking(argv[2]);
     if (argc == 2 && !strcmp(argv[1], "--terminal-driver")) return test_terminal_driver();
     if (argc == 3 && !strcmp(argv[1], "--terminal-fixtures")) test_output_dir = argv[2];
     ds4_agent_unit_tests_run();
+    test_v41_tool_syntax();
     test_compaction_boundaries();
     test_observation_error_is_not_context_exhaustion();
     test_atomic_file_tools();
     test_streaming_file_tools();
+    test_shell_spawn();
     test_background_jobs();
     test_fragmented_terminal_input();
     test_shell_terminal_controls();

@@ -12,6 +12,7 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--url", default="http://127.0.0.1:8080")
 parser.add_argument("--pi", type=Path, required=True)
 parser.add_argument("--output", type=Path, required=True)
+parser.add_argument("--model", default="deepseek-v4-flash")
 parser.add_argument("--api", action="append", choices=[
     "openai-completions", "openai-responses", "anthropic-messages"])
 args = parser.parse_args()
@@ -27,7 +28,7 @@ for api in args.api or ["openai-completions", "openai-responses", "anthropic-mes
     (settings / "settings.json").write_text(json.dumps({"compaction": {"enabled": False}}))
     provider = {"baseUrl": base + ("" if api == "anthropic-messages" else "/v1"),
                 "api": api, "apiKey": "local-test",
-                "models": [{"id": "deepseek-v4-flash", "name": "Vision QA", "reasoning": True,
+                "models": [{"id": args.model, "name": "Vision QA", "reasoning": True,
                             "input": ["text", "image"], "contextWindow": 16384, "maxTokens": 1536,
                             "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}}]}
     if api == "openai-completions":
@@ -39,7 +40,7 @@ for api in args.api or ["openai-completions", "openai-responses", "anthropic-mes
     (project / "CONTEXT.txt").write_text("\n".join(
         "Archive record %d: the build passed with no warnings." % i for i in range(200)))
     cmd = [str(args.pi.resolve()),
-           "--print", "--mode", "json", "--provider", "ds4", "--model", "deepseek-v4-flash",
+           "--print", "--mode", "json", "--provider", "ds4", "--model", args.model,
            "--thinking", "off", "--no-session", "--no-extensions", "--no-skills",
            "--no-context-files", "--no-prompt-templates",
            "Read CONTEXT.txt for background, then read ticket.py. Use the read tool to inspect "

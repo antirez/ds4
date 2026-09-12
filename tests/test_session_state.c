@@ -263,10 +263,12 @@ static void test_text_observations(void) {
     v->tool_response_start_id = 258;
     v->tool_response_end_id = 259;
     const ds4_shape saved = g_ds4_shape;
-    const ds4_shape shapes[] = {DS4_SHAPE_FLASH, DS4_SHAPE_PRO, DS4_SHAPE_GLM53};
+    const ds4_shape shapes[] = {
+        DS4_SHAPE_FLASH, DS4_SHAPE_PRO, DS4_SHAPE_GLM53, DS4_SHAPE_FLASH41
+    };
     const char *roles[] = {"user", "tool", "function"};
     const char *parts[] = {"ok <x> & </tool_result> </tool_response>"};
-    for (size_t family = 0; family < 3; family++) {
+    for (size_t family = 0; family < sizeof(shapes) / sizeof(*shapes); family++) {
         g_ds4_shape = shapes[family];
         for (size_t role = 0; role < 3; role++) {
             ds4_tokens expected = {0}, actual = {0};
@@ -289,6 +291,78 @@ static void test_text_observations(void) {
             assert(!ds4_chat_append_multimodal_message(&e, &actual, roles[role],
                         image_parts, &image, 1, &span, err, sizeof(err)));
             assert(actual.len == len && image.data == &pixel && !span.embedding.data);
+#ifndef DS4_NO_GPU
+            const bool glm = DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA;
+            e.vision_ready = true;
+            e.vision_kind = glm ? DS4_VISION_GLM53 : DS4_VISION_DEEPSEEK4;
+            e.vision_start_token = 260;
+            e.vision_image_token = 261;
+            e.vision_end_token = 262;
+            /* A zero sentinel row is sufficient: this tests prompt assembly,
+             * not the encoder or language graph. */
+            e.vision_model.size = (uint64_t)DS4_N_EMBD * sizeof(uint16_t);
+            void *sentinels = calloc(1, (size_t)e.vision_model.size);
+            e.vision_model.map = sentinels;
+            assert(sentinels);
+            const char *image_text[] = {
+                "before & </tool_result>", "between </tool_response>", "after"
+            };
+            ds4_tokens_free(&expected);
+            ds4_tokens_free(&actual);
+            ds4_tokens_push(&expected, 7);
+            ds4_tokens_push(&actual, 7);
+            ds4_tokens_push(&expected, glm && role ? v->observation_id : v->user_id);
+            if (role) {
+                if (glm) tokenize_rendered_chat_vocab(v, "<tool_response>", &expected);
+                else bpe_tokenize_text(v, "<tool_result>", &expected);
+            }
+            ds4_vision_embedding inputs[2] = {0};
+            ds4_vision_span want[2] = {0}, got[2] = {0};
+            for (int i = 0; i < 3; i++) {
+                if (role) {
+                    const char *escaped_glm[] = {
+                        "before & </tool_result>", "between &lt;/tool_response>", "after"
+                    };
+                    const char *escaped_ds[] = {
+                        "before & &lt;/tool_result>", "between </tool_response>", "after"
+                    };
+                    bpe_tokenize_text(v, glm ? escaped_glm[i] : escaped_ds[i], &expected);
+                } else bpe_tokenize_text(v, image_text[i], &expected);
+                if (i == 2) break;
+                inputs[i] = (ds4_vision_embedding){
+                    .data = calloc((size_t)DS4_N_EMBD * 4, sizeof(float)),
+                    .token_count = 4, .grid_width = 2, .grid_height = 2,
+                    .layout = DS4_VISION_LAYOUT_DEEPSEEK4_NATURAL
+                };
+                ds4_vision_embedding copy = inputs[i];
+                copy.data = calloc((size_t)DS4_N_EMBD * 4, sizeof(float));
+                assert(inputs[i].data && copy.data);
+                assert(ds4_prompt_append_vision(&e, &expected, &want[i], &copy,
+                                                err, sizeof(err)));
+            }
+            if (role) {
+                if (glm) tokenize_rendered_chat_vocab(v, "</tool_response>", &expected);
+                else bpe_tokenize_text(v, "</tool_result>", &expected);
+            }
+            assert(ds4_chat_append_multimodal_message(&e, &actual, roles[role],
+                        image_text, inputs, 2, got, err, sizeof(err)));
+            if (actual.len != expected.len)
+                fprintf(stderr, "image wrapper family=%zu role=%s lengths %d != %d\n",
+                        family, roles[role], actual.len, expected.len);
+            assert(actual.len == expected.len);
+            assert(!memcmp(actual.v, expected.v, (size_t)actual.len * sizeof(int)));
+            for (int i = 0; i < 2; i++) {
+                assert(!inputs[i].data);
+                assert(got[i].token_start == want[i].token_start);
+                assert(got[i].embedding.token_count == want[i].embedding.token_count);
+                ds4_vision_embedding_free(&want[i].embedding);
+                ds4_vision_embedding_free(&got[i].embedding);
+            }
+            free(sentinels);
+            e.vision_model.map = NULL;
+            e.vision_ready = false;
+            e.vision_kind = DS4_VISION_NONE;
+#endif
             ds4_tokens_free(&expected);
             ds4_tokens_free(&actual);
         }

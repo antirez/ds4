@@ -1,0 +1,3 @@
+# Formato sicuro per salvare l'header di un checkpoint di modello
+
+Quando si salva un checkpoint di un modello (PyTorch, Tensor

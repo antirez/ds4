@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -134,11 +135,12 @@ def request_one(
     provider_order: list[str],
     provider_allow_fallbacks: bool,
     provider_require_parameters: bool,
+    temperature: float = 0,
 ) -> dict:
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0,
+        "temperature": temperature,
         "stream": False,
     }
     if top_logprobs > 0:
@@ -181,6 +183,7 @@ def fetch_with_retry(
     provider_order: list[str],
     provider_allow_fallbacks: bool,
     provider_require_parameters: bool,
+    temperature: float = 0,
 ) -> dict:
     delay = 1.0
     for attempt in range(6):
@@ -198,6 +201,7 @@ def fetch_with_retry(
                 provider_order,
                 provider_allow_fallbacks,
                 provider_require_parameters,
+                temperature,
             )
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", "replace")
@@ -223,6 +227,9 @@ def main() -> int:
     ap.add_argument("--count", type=int, default=100)
     ap.add_argument("--max-tokens", type=int, default=24)
     ap.add_argument("--top-logprobs", type=int, default=5)
+    ap.add_argument("--temperature", type=float, default=0,
+                    help="sampling temperature, 0..2; use 1 for unscaled logprobs "
+                         "from providers reporting probabilities after sampling transforms")
     ap.add_argument("--thinking", choices=("disabled", "enabled", "omit"), default="disabled")
     ap.add_argument("--reasoning-effort",
                     choices=("xhigh", "high", "medium", "low", "minimal", "none", "omit"),
@@ -244,6 +251,8 @@ def main() -> int:
     args = ap.parse_args()
     if args.top_logprobs < 0 or args.top_logprobs > 20:
         raise SystemExit("--top-logprobs must be between 0 and 20")
+    if not math.isfinite(args.temperature) or not 0 <= args.temperature <= 2:
+        raise SystemExit("--temperature must be between 0 and 2")
 
     openrouter = "openrouter.ai" in args.endpoint
     api_key_env = args.api_key_env or ("OPENROUTER_API_KEY" if openrouter else "DEEPSEEK_API_KEY")
@@ -312,6 +321,7 @@ def main() -> int:
                     provider_order,
                     args.allow_provider_fallbacks,
                     provider_require_parameters,
+                    args.temperature,
                 )
                 choice = response["choices"][0]
                 content = choice.get("message", {}).get("content")
@@ -362,7 +372,7 @@ def main() -> int:
         "endpoint": args.endpoint,
         "observed_models": sorted(observed_models),
         "observed_providers": sorted(observed_providers),
-        "temperature": 0,
+        "temperature": args.temperature,
         "max_tokens": args.max_tokens,
         "top_logprobs": args.top_logprobs,
         "thinking": thinking,

@@ -1,0 +1,6 @@
+# Integer Clamp Function
+
+```c
+int clamp(int value, int min, int max) {
+    if (value < min) return min;
+   

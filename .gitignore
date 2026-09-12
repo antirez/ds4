@@ -26,8 +26,10 @@
 /tests/test_layer_pack
 /tests/test_metal_session_batch
 /tests/test_metal_tp_spec
+/tests/test_metal_tp_cancel
 /tests/test_metal_moe_prefill
 /tests/test_metal_ssd_experts
+/tests/test_metal_command_memory
 /tests/test_metal_dense_mpp
 /tests/test_mxfp4_cuda
 /tests/test_mxfp4_dot
@@ -40,6 +42,8 @@
 /tests/test_session_state
 /tests/test_session_state_gpu
 /tests/test_tp_commands
+/tests/test_tp_rdma
+/tests/test_metal_tp_bulk
 /tests/test_glm53_kda
 /tests/test_glm53_vision_engine
 /tests/test_glm_attention
@@ -47,6 +51,12 @@
 /tests/test_linux_memory
 /tests/test_rocm_memory
 /tests/test_deepseek4_vision_image
+/tests/test_deepseek41_metal
+/tests/test_deepseek41_gguf
+/tests/test_deepseek41_graph
+/tests/test_deepseek41_prefill
+/tests/test_deepseek41_cli
+/tests/test_engram
 *.o
 *.dSYM/
 __pycache__/

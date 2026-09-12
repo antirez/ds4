@@ -1,0 +1,3 @@
+# Perché gli array ordinati rendono più veloce la ricerca di appartenenza
+
+La differenza chiave sta **nell'algoritmo che pu
