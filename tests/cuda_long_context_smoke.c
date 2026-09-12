@@ -19,6 +19,101 @@ static double getenv_seconds(const char *name, double fallback) {
     return end != s && v > 0.0 ? v : fallback;
 }
 
+static int check_streaming_expert_cache(void) {
+    enum {
+        N_EXPERT = 4,
+        GATE_EXPERT_BYTES = 64,
+        DOWN_EXPERT_BYTES = 32,
+        EXPERT_BYTES = 2 * GATE_EXPERT_BYTES + DOWN_EXPERT_BYTES,
+        MODEL_BYTES = N_EXPERT * EXPERT_BYTES,
+        GATE_EXPERT_BYTES2 = 96,
+        DOWN_EXPERT_BYTES2 = 64,
+        EXPERT_BYTES2 = 2 * GATE_EXPERT_BYTES2 + DOWN_EXPERT_BYTES2,
+        MODEL_BYTES2 = N_EXPERT * EXPERT_BYTES2
+    };
+    unsigned char model[MODEL_BYTES];
+    unsigned char model2[MODEL_BYTES2];
+    for (size_t i = 0; i < sizeof(model); i++) model[i] = (unsigned char)i;
+    for (size_t i = 0; i < sizeof(model2); i++) model2[i] = (unsigned char)(i + 1);
+
+    const ds4_gpu_stream_expert_table table = {
+        .model_map = model,
+        .model_size = sizeof(model),
+        .layer = 0,
+        .n_total_expert = N_EXPERT,
+        .gate_offset = 0,
+        .up_offset = N_EXPERT * GATE_EXPERT_BYTES,
+        .down_offset = 2 * N_EXPERT * GATE_EXPERT_BYTES,
+        .gate_expert_bytes = GATE_EXPERT_BYTES,
+        .down_expert_bytes = DOWN_EXPERT_BYTES,
+    };
+    const ds4_gpu_stream_expert_table table2 = {
+        .model_map = model2,
+        .model_size = sizeof(model2),
+        .layer = 1,
+        .n_total_expert = N_EXPERT,
+        .gate_offset = 0,
+        .up_offset = N_EXPERT * GATE_EXPERT_BYTES2,
+        .down_offset = 2 * N_EXPERT * GATE_EXPERT_BYTES2,
+        .gate_expert_bytes = GATE_EXPERT_BYTES2,
+        .down_expert_bytes = DOWN_EXPERT_BYTES2,
+    };
+    const int32_t first[] = {0, 1};
+    const int32_t hit[] = {0};
+    const int32_t miss[] = {2};
+    const int32_t selected[] = {0, 1, 0, 1};
+    ds4_gpu_stream_expert_table invalid = table;
+    invalid.down_offset = sizeof(model);
+    int rc = 1;
+
+    ds4_gpu_set_ssd_streaming(true);
+    ds4_gpu_set_streaming_expert_cache_budget(2);
+    ds4_gpu_set_streaming_expert_cache_expert_bytes(EXPERT_BYTES);
+    if (ds4_gpu_stream_expert_cache_configured_count() != 2 ||
+        ds4_gpu_stream_expert_cache_budget_for_expert_size(
+                GATE_EXPERT_BYTES, DOWN_EXPERT_BYTES) != 2 ||
+        !ds4_gpu_stream_expert_cache_seed_selected(&table, first, 2) ||
+        ds4_gpu_stream_expert_cache_current_count() != 2 ||
+        !ds4_gpu_stream_expert_cache_seed_selected(&table, hit, 1) ||
+        ds4_gpu_stream_expert_cache_current_count() != 2 ||
+        !ds4_gpu_stream_expert_cache_prepare_selected_batch(
+                &table, selected, 2, 2) ||
+        !ds4_gpu_stream_expert_cache_seed_selected(&table, miss, 1) ||
+        ds4_gpu_stream_expert_cache_current_count() != 2 ||
+        ds4_gpu_stream_expert_cache_seed_selected(&invalid, hit, 1)) {
+        fprintf(stderr, "CUDA streaming expert cache regression failed\n");
+        goto cleanup;
+    }
+
+    ds4_gpu_set_streaming_expert_cache_expert_bytes2(EXPERT_BYTES2);
+    ds4_gpu_set_streaming_expert_cache_budget2(2);
+    if (ds4_gpu_stream_expert_cache_configured_count() != 4 ||
+        ds4_gpu_stream_expert_cache_budget_for_expert_size(
+                GATE_EXPERT_BYTES2, DOWN_EXPERT_BYTES2) != 2 ||
+        !ds4_gpu_stream_expert_cache_seed_selected(&table2, first, 2) ||
+        ds4_gpu_stream_expert_cache_current_count() != 4) {
+        fprintf(stderr, "CUDA streaming secondary expert cache regression failed\n");
+        goto cleanup;
+    }
+
+    ds4_gpu_stream_expert_cache_release_resident();
+    if (ds4_gpu_stream_expert_cache_current_count() != 0 ||
+        ds4_gpu_stream_expert_cache_configured_count() != 4) {
+        fprintf(stderr, "CUDA streaming expert cache release regression failed\n");
+        goto cleanup;
+    }
+    rc = 0;
+
+cleanup:
+    ds4_gpu_stream_expert_cache_release_resident();
+    ds4_gpu_set_streaming_expert_cache_budget(0);
+    ds4_gpu_set_streaming_expert_cache_expert_bytes(0);
+    ds4_gpu_set_streaming_expert_cache_budget2(0);
+    ds4_gpu_set_streaming_expert_cache_expert_bytes2(0);
+    ds4_gpu_set_ssd_streaming(false);
+    return rc;
+}
+
 static int check_large_topk(void) {
     const uint32_t n_comp = 32768;
     const uint32_t n_tokens = 32;
@@ -158,7 +253,8 @@ static int check_decode_attention_overflow_path(void) {
 
 int main(void) {
     if (!ds4_gpu_init()) return 1;
-    int rc = check_large_topk();
+    int rc = check_streaming_expert_cache();
+    if (check_large_topk() != 0) rc = 1;
     if (check_decode_attention_overflow_path() != 0) rc = 1;
     ds4_gpu_cleanup();
     if (rc == 0) puts("cuda long-context regression: OK");

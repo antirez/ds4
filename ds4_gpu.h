@@ -274,6 +274,10 @@ int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
+/* A model fd must back the associated read-only, whole-file mapping at offset
+ * zero. Keep the file immutable and the fd valid while the backend uses it;
+ * CUDA may discard mapped pages and reload their original bytes from the file.
+ * Do not associate anonymous buffers or privately modified mappings with an fd. */
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map);
 int ds4_gpu_build_derived_artifacts(const void *model_map, uint64_t model_size,
@@ -358,6 +362,10 @@ static inline int ds4_gpu_device_is_m5_apple_silicon(void) { return 0; }
 #endif
 void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts);
 void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes);
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+void ds4_gpu_set_streaming_expert_cache_budget2(uint32_t experts);
+void ds4_gpu_set_streaming_expert_cache_expert_bytes2(uint64_t bytes);
+#endif
 uint64_t ds4_gpu_recommended_working_set_size(void);
 uint32_t ds4_gpu_stream_expert_cache_configured_count(void);
 uint32_t ds4_gpu_stream_expert_cache_current_count(void);
