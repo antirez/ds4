@@ -59,4 +59,21 @@ static inline hipError_t ds4_rocm_mem_get_info(size_t *free_b, size_t *total_b) 
     return hipSuccess;
 }
 
+
+static inline hipError_t ds4_rocm_weights_alloc(void **ptr, size_t bytes) {
+    /* Integrated APUs (Strix Halo) expose a small device pool (BIOS UMA
+     * frame buffer, ~62 GiB). Model weights are better placed in host RAM,
+     * which is GPU-visible on UMA systems, mirroring llama.cpp GGML_HIP_UMA.
+     * DS4_ROCM_FORCE_DEVICE_MEM restores the old behavior. */
+    if (!getenv("DS4_ROCM_FORCE_DEVICE_MEM") && ds4_rocm_uses_host_ram()) {
+        if (ds4_rocm_allocation_fits(bytes, true)) {
+            hipError_t err = hipHostMalloc(ptr, bytes);
+            if (err == hipSuccess) return err;
+            err = hipMallocManaged(ptr, bytes);
+            if (err == hipSuccess) return err;
+        }
+    }
+    return hipMalloc(ptr, bytes);
+}
+
 #endif
