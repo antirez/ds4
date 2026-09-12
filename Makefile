@@ -833,12 +833,20 @@ test-quality-api: tests/test_quality_api.c gguf-tools/quality-testing/score_offi
 	./tests/test_quality_api
 	python3 tests/test_collect_official.py
 
+.PHONY: test-raw-completions
+tests/test_raw_completions: tests/test_raw_completions.c ds4_server.c ds4.h ds4_kvstore.h ds4_tool_text.h $(CPU_CORE_OBJS) ds4_help.o ds4_kvstore.o rax.o
+	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_NO_GPU -I. -ffunction-sections -fdata-sections -o $@ $< $(CPU_CORE_OBJS) ds4_help.o ds4_kvstore.o rax.o -Wl,$(if $(filter Darwin,$(UNAME_S)),-dead_strip,--gc-sections) $(LDLIBS)
+
+test-raw-completions: tests/test_raw_completions
+	./tests/test_raw_completions
+
 ds4.o ds4_cpu.o ds4_agent.o ds4_agent_cpu.o ds4_server.o ds4_server_cpu.o \
 ds4_test.o ds4_agent_test.o \
 ds4_cpu_test_hooks.o ds4_cuda_test_hooks.o tests/test_session_state.o \
 tests/test_session_state_gpu.o: ds4_tool_text.h
 
 clean:
+	rm -f tests/test_raw_completions
 	rm -f tests/test_metal_ssd_experts
 	rm -f tests/test_metal_command_memory
 	rm -f tests/test_deepseek41_metal

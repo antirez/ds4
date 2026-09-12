@@ -5236,45 +5236,147 @@ bad:
     return false;
 }
 
-static bool parse_prompt(const char **p, char **out) {
+typedef enum {
+    COMPLETION_PROMPT_NONE = 0,
+    COMPLETION_PROMPT_TEXT,
+    COMPLETION_PROMPT_TOKENS,
+} completion_prompt_kind;
+
+typedef struct {
+    completion_prompt_kind kind;
+    char *text;
+    ds4_tokens tokens;
+} completion_prompt;
+
+static void completion_prompt_free(completion_prompt *prompt) {
+    if (!prompt) return;
+    free(prompt->text);
+    ds4_tokens_free(&prompt->tokens);
+    memset(prompt, 0, sizeof(*prompt));
+}
+
+static bool parse_completion_token_id(const char **p, int *out) {
     json_ws(p);
-    if (**p == '"') return json_string(p, out);
-    if (**p != '[') {
-        if (!json_skip_value(p)) return false;
-        *out = xstrdup("");
-        return true;
+    const char *start = *p;
+    if (*start < '0' || *start > '9') return false;
+    uint64_t value = 0;
+    if (*start == '0' && start[1] >= '0' && start[1] <= '9') return false;
+    while (**p >= '0' && **p <= '9') {
+        const uint32_t digit = (uint32_t)(**p - '0');
+        if (value > ((uint64_t)INT_MAX - digit) / 10u) return false;
+        value = value * 10u + digit;
+        (*p)++;
     }
-    (*p)++;
-    json_ws(p);
-    if (**p == '"') {
-        if (!json_string(p, out)) return false;
-    } else {
-        *out = xstrdup("");
-        if (**p && **p != ']' && !json_skip_value(p)) return false;
-    }
-    while (**p && **p != ']') {
-        json_ws(p);
-        if (**p == ',') {
-            (*p)++;
-            if (!json_skip_value(p)) return false;
-        } else {
-            break;
-        }
-    }
-    if (**p != ']') return false;
-    (*p)++;
+    *out = (int)value;
     return true;
 }
 
-static bool parse_completion_request(ds4_engine *e, const char *body, int def_tokens,
-                                     int ctx_size, request *r, char *err, size_t errlen) {
+static bool parse_completion_prompt(const char **p, completion_prompt *out,
+                                    char *err, size_t errlen) {
+    completion_prompt parsed = {0};
+    json_ws(p);
+    if (**p == '"') {
+        if (!json_string(p, &parsed.text)) {
+            snprintf(err, errlen, "prompt must be a valid JSON string or a flat array of integer token IDs");
+            return false;
+        }
+        parsed.kind = COMPLETION_PROMPT_TEXT;
+        *out = parsed;
+        return true;
+    }
+    if (**p != '[') {
+        snprintf(err, errlen, "prompt must be a string or a flat array of integer token IDs");
+        return false;
+    }
+    (*p)++;
+    json_ws(p);
+    if (**p == ']') {
+        (*p)++;
+        parsed.kind = COMPLETION_PROMPT_TOKENS;
+        *out = parsed;
+        return true;
+    }
+    while (**p) {
+        int token = 0;
+        if (!parse_completion_token_id(p, &token)) {
+            snprintf(err, errlen, "prompt token array must contain only non-negative integer token IDs");
+            completion_prompt_free(&parsed);
+            return false;
+        }
+        ds4_tokens_push(&parsed.tokens, token);
+        json_ws(p);
+        if (**p == ']') {
+            (*p)++;
+            parsed.kind = COMPLETION_PROMPT_TOKENS;
+            *out = parsed;
+            return true;
+        }
+        if (**p != ',') {
+            snprintf(err, errlen, "prompt token array must be a flat array of integer token IDs");
+            completion_prompt_free(&parsed);
+            return false;
+        }
+        (*p)++;
+        json_ws(p);
+        if (**p == ']') {
+            snprintf(err, errlen, "prompt token array must not contain a trailing comma");
+            completion_prompt_free(&parsed);
+            return false;
+        }
+    }
+    snprintf(err, errlen, "unterminated prompt token array");
+    completion_prompt_free(&parsed);
+    return false;
+}
+
+static bool completion_prompt_build(ds4_engine *e, int vocab_size,
+                                    completion_prompt *prompt, request *r,
+                                    char *err, size_t errlen) {
+    if (prompt->kind == COMPLETION_PROMPT_TEXT) {
+        if (!e) {
+            snprintf(err, errlen, "completion text tokenization requires a loaded model");
+            return false;
+        }
+        r->prompt_text = prompt->text;
+        prompt->text = NULL;
+        ds4_chat_begin(e, &r->prompt);
+        ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+        return true;
+    }
+    if (prompt->kind != COMPLETION_PROMPT_TOKENS) {
+        snprintf(err, errlen, "missing prompt");
+        return false;
+    }
+    if (prompt->tokens.len == 0) {
+        snprintf(err, errlen, "prompt token array must not be empty");
+        return false;
+    }
+    if (vocab_size <= 0) {
+        snprintf(err, errlen, "completion token validation requires a loaded model");
+        return false;
+    }
+    for (int i = 0; i < prompt->tokens.len; i++) {
+        if (prompt->tokens.v[i] < 0 || prompt->tokens.v[i] >= vocab_size) {
+            snprintf(err, errlen, "prompt token ID %d is outside the model vocabulary [0, %d)",
+                     prompt->tokens.v[i], vocab_size);
+            return false;
+        }
+    }
+    r->prompt = prompt->tokens;
+    memset(&prompt->tokens, 0, sizeof(prompt->tokens));
+    return true;
+}
+
+static bool parse_completion_request_with_vocab(ds4_engine *e, int vocab_size,
+                                                const char *body, int def_tokens,
+                                                int ctx_size, request *r,
+                                                char *err, size_t errlen) {
     request_init(r, REQ_COMPLETION, def_tokens);
     r->model_syntax = server_model_syntax_for_engine(e);
     const char *p = body;
-    char *prompt = NULL;
-    bool got_thinking = false;
-    bool thinking_enabled = true;
-    ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
+    completion_prompt prompt = {0};
+    bool got_prompt = false;
+    (void)ctx_size;
 
     json_ws(&p);
     if (*p != '{') goto bad;
@@ -5290,14 +5392,16 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
         }
         p++;
         if (!strcmp(key, "prompt")) {
-            char *tmp = NULL;
-            if (!parse_prompt(&p, &tmp)) {
-                free(tmp);
+            completion_prompt tmp = {0};
+            if (!parse_completion_prompt(&p, &tmp, err, errlen)) {
                 free(key);
-                goto bad;
+                completion_prompt_free(&prompt);
+                request_free(r);
+                return false;
             }
-            free(prompt);
+            completion_prompt_free(&prompt);
             prompt = tmp;
+            got_prompt = true;
         } else if (!strcmp(key, "model")) {
             if (!json_string_replace(&p, &r->model)) {
                 free(key);
@@ -5357,22 +5461,23 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
                 goto bad;
             }
         } else if (!strcmp(key, "thinking")) {
-            if (!parse_thinking_control_value(&p, &thinking_enabled)) {
+            bool ignored = false;
+            if (!parse_thinking_control_value(&p, &ignored)) {
                 free(key);
                 goto bad;
             }
-            got_thinking = true;
         } else if (!strcmp(key, "reasoning_effort")) {
-            if (!parse_reasoning_effort_value(&p, &reasoning_effort)) {
+            ds4_think_mode ignored = DS4_THINK_NONE;
+            if (!parse_reasoning_effort_value(&p, &ignored)) {
                 free(key);
                 goto bad;
             }
         } else if (!strcmp(key, "think")) {
-            if (!json_bool(&p, &thinking_enabled)) {
+            bool ignored = false;
+            if (!json_bool(&p, &ignored)) {
                 free(key);
                 goto bad;
             }
-            got_thinking = true;
         } else if (!strcmp(key, "stop")) {
             if (!parse_stop(&p, &r->stops)) {
                 free(key);
@@ -5388,36 +5493,39 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
         json_ws(&p);
     }
     if (*p != '}') goto bad;
-    if (!prompt) {
+    if (!got_prompt) {
         snprintf(err, errlen, "missing prompt");
+        completion_prompt_free(&prompt);
         request_free(r);
         return false;
     }
-    if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
-    if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
-    r->think_mode = ds4_think_mode_for_context(
-        think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
-    chat_msgs msgs = {0};
-    chat_msg sys = {0};
-    sys.role = xstrdup("system");
-    sys.content = xstrdup("You are a helpful assistant");
-    chat_msgs_push(&msgs, sys);
-    chat_msg user_msg = {0};
-    user_msg.role = xstrdup("user");
-    user_msg.content = prompt;
-    prompt = NULL;
-    chat_msgs_push(&msgs, user_msg);
-    r->prompt_text = render_chat_prompt_text_for_syntax(
-        r->model_syntax, &msgs, NULL, NULL, r->think_mode);
-    ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
-    chat_msgs_free(&msgs);
-    free(prompt);
+    r->think_mode = DS4_THINK_NONE;
+    if (!completion_prompt_build(e, vocab_size, &prompt, r,
+                                 err, errlen)) {
+        completion_prompt_free(&prompt);
+        request_free(r);
+        return false;
+    }
+    completion_prompt_free(&prompt);
     return true;
 bad:
-    free(prompt);
+    completion_prompt_free(&prompt);
     snprintf(err, errlen, "invalid JSON request");
     request_free(r);
     return false;
+}
+
+static bool parse_completion_request(ds4_engine *e, const char *body, int def_tokens,
+                                     int ctx_size, request *r, char *err, size_t errlen) {
+    return parse_completion_request_with_vocab(
+        e, ds4_engine_vocab_size(e), body, def_tokens, ctx_size, r, err, errlen);
+}
+
+/* Raw completions have no injected no-thinking chat suffix. Thinking tags
+ * are ordinary output here; model generation stops still apply. */
+static bool request_token_is_stop(ds4_engine *e, const request *r, int token) {
+    return r->kind == REQ_COMPLETION ? ds4_token_is_stop(e, token) :
+        ds4_token_is_stop_for_think_mode(e, token, r->think_mode);
 }
 
 static long long wall_ms(void) {
@@ -10890,11 +10998,61 @@ static int kv_cache_try_load(server *s, server_slot *slot, const request *req,
                              ds4_tokens *effective_prompt,
                              char **loaded_path_out,
                              uint8_t *loaded_ext_flags_out) {
-    return kv_cache_try_load_text(s, slot, req ? req->prompt_text : NULL,
-                                  effective_prompt,
-                                  loaded_path_out,
-                                  loaded_ext_flags_out,
-                                  req && req->api == API_RESPONSES);
+    if (!req || req->kind != REQ_COMPLETION) {
+        return kv_cache_try_load_text(s, slot, req ? req->prompt_text : NULL,
+                                      effective_prompt,
+                                      loaded_path_out,
+                                      loaded_ext_flags_out,
+                                      req && req->api == API_RESPONSES);
+    }
+    if (loaded_path_out) *loaded_path_out = NULL;
+    if (loaded_ext_flags_out) *loaded_ext_flags_out = 0;
+    if (effective_prompt) effective_prompt->len = 0;
+    /* Exact token arrays cannot use a text-keyed cache. String keys include
+     * the automatic model start sequence, just like stored token histories. */
+    if (!s || !slot || !s->kv.enabled || !req->prompt_text) return 0;
+    size_t prompt_text_len = 0;
+    char *prompt_text = render_tokens_text(s->engine, &req->prompt,
+                                           &prompt_text_len);
+    int loaded = kv_cache_try_load_text(s, slot, prompt_text, effective_prompt,
+                                        loaded_path_out,
+                                        loaded_ext_flags_out, false);
+    if (loaded > 0) {
+        pthread_mutex_lock(&s->inference_mu);
+        const ds4_tokens *live = ds4_session_tokens(slot->session);
+        ds4_tokens start = {0};
+        ds4_chat_begin(s->engine, &start);
+        bool matches = live && ds4_tokens_starts_with(live, &start);
+        ds4_tokens_free(&start);
+        size_t live_text_len = 0;
+        char *live_text = matches ?
+            render_tokens_text(s->engine, live, &live_text_len) : NULL;
+        matches = matches && byte_prefix_match(prompt_text, prompt_text_len,
+                                               live_text, live_text_len);
+        free(live_text);
+        /* Chat-visible cache keys can omit hidden reasoning. A raw request
+         * must match the actual payload, and its suffix starts after those
+         * actual bytes rather than after the possibly shorter visible key. */
+        if (matches && effective_prompt) {
+            ds4_tokens_copy(effective_prompt, live);
+            ds4_tokenize_rendered_chat(s->engine,
+                                      prompt_text + live_text_len,
+                                      effective_prompt);
+        } else if (!matches) {
+            ds4_session_invalidate(slot->session);
+            if (effective_prompt) ds4_tokens_free(effective_prompt);
+            if (loaded_path_out) {
+                free(*loaded_path_out);
+                *loaded_path_out = NULL;
+            }
+            if (loaded_ext_flags_out) *loaded_ext_flags_out = 0;
+            slot->continued_last_store_tokens = 0;
+            loaded = 0;
+        }
+        pthread_mutex_unlock(&s->inference_mu);
+    }
+    free(prompt_text);
+    return loaded;
 }
 
 /* A text-only suffix tokenizer would turn image markers into literal text.
@@ -10957,9 +11115,25 @@ static int live_text_prefix_prompt(server *s, server_slot *slot,
 
     size_t live_text_len = 0;
     char *live_text = render_tokens_text(s->engine, live_tokens, &live_text_len);
+    size_t live_text_start = 0;
+    if (req->kind == REQ_COMPLETION) {
+        ds4_tokens start = {0};
+        ds4_chat_begin(s->engine, &start);
+        /* Raw string prompts include this start sequence. A previous exact
+         * token-array request may lack it, even when its visible text matches. */
+        if (!ds4_tokens_starts_with(live_tokens, &start)) {
+            ds4_tokens_free(&start);
+            free(live_text);
+            return 0;
+        }
+        char *start_text = render_tokens_text(s->engine, &start, &live_text_start);
+        free(start_text);
+        ds4_tokens_free(&start);
+    }
     const size_t prompt_text_len = strlen(req->prompt_text);
     if (!byte_prefix_match(req->prompt_text, prompt_text_len,
-                           live_text, live_text_len))
+                           live_text + live_text_start,
+                           live_text_len - live_text_start))
     {
         free(live_text);
         return 0;
@@ -10969,8 +11143,9 @@ static int live_text_prefix_prompt(server *s, server_slot *slot,
      * keep its sampled tokenization and tokenize only the request bytes that
      * come after it.  Reusing req->prompt's token suffix would be wrong: full
      * prompt BPE may have merged across this byte boundary. */
-    bool ok = build_live_prompt_suffix(s, slot, req, req->prompt_text + live_text_len,
-                                       effective_prompt);
+    bool ok = build_live_prompt_suffix(
+        s, slot, req, req->prompt_text + live_text_len - live_text_start,
+        effective_prompt);
     free(live_text);
     return ok ? live_tokens->len : 0;
 }
@@ -13111,9 +13286,7 @@ decode_again:
             snprintf(err, sizeof(err), "failed to select a non-EOS token");
             break;
         }
-        if (ds4_token_is_stop_for_think_mode(s->engine,
-                                             token,
-                                             j->req.think_mode)) {
+        if (request_token_is_stop(s->engine, &j->req, token)) {
             finish = "stop";
             stop_detail = "stop token";
             stop_token = token;
@@ -13168,9 +13341,7 @@ decode_again:
                 break;
             }
             token = toks[ti];
-            if (ds4_token_is_stop_for_think_mode(s->engine,
-                                                 token,
-                                                 j->req.think_mode)) {
+            if (request_token_is_stop(s->engine, &j->req, token)) {
                 finish = "stop";
                 stop_detail = "stop token";
                 stop_token = token;
@@ -18597,6 +18768,86 @@ static void test_json_skip_has_nesting_limit(void) {
     free(bad);
 }
 
+static void test_completion_prompt_shapes(void) {
+    char err[160] = {0};
+    completion_prompt prompt = {0};
+    const char *p = "\"raw <think> text\"";
+    TEST_ASSERT(parse_completion_prompt(&p, &prompt, err, sizeof(err)));
+    TEST_ASSERT(prompt.kind == COMPLETION_PROMPT_TEXT);
+    TEST_ASSERT(prompt.text && !strcmp(prompt.text, "raw <think> text"));
+    TEST_ASSERT(*p == '\0');
+    completion_prompt_free(&prompt);
+
+    p = "[11, 22, 33]";
+    TEST_ASSERT(parse_completion_prompt(&p, &prompt, err, sizeof(err)));
+    TEST_ASSERT(prompt.kind == COMPLETION_PROMPT_TOKENS);
+    TEST_ASSERT(prompt.tokens.len == 3);
+    TEST_ASSERT(prompt.tokens.len == 3 && prompt.tokens.v[0] == 11);
+    TEST_ASSERT(prompt.tokens.len == 3 && prompt.tokens.v[1] == 22);
+    TEST_ASSERT(prompt.tokens.len == 3 && prompt.tokens.v[2] == 33);
+    TEST_ASSERT(*p == '\0');
+    completion_prompt_free(&prompt);
+
+    const char *invalid[] = {
+        "null", "7", "true", "[\"a\"]", "[11,\"a\"]", "[[11,22]]",
+        "[11.0]", "[1e2]", "[-1]", "[01]", "[2147483648]", "[11,]",
+        "[11", "{\"tokens\":[11]}"
+    };
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+        memset(&prompt, 0, sizeof(prompt));
+        memset(err, 0, sizeof(err));
+        p = invalid[i];
+        TEST_ASSERT(!parse_completion_prompt(&p, &prompt, err, sizeof(err)));
+        TEST_ASSERT(err[0] != '\0');
+        completion_prompt_free(&prompt);
+    }
+}
+
+static void test_completion_token_requests_are_exact(void) {
+    char err[160] = {0};
+    request r;
+    bool ok = parse_completion_request_with_vocab(
+        NULL, 1000,
+        "{\"prompt\":[11,22,33],\"max_tokens\":0,\"thinking\":true,\"think\":false,\"reasoning_effort\":\"max\",\"stream\":true}",
+        128, 4096, &r, err, sizeof(err));
+    TEST_ASSERT(ok);
+    if (ok) {
+        TEST_ASSERT(r.prompt.len == 3);
+        TEST_ASSERT(r.prompt.len == 3 && r.prompt.v[0] == 11);
+        TEST_ASSERT(r.prompt.len == 3 && r.prompt.v[1] == 22);
+        TEST_ASSERT(r.prompt.len == 3 && r.prompt.v[2] == 33);
+        TEST_ASSERT(r.prompt_text == NULL);
+        TEST_ASSERT(r.max_tokens == 0);
+        TEST_ASSERT(r.stream);
+        TEST_ASSERT(r.think_mode == DS4_THINK_NONE);
+        request_free(&r);
+    }
+
+    ok = parse_completion_request_with_vocab(
+        NULL, 100, "{\"prompt\":[99],\"max_tokens\":0}",
+        128, 4096, &r, err, sizeof(err));
+    TEST_ASSERT(ok);
+    if (ok) request_free(&r);
+
+    const char *invalid[] = {
+        "{}", "{\"prompt\":[]}", "{\"prompt\":[100]}",
+        "{\"prompt\":[11,\"a\"]}", "{\"prompt\":[[11]]}",
+        "{\"prompt\":null}",
+        "{\"prompt\":[11],\"prompt\":[12,\"bad\"]}",
+        "{\"prompt\":\"owned text\",\"prompt\":[12,]}",
+        "{\"prompt\":[11],\"think\":\"yes\"}",
+        "{\"prompt\":[11],\"reasoning_effort\":\"invalid\"}"
+    };
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+        memset(err, 0, sizeof(err));
+        ok = parse_completion_request_with_vocab(
+            NULL, 100, invalid[i], 128, 4096, &r, err, sizeof(err));
+        TEST_ASSERT(!ok);
+        TEST_ASSERT(err[0] != '\0');
+        if (ok) request_free(&r);
+    }
+}
+
 static void test_request_parsers_reject_malformed_duplicate_owned_fields(void) {
     const char *p =
         "{\"name\":\"ok\",\"name\":\"bad\\q\",\"arguments\":\"{}\"}";
@@ -20764,6 +21015,8 @@ static void ds4_server_unit_tests_run(void) {
     test_stop_list_parses_all_sequences();
     test_stop_list_streaming_holds_and_trims_stop_text();
     test_json_skip_has_nesting_limit();
+    test_completion_prompt_shapes();
+    test_completion_token_requests_are_exact();
     test_request_parsers_reject_malformed_duplicate_owned_fields();
     test_json_parser_handles_tool_heavy_requests();
     test_json_string_handles_surrogates();

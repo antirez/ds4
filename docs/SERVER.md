@@ -49,6 +49,8 @@ Max only with sufficient context; otherwise it falls back to normal thinking.
 `xhigh` maps to normal thinking, not Think Max. Use `think:false`, a disabled
 thinking object, or a non-thinking model alias for direct answers.
 
+`/v1/completions` continues a raw prompt without adding a system message or chat template. `prompt` accepts one string or one non-empty flat array of integer token IDs. Strings receive the model start sequence and recognize explicitly spelled special tokens; token arrays are used exactly as supplied. Batches, nested or mixed arrays, and IDs outside the model vocabulary are rejected. The compatibility fields `thinking`, `think`, and `reasoning_effort` are validated but do not change the prompt or suppress thinking tags in the output. Model stop tokens and explicit client stop sequences still apply.
+
 ## Multiple sessions
 
 ```sh
