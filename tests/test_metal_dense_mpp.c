@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 enum { INPUT = 1024, OUTPUT = 128, ROWS = 128 };
@@ -89,7 +90,89 @@ static int run_type(uint32_t type) {
     return ok;
 }
 
-int main(void) {
+static uint32_t rng = 41;
+static float random_float(void) {
+    rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+    return ((int32_t)(rng & 0xffffffu) - 0x800000) / 8388608.0f;
+}
+
+static double seconds(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec + 1e-9 * t.tv_nsec;
+}
+
+static int run_router(void) {
+    enum { K = 5120, M = 384, CAP = 8192 };
+    const size_t bytes = (size_t)CAP * M * sizeof(float);
+    const size_t xbytes = (size_t)CAP * K * sizeof(float);
+    float *w = NULL, *x = malloc(xbytes), *ref = malloc(bytes), *out = malloc(bytes);
+    if (posix_memalign((void **)&w, getpagesize(), K*M*sizeof(float)) || !x || !ref || !out) return 0;
+    for (unsigned i = 0; i < K*M; i++) w[i] = random_float() * .03f;
+    for (size_t i = 0; i < xbytes / sizeof(float); i++) x[i] = random_float();
+    int ok = ds4_gpu_set_model_map(w, K*M*sizeof(float));
+    ds4_gpu_tensor *xt = ds4_gpu_tensor_alloc(xbytes);
+    ds4_gpu_tensor *yt = ds4_gpu_tensor_alloc(bytes + sizeof(float));
+    ok = ok && xt && yt && ds4_gpu_tensor_write(xt, 0, x, xbytes);
+    const unsigned sizes[] = {1, 8, 31, 32, 33, 128, 255, 256, 257, 511, 512, 513, 2048, 4096, 8192};
+    for (unsigned si = 0; si < sizeof(sizes)/sizeof(*sizes) && ok; si++) {
+        const unsigned rows = sizes[si];
+        const unsigned modes[] = {0, 1, 2, 2, 1, 0};
+        for (unsigned pass = 0; pass < sizeof(modes)/sizeof(*modes) && ok; pass++) {
+            const unsigned mode = modes[pass];
+            if (!mode) setenv("DS4_METAL_DISABLE_V41_ROUTER_BATCH", "1", 1);
+            else unsetenv("DS4_METAL_DISABLE_V41_ROUTER_BATCH");
+            if (mode == 1) setenv("DS4_METAL_DISABLE_V41_ROUTER_MM", "1", 1);
+            else unsetenv("DS4_METAL_DISABLE_V41_ROUTER_MM");
+            ok = ds4_gpu_tensor_fill_f32(yt, 12345, (size_t)CAP*M + 1);
+            double elapsed = 0;
+            for (unsigned repeat = 0; repeat < 4 && ok; repeat++) {
+                const double begin = seconds();
+                ok = ds4_gpu_matmul_f32_tensor(yt, w, K*M*sizeof(float), 0, K, M, xt, rows) &&
+                    ds4_gpu_synchronize();
+                if (repeat) elapsed += (seconds() - begin) / 3;
+            }
+            ok = ok && ds4_gpu_tensor_read(yt, 0, out, bytes);
+            float guard = 0;
+            ok = ok && ds4_gpu_tensor_read(yt, (uint64_t)rows*M*sizeof(float), &guard, sizeof(guard)) && guard == 12345;
+            if (!pass) memcpy(ref, out, (size_t)rows*M*sizeof(float));
+            double worst = 0;
+            for (size_t i = 0; i < (size_t)rows*M && ok; i++) {
+                ok = isfinite(out[i]) && fabs(out[i] - ref[i]) < 1e-4 * (1 + fabs(ref[i]));
+                worst = fmax(worst, fabs(out[i] - ref[i]));
+            }
+            double oracle = 0;
+            for (unsigned sample = 0; sample < 32 && ok; sample++) {
+                const unsigned r = (sample * 79u) % rows, m = (sample * 13u) % M;
+                double expected = 0;
+                for (unsigned k = 0; k < K; k++) expected += (double)w[(size_t)m*K + k] * x[(size_t)r*K + k];
+                const double error = fabs(out[(size_t)r*M + m] - expected);
+                oracle = fmax(oracle, error);
+                ok = error < 4e-6 * (1 + fabs(expected));
+                if (!ok) fprintf(stderr, "Router oracle mode=%u row=%u col=%u actual=%.9g expected=%.9g\n",
+                    mode, r, m, out[(size_t)r*M + m], expected);
+            }
+            fprintf(stderr, "F32 router rows=%u mode=%u pass=%u %.3f ms max_delta=%.9g oracle=%.9g: %s\n",
+                rows, mode, pass, elapsed*1000, worst, oracle, ok ? "PASS" : "FAIL");
+        }
+    }
+    unsetenv("DS4_METAL_DISABLE_V41_ROUTER_BATCH");
+    unsetenv("DS4_METAL_DISABLE_V41_ROUTER_MM");
+    ds4_gpu_tensor_free(yt); ds4_gpu_tensor_free(xt); ds4_gpu_cleanup();
+    free(w); free(x); free(ref); free(out);
+    return ok;
+}
+
+int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--router")) {
+        if (!ds4_gpu_init()) return 1;
+        ds4_gpu_set_quality(false);
+        return run_router() ? 0 : 1;
+    }
+    if (argc != 1) {
+        fprintf(stderr, "usage: %s [--router]\n", argv[0]);
+        return 1;
+    }
     const unsigned types[] = {8, 2, 12};
     for (unsigned i = 0; i < sizeof(types)/sizeof(*types); i++) {
         if (!ds4_gpu_init()) return 1;

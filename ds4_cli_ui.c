@@ -23,7 +23,7 @@ typedef struct {
 static const struct { const char *name, *description; } commands[] = {
     {"/help",       "Command guide"},
     {"/status",     "Session details"},
-    {"/think",      "Normal reasoning"},
+    {"/think [N]",  "Normal / V4.1 0..100"},
     {"/think-max",  "Max reasoning"},
     {"/nothink",    "Direct answers"},
     {"/ctx N",      "Restart context"},

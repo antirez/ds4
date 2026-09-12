@@ -1,0 +1,3 @@
+# Importance Matrix in Low-Bit Quantization
+
+An **importance matrix** is a per-weight (or per-column) collection of importance scores used to decide *

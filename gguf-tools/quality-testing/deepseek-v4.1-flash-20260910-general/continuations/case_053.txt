@@ -1,0 +1,6 @@
+```json
+{
+  "name": "nome_della_tool",
+  "arguments": {
+    "param1": "valore1",
+    "

@@ -17,13 +17,14 @@ artifacts must agree. Update all TP peers together when changing versions.
 ## Tensor parallelism between two Macs
 
 This is a 50/50 split with exactly one worker. Do not pass `--layers`.
-Routed experts are sharded; dense weights remain replicated. Both GPUs work
-on the same token and exchange partial results. This can reduce generation
+Routed experts are sharded; attention partitioning depends on the model. Both
+GPUs work on the same token and exchange partial results. This can reduce generation
 latency, but the gain depends on the model, link, and comparison setup.
 
-Two 128 GB Macs are useful for Flash Q4/MXFP4 or GLM 5.3 Flash Q4.
-GLM 5.2 IQ2_XXS is another tested capacity setup. A larger quant may need
-larger machines even though its tensor layout is supported.
+Two 128 GB Macs are useful for V4 Flash Q4/MXFP4 or GLM 5.3 Flash Q4.
+GLM 5.2 IQ2_XXS is another tested capacity setup. V4.1 Flash Q2 also runs
+on two 128 GB Macs, with disk-only Engram tables.
+A larger quant may need larger machines even though its tensor layout is supported.
 
 ### Link setup
 
@@ -86,9 +87,11 @@ Do not treat repeated handshake or RDMA timeouts as successful QA merely
 because a retry works.
 
 The coordinator can be `ds4`, `ds4-agent`, `ds4-server`, or `ds4-bench`;
-workers run `ds4`. Pass the same `--vision FILE` to both for image input.
+workers run `ds4`. For models with vision support, pass the same `--vision FILE`
+to both for image input.
 For GLM MTP, enable `--mtp` on both. For DeepSeek DSpark, both need the
-matching support model and DSpark options.
+matching support model and DSpark options. V4.1 supports vision but not
+speculative decoding.
 
 TP disk-cache restore currently rebuilds the exact saved token prefix on both
 ranks rather than restoring the coordinator alone. Expect prefill on restore.

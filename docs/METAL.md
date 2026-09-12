@@ -32,6 +32,9 @@ Leave other GPU and memory-heavy applications idle when comparing performance.
 | 256 GB | Flash Q4/MXFP4 or GLM 5.3 Flash Q4 |
 | 512 GB | Larger models, including PRO Q2 |
 
+Here, Flash means DeepSeek V4 Flash. V4.1 Flash has different memory
+requirements; see its [model guide](MODELS.md#deepseek-v41-flash).
+
 These are starting points, not guarantees that every context or session count
 will fit. GLM 5.3 Flash Q2 is about 90 GiB before runtime allocations.
 Stop other memory-heavy workloads before loading it resident.
@@ -64,5 +67,5 @@ For more than two machines, use [pipeline parallelism](DISTRIBUTED.md#pipeline-p
 - [Batched serving](SERVER.md#multiple-sessions)
 - [Benchmarking](PERFORMANCE.md)
 
-For DeepSeek, `--power 70` trades throughput for lower sustained GPU load.
-GLM currently requires `--power 100`.
+For DeepSeek V4 Flash and PRO, `--power 70` trades throughput for lower
+sustained GPU load. V4.1 and GLM currently require `--power 100`.

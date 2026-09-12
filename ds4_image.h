@@ -90,6 +90,14 @@ int ds4_image_preprocess_deepseek4(
         char                        *error,
         size_t                       error_cap);
 
+int ds4_image_preprocess_deepseek41(
+        ds4_deepseek4_image_patches *out, const ds4_image *image,
+        char *error, size_t error_cap);
+
+int ds4_deepseek41_image_layout_build(
+        ds4_deepseek4_image_layout *out, uint32_t height, uint32_t width,
+        char *error, size_t error_cap);
+
 int ds4_deepseek4_image_layout_build(
         ds4_deepseek4_image_layout *out,
         uint32_t                    grid_height,

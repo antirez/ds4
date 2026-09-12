@@ -1,0 +1,3 @@
+# Confronto: `mmap` dei pesi vs copia completa dei pesi su macOS
+
+## 1. Panoramica dei due appro

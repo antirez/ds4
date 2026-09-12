@@ -55,6 +55,43 @@ def check_fixtures(binary, directory):
     print("Tool schemas: both formats parse as JSON, with and without vision")
 
 
+def check_hints(directory):
+    for columns in (20, 40, 80, 120):
+        screens = []
+        for name in ("hints.ansi", "hints-fragmented.ansi"):
+            data = (directory / name).read_bytes()
+            assert not re.search(rb"\x1b\[[0-9;]*[ABCDHJK]", data), "hints must not repaint output"
+            screen = pyte.Screen(columns, 80)
+            stream = pyte.Stream(screen)
+            decoder = codecs.getincrementaldecoder("utf-8")("strict")
+            for byte in data.replace(b"\n", b"\r\n"):
+                stream.feed(decoder.decode(bytes([byte])))
+            assert not decoder.decode(b"", final=True)
+            cells = [screen.buffer[y][x] for y in range(screen.lines) for x in range(columns)]
+            badge = [cell for cell in cells if cell.bg != "default"]
+            assert "".join(cell.data for cell in badge) == " Hint ", badge
+            assert all(cell.bg == "005f5f" and cell.fg == "brightwhite" and cell.bold for cell in badge)
+            visible = "".join(cell.data for cell in cells)
+            assert "caf\u00e9" in visible and "\u4e2d" in visible
+            assert "\ufffd" not in visible
+            for y, line in enumerate(screen.display):
+                for word in ("Normal", "Another"):
+                    if word in line:
+                        x = line.index(word)
+                        assert screen.buffer[y][x].fg == "default" and not screen.buffer[y][x].bold
+            assert screen.cursor.attrs.bg == "default", "badge background leaked into the prompt"
+            screens.append(cells)
+        assert screens[0] == screens[1], "split tokens or UI redraws changed rendered text/attributes"
+    for family in ("glm", "dsml"):
+        screen = pyte.Screen(120, 40)
+        pyte.Stream(screen).feed((directory / f"hints-{family}-tool.ansi").read_text().replace("\n", "\r\n"))
+        rows = [y for y, line in enumerate(screen.display) if "printf HINT_OK" in line]
+        assert rows, "hint obscured the actual tool call"
+        for y in rows:
+            assert all(screen.buffer[y][x].bg == "default" for x in range(120))
+    print("Hints: white-on-teal badge, clean style boundaries, UTF-8 and 20/40/80/120-column wrapping passed")
+
+
 def check_pty(binary, directory):
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
@@ -117,6 +154,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="ds4-agent-terminal-") as temporary:
         directory = Path(temporary)
         check_fixtures(binary, directory)
+        check_hints(directory)
         check_pty(binary, directory)
 
 

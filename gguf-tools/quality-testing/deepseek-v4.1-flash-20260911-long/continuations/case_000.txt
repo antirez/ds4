@@ -1,0 +1,12 @@
+# Corrected C Code
+
+```c
+int lookup(int *a, int n, int index) {
+    if (index < 0 || index >= n) return -1;
+    return a[index];
+}
+```
+
+## Explanation of the Bounds Bug
+
+The original code has **two distinct bugs** in its

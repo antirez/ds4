@@ -41,7 +41,7 @@
 
 #define DS4_TP_MAGIC UINT32_C(0x44533454) /* "DS4T" */
 #define DS4_TP_BATCH_MAGIC UINT32_C(0x44533442) /* "DS4B" */
-#define DS4_TP_PROTOCOL_VERSION 10u
+#define DS4_TP_PROTOCOL_VERSION 12u
 
 #define DS4_TP_DEFAULT_TIMEOUT_SEC 300
 /* Once both ranks enter a Metal gate, a live exchange normally completes in
@@ -131,7 +131,8 @@ typedef struct {
  * (a model-fixed number of gates per token). After any initial bulk prefill,
  * decode keeps a receive window posted by sequence number: recv for seq s
  * lands in the slab in-slot (s-1) % slots and its completion is the arrival
- * signal. */
+ * signal. The provider also reports CQEs for unsignaled sends: request and
+ * account for every send, rather than treating one CQE as a completed chain. */
 #define DS4_TP_RDMA_MAX_MSG 16384
 #define DS4_TP_RDMA_RECV_WINDOW 16
 #define DS4_TP_RDMA_BULK_SLOTS 64
@@ -150,7 +151,7 @@ typedef struct {
     int gid_index;
     uint32_t max_inline;
     ds4_tp_rdma_info peer;
-    uint32_t send_outstanding;  /* signaled sends not yet reaped */
+    uint32_t send_outstanding;  /* individual sends not yet reaped */
     uint64_t recv_done;         /* highest gate seq whose recv completed */
     uint64_t last_gate_seq;     /* last real decode receive consumed */
     bool recv_window_active;    /* decode recvs are queued ahead */
@@ -203,6 +204,7 @@ struct ds4_tp {
     uint64_t timeout_sec;
     uint64_t gate_timeout_ms;
     atomic_bool failed;
+    uint64_t sync_checkpoint_seq;
 #ifdef DS4_TP_HAVE_VERBS
     ds4_tp_rdma rdma;
 #endif
@@ -1128,6 +1130,22 @@ static int tp_rdma_drain_cq(ds4_tp *tp) {
     return 1;
 }
 
+static int tp_rdma_ensure_work_requests(ds4_tp_rdma *r) {
+    if (r->win_sge && r->win_rwr && r->win_swr) return 1;
+    free(r->win_sge); free(r->win_rwr); free(r->win_swr);
+    const uint32_t recv = r->recv_depth ? r->recv_depth : 64u;
+    const uint32_t send = r->send_depth ? r->send_depth : 256u;
+    const uint32_t cap = recv > send ? recv : send;
+    r->win_sge = calloc(2u * cap, sizeof(*r->win_sge));
+    r->win_rwr = calloc(cap, sizeof(*r->win_rwr));
+    r->win_swr = calloc(cap, sizeof(*r->win_swr));
+    if (!r->win_sge || !r->win_rwr || !r->win_swr) {
+        fprintf(stderr, "ds4-tp: work-request allocation failed\n");
+        return 0;
+    }
+    return 1;
+}
+
 /* Verify-block window helpers. */
 static int tp_rdma_block_post_layer(ds4_tp *tp, uint32_t layer) {
     ds4_tp_rdma *r = &tp->rdma;
@@ -1135,7 +1153,7 @@ static int tp_rdma_block_post_layer(ds4_tp *tp, uint32_t layer) {
     const uint32_t chunks = (uint32_t)((tp->vec_bytes + DS4_TP_RDMA_MAX_MSG - 1u) /
                                        DS4_TP_RDMA_MAX_MSG);
     const uint32_t n = rows * chunks;
-    if (n == 0 || n > r->recv_depth) return 0;
+    if (n == 0 || n > r->recv_depth || !tp_rdma_ensure_work_requests(r)) return 0;
     struct ibv_sge *sge = r->win_sge;
     struct ibv_recv_wr *wr = r->win_rwr;
     memset(wr, 0, (size_t)n * sizeof(*wr));
@@ -1206,7 +1224,7 @@ static int tp_rdma_block_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows
                     wr[wi].sg_list = &sge[wi];
                     wr[wi].num_sge = 1;
                     wr[wi].opcode = IBV_WR_SEND;
-                    wr[wi].send_flags = wi + 1u == n ? IBV_SEND_SIGNALED : 0;
+                    wr[wi].send_flags = IBV_SEND_SIGNALED;
                     if (wi != 0) wr[wi - 1u].next = &wr[wi];
                     wi++;
                     off += len;
@@ -1218,7 +1236,7 @@ static int tp_rdma_block_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows
                         layer, strerror(errno));
                 ok = 0;
             } else {
-                r->send_outstanding++;
+                r->send_outstanding += n;
             }
         }
     }
@@ -1290,6 +1308,8 @@ static double g_rdma_stat_wait_us[2];
 static uint64_t g_rdma_stat_count[2];
 static int g_rdma_stat_enabled = -1;
 
+static int tp_rdma_window_barrier(ds4_tp *tp, uint8_t tag);
+
 static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq) {
     ds4_tp_rdma *r = &tp->rdma;
     const uint32_t slot = layer * DS4_TP_GATES_PER_LAYER + gate;
@@ -1312,6 +1332,9 @@ static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint
     if (!r->recv_window_active) {
         for (uint64_t s = seq; ok && s < seq + DS4_TP_RDMA_RECV_WINDOW; s++)
             ok = tp_rdma_post_gate_recv(tp, s);
+        /* UC does not retry a send that arrives before the peer posts its
+         * receive. This is needed once per window, not at every decode gate. */
+        if (ok) ok = tp_rdma_window_barrier(tp, 0xD1u);
         if (ok) r->recv_window_active = true;
     }
     struct ibv_sge send_sge[2];
@@ -1328,17 +1351,17 @@ static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint
         send_wr[send_count].sg_list = &send_sge[send_count];
         send_wr[send_count].num_sge = 1;
         send_wr[send_count].opcode = IBV_WR_SEND;
+        send_wr[send_count].send_flags = IBV_SEND_SIGNALED;
         if (send_count != 0) send_wr[send_count - 1u].next = &send_wr[send_count];
         off += len;
     }
     if (ok) {
-        send_wr[send_count - 1u].send_flags = IBV_SEND_SIGNALED;
         struct ibv_send_wr *bad = NULL;
         ok = ibv_post_send(r->qp, send_wr, &bad) == 0;
         if (!ok) {
             fprintf(stderr, "ds4-tp: rdma post_send: %s\n", strerror(errno));
         } else {
-            r->send_outstanding++;
+            r->send_outstanding += send_count;
         }
     }
     if (g_rdma_stat_enabled) st1 = tp_now_sec();
@@ -1415,7 +1438,7 @@ static int tp_rdma_drain_decode_window(ds4_tp *tp) {
             wr[wi].sg_list = &sge[wi];
             wr[wi].num_sge = 1;
             wr[wi].opcode = IBV_WR_SEND;
-            wr[wi].send_flags = wi + 1u == nwr ? IBV_SEND_SIGNALED : 0;
+            wr[wi].send_flags = IBV_SEND_SIGNALED;
             if (wi > 0) wr[wi - 1u].next = &wr[wi];
             wi++;
             off += len;
@@ -1432,11 +1455,11 @@ static int tp_rdma_drain_decode_window(ds4_tp *tp) {
     }
 
     uint32_t recv_done = 0;
-    int send_done = 0;
+    uint32_t send_done = 0;
     const double deadline =
         tp_now_sec() + (double)tp->gate_timeout_ms / 1000.0;
     uint32_t peer_poll = 0;
-    while (recv_done < nwr || !send_done) {
+    while (recv_done < nwr || send_done < nwr || r->send_outstanding) {
         struct ibv_wc wc[DS4_TP_RDMA_RECV_WINDOW * 2u + 1u];
         int n = ibv_poll_cq(r->cq,
                            (int)(DS4_TP_RDMA_RECV_WINDOW * 2u + 1u), wc);
@@ -1454,7 +1477,7 @@ static int tp_rdma_drain_decode_window(ds4_tp *tp) {
             if (wc[i].opcode & IBV_WC_RECV) {
                 recv_done++;
             } else if (wc[i].wr_id & DS4_TP_RDMA_BULK_WR_TAG) {
-                send_done = 1;
+                send_done++;
             } else if (r->send_outstanding > 0) {
                 r->send_outstanding--;
             }
@@ -1502,7 +1525,10 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
                                      void *in,
                                      uint64_t bytes) {
     ds4_tp_rdma *r = &tp->rdma;
-    if (!tp_rdma_big_gate_capable(tp) || r->recv_window_active) return 0;
+    if (!tp_rdma_big_gate_capable(tp) || r->recv_window_active) {
+        fprintf(stderr, "ds4-tp: big gate unavailable or decode window still active\n");
+        return 0;
+    }
     const uintptr_t slab_lo = (uintptr_t)tp->slab;
     const uintptr_t slab_hi = slab_lo + tp->slab_bytes;
     const uintptr_t out_lo = (uintptr_t)out;
@@ -1524,13 +1550,7 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
         if (depth == 0u) return 0;
         out_mr = in_mr = r->mr;
     }
-    if (!r->win_sge) {
-        const uint32_t cap = r->recv_depth > r->send_depth ? r->recv_depth : r->send_depth;
-        r->win_sge = calloc(2u * cap, sizeof(*r->win_sge));
-        r->win_rwr = calloc(cap, sizeof(*r->win_rwr));
-        r->win_swr = calloc(cap, sizeof(*r->win_swr));
-        if (!r->win_sge || !r->win_rwr || !r->win_swr) return 0;
-    }
+    if (!tp_rdma_ensure_work_requests(r)) return 0;
     const uint32_t send_depth = r->send_depth ? r->send_depth : 256u;
     uint64_t off = 0;
     uint8_t tag = 1;
@@ -1581,17 +1601,19 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
             return 0;
         }
         tag++;
-        /* Sends in sub-batches bounded by the send depth; the last of each
-         * sub-batch is signaled. */
-        uint32_t sent = 0, send_done = 0, recv_done = 0, signaled = 0;
+        /* Apple also completes unsignaled sends. Request and count every
+         * message: counting those CQEs as completed batches releases staging
+         * memory while later sends still read it. */
+        uint32_t sent = 0, send_done = 0, recv_done = 0;
+        uint64_t recv_seen[4] = {0}, send_seen[4] = {0};
         const double deadline = tp_now_sec() + (double)tp->gate_timeout_ms / 1000.0 + 2.0;
         uint32_t peer_poll = 0;
-        while (recv_done < chunks || send_done < signaled || sent < chunks) {
-            if (sent < chunks && (signaled - send_done) < 4u) {
+        while (recv_done < chunks || send_done < chunks) {
+            if (sent < chunks && sent - send_done < send_depth) {
                 uint32_t n = chunks - sent;
                 if (n > 64u) n = 64u;
-                if (n > send_depth / 4u && send_depth / 4u > 0u) n = send_depth / 4u;
-                if (n == 0u) n = 1u;
+                if (n > send_depth - (sent - send_done))
+                    n = send_depth - (sent - send_done);
                 for (uint32_t i = 0; i < n; i++) {
                     struct ibv_send_wr *w = &r->win_swr[i];
                     memset(w, 0, sizeof(*w));
@@ -1599,7 +1621,7 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
                     w->sg_list = &r->win_sge[depth + sent + i];
                     w->num_sge = 1;
                     w->opcode = IBV_WR_SEND;
-                    w->send_flags = i + 1u == n ? IBV_SEND_SIGNALED : 0;
+                    w->send_flags = IBV_SEND_SIGNALED;
                     w->next = i + 1u < n ? &r->win_swr[i + 1u] : NULL;
                 }
                 struct ibv_send_wr *bad_send = NULL;
@@ -1608,11 +1630,14 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
                     return 0;
                 }
                 sent += n;
-                signaled++;
             }
             struct ibv_wc wc[64];
             int nwc = ibv_poll_cq(r->cq, 64, wc);
-            if (nwc < 0) return 0;
+            if (nwc < 0) {
+                fprintf(stderr, "ds4-tp: big gate poll_cq failed at %llu/%llu bytes: %s\n",
+                    (unsigned long long)off, (unsigned long long)bytes, strerror(errno));
+                return 0;
+            }
             for (int i = 0; i < nwc; i++) {
                 if (wc[i].status != IBV_WC_SUCCESS) {
                     fprintf(stderr, "ds4-tp: big gate completion error: %s\n",
@@ -1627,11 +1652,20 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
                     }
                     continue;
                 }
-                if (wc[i].opcode & IBV_WC_RECV) {
-                    const uint64_t idx = (wc[i].wr_id & ~DS4_TP_RDMA_BULK_WR_TAG) - 1u;
+                const uint64_t idx = (wc[i].wr_id & ~DS4_TP_RDMA_BULK_WR_TAG) - 1u;
+                const bool received = (wc[i].opcode & IBV_WC_RECV) != 0;
+                uint64_t *seen = received ? recv_seen : send_seen;
+                if (idx >= (received ? chunks : sent) ||
+                    (seen[idx / 64u] & (UINT64_C(1) << (idx % 64u)))) {
+                    fprintf(stderr, "ds4-tp: duplicate or invalid big gate completion %llu\n",
+                        (unsigned long long)wc[i].wr_id);
+                    return 0;
+                }
+                seen[idx / 64u] |= UINT64_C(1) << (idx % 64u);
+                if (received) {
                     const uint32_t want = idx + 1u < chunks || win_bytes % DS4_TP_RDMA_MAX_MSG == 0u
                         ? (uint32_t)DS4_TP_RDMA_MAX_MSG : (uint32_t)(win_bytes % DS4_TP_RDMA_MAX_MSG);
-                    if (idx >= chunks || wc[i].byte_len != want) {
+                    if (wc[i].byte_len != want) {
                         fprintf(stderr, "ds4-tp: big gate chunk %llu received %u bytes, expected %u\n",
                                 (unsigned long long)idx, wc[i].byte_len, want);
                         return 0;
@@ -1647,7 +1681,7 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
             }
             if (nwc == 0 && tp_now_sec() > deadline) {
                 fprintf(stderr, "ds4-tp: timeout in big gate window (%u/%u recvs, %u/%u sends, %u sent)\n",
-                        recv_done, chunks, send_done, signaled, sent);
+                        recv_done, chunks, send_done, chunks, sent);
                 return 0;
             }
         }
@@ -2090,10 +2124,19 @@ int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
     if (dbg < 0) dbg = getenv("DS4_TP_BIG_GATE_DEBUG") != NULL;
     const double t_start = dbg ? tp_now_sec() : 0.0;
 #endif
+    /* A cold prefill kernel can make one rank arrive much later than the
+     * other. Match the bulk RDMA window's bounded grace, without relaxing
+     * the decode timeout or any subsequent payload exchange. */
+    if (!tp_socket_set_gate_timeout(tp->data_fd, tp->gate_timeout_ms + 2000u)) return 0;
     ds4_tp_gate_header h = { DS4_TP_BATCH_MAGIC, (uint16_t)layer, 0xB16u, seq };
-    if (!tp_write_full(tp->data_fd, &h, sizeof(h))) return 0;
     ds4_tp_gate_header ph;
-    if (!tp_read_full(tp->data_fd, &ph, sizeof(ph))) return 0;
+    const bool header_ok = tp_write_full(tp->data_fd, &h, sizeof(h)) &&
+        tp_read_full(tp->data_fd, &ph, sizeof(ph));
+    if (!header_ok)
+        fprintf(stderr, "ds4-tp: big gate header exchange failed or peer closed (layer %u seq %llu): %s\n",
+                layer, (unsigned long long)seq, strerror(errno));
+    const bool timeout_restored = tp_socket_set_gate_timeout(tp->data_fd, tp->gate_timeout_ms);
+    if (!header_ok || !timeout_restored) return 0;
 #ifdef DS4_TP_HAVE_VERBS
     const double t_hs = dbg ? tp_now_sec() : 0.0;
 #endif
@@ -2372,8 +2415,8 @@ int ds4_tp_send_command_ack(ds4_tp *tp, uint64_t session_id, int status) {
                          &ack, sizeof(ack));
 }
 
-int ds4_tp_wait_command_ack(ds4_tp *tp, uint64_t session_id,
-                            const char *operation, char *err, size_t errlen) {
+int ds4_tp_wait_command_status(ds4_tp *tp, uint64_t session_id, int *status,
+                               const char *operation, char *err, size_t errlen) {
     uint32_t type = 0, bytes = 0;
     ds4_tp_command_ack ack;
     if (!tp_read_frame_header(tp->control_fd, &type, &bytes) ||
@@ -2384,13 +2427,52 @@ int ds4_tp_wait_command_ack(ds4_tp *tp, uint64_t session_id,
                    operation ? operation : "command");
         return 0;
     }
-    if (ack.session_id != session_id || ack.status != 0) {
+    if (ack.session_id != session_id || ack.reserved != 0) {
+        ds4_tp_mark_failed(tp);
         tp_set_err(err, errlen,
                    "tp: worker %s failed (session %llu, status %d)",
                    operation ? operation : "command",
                    (unsigned long long)ack.session_id, (int)ack.status);
         return 0;
     }
+    *status = ack.status;
+    return 1;
+}
+
+int ds4_tp_wait_command_ack(ds4_tp *tp, uint64_t session_id,
+                            const char *operation, char *err, size_t errlen) {
+    int status;
+    if (!ds4_tp_wait_command_status(tp, session_id, &status, operation, err, errlen))
+        return 0;
+    if (status != 0) {
+        tp_set_err(err, errlen, "tp: worker %s failed (session %llu, status %d)",
+                   operation ? operation : "command", (unsigned long long)session_id, status);
+        return 0;
+    }
+    return 1;
+}
+
+int ds4_tp_sync_checkpoint(ds4_tp *tp, uint32_t point, int current, int total,
+                            bool requested, bool *cancelled) {
+    if (!tp || !cancelled) return 0;
+    struct {
+        uint64_t seq;
+        uint32_t point;
+        int32_t current, total;
+        uint32_t cancelled;
+    } local = {++tp->sync_checkpoint_seq, point, current, total, requested}, peer;
+    uint32_t type, bytes;
+    if (ds4_tp_failed(tp) ||
+        !tp_send_frame(tp->control_fd, DS4_TP_FRAME_SYNC_CHECKPOINT, &local, sizeof(local)) ||
+        !tp_read_frame_header(tp->control_fd, &type, &bytes) ||
+        type != DS4_TP_FRAME_SYNC_CHECKPOINT || bytes != sizeof(peer) ||
+        !tp_read_full(tp->control_fd, &peer, sizeof(peer)) ||
+        peer.seq != local.seq || peer.point != point ||
+        peer.current != current || peer.total != total || peer.cancelled > 1u) {
+        ds4_tp_mark_failed(tp);
+        return 0;
+    }
+    *cancelled = requested || peer.cancelled;
     return 1;
 }
 
@@ -2872,10 +2954,10 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
                 ds4_session_sync(session, &prompt, err, sizeof(err));
             if (!ds4_tp_send_command_ack(tp, command.session_id, sync_rc)) {
                 rc = 1;
-            } else if (sync_rc != 0) {
+            } else if (sync_rc != 0 && sync_rc != DS4_SESSION_SYNC_INTERRUPTED) {
                 ds4_log(stderr, DS4_LOG_ERROR, "tp worker sync: %s", err);
                 rc = 1;
-            } else if (ds4_engine_tp_vocab_split(engine) &&
+            } else if (sync_rc == 0 && ds4_engine_tp_vocab_split(engine) &&
                        !tp_worker_send_logits(tp, session, logits, vocab)) {
                 rc = 1;
             }

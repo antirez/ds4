@@ -574,12 +574,15 @@ static uint32_t ds4_deepseek4_grid_tokens(
         uint32_t height,
         uint32_t width,
         uint32_t *grid_height,
-        uint32_t *grid_width) {
+        uint32_t *grid_width,
+        bool v41) {
     const uint32_t h = (height / 14u + 2u) / 3u;
     const uint32_t w = (width / 14u + 2u) / 3u;
     uint64_t count = (uint64_t)h * (w + 1u) + 2u;
-    if (h & 1u) count += w + 1u;
-    if ((((h + 1u) / 2u) * (w + 1u)) & 1u) count += 2u;
+    if (!v41) {
+        if (h & 1u) count += w + 1u;
+        if ((((h + 1u) / 2u) * (w + 1u)) & 1u) count += 2u;
+    }
     if (grid_height) *grid_height = h;
     if (grid_width) *grid_width = w;
     return count <= UINT32_MAX ? (uint32_t)count : UINT32_MAX;
@@ -590,7 +593,8 @@ static int ds4_deepseek4_solve_resize(
         uint32_t width,
         uint32_t budget,
         uint32_t *best_height,
-        uint32_t *best_width) {
+        uint32_t *best_width,
+        bool v41) {
     const double ratio = (double)height / width;
     const double max_w_float = sqrt(((double)budget - 2.0) / ratio + 0.25) - 0.5;
     const double max_h_float = max_w_float * ratio;
@@ -598,19 +602,20 @@ static int ds4_deepseek4_solve_resize(
     if (max_w_float < 1.0) {
         max_w = 1;
         max_h = (budget - 2u) / (max_w + 1u);
-        max_h &= ~1u;
+        if (!v41) max_h &= ~1u;
         if (max_h == 0) return 0;
         *best_width = max_w * 42u;
         *best_height = max_h * 42u;
-    } else if (max_h_float < 2.0) {
-        max_h = 2;
+    } else if (max_h_float < (v41 ? 1.0 : 2.0)) {
+        max_h = v41 ? 1u : 2u;
         max_w = (budget - 2u) / max_h - 1u;
         if (max_w <= 1u) return 0;
         *best_width = max_w * 42u;
         *best_height = max_h * 42u;
     } else {
         max_w = (uint32_t)floor(max_w_float);
-        max_h = (uint32_t)floor(max_h_float) & ~1u;
+        max_h = (uint32_t)floor(max_h_float);
+        if (!v41) max_h &= ~1u;
         if (max_w == 0 || max_h == 0) return 0;
         const double scale = fmin((double)max_w * 42.0 / width,
                                   (double)max_h * 42.0 / height);
@@ -626,28 +631,31 @@ static int ds4_deepseek4_safe_resize(
         uint32_t *best_height,
         uint32_t *best_width,
         uint32_t *llm_height,
-        uint32_t *llm_width) {
-    uint32_t budget = 384u - 3u;
+        uint32_t *llm_width,
+        bool v41) {
+    const uint32_t max_tokens = v41 ? 1024u : 381u;
+    uint32_t budget = max_tokens;
     uint32_t tokens = ds4_deepseek4_grid_tokens(
-            *best_height, *best_width, llm_height, llm_width);
-    while (tokens > 381u) {
+            *best_height, *best_width, llm_height, llm_width, v41);
+    while (tokens > max_tokens) {
         if (budget <= 4u ||
             !ds4_deepseek4_solve_resize(height, width, budget,
-                                        best_height, best_width)) {
+                                        best_height, best_width, v41)) {
             return 0;
         }
         tokens = ds4_deepseek4_grid_tokens(
-                *best_height, *best_width, llm_height, llm_width);
+                *best_height, *best_width, llm_height, llm_width, v41);
         budget--;
     }
     return 1;
 }
 
-int ds4_image_preprocess_deepseek4(
+static int ds4_image_preprocess_deepseek(
         ds4_deepseek4_image_patches *out,
         const ds4_image *image,
         char *error,
-        size_t error_cap) {
+        size_t error_cap,
+        bool v41) {
     if (!out) return 0;
     memset(out, 0, sizeof(*out));
     if (!image || !image->rgb || image->width == 0 || image->height == 0) {
@@ -658,13 +666,14 @@ int ds4_image_preprocess_deepseek4(
 
     uint32_t planned_width = image->width;
     uint32_t planned_height = image->height;
-    if ((uint64_t)planned_width > (uint64_t)planned_height * 8u) {
+    if (!v41 && (uint64_t)planned_width > (uint64_t)planned_height * 8u) {
         planned_width = planned_height * 8u;
     }
     const uint64_t planned_pixels =
         (uint64_t)planned_width * planned_height;
-    if (planned_pixels < 147456u) {
-        const double scale = sqrt(147456.0 / planned_pixels);
+    const uint32_t min_pixels = v41 ? 295936u : 147456u;
+    if (planned_pixels < min_pixels) {
+        const double scale = sqrt((double)min_pixels / planned_pixels);
         planned_width = (uint32_t)(planned_width * scale);
         planned_height = (uint32_t)(planned_height * scale);
         if (planned_width == 0) planned_width = 1;
@@ -676,9 +685,9 @@ int ds4_image_preprocess_deepseek4(
     uint32_t llm_height = 0, llm_width = 0;
     if (!ds4_deepseek4_safe_resize(planned_height, planned_width,
                                    &best_height, &best_width,
-                                   &llm_height, &llm_width)) {
+                                   &llm_height, &llm_width, v41)) {
         ds4_image_error(error, error_cap,
-                        "unable to fit image within the 384-token vision budget");
+                        "unable to fit image within the vision token budget");
         return 0;
     }
     if (best_width > DS4_IMAGE_MAX_DIMENSION ||
@@ -701,7 +710,7 @@ int ds4_image_preprocess_deepseek4(
     uint32_t content_height = best_height;
     uint32_t offset_x = 0, offset_y = 0;
     const bool force_resize =
-        (uint64_t)image->width >= (uint64_t)image->height * 8u;
+        !v41 && (uint64_t)image->width >= (uint64_t)image->height * 8u;
     if (!force_resize) {
         const double scale = fmin((double)best_width / image->width,
                                   (double)best_height / image->height);
@@ -765,6 +774,50 @@ int ds4_image_preprocess_deepseek4(
     out->llm_grid_height = llm_height;
     out->patch_count = patch_count;
     out->patches = patches;
+    return 1;
+}
+
+int ds4_image_preprocess_deepseek4(
+        ds4_deepseek4_image_patches *out, const ds4_image *image,
+        char *error, size_t error_cap) {
+    return ds4_image_preprocess_deepseek(out, image, error, error_cap, false);
+}
+
+int ds4_image_preprocess_deepseek41(
+        ds4_deepseek4_image_patches *out, const ds4_image *image,
+        char *error, size_t error_cap) {
+    return ds4_image_preprocess_deepseek(out, image, error, error_cap, true);
+}
+
+int ds4_deepseek41_image_layout_build(
+        ds4_deepseek4_image_layout *out, uint32_t height, uint32_t width,
+        char *error, size_t error_cap) {
+    if (!out) return 0;
+    memset(out, 0, sizeof(*out));
+    const uint64_t count = (uint64_t)height * ((uint64_t)width + 1u) + 2u;
+    if (!height || !width || count > 1024u) {
+        ds4_image_error(error, error_cap, "invalid V4.1 image token grid");
+        return 0;
+    }
+    uint8_t *types = malloc((size_t)count);
+    uint32_t *perm = malloc((size_t)height * width * sizeof(*perm));
+    if (!types || !perm) {
+        free(types); free(perm);
+        ds4_image_error(error, error_cap, "unable to allocate V4.1 image layout");
+        return 0;
+    }
+    uint32_t token = 0, image = 0;
+    types[token++] = DS4_DEEPSEEK4_IMAGE_START;
+    for (uint32_t row = 0; row < height; row++) {
+        for (uint32_t col = 0; col < width; col++) {
+            types[token++] = DS4_DEEPSEEK4_IMAGE;
+            perm[image] = image;
+            image++;
+        }
+        types[token++] = DS4_DEEPSEEK4_IMAGE_NEWLINE;
+    }
+    types[token++] = DS4_DEEPSEEK4_IMAGE_END;
+    *out = (ds4_deepseek4_image_layout){token, image, types, perm};
     return 1;
 }
 

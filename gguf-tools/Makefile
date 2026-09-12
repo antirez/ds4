@@ -12,9 +12,9 @@ NATIVE_CPU_FLAG ?= -mcpu=native
 QUANTS_SHARED := libds4quants.dylib
 SHARED_FLAGS := -dynamiclib
 QUALITY_LDLIBS := -lm -pthread -framework Foundation -framework Metal
-QUALITY_TARGETS := ds4.o ds4_metal.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o ds4_image.o rax.o ds4_gpu_args.o
-QUALITY_OBJS := ../ds4.o ../ds4_metal.o ../ds4_distributed.o ../ds4_tp.o ../ds4_ssd.o ../ds4_layer_pack.o ../ds4_image.o ../rax.o ../ds4_gpu_args.o
-QUALITY_LINK := $(CC) $(CFLAGS) -I.. -o
+QUALITY_TARGETS := ds4.o ds4_metal.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o ds4_engram.o ds4_image.o rax.o ds4_gpu_args.o
+QUALITY_OBJS := ../ds4.o ../ds4_metal.o ../ds4_distributed.o ../ds4_tp.o ../ds4_ssd.o ../ds4_layer_pack.o ../ds4_engram.o ../ds4_image.o ../rax.o ../ds4_gpu_args.o
+QUALITY_LINK = $(CC) $(CFLAGS) -I.. -o
 LLAMA_CPP_LDLIBS ?= -L$(LLAMA_CPP_BIN) -Wl,-rpath,$(abspath $(LLAMA_CPP_BIN)) \
 	-lllama -lggml -lggml-base -lggml-cpu -lggml-blas -lggml-metal \
 	-framework Foundation -framework Metal -framework Accelerate

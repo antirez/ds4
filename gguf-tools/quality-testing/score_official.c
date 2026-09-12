@@ -30,6 +30,8 @@ static void usage(const char *prog) {
             "[--ssd-streaming-preload-experts N] "
             "[--dump-first-logits PATH] "
             "[--max-cases N] "
+            "[--continued-prefill N] "
+            "[--session-batch N] "
             "[--tensor-parallel --role coordinator --listen HOST PORT "
             "[--transport auto|rdma|tcp]]\n",
             prog);
@@ -69,6 +71,42 @@ static int parse_positive_int(const char *s, const char *opt) {
         exit(2);
     }
     return (int)v;
+}
+
+/* Leave the last N prompt tokens for a second sync, exercising cached-prefix
+ * inference against exactly the same official continuation. */
+static int sync_prompt(ds4_session *session, const ds4_tokens *prompt,
+                       int continued, char *err, size_t errlen) {
+    if (continued) {
+        if (continued < 0 || continued >= prompt->len) {
+            snprintf(err, errlen, "continued prefill must be shorter than the prompt");
+            return 1;
+        }
+        ds4_tokens prefix = *prompt;
+        prefix.len -= continued;
+        const int rc = ds4_session_sync(session, &prefix, err, errlen);
+        if (rc) return rc;
+    }
+    return ds4_session_sync(session, prompt, err, errlen);
+}
+
+/* Score one official continuation among unrelated, independently advancing
+ * sessions. Rotate row order to catch scratch/state ownership mistakes. */
+#define SCORE_MAX_SESSIONS 8
+static int eval_with_companions(ds4_session **sessions, int count, int token,
+                                unsigned step, char *err, size_t errlen) {
+    if (count == 1) return ds4_session_eval(sessions[0], token, err, errlen);
+    ds4_decode_item items[SCORE_MAX_SESSIONS];
+    for (int row = 0; row < count; row++) {
+        const int i = (row + step) % (unsigned)count;
+        const int next = i ? ds4_session_argmax(sessions[i]) : token;
+        if (next < 0) {
+            snprintf(err, errlen, "companion session %d has invalid logits", i);
+            return 1;
+        }
+        items[row] = (ds4_decode_item){.session = sessions[i], .token = next};
+    }
+    return ds4_sessions_eval_batch(items, count, err, errlen);
 }
 
 static char *read_file(const char *path) {
@@ -597,6 +635,8 @@ int main(int argc, char **argv) {
     uint32_t ssd_streaming_preload_experts = 0;
     const char *first_logits_path = NULL;
     int max_cases = 0;
+    int continued_prefill = 0;
+    int session_count = 1;
     ds4_dist_options dist = {0};
     ds4_tp_options tp = {0};
 
@@ -652,6 +692,15 @@ int main(int argc, char **argv) {
             first_logits_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--max-cases")) {
             max_cases = parse_positive_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--continued-prefill")) {
+            continued_prefill = parse_positive_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--session-batch")) {
+            session_count = parse_positive_int(need_arg(&i, argc, argv, arg), arg);
+            if (session_count > SCORE_MAX_SESSIONS) {
+                fprintf(stderr, "score_official: --session-batch must be between 1 and %d\n",
+                        SCORE_MAX_SESSIONS);
+                return 2;
+            }
         } else if (arg[0] != '-' && !ctx_set) {
             ctx_size = parse_positive_int(arg, "ctx");
             ctx_set = true;
@@ -760,6 +809,23 @@ int main(int argc, char **argv) {
 
     ds4_session *session = NULL;
     if (ds4_session_create(&session, engine, ctx_size) != 0) die("failed to create session");
+    ds4_session *sessions[SCORE_MAX_SESSIONS] = {session};
+    ds4_tokens companion_prompt[SCORE_MAX_SESSIONS] = {0};
+    static const char *companion_text[] = {
+        "List the integers from 1 to 100.",
+        "Explain how a hash table handles collisions, with an example.",
+        "Write a short story about a lighthouse keeper who discovers a letter.",
+        "Describe an algorithm for sorting a linked list and give its complexity.",
+        "Explain why the sky is blue.",
+        "Write a Python function that counts words, followed by three tests.",
+        "Compare three ways of storing a sparse matrix."
+    };
+    for (int i = 1; i < session_count; i++) {
+        if (ds4_session_create(&sessions[i], engine, ctx_size) != 0)
+            die("failed to create companion session");
+        ds4_encode_chat_prompt(engine, NULL, companion_text[i - 1], DS4_THINK_NONE,
+                               &companion_prompt[i]);
+    }
 
     const int n_vocab = ds4_engine_vocab_size(engine);
     float *logits = malloc((size_t)n_vocab * sizeof(logits[0]));
@@ -839,9 +905,18 @@ int main(int argc, char **argv) {
         }
         total_api_ref_tokens += have_api ? ref.n_pos : 0;
 
-        if (ds4_session_sync(session, &prompt, err, sizeof(err)) != 0) {
+        if (sync_prompt(session, &prompt, continued_prefill, err, sizeof(err)) != 0) {
             fprintf(stderr, "%s sync failed: %s\n", id, err);
             return 1;
+        }
+        for (int row = 1; row < session_count; row++) {
+            if (companion_prompt[row].len + target.len + 1 >= ctx_size)
+                die("companion continuation exceeds context");
+            ds4_session_invalidate(sessions[row]);
+            if (ds4_session_sync(sessions[row], &companion_prompt[row], err, sizeof(err)) != 0) {
+                fprintf(stderr, "%s companion %d sync failed: %s\n", id, row, err);
+                return 1;
+            }
         }
 
         double nll = 0.0;
@@ -934,7 +1009,8 @@ int main(int argc, char **argv) {
                 }
             }
 
-            if (ds4_session_eval(session, target.v[i], err, sizeof(err)) != 0) {
+            if (eval_with_companions(sessions, session_count, target.v[i], (unsigned)i,
+                                     err, sizeof(err)) != 0) {
                 fprintf(stderr, "%s eval failed at target token %d: %s\n", id, i, err);
                 return 1;
             }
@@ -1032,7 +1108,10 @@ int main(int argc, char **argv) {
     fclose(out);
     fclose(mf);
     free(logits);
-    ds4_session_free(session);
+    for (int i = 0; i < session_count; i++) {
+        ds4_session_free(sessions[i]);
+        ds4_tokens_free(&companion_prompt[i]);
+    }
     close_engine(engine);
     return 0;
 }

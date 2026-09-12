@@ -63,6 +63,9 @@ four times. Idle slots can be cached before reuse; active requests are not evict
 | Backend/model | Decode execution |
 | --- | --- |
 | Metal, resident Flash | Native shared-expert/QKV batching where supported |
+| Metal, resident V4.1 Flash | Native decoding for 2-8 sessions |
+| Metal RDMA TP, V4.1 Flash | Native decoding for 3-8 sessions; ordered fallback for two |
+| Metal SSD streaming, V4.1 Flash | Ordered fallback |
 | Metal, GLM 5.2 | Ordered fallback |
 | Metal, GLM 5.3 | Native batching through 2051 visible tokens; ordered fallback afterward |
 | CUDA, supported multi-GPU Flash TP layout | Native grouped decode and mixed prefill/decode |
@@ -70,7 +73,8 @@ four times. Idle slots can be cached before reuse; active requests are not evict
 
 Fallback executes the rows separately. It provides concurrency and scheduling
 fairness, not the aggregate speedup of native batching. Native grouping may
-change floating-point reduction order slightly.
+change floating-point reduction order slightly. V4.1 sessions containing images
+use the ordered fallback.
 
 Long prefills yield to active decoders in bounded intervals, normally 128
 tokens. `--mixed-prefill-quantum N` changes that interval for testing.

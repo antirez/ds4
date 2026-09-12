@@ -1,0 +1,3 @@
+# Differenza tra righe KV raw e righe KV compresse
+
+Nel contesto dei database e dei sistemi di storage (in particolare nei sistemi
