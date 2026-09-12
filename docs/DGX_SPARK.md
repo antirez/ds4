@@ -19,6 +19,15 @@ Do not use `--cuda-tensor-parallel` on a single Spark.
 Stop other inference services before loading a model so they do not compete
 for memory. Restore any services you stopped when finished.
 
+`DS4_CUDA_INDEXED_DECODE_GATHER=1` opts into ordered KV gathering for Flash's
+single-token indexed attention. It copies selected F32 rows once, in their
+existing order, before the original attention kernel reads them across heads.
+It does not change attention arithmetic, KV precision, cache formats or the
+selected rows. Unset, `0` and unrecognized values keep the original path.
+Other shapes, multi-GPU execution and graph capture also keep that path.
+This optimization has been evaluated on GB10; measure it on other CUDA devices
+before using it there. It does not change the Metal or ROCm backends.
+
 ## GLM 5.3 Flash
 
 Q2 is the resident target for one Spark:
