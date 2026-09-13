@@ -751,23 +751,30 @@ extern "C" void ds4_gpu_tp_set_split_exchange(ds4_gpu_tp_split_exchange_fn fn) {
 /* K-sliced Q8_0 matvec (TP shared-expert down / attention expand).      */
 /* ------------------------------------------------------------------ */
 
-__global__ static void matmul_q8_0_kslice_warp8_kernel(
+/* Like matmul_q8_0_preq_rows_w32_kernel, but each row starts k_off blocks
+ * into a row_bytes-strided Q8_0 matrix: the lanes stride over the owned K
+ * blocks so one wave instruction covers 32 consecutive 34-byte blocks and
+ * the int8 dot runs on pre-quantized activations.  The previous scalar
+ * form (one byte per lane, one block per iteration) ran at ~80 GB/s on
+ * gfx1151 against ~210 GB/s for this layout. */
+__global__ static void matmul_q8_0_kslice_preq_w32_kernel(
         float *out,
         const unsigned char *w,
-        const float *x,
+        const int8_t *xq,
+        const float *xscale,
         uint64_t k_blocks,
         uint64_t row_bytes,
-        uint64_t out_dim) {
-    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+        uint64_t out_dim,
+        uint32_t rows_per_block) {
+    const uint64_t row = (uint64_t)blockIdx.x * rows_per_block + (threadIdx.x >> 5u);
     const uint32_t lane = threadIdx.x & 31u;
     if (row >= out_dim) return;
     const unsigned char *wr = w + row * row_bytes;
     float acc = 0.0f;
-    for (uint64_t b = 0; b < k_blocks; b++) {
+    for (uint64_t b = lane; b < k_blocks; b += 32u) {
         const unsigned char *blk = wr + b * 34u;
-        const float d = q8_0_scale_broadcast_w32(blk);
-        const int8_t q = ((const int8_t *)(blk + 2u))[lane];
-        acc += d * (float)q * x[b * 32u + lane];
+        const int dot = dot_i8x32_dp4a((const int8_t *)(blk + 2u), xq + b * 32u);
+        acc += __half2float(*(const __half *)blk) * xscale[b] * (float)dot;
     }
     acc = warp_sum_f32(acc);
     if (lane == 0u) out[row] = acc;
@@ -796,13 +803,27 @@ extern "C" int ds4_gpu_matmul_q8_0_kslice_tensor(
             model_map, weight_offset, out_dim * row_bytes, "q8_0_kslice");
     if (!w) return 0;
     w += (k_off / 32u) * 34u;
-    matmul_q8_0_kslice_warp8_kernel<<<(unsigned)((out_dim + 7u) / 8u), 256>>>(
+    const uint64_t xq_bytes = k_blocks * 32u;
+    const uint64_t scale_off = (xq_bytes + 15u) & ~15ull;
+    void *tmp = cuda_tmp_alloc(scale_off + k_blocks * sizeof(float),
+                               "q8_0 kslice prequant");
+    if (!tmp) return 0;
+    int8_t *xq = (int8_t *)tmp;
+    float *xscale = (float *)((char *)tmp + scale_off);
+    quantize_q8_0_f32_kernel<<<(unsigned)k_blocks, 32>>>(
+            xq, xscale, (const float *)x->ptr + x_elem_off, k_cnt, k_blocks);
+    if (!cuda_ok(cudaGetLastError(), "matmul q8_0 kslice quantize launch")) return 0;
+    const uint32_t rpb = cuda_runtime_config()->q8_decode_rpb;
+    matmul_q8_0_kslice_preq_w32_kernel<<<
+            (unsigned)((out_dim + rpb - 1u) / rpb), rpb * 32u>>>(
             (float *)out->ptr,
             w,
-            (const float *)x->ptr + x_elem_off,
+            xq,
+            xscale,
             k_blocks,
             row_bytes,
-            out_dim);
+            out_dim,
+            rpb);
     return cuda_ok(cudaGetLastError(), "matmul q8_0 kslice launch");
 }
 
