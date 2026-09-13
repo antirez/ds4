@@ -476,6 +476,14 @@ int ds4_gpu_tp_gate_prefetch_plan(uint32_t gate,
  * split across both ranks. */
 void ds4_gpu_tp_suspend_expert_sharding(int suspend);
 int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate);
+/* Split form of ds4_gpu_tp_gate_encode for eager-stream backends (ROCm):
+ * arrive publishes the partial and queues the exchange, wait parks the
+ * stream on the release.  Kernels encoded between the two run while the
+ * exchange is in flight, so work that does not depend on the peer's half
+ * (the replicated shared expert) hides the gate latency.  Exactly one gate
+ * may be pending at a time and wait must name the same layer/gate. */
+int ds4_gpu_tp_gate_arrive(uint32_t layer, uint32_t gate);
+int ds4_gpu_tp_gate_wait(uint32_t layer, uint32_t gate);
 /* Verify-block batch gates: one exchange per layer moving `rows` partial
  * rows at once (speculative verify).  The callback runs on the gate service
  * thread with the same ud as the row-gate exchange fn. */

@@ -84,6 +84,10 @@ static uint32_t g_tp_qcount;
 static uint64_t g_tp_seq;        /* row gate sequence */
 static uint64_t g_tp_batch_seq;  /* batch + big gate sequence (shared, like Metal) */
 static uint64_t g_tp_split_seq;  /* kv-split gate sequence */
+/* Row gate pending between arrive and wait: gates are strictly ordered, so
+ * one slot/seq pair is enough and wait can check it names the same gate. */
+static uint32_t g_tp_pending_slot = UINT32_MAX;
+static uint64_t g_tp_pending_seq;
 
 /* Arrival signaling via stream events instead of a flag kernel: one kernel
  * launch per gate disappears from the critical path (the eager stream still
@@ -403,6 +407,7 @@ extern "C" int ds4_gpu_tp_init(uint32_t rank,
     g_tp_seq = 0;
     g_tp_batch_seq = 0;
     g_tp_split_seq = 0;
+    g_tp_pending_slot = UINT32_MAX;
     g_tp_qhead = 0;
     g_tp_qcount = 0;
     g_tp_exchange_fn = fn;
@@ -548,8 +553,8 @@ static volatile unsigned long long *ds4_rocm_tp_release_dev(uint32_t slot) {
                                            (uint64_t)slot * 8ull);
 }
 
-extern "C" int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
-    if (!g_tp_thread_running || g_tp_failed) return 0;
+extern "C" int ds4_gpu_tp_gate_arrive(uint32_t layer, uint32_t gate) {
+    if (!g_tp_thread_running || g_tp_failed || g_tp_pending_slot != UINT32_MAX) return 0;
     const uint64_t seq = ++g_tp_seq;
     const uint32_t slot = layer * 2u + gate;
     const uint32_t ev = (uint32_t)(++g_tp_event_seq % DS4_ROCM_TP_EVENTS);
@@ -567,10 +572,23 @@ extern "C" int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
     req.seq = seq;
     req.event_idx = ev;
     if (!ds4_rocm_tp_enqueue(&req)) return 0;
+    g_tp_pending_slot = slot;
+    g_tp_pending_seq = seq;
+    return 1;
+}
+
+extern "C" int ds4_gpu_tp_gate_wait(uint32_t layer, uint32_t gate) {
+    const uint32_t slot = layer * 2u + gate;
+    if (!g_tp_thread_running || g_tp_failed || g_tp_pending_slot != slot) return 0;
+    g_tp_pending_slot = UINT32_MAX;
     tp_gate_wait_kernel<<<1, 1>>>(
             ds4_rocm_tp_release_dev(slot),
-            (unsigned long long)(seq & ROCM_TP_SEQ_MASK));
-    return cuda_ok(cudaGetLastError(), "tp row gate encode");
+            (unsigned long long)(g_tp_pending_seq & ROCM_TP_SEQ_MASK));
+    return cuda_ok(cudaGetLastError(), "tp row gate wait encode");
+}
+
+extern "C" int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
+    return ds4_gpu_tp_gate_arrive(layer, gate) && ds4_gpu_tp_gate_wait(layer, gate);
 }
 
 extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {

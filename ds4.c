@@ -47803,12 +47803,23 @@ static bool glm_graph_encode_sparse_ffn_one(
         !(glm_decode_ablate_mask() & DS4_GLM_ABLATE_ROUTED)) {
         ok = imatrix_collect_glm_one(g->imatrix, g, il);
     }
+    /* The shared expert does not depend on the peer's routed half.  On the
+     * eager ROCm stream it is encoded between the gate's arrival and its
+     * release wait, so the GPU computes it while the CPUs exchange the
+     * routed partials instead of idling on the spin kernel; the combine
+     * then runs after both.  Metal keeps the single-call gate. */
+    bool tp_gate_pending = false;
     if (ok && tp_split_ffn) {
+#ifdef DS4_ROCM_BUILD
+        ok = ds4_gpu_tp_gate_arrive(il, DS4_TP_GATE_FFN) != 0;
+        tp_gate_pending = ok;
+#else
         ok = ds4_gpu_tp_gate_encode(il, DS4_TP_GATE_FFN) != 0;
         if (ok) ok = ds4_gpu_add_tensor(ffn_out,
                                         g->tp_out[tp_ffn_slot],
                                         g->tp_in[tp_ffn_slot],
                                         DS4_N_EMBD) != 0;
+#endif
         if (!ok) fprintf(stderr, "ds4: GLM TP gate/combine failed (layer %u)\n", il);
     } else if (!ok && tp_split_ffn) {
         fprintf(stderr, "ds4: GLM TP routed dispatch failed before the gate (layer %u)\n", il);
@@ -47862,6 +47873,14 @@ static bool glm_graph_encode_sparse_ffn_one(
                                              pos,
                                              1,
                                              stage_t0);
+    }
+    if (ok && tp_gate_pending) {
+        ok = ds4_gpu_tp_gate_wait(il, DS4_TP_GATE_FFN) != 0;
+        if (ok) ok = ds4_gpu_add_tensor(ffn_out,
+                                        g->tp_out[tp_ffn_slot],
+                                        g->tp_in[tp_ffn_slot],
+                                        DS4_N_EMBD) != 0;
+        if (!ok) fprintf(stderr, "ds4: GLM TP gate/combine failed (layer %u)\n", il);
     }
     if (ok && add_residual && !glm_graph_disable_add3_residual()) {
         ok = ds4_gpu_add3_tensor(next,
