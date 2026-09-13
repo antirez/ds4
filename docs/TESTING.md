@@ -26,6 +26,12 @@ make tests/test_session_state_gpu tests/test_glm53_kda tests/test_mxfp4_metal
 ./tests/test_mxfp4_metal
 ```
 
+The GLM KDA/attention executable is also included in `make test` on Metal.
+`make test-glm53-fork` runs the focused router/shared, serial top-k, and mixed
+Q8/BF16 input checks. `make test-glm53-hc-pre-repeat` checks repeated HC
+producer dispatches and equal output with both fallback producer variants.
+These two focused targets are Metal-only and model-free.
+
 `make test` also includes model-backed tests. Select the right GGUF and ensure
 that it fits before running it; do not accidentally load a large model on a
 single device during multi-GPU QA. ROCm has `make test-rocm`.

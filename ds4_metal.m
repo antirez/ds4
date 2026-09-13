@@ -38006,7 +38006,8 @@ static int ds4_gpu_glm_attention_indexed_batch_lora_layout_tensor(
          * and a token needs 64 / (8 * that many) staging passes over its
          * selected rows.  Gated to the GLM 5.3 DSA shape this was measured on:
          * no RoPE tail, 512 latent dimensions, resident, and a head range that
-         * divides evenly.
+         * divides evenly. The checked instantiation retains padded-ID safety;
+         * widening only shares row staging across heads.
          */
         const uint32_t heads_per_sg =
             ds4_gpu_glm53_prefill_indexed_attn_heads_per_sg();

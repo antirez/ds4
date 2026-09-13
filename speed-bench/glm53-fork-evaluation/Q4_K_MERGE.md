@@ -2,9 +2,9 @@
 
 All performance figures on this page use only the unchanged `GLM-5.3-Flash-Q4_K.gguf` (190,875,526,464 bytes). KDA and embedding/output-head weights remain BF16. Neither `-kdaQ8` nor `-kdaHeadQ8` is used in this comparison.
 
-Across these four frontiers, the merge adds **1.5–2.5% generation throughput** over the previous tip, with no resolved prefill change. Relative to current main, the branch gains **28.5–29.6% generation** and **14.9–18.9% prefill**. The 62,174-token new-arm result includes the opt-in DSA selector.
+Across these four frontiers, the measured merge adds **1.5–2.5% generation throughput** over the previous tip, with no resolved prefill change. Relative to the recorded main revision, the branch gains **28.5–29.6% generation** and **14.9–18.9% prefill**. The 62,174-token new-arm result includes the opt-in DSA selector. These measurements apply to the pinned revisions below, not subsequent rebases.
 
-The integration merge is `b4f26df3c7238eb2d2b13f27a52b60c87b483b76`, with parents `224e7669abac9fa64580e71a9a1581fa0c852d2a` and `8ad81dd02c6dd10db33a04e4d657162de6a494e8`. Its complete tree equals the validated experimental tip. Subsequent integration documentation commits do not change inference sources.
+The measured integration merge is `b4f26df3c7238eb2d2b13f27a52b60c87b483b76`, with parents `224e7669abac9fa64580e71a9a1581fa0c852d2a` and `8ad81dd02c6dd10db33a04e4d657162de6a494e8`. Its complete tree equals the validated experimental tip. The integration documentation commits recorded with this comparison did not change inference sources.
 
 ## What changed
 
@@ -37,7 +37,7 @@ Values are means of two runs per arm; percentage changes use unrounded means. Th
 
 ## Method
 
-Apple M3 Ultra, 80 GPU cores, 512 GiB RAM, macOS 26.5.2 (25F84). Current `origin/main` was fetched and pinned to `6289c516273979173abbc062209a81dd3706b804`. Previous branch tip: `224e7669abac9fa64580e71a9a1581fa0c852d2a`. New merge: `b4f26df3c7238eb2d2b13f27a52b60c87b483b76`.
+Apple M3 Ultra, 80 GPU cores, 512 GiB RAM, macOS 26.5.2 (25F84). At measurement time, `origin/main` was fetched and pinned to `6289c516273979173abbc062209a81dd3706b804`. Previous branch tip: `224e7669abac9fa64580e71a9a1581fa0c852d2a`. New merge: `b4f26df3c7238eb2d2b13f27a52b60c87b483b76`.
 
 Six serial processes in main → previous → new → new → previous → main order, two runs per arm. Each arm has the same mean position in the sequence, balancing linear drift. Each binary runs from its own frozen source directory so Metal shaders match the measured commit. The model is fully resident; SSD streaming, tracing and dispatch statistics are off. No model conversion occurs.
 

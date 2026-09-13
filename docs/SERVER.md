@@ -122,9 +122,10 @@ private. It is disposable; stop the server before clearing it.
 
 ## Tool history and debugging
 
-For DeepSeek, the server preserves sampled DSML tool blocks and assigns
-unguessable tool IDs. Replaying those IDs avoids retokenizing a differently
-formatted JSON history. The bounded replay map can be stored in cache files.
+For DeepSeek and GLM, the server preserves sampled tool blocks in each model's
+native syntax and assigns unguessable tool IDs. Replaying those IDs preserves
+the original tool-block bytes instead of retokenizing a differently formatted
+JSON history. The bounded replay map can be stored in cache files.
 When exact replay is unavailable, canonical rendering may require rebuilding
 part of the prefix.
 

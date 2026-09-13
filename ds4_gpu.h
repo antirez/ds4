@@ -349,7 +349,7 @@ enum {
     DS4_GPU_TEST_MXFP4_DOWN_HALF_LUT = 1u << 4,
     DS4_GPU_TEST_OUTPUT_HC_WEIGHTS4 = 1u << 5,
     DS4_GPU_TEST_HC_RMS_SCALE_PROJ = 1u << 6,
-    /* Exercise GLM prefill kernels on synthetic shapes/devices, while keeping
+    /* Exercise GLM tuning kernels on synthetic shapes/devices, while keeping
      * TP and streaming exclusions. The second flag forces the last KDA block
      * to finish before block 0 to test incoming-state ownership. */
     DS4_GPU_TEST_GLM53_PREFILL = 1u << 7,

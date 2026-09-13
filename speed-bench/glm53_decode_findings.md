@@ -5,10 +5,10 @@ Model: `GLM-5.3-Flash-Q4_K.gguf`, 177.8 GiB, fully resident, no SSD streaming.
 
 > **Benchmark provenance:** The measurements and model-sized exactness traces
 > in this document belong to the archived experimental series and the bases
-> identified in each campaign, ending with the `b0a147a` rebase. They were not
-> rerun on the later `9ab7053` base. Historical commit IDs and tables remain so
-> the measured artifacts stay identifiable; current runtime descriptions note
-> integration changes where they affect the old interpretation.
+> identified in each campaign, ending with the `b0a147a` rebase. Those pinned
+> results do not measure subsequent rebases. Historical commit IDs and tables
+> remain so the measured artifacts stay identifiable; current runtime
+> descriptions note integration changes where they affect the old interpretation.
 
 The short version: the routed-expert kernels are already close to the hardware
 ceiling, and the largest single consumer of decode bandwidth is not the experts
@@ -94,8 +94,9 @@ all of them at BF16, so it was not produced by that path.
 Metal has a fused three-way QKV matmul, `ds4_gpu_glm53_matmul_bf16_qkv`, which
 requires all three of q/k/v to be BF16 and issues one dispatch instead of
 three.  It is gated behind `DS4_METAL_DISABLE_M3_ULTRA_GLM53_DECODE`, so it was
-added as an M3 Ultra optimisation.  Quantizing KDA forfeits it and falls back
-to the generic per-tensor matmul.
+added as an M3 Ultra optimisation. In this measurement, quantizing KDA used
+the generic per-tensor matmul. For the later optional mixed Q8/BF16 fusion,
+see the [fork evaluation's scope and controls](glm53-fork-evaluation/REPORT.md#scope-of-the-adaptations).
 
 Measured, so the trade is not a guess:
 
@@ -294,8 +295,11 @@ the run is timing-only and can in principle perturb data-dependent routing.
 `DS4_GLM_DECODE_REPEAT` is the other half of the pincer.  Every stage it
 accepts is a pure function of its inputs, so dispatching it one extra time per
 site writes the same bytes; the whole-token delta is then one extra execution
-of that stage and **the model output is unchanged**.  Verified: all six arms
-dump logits identical to the baseline at max|delta| = 0.
+of that stage and **the model output is unchanged**. `hc_pre` repeats the
+producer variant that ran, including either fallback when compound fusion is
+disabled; the focused regression target is listed in the
+[testing guide](../docs/TESTING.md#focused-checks). In the historical measurement,
+all six arms dumped logits identical to the baseline at max|delta| = 0.
 
 Only idempotent stages get a bit.  The KDA recurrence advances conv and
 recurrent state, and directional steering updates in place, so neither can be
@@ -817,7 +821,7 @@ one change, and `DS4_METAL_DISABLE_GLM53_FLASH_TUNING` restores all of them:
 
 | switch | restores |
 |---|---|
-| `DS4_METAL_DISABLE_GLM53_HC_PRODUCER_FUSE` | four dispatches per mHC producer site instead of the fused BF16 kernel |
+| `DS4_METAL_DISABLE_GLM53_HC_PRODUCER_FUSE` | separate RMSNorm, mix projection, split/collapse, and weighted RMSNorm instead of the compound BF16 producer |
 | `DS4_METAL_DISABLE_GLM53_KDA_GATE_PAIR` | separate f_a / g_a and f_b / g_b projections |
 | `DS4_METAL_DISABLE_GLM53_KDA_GATE_TRIO` | beta as its own projection beside the pair |
 | `DS4_METAL_DISABLE_GLM53_KDA_OUT_HC_EXPAND` | a separate HC expand after kda_output |
@@ -891,10 +895,10 @@ Use the per-file overrides (`DS4_METAL_GLM53_KDA_SOURCE` and its siblings) with
 a single binary instead.  A measurement in this file was wrong for exactly
 this reason before it was caught.
 
-## Scope and caveats
+## Requantization scope and caveats
 
-- This is a **model-file** change, not an engine change.  It does not speed up
-  an artifact you already have; it produces a better one.
+- Requantization is a **model-file** change. Its measured gains require the
+  converted artifact; the engine-only measurements are recorded separately above.
 - Why the shipped artifact is BF16 is not established here.  It contradicts the
   repo's own quantizer, which suggests the artifact pipeline rather than a
   deliberate choice, but if it was deliberate the fix belongs upstream.
@@ -906,7 +910,7 @@ this reason before it was caught.
   head is worth a further +1.80% decode over a KDA-only artifact.  `token_embd`
   is deliberately not in the default -- it is a single-row lookup per token, so
   it saves resident memory rather than decode bandwidth.
-- Neither the constants recorded below nor a Q4_K KDA variant were measured.
+- A Q4_K KDA variant was not measured; the prefill sweeps are recorded below.
   The tool accepts `q4_K` as a target, which would take KDA to 2.39 GiB, but
   Q4_K on attention projections is a materially bigger quality question than
   Q8_0 and was not attempted.

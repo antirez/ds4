@@ -44312,19 +44312,12 @@ static uint32_t glm_graph_indexed_decode_split_blocks(void) {
     return (top_k + block_rows - 1u) / block_rows;
 }
 
-/* Every GLM 5.3 Flash decode optimisation on this branch is behind its own
- * rollback switch, and DS4_METAL_DISABLE_GLM53_FLASH_TUNING turns all of them
- * off at once, so one variable restores the pre-branch paths for an A/B run.
- * The table is the list; each entry is read once and cached.
+/* These graph-local GLM 5.3 Flash decode optimizations share an aggregate rollback
+ * switch with the backend-local tuning policies in ds4_metal.m. Each table
+ * entry is read once and cached.
  *
- * The prefill kernels pick their variant inside ds4_metal.m, where the shape
- * that selects them is known, so their switches live there and read the same
- * aggregate:
- *   DS4_METAL_DISABLE_GLM53_PREFILL_QK_LOW        qk-low token tile
- *   DS4_METAL_DISABLE_GLM53_PREFILL_INDEXED_ATTN  indexed attention head width
- *   DS4_METAL_DISABLE_GLM53_PREFILL_MOE_TAIL_CULL routed-expert tail cull
- *   DS4_METAL_DISABLE_GLM53_PREFILL_KDA_PREPARE   blocked KDA prepare
- *   DS4_METAL_DISABLE_GLM53_PREFILL_KDA_RECURRENCE two values per SIMDgroup */
+ * Backend-local variants are selected there because their tensor shapes and
+ * device restrictions are known at dispatch time. */
 typedef enum {
     GLM53_FLASH_HC_PRODUCER_FUSE,
     GLM53_FLASH_KDA_GATE_PAIR,
