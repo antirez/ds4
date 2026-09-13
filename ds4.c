@@ -54307,7 +54307,11 @@ static bool glm_graph_forward_token(
         glm_graph_decode_uses_indexed_attention(g, pos, logits_out);
     uint32_t decode_layer_flush_interval = 0;
     if (logits_out != NULL) {
-#if defined(__APPLE__) || defined(DS4_ROCM_BUILD) || defined(DS4_NO_GPU)
+        /* ROCm decodes eagerly on one in-order stream, where this periodic
+         * flush is a full device sync that only drains the CPU run-ahead
+         * (~2 ms/token at the 4-layer indexed cadence under TP), so it stays
+         * off there unless DS4_GLM_DECODE_FLUSH_INTERVAL asks for it. */
+#if defined(__APPLE__) || defined(DS4_NO_GPU)
         decode_layer_flush_interval = use_indexed_attention ? 4u : 32u;
 #endif
         const char *dfi = getenv("DS4_GLM_DECODE_FLUSH_INTERVAL");
