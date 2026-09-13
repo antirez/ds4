@@ -5,6 +5,45 @@
 #ifdef DS4_TP_HAVE_VERBS
 static atomic_uint decode_barriers;
 
+#ifdef __linux__
+static int fake_gid(struct ibv_context *ctx, uint32_t port, uint32_t index,
+                     struct ibv_gid_entry *entry, uint32_t flags, size_t size) {
+    (void)ctx;
+    assert(port == 1 && !flags && size == sizeof(*entry) && index < 5);
+    memset(entry, 0, sizeof(*entry));
+    entry->gid_type = index < 2 ? IBV_GID_TYPE_ROCE_V1 : IBV_GID_TYPE_ROCE_V2;
+    if (index == 4) return 0;
+    entry->gid.raw[10] = entry->gid.raw[11] = 0xff;
+    entry->gid.raw[12] = 127;
+    entry->gid.raw[15] = index == 2 ? 2 : 1;
+    return 0;
+}
+
+static void check_gid(void) {
+    ds4_tp tp = {0};
+    tp.rdma.api.query_gid_ex = fake_gid;
+    tp.control_fd = socket(AF_INET, SOCK_STREAM, 0);
+    assert(tp.control_fd >= 0);
+    struct sockaddr_in address = {.sin_family = AF_INET,
+        .sin_addr = {.s_addr = htonl(INADDR_LOOPBACK)}};
+    assert(bind(tp.control_fd, (struct sockaddr *)&address, sizeof(address)) == 0);
+    struct ibv_port_attr port = {.gid_tbl_len = 5};
+    union ibv_gid gid;
+    int index = -1;
+    assert(tp_rdma_linux_gid(&tp, NULL, &port, &gid, &index) == 2 && index == 3);
+    tp.opt.rdma_gid_index_set = true;
+    tp.opt.rdma_gid_index = 2;
+    assert(tp_rdma_linux_gid(&tp, NULL, &port, &gid, &index) == 1 && index == 2);
+    const int bad[] = {-1, 1, 4, 5, INT_MAX};
+    for (unsigned i = 0; i < sizeof(bad) / sizeof(*bad); i++) {
+        tp.opt.rdma_gid_index = bad[i];
+        assert(!tp_rdma_linux_gid(&tp, NULL, &port, &gid, &index));
+    }
+    close(tp.control_fd);
+    puts("RoCEv2 GID selection, direct address and invalid indices: PASS");
+}
+#endif
+
 typedef struct {
     struct ibv_wc recv[1024], send[1024];
     unsigned nr, dr, ns, ds, poll_batch, unsignaled;
@@ -171,9 +210,12 @@ static void check_rdma(void) {
 
 int main(void) {
 #ifdef DS4_TP_HAVE_VERBS
+#ifdef __linux__
+    check_gid();
+#endif
     check_rdma();
 #else
-    puts("SKIP: RDMA completion tests require the Apple verbs headers");
+    puts("SKIP: RDMA completion tests require verbs headers");
 #endif
     return 0;
 }

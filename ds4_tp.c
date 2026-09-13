@@ -1,13 +1,10 @@
-/* Tensor-parallel transport and lockstep protocol.  See ds4_tp.h and
- * misc/METAL_TENSOR_PARALLELISM.md for the design.
+/* Tensor-parallel transport and lockstep protocol. See ds4_tp.h.
  *
- * Wire notes: both ranks are identical Apple Silicon machines by
- * definition, so the wire format is host little-endian; the hello magic
+ * Wire notes: supported ranks are little-endian; the hello magic
  * doubles as a byte-order check.  The control socket is a plain blocking
- * TCP stream carrying framed commands.  Gate traffic goes over RDMA
- * (Thunderbolt UC queue pair, two-sided send/recv — see the driver quirks
- * note at ds4_tp_rdma) or over a dedicated full-duplex TCP socket at 16KB
- * per direction as the fallback. */
+ * TCP stream carrying framed commands. Gate traffic uses two-sided RDMA
+ * send/recv (Thunderbolt UC on Metal, RoCE RC on Linux) or a separate
+ * full-duplex TCP socket. */
 
 #include <errno.h>
 #include <fcntl.h>
@@ -18,6 +15,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
+#include <poll.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,7 +29,7 @@
 #include "ds4_tp.h"
 #include "ds4_gpu.h"
 
-#if defined(__APPLE__) && defined(__has_include)
+#if (defined(__APPLE__) || defined(__linux__)) && defined(__has_include)
 #if __has_include(<infiniband/verbs.h>)
 #include <infiniband/verbs.h>
 #include <dlfcn.h>
@@ -41,7 +39,8 @@
 
 #define DS4_TP_MAGIC UINT32_C(0x44533454) /* "DS4T" */
 #define DS4_TP_BATCH_MAGIC UINT32_C(0x44533442) /* "DS4B" */
-#define DS4_TP_PROTOCOL_VERSION 12u
+/* V4.1 CUDA workers now return half-logit frames after successful work. */
+#define DS4_TP_PROTOCOL_VERSION 14u
 
 #define DS4_TP_DEFAULT_TIMEOUT_SEC 300
 /* Once both ranks enter a Metal gate, a live exchange normally completes in
@@ -83,6 +82,7 @@ typedef struct {
     uint16_t lid;
     uint8_t gid[16];
     uint8_t link_layer;
+    uint8_t reliable;
 } ds4_tp_rdma_info;
 
 /* TCP gate frames carry a small header so a desynchronized pair fails loudly
@@ -109,6 +109,10 @@ typedef struct {
     int (*query_device)(struct ibv_context *, struct ibv_device_attr *);
     int (*query_port)(struct ibv_context *, uint8_t, struct ibv_port_attr *);
     int (*query_gid)(struct ibv_context *, uint8_t, int, union ibv_gid *);
+#ifdef __linux__
+    int (*query_gid_ex)(struct ibv_context *, uint32_t, uint32_t,
+                        struct ibv_gid_entry *, uint32_t, size_t);
+#endif
     struct ibv_pd *(*alloc_pd)(struct ibv_context *);
     int (*dealloc_pd)(struct ibv_pd *);
     struct ibv_mr *(*reg_mr)(struct ibv_pd *, void *, size_t, int);
@@ -158,6 +162,7 @@ typedef struct {
     int warm_failed;            /* last warm-up round failed (dead direction) */
     uint32_t setup_attempt;     /* queue pair recreations so far */
     pthread_mutex_t post_lock;
+    bool post_lock_ready;
     uint32_t recv_depth;        /* queue pair receive depth actually granted */
     uint32_t send_depth;        /* queue pair send depth actually granted */
     struct ibv_sge *win_sge;    /* window work request arrays (recv_depth) */
@@ -285,6 +290,79 @@ static int tp_socket_set_gate_timeout(int fd, uint64_t timeout_ms) {
     if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0)
         return 0;
     return 1;
+}
+
+static void tp_iov_advance(struct msghdr *msg, size_t bytes) {
+    while (msg->msg_iovlen && bytes >= msg->msg_iov->iov_len) {
+        bytes -= msg->msg_iov->iov_len;
+        msg->msg_iov++;
+        msg->msg_iovlen--;
+    }
+    if (bytes) {
+        msg->msg_iov->iov_base = (char *)msg->msg_iov->iov_base + bytes;
+        msg->msg_iov->iov_len -= bytes;
+    }
+}
+
+/* Keep both directions moving even if the kernel clamps the socket buffers. */
+static int tp_tcp_exchange_io(ds4_tp *tp, ds4_tp_gate_header *header,
+                              ds4_tp_gate_header *peer_header,
+                              const void *out, void *in, size_t bytes) {
+    struct iovec tx[] = {{header, sizeof(*header)}, {(void *)out, bytes}};
+    struct iovec rx[] = {{peer_header, sizeof(*peer_header)}, {in, bytes}};
+    struct msghdr send_msg = {.msg_iov = tx + !header, .msg_iovlen = header ? 2 : 1};
+    struct msghdr recv_msg = {.msg_iov = rx + !header, .msg_iovlen = header ? 2 : 1};
+    const double timeout = tp->gate_timeout_ms / 1000.0;
+    double deadline = tp_now_sec() + timeout;
+    while (send_msg.msg_iovlen || recv_msg.msg_iovlen) {
+        int progress = 0;
+        if (send_msg.msg_iovlen) {
+            int flags = MSG_DONTWAIT;
+#ifdef MSG_NOSIGNAL
+            flags |= MSG_NOSIGNAL;
+#endif
+            ssize_t n = sendmsg(tp->data_fd, &send_msg, flags);
+            if (n > 0) { tp_iov_advance(&send_msg, (size_t)n); progress = 1; }
+            else if (n == 0) { errno = EPIPE; return 0; }
+            else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) return 0;
+        }
+        if (recv_msg.msg_iovlen) {
+            ssize_t n = recvmsg(tp->data_fd, &recv_msg, MSG_DONTWAIT);
+            if (n > 0) { tp_iov_advance(&recv_msg, (size_t)n); progress = 1; }
+            else if (n == 0) { errno = ECONNRESET; return 0; }
+            else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) return 0;
+        }
+        if (progress) { deadline = tp_now_sec() + timeout; continue; }
+        const double remaining_ms = (deadline - tp_now_sec()) * 1000.0;
+        if (remaining_ms <= 0.0) { errno = ETIMEDOUT; return 0; }
+        struct pollfd pfd = {.fd = tp->data_fd,
+            .events = (send_msg.msg_iovlen ? POLLOUT : 0) |
+                      (recv_msg.msg_iovlen ? POLLIN : 0)};
+        int wait_ms = remaining_ms >= INT_MAX ? INT_MAX : (int)remaining_ms + 1;
+        if (poll(&pfd, 1, wait_ms) < 0 && errno != EINTR) return 0;
+        if (pfd.revents & POLLNVAL) { errno = EBADF; return 0; }
+    }
+    return 1;
+}
+
+static int tp_tcp_exchange(ds4_tp *tp, ds4_tp_gate_header *header,
+                           ds4_tp_gate_header *peer_header,
+                           const void *out, void *in, size_t bytes) {
+#ifdef __APPLE__
+    /* Darwin sendmsg can block despite MSG_DONTWAIT. The data socket has
+     * one exchange owner; restore its mode before blocking header I/O. */
+    const int flags = fcntl(tp->data_fd, F_GETFL);
+    if (flags < 0) return 0;
+    const bool changed = !(flags & O_NONBLOCK);
+    if (changed && fcntl(tp->data_fd, F_SETFL, flags | O_NONBLOCK) < 0) return 0;
+#endif
+    const int ok = tp_tcp_exchange_io(tp, header, peer_header, out, in, bytes);
+#ifdef __APPLE__
+    const int saved_errno = errno;
+    if (changed && fcntl(tp->data_fd, F_SETFL, flags) < 0) return 0;
+    errno = saved_errno;
+#endif
+    return ok;
 }
 
 #ifdef DS4_TP_HAVE_VERBS
@@ -534,8 +612,16 @@ int ds4_tp_validate_engine_options(
         }
         return 1;
     }
-    if (opt->backend != DS4_BACKEND_METAL) {
-        tp_set_err(err, errlen, "tensor parallelism requires the Metal backend");
+    bool supported_backend = opt->backend == DS4_BACKEND_METAL;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+    supported_backend |= opt->backend == DS4_BACKEND_CUDA;
+#endif
+    if (!supported_backend) {
+        tp_set_err(err, errlen, "network tensor parallelism requires Metal or supported CUDA models");
+        return 0;
+    }
+    if (opt->backend == DS4_BACKEND_CUDA && (opt->cuda_tensor_parallel || opt->ssd_streaming)) {
+        tp_set_err(err, errlen, "network CUDA TP requires one GPU per rank and resident expert shards");
         return 0;
     }
     if (opt->distributed.role != DS4_DISTRIBUTED_NONE) {
@@ -640,8 +726,12 @@ static int tp_gate_mask_fits(
 
 static int tp_rdma_load_api(ds4_tp_verbs_api *api) {
     if (api->handle) return 1;
+#ifdef __APPLE__
     void *h = dlopen("/usr/lib/librdma.dylib", RTLD_NOW | RTLD_LOCAL);
     if (!h) h = dlopen("librdma.dylib", RTLD_NOW | RTLD_LOCAL);
+#else
+    void *h = dlopen("libibverbs.so.1", RTLD_NOW | RTLD_LOCAL);
+#endif
     if (!h) return 0;
 #define TP_SYM(field, name) \
     do { \
@@ -656,6 +746,9 @@ static int tp_rdma_load_api(ds4_tp_verbs_api *api) {
     TP_SYM(query_device, "ibv_query_device");
     TP_SYM(query_port, "ibv_query_port");
     TP_SYM(query_gid, "ibv_query_gid");
+#ifdef __linux__
+    TP_SYM(query_gid_ex, "_ibv_query_gid_ex");
+#endif
     TP_SYM(alloc_pd, "ibv_alloc_pd");
     TP_SYM(dealloc_pd, "ibv_dealloc_pd");
     TP_SYM(reg_mr, "ibv_reg_mr");
@@ -681,6 +774,53 @@ static int tp_rdma_probe(ds4_tp_verbs_api *api) {
     return num > 0;
 }
 
+#ifdef __linux__
+/* Prefer the RoCEv2 GID belonging to the control socket's direct-link address.
+ * Device order need not agree between hosts with several crossed NIC ports. */
+static int tp_rdma_linux_gid(ds4_tp *tp, struct ibv_context *ctx,
+                              const struct ibv_port_attr *port,
+                              union ibv_gid *gid, int *index) {
+    struct sockaddr_storage local = {0};
+    socklen_t len = sizeof(local);
+    union ibv_gid address = {0};
+    bool have_address = getsockname(tp->control_fd, (struct sockaddr *)&local, &len) == 0;
+    if (have_address && local.ss_family == AF_INET) {
+        address.raw[10] = address.raw[11] = 0xff;
+        memcpy(address.raw + 12, &((struct sockaddr_in *)&local)->sin_addr, 4);
+    } else if (have_address && local.ss_family == AF_INET6) {
+        memcpy(address.raw, &((struct sockaddr_in6 *)&local)->sin6_addr, 16);
+    } else {
+        have_address = false;
+    }
+    int best = 0;
+    const int first = tp->opt.rdma_gid_index_set ? tp->opt.rdma_gid_index : 0;
+    if (first < 0 || first >= port->gid_tbl_len || first > UINT8_MAX) return 0;
+    const int end = tp->opt.rdma_gid_index_set ? first + 1 : port->gid_tbl_len;
+    for (int i = first; i < end && i <= UINT8_MAX; i++) {
+        struct ibv_gid_entry entry = {0};
+        if (tp->rdma.api.query_gid_ex(ctx, 1, (uint32_t)i, &entry, 0, sizeof(entry)) ||
+            entry.gid_type != IBV_GID_TYPE_ROCE_V2) continue;
+        const union ibv_gid zero = {0};
+        if (!memcmp(entry.gid.raw, zero.raw, sizeof(zero.raw))) continue;
+        const int score = have_address && !memcmp(entry.gid.raw, address.raw, 16) ? 2 : 1;
+        if (score > best) {
+            *gid = entry.gid;
+            *index = i;
+            best = score;
+        }
+    }
+    return best;
+}
+#endif
+
+static enum ibv_qp_type tp_rdma_qp_type(void) {
+#ifdef __APPLE__
+    return IBV_QPT_UC;
+#else
+    return IBV_QPT_RC;
+#endif
+}
+
 static int tp_rdma_open(ds4_tp *tp, char *err, size_t errlen) {
     ds4_tp_rdma *r = &tp->rdma;
     int num = 0;
@@ -694,12 +834,46 @@ static int tp_rdma_open(ds4_tp *tp, char *err, size_t errlen) {
      * unless the caller selected a device explicitly. */
     const char *want_name = tp->opt.rdma_device;
     char states[256] = "";
+#ifdef __linux__
+    int best = 0, candidates = 0;
+    for (int i = 0; i < num; i++) {
+        const char *name = r->api.get_device_name(devs[i]);
+        if (want_name && strcmp(want_name, name)) continue;
+        struct ibv_context *ctx = r->api.open_device(devs[i]);
+        if (!ctx) continue;
+        struct ibv_port_attr pa = {0};
+        union ibv_gid gid;
+        int index = -1;
+        const int score = !r->api.query_port(ctx, 1, &pa) && pa.state == IBV_PORT_ACTIVE &&
+            pa.link_layer == IBV_LINK_LAYER_ETHERNET ? tp_rdma_linux_gid(tp, ctx, &pa, &gid, &index) : 0;
+        if (score) candidates++;
+        if (score > best) {
+            if (r->ctx) r->api.close_device(r->ctx);
+            r->ctx = ctx;
+            r->port = pa;
+            r->gid = gid;
+            r->gid_index = index;
+            best = score;
+            snprintf(states, sizeof(states), "%s", name);
+        } else {
+            r->api.close_device(ctx);
+        }
+    }
+    r->api.free_device_list(devs);
+    if (!best || (!want_name && best == 1 && candidates > 1)) {
+        tp_set_err(err, errlen,
+            "tp rdma: %s; use the direct RoCE address for --coordinator, or select --rdma-device and --rdma-gid-index",
+            best ? "multiple active ports, none matches the control address" : "no active RoCEv2 GID for the requested device/index");
+        return 0;
+    }
+    fprintf(stderr, "ds4-tp: rdma device %s, RoCEv2 GID %d, RC\n", states, r->gid_index);
+#else
     for (int i = 0; i < num && !r->ctx; i++) {
         const char *name = r->api.get_device_name(devs[i]);
         if (want_name && strcmp(want_name, name) != 0) continue;
         struct ibv_context *ctx = r->api.open_device(devs[i]);
         if (!ctx) continue;
-        struct ibv_port_attr pa;
+        struct ibv_port_attr pa = {0};
         if (r->api.query_port(ctx, 1, &pa) == 0 &&
             (pa.state == IBV_PORT_ACTIVE || want_name)) {
             r->ctx = ctx;
@@ -754,6 +928,7 @@ static int tp_rdma_open(ds4_tp *tp, char *err, size_t errlen) {
             return 0;
         }
     }
+#endif
     r->pd = r->api.alloc_pd(r->ctx);
     if (!r->pd) {
         tp_set_err(err, errlen, "tp rdma: alloc_pd failed");
@@ -775,7 +950,7 @@ static int tp_rdma_open(ds4_tp *tp, char *err, size_t errlen) {
     struct ibv_qp_init_attr qia = {0};
     qia.send_cq = r->cq;
     qia.recv_cq = r->cq;
-    qia.qp_type = IBV_QPT_UC;
+    qia.qp_type = tp_rdma_qp_type();
     qia.cap.max_send_wr = 1024;
     qia.cap.max_recv_wr = 1024;
     qia.cap.max_send_sge = 1;
@@ -788,7 +963,7 @@ static int tp_rdma_open(ds4_tp *tp, char *err, size_t errlen) {
         r->qp = r->api.create_qp(r->pd, &qia);
     }
     if (!r->qp) {
-        tp_set_err(err, errlen, "tp rdma: create_qp(UC): %s", strerror(errno));
+        tp_set_err(err, errlen, "tp rdma: create_qp: %s", strerror(errno));
         return 0;
     }
     r->max_inline = qia.cap.max_inline_data;
@@ -797,7 +972,12 @@ static int tp_rdma_open(ds4_tp *tp, char *err, size_t errlen) {
     if (r->recv_depth > 4096u) r->recv_depth = 4096u;
     if (r->send_depth > 4096u) r->send_depth = 4096u;
 
-    pthread_mutex_init(&r->post_lock, NULL);
+    const int mutex_error = pthread_mutex_init(&r->post_lock, NULL);
+    if (mutex_error) {
+        tp_set_err(err, errlen, "tp rdma: post mutex: %s", strerror(mutex_error));
+        return 0;
+    }
+    r->post_lock_ready = true;
     return 1;
 }
 
@@ -856,7 +1036,9 @@ static int tp_rdma_warm_up(ds4_tp *tp, char *err, size_t errlen) {
         return 0;
     }
     int got_recv = 0, peer_got = 0, attempts = 0;
-    for (int attempt = 0; attempt < 20 && !(got_recv && peer_got); attempt++) {
+    bool warm_send_done = false;
+    const bool reliable = tp_rdma_qp_type() == IBV_QPT_RC;
+    for (int attempt = 0; attempt < (reliable ? 1 : 20) && !(got_recv && peer_got); attempt++) {
         attempts = attempt + 1;
         int send_done = peer_got;
         if (!peer_got) {
@@ -876,7 +1058,7 @@ static int tp_rdma_warm_up(ds4_tp *tp, char *err, size_t errlen) {
                 return 0;
             }
         }
-        const double deadline = tp_now_sec() + 0.1;
+        const double deadline = tp_now_sec() + (reliable ? tp->gate_timeout_ms / 1000.0 : 0.1);
         while (tp_now_sec() < deadline && !(send_done && got_recv)) {
             struct ibv_wc wc[8];
             int n = ibv_poll_cq(r->cq, 8, wc);
@@ -895,6 +1077,7 @@ static int tp_rdma_warm_up(ds4_tp *tp, char *err, size_t errlen) {
                 else send_done = 1;
             }
         }
+        warm_send_done = send_done != 0;
         uint32_t mine = (uint32_t)got_recv, theirs = 0, t = 0, b = 0;
         if (!tp_send_frame(tp->control_fd, DS4_TP_FRAME_RDMA_WARM, &mine, sizeof(mine)) ||
             !tp_read_frame_header(tp->control_fd, &t, &b) ||
@@ -905,10 +1088,10 @@ static int tp_rdma_warm_up(ds4_tp *tp, char *err, size_t errlen) {
         }
         peer_got = theirs != 0;
     }
-    if (!(got_recv && peer_got)) {
+    if (!(got_recv && peer_got) || (reliable && !warm_send_done)) {
         tp_set_err(err, errlen, "tp rdma: warm-up failed after %d attempts (recv %d, peer %d)",
                    attempts, got_recv, peer_got);
-        r->warm_failed = 1;
+        r->warm_failed = !reliable;
         return 0;
     }
     fprintf(stderr, "ds4-tp: rdma warm-up ok (%d attempt%s), queue depth recv %u send %u\n",
@@ -936,7 +1119,7 @@ static int tp_rdma_recreate_qp(ds4_tp *tp, char *err, size_t errlen) {
     struct ibv_qp_init_attr qia = {0};
     qia.send_cq = r->cq;
     qia.recv_cq = r->cq;
-    qia.qp_type = IBV_QPT_UC;
+    qia.qp_type = tp_rdma_qp_type();
     qia.cap.max_send_wr = 1024;
     qia.cap.max_recv_wr = 1024;
     qia.cap.max_send_sge = 1;
@@ -983,6 +1166,7 @@ static int tp_rdma_register_and_exchange(ds4_tp *tp, char *err, size_t errlen) {
     mine.lid = r->port.lid;
     memcpy(mine.gid, r->gid.raw, 16);
     mine.link_layer = r->port.link_layer;
+    mine.reliable = tp_rdma_qp_type() == IBV_QPT_RC;
     if (!tp_send_frame(tp->control_fd, DS4_TP_FRAME_RDMA_INFO, &mine, sizeof(mine))) {
         tp_set_err(err, errlen, "tp rdma: info send failed");
         return 0;
@@ -995,6 +1179,10 @@ static int tp_rdma_register_and_exchange(ds4_tp *tp, char *err, size_t errlen) {
         return 0;
     }
 
+    if (r->peer.reliable != mine.reliable || r->peer.link_layer != mine.link_layer) {
+        tp_set_err(err, errlen, "tp rdma: incompatible queue-pair transport");
+        return 0;
+    }
     /* INIT -> RTR -> RTS with the exact recipe the driver accepts (same as
      * JACCL): MTU 1024 and GRH via the IPv4-mapped GID. */
     struct ibv_qp_attr a = {0};
@@ -1011,6 +1199,17 @@ static int tp_rdma_register_and_exchange(ds4_tp *tp, char *err, size_t errlen) {
     memset(&a, 0, sizeof(a));
     a.qp_state = IBV_QPS_RTR;
     a.path_mtu = IBV_MTU_1024;
+    int rtr_mask = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN | IBV_QP_RQ_PSN;
+    if (mine.reliable) {
+        if (r->peer.mtu < IBV_MTU_256 || r->peer.mtu > IBV_MTU_4096) {
+            tp_set_err(err, errlen, "tp rdma: invalid peer MTU");
+            return 0;
+        }
+        a.path_mtu = (enum ibv_mtu)(mine.mtu < r->peer.mtu ? mine.mtu : r->peer.mtu);
+        a.max_dest_rd_atomic = 1;
+        a.min_rnr_timer = 12;
+        rtr_mask |= IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
+    }
     a.dest_qp_num = r->peer.qpn;
     a.rq_psn = r->peer.psn;
     a.ah_attr.dlid = (uint16_t)r->peer.lid;
@@ -1019,16 +1218,22 @@ static int tp_rdma_register_and_exchange(ds4_tp *tp, char *err, size_t errlen) {
     memcpy(a.ah_attr.grh.dgid.raw, r->peer.gid, 16);
     a.ah_attr.grh.sgid_index = (uint8_t)r->gid_index;
     a.ah_attr.grh.hop_limit = 1;
-    if (r->api.modify_qp(r->qp, &a,
-            IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
-            IBV_QP_RQ_PSN) != 0) {
+    if (r->api.modify_qp(r->qp, &a, rtr_mask) != 0) {
         tp_set_err(err, errlen, "tp rdma: modify RTR: %s", strerror(errno));
         return 0;
     }
     memset(&a, 0, sizeof(a));
     a.qp_state = IBV_QPS_RTS;
     a.sq_psn = mine.psn;
-    if (r->api.modify_qp(r->qp, &a, IBV_QP_STATE | IBV_QP_SQ_PSN) != 0) {
+    int rts_mask = IBV_QP_STATE | IBV_QP_SQ_PSN;
+    if (mine.reliable) {
+        a.timeout = 14;
+        a.retry_cnt = 3;
+        a.rnr_retry = 3;
+        a.max_rd_atomic = 1;
+        rts_mask |= IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY | IBV_QP_MAX_QP_RD_ATOMIC;
+    }
+    if (r->api.modify_qp(r->qp, &a, rts_mask) != 0) {
         tp_set_err(err, errlen, "tp rdma: modify RTS: %s", strerror(errno));
         return 0;
     }
@@ -1703,6 +1908,10 @@ static void tp_rdma_close(ds4_tp *tp) {
     if (r->cq) r->api.destroy_cq(r->cq);
     if (r->pd) r->api.dealloc_pd(r->pd);
     if (r->ctx) r->api.close_device(r->ctx);
+    if (r->post_lock_ready) pthread_mutex_destroy(&r->post_lock);
+    if (r->api.handle) dlclose(r->api.handle);
+    r->api.handle = NULL;
+    r->post_lock_ready = false;
     r->qp = NULL; r->mr = NULL; r->cq = NULL; r->pd = NULL; r->ctx = NULL;
 }
 
@@ -1921,6 +2130,16 @@ void ds4_tp_free(ds4_tp *tp) {
     free(tp);
 }
 
+void ds4_tp_detach_slab(ds4_tp *tp) {
+    if (!tp) return;
+#ifdef DS4_TP_HAVE_VERBS
+    tp_rdma_close(tp);
+#endif
+    tp->slab = NULL;
+    tp->rdma_active = false;
+    ds4_tp_mark_failed(tp);
+}
+
 int ds4_tp_rank(const ds4_tp *tp) { return tp->rank; }
 bool ds4_tp_is_rdma(const ds4_tp *tp) { return tp->rdma_active; }
 uint32_t ds4_tp_peer_ctx(const ds4_tp *tp) { return tp->peer_ctx; }
@@ -1939,48 +2158,24 @@ int ds4_tp_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq
 #ifdef DS4_TP_HAVE_VERBS
     if (tp->rdma_active) return tp_rdma_gate_exchange(tp, layer, gate, seq);
 #endif
-    /* TCP: both sides write their partial then read the peer's.  16KB per
-     * direction fits comfortably in the socket buffers, so the symmetric
-     * write-then-read cannot deadlock.  Header and payload go out in one
-     * writev so NODELAY does not split them into two segments. */
+    /* Send header and payload together without depending on socket capacity. */
     ds4_tp_gate_header h = { DS4_TP_MAGIC, (uint16_t)layer, (uint16_t)gate, seq };
-    struct iovec iov[2] = {
-        { &h, sizeof(h) },
-        { tp->slab + ds4_tp_slab_out_offset(tp, layer, gate), tp->vec_bytes },
-    };
-    size_t want = sizeof(h) + tp->vec_bytes;
-    ssize_t w = writev(tp->data_fd, iov, 2);
-    if (w < 0 || (size_t)w != want) {
-        /* Short writev: finish with the plain path. */
-        if (w < 0) return 0;
-        size_t done = (size_t)w;
-        if (done < sizeof(h)) {
-            if (!tp_write_full(tp->data_fd, (char *)&h + done, sizeof(h) - done)) return 0;
-            done = sizeof(h);
-        }
-        uint64_t payload_done = done - sizeof(h);
-        if (!tp_write_full(tp->data_fd,
-                           tp->slab + ds4_tp_slab_out_offset(tp, layer, gate) + payload_done,
-                           tp->vec_bytes - payload_done))
-            return 0;
-    }
     ds4_tp_gate_header ph;
-    if (!tp_read_full(tp->data_fd, &ph, sizeof(ph))) return 0;
+    if (!tp_tcp_exchange(tp, &h, &ph,
+            tp->slab + ds4_tp_slab_out_offset(tp, layer, gate),
+            tp->slab + ds4_tp_slab_in_offset(tp, layer, gate), tp->vec_bytes)) return 0;
     if (ph.magic != DS4_TP_MAGIC || ph.layer != layer || ph.gate != gate || ph.seq != seq) {
         fprintf(stderr, "ds4-tp: gate desync: got l=%u g=%u seq=%llu, want l=%u g=%u seq=%llu\n",
                 ph.layer, ph.gate, (unsigned long long)ph.seq,
                 layer, gate, (unsigned long long)seq);
         return 0;
     }
-    if (!tp_read_full(tp->data_fd, tp->slab + ds4_tp_slab_in_offset(tp, layer, gate),
-                      tp->vec_bytes))
-        return 0;
     return 1;
 }
 
 /* Verify-block batch gate: one exchange per layer moving all block rows at
  * once. The payload lives in the registered slab, so RDMA sends it directly;
- * TCP remains the symmetric write-then-read fallback. */
+ * TCP exchanges both directions concurrently. */
 /* Verify-block window: called on both ranks right before a speculative
  * verify block whose every layer ends in one batch gate of `rows` rows.
  * Drains the decode receive window, posts the first layer's receives,
@@ -2073,29 +2268,10 @@ int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
                 bytes);
     }
 #endif
-    struct iovec iov[2] = {
-        { &h, sizeof(h) },
-        { tp->slab + ds4_tp_slab_batch_out_offset(tp, layer), bytes },
-    };
-    size_t want = sizeof(h) + bytes;
-    ssize_t w = writev(tp->data_fd, iov, 2);
-    if (w < 0) return 0;
-    if ((size_t)w != want) {
-        size_t done = (size_t)w;
-        if (done < sizeof(h)) {
-            if (!tp_write_full(tp->data_fd, (char *)&h + done, sizeof(h) - done))
-                return 0;
-            done = sizeof(h);
-        }
-        uint64_t payload_done = done - sizeof(h);
-        if (!tp_write_full(tp->data_fd,
-                           tp->slab + ds4_tp_slab_batch_out_offset(tp, layer) +
-                               payload_done,
-                           bytes - payload_done))
-            return 0;
-    }
     ds4_tp_gate_header ph;
-    if (!tp_read_full(tp->data_fd, &ph, sizeof(ph))) return 0;
+    if (!tp_tcp_exchange(tp, &h, &ph,
+            tp->slab + ds4_tp_slab_batch_out_offset(tp, layer),
+            tp->slab + ds4_tp_slab_batch_in_offset(tp, layer), bytes)) return 0;
     if (ph.magic != DS4_TP_BATCH_MAGIC || ph.layer != layer ||
         ph.gate != rows || ph.seq != seq) {
         fprintf(stderr,
@@ -2105,17 +2281,10 @@ int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
                 layer, rows, (unsigned long long)seq);
         return 0;
     }
-    return tp_read_full(tp->data_fd,
-                        tp->slab + ds4_tp_slab_batch_in_offset(tp, layer),
-                        bytes);
+    return 1;
 }
 
-/* Prefill batch gate: RDMA uses the pipelined registered-slab path above.
- * The fallback alternates 2MB TCP write/read rounds in the same order, so
- * neither side can fill its send buffer while the peer is also only writing
- * (the 4MB socket buffers absorb one round). */
-#define DS4_TP_BIG_CHUNK (2ull * 1024ull * 1024ull)
-
+/* Prefill batch gate: RDMA uses the pipelined registered-slab path above. */
 int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
                              const void *out, void *in, uint64_t bytes) {
     if (tp->data_fd < 0 || !out || !in || bytes == 0) return 0;
@@ -2173,13 +2342,10 @@ int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
         return ok;
     }
 #endif
-    uint64_t off = 0;
-    while (off < bytes) {
-        const uint64_t n = bytes - off > DS4_TP_BIG_CHUNK ?
-                           DS4_TP_BIG_CHUNK : bytes - off;
-        if (!tp_write_full(tp->data_fd, (const char *)out + off, n)) return 0;
-        if (!tp_read_full(tp->data_fd, (char *)in + off, n)) return 0;
-        off += n;
+    if (!tp_tcp_exchange(tp, NULL, NULL, out, in, bytes)) {
+        fprintf(stderr, "ds4-tp: big gate payload exchange failed (layer %u): %s\n",
+                layer, strerror(errno));
+        return 0;
     }
     if (getenv("DS4_GLM_TP_DEBUG")) {
         const float *o = (const float *)out, *i = (const float *)in;
@@ -2875,6 +3041,7 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
         malloc((size_t)vocab * sizeof(*logits)) : NULL;
     if (ds4_engine_tp_vocab_split(engine) && !logits) {
         ds4_log(stderr, DS4_LOG_ERROR, "tp worker: logits buffer allocation failed");
+        ds4_engine_tp_unbind(engine);
         ds4_tp_free(tp);
         return 1;
     }
@@ -3047,6 +3214,7 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
     }
     free(sessions.v);
     free(logits);
+    ds4_engine_tp_unbind(engine);
     ds4_tp_free(tp);
     return rc;
 }
