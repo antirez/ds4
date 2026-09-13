@@ -65759,11 +65759,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
     const char *expert_hotlist_path = getenv("DS4_EXPERT_HOTLIST");
     if ((expert_profile_path && expert_profile_path[0]) ||
         (expert_hotlist_path && expert_hotlist_path[0])) {
-        if (e->backend == DS4_BACKEND_METAL) {
+        if (e->backend == DS4_BACKEND_METAL || e->backend == DS4_BACKEND_CUDA) {
             ds4_expert_profile_init(expert_profile_path, expert_hotlist_path);
         } else {
             fprintf(stderr,
-                    "ds4: expert profile/hotlist is Metal-only for now; ignoring for %s backend\n",
+                    "ds4: expert profile/hotlist requires Metal or CUDA; ignoring for %s backend\n",
                     ds4_backend_name(e->backend));
         }
     }
