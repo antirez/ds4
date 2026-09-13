@@ -349,8 +349,28 @@ enum {
     DS4_GPU_TEST_MXFP4_DOWN_HALF_LUT = 1u << 4,
     DS4_GPU_TEST_OUTPUT_HC_WEIGHTS4 = 1u << 5,
     DS4_GPU_TEST_HC_RMS_SCALE_PROJ = 1u << 6,
+    /* Exercise GLM tuning kernels on synthetic shapes/devices, while keeping
+     * TP and streaming exclusions. The second flag forces the last KDA block
+     * to finish before block 0 to test incoming-state ownership. */
+    DS4_GPU_TEST_GLM53_PREFILL = 1u << 7,
+    DS4_GPU_TEST_GLM53_KDA_LAST_BLOCK_FIRST = 1u << 8,
 };
 void ds4_gpu_test_set_flags(uint32_t flags);
+enum {
+    DS4_GPU_GLM53_PREFILL_QK_LOW = 1u << 0,
+    DS4_GPU_GLM53_PREFILL_INDEXED_ATTN = 1u << 1,
+    DS4_GPU_GLM53_PREFILL_MOE_TAIL_CULL = 1u << 2,
+    DS4_GPU_GLM53_PREFILL_KDA_PREPARE = 1u << 3,
+    DS4_GPU_GLM53_PREFILL_KDA_RECURRENCE = 1u << 4,
+    DS4_GPU_GLM53_ROUTER_TOP8 = 1u << 5,
+    DS4_GPU_GLM53_DECODE_QK_LOW = 1u << 6,
+    DS4_GPU_GLM53_BF16_SHORT_ROWS = 1u << 7,
+    DS4_GPU_GLM53_DSA_SCORE_TILE = 1u << 8,
+    DS4_GPU_GLM53_DECODE_KDA_VALUES4 = 1u << 9,
+    DS4_GPU_GLM53_KDA_INPUTS = 1u << 10,
+};
+/* Returns and clears GLM tuning coverage recorded only in the test mode. */
+uint32_t ds4_gpu_test_glm53_prefill_take_dispatches(void);
 void ds4_gpu_release_zero_prefix_prefill_mask_cache(void);
 #else
 static inline int ds4_gpu_device_is_pre_m5_apple_silicon(void) { return 0; }
@@ -1739,6 +1759,47 @@ int ds4_gpu_glm_attention_indexed_decode_typed_tensor(
         float                 beta_fast,
         float                 beta_slow);
 
+int ds4_gpu_glm_attention_indexed_decode_exact_typed_tensor(
+        ds4_gpu_tensor       *heads,
+        ds4_gpu_tensor       *scores,
+        ds4_gpu_tensor       *lora,
+        ds4_gpu_tensor       *denom,
+        const ds4_gpu_tensor *qk_low,
+        const ds4_gpu_tensor *kv_lora_cache,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              value_weight_offset,
+        uint32_t              value_weight_type,
+        const ds4_gpu_tensor *selected,
+        uint32_t              n_selected,
+        uint32_t              cache_cap,
+        bool                  cache_f16,
+        uint32_t              n_head,
+        uint32_t              kv_lora_dim,
+        uint32_t              qk_nope,
+        uint32_t              qk_rope,
+        uint32_t              value_dim);
+
+int ds4_gpu_glm_attention_indexed_decode_exact_tensor(
+        ds4_gpu_tensor       *heads,
+        ds4_gpu_tensor       *scores,
+        ds4_gpu_tensor       *lora,
+        ds4_gpu_tensor       *denom,
+        const ds4_gpu_tensor *qk_low,
+        const ds4_gpu_tensor *kv_lora_cache,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              value_weight_offset,
+        const ds4_gpu_tensor *selected,
+        uint32_t              n_selected,
+        uint32_t              cache_cap,
+        bool                  cache_f16,
+        uint32_t              n_head,
+        uint32_t              kv_lora_dim,
+        uint32_t              qk_nope,
+        uint32_t              qk_rope,
+        uint32_t              value_dim);
+
 int ds4_gpu_glm_attention_indexed_decode_split_group8_tensor(
         ds4_gpu_tensor       *heads,
         ds4_gpu_tensor       *partial_lora,
@@ -3027,6 +3088,27 @@ int ds4_gpu_hc_expand_add_rms_norm_mix_split_norm_f16_tensor(
         float                 hc_eps,
         float                 norm_eps);
 
+int ds4_gpu_hc_rms_norm_mix_split_norm_bf16_tensor(
+        ds4_gpu_tensor       *mix,
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *norm_out,
+        ds4_gpu_tensor       *split,
+        const ds4_gpu_tensor *residual_hc,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              mix_weight_offset,
+        uint64_t              scale_offset,
+        uint64_t              base_offset,
+        uint64_t              norm_weight_offset,
+        uint32_t              n,
+        uint32_t              mix_dim,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        uint32_t              sinkhorn_iters,
+        float                 eps,
+        float                 hc_eps,
+        float                 norm_eps);
+
 #endif
 int ds4_gpu_output_hc_weights_tensor(
         ds4_gpu_tensor       *out,
@@ -3196,6 +3278,71 @@ int ds4_gpu_glm53_matmul_bf16_qkv(
         uint32_t              in_dim,
         uint32_t              out_dim,
         const ds4_gpu_tensor *x);
+
+int ds4_gpu_glm53_matmul_bf16_pair(
+        ds4_gpu_tensor       *out_a,
+        ds4_gpu_tensor       *out_b,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_a_offset,
+        uint64_t              weight_b_offset,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        const ds4_gpu_tensor *x_a,
+        const ds4_gpu_tensor *x_b);
+
+#ifdef __APPLE__
+/* Single-token GLM-5.3 KDA input projections, all reading 4096 F32 values.
+ * Slots are Q/K/V (8192 rows), f_a/g_a (128 rows), and beta (64 rows).
+ * Returns zero without encoding when the resident M3 Ultra policy declines. */
+int ds4_gpu_glm53_kda_inputs_bf16(
+        ds4_gpu_tensor *const outputs[6], const uint64_t weight_offsets[6],
+        const void *model_map, uint64_t model_size, const ds4_gpu_tensor *x);
+
+/* Exact bounded selector for serial GLM pool rows, with the original
+ * sort as a GPU-dispatched fallback. Experimental opt-in. */
+int ds4_gpu_glm53_indexer_topk_tensor(ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *scores, uint32_t n_comp,
+        uint32_t n_tokens, uint32_t top_k);
+/* Call only after synchronizing. Reports cumulative selector telemetry. */
+int ds4_gpu_test_glm53_topk_stats(uint32_t *out, uint32_t count);
+int ds4_gpu_test_glm53_topk_poison_recovery_state(void);
+void ds4_gpu_test_invalidate_completion_counters(void);
+
+int ds4_gpu_glm53_kda_inputs_q8_bf16(
+        ds4_gpu_tensor *const outputs[6], const uint64_t weight_offsets[6],
+        const void *model_map, uint64_t model_size, const ds4_gpu_tensor *x);
+#endif
+
+uint64_t ds4_gpu_encoder_count(void);
+
+int ds4_gpu_glm53_matmul_bf16_trio(
+        ds4_gpu_tensor       *out_a,
+        ds4_gpu_tensor       *out_b,
+        ds4_gpu_tensor       *out_c,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_a_offset,
+        uint64_t              weight_b_offset,
+        uint64_t              weight_c_offset,
+        uint32_t              in_dim,
+        uint32_t              out_dim_ab,
+        uint32_t              out_dim_c,
+        const ds4_gpu_tensor *x);
+
+int ds4_gpu_glm53_matmul_bf16_hc_expand4(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *hc_out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *post,
+        const ds4_gpu_tensor *comb,
+        uint32_t              n_hc);
 
 #ifndef DS4_GLM53_VISION_TYPES_DEFINED
 #define DS4_GLM53_VISION_TYPES_DEFINED
@@ -3380,6 +3527,17 @@ int  ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key);
 int  ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key);
 void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key);
 void ds4_gpu_decode_graphs_invalidate(void);
+
+#ifdef __APPLE__
+int ds4_gpu_glm53_router_shared_exact(
+        ds4_gpu_tensor *logits, ds4_gpu_tensor *selected,
+        ds4_gpu_tensor *weights, ds4_gpu_tensor *probs,
+        ds4_gpu_tensor *counter, ds4_gpu_tensor *shared_mid,
+        const void *model_map, uint64_t model_size,
+        uint64_t router_offset, uint64_t bias_offset,
+        uint64_t gate_offset, uint64_t up_offset,
+        const ds4_gpu_tensor *x, float scale, float clamp);
+#endif
 
 #ifdef __cplusplus
 }

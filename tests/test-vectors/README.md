@@ -41,7 +41,10 @@ new directory instead of replacing an existing fixture. Confirm which
 checkpoint the API is serving before assigning the label. Running the fetcher
 without `--only` also regenerates `official.vec`.
 
-The C runner defaults to the 0731 official and local-golden fixtures:
+The C runner defaults to the 0731 official and local-golden fixtures, but
+skips these defaults for GLM models. Explicit `DS4_TEST_VECTOR_FILE` and
+`DS4_TEST_LOCAL_GOLDEN_FILE` overrides are always checked; select a fixture
+matching the model and checkpoint:
 
 ```sh
 ./ds4_test --logprob-vectors

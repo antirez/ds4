@@ -1,0 +1,27 @@
+{
+  "commit": "0f211542950428f2469c0976a1ecf459abc6feab",
+  "queries": 30000,
+  "operations": [
+    "insert",
+    "remove",
+    "longest prefix"
+  ],
+  "cases": [
+    "binary keys",
+    "empty keys",
+    "null values",
+    "nested prefixes"
+  ],
+  "result": "passed",
+  "command": [
+    "cc",
+    "-O2",
+    "-I",
+    "recovery-arm",
+    "check-rax-prefix.c",
+    "recovery-arm/rax.o",
+    "-o",
+    "check-rax-prefix"
+  ],
+  "source_sha256": "ef108d3919b11c61bca57045d12d9ebc569b05d85fa4bbb2a13637b36ef53320"
+}

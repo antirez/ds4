@@ -1,0 +1,721 @@
+[
+  {
+    "tag": "q8-baseline-trace-short",
+    "arm": "baseline",
+    "command": [
+      "./campaign-bench",
+      "-m",
+      "/Users/jw/ds4/gguf/GLM-5.3-Flash-Q4_K-kdaQ8.gguf",
+      "--prompt-file",
+      "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/baseline/speed-bench/promessi_sposi.txt",
+      "--ctx-start",
+      "2048",
+      "--ctx-max",
+      "8192",
+      "--step-mul",
+      "4",
+      "--ctx-alloc",
+      "16384",
+      "--gen-tokens",
+      "128",
+      "--show-output",
+      "--csv",
+      "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/runs/q8-baseline-trace-short.csv"
+    ],
+    "runtime_overrides": {
+      "DS4_BENCH_FORCE_SNAPSHOT": "1",
+      "DS4_GLM_ENABLE_KDA_Q8_INPUTS": "1",
+      "DS4_BENCH_SAVE_PREFIX": "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/prefix-q8-short",
+      "DS4_BENCH_TRACE_LOGITS": "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/runs/q8-baseline-trace-short.bin"
+    },
+    "wall_seconds": 75.93162131309509,
+    "rows": [
+      {
+        "ctx_tokens": "2048",
+        "prefill_tokens": "2048",
+        "prefill_tps": "509.25",
+        "gen_tokens": "128",
+        "gen_tps": "30.56",
+        "gen_first_ms": "38.533",
+        "gen_steady_tokens": "127",
+        "gen_steady_tps": "30.63",
+        "kvcache_bytes": "202327452"
+      },
+      {
+        "ctx_tokens": "8192",
+        "prefill_tokens": "6144",
+        "prefill_tps": "434.68",
+        "gen_tokens": "128",
+        "gen_tps": "30.33",
+        "gen_first_ms": "33.501",
+        "gen_steady_tokens": "127",
+        "gen_steady_tps": "30.36",
+        "kvcache_bytes": "0"
+      }
+    ],
+    "trace_instrumented": true,
+    "prefix_loaded": false,
+    "trace_sha256": "ed1e63dd49f42ffa25f169592f1293f3214cdec209b22fa6d9ca672cb987e291"
+  },
+  {
+    "tag": "q8-candidate-trace-short",
+    "arm": "q8-arm",
+    "command": [
+      "./campaign-bench",
+      "-m",
+      "/Users/jw/ds4/gguf/GLM-5.3-Flash-Q4_K-kdaQ8.gguf",
+      "--prompt-file",
+      "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/baseline/speed-bench/promessi_sposi.txt",
+      "--ctx-start",
+      "2048",
+      "--ctx-max",
+      "8192",
+      "--step-mul",
+      "4",
+      "--ctx-alloc",
+      "16384",
+      "--gen-tokens",
+      "128",
+      "--show-output",
+      "--csv",
+      "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/runs/q8-candidate-trace-short.csv"
+    ],
+    "runtime_overrides": {
+      "DS4_BENCH_FORCE_SNAPSHOT": "1",
+      "DS4_GLM_ENABLE_KDA_Q8_INPUTS": "1",
+      "DS4_BENCH_TRACE_LOGITS": "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/runs/q8-candidate-trace-short.bin"
+    },
+    "wall_seconds": 30.2089741230011,
+    "rows": [
+      {
+        "ctx_tokens": "2048",
+        "prefill_tokens": "2048",
+        "prefill_tps": "509.01",
+        "gen_tokens": "128",
+        "gen_tps": "31.61",
+        "gen_first_ms": "31.583",
+        "gen_steady_tokens": "127",
+        "gen_steady_tps": "31.63",
+        "kvcache_bytes": "202327452"
+      },
+      {
+        "ctx_tokens": "8192",
+        "prefill_tokens": "6144",
+        "prefill_tps": "434.85",
+        "gen_tokens": "128",
+        "gen_tps": "31.28",
+        "gen_first_ms": "31.586",
+        "gen_steady_tokens": "127",
+        "gen_steady_tps": "31.30",
+        "kvcache_bytes": "0"
+      }
+    ],
+    "trace_instrumented": true,
+    "prefix_loaded": false,
+    "trace_sha256": "ed1e63dd49f42ffa25f169592f1293f3214cdec209b22fa6d9ca672cb987e291"
+  },
+  {
+    "tag": "q8-ab-0-baseline",
+    "arm": "baseline",
+    "command": [
+      "./ds4-bench",
+      "-m",
+      "/Users/jw/ds4/gguf/GLM-5.3-Flash-Q4_K-kdaQ8.gguf",
+      "--prompt-file",
+      "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/baseline/speed-bench/promessi_sposi.txt",
+      "--ctx-start",
+      "2048",
+      "--ctx-max",
+      "8192",
+      "--step-mul",
+      "4",
+      "--ctx-alloc",
+      "16384",
+      "--gen-tokens",
+      "256",
+      "--show-output",
+      "--csv",
+      "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/runs/q8-ab-0-baseline.csv"
+    ],
+    "runtime_overrides": {
+      "DS4_BENCH_FORCE_SNAPSHOT": "1",
+      "DS4_GLM_ENABLE_KDA_Q8_INPUTS": "1"
+    },
+    "wall_seconds": 36.86239194869995,
+    "rows": [
+      {
+        "ctx_tokens": "2048",
+        "prefill_tokens": "2048",
+        "prefill_tps": "508.57",
+        "gen_tokens": "256",
+        "gen_tps": "30.66",
+        "gen_first_ms": "33.209",
+        "gen_steady_tokens": "255",
+        "gen_steady_tps": "30.69",
+        "kvcache_bytes": "202327452"
+      },
+      {
+        "ctx_tokens": "8192",
+        "prefill_tokens": "6144",
+        "prefill_tps": "434.51",
+        "gen_tokens": "256",
+        "gen_tps": "30.49",
+        "gen_first_ms": "32.443",
+        "gen_steady_tokens": "255",
+        "gen_steady_tps": "30.52",
+        "kvcache_bytes": "0"
+      }
+    ],
+    "trace_instrumented": false,
+    "prefix_loaded": false
+  },
+  {
+    "tag": "q8-ab-1-router-arm",
+    "arm": "router-arm",
+    "command": [
+      "./ds4-bench",
+      "-m",
+      "/Users/jw/ds4/gguf/GLM-5.3-Flash-Q4_K-kdaQ8.gguf",
+      "--prompt-file",
+      "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/baseline/speed-bench/promessi_sposi.txt",
+      "--ctx-start",
+      "2048",
+      "--ctx-max",
+      "8192",
+      "--step-mul",
+      "4",
+      "--ctx-alloc",
+      "16384",
+      "--gen-tokens",
+      "256",
+      "--show-output",
+      "--csv",
+      "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/runs/q8-ab-1-router-arm.csv"
+    ],
+    "runtime_overrides": {
+      "DS4_BENCH_FORCE_SNAPSHOT": "1",
+      "DS4_GLM_ENABLE_KDA_Q8_INPUTS": "1"
+    },
+    "wall_seconds": 36.70477890968323,
+    "rows": [
+      {
+        "ctx_tokens": "2048",
+        "prefill_tokens": "2048",
+        "prefill_tps": "508.68",
+        "gen_tokens": "256",
+        "gen_tps": "31.29",
+        "gen_first_ms": "32.113",
+        "gen_steady_tokens": "255",
+        "gen_steady_tps": "31.32",
+        "kvcache_bytes": "202327452"
+      },
+      {
+        "ctx_tokens": "8192",
+        "prefill_tokens": "6144",
+        "prefill_tps": "434.62",
+        "gen_tokens": "256",
+        "gen_tps": "30.99",
+        "gen_first_ms": "32.172",
+        "gen_steady_tokens": "255",
+        "gen_steady_tps": "31.02",
+        "kvcache_bytes": "0"
+      }
+    ],
+    "trace_instrumented": false,
+    "prefix_loaded": false
+  },
+  {
+    "tag": "q8-ab-2-q8-arm",
+    "arm": "q8-arm",
+    "command": [
+      "./ds4-bench",
+      "-m",
+      "/Users/jw/ds4/gguf/GLM-5.3-Flash-Q4_K-kdaQ8.gguf",
+      "--prompt-file",
+      "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/baseline/speed-bench/promessi_sposi.txt",
+      "--ctx-start",
+      "2048",
+      "--ctx-max",
+      "8192",
+      "--step-mul",
+      "4",
+      "--ctx-alloc",
+      "16384",
+      "--gen-tokens",
+      "256",
+      "--show-output",
+      "--csv",
+      "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/runs/q8-ab-2-q8-arm.csv"
+    ],
+    "runtime_overrides": {
+      "DS4_BENCH_FORCE_SNAPSHOT": "1",
+      "DS4_GLM_ENABLE_KDA_Q8_INPUTS": "1"
+    },
+    "wall_seconds": 36.52256393432617,
+    "rows": [
+      {
+        "ctx_tokens": "2048",
+        "prefill_tokens": "2048",
+        "prefill_tps": "509.05",
+        "gen_tokens": "256",
+        "gen_tps": "31.78",
+        "gen_first_ms": "32.309",
+        "gen_steady_tokens": "255",
+        "gen_steady_tps": "31.81",
+        "kvcache_bytes": "202327452"
+      },
+      {
+        "ctx_tokens": "8192",
+        "prefill_tokens": "6144",
+        "prefill_tps": "434.62",
+        "gen_tokens": "256",
+        "gen_tps": "31.48",
+        "gen_first_ms": "31.741",
+        "gen_steady_tokens": "255",
+        "gen_steady_tps": "31.51",
+        "kvcache_bytes": "0"
+      }
+    ],
+    "trace_instrumented": false,
+    "prefix_loaded": false
+  },
+  {
+    "tag": "q8-ab-3-q8-arm",
+    "arm": "q8-arm",
+    "command": [
+      "./ds4-bench",
+      "-m",
+      "/Users/jw/ds4/gguf/GLM-5.3-Flash-Q4_K-kdaQ8.gguf",
+      "--prompt-file",
+      "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/baseline/speed-bench/promessi_sposi.txt",
+      "--ctx-start",
+      "2048",
+      "--ctx-max",
+      "8192",
+      "--step-mul",
+      "4",
+      "--ctx-alloc",
+      "16384",
+      "--gen-tokens",
+      "256",
+      "--show-output",
+      "--csv",
+      "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/runs/q8-ab-3-q8-arm.csv"
+    ],
+    "runtime_overrides": {
+      "DS4_BENCH_FORCE_SNAPSHOT": "1",
+      "DS4_GLM_ENABLE_KDA_Q8_INPUTS": "1"
+    },
+    "wall_seconds": 36.38669228553772,
+    "rows": [
+      {
+        "ctx_tokens": "2048",
+        "prefill_tokens": "2048",
+        "prefill_tps": "509.00",
+        "gen_tokens": "256",
+        "gen_tps": "31.80",
+        "gen_first_ms": "32.092",
+        "gen_steady_tokens": "255",
+        "gen_steady_tps": "31.83",
+        "kvcache_bytes": "202327452"
+      },
+      {
+        "ctx_tokens": "8192",
+        "prefill_tokens": "6144",
+        "prefill_tps": "434.58",
+        "gen_tokens": "256",
+        "gen_tps": "31.48",
+        "gen_first_ms": "31.649",
+        "gen_steady_tokens": "255",
+        "gen_steady_tps": "31.51",
+        "kvcache_bytes": "0"
+      }
+    ],
+    "trace_instrumented": false,
+    "prefix_loaded": false
+  },
+  {
+    "tag": "q8-ab-4-router-arm",
+    "arm": "router-arm",
+    "command": [
+      "./ds4-bench",
+      "-m",
+      "/Users/jw/ds4/gguf/GLM-5.3-Flash-Q4_K-kdaQ8.gguf",
+      "--prompt-file",
+      "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/baseline/speed-bench/promessi_sposi.txt",
+      "--ctx-start",
+      "2048",
+      "--ctx-max",
+      "8192",
+      "--step-mul",
+      "4",
+      "--ctx-alloc",
+      "16384",
+      "--gen-tokens",
+      "256",
+      "--show-output",
+      "--csv",
+      "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/runs/q8-ab-4-router-arm.csv"
+    ],
+    "runtime_overrides": {
+      "DS4_BENCH_FORCE_SNAPSHOT": "1",
+      "DS4_GLM_ENABLE_KDA_Q8_INPUTS": "1"
+    },
+    "wall_seconds": 36.63446593284607,
+    "rows": [
+      {
+        "ctx_tokens": "2048",
+        "prefill_tokens": "2048",
+        "prefill_tps": "508.40",
+        "gen_tokens": "256",
+        "gen_tps": "31.29",
+        "gen_first_ms": "32.535",
+        "gen_steady_tokens": "255",
+        "gen_steady_tps": "31.32",
+        "kvcache_bytes": "202327452"
+      },
+      {
+        "ctx_tokens": "8192",
+        "prefill_tokens": "6144",
+        "prefill_tps": "434.54",
+        "gen_tokens": "256",
+        "gen_tps": "30.99",
+        "gen_first_ms": "32.405",
+        "gen_steady_tokens": "255",
+        "gen_steady_tps": "31.02",
+        "kvcache_bytes": "0"
+      }
+    ],
+    "trace_instrumented": false,
+    "prefix_loaded": false
+  },
+  {
+    "tag": "q8-ab-5-baseline",
+    "arm": "baseline",
+    "command": [
+      "./ds4-bench",
+      "-m",
+      "/Users/jw/ds4/gguf/GLM-5.3-Flash-Q4_K-kdaQ8.gguf",
+      "--prompt-file",
+      "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/baseline/speed-bench/promessi_sposi.txt",
+      "--ctx-start",
+      "2048",
+      "--ctx-max",
+      "8192",
+      "--step-mul",
+      "4",
+      "--ctx-alloc",
+      "16384",
+      "--gen-tokens",
+      "256",
+      "--show-output",
+      "--csv",
+      "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/runs/q8-ab-5-baseline.csv"
+    ],
+    "runtime_overrides": {
+      "DS4_BENCH_FORCE_SNAPSHOT": "1",
+      "DS4_GLM_ENABLE_KDA_Q8_INPUTS": "1"
+    },
+    "wall_seconds": 36.97553205490112,
+    "rows": [
+      {
+        "ctx_tokens": "2048",
+        "prefill_tokens": "2048",
+        "prefill_tps": "508.53",
+        "gen_tokens": "256",
+        "gen_tps": "30.72",
+        "gen_first_ms": "32.952",
+        "gen_steady_tokens": "255",
+        "gen_steady_tps": "30.74",
+        "kvcache_bytes": "202327452"
+      },
+      {
+        "ctx_tokens": "8192",
+        "prefill_tokens": "6144",
+        "prefill_tps": "434.73",
+        "gen_tokens": "256",
+        "gen_tps": "30.39",
+        "gen_first_ms": "32.570",
+        "gen_steady_tokens": "255",
+        "gen_steady_tps": "30.41",
+        "kvcache_bytes": "0"
+      }
+    ],
+    "trace_instrumented": false,
+    "prefix_loaded": false
+  },
+  {
+    "tag": "q8-baseline-trace-long",
+    "arm": "baseline",
+    "command": [
+      "./campaign-bench",
+      "-m",
+      "/Users/jw/ds4/gguf/GLM-5.3-Flash-Q4_K-kdaQ8.gguf",
+      "--prompt-file",
+      "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/baseline/speed-bench/promessi_sposi.txt",
+      "--ctx-start",
+      "62174",
+      "--ctx-max",
+      "62174",
+      "--step-incr",
+      "237826",
+      "--ctx-alloc",
+      "63000",
+      "--gen-tokens",
+      "256",
+      "--show-output",
+      "--csv",
+      "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/runs/q8-baseline-trace-long.csv"
+    ],
+    "runtime_overrides": {
+      "DS4_BENCH_FORCE_SNAPSHOT": "1",
+      "DS4_GLM_ENABLE_KDA_Q8_INPUTS": "1",
+      "DS4_BENCH_SAVE_PREFIX": "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/prefix-q8-long",
+      "DS4_BENCH_TRACE_LOGITS": "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/runs/q8-baseline-trace-long.bin"
+    },
+    "wall_seconds": 158.46707820892334,
+    "rows": [
+      {
+        "ctx_tokens": "62174",
+        "prefill_tokens": "62174",
+        "prefill_tps": "422.14",
+        "gen_tokens": "256",
+        "gen_tps": "29.45",
+        "gen_first_ms": "35.647",
+        "gen_steady_tokens": "255",
+        "gen_steady_tps": "29.48",
+        "kvcache_bytes": "0"
+      }
+    ],
+    "trace_instrumented": true,
+    "prefix_loaded": false,
+    "trace_sha256": "63a280e37e0efd75e751e40d965af9024fb4b9c443d23cbe9c5d82ef85b51026"
+  },
+  {
+    "tag": "q8-candidate-trace-long",
+    "arm": "q8-arm",
+    "command": [
+      "./campaign-bench",
+      "-m",
+      "/Users/jw/ds4/gguf/GLM-5.3-Flash-Q4_K-kdaQ8.gguf",
+      "--prompt-file",
+      "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/baseline/speed-bench/promessi_sposi.txt",
+      "--ctx-start",
+      "62174",
+      "--ctx-max",
+      "62174",
+      "--step-incr",
+      "237826",
+      "--ctx-alloc",
+      "63000",
+      "--gen-tokens",
+      "256",
+      "--show-output",
+      "--csv",
+      "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/runs/q8-candidate-trace-long.csv"
+    ],
+    "runtime_overrides": {
+      "DS4_BENCH_FORCE_SNAPSHOT": "1",
+      "DS4_GLM_ENABLE_KDA_Q8_INPUTS": "1",
+      "DS4_BENCH_LOAD_PREFIX": "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/prefix-q8-long",
+      "DS4_BENCH_TRACE_LOGITS": "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/runs/q8-candidate-trace-long.bin"
+    },
+    "wall_seconds": 10.756156921386719,
+    "rows": [
+      {
+        "ctx_tokens": "62174",
+        "prefill_tokens": "62174",
+        "prefill_tps": "0.00",
+        "gen_tokens": "256",
+        "gen_tps": "30.45",
+        "gen_first_ms": "35.217",
+        "gen_steady_tokens": "255",
+        "gen_steady_tps": "30.49",
+        "kvcache_bytes": "0"
+      }
+    ],
+    "trace_instrumented": true,
+    "prefix_loaded": true,
+    "trace_sha256": "63a280e37e0efd75e751e40d965af9024fb4b9c443d23cbe9c5d82ef85b51026"
+  },
+  {
+    "tag": "q8-long-ab-0-router-arm",
+    "arm": "router-arm",
+    "command": [
+      "./campaign-bench",
+      "-m",
+      "/Users/jw/ds4/gguf/GLM-5.3-Flash-Q4_K-kdaQ8.gguf",
+      "--prompt-file",
+      "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/baseline/speed-bench/promessi_sposi.txt",
+      "--ctx-start",
+      "62174",
+      "--ctx-max",
+      "62174",
+      "--step-incr",
+      "237826",
+      "--ctx-alloc",
+      "63000",
+      "--gen-tokens",
+      "256",
+      "--show-output",
+      "--csv",
+      "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/runs/q8-long-ab-0-router-arm.csv"
+    ],
+    "runtime_overrides": {
+      "DS4_BENCH_FORCE_SNAPSHOT": "1",
+      "DS4_GLM_ENABLE_KDA_Q8_INPUTS": "1",
+      "DS4_BENCH_LOAD_PREFIX": "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/prefix-q8-long"
+    },
+    "wall_seconds": 10.806165933609009,
+    "rows": [
+      {
+        "ctx_tokens": "62174",
+        "prefill_tokens": "62174",
+        "prefill_tps": "0.00",
+        "gen_tokens": "256",
+        "gen_tps": "30.02",
+        "gen_first_ms": "34.602",
+        "gen_steady_tokens": "255",
+        "gen_steady_tps": "30.05",
+        "kvcache_bytes": "0"
+      }
+    ],
+    "trace_instrumented": false,
+    "prefix_loaded": true
+  },
+  {
+    "tag": "q8-long-ab-1-q8-arm",
+    "arm": "q8-arm",
+    "command": [
+      "./campaign-bench",
+      "-m",
+      "/Users/jw/ds4/gguf/GLM-5.3-Flash-Q4_K-kdaQ8.gguf",
+      "--prompt-file",
+      "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/baseline/speed-bench/promessi_sposi.txt",
+      "--ctx-start",
+      "62174",
+      "--ctx-max",
+      "62174",
+      "--step-incr",
+      "237826",
+      "--ctx-alloc",
+      "63000",
+      "--gen-tokens",
+      "256",
+      "--show-output",
+      "--csv",
+      "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/runs/q8-long-ab-1-q8-arm.csv"
+    ],
+    "runtime_overrides": {
+      "DS4_BENCH_FORCE_SNAPSHOT": "1",
+      "DS4_GLM_ENABLE_KDA_Q8_INPUTS": "1",
+      "DS4_BENCH_LOAD_PREFIX": "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/prefix-q8-long"
+    },
+    "wall_seconds": 10.691336154937744,
+    "rows": [
+      {
+        "ctx_tokens": "62174",
+        "prefill_tokens": "62174",
+        "prefill_tps": "0.00",
+        "gen_tokens": "256",
+        "gen_tps": "30.55",
+        "gen_first_ms": "34.234",
+        "gen_steady_tokens": "255",
+        "gen_steady_tps": "30.58",
+        "kvcache_bytes": "0"
+      }
+    ],
+    "trace_instrumented": false,
+    "prefix_loaded": true
+  },
+  {
+    "tag": "q8-long-ab-2-q8-arm",
+    "arm": "q8-arm",
+    "command": [
+      "./campaign-bench",
+      "-m",
+      "/Users/jw/ds4/gguf/GLM-5.3-Flash-Q4_K-kdaQ8.gguf",
+      "--prompt-file",
+      "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/baseline/speed-bench/promessi_sposi.txt",
+      "--ctx-start",
+      "62174",
+      "--ctx-max",
+      "62174",
+      "--step-incr",
+      "237826",
+      "--ctx-alloc",
+      "63000",
+      "--gen-tokens",
+      "256",
+      "--show-output",
+      "--csv",
+      "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/runs/q8-long-ab-2-q8-arm.csv"
+    ],
+    "runtime_overrides": {
+      "DS4_BENCH_FORCE_SNAPSHOT": "1",
+      "DS4_GLM_ENABLE_KDA_Q8_INPUTS": "1",
+      "DS4_BENCH_LOAD_PREFIX": "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/prefix-q8-long"
+    },
+    "wall_seconds": 10.73160696029663,
+    "rows": [
+      {
+        "ctx_tokens": "62174",
+        "prefill_tokens": "62174",
+        "prefill_tps": "0.00",
+        "gen_tokens": "256",
+        "gen_tps": "30.52",
+        "gen_first_ms": "34.641",
+        "gen_steady_tokens": "255",
+        "gen_steady_tps": "30.55",
+        "kvcache_bytes": "0"
+      }
+    ],
+    "trace_instrumented": false,
+    "prefix_loaded": true
+  },
+  {
+    "tag": "q8-long-ab-3-router-arm",
+    "arm": "router-arm",
+    "command": [
+      "./campaign-bench",
+      "-m",
+      "/Users/jw/ds4/gguf/GLM-5.3-Flash-Q4_K-kdaQ8.gguf",
+      "--prompt-file",
+      "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/baseline/speed-bench/promessi_sposi.txt",
+      "--ctx-start",
+      "62174",
+      "--ctx-max",
+      "62174",
+      "--step-incr",
+      "237826",
+      "--ctx-alloc",
+      "63000",
+      "--gen-tokens",
+      "256",
+      "--show-output",
+      "--csv",
+      "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/runs/q8-long-ab-3-router-arm.csv"
+    ],
+    "runtime_overrides": {
+      "DS4_BENCH_FORCE_SNAPSHOT": "1",
+      "DS4_GLM_ENABLE_KDA_Q8_INPUTS": "1",
+      "DS4_BENCH_LOAD_PREFIX": "/Users/jw/.cache/ds4-bench/glm53-fork-eval-20260909-185810/prefix-q8-long"
+    },
+    "wall_seconds": 10.900831699371338,
+    "rows": [
+      {
+        "ctx_tokens": "62174",
+        "prefill_tokens": "62174",
+        "prefill_tps": "0.00",
+        "gen_tokens": "256",
+        "gen_tps": "29.97",
+        "gen_first_ms": "35.400",
+        "gen_steady_tokens": "255",
+        "gen_steady_tps": "30.01",
+        "kvcache_bytes": "0"
+      }
+    ],
+    "trace_instrumented": false,
+    "prefix_loaded": true
+  }
+]

@@ -1116,6 +1116,60 @@ void *raxFind(rax *rax, unsigned char *s, size_t len) {
     return raxGetData(h);
 }
 
+void *raxFindLongestPrefix(rax *rt, unsigned char *s, size_t len,
+                           size_t *matched_len, size_t *examined) {
+    raxNode *h = rt->head;
+    void *best = raxNotFound;
+    size_t best_len = 0;
+    size_t checked = 0;
+    size_t i = 0;
+
+    for (;;) {
+        if (h->iskey) {
+            best = h->isnull ? NULL : raxGetData(h);
+            best_len = i;
+        }
+        if (i == len || h->size == 0) break;
+
+        unsigned char *v = h->data;
+        size_t child = 0;
+        if (h->iscompr) {
+            size_t j = 0;
+            while (j < h->size && i < len) {
+                checked++;
+                if (v[j] != s[i]) break;
+                j++;
+                i++;
+            }
+            if (j != h->size) break;
+        } else {
+            checked++;
+            if (h->size > 16) {
+                unsigned char *found = memchr(v, s[i], h->size);
+                if (!found) break;
+                child = (size_t)(found - v);
+            } else {
+                while (child < h->size && v[child] != s[i]) child++;
+                if (child == h->size) break;
+            }
+            i++;
+        }
+
+        raxNode **children = raxNodeFirstChildPtr(h);
+        if (h->iscompr) child = 0;
+        if (raxIsInlineLeaf(h, child)) {
+            memcpy(&best, children + child, sizeof(best));
+            best_len = i;
+            break;
+        }
+        memcpy(&h, children + child, sizeof(h));
+    }
+
+    if (matched_len) *matched_len = best_len;
+    if (examined) *examined = checked;
+    return best;
+}
+
 /* Return the memory address where the 'parent' node stores the specified
  * 'child' pointer, so that the caller can update the pointer with another
  * one if needed. The function assumes it will find a match, otherwise the

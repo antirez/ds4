@@ -273,6 +273,8 @@ int raxInsert(rax *rax, unsigned char *s, size_t len, void *data, void **old);
 int raxTryInsert(rax *rax, unsigned char *s, size_t len, void *data, void **old);
 int raxRemove(rax *rax, unsigned char *s, size_t len, void **old);
 void *raxFind(rax *rax, unsigned char *s, size_t len);
+void *raxFindLongestPrefix(rax *rax, unsigned char *s, size_t len,
+                           size_t *matched_len, size_t *examined);
 void raxFree(rax *rax);
 void raxFreeWithCallback(rax *rax, void (*free_callback)(void*));
 void raxStart(raxIterator *it, rax *rt);

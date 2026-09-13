@@ -1,0 +1,44 @@
+{
+  "base": "224e7669abac9fa64580e71a9a1581fa0c852d2a",
+  "sha256": {
+    "ds4": "55d74fcdf881db3ff0bb7984a821cff79f804657acbe67b272cbfe712c7fb16c",
+    "ds4-bench": "5825b28cac73a51861003b30b9aa123e248ae73a3a2256826c77e9fde6e946bc",
+    "ds4.c": "994cd192a4825ada0d50fd390c8fb741811d277b00ae75581300ddb06993a3d0",
+    "ds4_metal.m": "b2da90a88f4538aa9a482293db1f96a4e402b501952708d00ad9acb0d4ff0850",
+    "ds4_bench.c": "f8cc29d57c1e37748273274611b85cad8fd71d1896e0f7c00a109f20ade57ad0",
+    "metal/argsort.metal": "0c868f5cbf751f889bb73aa5ac8599ff2b4359d9ed9aabd035043550256df790",
+    "metal/bin.metal": "4b537679fe874fa4dea079bbb10634b3feeb2cce9b737bdb602fe6926fbb175a",
+    "metal/concat.metal": "04fb0fc2a3b51015444e330290b979a56e4cac82aee523afa2b42e361ab23da7",
+    "metal/cpy.metal": "53aad2024bd30543ad9d4bac3dbd718830482e76ce4f9f563fee17d558a2ac02",
+    "metal/deepseek4_vision.metal": "c660082cb41fe767c26a396881c1b228c2d6d4b140eb09c81881efbabfd1b682",
+    "metal/dense.metal": "03fb317ec831bbada5af603b6608a8a0d883a6540cefa581098dda894944c801",
+    "metal/dsv4_hc.metal": "e5190d307d82422d2351e29c8ada6209ff05255487872ae00b662fe2e5fa5a38",
+    "metal/dsv4_kv.metal": "65e6e12ac3266fdf72b1e9c69bfbd07ea7324e930a8117b63b651b5016b1b5f6",
+    "metal/dsv4_misc.metal": "bdc87b624f3a7f1f80f4320cebb4b752cc155e63ae2304eee47ea7e6d237eee3",
+    "metal/dsv4_rope.metal": "f56cb24a381c27435953d120448bc22c1b2314b151280445246bd28920b4d518",
+    "metal/flash_attn.metal": "c9ec79daf2063cd9e8c4e8874c123fbf2642c3fb6247b16aa21e1e0e6db92fcc",
+    "metal/get_rows.metal": "bd3b352a6ffb138ae5e391db97b211f8386d417365eac2caa3730f55a075aa3a",
+    "metal/glm53_bf16.metal": "7e63274bdecc74c04507c7ecf9d35d2277d44f69a6e039221757eb763bf96cae",
+    "metal/glm53_kda.metal": "74040f612879e936411146ec0fa0457bb4afca2f37208b1172878171d5b697e9",
+    "metal/glm53_vision.metal": "d20bdf039f9bd9d7b0cab8c6a4fc10bcb3097571a81246dbde1c278e0e9bec7b",
+    "metal/glu.metal": "59281e30a27cc2eb618800b6e53a57e234f65f1a1e680d6267d9139e1a06b627",
+    "metal/moe.metal": "a58790964a864d3cc0b51342a5183f41732700cce75e1c7b7d0b950b63c2f0eb",
+    "metal/norm.metal": "700bf92792e70a969c1f564c3c0ea7c8c9fe707d51a3537b766a9d336acfddd6",
+    "metal/repeat.metal": "2c6142b47a2007d246f5eb6e7395047627bb6dfa02c649311d16620da35007cd",
+    "metal/set_rows.metal": "25f597bf5f5fb5a3791efc68e3182539727609f09c45750ef9376ed430d7a029",
+    "metal/softmax.metal": "6eaa6ce78c4b221b3c7fe45647d6eb42f165201992a243d77d04cf2668fb7664",
+    "metal/sum_rows.metal": "7e1f3ad3f945b1f6f59aa2d8ee5bf464052d989a632c33ea95ce50d3c4fbf0fc",
+    "metal/unary.metal": "56be9a0316b02d4f16cdf9487074e5a7c94215a15d9b58917e38c474cbe16dde"
+  },
+  "model": "/Users/jw/ds4/gguf/GLM-5.3-Flash-Q4_K.gguf",
+  "model_stat": {
+    "st_dev": 16777231,
+    "st_ino": 5214537,
+    "st_size": 190875526464,
+    "st_mtime_ns": 1788307683582753100
+  },
+  "prompt_sha256": "f53e0d80cb2d4492d24ebd63c7000c397b16ae70f9bf09b3763e5d8323ec209f",
+  "runtime_overrides": {
+    "DS4_BENCH_FORCE_SNAPSHOT": "1"
+  }
+}

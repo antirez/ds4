@@ -1,13 +1,16 @@
 # DS4 GGUF Tools
 
 This directory contains the offline tools used to build and evaluate DeepSeek
-V4 Flash GGUF files for `ds4`.
+V4 Flash GGUF files and to requantize selected GLM 5.3 Flash tensors for
+`ds4`.
 
 The important pieces are:
 
 - `deepseek4-quantize.c`: C HF-safetensors to GGUF quantizer.
+- `glm53_requant_bf16.c`: separate-file converter for selected BF16 KDA,
+  output-head, and embedding tensors in an existing GLM 5.3 Flash GGUF.
 - `quants.[ch]`: the deliberately small local quantization implementation used
-  by the quantizer.  It implements the DS4 output formats we actually ship:
+  by the converters.  It implements the DS4 output formats we actually ship:
   `q8_0`, `q8_K`, `q4_K`, `q2_K`, and `iq2_xxs`.
 - `imatrix/`: dataset and instructions for collecting routed-MoE activation
   importance with `ds4`.
@@ -20,9 +23,29 @@ The important pieces are:
 make -C gguf-tools
 ```
 
-The quantizer is plain C and does not link GGML.  GGUF metadata handling,
+The converters are plain C and do not link GGML.  GGUF metadata handling,
 safetensors loading, FP4/FP8 dequantization, and the quantizers used by our Q2
 and Q4 recipes live in this directory.
+
+## Requantize GLM 5.3 BF16 Tensors
+
+Build and run the existing-GGUF converter with a distinct output path:
+
+```sh
+make -C gguf-tools glm53-requant-bf16
+gguf-tools/glm53-requant-bf16 in.gguf out.gguf \
+  --type q8_0 --tensors kda
+```
+
+The target type is `q8_0` by default; `q4_K` is also accepted. `--tensors`
+takes a comma-separated list of `kda`, `head`, `embd`, or `all`, and defaults
+to `kda`. Only matching BF16 tensors are converted. The tool has no in-place
+mode and rejects an output path, hard link, or symlink that resolves to the
+input. It writes beside the destination and replaces the destination only
+after the complete output is ready.
+
+See the [GLM 5.3 decode findings](../speed-bench/glm53_decode_findings.md) for
+the historical performance and quality measurements that motivated the tool.
 
 ## Generate An Imatrix
 

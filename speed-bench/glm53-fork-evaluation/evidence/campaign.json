@@ -1,0 +1,10 @@
+{
+  "base": "224e7669abac9fa64580e71a9a1581fa0c852d2a",
+  "fork": "95eb218614868284fb6a9350b4be9f32c0d57575",
+  "machine": "Apple M3 Ultra 80 GPU cores 512 GiB",
+  "scope": "Separate exact router/shared fusion, DSA pool top-k, Q8 KDA folds; screen long-prefill bank and existing untracked mapping knob. Preserve weights, precision and arithmetic.",
+  "models": [
+    "/Users/jw/ds4/gguf/GLM-5.3-Flash-Q4_K.gguf",
+    "/Users/jw/ds4/gguf/GLM-5.3-Flash-Q4_K-kdaQ8.gguf"
+  ]
+}

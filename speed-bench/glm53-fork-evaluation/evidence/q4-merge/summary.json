@@ -1,0 +1,284 @@
+{
+  "contexts": [
+    {
+      "context": 2048,
+      "arms": {
+        "main": {
+          "gen_tps": {
+            "runs": [
+              21.02,
+              20.95
+            ],
+            "mean": 20.985,
+            "spread_percent": 0.33357159876102116
+          },
+          "prefill_tps": {
+            "runs": [
+              429.4,
+              429.4
+            ],
+            "mean": 429.4,
+            "spread_percent": 0.0
+          }
+        },
+        "previous": {
+          "gen_tps": {
+            "runs": [
+              26.64,
+              26.64
+            ],
+            "mean": 26.64,
+            "spread_percent": 0.0
+          },
+          "prefill_tps": {
+            "runs": [
+              510.09,
+              510.99
+            ],
+            "mean": 510.53999999999996,
+            "spread_percent": 0.17628393465742825
+          }
+        },
+        "new": {
+          "gen_tps": {
+            "runs": [
+              27.1,
+              27.1
+            ],
+            "mean": 27.1,
+            "spread_percent": 0.0
+          },
+          "prefill_tps": {
+            "runs": [
+              510.19,
+              510.67
+            ],
+            "mean": 510.43,
+            "spread_percent": 0.0940383598142778
+          }
+        }
+      },
+      "gen_tps_gain_percent": {
+        "previous_vs_main": 26.947819871336677,
+        "new_vs_main": 29.139861806051947,
+        "new_vs_previous": 1.726726726726735
+      },
+      "prefill_tps_gain_percent": {
+        "previous_vs_main": 18.89613414066138,
+        "new_vs_main": 18.87051700046578,
+        "new_vs_previous": -0.021545814235901517
+      }
+    },
+    {
+      "context": 8192,
+      "arms": {
+        "main": {
+          "gen_tps": {
+            "runs": [
+              20.88,
+              20.8
+            ],
+            "mean": 20.84,
+            "spread_percent": 0.38387715930901295
+          },
+          "prefill_tps": {
+            "runs": [
+              378.65,
+              378.5
+            ],
+            "mean": 378.575,
+            "spread_percent": 0.039622267714449516
+          }
+        },
+        "previous": {
+          "gen_tps": {
+            "runs": [
+              26.43,
+              26.41
+            ],
+            "mean": 26.42,
+            "spread_percent": 0.07570022710067968
+          },
+          "prefill_tps": {
+            "runs": [
+              435.87,
+              435.82
+            ],
+            "mean": 435.845,
+            "spread_percent": 0.011471968245594504
+          }
+        },
+        "new": {
+          "gen_tps": {
+            "runs": [
+              26.86,
+              26.87
+            ],
+            "mean": 26.865000000000002,
+            "spread_percent": 0.037223152801048064
+          },
+          "prefill_tps": {
+            "runs": [
+              435.92,
+              435.81
+            ],
+            "mean": 435.865,
+            "spread_percent": 0.02523717206015937
+          }
+        }
+      },
+      "gen_tps_gain_percent": {
+        "previous_vs_main": 26.775431861804222,
+        "new_vs_main": 28.910748560460654,
+        "new_vs_previous": 1.6843300529901573
+      },
+      "prefill_tps_gain_percent": {
+        "previous_vs_main": 15.127781813379126,
+        "new_vs_main": 15.133064782407724,
+        "new_vs_previous": 0.004588787298231978
+      }
+    },
+    {
+      "context": 32768,
+      "arms": {
+        "main": {
+          "gen_tps": {
+            "runs": [
+              20.61,
+              20.57
+            ],
+            "mean": 20.59,
+            "spread_percent": 0.19426906265176858
+          },
+          "prefill_tps": {
+            "runs": [
+              371.86,
+              371.66
+            ],
+            "mean": 371.76,
+            "spread_percent": 0.05379814934365952
+          }
+        },
+        "previous": {
+          "gen_tps": {
+            "runs": [
+              26.07,
+              26.06
+            ],
+            "mean": 26.064999999999998,
+            "spread_percent": 0.03836562440054312
+          },
+          "prefill_tps": {
+            "runs": [
+              427.91,
+              427.94
+            ],
+            "mean": 427.925,
+            "spread_percent": 0.007010574282870296
+          }
+        },
+        "new": {
+          "gen_tps": {
+            "runs": [
+              26.45,
+              26.46
+            ],
+            "mean": 26.455,
+            "spread_percent": 0.03780003780004371
+          },
+          "prefill_tps": {
+            "runs": [
+              427.98,
+              427.95
+            ],
+            "mean": 427.96500000000003,
+            "spread_percent": 0.007009919035442047
+          }
+        }
+      },
+      "gen_tps_gain_percent": {
+        "previous_vs_main": 26.59057795046138,
+        "new_vs_main": 28.484701311316172,
+        "new_vs_previous": 1.4962593516209433
+      },
+      "prefill_tps_gain_percent": {
+        "previous_vs_main": 15.107865289434042,
+        "new_vs_main": 15.118624919302782,
+        "new_vs_previous": 0.009347432377171394
+      }
+    },
+    {
+      "context": 62174,
+      "arms": {
+        "main": {
+          "gen_tps": {
+            "runs": [
+              20.39,
+              20.41
+            ],
+            "mean": 20.4,
+            "spread_percent": 0.09803921568627243
+          },
+          "prefill_tps": {
+            "runs": [
+              358.9,
+              358.84
+            ],
+            "mean": 358.87,
+            "spread_percent": 0.01671914620893423
+          }
+        },
+        "previous": {
+          "gen_tps": {
+            "runs": [
+              25.79,
+              25.77
+            ],
+            "mean": 25.78,
+            "spread_percent": 0.0775795190069805
+          },
+          "prefill_tps": {
+            "runs": [
+              412.32,
+              412.31
+            ],
+            "mean": 412.315,
+            "spread_percent": 0.0024253301480641996
+          }
+        },
+        "new": {
+          "gen_tps": {
+            "runs": [
+              26.42,
+              26.44
+            ],
+            "mean": 26.43,
+            "spread_percent": 0.07567158531971084
+          },
+          "prefill_tps": {
+            "runs": [
+              412.37,
+              412.33
+            ],
+            "mean": 412.35,
+            "spread_percent": 0.009700497150483925
+          }
+        }
+      },
+      "gen_tps_gain_percent": {
+        "previous_vs_main": 26.37254901960786,
+        "new_vs_main": 29.55882352941177,
+        "new_vs_previous": 2.521334367726924
+      },
+      "prefill_tps_gain_percent": {
+        "previous_vs_main": 14.892579485607605,
+        "new_vs_main": 14.90233232089615,
+        "new_vs_previous": 0.008488655518235078
+      }
+    }
+  ],
+  "maximum_within_arm_spread_percent": {
+    "gen_tps": 0.38387715930901295,
+    "prefill_tps": 0.17628393465742825
+  }
+}
