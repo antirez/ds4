@@ -140,6 +140,9 @@ uint64_t ds4_tp_slab_gpu_flags_offset(const ds4_tp *tp);
 /* Offset of the per-slot u64 in-flags words (backend release protocol). */
 uint64_t ds4_tp_slab_in_flags_offset(const ds4_tp *tp);
 int ds4_tp_attach_slab(ds4_tp *tp, void *base, char *err, size_t errlen);
+/* Stop the data plane before freeing its registered buffers. No more gates
+ * may be issued; free the transport after the engine has been unbound. */
+void ds4_tp_detach_slab(ds4_tp *tp);
 
 /* Exchange one gate: send out[layer][gate] to the peer's in[layer][gate]
  * and wait until the peer's partial for `seq` has fully landed locally.

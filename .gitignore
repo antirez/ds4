@@ -9,7 +9,7 @@
 /ds4_test
 /ds4flash.gguf
 /TODO.md
-/gguf/
+/gguf
 /core
 /core.*
 /tests/test_engine_mgpu_placement
@@ -43,6 +43,10 @@
 /tests/test_session_state_gpu
 /tests/test_tp_commands
 /tests/test_tp_rdma
+/tests/test_tp_tcp
+/tests/test_tp_link
+/tests/test_cuda_tp
+/tests/test_cuda_tp_repack
 /tests/test_metal_tp_bulk
 /tests/test_glm53_kda
 /tests/test_glm53_vision_engine
@@ -52,6 +56,13 @@
 /tests/test_rocm_memory
 /tests/test_deepseek4_vision_image
 /tests/test_deepseek41_metal
+/tests/test_deepseek41_cuda
+/tests/test_cuda_q8_rows
+/tests/test_cuda_reductions
+/tests/test_cuda_shared
+/tests/test_cuda_ssd_cache
+/tests/test_cuda_ssd_batch
+/tests/test_cuda_ssd_repack
 /tests/test_deepseek41_gguf
 /tests/test_deepseek41_graph
 /tests/test_deepseek41_prefill

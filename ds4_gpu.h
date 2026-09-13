@@ -81,104 +81,8 @@ int ds4_gpu_begin_commands(void);
 int ds4_gpu_flush_encoder(void);
 int ds4_gpu_flush_commands(void);
 int ds4_gpu_commands_active(void);
+#include "ds4_deepseek41_gpu.h"
 #ifdef __APPLE__
-/* V4.1 activation/cache formats. Buffers are float-addressable but the
- * rounded values follow the released BF16/FP8/FP4 inference graph. */
-typedef enum {
-    DS4_V41_BF16 = 0,
-    DS4_V41_FP8_E8M0 = 1,
-    DS4_V41_FP4_E8M0 = 2,
-    DS4_V41_FP4_E4M3 = 3,
-} ds4_v41_activation_format;
-int ds4_gpu_dsv41_quantize(ds4_gpu_tensor *x, uint32_t width, uint32_t rows,
-                          ds4_v41_activation_format format);
-/* Full-head prefill, with BF16 rounding between the two Q8 projections. */
-int ds4_gpu_dsv41_attention_output_batch(
-        ds4_gpu_tensor *out, ds4_gpu_tensor *low,
-        const void *model_map, uint64_t model_size,
-        uint64_t out_a_offset, uint64_t out_b_offset,
-        const ds4_gpu_tensor *heads, uint32_t n_tokens);
-/* Packed local 32-head input and BF16 low projection; output is an unrounded
- * rank partial. The graph sums ranks before rounding the attention block. */
-int ds4_gpu_dsv41_attention_output_tp_batch(
-        ds4_gpu_tensor *out, ds4_gpu_tensor *low,
-        const void *model_map, uint64_t model_size,
-        uint64_t out_a_offset, uint64_t out_b_offset,
-        const ds4_gpu_tensor *heads, uint32_t n_tokens, uint32_t tp_rank);
-/* Adjacent-pair, unit-magnitude RoPE with the released V4.1 frequencies. */
-int ds4_gpu_dsv41_rope(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
-                      uint32_t rows, uint32_t start, bool compressed, bool inverse);
-/* Compressed pairs advance two absolute token positions per stored row. */
-int ds4_gpu_dsv41_rope_stride(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
-                             uint32_t rows, uint32_t start, uint32_t stride,
-                             bool compressed, bool inverse);
-int ds4_gpu_dsv41_engram_add(ds4_gpu_tensor *residual,
-                           const ds4_gpu_tensor *kv,
-                           const ds4_gpu_tensor *q_weight,
-                           const ds4_gpu_tensor *k_weight,
-                           const ds4_gpu_tensor *mask,
-                           uint32_t width, uint32_t rows, float eps);
-/* Pool complete pairs and retain the last unpaired projection in previous_*.
- * start is the absolute token position, including earlier chunks. */
-int ds4_gpu_dsv41_pool2(ds4_gpu_tensor *out,
-                      const ds4_gpu_tensor *kv, const ds4_gpu_tensor *scores,
-                      ds4_gpu_tensor *previous_kv, ds4_gpu_tensor *previous_scores,
-                       uint32_t width, uint32_t rows, uint32_t start);
-/* Candidate blocks contain eight compressed positions. Produce causal block
- * maxima, pinning the newest block; filter consumes a 0/-inf block mask. */
-int ds4_gpu_dsv41_candidate_blocks(ds4_gpu_tensor *blocks,
-                                  const ds4_gpu_tensor *scores,
-                                  uint32_t width, uint32_t rows,
-                                  uint32_t start, uint32_t ratio);
-int ds4_gpu_dsv41_candidate_filter(ds4_gpu_tensor *scores,
-                                  const ds4_gpu_tensor *block_mask,
-                                  uint32_t width, uint32_t rows,
-                                  uint32_t start, uint32_t ratio);
-/* Causal index scores over ratio-1/2 compressed keys, without an extra cast
- * of the already quantized FP4 queries/keys. Scores have source_rows stride. */
-int ds4_gpu_dsv41_indexer_scores_batch(ds4_gpu_tensor *scores,
-                                     const ds4_gpu_tensor *q,
-                                     const ds4_gpu_tensor *weights,
-                                     const ds4_gpu_tensor *keys,
-                                     uint32_t source_rows, uint32_t rows,
-                                     uint32_t start, uint32_t ratio);
-int ds4_gpu_dsv41_tensor_ops_available(void);
-/* Reuse exact BF16 views of FP4 queries/keys across score tiles. Invalid
- * casts retain the F32 arithmetic for the affected tile. */
-uint64_t ds4_gpu_dsv41_indexer_packed_bytes(uint32_t source_rows, uint32_t rows);
-int ds4_gpu_dsv41_indexer_pack(ds4_gpu_tensor *packed,
-                              const ds4_gpu_tensor *q, const ds4_gpu_tensor *keys,
-                              uint32_t source_rows, uint32_t rows);
-int ds4_gpu_dsv41_indexer_scores_packed(ds4_gpu_tensor *scores,
-                                      const ds4_gpu_tensor *q,
-                                      const ds4_gpu_tensor *weights,
-                                      const ds4_gpu_tensor *keys,
-                                      const ds4_gpu_tensor *packed,
-                                      uint32_t source_rows, uint32_t rows,
-                                      uint32_t start, uint32_t ratio,
-                                      uint32_t packed_rows, uint32_t offset);
-/* Exact row-sort ordering with independent causal widths; at least 1024
- * visible keys per row. Output stride is 512 indices. */
-int ds4_gpu_dsv41_indexer_topk_batch(ds4_gpu_tensor *selected,
-                                    const ds4_gpu_tensor *scores,
-                                    uint32_t width, uint32_t rows,
-                                    uint32_t start, uint32_t ratio);
-enum { DS4_V41_CARRY_BF16, DS4_V41_CARRY_MASK, DS4_V41_CARRY_F32 };
-/* Lossless storage for already-BF16 activations or 0/-inf candidate masks.
- * Packed rows are padded to whole uint32_t words. Plain rows remain F32. */
-int ds4_gpu_dsv41_carry_copy(ds4_gpu_tensor *packed, uint32_t row_offset,
-                            ds4_gpu_tensor *plain, uint32_t width, uint32_t rows,
-                            uint32_t format, bool pack);
-/* Batched F16 projections with the same arithmetic as individual matvecs. */
-int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out,
-                                 const void *model_map, uint64_t model_size,
-                                 uint64_t weight_offset, uint32_t width,
-                                 uint32_t outputs, uint32_t rows,
-                                 const ds4_gpu_tensor *in);
-/* Gather 512-wide F32 KV rows; IDs must come from top-k over source_rows. */
-int ds4_gpu_dsv41_gather_kv(ds4_gpu_tensor *out, const ds4_gpu_tensor *source,
-                           const ds4_gpu_tensor *ids, uint32_t source_rows,
-                           uint32_t selected_rows);
 int ds4_gpu_parallel_ffn_finish(void);
 void ds4_gpu_parallel_ffn_abort(void);
 int ds4_gpu_parallel_ffn_start(
@@ -280,7 +184,12 @@ int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map);
 int ds4_gpu_build_derived_artifacts(const void *model_map, uint64_t model_size,
-                                    const char *model_path);
+                                  const char *model_path);
+/* Two-rank expert-only artifacts; never build or cache the unowned half.
+ * file_size includes any disk-only tail outside the model mapping. */
+int ds4_gpu_build_derived_artifacts_shard(const void *model_map, uint64_t model_size,
+                                        uint64_t file_size,
+                                        const char *model_path, uint32_t rank);
 int ds4_gpu_model_range_replaced(const void *model_map, uint64_t offset,
                                  uint64_t bytes);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes);
@@ -437,109 +346,13 @@ int ds4_gpu_stream_expert_cache_seed_experts_gpu_copy(
 #endif
 void ds4_gpu_print_memory_report(const char *label);
 
-/* Tensor-parallel per-layer gates (Metal only).  The encoder calls
- * ds4_gpu_tp_gate_encode() right after the kernels that produce a partial
- * block output in the TP slab: it closes the current encoder, makes the GPU
- * signal a shared event, queues the exchange on a service thread, and makes
- * the GPU wait for the CPU-signaled release before the combine kernel runs.
- * Sequence values are assigned internally and increase monotonically; both
- * ranks encode the identical gate sequence so values pair up by
- * construction.  The exchange callback runs on the service thread and must
- * return nonzero on success. */
-typedef int (*ds4_gpu_tp_exchange_fn)(void *ud, uint32_t layer, uint32_t gate, uint64_t seq);
-/* Bind one rank of the two-way split. slab is the transport slab tensor and
- * gpu_flags_off is the offset of its GPU-written gate-ready flag words. */
-int ds4_gpu_tp_init(uint32_t rank,
-                    ds4_gpu_tensor *slab, uint64_t gpu_flags_off,
-                    uint64_t out_off, uint64_t vec_bytes,
-                    ds4_gpu_tp_exchange_fn fn, void *ud);
-void ds4_gpu_tp_shutdown(void);
-/* Backends whose release protocol lives in the slab (ROCm flag gates) need
- * the in-flags region offset; call right after ds4_gpu_tp_init. */
-void ds4_gpu_tp_set_slab_layout(uint64_t in_flags_off);
-/* Multi-session TP reuses slab slots across several encoded graph tapes.
- * Shared-event arrival is required in that mode to make each partial vector
- * CPU-visible before the transport thread reads it. */
-void ds4_gpu_tp_set_session_batch_mode(int enabled);
-/* Single-session flag gates use one exact arrival word per layer/gate, so
- * decode command buffers may be submitted in layer order without a later
- * monotonic event signal satisfying an earlier arrival. */
-int ds4_gpu_tp_decode_split_flush_safe(void);
-/* Weight ranges to pull into the GPU cache while the given gate (0 attention,
- * 1 FFN) waits for the peer: consumed by the next poll gate of that kind. */
-int ds4_gpu_tp_gate_prefetch_plan(uint32_t gate,
-                                  const void *model_map, uint64_t model_size,
-                                  const uint64_t *offsets, const uint64_t *bytes,
-                                  uint32_t count);
-/* The coordinator-only DSpark support model does not participate in TP.
- * Suspend ownership only while encoding it; base-model verification remains
- * split across both ranks. */
-void ds4_gpu_tp_suspend_expert_sharding(int suspend);
-int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate);
-/* Split form of ds4_gpu_tp_gate_encode for eager-stream backends (ROCm):
- * arrive publishes the partial and queues the exchange, wait parks the
- * stream on the release.  Kernels encoded between the two run while the
- * exchange is in flight, so work that does not depend on the peer's half
- * (the replicated shared expert) hides the gate latency.  Exactly one gate
- * may be pending at a time and wait must name the same layer/gate. */
-int ds4_gpu_tp_gate_arrive(uint32_t layer, uint32_t gate);
-int ds4_gpu_tp_gate_wait(uint32_t layer, uint32_t gate);
-/* Verify-block batch gates: one exchange per layer moving `rows` partial
- * rows at once (speculative verify).  The callback runs on the gate service
- * thread with the same ud as the row-gate exchange fn. */
-typedef int (*ds4_gpu_tp_batch_exchange_fn)(void *ud, uint32_t layer,
-                                            uint32_t rows, uint64_t seq);
-void ds4_gpu_tp_set_batch_exchange(ds4_gpu_tp_batch_exchange_fn fn);
-int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows);
-/* Prefill batch gates: the service thread exchanges `bytes` between two
- * CPU-visible bounce tensors directly (payloads far beyond slab slots). */
-typedef int (*ds4_gpu_tp_big_exchange_fn)(void *ud, uint32_t layer,
-                                          uint64_t seq, const void *out,
-                                          void *in, uint64_t bytes);
-void ds4_gpu_tp_set_big_exchange(ds4_gpu_tp_big_exchange_fn fn);
-int ds4_gpu_tp_big_gate_encode(uint32_t layer, uint32_t rows,
-                               const ds4_gpu_tensor *out_t,
-                               ds4_gpu_tensor *in_t,
-                               uint64_t bytes);
-/* Split big gate: kick publishes the GPU arrival marker (batch shared
- * event, whose completion semantics make the bounce payload visible to
- * the exchange thread) and queues the exchange, returning the gate seq
- * (0 on failure); wait encodes the release.  Multiple kicks may be in
- * flight; waiting on the last seq covers all earlier kicks (monotonic
- * release event, in-order service thread). */
-uint64_t ds4_gpu_tp_big_gate_kick(uint32_t layer, uint32_t rows,
-                                  const ds4_gpu_tensor *out_t,
-                                  ds4_gpu_tensor *in_t,
-                                  uint64_t bytes);
-int ds4_gpu_tp_big_gate_wait(uint64_t seq);
-/* KV-split small gates: fixed-slot payloads (indexer candidates, attention
- * score partials) staged through the dedicated split slab regions. */
-typedef int (*ds4_gpu_tp_split_exchange_fn)(void *ud, uint32_t layer,
-                                            uint32_t kind, uint64_t seq,
-                                            uint64_t bytes);
-void ds4_gpu_tp_set_split_exchange(ds4_gpu_tp_split_exchange_fn fn);
-void ds4_gpu_tp_set_split_layout(uint64_t split_out_off, uint64_t split_in_off,
-                                 uint64_t split_slot_bytes);
-int ds4_gpu_tp_split_gate_encode(uint32_t layer, uint32_t kind,
-                                 const ds4_gpu_tensor *out_t,
-                                 ds4_gpu_tensor *in_t,
-                                 uint64_t bytes);
-/* Pause/resume the DVFS keep-alive around work that keeps the GPU busy.
- * No-op when TP is not bound. */
-void ds4_gpu_tp_keepalive_pause(int paused);
-/* Split attention heads across the two TP ranks in the GLM batch-prefill
- * attention kernels (qk-low, attention-lora, value-project). The caller
- * zeroes the unowned head range of the heads buffer and combines the
- * attn-output partials over the TP big-gate exchange. */
-void ds4_gpu_tp_set_attn_head_split(int enabled);
+#include "ds4_gpu_tp.h"
 /* Skip the whole-file model residency set (TP sharding: only the
  * owned ranges are warmed; the rest must never be paged in). Call before
  * the model is mapped. */
 void ds4_gpu_model_residency_skip(int skip);
 /* Submit one trivial command buffer (first-submission costs paid at load). */
 int ds4_gpu_warm_command_queue(void);
-/* Nonzero after any gate exchange failed; the eval must abort. */
-int ds4_gpu_tp_failed(void);
 
 /* Tensor-parallel sliced projections (Metal decode path only).
  *
@@ -3425,7 +3238,7 @@ int ds4_gpu_glm53_kda_prefill(
  * byte-for-byte (it does not include this header); keep both in sync. */
 typedef struct ds4_decode_graph_key {
     uint32_t il;
-    uint32_t island;    /* 0: layer top to pre-rope; 1: attn-out to layer end */
+    uint32_t island;    /* 0: layer top; 1: FFN tail; 2: V4.1 TP attn-out */
     uint32_t variant;
     uint32_t _pad;
     void    *cur_hc;

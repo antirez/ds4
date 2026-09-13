@@ -7,7 +7,7 @@ language models on consumer hardware (that is, hardware that people
 can actually own). To reach this goal, we are building
 a small native inference engine optimized first for
 **DeepSeek V4 Flash** (including the experimental vision model),
-**DeepSeek V4.1 Flash** (Metal only),
+**DeepSeek V4.1 Flash** (Metal, and text inference on CUDA),
 and additionally **GLM 5.2 and 5.3**, **GLM 5.3 Flash** and
 **DeepSeek V4 PRO**. The code is self-contained and
 deliberately narrow, not a general GGUF runner: you need to use the
@@ -164,9 +164,10 @@ the [client setup guide](docs/CLIENTS.md).
 requirements. DeepSeek Vision Experimental uses a different checkpoint from
 Flash 0731; GLM 5.3 Flash adds vision to the same text model.
 
-DeepSeek V4.1 Flash text and vision run on Metal. Q2 runs with SSD streaming
-on one 128 GB Mac, or resident across two using RDMA. Q4 needs SSD streaming
-or a 512 GB Mac. Engram tables remain on disk in every mode, so use a fast
+DeepSeek V4.1 Flash text and vision run on Metal; text also runs on a DGX Spark.
+Q2 runs with SSD streaming on one 128 GB Mac or Spark, or resident across two
+Macs or two Sparks using RDMA. Q4 needs SSD streaming or a 512 GB Mac.
+Engram tables remain on disk in every mode, so use a fast
 local SSD. See the [model guide](docs/MODELS.md#deepseek-v41-flash) for downloads
 and setup.
 

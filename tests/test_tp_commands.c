@@ -18,8 +18,8 @@ static void *exchange_bulk(void *arg) {
 }
 
 static void check_bulk_exchange(void) {
-    const uint64_t sizes[] = {20480, DS4_TP_BIG_CHUNK - 4,
-        DS4_TP_BIG_CHUNK, DS4_TP_BIG_CHUNK + 4, 7 * 1024 * 1024 + 4};
+    const uint64_t sizes[] = {20480, 2 * 1024 * 1024 - 4,
+        2 * 1024 * 1024, 2 * 1024 * 1024 + 4, 7 * 1024 * 1024 + 4};
     for (unsigned n = 0; n < sizeof(sizes) / sizeof(*sizes); n++) {
         int fd[2];
         assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fd) == 0);
@@ -132,16 +132,76 @@ static void check_sync_cancellation(void) {
     puts("TP cancellation agreement, reuse, interrupted acknowledgment, mismatch and timeout: ok");
 }
 
+static void check_backend_options(void) {
+    char err[256];
+    ds4_engine_options opt = {.backend = DS4_BACKEND_METAL,
+        .tp = {.role = DS4_TP_LEADER, .requested = true}};
+    assert(ds4_tp_validate_engine_options(&opt, err, sizeof(err)));
+    opt.backend = DS4_BACKEND_CPU;
+    assert(!ds4_tp_validate_engine_options(&opt, err, sizeof(err)));
+    opt.backend = DS4_BACKEND_CUDA;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+    assert(ds4_tp_validate_engine_options(&opt, err, sizeof(err)));
+    opt.ssd_streaming = true;
+    assert(!ds4_tp_validate_engine_options(&opt, err, sizeof(err)));
+    opt.ssd_streaming = false;
+    opt.cuda_tensor_parallel = true;
+    assert(!ds4_tp_validate_engine_options(&opt, err, sizeof(err)));
+#else
+    assert(!ds4_tp_validate_engine_options(&opt, err, sizeof(err)));
+#endif
+    puts("TP backend and mutually exclusive placement options: ok");
+}
+
+static void check_logits_halves(void) {
+    const float expected[] = {1.25f, -2.5f, 0, -0.0f, 9, -17, 0.125f, 65536};
+    float received[10];
+    const uint32_t canary = UINT32_C(0xa5a5a5a5);
+    for (unsigned mode = 0; mode < 7; mode++) {
+        int fd[2];
+        assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fd) == 0);
+        assert(tp_socket_set_gate_timeout(fd[0], 50));
+        ds4_tp leader = {.control_fd = fd[0]}, worker = {.control_fd = fd[1]};
+        memset(received, 0xa5, sizeof(received));
+        if (mode == 0) {
+            for (unsigned repeat = 0; repeat < 3; repeat++) {
+                assert(ds4_tp_send_logits_half(&worker, expected, 8));
+                assert(ds4_tp_recv_logits_half(&leader, received + 1, 8));
+                assert(!memcmp(received + 1, expected, sizeof(expected)));
+            }
+        } else {
+            if (mode != 1 && mode != 5) {
+                ds4_tp_frame_header h = {DS4_TP_MAGIC,
+                    mode == 3 ? DS4_TP_FRAME_STOP : DS4_TP_FRAME_LOGITS,
+                    mode == 4 ? sizeof(expected) - sizeof(float) : sizeof(expected)};
+                assert(tp_write_full(fd[1], &h, sizeof(h)));
+                if (mode == 2 || mode == 6)
+                    assert(tp_write_full(fd[1], expected, 2 * sizeof(float)));
+            }
+            /* Missing header, partial payload, wrong frame, wrong size,
+             * then stalled header and stalled payload. */
+            if (mode <= 4) assert(shutdown(fd[1], SHUT_WR) == 0);
+            assert(!ds4_tp_recv_logits_half(&leader, received + 1, 8));
+        }
+        assert(!memcmp(received, &canary, sizeof(canary)));
+        assert(!memcmp(received + 9, &canary, sizeof(canary)));
+        close(fd[0]); close(fd[1]);
+    }
+    puts("TP logits halves: exact frames, reuse, canaries, EOF, invalid frames and timeout: ok");
+}
+
 int main(void) {
+    check_backend_options();
     check_bulk_exchange();
     check_sync_cancellation();
+    check_logits_halves();
     int fd[2];
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fd) == 0);
     ds4_tp leader = { .control_fd = fd[0] };
     ds4_tp worker = { .control_fd = fd[1] };
     char err[256] = "";
     ds4_tp_command cmd;
-    assert(DS4_TP_PROTOCOL_VERSION == 12);
+    assert(DS4_TP_PROTOCOL_VERSION == 14);
     for (int i = 0; i < 4; i++) {
         assert(ds4_tp_send_eval(&leader, 42, 2*i, 100+i));
         assert(ds4_tp_recv_command(&worker, &cmd, err, sizeof(err)));
