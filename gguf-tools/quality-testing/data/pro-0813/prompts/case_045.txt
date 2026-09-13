@@ -1,0 +1,1 @@
+Explain why one large Metal buffer can be worse than multiple overlapping views.

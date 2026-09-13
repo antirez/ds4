@@ -12,6 +12,8 @@ struct ds4_metal_args_argsort {
     int32_t  ne2;
     int32_t  ne3;
     int32_t  top_k;
+    uint32_t causal_start;
+    uint32_t causal_ratio;
 };
 
 struct ds4_metal_args_argsort_merge {
@@ -29,6 +31,10 @@ struct ds4_metal_args_argsort_merge {
     int32_t  ne3;
     int32_t  top_k;
     int32_t  len;
+    uint32_t causal_start;
+    uint32_t causal_ratio;
+    uint32_t block_width;
+    uint32_t block_top_k;
 };
 
 typedef void (argsort_t)(
@@ -42,7 +48,7 @@ typedef void (argsort_t)(
 
 // Sort one float row into an index row. DS4 only exports the descending
 // instance because router and indexer selection both need top-k order.
-template<ds4_sort_order order>
+template<ds4_sort_order order, bool causal = false, bool shuffle = false>
 kernel void kernel_argsort_f32_i32(
         constant   ds4_metal_args_argsort & args,
         device   const char * src0,
@@ -59,6 +65,11 @@ kernel void kernel_argsort_f32_i32(
     const int i01 = tgpig[0] % args.ne01;
     const int i02 = tgpig[1];
     const int i03 = tgpig[2];
+    const int width = causal ? min(args.ne00,
+        int((args.causal_start + uint(i01) + 1u) / args.causal_ratio)) : args.ne00;
+    if (i00 >= width) return;
+    const int work_width = causal ?
+        ((width - 1) / ntg.x) * args.top_k + min((width - 1) % ntg.x + 1, args.top_k) : args.ne0;
 
     device const float * src0_row = (device const float *) (src0 + args.nb01*i01 + args.nb02*i02 + args.nb03*i03);
 
@@ -70,27 +81,45 @@ kernel void kernel_argsort_f32_i32(
     // The host allocates ntg.x extra floats after the index array.  Values and
     // the comparison network are unchanged, so the permutation is identical.
     threadgroup float * shmem_f32 = (threadgroup float *) (shmem_i32 + ntg.x);
-    if (i00 + col < args.ne00) {
+    if (i00 + col < width) {
         shmem_f32[col] = src0_row[i00 + col];
     }
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
+    int reg_idx = i00 + col;
+    float reg_value = reg_idx < width ? shmem_f32[col] : 0.0f;
     for (int k = 2; k <= ntg.x; k *= 2) {
         for (int j = k / 2; j > 0; j /= 2) {
+            if (shuffle && j < 32) {
+                if (k > 32 && j == 16) {
+                    reg_idx = shmem_i32[col];
+                    reg_value = reg_idx < width ? shmem_f32[reg_idx - i00] : 0.0f;
+                }
+                const int other = simd_shuffle_xor(reg_idx, j);
+                const float value = simd_shuffle_xor(reg_value, j);
+                const bool first = ((col & k) == 0) == ((col & j) == 0);
+                const bool exchange = first ?
+                    (reg_idx >= width || (other < width && (order == DS4_SORT_ORDER_ASC ?
+                        reg_value > value : reg_value < value))) :
+                    (other >= width || (reg_idx < width && (order == DS4_SORT_ORDER_ASC ?
+                        reg_value < value : reg_value > value)));
+                if (exchange) { reg_idx = other; reg_value = value; }
+                continue;
+            }
             int ixj = col ^ j;
             if (ixj > col) {
                 if ((col & k) == 0) {
-                    if (shmem_i32[col] >= args.ne00 ||
-                       (shmem_i32[ixj] <  args.ne00 && (order == DS4_SORT_ORDER_ASC ?
+                    if (shmem_i32[col] >= width ||
+                       (shmem_i32[ixj] <  width && (order == DS4_SORT_ORDER_ASC ?
                             shmem_f32[shmem_i32[col] - i00] > shmem_f32[shmem_i32[ixj] - i00] :
                             shmem_f32[shmem_i32[col] - i00] < shmem_f32[shmem_i32[ixj] - i00]))
                     ) {
                         SWAP(shmem_i32[col], shmem_i32[ixj]);
                     }
                 } else {
-                    if (shmem_i32[ixj] >= args.ne00 ||
-                       (shmem_i32[col] <  args.ne00 && (order == DS4_SORT_ORDER_ASC ?
+                    if (shmem_i32[ixj] >= width ||
+                       (shmem_i32[col] <  width && (order == DS4_SORT_ORDER_ASC ?
                             shmem_f32[shmem_i32[col] - i00] < shmem_f32[shmem_i32[ixj] - i00] :
                             shmem_f32[shmem_i32[col] - i00] > shmem_f32[shmem_i32[ixj] - i00]))
                     ) {
@@ -101,20 +130,26 @@ kernel void kernel_argsort_f32_i32(
 
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
+        if (shuffle && k >= 32) {
+            shmem_i32[col] = reg_idx;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
     }
 
     const int64_t i0 = ib*args.top_k;
 
     // copy the result to dst without the padding
-    if (i0 + col < args.ne0 && col < args.top_k) {
+    if (i0 + col < work_width && col < args.top_k) {
         dst += i0 + args.ne0*i01 + args.ne0*args.ne1*i02 + args.ne0*args.ne1*args.ne2*i03;
 
-        dst[col] = shmem_i32[col];
+        dst[col] = shuffle ? reg_idx : shmem_i32[col];
     }
 }
 
 // Host-visible sort variant used by DS4 top-k selection.
 template [[host_name("kernel_argsort_f32_i32_desc")]] kernel argsort_t kernel_argsort_f32_i32<DS4_SORT_ORDER_DESC>;
+template [[host_name("kernel_argsort_f32_i32_desc_causal")]] kernel argsort_t kernel_argsort_f32_i32<DS4_SORT_ORDER_DESC, true>;
+template [[host_name("kernel_argsort_f32_i32_desc_causal_shuffle")]] kernel argsort_t kernel_argsort_f32_i32<DS4_SORT_ORDER_DESC, true, true>;
 
 typedef void (argsort_merge_t)(
         constant   ds4_metal_args_argsort_merge & args,
@@ -127,7 +162,7 @@ typedef void (argsort_merge_t)(
 
 // Merges sorted index runs produced by kernel_argsort_f32_i32. In the DS4 graph
 // this finishes top-k over router or compressed-attention score rows.
-template<ds4_sort_order order>
+template<ds4_sort_order order, bool causal = false, bool prefix = false>
 kernel void kernel_argsort_merge_f32_i32(
         constant   ds4_metal_args_argsort_merge & args,
         device const char    * src0,
@@ -143,9 +178,16 @@ kernel void kernel_argsort_merge_f32_i32(
     const int i03 = tgpig[2];
 
     const int start = im * (2 * args.len);
+    const uint width = causal ? min(uint(args.ne00),
+        (args.causal_start + uint(i01) + 1u) / args.causal_ratio) : 0u;
+    const int work_width = causal ? int(((width - 1u) / args.block_width) * args.block_top_k +
+        min((width - 1u) % args.block_width + 1u, args.block_top_k)) : args.ne0;
 
-    const int len0 = MIN(args.len, MAX(0, args.ne0 - (int)(start)));
-    const int len1 = MIN(args.len, MAX(0, args.ne0 - (int)(start + args.len)));
+    // A merged run can contribute at most 512 entries to the final result.
+    // Keep the original run offsets so the comparison and tie order agree.
+    const int read_limit = prefix ? min(args.len, 512) : args.len;
+    const int len0 = MIN(read_limit, MAX(0, work_width - start));
+    const int len1 = MIN(read_limit, MAX(0, work_width - (start + args.len)));
 
     const int total = len0 + len1;
 
@@ -173,9 +215,10 @@ kernel void kernel_argsort_merge_f32_i32(
     const int chunk = (total + ntg.x - 1) / ntg.x;
 
     const int k0 = tpitg.x * chunk;
-    const int k1 = MIN(MIN(k0 + chunk, total), args.top_k);
+    const int limit = prefix ? min(args.top_k, 512) : args.top_k;
+    const int k1 = MIN(MIN(k0 + chunk, total), limit);
 
-    if (k0 >= args.top_k) {
+    if (k0 >= limit) {
         return;
     }
 
@@ -273,3 +316,5 @@ kernel void kernel_argsort_merge_f32_i32(
 
 // Host-visible merge variant used by DS4 top-k selection.
 template [[host_name("kernel_argsort_merge_f32_i32_desc")]] kernel argsort_merge_t kernel_argsort_merge_f32_i32<DS4_SORT_ORDER_DESC>;
+template [[host_name("kernel_argsort_merge_f32_i32_desc_causal")]] kernel argsort_merge_t kernel_argsort_merge_f32_i32<DS4_SORT_ORDER_DESC, true>;
+template [[host_name("kernel_argsort_merge_f32_i32_desc_causal_prefix")]] kernel argsort_merge_t kernel_argsort_merge_f32_i32<DS4_SORT_ORDER_DESC, true, true>;

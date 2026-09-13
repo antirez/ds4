@@ -1,6 +1,8 @@
 #include "ds4.h"
+#include "ds4_distributed.h"
 #include "ds4_gpu_args.h"
 #include "ds4_ssd.h"
+#include "ds4_tp.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -20,13 +22,36 @@ static void die(const char *msg) {
 static void usage(const char *prog) {
     fprintf(stderr,
             "usage: %s MODEL manifest.tsv OUT.tsv [ctx] "
-            "[--quality] "
+            "[--quality] [--rendered-prompt] "
             "[--gpu-vram N[,N,...]|auto] [--gpu-devices N[,N,...]] "
             "[--cuda-tensor-parallel] "
             "[--ssd-streaming] [--ssd-streaming-cold] "
             "[--ssd-streaming-cache-experts N|NGB] "
-            "[--ssd-streaming-preload-experts N]\n",
+            "[--ssd-streaming-preload-experts N] "
+            "[--dump-first-logits PATH] "
+            "[--max-cases N] "
+            "[--continued-prefill N] "
+            "[--session-batch N] "
+            "[--tensor-parallel --role coordinator --listen HOST PORT "
+            "[--transport auto|rdma|tcp]]\n",
             prog);
+}
+
+static ds4_tp *exit_tp;
+
+static void stop_tp_at_exit(void) {
+    if (!exit_tp) return;
+    ds4_tp_send_stop(exit_tp);
+    ds4_tp_free(exit_tp);
+    exit_tp = NULL;
+}
+
+static void close_engine(ds4_engine *engine) {
+    ds4_tp *tp = exit_tp;
+    if (tp) ds4_tp_send_stop(tp);
+    exit_tp = NULL;
+    ds4_engine_close(engine);
+    ds4_tp_free(tp);
 }
 
 static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
@@ -46,6 +71,42 @@ static int parse_positive_int(const char *s, const char *opt) {
         exit(2);
     }
     return (int)v;
+}
+
+/* Leave the last N prompt tokens for a second sync, exercising cached-prefix
+ * inference against exactly the same official continuation. */
+static int sync_prompt(ds4_session *session, const ds4_tokens *prompt,
+                       int continued, char *err, size_t errlen) {
+    if (continued) {
+        if (continued < 0 || continued >= prompt->len) {
+            snprintf(err, errlen, "continued prefill must be shorter than the prompt");
+            return 1;
+        }
+        ds4_tokens prefix = *prompt;
+        prefix.len -= continued;
+        const int rc = ds4_session_sync(session, &prefix, err, errlen);
+        if (rc) return rc;
+    }
+    return ds4_session_sync(session, prompt, err, errlen);
+}
+
+/* Score one official continuation among unrelated, independently advancing
+ * sessions. Rotate row order to catch scratch/state ownership mistakes. */
+#define SCORE_MAX_SESSIONS 8
+static int eval_with_companions(ds4_session **sessions, int count, int token,
+                                unsigned step, char *err, size_t errlen) {
+    if (count == 1) return ds4_session_eval(sessions[0], token, err, errlen);
+    ds4_decode_item items[SCORE_MAX_SESSIONS];
+    for (int row = 0; row < count; row++) {
+        const int i = (row + step) % (unsigned)count;
+        const int next = i ? ds4_session_argmax(sessions[i]) : token;
+        if (next < 0) {
+            snprintf(err, errlen, "companion session %d has invalid logits", i);
+            return 1;
+        }
+        items[row] = (ds4_decode_item){.session = sessions[i], .token = next};
+    }
+    return ds4_sessions_eval_batch(items, count, err, errlen);
 }
 
 static char *read_file(const char *path) {
@@ -367,35 +428,56 @@ static bool api_parse_pos(const char **pp, api_pos *pos) {
     }
 }
 
-static bool api_ref_load(const char *path, api_ref *ref) {
-    memset(ref, 0, sizeof(*ref));
-    if (!path || !path[0]) return false;
-    char *json = read_file(path);
-    const char *p = strstr(json, "\"logprobs\"");
-    if (p) p = strstr(p, "\"content\"");
-    if (p) p = strchr(p, '[');
-    if (!p) {
-        free(json);
-        return false;
+static const char *json_member(const char *p, const char *name) {
+    if (!p || *(p = json_ws(p)) != '{') return NULL;
+    p++;
+    while (*p) {
+        char key[64];
+        if (!json_key(&p, key, sizeof(key))) return NULL;
+        p = json_ws(p);
+        if (*p++ != ':') return NULL;
+        p = json_ws(p);
+        if (!strcmp(key, name)) return p;
+        const char *end = json_skip_value(p);
+        if (end == p) return NULL;
+        p = json_ws(end);
+        if (*p++ != ',') return NULL;
     }
+    return NULL;
+}
+
+static bool api_ref_parse(const char *json, api_ref *ref) {
+    memset(ref, 0, sizeof(*ref));
+    const char *p = json_member(json, "choices");
+    if (!p || *p != '[') return false;
+    p = json_member(json_ws(p + 1), "logprobs");
+    p = json_member(p, "content");
+    if (!p || *p != '[') return false;
     p++;
     while (1) {
         p = json_ws(p);
         if (*p == ']') {
-            free(json);
             return ref->n_pos > 0;
         }
         api_pos pos = {0};
-        if (!api_parse_pos(&p, &pos)) {
+        if (!api_parse_pos(&p, &pos) || !isfinite(pos.logprob)) {
             api_pos_free(&pos);
             api_ref_free(ref);
-            free(json);
             return false;
         }
         api_ref_add_pos(ref, &pos);
         p = json_ws(p);
         if (*p == ',') p++;
     }
+}
+
+static bool api_ref_load(const char *path, api_ref *ref) {
+    memset(ref, 0, sizeof(*ref));
+    if (!path || !path[0]) return false;
+    char *json = read_file(path);
+    bool ok = api_ref_parse(json, ref);
+    free(json);
+    return ok;
 }
 
 static int api_alt_token_id(ds4_engine *engine, const api_alt *alt) {
@@ -431,7 +513,8 @@ static bool local_logits(ds4_session *session, float *logits, int n_vocab,
     int best = -1;
     for (int i = 0; i < n_vocab; i++) {
         const float v = logits[i];
-        if (isfinite(v) && (best < 0 || v > max_logit)) {
+        if (!isfinite(v)) return false;
+        if (best < 0 || v > max_logit) {
             max_logit = v;
             best = i;
         }
@@ -439,12 +522,31 @@ static bool local_logits(ds4_session *session, float *logits, int n_vocab,
     if (best < 0) return false;
     double sum = 0.0;
     for (int i = 0; i < n_vocab; i++) {
-        const float v = logits[i];
-        if (isfinite(v)) sum += exp((double)v - (double)max_logit);
+        sum += exp((double)logits[i] - (double)max_logit);
     }
     *logsum = (double)max_logit + log(sum);
     *argmax = best;
     return true;
+}
+
+static bool dump_logits(const char *path, const char *case_id, int target,
+                        int greedy, const float *logits, int n_vocab) {
+    FILE *fp = fopen(path, "wb");
+    if (!fp) {
+        fprintf(stderr, "open %s: %s\n", path, strerror(errno));
+        return false;
+    }
+    bool ok = fprintf(fp,
+                      "# ds4 first logits v1\n"
+                      "# case=%s target=%d greedy=%d vocab=%d\n"
+                      "token\tlogit\n",
+                      case_id, target, greedy, n_vocab) >= 0;
+    for (int i = 0; ok && i < n_vocab; i++) {
+        ok = fprintf(fp, "%d\t%a\n", i, (double)logits[i]) >= 0;
+    }
+    if (fclose(fp) != 0) ok = false;
+    if (!ok) fprintf(stderr, "write %s failed\n", path);
+    return ok;
 }
 
 static double local_logprob(const float *logits, int n_vocab, int token, double logsum) {
@@ -522,6 +624,7 @@ int main(int argc, char **argv) {
     int ctx_size = 4096;
     bool ctx_set = false;
     bool quality = false;
+    bool rendered_prompt = false;
     const char *gpu_vram_arg = NULL;
     const char *gpu_devices_arg = NULL;
     bool cuda_tensor_parallel = false;
@@ -530,11 +633,38 @@ int main(int argc, char **argv) {
     uint32_t ssd_streaming_cache_experts = 0;
     uint64_t ssd_streaming_cache_bytes = 0;
     uint32_t ssd_streaming_preload_experts = 0;
+    const char *first_logits_path = NULL;
+    int max_cases = 0;
+    int continued_prefill = 0;
+    int session_count = 1;
+    ds4_dist_options dist = {0};
+    ds4_tp_options tp = {0};
 
     for (int i = 4; i < argc; i++) {
         const char *arg = argv[i];
+        char parse_err[256] = {0};
+        ds4_dist_cli_parse_result dist_parse =
+            ds4_dist_parse_cli_arg(arg, &i, argc, argv, &dist,
+                                   parse_err, sizeof(parse_err));
+        if (dist_parse == DS4_DIST_CLI_ERROR) {
+            fprintf(stderr, "score_official: %s\n", parse_err);
+            return 2;
+        }
+        if (dist_parse == DS4_DIST_CLI_MATCHED) continue;
+
+        ds4_tp_cli_parse_result tp_parse =
+            ds4_tp_parse_cli_arg(arg, &i, argc, argv, &tp,
+                                 parse_err, sizeof(parse_err));
+        if (tp_parse == DS4_TP_CLI_ERROR) {
+            fprintf(stderr, "score_official: %s\n", parse_err);
+            return 2;
+        }
+        if (tp_parse == DS4_TP_CLI_MATCHED) continue;
+
         if (!strcmp(arg, "--quality")) {
             quality = true;
+        } else if (!strcmp(arg, "--rendered-prompt")) {
+            rendered_prompt = true;
         } else if (!strcmp(arg, "--gpu-vram")) {
             gpu_vram_arg = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--gpu-devices")) {
@@ -558,6 +688,19 @@ int main(int argc, char **argv) {
         } else if (!strcmp(arg, "--ssd-streaming-preload-experts")) {
             ssd_streaming_preload_experts =
                 (uint32_t)parse_positive_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--dump-first-logits")) {
+            first_logits_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--max-cases")) {
+            max_cases = parse_positive_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--continued-prefill")) {
+            continued_prefill = parse_positive_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--session-batch")) {
+            session_count = parse_positive_int(need_arg(&i, argc, argv, arg), arg);
+            if (session_count > SCORE_MAX_SESSIONS) {
+                fprintf(stderr, "score_official: --session-batch must be between 1 and %d\n",
+                        SCORE_MAX_SESSIONS);
+                return 2;
+            }
         } else if (arg[0] != '-' && !ctx_set) {
             ctx_size = parse_positive_int(arg, "ctx");
             ctx_set = true;
@@ -567,6 +710,16 @@ int main(int argc, char **argv) {
         }
     }
     if (ctx_size < 1024) ctx_size = 1024;
+
+    char tp_err[256] = {0};
+    if (!ds4_tp_adopt_distributed_options(&tp, &dist,
+                                          tp_err, sizeof(tp_err))) {
+        fprintf(stderr, "score_official: %s\n", tp_err);
+        return 2;
+    }
+    if (tp.role == DS4_TP_WORKER || dist.role == DS4_DISTRIBUTED_WORKER) {
+        die("score_official: start workers with ./ds4");
+    }
 
     ds4_engine_options opt = {
         .model_path = model_path,
@@ -586,7 +739,19 @@ int main(int argc, char **argv) {
         .cuda_tensor_parallel = cuda_tensor_parallel,
         .ssd_streaming = ssd_streaming,
         .ssd_streaming_cold = ssd_streaming_cold,
+        .distributed = dist,
+        .tp = tp,
     };
+    char dist_err[256] = {0};
+    if (ds4_dist_prepare_engine_options(&dist, &opt,
+                                        dist_err, sizeof(dist_err)) != 0) {
+        fprintf(stderr, "score_official: %s\n", dist_err);
+        return 2;
+    }
+    if (!ds4_tp_validate_engine_options(&opt, tp_err, sizeof(tp_err))) {
+        fprintf(stderr, "score_official: %s\n", tp_err);
+        return 2;
+    }
 
     ds4_engine *engine = NULL;
     if (gpu_vram_arg || gpu_devices_arg) {
@@ -616,8 +781,51 @@ int main(int argc, char **argv) {
         if (ds4_engine_open(&engine, &opt) != 0) die("failed to open model");
     }
 
+    if (tp.role == DS4_TP_LEADER) {
+        ds4_tp_identity tp_id = {
+            .gguf_bytes = ds4_engine_model_bytes(engine),
+            .model_id = (uint32_t)ds4_engine_model_id(engine),
+            .n_layer = (uint32_t)ds4_engine_layer_count(engine),
+            .n_embd = (uint32_t)ds4_engine_embd_dim(engine),
+            .n_vocab = (uint32_t)ds4_engine_vocab_size(engine),
+            .quant_bits = (uint32_t)ds4_engine_routed_quant_bits(engine),
+            .ctx_size = (uint32_t)ctx_size,
+        };
+        ds4_engine_tp_gate_schedule(engine,
+                                    &tp_id.gate_slot_start,
+                                    &tp_id.gate_slot_step,
+                                    &tp_id.gates_per_token,
+                                    tp_id.gate_slot_mask);
+        if (!ds4_tp_create(&exit_tp, &tp, &tp_id,
+                           tp_err, sizeof(tp_err)) ||
+            !ds4_engine_tp_bind(engine, exit_tp,
+                                tp_err, sizeof(tp_err))) {
+            fprintf(stderr, "score_official: %s\n", tp_err);
+            close_engine(engine);
+            return 1;
+        }
+        atexit(stop_tp_at_exit);
+    }
+
     ds4_session *session = NULL;
     if (ds4_session_create(&session, engine, ctx_size) != 0) die("failed to create session");
+    ds4_session *sessions[SCORE_MAX_SESSIONS] = {session};
+    ds4_tokens companion_prompt[SCORE_MAX_SESSIONS] = {0};
+    static const char *companion_text[] = {
+        "List the integers from 1 to 100.",
+        "Explain how a hash table handles collisions, with an example.",
+        "Write a short story about a lighthouse keeper who discovers a letter.",
+        "Describe an algorithm for sorting a linked list and give its complexity.",
+        "Explain why the sky is blue.",
+        "Write a Python function that counts words, followed by three tests.",
+        "Compare three ways of storing a sparse matrix."
+    };
+    for (int i = 1; i < session_count; i++) {
+        if (ds4_session_create(&sessions[i], engine, ctx_size) != 0)
+            die("failed to create companion session");
+        ds4_encode_chat_prompt(engine, NULL, companion_text[i - 1], DS4_THINK_NONE,
+                               &companion_prompt[i]);
+    }
 
     const int n_vocab = ds4_engine_vocab_size(engine);
     float *logits = malloc((size_t)n_vocab * sizeof(logits[0]));
@@ -655,6 +863,7 @@ int main(int argc, char **argv) {
     while (fgets(line, sizeof(line), mf)) {
         strip_newline(line);
         if (!line[0] || line[0] == '#') continue;
+        if (max_cases != 0 && case_n >= max_cases) break;
 
         char *id = strtok(line, "\t");
         char *prompt_path = strtok(NULL, "\t");
@@ -671,7 +880,10 @@ int main(int argc, char **argv) {
 
         ds4_tokens prompt = {0};
         ds4_tokens target = {0};
-        ds4_encode_chat_prompt(engine, NULL, prompt_text, DS4_THINK_NONE, &prompt);
+        if (rendered_prompt)
+            ds4_tokenize_rendered_chat(engine, prompt_text, &prompt);
+        else
+            ds4_encode_chat_prompt(engine, NULL, prompt_text, DS4_THINK_NONE, &prompt);
         ds4_tokenize_text(engine, cont_text, &target);
 
         if (prompt.len + target.len + 1 >= ctx_size) {
@@ -693,9 +905,18 @@ int main(int argc, char **argv) {
         }
         total_api_ref_tokens += have_api ? ref.n_pos : 0;
 
-        if (ds4_session_sync(session, &prompt, err, sizeof(err)) != 0) {
+        if (sync_prompt(session, &prompt, continued_prefill, err, sizeof(err)) != 0) {
             fprintf(stderr, "%s sync failed: %s\n", id, err);
             return 1;
+        }
+        for (int row = 1; row < session_count; row++) {
+            if (companion_prompt[row].len + target.len + 1 >= ctx_size)
+                die("companion continuation exceeds context");
+            ds4_session_invalidate(sessions[row]);
+            if (ds4_session_sync(sessions[row], &companion_prompt[row], err, sizeof(err)) != 0) {
+                fprintf(stderr, "%s companion %d sync failed: %s\n", id, row, err);
+                return 1;
+            }
         }
 
         double nll = 0.0;
@@ -706,7 +927,15 @@ int main(int argc, char **argv) {
             double logsum = 0.0;
             int greedy = -1;
             if (!local_logits(session, logits, n_vocab, &logsum, &greedy)) {
-                fprintf(stderr, "%s logits failed at target token %d\n", id, i);
+                fprintf(stderr,
+                        "%s logits copy failed or returned a non-finite value "
+                        "at target token %d\n",
+                        id, i);
+                return 1;
+            }
+            if (first_logits_path && case_n == 0 && i == 0 &&
+                !dump_logits(first_logits_path, id, target.v[i], greedy,
+                             logits, n_vocab)) {
                 return 1;
             }
 
@@ -780,7 +1009,8 @@ int main(int argc, char **argv) {
                 }
             }
 
-            if (ds4_session_eval(session, target.v[i], err, sizeof(err)) != 0) {
+            if (eval_with_companions(sessions, session_count, target.v[i], (unsigned)i,
+                                     err, sizeof(err)) != 0) {
                 fprintf(stderr, "%s eval failed at target token %d: %s\n", id, i, err);
                 return 1;
             }
@@ -878,7 +1108,10 @@ int main(int argc, char **argv) {
     fclose(out);
     fclose(mf);
     free(logits);
-    ds4_session_free(session);
-    ds4_engine_close(engine);
+    for (int i = 0; i < session_count; i++) {
+        ds4_session_free(sessions[i]);
+        ds4_tokens_free(&companion_prompt[i]);
+    }
+    close_engine(engine);
     return 0;
 }

@@ -1,0 +1,3 @@
+To understand why a GPU prefill path (processing a large prompt all at once) is faster than single-token decode (generating one token at a time), you have to look at the fundamental difference between **memory bandwidth** and **compute latency** in modern GPUs. 
+
+Here is the core answer: **

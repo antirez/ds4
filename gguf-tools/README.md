@@ -119,6 +119,47 @@ gguf-tools/deepseek4-quantize \
 `--compare-tensor` regenerates a single tensor and byte-compares it against the
 template or `--compare-gguf`.  `--threads N` controls routed-expert workers.
 
+## Convert DeepSeek V4.1 Flash
+
+V4.1 uses its own converter; a V4 template is not compatible. Install NumPy,
+tokenizers and SymPy, then build the quantizer library:
+
+```sh
+make -C gguf-tools libds4quants.dylib
+python3 gguf-tools/deepseek41_quantize.py \
+  --hf models/DeepSeek-V4.1-Flash \
+  --source-revision df42c109f1defefcbfcedbe7d905718a12266e40 \
+  --out gguf/DeepSeek-V4.1-Flash-IQ2_XXS-Q2_K-bootstrap.gguf --dry-run
+```
+
+Omit `--dry-run` to write the file. Add `--resume` after an interrupted conversion.
+Use `libds4quants.so` on Linux. Gate/up experts use IQ2_XXS and down experts use
+Q2_K; attention, shared experts and the output head use Q8_0. Engram rows retain
+their original FP8 values and scales, packed together at the end of the GGUF for
+disk lookups. Vision and DSpark weights are not included.
+
+The first conversion uses weight-energy importance for IQ2_XXS. After runtime
+calibration, add `--imatrix FILE` and choose a new output filename to regenerate
+from the original safetensors. Do not requantize the first GGUF.
+
+For Q4, add `--quant q4` and use `DeepSeek-V4.1-Flash-Q4.gguf` as the output.
+This changes only the routed experts to Q4_K; the other tensor formats and
+disk-only Engram layout stay the same. The same imatrix works for both recipes.
+
+Check the finished artifact against the pinned source before running it:
+
+```sh
+python3 gguf-tools/deepseek41_validate_gguf.py \
+  --hf models/DeepSeek-V4.1-Flash \
+  --source-revision df42c109f1defefcbfcedbe7d905718a12266e40 \
+  --gguf gguf/DeepSeek-V4.1-Flash-IQ2_XXS-Q2_K-bootstrap.gguf --payload
+```
+
+For a calibrated file, pass the same `--imatrix FILE` used during conversion.
+Pass `--quant q4` to the audit as well when checking a Q4 file.
+The audit checks the complete layout, all non-expert tensors, sampled experts
+and native Engram rows. It does not replace [inference quality tests](quality-testing/deepseek-v4.1-flash-20260910/README.md).
+
 ## Convert A DSpark Support Checkpoint
 
 The DSpark Flash checkpoint is published as Hugging Face safetensors and stores
@@ -128,7 +169,7 @@ understood by the converter:
 
 ```sh
 gguf-tools/deepseek4-quantize \
-  --hf ../deepseek-v4-quants/hf/DeepSeek-V4-Flash-DSpark \
+  --hf ../deepseek-v4-quants/hf/DeepSeek-V4-Flash-0731 \
   --dspark-manifest > /tmp/dspark-manifest.tsv
 ```
 
@@ -142,9 +183,9 @@ it does not require a base-model GGUF template:
 
 ```sh
 gguf-tools/deepseek4-quantize \
-  --hf ../deepseek-v4-quants/hf/DeepSeek-V4-Flash-DSpark \
+  --hf ../deepseek-v4-quants/hf/DeepSeek-V4-Flash-0731 \
   --dspark-support \
-  --out DeepSeek-V4-Flash-DSpark-support.gguf
+  --out DeepSeek-V4-Flash-DSpark-support-0731.gguf
 ```
 
 `--dspark-support --dry-run` reads safetensors shard headers to derive exact
@@ -158,13 +199,13 @@ Before a full write, regenerate one support tensor and record its checksum:
 
 ```sh
 gguf-tools/deepseek4-quantize \
-  --hf ../deepseek-v4-quants/hf/DeepSeek-V4-Flash-DSpark \
+  --hf ../deepseek-v4-quants/hf/DeepSeek-V4-Flash-0731 \
   --dspark-support \
   --compare-tensor mtp.0.main_proj.weight
 ```
 
 This reads only the payloads needed for that tensor.  Add `--compare-gguf
-DeepSeek-V4-Flash-DSpark-support.gguf` to byte-compare against an existing
+DeepSeek-V4-Flash-DSpark-support-0731.gguf` to byte-compare against an existing
 support GGUF.
 
 ## When No Imatrix Is Given

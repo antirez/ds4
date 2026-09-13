@@ -1,0 +1,4 @@
+Ecco lo pseudocodice per inserire un elemento in un heap binario (max-heap):
+
+```
+Fun

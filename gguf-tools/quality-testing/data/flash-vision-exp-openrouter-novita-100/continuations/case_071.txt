@@ -1,0 +1,4 @@
+Per capire perché gli array ordinati rendono più veloce la ricerca di appartenenza, dobbiamo confrontare due scenari: **array non ordinato** e **array ordinato**.
+
+## 1. Array non ordinato (ricerca lineare)
+In un array non ordinato, per verific

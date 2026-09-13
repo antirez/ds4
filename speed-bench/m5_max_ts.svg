@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="540" viewBox="0 0 960 540">
+<style>
+text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+.title { font-size: 26px; font-weight: 700; fill: #1f2933; }
+.axis-label { font-size: 14px; font-weight: 600; fill: #334155; }
+.tick { font-size: 12px; fill: #64748b; }
+.legend { font-size: 13px; font-weight: 600; fill: #1f2933; }
+</style>
+<rect width="960" height="540" fill="#ffffff"/>
+<text class="title" x="480.0" y="34" text-anchor="middle">M5 Max t/s</text>
+<line x1="82" y1="468.00" x2="878" y2="468.00" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="70" y="472.00" text-anchor="end">0</text>
+<line x1="82" y1="387.60" x2="878" y2="387.60" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="70" y="391.60" text-anchor="end">200</text>
+<line x1="82" y1="307.20" x2="878" y2="307.20" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="70" y="311.20" text-anchor="end">400</text>
+<line x1="82" y1="226.80" x2="878" y2="226.80" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="70" y="230.80" text-anchor="end">600</text>
+<line x1="82" y1="146.40" x2="878" y2="146.40" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="70" y="150.40" text-anchor="end">800</text>
+<line x1="82" y1="66.00" x2="878" y2="66.00" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="70" y="70.00" text-anchor="end">1k</text>
+<text class="tick" x="890" y="472.00" text-anchor="start">0</text>
+<text class="tick" x="890" y="391.60" text-anchor="start">10</text>
+<text class="tick" x="890" y="311.20" text-anchor="start">20</text>
+<text class="tick" x="890" y="230.80" text-anchor="start">30</text>
+<text class="tick" x="890" y="150.40" text-anchor="start">40</text>
+<text class="tick" x="890" y="70.00" text-anchor="start">50</text>
+<line x1="82.00" y1="66" x2="82.00" y2="468" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="82.00" y="492" text-anchor="middle">0</text>
+<line x1="324.92" y1="66" x2="324.92" y2="468" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="324.92" y="492" text-anchor="middle">20k</text>
+<line x1="567.84" y1="66" x2="567.84" y2="468" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="567.84" y="492" text-anchor="middle">40k</text>
+<line x1="810.76" y1="66" x2="810.76" y2="468" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="810.76" y="492" text-anchor="middle">60k</text>
+<line x1="82" y1="66" x2="82" y2="468" stroke="#334155" stroke-width="1.4"/>
+<line x1="878" y1="66" x2="878" y2="468" stroke="#334155" stroke-width="1.4"/>
+<line x1="82" y1="468" x2="878" y2="468" stroke="#334155" stroke-width="1.4"/>
+<text class="axis-label" x="480.0" y="520" text-anchor="middle">ctx size</text>
+<text class="axis-label" x="22" y="267.0" text-anchor="middle" transform="rotate(-90 22 267.0)">prefill t/s</text>
+<text class="axis-label" x="938" y="267.0" text-anchor="middle" transform="rotate(90 938 267.0)">generation t/s</text>
+<polyline fill="none" stroke="#2563eb" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" points="106.88,150.35 131.75,182.38 156.62,184.92 181.50,193.09 206.38,206.18 231.25,216.48 256.12,231.30 281.00,237.84 305.88,240.60 330.75,240.46 355.62,239.80 380.50,238.70 405.38,239.91 430.25,238.92 455.12,238.58 480.00,244.07 504.88,253.08 529.75,262.64 554.62,267.66 579.50,271.24 604.38,276.95 629.25,280.87 654.12,284.97 679.00,287.69 703.88,293.01 728.75,294.77 753.62,299.04 778.50,298.87 803.38,304.38 828.25,303.96 853.12,307.65 878.00,307.80"/>
+<polyline fill="none" stroke="#dc2626" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" points="106.88,151.63 131.75,166.50 156.62,169.07 181.50,170.28 206.38,172.45 231.25,173.49 256.12,175.34 281.00,177.43 305.88,180.25 330.75,180.89 355.62,183.14 380.50,183.79 405.38,186.44 430.25,187.40 455.12,189.17 480.00,191.75 504.88,194.64 529.75,196.97 554.62,205.01 579.50,210.32 604.38,211.93 629.25,216.27 654.12,223.10 679.00,234.28 703.88,236.85 728.75,239.99 753.62,240.15 778.50,243.93 803.38,243.20 828.25,245.45 853.12,243.76 878.00,245.77"/>
+<rect x="694" y="66" width="176" height="62" rx="6" fill="#ffffff" stroke="#cbd5e1"/>
+<rect x="708" y="78" width="12" height="12" fill="#2563eb"/>
+<text class="legend" x="730" y="89">prefill</text>
+<rect x="708" y="104" width="12" height="12" fill="#dc2626"/>
+<text class="legend" x="730" y="115">generation</text>
+</svg>

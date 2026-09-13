@@ -1,0 +1,3 @@
+La decodifica speculativa (speculative decoding) mantiene l'output **esatto** (identico a quello del modello originale) grazie a un meccanismo di **verifica matematica rigorosa**. Ecco il riassunto dei punti chiave:
+
+1. **Due modelli in gi

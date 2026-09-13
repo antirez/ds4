@@ -1,0 +1,6 @@
+Ecco una checklist concisa per la revisione della gestione della memoria in una PR:
+
+## ✅ Checklist Lifetime di Memoria
+
+### 1. **Allocazioni e Deallocazioni**
+- [ ] Ogni `new`/`malloc` ha un corrispondente `delete`/`free`

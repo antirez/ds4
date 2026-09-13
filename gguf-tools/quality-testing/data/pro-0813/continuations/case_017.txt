@@ -1,0 +1,1 @@
+La **decodifica speculativa** mantiene l'output esatto perché il modello più piccolo (draft

@@ -1,0 +1,5 @@
+Per capire la differenza tra **latenza** e **throughput**, la metafora migliore è quella di un **tubo dell'acqua** o di un **ristorante**.
+
+Immagina un ristorante con un solo cameriere.
+
+-   **Latenza** è

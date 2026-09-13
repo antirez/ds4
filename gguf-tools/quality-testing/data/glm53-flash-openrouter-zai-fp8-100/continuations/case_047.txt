@@ -1,0 +1,12 @@
+# Raw KV Rows vs. Compressed KV Rows
+
+This distinction typically comes up in the context of **KV caching in transformer inference** (and similar key-value storage systems).
+
+## Raw KV Rows
+
+Raw KV rows store the key and value tensors exactly as computed by the attention layers, in full precision:
+
+- **Format**: Full-precision (e.g., FP16, BF16, FP32) tensors
+- **Size**: Large — memory grows linearly with sequence length × batch size × layers × heads × head dimension
+- **Fidelity**: Exact values as produced during the forward pass
+- **Use case**: Default

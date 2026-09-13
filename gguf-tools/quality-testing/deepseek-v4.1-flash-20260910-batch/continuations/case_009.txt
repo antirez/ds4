@@ -1,0 +1,6 @@
+Looking at the background data, I can see the pattern of entries is useful context — they demonstrate a strong theme of **bounded/checked indexing** (every entry has a "status checked" note), which is exactly the kind of guarantee this C function fails to provide.
+
+## The Bug
+
+```c
+int lookup

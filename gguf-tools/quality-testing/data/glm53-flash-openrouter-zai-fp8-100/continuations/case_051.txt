@@ -1,0 +1,13 @@
+# Perché piccole differenze nei logit possono cambiare la continuazione greedy
+
+## Il meccanismo di base
+
+La decodifica greedy seleziona sempre il token con **logit massimo**:
+
+$$\text{token} = \arg\max_i \; z_i$$
+
+dove $z_i$ sono i logit. La decisione dipende solo dall'**ordinamento** dei logit, non dalla loro magnitudine. Questo rende la scelta estremamente sensibile a perturbazioni.
+
+## Le ragioni principali
+
+### 1. Differenze piccole

@@ -1,0 +1,46 @@
+{
+  "id": "gen-1788193392-t6otGdGQ3IbMyWwcZbhg",
+  "object": "chat.completion",
+  "created": 1788193392,
+  "model": "deepseek/deepseek-v4-flash-vision-exp",
+  "provider": "Novita",
+  "system_fingerprint": "aa8d6caccae4a22492bb51091cfc8eab",
+  "service_tier": null,
+  "choices": [
+    {
+      "index": 0,
+      "logprobs": null,
+      "finish_reason": "stop",
+      "native_finish_reason": "stop",
+      "message": {
+        "role": "assistant",
+        "content": "Quantization reduces memory but can alter the logits.",
+        "refusal": null,
+        "reasoning": null
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 23,
+    "completion_tokens": 11,
+    "total_tokens": 34,
+    "cost": 2.464e-05,
+    "is_byok": false,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "cache_write_tokens": 0,
+      "audio_tokens": 0,
+      "video_tokens": 0
+    },
+    "cost_details": {
+      "upstream_inference_cost": 2.464e-05,
+      "upstream_inference_prompt_cost": 1.012e-05,
+      "upstream_inference_completions_cost": 1.452e-05
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 0,
+      "image_tokens": 0,
+      "audio_tokens": 0
+    }
+  }
+}

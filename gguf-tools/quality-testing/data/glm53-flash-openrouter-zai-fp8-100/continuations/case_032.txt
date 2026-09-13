@@ -1,0 +1,13 @@
+# Mutex vs Contatore Atomico
+
+## Contatore Atomico
+
+Un **contatore atomico** (es. `std::atomic<int>` in C++, `AtomicInteger` in Java) è una variabile su cui le operazioni come incremento, decremento e lettura/scrittura vengono eseguite in modo **indivisibile**, senza che altri thread possano osservare stati intermedi.
+
+```cpp
+std::atomic<int> counter{0};
+counter++;  // atomico, thread-safe
+```
+
+**Caratteristiche:**
+- Operazioni singole, semplici (incremento,

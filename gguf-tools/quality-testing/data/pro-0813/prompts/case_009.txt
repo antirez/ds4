@@ -1,0 +1,1 @@
+Write three invariants for a tokenizer special-token table.

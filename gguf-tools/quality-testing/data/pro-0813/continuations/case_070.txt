@@ -1,0 +1,4 @@
+Ecco una semplice funzione Python che calcola la mediana di tre numeri:
+
+```python
+def mediana_t

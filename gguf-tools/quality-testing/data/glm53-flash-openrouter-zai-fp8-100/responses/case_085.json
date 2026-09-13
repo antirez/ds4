@@ -1,0 +1,46 @@
+{
+  "id": "gen-1787762364-mJxlLI9g9Un2G7JSi5XJ",
+  "object": "chat.completion",
+  "created": 1787762364,
+  "model": "z-ai/glm-5.3-flash",
+  "provider": "Z.AI",
+  "system_fingerprint": null,
+  "service_tier": null,
+  "choices": [
+    {
+      "index": 0,
+      "logprobs": null,
+      "finish_reason": "length",
+      "native_finish_reason": "length",
+      "message": {
+        "role": "assistant",
+        "content": "A compiler uses an abstract syntax tree (AST) as a hierarchical, tree-shaped representation of a program's structure, built during the parsing phase after the source code is tokenized. Each node in the tree represents a syntactic construct—such as an expression, statement, variable declaration, or function definition—with parent-child relationships capturing how these constructs nest (for example, an assignment node might have child nodes for the variable being assigned and the expression computing its value). Unlike the concrete syntax tree, the AST omits irrelevant details like punctuation and parentheses, focusing instead on semantic structure. Once constructed, the AST serves as the central data structure that",
+        "refusal": null,
+        "reasoning": null
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 26,
+    "completion_tokens": 128,
+    "total_tokens": 154,
+    "cost": 3.395e-05,
+    "is_byok": false,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "cache_write_tokens": 0,
+      "audio_tokens": 0,
+      "video_tokens": 0
+    },
+    "cost_details": {
+      "upstream_inference_cost": 3.395e-05,
+      "upstream_inference_prompt_cost": 1.95e-06,
+      "upstream_inference_completions_cost": 3.2e-05
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 0,
+      "image_tokens": 0,
+      "audio_tokens": 0
+    }
+  }
+}

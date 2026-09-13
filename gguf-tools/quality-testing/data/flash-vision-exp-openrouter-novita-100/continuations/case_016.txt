@@ -1,0 +1,3 @@
+Per rispondere bene, dobbiamo prima chiarire un malinteso comune: **top-p (nucleus sampling)** e **temperatura** non sono due metodi alternativi, ma due *parametri* che agiscono su aspetti diversi dello stesso processo di generazione. 
+
+Tutt

@@ -2,20 +2,25 @@
  *
  * Run with:
  *   DS4_TEST_MODEL=/path/to/model.gguf make test-metal-session-batch
+ * Optional steering coverage:
+ *   DS4_TEST_DIRECTIONAL_STEERING_FILE=/path/to/direction.f32
+ *   DS4_TEST_DIRECTIONAL_STEERING_FFN=1
+ *   DS4_TEST_DIRECTIONAL_STEERING_ATTN=0.25
  */
 
 #include "ds4.h"
 #include "ds4_tp.h"
 
-#include <float.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #define MAX_SESSION_COUNT 16
-#define DECODE_STEPS 6
+#define MAX_DECODE_STEPS 64
+#define DEFAULT_DECODE_STEPS 6
 #define MIXED_SUFFIX_TOKENS 8
 #define TEST_CTX 512
 
@@ -29,6 +34,15 @@ static const char *prompts[MAX_SESSION_COUNT] = {
     "Give a compact example of hexadecimal notation.",
     "Describe one invariant of a binary search tree.",
 };
+
+static float observed_max_abs;
+static bool compare_argmax_only;
+
+static double now_seconds(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
+}
 
 static void fail(const char *what, int session, int step) {
     fprintf(stderr, "FAIL: %s session=%d step=%d\n", what, session, step);
@@ -71,6 +85,92 @@ static int session_count_from_env(void) {
     return (int)count;
 }
 
+static int decode_steps_from_env(void) {
+    const char *value = getenv("DS4_TEST_DECODE_STEPS");
+    if (!value || !value[0]) return DEFAULT_DECODE_STEPS;
+    char *end = NULL;
+    long steps = strtol(value, &end, 10);
+    if (end == value || *end != '\0' || steps < 1 ||
+        steps > MAX_DECODE_STEPS) {
+        fprintf(stderr, "FAIL: invalid DS4_TEST_DECODE_STEPS=%s\n", value);
+        exit(1);
+    }
+    return (int)steps;
+}
+
+static unsigned disconnect_delay_ms_from_env(void) {
+    const char *value = getenv("DS4_TEST_TP_DISCONNECT_DELAY_MS");
+    if (!value || !value[0]) return 1000;
+    char *end = NULL;
+    unsigned long delay = strtoul(value, &end, 10);
+    if (end == value || *end != '\0' || delay > 60000) {
+        fprintf(stderr,
+                "FAIL: invalid DS4_TEST_TP_DISCONNECT_DELAY_MS=%s\n",
+                value);
+        exit(1);
+    }
+    return (unsigned)delay;
+}
+
+static uint32_t context_size_from_env(void) {
+    const char *value = getenv("DS4_TEST_CONTEXT_SIZE");
+    if (!value || !value[0]) return TEST_CTX;
+    char *end = NULL;
+    unsigned long size = strtoul(value, &end, 10);
+    if (end == value || *end != '\0' || size < 16 || size > UINT32_MAX) {
+        fprintf(stderr, "FAIL: invalid DS4_TEST_CONTEXT_SIZE=%s\n", value);
+        exit(1);
+    }
+    return (uint32_t)size;
+}
+
+static char *read_prompt_file(const char *path) {
+    if (!path || !path[0]) return NULL;
+    FILE *fp = fopen(path, "rb");
+    if (!fp || fseek(fp, 0, SEEK_END) != 0) {
+        fprintf(stderr, "FAIL: cannot open prompt file %s\n", path);
+        exit(1);
+    }
+    long size = ftell(fp);
+    if (size < 0 || fseek(fp, 0, SEEK_SET) != 0) {
+        fprintf(stderr, "FAIL: cannot size prompt file %s\n", path);
+        exit(1);
+    }
+    char *text = malloc((size_t)size + 1u);
+    if (!text || fread(text, 1, (size_t)size, fp) != (size_t)size) {
+        fprintf(stderr, "FAIL: cannot read prompt file %s\n", path);
+        exit(1);
+    }
+    fclose(fp);
+    text[size] = '\0';
+    return text;
+}
+
+static float logit_tolerance_from_env(void) {
+    const char *value = getenv("DS4_TEST_LOGIT_TOLERANCE");
+    if (!value || !value[0]) return 0.0f;
+    char *end = NULL;
+    float tolerance = strtof(value, &end);
+    if (end == value || *end != '\0' || !isfinite(tolerance) || tolerance < 0.0f) {
+        fprintf(stderr, "FAIL: invalid DS4_TEST_LOGIT_TOLERANCE=%s\n", value);
+        exit(1);
+    }
+    return tolerance;
+}
+
+static float steering_scale_from_env(const char *name, float fallback) {
+    const char *value = getenv(name);
+    if (!value || !value[0]) return fallback;
+    char *end = NULL;
+    float scale = strtof(value, &end);
+    if (end == value || *end != '\0' || !isfinite(scale) ||
+        scale < -100.0f || scale > 100.0f) {
+        fprintf(stderr, "FAIL: invalid %s=%s\n", name, value);
+        exit(1);
+    }
+    return scale;
+}
+
 static void archive_logits(ds4_session *session, float *dst, int vocab,
                            int session_id, int step) {
     if (ds4_session_copy_logits(session, dst, vocab) != vocab) {
@@ -80,31 +180,236 @@ static void archive_logits(ds4_session *session, float *dst, int vocab,
 
 static void compare_logits(ds4_session *session, const float *expected,
                            float *actual, int vocab, int expected_argmax,
-                           int session_id, int step) {
+                           float tolerance, int session_id, int step) {
     archive_logits(session, actual, vocab, session_id, step);
     float max_abs = 0.0f;
     int different = 0;
     int low_different = 0;
     int high_different = 0;
     for (int i = 0; i < vocab; i++) {
+        /* This target is also built with fast-math, so inspect exponent bits
+         * instead of relying on an isfinite check the compiler can remove. */
+        uint32_t actual_bits, expected_bits;
+        memcpy(&actual_bits, &actual[i], sizeof(actual_bits));
+        memcpy(&expected_bits, &expected[i], sizeof(expected_bits));
+        if ((actual_bits & 0x7f800000u) == 0x7f800000u ||
+            (expected_bits & 0x7f800000u) == 0x7f800000u)
+            fail("nonfinite logits", session_id, step);
         if (memcmp(&actual[i], &expected[i], sizeof(float)) != 0) {
             different++;
             if (i < vocab / 2) low_different++;
             else high_different++;
         }
         float d = fabsf(actual[i] - expected[i]);
-        if (!isfinite(d)) d = FLT_MAX;
         if (d > max_abs) max_abs = d;
     }
     int actual_argmax = ds4_session_argmax(session);
-    if (different != 0 || actual_argmax != expected_argmax) {
+    if (max_abs > observed_max_abs) observed_max_abs = max_abs;
+    if ((!compare_argmax_only && max_abs > tolerance) ||
+        actual_argmax != expected_argmax) {
         fprintf(stderr,
                 "FAIL: logits mismatch session=%d step=%d expected_top=%d "
-                "actual_top=%d differing=%d low=%d high=%d max_abs=%g\n",
+                "actual_top=%d differing=%d low=%d high=%d max_abs=%g tolerance=%g\n",
                 session_id, step, expected_argmax, actual_argmax,
-                different, low_different, high_different, max_abs);
+                different, low_different, high_different, max_abs, tolerance);
         exit(1);
     }
+}
+
+static void check_mixed_shapes(ds4_engine *engine, uint32_t ctx) {
+    const int vocab = ds4_engine_vocab_size(engine);
+    const size_t bytes = (size_t)vocab * sizeof(float);
+    ds4_session *base = NULL, *control = NULL, *sessions[8] = {0};
+    ds4_session_snapshot snapshot = {0};
+    ds4_tokens text = {0}, prompt = {0};
+    char error[256] = {0};
+    float *expected = malloc(8u * 5u * bytes), *actual = malloc(bytes);
+    if (!expected || !actual) fail("mixed shape allocation", -1, -1);
+    ds4_tokenize_text(engine, " The programmer checked every boundary and preserved the original data.", &text);
+    if (text.len == 0) fail("mixed shape tokenization", -1, -1);
+    for (uint32_t i = 0; i < ctx; i++) ds4_tokens_push(&prompt, text.v[i % (uint32_t)text.len]);
+    if (ds4_session_create(&base, engine, ctx) || ds4_session_create(&control, engine, ctx))
+        fail("mixed shape controls", -1, -1);
+    for (int i = 0; i < 8; i++)
+        if (ds4_session_create(&sessions[i], engine, ctx)) fail("mixed shape session", i, -1);
+    const int starts[] = {127, 128, 1023, 16383, 32767, 65535};
+    for (size_t b = 0; b < sizeof(starts) / sizeof(*starts); b++) {
+        const int start = starts[b];
+        if ((uint32_t)(start + 16) >= ctx) continue;
+        prompt.len = start;
+        if (ds4_session_sync(base, &prompt, error, sizeof(error)) ||
+            ds4_session_save_snapshot(base, &snapshot, error, sizeof(error)))
+            fail("mixed shape base", -1, start);
+        for (int prefix = 1; prefix <= 7; prefix++) {
+            const int count = 8 - prefix;
+            int tokens[8][5];
+            for (int i = 0; i <= count; i++) {
+                if (ds4_session_load_snapshot(control, &snapshot, error, sizeof(error)) ||
+                    ds4_session_load_snapshot(sessions[i], &snapshot, error, sizeof(error)))
+                    fail("mixed shape restore", i, start);
+                tokens[i][0] = prompt.v[start + i];
+                const int n = i == 0 ? prefix : 1;
+                for (int j = 0; j < n; j++)
+                    if (ds4_session_eval(control, i == 0 ? prompt.v[start + j] : tokens[i][0],
+                                          error, sizeof(error))) fail("mixed scalar", i, j);
+                for (int step = 0; step < 5; step++) {
+                    archive_logits(control, expected + (i * 5u + step) * (size_t)vocab,
+                                   vocab, i, step);
+                    if (step < 4) {
+                        tokens[i][step + 1] = prompt.v[start + prefix + i + step];
+                        if (ds4_session_eval(control, tokens[i][step + 1], error, sizeof(error)))
+                            fail("mixed scalar followup", i, step);
+                    }
+                }
+            }
+            ds4_decode_item items[8];
+            for (int i = 0; i < count; i++) items[i] = (ds4_decode_item){sessions[i + 1], tokens[i + 1][0]};
+            prompt.len = start + prefix;
+            const int saved_token = items[0].token;
+            items[0].token = vocab;
+            if (!ds4_sessions_eval_batch_with_prefill(items, count, sessions[0], &prompt,
+                                                       error, sizeof(error)))
+                fail("mixed invalid token accepted", -1, prefix);
+            for (int i = 0; i <= count; i++)
+                if (ds4_session_pos(sessions[i]) != start) fail("mixed invalid input advanced", i, prefix);
+            items[0].token = saved_token;
+            const double serial_begin = now_seconds();
+            if (ds4_session_sync(sessions[0], &prompt, error, sizeof(error)) ||
+                ds4_sessions_eval_batch(items, count, error, sizeof(error)))
+                fail("mixed serialized baseline", -1, prefix);
+            const double serial_seconds = now_seconds() - serial_begin;
+            for (int i = 0; i <= count; i++)
+                if (ds4_session_load_snapshot(sessions[i], &snapshot, error, sizeof(error)))
+                    fail("mixed timed baseline restore", i, prefix);
+            const double begin = now_seconds();
+            if (ds4_sessions_eval_batch_with_prefill(items, count, sessions[0], &prompt,
+                                                      error, sizeof(error))) {
+                fprintf(stderr, "%s\n", error);
+                fail("mixed shape execute", -1, prefix);
+            }
+            const double elapsed = now_seconds() - begin;
+            for (int step = 0; step < 5; step++) {
+                for (int i = 0; i <= count; i++) {
+                    const float *row = expected + (i * 5u + step) * (size_t)vocab;
+                    int top = 0;
+                    for (int v = 1; v < vocab; v++) if (row[v] > row[top]) top = v;
+                    compare_logits(sessions[i], row, actual, vocab, top, 0.0002f, i, step);
+                    if (ds4_session_pos(sessions[i]) != start + (i == 0 ? prefix : 1) + step)
+                        fail("mixed shape position", i, step);
+                }
+                if (step == 4) break;
+                for (int i = 0; i <= count; i++)
+                    items[i] = (ds4_decode_item){sessions[i], tokens[i][step + 1]};
+                if (ds4_sessions_eval_batch(items, count + 1, error, sizeof(error)))
+                    fail("mixed shape next batch", -1, step);
+            }
+            fprintf(stderr, "mixed shape PASS start=%d prefix=%d decode=%d seconds=%.6f serial=%.6f\n",
+                    start, prefix, count, elapsed, serial_seconds);
+        }
+    }
+    ds4_session_snapshot_free(&snapshot);
+    for (int i = 0; i < 8; i++) ds4_session_free(sessions[i]);
+    ds4_session_free(base); ds4_session_free(control);
+    ds4_tokens_free(&text); ds4_tokens_free(&prompt);
+    free(expected); free(actual);
+    fprintf(stderr, "V4.1 mixed shapes PASS full_logits_max_abs=%g\n", observed_max_abs);
+}
+
+/* Compare equal arithmetic with different companions. This is independent of
+ * the separate serial/batch numerical comparison: no tolerance is allowed. */
+static void check_batch_isolation(ds4_engine *engine, int count, int steps,
+                                  uint32_t ctx, const char *prompt_text) {
+    const int vocab = ds4_engine_vocab_size(engine);
+    const size_t bytes = (size_t)vocab * sizeof(float);
+    float *expected = malloc((size_t)(steps + 3) * bytes);
+    float *actual = malloc(bytes);
+    float *unchanged = malloc(bytes);
+    int target[MAX_DECODE_STEPS + 1];
+    int top[MAX_DECODE_STEPS + 3];
+    double seconds[2] = {0};
+    if (!expected || !actual || !unchanged) fail("isolation allocation", -1, -1);
+    compare_argmax_only = false;
+    for (int phase = 0; phase < 2; phase++) {
+        ds4_session *sessions[MAX_SESSION_COUNT] = {0};
+        ds4_tokens transcript = {0};
+        char error[256] = {0};
+        for (int i = 0; i < count; i++) {
+            ds4_tokens prompt = {0};
+            const char *text = i ? prompts[(i + phase * 3) % 8] :
+                                    (prompt_text ? prompt_text : prompts[0]);
+            ds4_encode_chat_prompt(engine, NULL, text, DS4_THINK_NONE, &prompt);
+            if (i == 0) ds4_tokens_copy(&transcript, &prompt);
+            if (ds4_session_create(&sessions[i], engine, ctx) != 0 ||
+                ds4_session_sync(sessions[i], &prompt, error, sizeof(error)) != 0) {
+                fprintf(stderr, "isolation prefill failed: %s\n", error);
+                fail("isolation prefill", i, phase);
+            }
+            ds4_tokens_free(&prompt);
+        }
+        archive_logits(sessions[0], actual, vocab, 0, -1);
+        const int before = ds4_session_pos(sessions[0]);
+        const int next = ds4_session_argmax(sessions[0]);
+        ds4_decode_item invalid[2] = {{.session = sessions[0], .token = next},
+                                     {.session = sessions[0], .token = next}};
+        if (!ds4_sessions_eval_batch(NULL, 0, error, sizeof(error)) ||
+            !ds4_sessions_eval_batch(invalid, 2, error, sizeof(error)))
+            fail("isolation invalid batch accepted", phase, -1);
+        invalid[1].session = sessions[1];
+        invalid[1].token = vocab;
+        if (!ds4_sessions_eval_batch(invalid, 2, error, sizeof(error)) ||
+            ds4_session_pos(sessions[0]) != before)
+            fail("isolation invalid batch advanced", phase, -1);
+        compare_logits(sessions[0], actual, unchanged, vocab, next, 0, 0, -1);
+        error[0] = '\0';
+        for (int step = 0; step <= steps + 2; step++) {
+            float *reference = expected + (size_t)step * vocab;
+            if (!phase) {
+                archive_logits(sessions[0], reference, vocab, 0, step);
+                top[step] = ds4_session_argmax(sessions[0]);
+            } else compare_logits(sessions[0], reference, actual, vocab, top[step], 0, 0, step);
+            if (step == steps + 2) break;
+            ds4_decode_item items[MAX_SESSION_COUNT];
+            if (step < steps) {
+                if (!phase) target[step] = ds4_session_argmax(sessions[0]);
+                for (int row = 0; row < count; row++) {
+                    const int i = (row + step + phase) % count;
+                    items[row] = (ds4_decode_item){.session = sessions[i],
+                        .token = i ? ds4_session_argmax(sessions[i]) : target[step]};
+                }
+                const double begin = now_seconds();
+                if (ds4_sessions_eval_batch(items, count, error, sizeof(error)) != 0)
+                    fail("isolation batch", phase, step);
+                seconds[phase] += now_seconds() - begin;
+                ds4_tokens_push(&transcript, target[step]);
+            } else if (step == steps) {
+                ds4_tokenize_text(engine, "\nGive a brief verification of the result.", &transcript);
+                for (int i = 1; i < count; i++)
+                    items[i - 1] = (ds4_decode_item){.session = sessions[i],
+                        .token = ds4_session_argmax(sessions[i])};
+                const int rc = phase ? ds4_session_sync(sessions[0], &transcript, error, sizeof(error)) :
+                    ds4_sessions_eval_batch_with_prefill(items, count - 1, sessions[0],
+                                                         &transcript, error, sizeof(error));
+                if (rc != 0) fail("isolation mixed prefill", phase, step);
+            } else {
+                if (!phase) target[steps] = ds4_session_argmax(sessions[0]);
+                if (ds4_session_eval(sessions[0], target[steps], error, sizeof(error)) != 0)
+                    fail("isolation resumed serial decode", phase, step);
+                ds4_tokens_push(&transcript, target[steps]);
+            }
+            if (ds4_session_pos(sessions[0]) != transcript.len)
+                fail("isolation checkpoint", phase, step);
+        }
+        for (int i = 0; i < count; i++) ds4_session_free(sessions[i]);
+        ds4_tokens_free(&transcript);
+    }
+    free(unchanged);
+    free(actual);
+    free(expected);
+    fprintf(stderr, "test_metal_session_batch ISOLATION PASS sessions=%d steps=%d "
+                    "full_logits=exact rotated_rows changed_companions mixed_prefill resumed_decode\n",
+            count, steps);
+    fprintf(stderr, "isolation decode aggregate_tps=%.3f/%.3f tokens_per_phase=%d\n",
+            (double)count * steps / seconds[0], (double)count * steps / seconds[1], count * steps);
 }
 
 int main(void) {
@@ -115,6 +420,14 @@ int main(void) {
     }
     setenv("DS4_METAL_SESSION_BATCH_LOG", "1", 1);
     const int session_count = session_count_from_env();
+    const int decode_steps = decode_steps_from_env();
+    const uint32_t context_size = context_size_from_env();
+    const float logit_tolerance = logit_tolerance_from_env();
+    const bool skip_mixed = getenv("DS4_TEST_SKIP_MIXED") != NULL;
+    const bool live_controls = getenv("DS4_TEST_LIVE_CONTROLS") != NULL;
+    char *prompt_file_text = read_prompt_file(getenv("DS4_TEST_PROMPT_FILE"));
+    const char *argmax_only = getenv("DS4_TEST_ARGMAX_ONLY");
+    compare_argmax_only = argmax_only && strcmp(argmax_only, "0") != 0;
 
     const char *tp_mode = getenv("DS4_TEST_TP_MODE");
     const bool tp_leader = tp_mode && strcmp(tp_mode, "leader") == 0;
@@ -128,8 +441,17 @@ int main(void) {
         .model_path = model,
         .backend = DS4_BACKEND_METAL,
         .n_threads = 1,
-        .context_size = TEST_CTX,
+        .context_size = context_size,
     };
+    const char *steering_file =
+        getenv("DS4_TEST_DIRECTIONAL_STEERING_FILE");
+    if (steering_file && steering_file[0]) {
+        opt.directional_steering_file = steering_file;
+        opt.directional_steering_attn = steering_scale_from_env(
+                "DS4_TEST_DIRECTIONAL_STEERING_ATTN", 0.0f);
+        opt.directional_steering_ffn = steering_scale_from_env(
+                "DS4_TEST_DIRECTIONAL_STEERING_FFN", 1.0f);
+    }
     if (tp_leader) {
         opt.tp.role = DS4_TP_LEADER;
         opt.tp.listen_host = getenv("DS4_TEST_TP_LISTEN_HOST");
@@ -147,6 +469,16 @@ int main(void) {
         }
         opt.tp.leader_port = tp_port;
         opt.tp.transport = tp_transport_from_env();
+    }
+    opt.tp.rdma_device = getenv("DS4_TEST_TP_RDMA_DEVICE");
+    const char *gid = getenv("DS4_TEST_TP_GID_INDEX");
+    if (gid && gid[0]) {
+        char *end = NULL;
+        const long value = strtol(gid, &end, 10);
+        if (end == gid || *end || value < 0 || value > 255)
+            fail("invalid RDMA GID index", -1, -1);
+        opt.tp.rdma_gid_index = (int)value;
+        opt.tp.rdma_gid_index_set = true;
     }
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &opt) != 0) fail("engine open", -1, -1);
@@ -167,12 +499,16 @@ int main(void) {
             .n_embd = (uint32_t)ds4_engine_embd_dim(engine),
             .n_vocab = (uint32_t)ds4_engine_vocab_size(engine),
             .quant_bits = (uint32_t)ds4_engine_routed_quant_bits(engine),
-            .ctx_size = TEST_CTX,
+            .ctx_size = context_size,
         };
         ds4_engine_tp_gate_schedule(engine,
                                     &identity.gate_slot_start,
                                     &identity.gate_slot_step,
-                                    &identity.gates_per_token);
+                                    &identity.gates_per_token,
+                                    identity.gate_slot_mask);
+        if (getenv("DS4_TEST_TP_IDENTITY_MISMATCH")) {
+            identity.n_vocab++;
+        }
         if (!ds4_tp_create(&tp, &opt.tp, &identity,
                            tp_err, sizeof(tp_err)) ||
             !ds4_engine_tp_bind(engine, tp, tp_err, sizeof(tp_err))) {
@@ -181,18 +517,39 @@ int main(void) {
         }
     }
 
+    if (getenv("DS4_TEST_BATCH_ISOLATION") || getenv("DS4_TEST_MIXED_SHAPES")) {
+        if (getenv("DS4_TEST_MIXED_SHAPES")) check_mixed_shapes(engine, context_size);
+        else check_batch_isolation(engine, session_count, decode_steps, context_size, prompt_file_text);
+        free(prompt_file_text);
+        if (tp) (void)ds4_tp_send_stop(tp);
+        ds4_engine_close(engine);
+        ds4_tp_free(tp);
+        return 0;
+    }
     ds4_tokens prompt[MAX_SESSION_COUNT] = {0};
     ds4_session *batched[MAX_SESSION_COUNT] = {0};
     char err[256] = {0};
     for (int i = 0; i < session_count; i++) {
-        ds4_encode_chat_prompt(engine, NULL, prompts[i % 8], DS4_THINK_NONE,
+        ds4_encode_chat_prompt(engine, NULL,
+                               prompt_file_text ? prompt_file_text : prompts[i % 8],
+                               DS4_THINK_NONE,
                                &prompt[i]);
-        if (ds4_session_create(&batched[i], engine, TEST_CTX) != 0) {
+        if (ds4_session_create(&batched[i], engine, context_size) != 0) {
             fail("session create", i, -1);
         }
         if (ds4_session_sync(batched[i], &prompt[i], err, sizeof(err)) != 0) {
             fprintf(stderr, "FAIL: prefill session=%d: %s\n", i, err);
             return 1;
+        }
+    }
+    if (steering_file && steering_file[0] && !tp_leader) {
+        const float initial = opt.directional_steering_ffn;
+        if (ds4_session_directional_steering_ffn(batched[0]) != initial ||
+            ds4_session_set_directional_steering_ffn(batched[0], 0.0f) != 0 ||
+            ds4_session_directional_steering_ffn(batched[0]) != 0.0f ||
+            ds4_session_set_directional_steering_ffn(batched[0], initial) != 0 ||
+            ds4_session_directional_steering_ffn(batched[0]) != initial) {
+            fail("live steering control", 0, -1);
         }
     }
 
@@ -204,7 +561,7 @@ int main(void) {
         }
         fprintf(stderr, "TP_DISCONNECT_READY\n");
         fflush(stderr);
-        usleep(1000 * 1000);
+        usleep(disconnect_delay_ms_from_env() * 1000u);
         err[0] = '\0';
         if (ds4_sessions_eval_batch(items, session_count,
                                     err, sizeof(err)) == 0) {
@@ -227,11 +584,14 @@ int main(void) {
 
     const int vocab = ds4_engine_vocab_size(engine);
     const size_t frontier_count =
-        (size_t)session_count * (DECODE_STEPS + 1u);
+        (size_t)session_count * ((size_t)decode_steps + 1u);
     float *expected = malloc(frontier_count * (size_t)vocab * sizeof(float));
     float *actual = malloc((size_t)vocab * sizeof(float));
     int *argmax = malloc(frontier_count * sizeof(int));
-    int generated[MAX_SESSION_COUNT][DECODE_STEPS];
+    int generated[MAX_SESSION_COUNT][MAX_DECODE_STEPS];
+    ds4_session *live_control[MAX_SESSION_COUNT] = {0};
+    double control_seconds = 0.0;
+    double live_control_seconds = 0.0;
     if (!expected || !actual || !argmax) fail("oracle allocation", -1, -1);
 
 #define FRONTIER(step_, session_) \
@@ -242,8 +602,27 @@ int main(void) {
                        vocab, i, 0);
         argmax[f] = ds4_session_argmax(batched[i]);
     }
+    if (live_controls) {
+        for (int i = 0; i < session_count; i++) {
+            if (ds4_session_create(&live_control[i], engine,
+                                   context_size) != 0) {
+                fail("live control create", i, 0);
+            }
+            if (ds4_session_sync(live_control[i], &prompt[i],
+                                 err, sizeof(err)) != 0) {
+                fprintf(stderr, "FAIL: live control prefill session=%d: %s\n",
+                        i, err);
+                return 1;
+            }
+            const size_t f = FRONTIER(0, i);
+            compare_logits(live_control[i],
+                           expected + f * (size_t)vocab,
+                           actual, vocab, argmax[f], logit_tolerance, i, 0);
+        }
+    }
 
-    for (int step = 0; step < DECODE_STEPS; step++) {
+    const double batch_t0 = now_seconds();
+    for (int step = 0; step < decode_steps; step++) {
         ds4_decode_item items[MAX_SESSION_COUNT];
         for (int row = 0; row < session_count; row++) {
             int i = (step & 1) ? session_count - 1 - row : row;
@@ -262,24 +641,45 @@ int main(void) {
             archive_logits(batched[i], expected + f * (size_t)vocab,
                            vocab, i, step + 1);
             argmax[f] = ds4_session_argmax(batched[i]);
+            if (live_controls) {
+                const double eval_t0 = now_seconds();
+                const int eval_rc = ds4_session_eval(
+                        live_control[i], generated[i][step],
+                        err, sizeof(err));
+                live_control_seconds += now_seconds() - eval_t0;
+                if (eval_rc != 0) {
+                    fprintf(stderr,
+                            "FAIL: live control eval session=%d step=%d: %s\n",
+                            i, step, err);
+                    return 1;
+                }
+                compare_logits(live_control[i],
+                               expected + f * (size_t)vocab,
+                               actual, vocab, argmax[f], logit_tolerance,
+                               i, step + 1);
+            }
         }
     }
+    const double batch_seconds =
+        now_seconds() - batch_t0 - live_control_seconds;
     for (int i = 0; i < session_count; i++) {
         ds4_session_free(batched[i]);
+        if (live_control[i]) ds4_session_free(live_control[i]);
     }
 
-    ds4_tokens mixed_prompt = {0};
-    ds4_tokens suffix = {0};
-    ds4_tokens_copy(&mixed_prompt, &prompt[0]);
-    ds4_tokenize_text(engine,
-                      " Continue with a concise verification example and conclusion.",
-                      &suffix);
-    if (suffix.len < MIXED_SUFFIX_TOKENS) {
-        fail("mixed suffix tokenization", -1, -1);
-    }
-    for (int i = 0; i < MIXED_SUFFIX_TOKENS; i++) {
-        ds4_tokens_push(&mixed_prompt, suffix.v[i]);
-    }
+    if (!skip_mixed) {
+        ds4_tokens mixed_prompt = {0};
+        ds4_tokens suffix = {0};
+        ds4_tokens_copy(&mixed_prompt, &prompt[0]);
+        ds4_tokenize_text(engine,
+                          " Continue with a concise verification example and conclusion.",
+                          &suffix);
+        if (suffix.len < MIXED_SUFFIX_TOKENS) {
+            fail("mixed suffix tokenization", -1, -1);
+        }
+        for (int i = 0; i < MIXED_SUFFIX_TOKENS; i++) {
+            ds4_tokens_push(&mixed_prompt, suffix.v[i]);
+        }
 
     ds4_session *mixed_prefill = NULL;
     ds4_session *mixed_decode[MAX_SESSION_COUNT] = {0};
@@ -287,7 +687,7 @@ int main(void) {
             (size_t)(session_count + 1) * (size_t)vocab * sizeof(float));
     int mixed_argmax[MAX_SESSION_COUNT + 1];
     if (!mixed_expected) fail("mixed oracle allocation", -1, -1);
-    if (ds4_session_create(&mixed_prefill, engine, TEST_CTX) != 0) {
+    if (ds4_session_create(&mixed_prefill, engine, context_size) != 0) {
         fail("mixed prefill create", -1, -1);
     }
     if (ds4_session_sync(mixed_prefill, &prompt[0], err, sizeof(err)) != 0) {
@@ -296,7 +696,7 @@ int main(void) {
     }
     ds4_decode_item mixed_items[MAX_SESSION_COUNT];
     for (int i = 0; i < session_count; i++) {
-        if (ds4_session_create(&mixed_decode[i], engine, TEST_CTX) != 0) {
+        if (ds4_session_create(&mixed_decode[i], engine, context_size) != 0) {
             fail("mixed decode create", i, -1);
         }
         if (ds4_session_sync(mixed_decode[i], &prompt[i], err, sizeof(err)) != 0) {
@@ -323,7 +723,7 @@ int main(void) {
     }
 
     ds4_session *mixed_control = NULL;
-    if (ds4_session_create(&mixed_control, engine, TEST_CTX) != 0) {
+    if (ds4_session_create(&mixed_control, engine, context_size) != 0) {
         fail("mixed prefill control create", -1, -1);
     }
     if (ds4_session_sync(mixed_control, &prompt[0], err, sizeof(err)) != 0 ||
@@ -332,7 +732,7 @@ int main(void) {
         return 1;
     }
     compare_logits(mixed_control, mixed_expected, actual, vocab,
-                   mixed_argmax[0],
+                   mixed_argmax[0], logit_tolerance,
                    -1, -1);
     if (ds4_session_pos(mixed_prefill) != mixed_prompt.len ||
         ds4_session_pos(mixed_control) != mixed_prompt.len) {
@@ -342,7 +742,7 @@ int main(void) {
 
     for (int i = 0; i < session_count; i++) {
         mixed_control = NULL;
-        if (ds4_session_create(&mixed_control, engine, TEST_CTX) != 0) {
+        if (ds4_session_create(&mixed_control, engine, context_size) != 0) {
             fail("mixed decode control create", i, -1);
         }
         if (ds4_session_sync(mixed_control, &prompt[i], err, sizeof(err)) != 0 ||
@@ -353,7 +753,8 @@ int main(void) {
         }
         compare_logits(mixed_control,
                        mixed_expected + (size_t)(i + 1) * (size_t)vocab,
-                       actual, vocab, mixed_argmax[i + 1], i, -1);
+                       actual, vocab, mixed_argmax[i + 1],
+                       logit_tolerance, i, -1);
         if (ds4_session_pos(mixed_decode[i]) != prompt[i].len + 1 ||
             ds4_session_pos(mixed_control) != prompt[i].len + 1) {
             fail("mixed decode checkpoint", i, -1);
@@ -365,27 +766,33 @@ int main(void) {
     free(mixed_expected);
     ds4_tokens_free(&suffix);
     ds4_tokens_free(&mixed_prompt);
+    }
 
     for (int i = 0; i < session_count; i++) {
         ds4_session *control = NULL;
-        if (ds4_session_create(&control, engine, TEST_CTX) != 0) {
+        if (ds4_session_create(&control, engine, context_size) != 0) {
             fail("control create", i, -1);
         }
         if (ds4_session_sync(control, &prompt[i], err, sizeof(err)) != 0) {
             fprintf(stderr, "FAIL: control prefill session=%d: %s\n", i, err);
             return 1;
         }
-        for (int step = 0; step <= DECODE_STEPS; step++) {
+        for (int step = 0; step <= decode_steps; step++) {
             size_t f = FRONTIER(step, i);
             compare_logits(control, expected + f * (size_t)vocab,
-                           actual, vocab, argmax[f], i, step);
-            if (step < DECODE_STEPS &&
-                ds4_session_eval(control, generated[i][step],
-                                 err, sizeof(err)) != 0) {
-                fprintf(stderr,
-                        "FAIL: control eval session=%d step=%d: %s\n",
-                        i, step, err);
-                return 1;
+                           actual, vocab, argmax[f], logit_tolerance,
+                           i, step);
+            if (step < decode_steps) {
+                const double eval_t0 = now_seconds();
+                const int eval_rc = ds4_session_eval(
+                        control, generated[i][step], err, sizeof(err));
+                control_seconds += now_seconds() - eval_t0;
+                if (eval_rc != 0) {
+                    fprintf(stderr,
+                            "FAIL: control eval session=%d step=%d: %s\n",
+                            i, step, err);
+                    return 1;
+                }
             }
         }
         ds4_session_free(control);
@@ -395,12 +802,21 @@ int main(void) {
     free(argmax);
     free(actual);
     free(expected);
+    free(prompt_file_text);
     if (tp) (void)ds4_tp_send_stop(tp);
     ds4_engine_close(engine);
     ds4_tp_free(tp);
     fprintf(stderr,
-            "test_metal_session_batch PASS sessions=%d steps=%d mixed_suffix=%d exact_logits=1\n",
-            session_count, DECODE_STEPS, MIXED_SUFFIX_TOKENS);
+            "test_metal_session_batch PASS sessions=%d steps=%d mixed_suffix=%d "
+            "comparison=%s logit_tolerance=%g max_abs=%g batch=%.2f rows/s "
+            "serial=%.2f rows/s speedup=%.2fx\n",
+            session_count, decode_steps,
+            skip_mixed ? 0 : MIXED_SUFFIX_TOKENS,
+            compare_argmax_only ? "argmax" : "logits",
+            logit_tolerance, observed_max_abs,
+            (double)(session_count * decode_steps) / batch_seconds,
+            (double)(session_count * decode_steps) / control_seconds,
+            control_seconds / batch_seconds);
     return 0;
 #undef FRONTIER
 }

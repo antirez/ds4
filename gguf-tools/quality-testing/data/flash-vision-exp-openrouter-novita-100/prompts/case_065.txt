@@ -1,0 +1,1 @@
+How does a trie represent a set of strings?

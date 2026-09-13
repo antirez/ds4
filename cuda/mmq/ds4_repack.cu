@@ -6,8 +6,12 @@
  * lines are the gate. */
 #include "ds4_repack.h"
 
+#if defined(GGML_USE_HIP)
+#include "vendors/hip.h"
+#else
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#endif
 
 #include <atomic>
 #include <cerrno>

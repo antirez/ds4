@@ -1,0 +1,1 @@
+Explain why KV cache checkpointing helps agentic sessions.

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -134,15 +135,17 @@ def request_one(
     provider_order: list[str],
     provider_allow_fallbacks: bool,
     provider_require_parameters: bool,
+    temperature: float = 0,
 ) -> dict:
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0,
-        "logprobs": True,
-        "top_logprobs": top_logprobs,
+        "temperature": temperature,
         "stream": False,
     }
+    if top_logprobs > 0:
+        payload["logprobs"] = True
+        payload["top_logprobs"] = top_logprobs
     payload[token_limit_field] = max_tokens
     if thinking != "omit":
         payload["thinking"] = {"type": thinking}
@@ -180,6 +183,7 @@ def fetch_with_retry(
     provider_order: list[str],
     provider_allow_fallbacks: bool,
     provider_require_parameters: bool,
+    temperature: float = 0,
 ) -> dict:
     delay = 1.0
     for attempt in range(6):
@@ -197,6 +201,7 @@ def fetch_with_retry(
                 provider_order,
                 provider_allow_fallbacks,
                 provider_require_parameters,
+                temperature,
             )
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", "replace")
@@ -222,6 +227,9 @@ def main() -> int:
     ap.add_argument("--count", type=int, default=100)
     ap.add_argument("--max-tokens", type=int, default=24)
     ap.add_argument("--top-logprobs", type=int, default=5)
+    ap.add_argument("--temperature", type=float, default=0,
+                    help="sampling temperature, 0..2; use 1 for unscaled logprobs "
+                         "from providers reporting probabilities after sampling transforms")
     ap.add_argument("--thinking", choices=("disabled", "enabled", "omit"), default="disabled")
     ap.add_argument("--reasoning-effort",
                     choices=("xhigh", "high", "medium", "low", "minimal", "none", "omit"),
@@ -234,9 +242,17 @@ def main() -> int:
     ap.add_argument("--allow-provider-fallbacks", action="store_true")
     ap.add_argument("--require-parameters", action="store_true",
                     help="for OpenRouter, route only to endpoints advertising the requested parameters")
+    ap.add_argument("--require-response-model",
+                    help="reject a response that reports a different model ID")
+    ap.add_argument("--require-response-provider",
+                    help="reject a response from a different provider")
+    ap.add_argument("--resume", action="store_true",
+                    help="reuse complete cases already present in the output directory")
     args = ap.parse_args()
     if args.top_logprobs < 0 or args.top_logprobs > 20:
         raise SystemExit("--top-logprobs must be between 0 and 20")
+    if not math.isfinite(args.temperature) or not 0 <= args.temperature <= 2:
+        raise SystemExit("--temperature must be between 0 and 2")
 
     openrouter = "openrouter.ai" in args.endpoint
     api_key_env = args.api_key_env or ("OPENROUTER_API_KEY" if openrouter else "DEEPSEEK_API_KEY")
@@ -265,6 +281,8 @@ def main() -> int:
 
     manifest = out / "manifest.tsv"
     rows = []
+    observed_models = set()
+    observed_providers = set()
     total = min(args.count, len(prompts))
     print(f"model={args.model} endpoint={args.endpoint}", file=sys.stderr)
     print(f"key_env={api_key_env} token_field={token_limit_field} thinking={thinking} reasoning={reasoning_effort}",
@@ -276,34 +294,70 @@ def main() -> int:
     for i, prompt in enumerate(prompts[: args.count]):
         case_id = f"case_{i:03d}"
         print(f"official {i + 1}/{total}: {case_id}", file=sys.stderr, flush=True)
-        response = fetch_with_retry(
-            api_key,
-            args.endpoint,
-            args.model,
-            prompt,
-            args.max_tokens,
-            args.top_logprobs,
-            thinking,
-            reasoning_effort,
-            token_limit_field,
-            provider_order,
-            args.allow_provider_fallbacks,
-            provider_require_parameters,
-        )
+        prompt_path = out / "prompts" / f"{case_id}.txt"
+        cont_path = out / "continuations" / f"{case_id}.txt"
+        resp_path = out / "responses" / f"{case_id}.json"
+        complete = prompt_path.exists() and cont_path.exists() and resp_path.exists()
+        if args.resume and complete:
+            if prompt_path.read_text(encoding="utf-8") != prompt:
+                raise RuntimeError(f"{case_id}: saved prompt differs from current prompt set")
+            content = cont_path.read_text(encoding="utf-8")
+            response = json.loads(resp_path.read_text(encoding="utf-8"))
+            if not content:
+                complete = False
+
+        if not args.resume or not complete:
+            for empty_attempt in range(3):
+                response = fetch_with_retry(
+                    api_key,
+                    args.endpoint,
+                    args.model,
+                    prompt,
+                    args.max_tokens,
+                    args.top_logprobs,
+                    thinking,
+                    reasoning_effort,
+                    token_limit_field,
+                    provider_order,
+                    args.allow_provider_fallbacks,
+                    provider_require_parameters,
+                    args.temperature,
+                )
+                choice = response["choices"][0]
+                content = choice.get("message", {}).get("content")
+                if isinstance(content, str) and content:
+                    break
+                print(f"warning: empty continuation for {case_id}; retrying",
+                      file=sys.stderr, flush=True)
+                time.sleep(1.0 + empty_attempt)
+            else:
+                raise RuntimeError(f"{case_id}: provider returned three empty continuations")
         choice = response["choices"][0]
-        content = choice.get("message", {}).get("content", "")
-        if not content:
-            print(f"warning: empty continuation for {case_id}", file=sys.stderr)
+        if (args.require_response_model and
+                response.get("model") != args.require_response_model):
+            raise RuntimeError(
+                f"{case_id}: expected model {args.require_response_model!r}, "
+                f"got {response.get('model')!r}"
+            )
+        if (args.require_response_provider and
+                response.get("provider") != args.require_response_provider):
+            raise RuntimeError(
+                f"{case_id}: expected provider "
+                f"{args.require_response_provider!r}, got "
+                f"{response.get('provider')!r}"
+            )
+        if response.get("model"):
+            observed_models.add(response["model"])
+        if response.get("provider"):
+            observed_providers.add(response["provider"])
         logprob_items = (choice.get("logprobs") or {}).get("content", []) or []
         if args.top_logprobs > 0 and not logprob_items:
             raise RuntimeError(f"{case_id}: response did not include output-token logprobs")
 
-        prompt_path = out / "prompts" / f"{case_id}.txt"
-        cont_path = out / "continuations" / f"{case_id}.txt"
-        resp_path = out / "responses" / f"{case_id}.json"
-        prompt_path.write_text(prompt, encoding="utf-8")
-        cont_path.write_text(content, encoding="utf-8")
-        resp_path.write_text(json.dumps(response, ensure_ascii=False, indent=2), encoding="utf-8")
+        if not args.resume or not complete:
+            prompt_path.write_text(prompt, encoding="utf-8")
+            cont_path.write_text(content, encoding="utf-8")
+            resp_path.write_text(json.dumps(response, ensure_ascii=False, indent=2), encoding="utf-8")
         rows.append((case_id, prompt_path, cont_path, resp_path))
         time.sleep(0.05)
 
@@ -311,6 +365,29 @@ def main() -> int:
         fp.write("# id\tprompt_file\tcontinuation_file\tresponse_file\n")
         for row in rows:
             fp.write("\t".join([row[0], str(row[1]), str(row[2]), str(row[3])]) + "\n")
+    collection = {
+        "schema": "ds4-official-continuations-v1",
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "model": args.model,
+        "endpoint": args.endpoint,
+        "observed_models": sorted(observed_models),
+        "observed_providers": sorted(observed_providers),
+        "temperature": args.temperature,
+        "max_tokens": args.max_tokens,
+        "top_logprobs": args.top_logprobs,
+        "thinking": thinking,
+        "reasoning_effort": reasoning_effort,
+        "token_limit_field": token_limit_field,
+        "provider_order": provider_order,
+        "allow_provider_fallbacks": args.allow_provider_fallbacks,
+        "require_parameters": provider_require_parameters,
+        "required_response_model": args.require_response_model,
+        "required_response_provider": args.require_response_provider,
+        "case_count": len(rows),
+    }
+    (out / "collection.json").write_text(
+        json.dumps(collection, indent=2) + "\n", encoding="utf-8"
+    )
     print(f"wrote {manifest}", file=sys.stderr)
     return 0
 

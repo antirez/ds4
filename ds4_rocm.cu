@@ -1,6 +1,7 @@
 #ifdef __HIP_PLATFORM_AMD__
 #include "ds4_rocm.h"
 #include <hipblaslt/hipblaslt.h>
+#include <rocblas/rocblas.h>
 
 #define FULL_WARP_MASK 0xFFFFFFFFFFFFFFFFULL
 #define MASK_T uint64_t
@@ -39,7 +40,27 @@
 #include <vector>
 
 #include "ds4_gpu.h"
+#include "ds4_image.h"
 
+static thread_local bool g_dspark_verify_mode;
+
+extern "C" void ds4_gpu_set_dspark_verify_mode(bool enabled) {
+    g_dspark_verify_mode = enabled;
+}
+
+extern "C" int ds4_mmq_init(int device);
+extern "C" int ds4_mmq_iq2_xxs_moe_pair(
+    const void *W_a, const void *W_b, const float *X_f32,
+    const int32_t *ids, float *out_a, float *out_b,
+    int M, int K, int n_tokens, int n_experts, int n_expert_used,
+    cudaStream_t stream);
+extern "C" int ds4_mmq_q8_0_dense_vec(
+    const void *W, const float *X_f32, float *out_f32,
+    int M, int N, int K, cudaStream_t stream);
+extern "C" int ds4_mmq_q2_K_moe_down_sum6_vec(
+    const void *W, const float *X, const int32_t *ids, float *out,
+    int M, int K, int n_tokens, int n_experts, int n_expert_used,
+    cudaStream_t stream);
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -87,11 +108,29 @@ typedef struct {
     uint16_t qs[CUDA_QK_K / 8];
 } cuda_block_iq2_xxs;
 
+typedef struct {
+    uint8_t e;
+    uint8_t qs[16];
+} cuda_block_mxfp4;
+
+static_assert(sizeof(cuda_block_mxfp4) == 17, "cuda_block_mxfp4 must match the GGUF MXFP4 block layout");
+
+/* Twice the MXFP4 values so each 32-value sub-block can use signed-int8
+ * dp4a; the factor of 1/2 is folded into the sub-block scale. */
+__device__ __constant__ static const int8_t cuda_mxfp4_values_x2[16] = {
+     0,  1,  2,  3,  4,  6,  8,  12,
+     0, -1, -2, -3, -4, -6, -8, -12,
+};
+
 #include "ds4_iq2_tables_cuda.inc"
 
 #include "rocm/ds4_rocm_runtime.cuh"
 
 #include "rocm/ds4_rocm_common.cuh"
+
+extern "C" int ds4_gpu_dspark_gfx1151_fast_path(void) {
+    return ds4_rocm_is_gfx1151();
+}
 
 #include "rocm/ds4_rocm_q8.cuh"
 
@@ -131,6 +170,10 @@ typedef struct {
 #include "rocm/ds4_rocm_hc_output_launch.cuh"
 
 #include "rocm/ds4_rocm_current_api_compat.cuh"
+
+#include "ds4_glm53_vision_gpu.cuh"
+#include "ds4_deepseek4_vision_gpu.cuh"
+#include "rocm/ds4_rocm_deepseek4_vision.cuh"
 
 /* Tensor-parallel gates are Metal-only; stubs keep shared graph code
  * linkable (TP option validation rejects non-Metal backends). */

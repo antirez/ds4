@@ -1,0 +1,46 @@
+{
+  "id": "gen-1787762215-F7y5cjI1LBGTWtbD7FE9",
+  "object": "chat.completion",
+  "created": 1787762215,
+  "model": "z-ai/glm-5.3-flash",
+  "provider": "Z.AI",
+  "system_fingerprint": null,
+  "service_tier": null,
+  "choices": [
+    {
+      "index": 0,
+      "logprobs": null,
+      "finish_reason": "stop",
+      "native_finish_reason": "stop",
+      "message": {
+        "role": "assistant",
+        "content": "```json\n{\n  \"type\": \"object\",\n  \"properties\": {\n    \"name\": {\n      \"type\": \"string\"\n    },\n    \"arguments\": {\n      \"type\": \"object\"\n    }\n  },\n  \"required\": [\"name\", \"arguments\"]\n}\n```\n\nThis defines a tool call with:\n- **`name`** — a required string identifying the function to call\n- **`arguments`** — a required object holding the parameters (left open-ended; you can tighten it with `additionalProperties: false` and specific `properties` per tool)",
+        "refusal": null,
+        "reasoning": null
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 26,
+    "completion_tokens": 121,
+    "total_tokens": 147,
+    "cost": 3.22e-05,
+    "is_byok": false,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "cache_write_tokens": 0,
+      "audio_tokens": 0,
+      "video_tokens": 0
+    },
+    "cost_details": {
+      "upstream_inference_cost": 3.22e-05,
+      "upstream_inference_prompt_cost": 1.95e-06,
+      "upstream_inference_completions_cost": 3.025e-05
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 0,
+      "image_tokens": 0,
+      "audio_tokens": 0
+    }
+  }
+}

@@ -227,13 +227,135 @@ static void compare_case(const float *logits, float *scratch, uint32_t n,
     }
 }
 
+static void check_greedy_argmax_case(const float *logits, uint32_t n,
+                                     int expected, const char *label) {
+    uint64_t unrolled_rng = 0x1234u;
+    uint64_t scalar_rng = unrolled_rng;
+    CHECK(unsetenv("DS4_CPU_DISABLE_UNROLLED_ARGMAX") == 0,
+          "%s select unrolled argmax", label);
+    const int unrolled = ds4_test_sample_logits(
+            logits, n, 0.0f, 0, 1.0f, 0.0f, &unrolled_rng, NULL);
+    CHECK(setenv("DS4_CPU_DISABLE_UNROLLED_ARGMAX", "1", 1) == 0,
+          "%s select scalar argmax", label);
+    const int scalar = ds4_test_sample_logits(
+            logits, n, 0.0f, 0, 1.0f, 0.0f, &scalar_rng, NULL);
+    CHECK(unsetenv("DS4_CPU_DISABLE_UNROLLED_ARGMAX") == 0,
+          "%s restore unrolled argmax", label);
+    CHECK(unrolled == scalar,
+          "%s unrolled=%d scalar=%d", label, unrolled, scalar);
+    CHECK(unrolled == expected,
+          "%s token=%d expected=%d", label, unrolled, expected);
+    CHECK(unrolled_rng == 0x1234u && scalar_rng == 0x1234u,
+          "%s greedy argmax changed RNG state", label);
+}
+
+static void check_excluding_argmax_case(const float *logits, uint32_t n,
+                                        int excluded_id, int expected,
+                                        const char *label) {
+    CHECK(unsetenv("DS4_CPU_DISABLE_UNROLLED_ARGMAX") == 0,
+          "%s select unrolled excluding argmax", label);
+    const int unrolled = ds4_test_argmax_excluding_logits(
+            logits, n, excluded_id);
+    CHECK(setenv("DS4_CPU_DISABLE_UNROLLED_ARGMAX", "1", 1) == 0,
+          "%s select scalar excluding argmax", label);
+    const int scalar = ds4_test_argmax_excluding_logits(
+            logits, n, excluded_id);
+    CHECK(unsetenv("DS4_CPU_DISABLE_UNROLLED_ARGMAX") == 0,
+          "%s restore unrolled excluding argmax", label);
+    CHECK(unrolled == scalar,
+          "%s excluded=%d unrolled=%d scalar=%d",
+          label, excluded_id, unrolled, scalar);
+    CHECK(unrolled == expected,
+          "%s excluded=%d token=%d expected=%d",
+          label, excluded_id, unrolled, expected);
+}
+
 static double now_sec(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;
 }
 
+static void check_speculative_distribution(void) {
+    const float filter_logits[] = {
+        logf(0.50f), logf(0.30f), logf(0.15f), logf(0.05f),
+    };
+    float probs[4];
+    CHECK(ds4_test_sampling_probabilities(filter_logits, 4, 1.0f,
+                                          3, 0.70f, 0.0f, probs) != 0,
+          "build top-k/top-p probabilities");
+    CHECK(fabsf(probs[0] - 0.625f) < 1e-6f,
+          "top-k/top-p p0 %.9g", probs[0]);
+    CHECK(fabsf(probs[1] - 0.375f) < 1e-6f,
+          "top-k/top-p p1 %.9g", probs[1]);
+    CHECK(probs[2] == 0.0f && probs[3] == 0.0f,
+          "top-k/top-p filtered tail %.9g %.9g", probs[2], probs[3]);
+
+    CHECK(ds4_test_sampling_probabilities(filter_logits, 4, 1.0f,
+                                          0, 1.0f, 0.40f, probs) != 0,
+          "build min-p probabilities");
+    CHECK(fabsf(probs[0] - 0.625f) < 1e-6f,
+          "min-p p0 %.9g", probs[0]);
+    CHECK(fabsf(probs[1] - 0.375f) < 1e-6f,
+          "min-p p1 %.9g", probs[1]);
+    CHECK(probs[2] == 0.0f && probs[3] == 0.0f,
+          "min-p filtered tail %.9g %.9g", probs[2], probs[3]);
+
+    const float target_logits[] = {
+        logf(0.62f), logf(0.27f), logf(0.11f),
+    };
+    const float draft_logits[] = {
+        logf(0.15f), logf(0.55f), logf(0.30f),
+    };
+    uint64_t rng = 0x45f17a9d2c6b0381ULL;
+    uint32_t counts[3] = {0};
+    float target_probs[3];
+    float draft_probs[3];
+    const uint32_t trials = 100000;
+    for (uint32_t i = 0; i < trials; i++) {
+        const int token = ds4_test_speculative_sample(
+            target_logits, draft_logits, 3, 1.0f, 0, 1.0f, 0.0f,
+            &rng, target_probs, draft_probs);
+        CHECK(token >= 0 && token < 3,
+              "speculative sample token %d", token);
+        if (token >= 0 && token < 3) counts[token]++;
+    }
+    const float expected[] = {0.62f, 0.27f, 0.11f};
+    for (uint32_t i = 0; i < 3; i++) {
+        const float observed = (float)counts[i] / (float)trials;
+        CHECK(fabsf(observed - expected[i]) < 0.006f,
+              "speculative distribution token=%u observed=%.6f expected=%.6f",
+              i, observed, expected[i]);
+    }
+    printf("stochastic speculative distribution: %.4f %.4f %.4f\n",
+           (double)counts[0] / trials,
+           (double)counts[1] / trials,
+           (double)counts[2] / trials);
+
+    memset(counts, 0, sizeof(counts));
+    rng = 0x8f76c2b5a149d30eULL;
+    for (uint32_t i = 0; i < trials; i++) {
+        const int token = ds4_test_speculative_delta_sample(
+            target_logits, 3, 0, 1.0f, 0, 1.0f, 0.0f,
+            &rng, target_probs);
+        CHECK(token >= 0 && token < 3,
+              "delta speculative sample token %d", token);
+        if (token >= 0 && token < 3) counts[token]++;
+    }
+    for (uint32_t i = 0; i < 3; i++) {
+        const float observed = (float)counts[i] / (float)trials;
+        CHECK(fabsf(observed - expected[i]) < 0.006f,
+              "delta distribution token=%u observed=%.6f expected=%.6f",
+              i, observed, expected[i]);
+    }
+    printf("delta speculative distribution: %.4f %.4f %.4f\n",
+           (double)counts[0] / trials,
+           (double)counts[1] / trials,
+           (double)counts[2] / trials);
+}
+
 int main(void) {
+    check_speculative_distribution();
     const uint32_t semantic_n = 4096;
     float *logits = malloc((size_t)semantic_n * sizeof(*logits));
     float *scratch = malloc((size_t)semantic_n * sizeof(*scratch));
@@ -251,8 +373,75 @@ int main(void) {
                  "top-p");
     compare_case(logits, scratch, semantic_n, 0.8f, 64, 0.9f, 0.05f,
                  "top-k");
+    CHECK(unsetenv("DS4_CPU_DISABLE_UNROLLED_ARGMAX") == 0,
+          "select unrolled argmax default");
     compare_case(logits, scratch, semantic_n, 0.0f, 0, 1.0f, 0.05f,
                  "greedy");
+    CHECK(setenv("DS4_CPU_DISABLE_UNROLLED_ARGMAX", "1", 1) == 0,
+          "set scalar argmax control");
+    compare_case(logits, scratch, semantic_n, 0.0f, 0, 1.0f, 0.05f,
+                 "greedy-scalar-control");
+    CHECK(unsetenv("DS4_CPU_DISABLE_UNROLLED_ARGMAX") == 0,
+          "restore unrolled argmax default");
+
+    const float cross_lane_tie[] = {
+        -4.0f, 9.0f, -2.0f, 3.0f, 1.0f, 5.0f, 0.0f, 7.0f,
+         9.0f, 4.0f,  6.0f, 2.0f, 8.0f, 1.0f, 3.0f, 0.0f,
+         9.0f,
+    };
+    check_greedy_argmax_case(
+            cross_lane_tie,
+            (uint32_t)(sizeof(cross_lane_tie) / sizeof(cross_lane_tie[0])),
+            1, "greedy-cross-lane-tie");
+
+    const float tail_tie[] = {
+        -3.0f, 0.0f, 8.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f,
+         6.0f, 7.0f, 8.0f,
+    };
+    check_greedy_argmax_case(
+            tail_tie,
+            (uint32_t)(sizeof(tail_tie) / sizeof(tail_tie[0])),
+            2, "greedy-tail-tie");
+
+    const float nonfinite_greedy[] = {
+        NAN, -INFINITY, -2.0e30f, INFINITY, INFINITY, 1.0f, NAN, 0.0f, 2.0f,
+    };
+    check_greedy_argmax_case(
+            nonfinite_greedy,
+            (uint32_t)(sizeof(nonfinite_greedy) /
+                       sizeof(nonfinite_greedy[0])),
+            3, "greedy-nonfinite");
+
+    const float below_sentinel[] = {
+        -2.0e30f, -1.5e30f, -INFINITY, NAN, -3.0e30f,
+    };
+    check_greedy_argmax_case(
+            below_sentinel,
+            (uint32_t)(sizeof(below_sentinel) / sizeof(below_sentinel[0])),
+            0, "greedy-below-sentinel");
+
+    const uint32_t excluding_n =
+        (uint32_t)(sizeof(cross_lane_tie) / sizeof(cross_lane_tie[0]));
+    check_excluding_argmax_case(
+            cross_lane_tie, excluding_n, -1, 1, "excluding-none");
+    check_excluding_argmax_case(
+            cross_lane_tie, excluding_n, 1, 8, "excluding-best");
+    check_excluding_argmax_case(
+            cross_lane_tie, excluding_n, 8, 1, "excluding-later-tie");
+    check_excluding_argmax_case(
+            cross_lane_tie, excluding_n, 16, 1, "excluding-tail-tie");
+    check_excluding_argmax_case(
+            cross_lane_tie, excluding_n, (int)excluding_n, 1,
+            "excluding-out-of-range");
+    check_excluding_argmax_case(
+            nonfinite_greedy,
+            (uint32_t)(sizeof(nonfinite_greedy) /
+                       sizeof(nonfinite_greedy[0])),
+            -1, 0, "excluding-leading-nan");
+    check_excluding_argmax_case(
+            below_sentinel,
+            (uint32_t)(sizeof(below_sentinel) / sizeof(below_sentinel[0])),
+            0, 1, "excluding-first-anchor");
 
     /* Exercise min-p values immediately around expf's cutoff. */
     const float cutoff = logf(0.05f);

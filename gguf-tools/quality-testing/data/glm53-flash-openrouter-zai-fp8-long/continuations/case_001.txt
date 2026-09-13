@@ -1,0 +1,5 @@
+## How storage and retrieval work (based on this excerpt)
+
+**File layout.** Each checkpoint is one file named `<40-char-hex-sha1>.kv` in a cache directory. The file consists of:
+
+1. A fixed header (`DS4_KVSTORE_FIXED_HEADER` bytes) written by `ds4_kvstore_fill_header`: magic `KVC`, format version (byte 3), quantization bits, reason code, extension flags, model id, then LE32 fields for tokens/hits/ctx_size, a payload

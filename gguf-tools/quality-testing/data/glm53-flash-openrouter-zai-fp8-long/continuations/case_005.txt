@@ -1,0 +1,7 @@
+## Session State
+
+The session lives in the worker thread and is represented by several cooperating pieces:
+
+- **`ds4_session *session`** — the live engine session object; the worker owns it exclusively.
+- **`ds4_tokens transcript`** — the token transcript backing the session, plus `session_dirty` flagging unsaved state and `user_activity` for save/compact heuristics.
+- **Session metadata**: `session_sha[41]` (hash/identifier), `session_title`, `session_created_at`, and `legacy_session_path_to

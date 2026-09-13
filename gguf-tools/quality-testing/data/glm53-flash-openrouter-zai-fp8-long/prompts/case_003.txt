@@ -1,0 +1,834 @@
+The following is an excerpt from ds4_server.c:
+```c
+#include "ds4.h"
+#include "ds4_distributed.h"
+#include "ds4_gpu_args.h"
+#include "ds4_help.h"
+#include "ds4_kvstore.h"
+#include "ds4_tp.h"
+#include "rax.h"
+
+/* OpenAI/Anthropic compatible local server.
+ *
+ * HTTP is intentionally simple: each client connection is handled by a small
+ * blocking thread that parses one request, then queues a job to a resident
+ * session worker. A model coordinator batches decode-ready sessions and
+ * serializes bounded prefill quanta, keeping graph mutations out of client
+ * threads while preserving per-session KV ownership. */
+
+#include <arpa/inet.h>
+#include <ctype.h>
+#include <dirent.h>
+#include <errno.h>
+#include <float.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <math.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <time.h>
+#include <unistd.h>
+
+static volatile sig_atomic_t g_stop_requested = 0;
+static volatile sig_atomic_t g_listen_fd = -1;
+
+#define DS4_SERVER_IO_TIMEOUT_SEC 10
+#define DS4_SERVER_SEND_STALL_TIMEOUT_MS 2000
+
+#if defined(__GNUC__) || defined(__clang__)
+#define DS4_SERVER_MAYBE_UNUSED __attribute__((unused))
+#else
+#define DS4_SERVER_MAYBE_UNUSED
+#endif
+
+static void stop_signal_handler(int sig) {
+    (void)sig;
+    if (g_stop_requested) _exit(130);
+    g_stop_requested = 1;
+    if (g_listen_fd >= 0) {
+        int fd = (int)g_listen_fd;
+        g_listen_fd = -1;
+        close(fd);
+    }
+}
+
+typedef struct {
+    char *ptr;
+    size_t len;
+    size_t cap;
+} buf;
+
+static void die(const char *msg) {
+    fprintf(stderr, "ds4-server: %s\n", msg);
+    exit(1);
+}
+
+static void *xmalloc(size_t n) {
+    void *p = malloc(n ? n : 1);
+    if (!p) die("out of memory");
+    return p;
+}
+
+static void *xrealloc(void *p, size_t n) {
+    p = realloc(p, n ? n : 1);
+    if (!p) die("out of memory");
+    return p;
+}
+
+static char *xstrdup(const char *s) {
+    size_t n = strlen(s);
+    char *p = xmalloc(n + 1);
+    memcpy(p, s, n + 1);
+    return p;
+}
+
+static bool random_bytes(void *dst, size_t len) {
+    unsigned char *p = dst;
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd < 0) return false;
+    while (len) {
+        ssize_t n = read(fd, p, len);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) {
+            close(fd);
+            return false;
+        }
+        p += (size_t)n;
+        len -= (size_t)n;
+    }
+    close(fd);
+    return true;
+}
+
+static char *xstrndup(const char *s, size_t n) {
+    char *p = xmalloc(n + 1);
+    memcpy(p, s, n);
+    p[n] = '\0';
+    return p;
+}
+
+static void buf_reserve(buf *b, size_t add) {
+    if (add > SIZE_MAX - b->len - 1) die("buffer overflow");
+    size_t need = b->len + add + 1;
+    if (need <= b->cap) return;
+    size_t cap = b->cap ? b->cap * 2 : 256;
+    while (cap < need) {
+        if (cap > SIZE_MAX / 2) {
+            cap = need;
+            break;
+        }
+        cap *= 2;
+    }
+    b->ptr = xrealloc(b->ptr, cap);
+    b->cap = cap;
+}
+
+static void buf_append(buf *b, const void *p, size_t n) {
+    buf_reserve(b, n);
+    memcpy(b->ptr + b->len, p, n);
+    b->len += n;
+    b->ptr[b->len] = '\0';
+}
+
+static void buf_putc(buf *b, char c) {
+    buf_append(b, &c, 1);
+}
+
+static void buf_puts(buf *b, const char *s) {
+    buf_append(b, s, strlen(s));
+}
+
+static void buf_printf(buf *b, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    va_list ap2;
+    va_copy(ap2, ap);
+    int n = vsnprintf(NULL, 0, fmt, ap);
+    va_end(ap);
+    if (n < 0) die("vsnprintf failed");
+    buf_reserve(b, (size_t)n);
+    vsnprintf(b->ptr + b->len, b->cap - b->len, fmt, ap2);
+    va_end(ap2);
+    b->len += (size_t)n;
+}
+
+static char *buf_take(buf *b) {
+    if (!b->ptr) return xstrdup("");
+    char *p = b->ptr;
+    memset(b, 0, sizeof(*b));
+    return p;
+}
+
+static void buf_free(buf *b) {
+    free(b->ptr);
+    memset(b, 0, sizeof(*b));
+}
+
+static void json_ws(const char **p) {
+    while (**p && isspace((unsigned char)**p)) (*p)++;
+}
+
+static bool json_lit(const char **p, const char *lit) {
+    size_t n = strlen(lit);
+    if (strncmp(*p, lit, n) != 0) return false;
+    *p += n;
+    return true;
+}
+
+static int json_hex(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + c - 'a';
+    if (c >= 'A' && c <= 'F') return 10 + c - 'A';
+    return -1;
+}
+
+static void utf8_put(buf *b, uint32_t cp) {
+    if (cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) cp = 0xfffd;
+    if (cp <= 0x7f) {
+        buf_putc(b, (char)cp);
+    } else if (cp <= 0x7ff) {
+        buf_putc(b, (char)(0xc0 | (cp >> 6)));
+        buf_putc(b, (char)(0x80 | (cp & 0x3f)));
+    } else if (cp <= 0xffff) {
+        buf_putc(b, (char)(0xe0 | (cp >> 12)));
+        buf_putc(b, (char)(0x80 | ((cp >> 6) & 0x3f)));
+        buf_putc(b, (char)(0x80 | (cp & 0x3f)));
+    } else {
+        buf_putc(b, (char)(0xf0 | (cp >> 18)));
+        buf_putc(b, (char)(0x80 | ((cp >> 12) & 0x3f)));
+        buf_putc(b, (char)(0x80 | ((cp >> 6) & 0x3f)));
+        buf_putc(b, (char)(0x80 | (cp & 0x3f)));
+    }
+}
+
+static bool json_u16(const char **p, uint32_t *out) {
+    if ((*p)[0] != '\\' || (*p)[1] != 'u') return false;
+    uint32_t cp = 0;
+    for (int i = 0; i < 4; i++) {
+        int h = json_hex((*p)[2 + i]);
+        if (h < 0) return false;
+        cp = (cp << 4) | (uint32_t)h;
+    }
+    *p += 6;
+    *out = cp;
+    return true;
+}
+
+static bool json_string(const char **p, char **out) {
+    /* Always define *out. Every failure path below returns false without
+     * producing a string, and several callers reparse in place with
+     * `free(x); json_string(&p, &x)` (e.g. duplicate JSON keys, the "model"
+     * field). Without this, a non-string or malformed value leaves *out
+     * holding the just-freed pointer, which a later cleanup frees again --
+     * a double-free. Nulling on entry closes that whole class at the root. */
+    *out = NULL;
+    json_ws(p);
+    if (**p != '"') return false;
+    (*p)++;
+    buf b = {0};
+    while (**p && **p != '"') {
+        unsigned char c = (unsigned char)*(*p)++;
+        if (c != '\\') {
+            buf_putc(&b, (char)c);
+            continue;
+        }
+        c = (unsigned char)*(*p)++;
+        switch (c) {
+        case '"': buf_putc(&b, '"'); break;
+        case '\\': buf_putc(&b, '\\'); break;
+        case '/': buf_putc(&b, '/'); break;
+        case 'b': buf_putc(&b, '\b'); break;
+        case 'f': buf_putc(&b, '\f'); break;
+        case 'n': buf_putc(&b, '\n'); break;
+        case 'r': buf_putc(&b, '\r'); break;
+        case 't': buf_putc(&b, '\t'); break;
+        case 'u': {
+            *p -= 2;
+            uint32_t cp = 0, lo = 0;
+            if (!json_u16(p, &cp)) goto fail;
+            if (cp >= 0xd800 && cp <= 0xdbff) {
+                const char *low_start = *p;
+                if (json_u16(p, &lo) && lo >= 0xdc00 && lo <= 0xdfff) {
+                    cp = 0x10000u + ((cp - 0xd800u) << 10) + (lo - 0xdc00u);
+                } else {
+                    *p = low_start;
+                    cp = 0xfffd;
+                }
+            }
+            utf8_put(&b, cp);
+            break;
+        }
+        default:
+            goto fail;
+        }
+    }
+    if (**p != '"') goto fail;
+    (*p)++;
+    *out = buf_take(&b);
+    return true;
+fail:
+    buf_free(&b);
+    return false;
+}
+
+static bool json_number(const char **p, double *out) {
+    json_ws(p);
+    char *end = NULL;
+    double v = strtod(*p, &end);
+    if (end == *p) return false;
+    *p = end;
+    *out = v;
+    return true;
+}
+
+static bool json_int(const char **p, int *out) {
+    double v = 0.0;
+    if (!json_number(p, &v)) return false;
+    /* json_number() uses strtod(), which accepts "NaN"/"Infinity". NaN fails
+     * every comparison, so a plain `v < 0` clamp would let it through to the
+     * (int) cast, which is undefined for NaN; `!(v >= 0)` folds NaN (and
+     * negatives) to 0. +/-Infinity are handled by the two clamps. */
+    if (!(v >= 0)) v = 0;
+    if (v > INT_MAX) v = INT_MAX;
+    *out = (int)v;
+    return true;
+}
+
+static bool json_bool(const char **p, bool *out) {
+    json_ws(p);
+    if (json_lit(p, "true")) {
+        *out = true;
+        return true;
+    }
+    if (json_lit(p, "false")) {
+        *out = false;
+        return true;
+    }
+    return false;
+}
+
+/* The request parser only understands the API fields we use and skips the
+ * rest.  Skipping is recursive because JSON values nest, so keep an explicit
+ * ceiling: without it, a useless ignored field like {"x":[[[...]]]} can spend
+ * the whole C stack before the request is rejected. */
+#define JSON_MAX_NESTING 256
+
+static bool json_skip_value_depth(const char **p, int depth);
+
+static bool json_skip_array_depth(const char **p, int depth) {
+    if (depth >= JSON_MAX_NESTING) return false;
+    json_ws(p);
+    if (**p != '[') return false;
+    (*p)++;
+    json_ws(p);
+    if (**p == ']') {
+        (*p)++;
+        return true;
+    }
+    for (;;) {
+        if (!json_skip_value_depth(p, depth + 1)) return false;
+        json_ws(p);
+        if (**p == ']') {
+            (*p)++;
+            return true;
+        }
+        if (**p != ',') return false;
+        (*p)++;
+    }
+}
+
+static bool json_skip_object_depth(const char **p, int depth) {
+    if (depth >= JSON_MAX_NESTING) return false;
+    json_ws(p);
+    if (**p != '{') return false;
+    (*p)++;
+    json_ws(p);
+    if (**p == '}') {
+        (*p)++;
+        return true;
+    }
+    for (;;) {
+        char *key = NULL;
+        if (!json_string(p, &key)) return false;
+        free(key);
+        json_ws(p);
+        if (**p != ':') return false;
+        (*p)++;
+        if (!json_skip_value_depth(p, depth + 1)) return false;
+        json_ws(p);
+        if (**p == '}') {
+            (*p)++;
+            return true;
+        }
+        if (**p != ',') return false;
+        (*p)++;
+    }
+}
+
+static bool json_skip_value_depth(const char **p, int depth) {
+    json_ws(p);
+    if (**p == '"') {
+        char *s = NULL;
+        bool ok = json_string(p, &s);
+        free(s);
+        return ok;
+    }
+    if (**p == '{') return json_skip_object_depth(p, depth);
+    if (**p == '[') return json_skip_array_depth(p, depth);
+    if (json_lit(p, "true") || json_lit(p, "false") || json_lit(p, "null")) return true;
+    double v = 0.0;
+    return json_number(p, &v);
+}
+
+static bool json_skip_value(const char **p) {
+    return json_skip_value_depth(p, 0);
+}
+
+static bool json_raw_value(const char **p, char **out) {
+    json_ws(p);
+    const char *start = *p;
+    if (!json_skip_value(p)) return false;
+    size_t n = (size_t)(*p - start);
+    char *s = xmalloc(n + 1);
+    memcpy(s, start, n);
+    s[n] = '\0';
+    *out = s;
+    return true;
+}
+
+static char *json_minify_raw_value(const char *json) {
+    const char *p = json ? json : "null";
+    json_ws(&p);
+    const char *start = p;
+    if (!json_skip_value(&p)) return xstrdup(json ? json : "null");
+    const char *end = p;
+
+    buf b = {0};
+    bool in_string = false;
+    bool escape = false;
+    for (const char *s = start; s < end; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (in_string) {
+            buf_putc(&b, (char)c);
+            if (escape) escape = false;
+            else if (c == '\\') escape = true;
+            else if (c == '"') in_string = false;
+        } else if (c == '"') {
+            in_string = true;
+            buf_putc(&b, (char)c);
+        } else if (!isspace(c)) {
+            buf_putc(&b, (char)c);
+        }
+    }
+    return buf_take(&b);
+}
+
+#define SERVER_IMAGE_MARKER_BYTES 64
+
+typedef struct {
+    char marker[SERVER_IMAGE_MARKER_BYTES];
+    uint8_t *encoded;
+    size_t encoded_len;
+} server_image_input;
+
+typedef struct {
+    server_image_input *v;
+    size_t len;
+    size_t cap;
+} server_image_inputs;
+
+static void server_image_inputs_free(server_image_inputs *images) {
+    if (!images) return;
+    for (size_t i = 0; i < images->len; i++) free(images->v[i].encoded);
+    free(images->v);
+    memset(images, 0, sizeof(*images));
+}
+
+static int base64_value(unsigned char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return 26 + c - 'a';
+    if (c >= '0' && c <= '9') return 52 + c - '0';
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+static bool server_decode_base64(const char *src, uint8_t **out, size_t *out_len) {
+    const size_t n = src ? strlen(src) : 0;
+    if (n == 0 || (n & 3u) != 0 || n > 64u * 1024u * 1024u)
+        return false;
+    size_t cap = (n / 4u) * 3u;
+    uint8_t *decoded = xmalloc(cap ? cap : 1);
+    size_t used = 0;
+    for (size_t i = 0; i < n; i += 4) {
+        int a = base64_value((unsigned char)src[i]);
+        int b = base64_value((unsigned char)src[i + 1]);
+        bool pad2 = src[i + 2] == '=';
+        bool pad3 = src[i + 3] == '=';
+        int c = pad2 ? 0 : base64_value((unsigned char)src[i + 2]);
+        int d = pad3 ? 0 : base64_value((unsigned char)src[i + 3]);
+        if (a < 0 || b < 0 || c < 0 || d < 0 ||
+            (pad2 && !pad3) || ((pad2 || pad3) && i + 4 != n)) {
+            free(decoded);
+            return false;
+        }
+        uint32_t bits = ((uint32_t)a << 18) | ((uint32_t)b << 12) |
+                        ((uint32_t)c << 6) | (uint32_t)d;
+        decoded[used++] = (uint8_t)(bits >> 16);
+        if (!pad2) decoded[used++] = (uint8_t)(bits >> 8);
+        if (!pad3) decoded[used++] = (uint8_t)bits;
+    }
+    *out = decoded;
+    *out_len = used;
+    return true;
+}
+
+static bool server_image_media_type(const char *media_type) {
+    return media_type &&
+           (!strcasecmp(media_type, "image/png") ||
+            !strcasecmp(media_type, "image/jpeg") ||
+            !strcasecmp(media_type, "image/jpg"));
+}
+
+static bool server_image_inputs_push_base64(server_image_inputs *images,
+                                            const char *media_type,
+                                            const char *base64,
+                                            char marker[SERVER_IMAGE_MARKER_BYTES]) {
+    if (!server_image_media_type(media_type)) return false;
+    server_image_input image = {0};
+    if (!server_decode_base64(base64, &image.encoded, &image.encoded_len))
+        return false;
+    unsigned char nonce[12];
+    if (!random_bytes(nonce, sizeof(nonce))) {
+        uint64_t fallback = (uint64_t)time(NULL) ^
+                            ((uint64_t)getpid() << 32) ^
+                            (uint64_t)(uintptr_t)images;
+        memcpy(nonce, &fallback, sizeof(fallback));
+        memset(nonce + sizeof(fallback), 0, sizeof(nonce) - sizeof(fallback));
+    }
+    static const char hex[] = "0123456789abcdef";
+    size_t pos = (size_t)snprintf(image.marker, sizeof(image.marker),
+                                  "\036" "DS4_IMAGE_");
+    for (size_t i = 0; i < sizeof(nonce) && pos + 2 < sizeof(image.marker); i++) {
+        image.marker[pos++] = hex[nonce[i] >> 4];
+        image.marker[pos++] = hex[nonce[i] & 15];
+    }
+    image.marker[pos++] = '\x1f';
+    image.marker[pos] = '\0';
+    if (images->len == images->cap) {
+        size_t cap = images->cap ? images->cap * 2 : 2;
+        images->v = xrealloc(images->v, cap * sizeof(images->v[0]));
+        images->cap = cap;
+    }
+    images->v[images->len++] = image;
+    snprintf(marker, SERVER_IMAGE_MARKER_BYTES, "%s", image.marker);
+    return true;
+}
+
+static bool server_image_inputs_push_data_uri(
+        server_image_inputs *images, const char *uri,
+        char marker[SERVER_IMAGE_MARKER_BYTES]) {
+    static const char png[] = "data:image/png;base64,";
+    static const char jpeg[] = "data:image/jpeg;base64,";
+    static const char jpg[] = "data:image/jpg;base64,";
+    if (!uri) return false;
+    if (!strncmp(uri, png, sizeof(png) - 1))
+        return server_image_inputs_push_base64(
+            images, "image/png", uri + sizeof(png) - 1, marker);
+    if (!strncmp(uri, jpeg, sizeof(jpeg) - 1))
+        return server_image_inputs_push_base64(
+            images, "image/jpeg", uri + sizeof(jpeg) - 1, marker);
+    if (!strncmp(uri, jpg, sizeof(jpg) - 1))
+        return server_image_inputs_push_base64(
+            images, "image/jpg", uri + sizeof(jpg) - 1, marker);
+    return false;
+}
+
+static void append_owned_text(char **dst, const char *text) {
+    buf b = {0};
+    buf_puts(&b, *dst ? *dst : "");
+    buf_puts(&b, text ? text : "");
+    free(*dst);
+    *dst = buf_take(&b);
+}
+
+static bool json_content(const char **p, char **out) {
+    json_ws(p);
+    if (**p == '"') return json_string(p, out);
+    if (json_lit(p, "null")) {
+        *out = xstrdup("");
+        return true;
+    }
+    if (**p != '[') {
+        if (!json_skip_value(p)) return false;
+        *out = xstrdup("");
+        return true;
+    }
+
+    (*p)++;
+    buf b = {0};
+    json_ws(p);
+    while (**p && **p != ']') {
+        if (**p == '"') {
+            char *s = NULL;
+            if (!json_string(p, &s)) goto fail;
+            buf_puts(&b, s);
+            free(s);
+        } else if (**p == '{') {
+            (*p)++;
+            json_ws(p);
+            while (**p && **p != '}') {
+                char *key = NULL;
+                if (!json_string(p, &key)) goto fail;
+                json_ws(p);
+                if (**p != ':') {
+                    free(key);
+                    goto fail;
+                }
+                (*p)++;
+                if (!strcmp(key, "text")) {
+                    char *s = NULL;
+                    if (!json_string(p, &s)) {
+                        free(key);
+                        goto fail;
+                    }
+                    buf_puts(&b, s);
+                    free(s);
+                } else if (!json_skip_value(p)) {
+                    free(key);
+                    goto fail;
+                }
+                free(key);
+                json_ws(p);
+                if (**p == ',') (*p)++;
+                json_ws(p);
+            }
+            if (**p != '}') goto fail;
+            (*p)++;
+        } else if (!json_skip_value(p)) {
+            goto fail;
+        }
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != ']') goto fail;
+    (*p)++;
+    *out = buf_take(&b);
+    return true;
+fail:
+    buf_free(&b);
+    return false;
+}
+
+static bool json_string_replace(const char **p, char **dst) {
+    char *tmp = NULL;
+    if (!json_string(p, &tmp)) return false;
+    free(*dst);
+    *dst = tmp;
+    return true;
+}
+
+static bool json_raw_value_replace(const char **p, char **dst) {
+    char *tmp = NULL;
+    if (!json_raw_value(p, &tmp)) return false;
+    free(*dst);
+    *dst = tmp;
+    return true;
+}
+
+static bool json_content_replace(const char **p, char **dst) {
+    char *tmp = NULL;
+    if (!json_content(p, &tmp)) return false;
+    free(*dst);
+    *dst = tmp;
+    return true;
+}
+
+typedef enum {
+    REQ_CHAT,
+    REQ_COMPLETION,
+} req_kind;
+
+typedef enum {
+    API_OPENAI,
+    API_ANTHROPIC,
+    API_RESPONSES,
+} api_style;
+
+typedef enum {
+    SERVER_MODEL_SYNTAX_DEEPSEEK,
+    SERVER_MODEL_SYNTAX_GLM,
+} server_model_syntax;
+
+static void random_tool_id(char *dst, size_t dstlen, api_style api) {
+    static uint64_t fallback_ctr;
+    unsigned char bytes[16];
+    const char *prefix = api == API_ANTHROPIC ? "toolu_" : "call_";
+    size_t pos = snprintf(dst, dstlen, "%s", prefix);
+    if (pos >= dstlen) return;
+
+    if (!random_bytes(bytes, sizeof(bytes))) {
+        uint64_t a = ((uint64_t)time(NULL) << 32) ^ (uint64_t)getpid();
+        uint64_t b = ++fallback_ctr ^ (uint64_t)(uintptr_t)dst;
+        memcpy(bytes, &a, sizeof(a));
+        memcpy(bytes + sizeof(a), &b, sizeof(b));
+    }
+
+    static const char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < sizeof(bytes) && pos + 2 < dstlen; i++) {
+        dst[pos++] = hex[bytes[i] >> 4];
+        dst[pos++] = hex[bytes[i] & 15];
+    }
+    dst[pos] = '\0';
+}
+
+typedef struct server server;
+static void server_inference_lock(server *s);
+static void server_inference_unlock(server *s);
+
+typedef struct {
+    char *id;
+    char *name;
+    char *arguments;
+} tool_call;
+
+typedef struct {
+    tool_call *v;
+    int len;
+    int cap;
+    char *raw_tool_text;
+} tool_calls;
+
+typedef struct {
+    int mem;
+    int disk;
+    int canonical;
+    int missing_ids;
+} tool_replay_stats;
+
+typedef struct {
+    char *name;
+    char *wire_name;
+    char *namespace;
+    /* Distinguish the Responses hosted tool from a normal function that
+     * happens to be named "tool_search". */
+    bool responses_tool_search;
+    char **prop;
+    int len;
+    int cap;
+} tool_schema_order;
+
+typedef struct {
+    tool_schema_order *v;
+    int len;
+    int cap;
+} tool_schema_orders;
+
+typedef struct {
+    char *role;
+    char *content;
+    server_image_inputs images;
+    char *reasoning;
+    char *tool_call_id;
+    char **tool_call_ids;
+    int tool_call_ids_len;
+    int tool_call_ids_cap;
+    tool_calls calls;
+} chat_msg;
+
+typedef struct {
+    chat_msg *v;
+    int len;
+    int cap;
+} chat_msgs;
+
+static void tool_memory_attach_to_messages(server *s, chat_msgs *msgs,
+                                           tool_replay_stats *stats);
+static bool tool_memory_has_id(server *s, const char *id);
+static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs *msgs);
+
+typedef struct {
+    char **v;
+    int len;
+    int cap;
+    size_t max_len;
+} stop_list;
+
+static void stop_list_clear(stop_list *stops);
+static bool id_list_contains(const stop_list *ids, const char *id);
+static void id_list_push_unique(stop_list *ids, const char *id);
+static void id_list_free(stop_list *ids);
+static bool responses_live_has_call_id(server *s, const char *id);
+static bool anthropic_live_has_call_id(server *s, const char *id);
+
+typedef struct {
+    req_kind kind;
+    api_style api;
+    server_model_syntax model_syntax;
+    ds4_tokens prompt;
+    ds4_vision_span *images;
+    size_t image_count;
+    char *model;
+    bool model_from_request;
+    stop_list stops;
+    char *raw_body;
+    char *prompt_text;
+    tool_schema_orders tool_orders;
+    int max_tokens;
+    int top_k;
+    float temperature;
+    float top_p;
+    float min_p;
+    /* Explicit client sampling wins even in thinking mode; the fixed
+     * DeepSeek-style thinking defaults apply only to omitted knobs. */
+    bool temperature_set;
+    bool top_p_set;
+    bool min_p_set;
+    bool top_k_set;
+    uint64_t seed;
+    bool stream;
+    bool stream_include_usage;
+    bool ignore_eos;
+    int cache_read_tokens;
+    int cache_write_tokens;
+    ds4_think_mode think_mode;
+    bool has_tools;
+    bool prompt_preserves_reasoning;
+    /* For /v1/responses: emit reasoning_summary_* events / fields only when the
+     * client opted in via reasoning.summary. Other APIs leave this false; the
+     * field is ignored on those code paths. */
+    bool reasoning_summary_emit;
+    /* Responses continuation contract:
+     *
+     * A live Responses tool loop is not a normal "new prompt with a long
+     * prefix" request.  The protocol gives tool outputs a call_id that binds
+     * them to a prior assistant tool call.  If that call_id is still known in
+     * memory, the live KV is the authoritative prefix, including any hidden
+     * thinking that the client did not replay.  These fields carry the parsed
+     * evidence needed by generate_job() to append only the new suffix.
+     *
+     * A tool-output-only request has no stateless prefix to match.  If the live
+     * call_id binding is gone by the time the worker executes it, DS4 must ask
+     * for a full replay rather than cold-prefilling a prompt that starts with a
+     * naked tool result.  Similarly, if live state is gone, a reasoning-mode
+     * tool replay must contain the prior reasoning item (or an equivalent
+     * opaque reasoning state from a future implementation). */
+    bool responses_requires_live_tool_state;
+    bool responses_requires_live_reasoning;
+    stop_list responses_live_call_ids;
+```
+Explain the state owned by this server and two constraints its request handling must respect. Base your answer only on the excerpt.

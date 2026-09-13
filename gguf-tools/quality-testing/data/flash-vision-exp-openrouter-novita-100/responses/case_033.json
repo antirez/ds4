@@ -1,0 +1,46 @@
+{
+  "id": "gen-1788193309-xGRjIyZIN6GjGnoIvIGB",
+  "object": "chat.completion",
+  "created": 1788193309,
+  "model": "deepseek/deepseek-v4-flash-vision-exp",
+  "provider": "Novita",
+  "system_fingerprint": "aa8d6caccae4a22492bb51091cfc8eab",
+  "service_tier": null,
+  "choices": [
+    {
+      "index": 0,
+      "logprobs": null,
+      "finish_reason": "length",
+      "native_finish_reason": "length",
+      "message": {
+        "role": "assistant",
+        "content": "In un server di rete, **backpressure** (contropressione) è un meccanismo di controllo del flusso che impedisce al sistema di essere sopraffatto da un volume di dati superiore alla sua capacità di elaborazione.\n\nIn pratica, funziona come un **sistema di fren",
+        "refusal": null,
+        "reasoning": null
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 15,
+    "completion_tokens": 64,
+    "total_tokens": 79,
+    "cost": 9.108e-05,
+    "is_byok": false,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "cache_write_tokens": 0,
+      "audio_tokens": 0,
+      "video_tokens": 0
+    },
+    "cost_details": {
+      "upstream_inference_cost": 9.108e-05,
+      "upstream_inference_prompt_cost": 6.6e-06,
+      "upstream_inference_completions_cost": 8.448e-05
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 0,
+      "image_tokens": 0,
+      "audio_tokens": 0
+    }
+  }
+}

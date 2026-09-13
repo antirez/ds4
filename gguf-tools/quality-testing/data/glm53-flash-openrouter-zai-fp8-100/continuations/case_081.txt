@@ -1,0 +1,15 @@
+This looks like the start of a comment describing what a lock (mutex/spinlock) protects in code. A typical completion would be:
+
+```c
+/* This lock protects the shared data structure below. */
+```
+
+Common variations you'd see in real codebases:
+
+```c
+/* This lock protects all fields in this struct. */
+/* This lock protects the device state. */
+/* This lock protects access to the global list. */
+```
+
+If you have specific context (e.g., the surrounding code or which project this is from), share it and I can
