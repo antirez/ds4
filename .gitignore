@@ -71,3 +71,4 @@ __pycache__/
 /tests/test_glm53_router_shared
 /tests/test_glm53_topk_fast
 /tests/test_glm53_q8_inputs
+/tests/test_glm53_hc_pre_repeat

@@ -484,6 +484,16 @@ test-glm53-fork: $(GLM53_FORK_TESTS)
 	./tests/test_glm53_router_shared
 	./tests/test_glm53_topk_fast
 	./tests/test_glm53_q8_inputs
+
+tests/test_glm53_hc_pre_repeat: tests/test_glm53_hc_pre_repeat.c ds4.c ds4.h ds4_gpu.h ds4_metal.o ds4_image.o
+	$(CC) $(CFLAGS) -Wno-unused-function -I. -ffunction-sections -fdata-sections $< ds4_metal.o ds4_image.o -Wl,-dead_strip -o $@ $(METAL_LDLIBS)
+
+.PHONY: test-glm53-hc-pre-repeat
+test-glm53-hc-pre-repeat: tests/test_glm53_hc_pre_repeat
+	./tests/test_glm53_hc_pre_repeat 0 0
+	./tests/test_glm53_hc_pre_repeat 1 0
+	./tests/test_glm53_hc_pre_repeat 0 1
+	./tests/test_glm53_hc_pre_repeat 1 1
 endif
 
 ifeq ($(UNAME_S),Darwin)
@@ -861,6 +871,7 @@ ds4_cpu_test_hooks.o ds4_cuda_test_hooks.o tests/test_session_state.o \
 tests/test_session_state_gpu.o: ds4_tool_text.h
 
 clean:
+	rm -f tests/test_glm53_hc_pre_repeat
 	rm -f tests/test_metal_ssd_experts
 	rm -f tests/test_metal_command_memory
 	rm -f tests/test_deepseek41_metal

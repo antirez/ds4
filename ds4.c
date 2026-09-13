@@ -46830,30 +46830,35 @@ static bool glm53_graph_hc_pre(
         }
     }
 #endif
-    bool ok = ds4_gpu_rms_norm_plain_tensor(g->hc_flat,
-                                            residual_hc,
-                                            hc_dim,
-                                            DS4_RMS_EPS) != 0;
-    if (ok) ok = glm53_graph_matmul(g->hc_mix,
-                                         model,
-                                         fn,
-                                         hc_dim,
-                                         hc_mix,
-                                         g->hc_flat);
-    if (ok) ok = metal_graph_decode_hc_pre(collapsed,
-                                           g->hc_split,
-                                           g->hc_mix,
+    const uint32_t passes =
+        (glm_decode_repeat_mask() & DS4_GLM_REPEAT_HC_PRE) ? 2u : 1u;
+    bool ok = true;
+    for (uint32_t pass = 0; ok && pass < passes; pass++) {
+        ok = ds4_gpu_rms_norm_plain_tensor(g->hc_flat,
                                            residual_hc,
-                                           model,
-                                           scale->abs_offset,
-                                           base->abs_offset);
-    if (ok) ok = ds4_gpu_rms_norm_weight_tensor(normalized,
-                                                collapsed,
-                                                model->map,
-                                                model->size,
-                                                norm->abs_offset,
-                                                DS4_N_EMBD,
-                                                DS4_RMS_EPS) != 0;
+                                           hc_dim,
+                                           DS4_RMS_EPS) != 0;
+        if (ok) ok = glm53_graph_matmul(g->hc_mix,
+                                       model,
+                                       fn,
+                                       hc_dim,
+                                       hc_mix,
+                                       g->hc_flat);
+        if (ok) ok = metal_graph_decode_hc_pre(collapsed,
+                                              g->hc_split,
+                                              g->hc_mix,
+                                              residual_hc,
+                                              model,
+                                              scale->abs_offset,
+                                              base->abs_offset);
+        if (ok) ok = ds4_gpu_rms_norm_weight_tensor(normalized,
+                                                   collapsed,
+                                                   model->map,
+                                                   model->size,
+                                                   norm->abs_offset,
+                                                   DS4_N_EMBD,
+                                                   DS4_RMS_EPS) != 0;
+    }
     return ok;
 }
 
