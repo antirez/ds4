@@ -18,6 +18,7 @@
 #include <sys/uio.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -214,6 +215,31 @@ typedef struct {
 #define DS4_TP_ODL_SID_WORKER 31u
 #define DS4_TP_ODL_MAX_MSG (1u << 20)
 
+/* Reliable exchange on top of the stream API.  odl_tb5 delivers whole
+ * messages in order, but when one Thunderbolt frame of a message fails
+ * CRC the driver drops the entire message ("fragment gap ... dropping
+ * message" in dmesg) and the sender is never told, so a gate could park
+ * both ranks on their spin kernels until the timeout and take the TP
+ * session down.  Every message therefore carries this header, a receiver
+ * asks for the chunks it misses, and a sender keeps the framed copies of
+ * its current and previous exchange: lockstep bounds the peer's lag to one
+ * exchange (it cannot finish N+1 without our N+1 data, which we only send
+ * once we finished N), so those two buffers always cover a request.
+ * Requests are answered from the exchange loop and, for a rank that is
+ * idle or in a control-channel wait, from tp_odl_idle_service(). */
+#define DS4_TP_ODL_MAGIC UINT32_C(0x4453344f) /* "DS4O" */
+#define DS4_TP_ODL_DATA 1u
+#define DS4_TP_ODL_NACK 2u
+typedef struct {
+    uint32_t magic;
+    uint16_t kind;
+    uint16_t idx;     /* DATA: this chunk; NACK: first chunk still missing */
+    uint64_t seq;     /* exchange sequence, identical on both ranks */
+} ds4_tp_odl_hdr;
+#define DS4_TP_ODL_CHUNK (DS4_TP_ODL_MAX_MSG - sizeof(ds4_tp_odl_hdr))
+#define DS4_TP_ODL_WINDOW 4u        /* chunks in flight per direction */
+#define DS4_TP_ODL_MAX_CHUNKS 4096u /* 4 GiB per exchange */
+
 typedef struct {
     void *handle;
     /* Signatures mirror odl_tb5.h; the opaque handle is a pointer, so
@@ -228,6 +254,16 @@ typedef struct {
     int (*stream_recv)(void *, uint8_t, void *, uint32_t, uint8_t *, uint32_t *);
 } ds4_tp_odl_api;
 
+/* Framed copy of one exchange's outgoing payload: chunk i lives at
+ * i * DS4_TP_ODL_MAX_MSG, header first, so a retransmission is one send. */
+typedef struct {
+    uint8_t *buf;
+    uint64_t cap;
+    uint64_t seq;
+    uint32_t n;
+    uint64_t bytes;
+} ds4_tp_odl_tx;
+
 typedef struct {
     ds4_tp_odl_api api;
     void *dev;
@@ -235,6 +271,15 @@ typedef struct {
     uint8_t peer_sid;
     int fd;
     pthread_mutex_t lock;
+    uint64_t xseq;                     /* current (or last finished) exchange */
+    ds4_tp_odl_tx tx[2];               /* indexed by xseq & 1: current, previous */
+    uint8_t *rx;                       /* one message of receive scratch */
+    uint8_t *early[DS4_TP_ODL_WINDOW]; /* next exchange's chunks that arrived early */
+    uint32_t early_len[DS4_TP_ODL_WINDOW];
+    uint32_t n_early;
+    uint64_t drop_every;               /* DS4_TP_ODL_DROP_TEST=N drops every Nth data send */
+    uint64_t sends;
+    uint64_t recovered;
 } ds4_tp_odl;
 
 /* Defined after the verbs path; the split-gate exchange below uses it. */
@@ -337,17 +382,22 @@ static int tp_read_full(int fd, void *buf, size_t len) {
 /* Read with the pair timeout while watching the failure flag: gate header
  * reads legitimately wait for the peer to reach the same gate, but must not
  * wait forever if the peer abandoned its graph (hard leader-side error). */
+static void tp_odl_idle_service(ds4_tp *tp);
+
 static int tp_read_full_deadline(ds4_tp *tp, int fd, void *buf, size_t len) {
     char *p = buf;
     const double deadline = tp_now_sec() + (double)tp->timeout_sec;
     while (len) {
         struct pollfd pfd = { fd, POLLIN, 0 };
-        const int pr = poll(&pfd, 1, 1000);
+        /* Under OdinLink keep serving the peer's retransmission requests
+         * while this read waits (see tp_control_wait). */
+        const int pr = poll(&pfd, 1, tp->odl_active ? 5 : 1000);
         if (pr < 0) {
             if (errno == EINTR) continue;
             return 0;
         }
         if (pr == 0) {
+            tp_odl_idle_service(tp);
             if (ds4_tp_failed(tp) || tp_now_sec() > deadline) return 0;
             continue;
         }
@@ -480,6 +530,37 @@ static int tp_read_frame_header(int fd, uint32_t *type, uint32_t *bytes) {
     *type = h.type;
     *bytes = h.bytes;
     return 1;
+}
+
+static void tp_odl_idle_service(ds4_tp *tp);
+
+/* Block until fd is readable.  Under OdinLink the wait polls so this rank
+ * keeps answering the peer's retransmission requests: a worker waiting for
+ * its next command, a leader waiting for an ack and either side in the
+ * big-gate header handshake would otherwise leave a peer that lost a chunk
+ * of the previous exchange stuck until its deadline. */
+static int tp_control_wait(ds4_tp *tp, int fd, double timeout_sec) {
+    const double deadline = timeout_sec > 0.0 ? tp_now_sec() + timeout_sec : 0.0;
+    for (;;) {
+        struct pollfd pfd = { fd, POLLIN, 0 };
+        const int rc = poll(&pfd, 1, tp->odl_active ? 5 : 1000);
+        if (rc > 0) return 1;
+        if (rc < 0 && errno != EINTR) return 0;
+        tp_odl_idle_service(tp);
+        if (deadline > 0.0 && tp_now_sec() > deadline) return 0;
+    }
+}
+
+static int tp_frame_header_wait(ds4_tp *tp, int fd, uint32_t *type, uint32_t *bytes) {
+    if (tp->odl_active && !tp_control_wait(tp, fd, 0.0)) return 0;
+    return tp_read_frame_header(fd, type, bytes);
+}
+
+static int tp_read_full_wait(ds4_tp *tp, int fd, void *buf, size_t len) {
+    if (tp->odl_active &&
+        !tp_control_wait(tp, fd, (double)(tp->gate_timeout_ms + 2000u) / 1000.0))
+        return 0;
+    return tp_read_full(fd, buf, len);
 }
 
 /* ------------------------------------------------------------------------
@@ -1045,7 +1126,7 @@ static const char *tp_wc_status_str(int status);
 static int tp_rdma_posted_barrier(ds4_tp *tp, uint32_t tag) {
     uint32_t t = 0, b = 0, theirs = 0;
     if (!tp_send_frame(tp->control_fd, DS4_TP_FRAME_RDMA_POSTED, &tag, sizeof(tag))) return 0;
-    if (!tp_read_frame_header(tp->control_fd, &t, &b) ||
+    if (!tp_frame_header_wait(tp, tp->control_fd, &t, &b) ||
         t != DS4_TP_FRAME_RDMA_POSTED || b != sizeof(theirs) ||
         !tp_read_full(tp->control_fd, &theirs, sizeof(theirs)) || theirs != tag) {
         return 0;
@@ -1123,7 +1204,7 @@ static int tp_rdma_warm_up(ds4_tp *tp, char *err, size_t errlen) {
         }
         uint32_t mine = (uint32_t)got_recv, theirs = 0, t = 0, b = 0;
         if (!tp_send_frame(tp->control_fd, DS4_TP_FRAME_RDMA_WARM, &mine, sizeof(mine)) ||
-            !tp_read_frame_header(tp->control_fd, &t, &b) ||
+            !tp_frame_header_wait(tp, tp->control_fd, &t, &b) ||
             t != DS4_TP_FRAME_RDMA_WARM || b != sizeof(theirs) ||
             !tp_read_full(tp->control_fd, &theirs, sizeof(theirs))) {
             tp_set_err(err, errlen, "tp rdma: warm-up status exchange failed");
@@ -1230,7 +1311,7 @@ static int tp_rdma_register_and_exchange(ds4_tp *tp, char *err, size_t errlen) {
         return 0;
     }
     uint32_t type = 0, bytes = 0;
-    if (!tp_read_frame_header(tp->control_fd, &type, &bytes) ||
+    if (!tp_frame_header_wait(tp, tp->control_fd, &type, &bytes) ||
         type != DS4_TP_FRAME_RDMA_INFO || bytes != sizeof(r->peer) ||
         !tp_read_full(tp->control_fd, &r->peer, sizeof(r->peer))) {
         tp_set_err(err, errlen, "tp rdma: info recv failed");
@@ -1329,7 +1410,7 @@ static int tp_rdma_register_and_exchange(ds4_tp *tp, char *err, size_t errlen) {
         return 0;
     }
     uint32_t rtype = 0, rbytes = 0;
-    if (!tp_read_frame_header(tp->control_fd, &rtype, &rbytes) ||
+    if (!tp_frame_header_wait(tp, tp->control_fd, &rtype, &rbytes) ||
         rtype != DS4_TP_FRAME_RDMA_READY || rbytes != 0) {
         tp_set_err(err, errlen, "tp rdma: ready barrier failed");
         return 0;
@@ -2471,93 +2552,295 @@ static int tp_odl_open(ds4_tp *tp, char *err, size_t errlen) {
         if (fl >= 0) (void)fcntl(o->fd, F_SETFL, fl | O_NONBLOCK);
     }
     pthread_mutex_init(&o->lock, NULL);
+    o->rx = malloc(DS4_TP_ODL_MAX_MSG);
+    for (uint32_t i = 0; i < DS4_TP_ODL_WINDOW; i++)
+        o->early[i] = malloc(DS4_TP_ODL_MAX_MSG);
+    if (!o->rx || !o->early[DS4_TP_ODL_WINDOW - 1u]) {
+        tp_set_err(err, errlen, "tp odl: out of memory for message buffers");
+        return 0;
+    }
+    o->xseq = 0;
+    o->n_early = 0;
+    const char *drop = getenv("DS4_TP_ODL_DROP_TEST");
+    o->drop_every = drop ? strtoull(drop, NULL, 10) : 0;
+    if (o->drop_every)
+        fprintf(stderr, "ds4-tp: odl test mode: dropping every %llu-th data send\n",
+                (unsigned long long)o->drop_every);
     fprintf(stderr, "ds4-tp: odl device %d, stream %u -> peer %u\n",
             tp_odl_dev_index(), o->my_sid, o->peer_sid);
     return 1;
 }
 
-/* Chunked stream send.  The kernel fragments each call at frame size
- * internally, so the chunk bound is just the proven per-call ceiling. */
-static int tp_odl_send_buf(ds4_tp *tp, const void *p, uint64_t bytes) {
+static uint32_t tp_odl_chunk_len(uint64_t bytes, uint32_t i) {
+    const uint64_t off = (uint64_t)i * DS4_TP_ODL_CHUNK;
+    return bytes - off > DS4_TP_ODL_CHUNK ? (uint32_t)DS4_TP_ODL_CHUNK
+                                         : (uint32_t)(bytes - off);
+}
+
+/* Frame the outgoing payload once; sends and retransmissions read from it. */
+static int tp_odl_frame(ds4_tp_odl_tx *tx, uint64_t seq, const void *out,
+                        uint64_t bytes) {
+    const uint32_t n = (uint32_t)((bytes + DS4_TP_ODL_CHUNK - 1u) / DS4_TP_ODL_CHUNK);
+    if (bytes == 0 || n > DS4_TP_ODL_MAX_CHUNKS) return 0;
+    const uint64_t need = (uint64_t)n * DS4_TP_ODL_MAX_MSG;
+    if (tx->cap < need) {
+        free(tx->buf);
+        tx->buf = malloc(need);
+        tx->cap = tx->buf ? need : 0;
+        if (!tx->buf) return 0;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        ds4_tp_odl_hdr *h = (ds4_tp_odl_hdr *)(tx->buf + (uint64_t)i * DS4_TP_ODL_MAX_MSG);
+        h->magic = DS4_TP_ODL_MAGIC;
+        h->kind = DS4_TP_ODL_DATA;
+        h->idx = (uint16_t)i;
+        h->seq = seq;
+        memcpy(h + 1, (const uint8_t *)out + (uint64_t)i * DS4_TP_ODL_CHUNK,
+               tp_odl_chunk_len(bytes, i));
+    }
+    tx->seq = seq;
+    tx->n = n;
+    tx->bytes = bytes;
+    return 1;
+}
+
+static int tp_odl_send_msg(ds4_tp *tp, const void *msg, uint32_t len) {
     ds4_tp_odl *o = &tp->odl;
-    uint64_t off = 0;
-    while (off < bytes) {
-        const uint32_t len = bytes - off > DS4_TP_ODL_MAX_MSG ?
-            DS4_TP_ODL_MAX_MSG : (uint32_t)(bytes - off);
-        if (o->api.stream_send(o->dev, o->my_sid, o->peer_sid,
-                               (const uint8_t *)p + off, len) < 0) {
-            fprintf(stderr, "ds4-tp: odl stream_send failed at %llu/%llu: %s\n",
-                    (unsigned long long)off, (unsigned long long)bytes,
-                    strerror(errno));
-            return 0;
-        }
-        off += len;
+    if (o->api.stream_send(o->dev, o->my_sid, o->peer_sid, msg, len) < 0) {
+        fprintf(stderr, "ds4-tp: odl stream_send(%u bytes) failed: %s\n",
+                len, strerror(errno));
+        return 0;
     }
     return 1;
 }
 
-/* Chunked stream receive.  stream_recv returns only complete messages
- * (never partial payloads), so a message boundary is an atomic arrival.
- * The socket is non-blocking: poll with the same peer-death sampling as
- * the verbs CQ loop, under the gate deadline (bulk callers pass the
- * coarser session timeout instead).  Both sides derive identical chunk
- * boundaries from the same byte count, so a cap can never be smaller
- * than the peer's message. */
-static int tp_odl_recv_buf(ds4_tp *tp, void *p, uint64_t bytes,
-                           uint64_t deadline_ms) {
+static int tp_odl_send_chunk(ds4_tp *tp, const ds4_tp_odl_tx *tx, uint32_t i) {
     ds4_tp_odl *o = &tp->odl;
-    uint64_t off = 0;
-    double deadline = 0.0;
-    uint32_t peer_poll = 0;
-    while (off < bytes) {
-        const uint32_t len = bytes - off > DS4_TP_ODL_MAX_MSG ?
-            DS4_TP_ODL_MAX_MSG : (uint32_t)(bytes - off);
-        uint8_t src = 0;
-        uint32_t actual = 0;
-        const int rc = o->api.stream_recv(o->dev, o->my_sid,
-                                          (uint8_t *)p + off, len,
-                                          &src, &actual);
-        if (rc < 0 && (rc == -EAGAIN || rc == -EWOULDBLOCK || rc == -EINTR ||
-                       errno == EAGAIN || errno == EWOULDBLOCK ||
-                       errno == EINTR)) {
+    if (o->drop_every && (++o->sends % o->drop_every) == 0) {
+        fprintf(stderr, "ds4-tp: odl test drop: exchange %llu chunk %u\n",
+                (unsigned long long)tx->seq, i);
+        return 1;
+    }
+    return tp_odl_send_msg(tp, tx->buf + (uint64_t)i * DS4_TP_ODL_MAX_MSG,
+                           (uint32_t)(sizeof(ds4_tp_odl_hdr) +
+                                      tp_odl_chunk_len(tx->bytes, i)));
+}
+
+static int tp_odl_send_nack(ds4_tp *tp, uint64_t seq, uint32_t idx) {
+    const ds4_tp_odl_hdr h = { DS4_TP_ODL_MAGIC, DS4_TP_ODL_NACK, (uint16_t)idx, seq };
+    return tp_odl_send_msg(tp, &h, sizeof(h));
+}
+
+/* One message into o->rx: 1 with the header validated and *len the payload
+ * bytes, 0 when nothing is pending, -1 on a transport or protocol error. */
+static int tp_odl_recv_msg(ds4_tp *tp, ds4_tp_odl_hdr *h, uint32_t *len) {
+    ds4_tp_odl *o = &tp->odl;
+    uint8_t src = 0;
+    uint32_t actual = 0;
+    const int rc = o->api.stream_recv(o->dev, o->my_sid, o->rx, DS4_TP_ODL_MAX_MSG,
+                                      &src, &actual);
+    if (rc < 0) {
+        if (rc == -EAGAIN || rc == -EWOULDBLOCK || rc == -EINTR ||
+            errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+            return 0;
+        fprintf(stderr, "ds4-tp: odl stream_recv failed: rc=%d (%s)\n",
+                rc, strerror(errno));
+        return -1;
+    }
+    if (actual < sizeof(*h)) {
+        fprintf(stderr, "ds4-tp: odl runt message (%u bytes)\n", actual);
+        return -1;
+    }
+    memcpy(h, o->rx, sizeof(*h));
+    if (h->magic != DS4_TP_ODL_MAGIC) {
+        fprintf(stderr, "ds4-tp: odl message with magic %08x: peer runs another "
+                "protocol version?\n", h->magic);
+        return -1;
+    }
+    *len = actual - (uint32_t)sizeof(*h);
+    return 1;
+}
+
+/* Retransmit a chunk the peer reports missing.  seq > xseq is the peer
+ * already asking about the next exchange (its data goes out when we get
+ * there); anything older than the two kept exchanges cannot happen under
+ * lockstep and is ignored. */
+static int tp_odl_serve_nack(ds4_tp *tp, uint64_t seq, uint32_t idx) {
+    ds4_tp_odl *o = &tp->odl;
+    if (seq > o->xseq) return 1;
+    const ds4_tp_odl_tx *tx = &o->tx[seq & 1u];
+    if (tx->seq != seq) return 1;
+    if (idx >= tx->n) {
+        fprintf(stderr, "ds4-tp: odl peer asked for chunk %u of %u (exchange %llu)\n",
+                idx, tx->n, (unsigned long long)seq);
+        return 0;
+    }
+    /* A request usually means the driver dropped a CRC-damaged frame (dmesg
+     * shows it), but a peer that reaches the gate later than the retry
+     * interval asks as well, so keep the log to a trickle. */
+    o->recovered++;
+    if (o->recovered <= 3u || (o->recovered % 100u) == 0u)
+        fprintf(stderr, "ds4-tp: odl retransmitting chunk %u/%u of exchange %llu "
+                "(%llu retransmissions so far)\n",
+                idx, tx->n, (unsigned long long)seq, (unsigned long long)o->recovered);
+    return tp_odl_send_chunk(tp, tx, idx);
+}
+
+/* A chunk of the next exchange arrived while this one still misses data:
+ * park it (the peer's send window bounds how many) for replay. */
+static int tp_odl_stash_early(ds4_tp *tp, uint32_t len) {
+    ds4_tp_odl *o = &tp->odl;
+    if (o->n_early >= DS4_TP_ODL_WINDOW) {
+        fprintf(stderr, "ds4-tp: odl peer ran more than %u chunks ahead\n",
+                DS4_TP_ODL_WINDOW);
+        return 0;
+    }
+    o->early_len[o->n_early] = len;
+    memcpy(o->early[o->n_early++], o->rx, sizeof(ds4_tp_odl_hdr) + len);
+    return 1;
+}
+
+/* Drain pending messages while no exchange is running: retransmission
+ * requests for the exchange just finished and early chunks of the next.
+ * trylock: if the exchange loop holds the lock it is doing this itself. */
+static void tp_odl_idle_service(ds4_tp *tp) {
+    ds4_tp_odl *o = &tp->odl;
+    /* odl_active is negotiated before tp_odl_open() creates the lock and
+     * buffers; nothing can be pending until then. */
+    if (!tp->odl_active || !o->rx || pthread_mutex_trylock(&o->lock) != 0) return;
+    for (;;) {
+        ds4_tp_odl_hdr h;
+        uint32_t len = 0;
+        if (tp_odl_recv_msg(tp, &h, &len) <= 0) break;
+        if (h.kind == DS4_TP_ODL_NACK) {
+            if (!tp_odl_serve_nack(tp, h.seq, h.idx)) break;
+        } else if (h.kind == DS4_TP_ODL_DATA && h.seq == o->xseq + 1u) {
+            if (!tp_odl_stash_early(tp, len)) break;
+        }
+        /* Anything else is a duplicate of a chunk we already have. */
+    }
+    pthread_mutex_unlock(&o->lock);
+}
+
+/* Symmetric exchange of `bytes`: both ranks send their payload in
+ * DS4_TP_ODL_CHUNK pieces (a send-ahead window keeps several on the wire
+ * without starving the shared kernel frame ring) and return once every
+ * chunk of the peer's has landed in `in`.  A gap in the arriving indices,
+ * or a retry interval without progress (2 ms for gate vectors, 50 ms for
+ * bulk; lockstep skew is far below either), requests the first missing chunk;
+ * the peer's own requests are answered inline.  Caller holds o->lock. */
+static int tp_odl_exchange(ds4_tp *tp, const void *out, void *in,
+                           uint64_t bytes, uint64_t deadline_ms) {
+    ds4_tp_odl *o = &tp->odl;
+    const double t0 = tp_now_sec();
+    const double retry = bytes > 65536u ? 0.05 : 0.002;
+    const uint64_t seq = ++o->xseq;
+    ds4_tp_odl_tx *tx = &o->tx[seq & 1u];
+    if (!tp_odl_frame(tx, seq, out, bytes)) {
+        fprintf(stderr, "ds4-tp: odl exchange %llu: cannot frame %llu bytes\n",
+                (unsigned long long)seq, (unsigned long long)bytes);
+        return 0;
+    }
+    const uint32_t n = tx->n;
+    uint64_t got[DS4_TP_ODL_MAX_CHUNKS / 64u] = {0};
+    uint32_t ngot = 0, sent = 0, nacked = UINT32_MAX, early_i = 0, peer_poll = 0;
+    /* Chunks of this exchange parked by the previous one are replayed
+     * first; the count is snapshotted because the loop below may park
+     * chunks of the next exchange while it runs. */
+    const uint32_t n_early = o->n_early;
+    double last_progress = t0, last_nack = 0.0;
+    while (sent < n && sent < DS4_TP_ODL_WINDOW) {
+        if (!tp_odl_send_chunk(tp, tx, sent)) return 0;
+        sent++;
+    }
+    while (ngot < n) {
+        ds4_tp_odl_hdr h;
+        uint32_t len = 0;
+        int rc;
+        if (early_i < n_early) {
+            /* Zero copy: swap the parked message into the scratch slot. */
+            uint8_t *tmp = o->rx;
+            o->rx = o->early[early_i];
+            o->early[early_i] = tmp;
+            len = o->early_len[early_i];
+            memcpy(&h, o->rx, sizeof(h));
+            rc = 1;
+            if (++early_i == n_early) o->n_early = 0;
+        } else {
+            rc = tp_odl_recv_msg(tp, &h, &len);
+        }
+        if (rc < 0) return 0;
+        if (rc == 0) {
             if ((peer_poll++ & 0x3fffu) == 0 && tp_peer_closed(tp)) {
-                fprintf(stderr, "ds4-tp: peer disconnected during odl recv\n");
+                fprintf(stderr, "ds4-tp: peer disconnected during odl exchange\n");
                 return 0;
             }
-            if (deadline == 0.0) {
-                deadline = tp_now_sec() + (double)deadline_ms / 1000.0;
-            } else if (tp_now_sec() > deadline) {
-                fprintf(stderr,
-                        "ds4-tp: timeout waiting odl message (%llu/%llu); if this happens at "
-                        "large contexts, raise DS4_TP_GATE_TIMEOUT_MS on both ranks\n",
-                        (unsigned long long)off, (unsigned long long)bytes);
+            const double now = tp_now_sec();
+            if (now - last_progress > retry && now - last_nack > retry) {
+                uint32_t miss = 0;
+                while (got[miss >> 6] & (1ull << (miss & 63u))) miss++;
+                if (!tp_odl_send_nack(tp, seq, miss)) return 0;
+                nacked = miss;
+                last_nack = now;
+            }
+            if (now - t0 > (double)deadline_ms / 1000.0) {
+                fprintf(stderr, "ds4-tp: odl exchange %llu timed out after %llu ms "
+                        "with %u/%u chunks (peer stalled or link down; dmesg "
+                        "shows odl_tb5 CRC drops)\n",
+                        (unsigned long long)seq, (unsigned long long)deadline_ms,
+                        ngot, n);
                 return 0;
             }
             continue;
         }
-        if (rc < 0) {
-            fprintf(stderr, "ds4-tp: odl stream_recv failed at %llu/%llu: "
-                    "rc=%d (%s)\n",
-                    (unsigned long long)off, (unsigned long long)bytes,
-                    rc, strerror(errno));
+        if (h.kind == DS4_TP_ODL_NACK) {
+            if (!tp_odl_serve_nack(tp, h.seq, h.idx)) return 0;
+            continue;
+        }
+        if (h.kind != DS4_TP_ODL_DATA) {
+            fprintf(stderr, "ds4-tp: odl unknown message kind %u\n", h.kind);
             return 0;
         }
-        if (actual == 0 || actual > len) {
-            fprintf(stderr,
-                    "ds4-tp: odl recv %u bytes at offset %llu, expected <= %u "
-                    "(peer desync?)\n",
-                    actual, (unsigned long long)off, len);
+        if (h.seq < seq) continue;  /* duplicate of a served request */
+        if (h.seq > seq) {          /* the peer already runs the next exchange */
+            if (h.seq != seq + 1u) {
+                fprintf(stderr, "ds4-tp: odl desync: exchange %llu while we run %llu\n",
+                        (unsigned long long)h.seq, (unsigned long long)seq);
+                return 0;
+            }
+            if (!tp_odl_stash_early(tp, len)) return 0;
+            continue;
+        }
+        if (h.idx >= n || len != tp_odl_chunk_len(bytes, h.idx)) {
+            fprintf(stderr, "ds4-tp: odl exchange %llu: chunk %u of %u with %u bytes "
+                    "(peer desync?)\n", (unsigned long long)seq, h.idx, n, len);
             return 0;
         }
-        off += actual;
+        if (got[h.idx >> 6] & (1ull << (h.idx & 63u))) continue;
+        memcpy((uint8_t *)in + (uint64_t)h.idx * DS4_TP_ODL_CHUNK,
+               o->rx + sizeof(h), len);
+        got[h.idx >> 6] |= 1ull << (h.idx & 63u);
+        ngot++;
+        last_progress = tp_now_sec();
+        if (sent < n) {
+            if (!tp_odl_send_chunk(tp, tx, sent)) return 0;
+            sent++;
+        }
+        /* In-order delivery makes a gap below this chunk a dropped message:
+         * ask for it right away instead of waiting for the retry timer. */
+        uint32_t miss = 0;
+        while (miss < h.idx && (got[miss >> 6] & (1ull << (miss & 63u)))) miss++;
+        if (miss < h.idx && (miss != nacked || last_progress - last_nack > retry)) {
+            if (!tp_odl_send_nack(tp, seq, miss)) return 0;
+            nacked = miss;
+            last_nack = last_progress;
+        }
     }
     return 1;
 }
 
-/* One decode gate: fire our partial as a single message, then block for
- * the peer's.  Both ranks send before either needs the peer's data, and
- * stream_send only waits for local submission, so the symmetric exchange
- * cannot deadlock. */
+/* One decode gate: the rank's partial for the slot out, the peer's into
+ * the slot in, under the gate deadline. */
 static int tp_odl_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate,
                                 uint64_t seq) {
     const uint32_t slot = layer * DS4_TP_GATES_PER_LAYER + gate;
@@ -2566,52 +2849,24 @@ static int tp_odl_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate,
                 layer, gate, (unsigned long long)seq);
         return 0;
     }
-    if (tp->vec_bytes > DS4_TP_ODL_MAX_MSG) {
-        fprintf(stderr, "ds4-tp: odl gate vector %llu exceeds %u message cap\n",
-                (unsigned long long)tp->vec_bytes, DS4_TP_ODL_MAX_MSG);
-        return 0;
-    }
     const uint64_t deadline_ms = tp->gate_timeout_ms ? tp->gate_timeout_ms
                                                      : tp->timeout_sec * 1000;
     pthread_mutex_lock(&tp->odl.lock);
-    const int ok =
-        tp_odl_send_buf(tp, tp->slab + ds4_tp_slab_out_offset(tp, layer, gate),
-                        tp->vec_bytes) &&
-        tp_odl_recv_buf(tp, tp->slab + ds4_tp_slab_in_offset(tp, layer, gate),
-                        tp->vec_bytes, deadline_ms);
+    const int ok = tp_odl_exchange(tp,
+                                   tp->slab + ds4_tp_slab_out_offset(tp, layer, gate),
+                                   tp->slab + ds4_tp_slab_in_offset(tp, layer, gate),
+                                   tp->vec_bytes, deadline_ms);
     pthread_mutex_unlock(&tp->odl.lock);
     return ok;
 }
 
-/* Symmetric bulk swap for verify-block batches, kv-split gates, and
- * prefill big gates.  A send-ahead window keeps several chunks on the
- * wire while earlier ones are still reassembling (an interleaved
- * send/recv round-trip would serialize the link at one chunk per RTT).
- * The window must stay well under the kernel frame ring (~16 MiB, 4096
- * x 4024B frames shared by both directions) or stream_send starves the
- * frame pool, so 4 MiB.  The header handshake that precedes this call
- * has already ordered both ranks into the same round sequence. */
-#define DS4_TP_ODL_BULK_WINDOW (4u * DS4_TP_ODL_MAX_MSG)
-
+/* Bulk swap for verify-block batches and prefill big gates.  The TCP
+ * header handshake that precedes this call has already ordered both ranks
+ * into the same round, so the coarser session timeout applies. */
 static int tp_odl_bulk_exchange(ds4_tp *tp, const void *out, void *in,
                                 uint64_t bytes) {
-    const uint64_t deadline_ms = tp->timeout_sec * 1000;
     pthread_mutex_lock(&tp->odl.lock);
-    int ok = 1;
-    uint64_t sent = 0, recvd = 0;
-    while (ok && recvd < bytes) {
-        while (ok && sent < bytes && sent - recvd < DS4_TP_ODL_BULK_WINDOW) {
-            const uint32_t len = bytes - sent > DS4_TP_ODL_MAX_MSG ?
-                DS4_TP_ODL_MAX_MSG : (uint32_t)(bytes - sent);
-            ok = tp_odl_send_buf(tp, (const uint8_t *)out + sent, len);
-            sent += len;
-        }
-        if (!ok) break;
-        const uint32_t len = bytes - recvd > DS4_TP_ODL_MAX_MSG ?
-            DS4_TP_ODL_MAX_MSG : (uint32_t)(bytes - recvd);
-        ok = tp_odl_recv_buf(tp, (uint8_t *)in + recvd, len, deadline_ms);
-        recvd += len;
-    }
+    const int ok = tp_odl_exchange(tp, out, in, bytes, tp->timeout_sec * 1000);
     pthread_mutex_unlock(&tp->odl.lock);
     return ok;
 }
@@ -2622,6 +2877,17 @@ static void tp_odl_close(ds4_tp *tp) {
         o->api.stream_close(o->dev, o->my_sid);
         o->api.close(o->dev);
         o->dev = NULL;
+    }
+    free(o->rx);
+    o->rx = NULL;
+    for (uint32_t i = 0; i < DS4_TP_ODL_WINDOW; i++) {
+        free(o->early[i]);
+        o->early[i] = NULL;
+    }
+    for (int i = 0; i < 2; i++) {
+        free(o->tx[i].buf);
+        o->tx[i].buf = NULL;
+        o->tx[i].cap = 0;
     }
 }
 
@@ -2874,7 +3140,7 @@ int ds4_tp_attach_slab(ds4_tp *tp, void *base, char *err, size_t errlen) {
          * dropped by its kernel demux, so rendezvous like RDMA_READY. */
         uint32_t rtype = 0, rbytes = 0;
         if (!tp_send_frame(tp->control_fd, DS4_TP_FRAME_ODL_READY, NULL, 0) ||
-            !tp_read_frame_header(tp->control_fd, &rtype, &rbytes) ||
+            !tp_frame_header_wait(tp, tp->control_fd, &rtype, &rbytes) ||
             rtype != DS4_TP_FRAME_ODL_READY || rbytes != 0) {
             tp_set_err(err, errlen, "tp odl: ready barrier failed");
             return 0;
@@ -3155,7 +3421,7 @@ int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
                              bytes };
     ds4_tp_gate_header ph;
     const bool header_ok = tp_write_full(tp->data_fd, &h, sizeof(h)) &&
-        tp_read_full(tp->data_fd, &ph, sizeof(ph));
+        tp_read_full_wait(tp, tp->data_fd, &ph, sizeof(ph));
     if (!header_ok)
         fprintf(stderr, "ds4-tp: big gate header exchange failed or peer closed (layer %u seq %llu): %s\n",
                 layer, (unsigned long long)seq, strerror(errno));
@@ -3471,7 +3737,7 @@ int ds4_tp_wait_command_ack_status(ds4_tp *tp, uint64_t session_id,
     }
     uint32_t type = 0, bytes = 0;
     ds4_tp_command_ack ack;
-    if (!tp_read_frame_header(tp->control_fd, &type, &bytes) ||
+    if (!tp_frame_header_wait(tp, tp->control_fd, &type, &bytes) ||
         type != DS4_TP_FRAME_COMMAND_ACK || bytes != sizeof(ack) ||
         !tp_read_full(tp->control_fd, &ack, sizeof(ack))) {
         ds4_tp_mark_failed(tp);
@@ -3525,7 +3791,7 @@ int ds4_tp_sync_checkpoint(ds4_tp *tp, uint32_t point, int current, int total,
     uint32_t type, bytes;
     if (ds4_tp_failed(tp) ||
         !tp_send_frame(tp->control_fd, DS4_TP_FRAME_SYNC_CHECKPOINT, &local, sizeof(local)) ||
-        !tp_read_frame_header(tp->control_fd, &type, &bytes) ||
+        !tp_frame_header_wait(tp, tp->control_fd, &type, &bytes) ||
         type != DS4_TP_FRAME_SYNC_CHECKPOINT || bytes != sizeof(peer) ||
         !tp_read_full(tp->control_fd, &peer, sizeof(peer)) ||
         peer.seq != local.seq || peer.point != point ||
@@ -3559,7 +3825,7 @@ int ds4_tp_recv_sync_go(ds4_tp *tp, int *stop) {
     if (!tp || ds4_tp_failed(tp)) return 0;
     uint32_t type = 0, bytes = 0;
     ds4_tp_sync_go msg;
-    if (!tp_read_frame_header(tp->control_fd, &type, &bytes) ||
+    if (!tp_frame_header_wait(tp, tp->control_fd, &type, &bytes) ||
         type != DS4_TP_FRAME_SYNC_GO || bytes != sizeof(msg) ||
         !tp_read_full(tp->control_fd, &msg, sizeof(msg))) {
         ds4_tp_mark_failed(tp);
@@ -3699,7 +3965,7 @@ int ds4_tp_recv_command(ds4_tp *tp, ds4_tp_command *command,
     memset(command, 0, sizeof(*command));
     command->type = DS4_TP_FRAME_ERROR;
     uint32_t ftype = 0, bytes = 0;
-    if (!tp_read_frame_header(tp->control_fd, &ftype, &bytes)) {
+    if (!tp_frame_header_wait(tp, tp->control_fd, &ftype, &bytes)) {
         tp_set_err(err, errlen, "tp: control channel closed");
         return 0;
     }
@@ -3827,7 +4093,7 @@ int ds4_tp_send_logits_half(ds4_tp *tp, const float *half, uint32_t count) {
 
 int ds4_tp_recv_logits_half(ds4_tp *tp, float *half, uint32_t count) {
     uint32_t type = 0, bytes = 0;
-    if (!tp_read_frame_header(tp->control_fd, &type, &bytes) ||
+    if (!tp_frame_header_wait(tp, tp->control_fd, &type, &bytes) ||
         type != DS4_TP_FRAME_LOGITS || bytes != count * sizeof(float)) {
         fprintf(stderr, "ds4-tp: bad logits frame (type %u bytes %u)\n", type, bytes);
         return 0;
@@ -3850,7 +4116,7 @@ int ds4_tp_send_verify_commit(ds4_tp *tp, int32_t mode, int32_t token_count) {
 int ds4_tp_recv_verify_commit(ds4_tp *tp, int32_t *mode, int32_t *token_count) {
     uint32_t type = 0, bytes = 0;
     struct { int32_t mode; int32_t count; } msg;
-    if (!tp_read_frame_header(tp->control_fd, &type, &bytes) ||
+    if (!tp_frame_header_wait(tp, tp->control_fd, &type, &bytes) ||
         type != DS4_TP_FRAME_VERIFY_COMMIT || bytes != sizeof(msg) ||
         !tp_read_full(tp->control_fd, &msg, sizeof(msg))) {
         fprintf(stderr, "ds4-tp: bad verify-commit frame (type %u bytes %u)\n",
@@ -3869,7 +4135,7 @@ int ds4_tp_hash_check(ds4_tp *tp, uint64_t seq, uint64_t hash, char *err, size_t
         return 0;
     }
     uint32_t type = 0, bytes = 0;
-    if (!tp_read_frame_header(tp->control_fd, &type, &bytes) ||
+    if (!tp_frame_header_wait(tp, tp->control_fd, &type, &bytes) ||
         type != DS4_TP_FRAME_HASH || bytes != sizeof(theirs) ||
         !tp_read_full(tp->control_fd, &theirs, sizeof(theirs))) {
         tp_set_err(err, errlen, "tp: hash recv failed");
