@@ -70997,8 +70997,6 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                          worker_status);
             }
             ds4_session_invalidate(s);
-            if (rc == 0 && acknowledged && worker_status != 0)
-                snprintf(err, errlen, "tp: worker prefill failed (status %d)", worker_status);
             return rc != 0 ? rc : 1;
         }
     }

@@ -2342,7 +2342,7 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
                 fprintf(stderr, "ds4-tp: timeout in big gate window (%u/%u recvs, %u/%u sends, %u sent); "
                                 "the peer stopped sending (check its log; if this happens at large "
                                 "contexts, raise DS4_TP_GATE_TIMEOUT_MS on both ranks)\n",
-                        recv_done, chunks, send_done, signaled, sent);
+                        recv_done, chunks, send_done, chunks, sent);
                 if (getenv("DS4_TP_CQ_DEBUG")) {
                     struct ibv_wc dbg_wc[64];
                     int dbg_n = ibv_poll_cq(r->cq, 64, dbg_wc);
@@ -3498,24 +3498,6 @@ int ds4_tp_wait_command_status(ds4_tp *tp, uint64_t session_id, int *status,
                                const char *operation, char *err, size_t errlen) {
     return ds4_tp_wait_command_ack_status(tp, session_id, operation, 0,
                                           status, err, errlen);
-}
-
-int ds4_tp_wait_command_ack(ds4_tp *tp, uint64_t session_id,
-                            const char *operation, char *err, size_t errlen) {
-    int status = 0;
-    if (!ds4_tp_wait_command_ack_status(tp, session_id, operation, 0,
-                                        &status, err, errlen)) {
-        return 0;
-    }
-    if (status != 0) {
-        tp_set_err(err, errlen,
-                   "tp: worker %s failed (session %llu, status %d)",
-                   operation ? operation : "command",
-                   (unsigned long long)session_id, status);
-        return 0;
-    }
-    *status = ack.status;
-    return 1;
 }
 
 int ds4_tp_wait_command_ack(ds4_tp *tp, uint64_t session_id,
