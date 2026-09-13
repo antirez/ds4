@@ -73,8 +73,10 @@ uint64_t ds4_test_mixed_native_count(void) {
 }
 #endif
 
-/* TP context for the verify-block RDMA window (set with the gate callbacks). */
-#if !defined(DS4_NO_GPU)
+/* TP context for the verify-block RDMA window (set with the gate callbacks).
+ * Every use sits inside an __APPLE__ block, so the declaration is Apple-only;
+ * without that a ROCm build warns about a defined-but-unused variable. */
+#if !defined(DS4_NO_GPU) && defined(__APPLE__)
 static ds4_tp *g_tp_block_ctx;
 #endif
 

@@ -25,7 +25,7 @@ static void check_bulk_exchange(void) {
         assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fd) == 0);
         bulk_peer peer[2] = {0};
         for (unsigned rank = 0; rank < 2; rank++) {
-            tp_socket_tune(fd[rank]);
+            assert(tp_socket_tune(fd[rank], 3));
             assert(tp_socket_set_gate_timeout(fd[rank], 3000));
             peer[rank].tp.data_fd = fd[rank];
             peer[rank].tp.gate_timeout_ms = 3000;
@@ -202,6 +202,10 @@ int main(void) {
     char err[256] = "";
     ds4_tp_command cmd;
     assert(DS4_TP_PROTOCOL_VERSION == 14);
+    /* Upstream owns checkpoint 22; NHI handshake frames must not alias it. */
+    assert(DS4_TP_FRAME_SYNC_CHECKPOINT == 22);
+    assert(DS4_TP_FRAME_NHI_READY == 23);
+    assert(DS4_TP_FRAME_NHI_CLOSED == 24);
     for (int i = 0; i < 4; i++) {
         assert(ds4_tp_send_eval(&leader, 42, 2*i, 100+i));
         assert(ds4_tp_recv_command(&worker, &cmd, err, sizeof(err)));

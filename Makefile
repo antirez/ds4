@@ -915,14 +915,14 @@ tests/test_tp_rdma: tests/test_tp_rdma.o $(filter-out ds4_tp.o,$(CPU_CORE_OBJS))
 tests/test_tp_link.o: tests/test_tp_link.c ds4_tp.h ds4.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
-tests/test_tp_link: tests/test_tp_link.o $(CPU_CORE_OBJS)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+tests/test_tp_link: tests/test_tp_link.o $(CPU_CORE_OBJS) $(TEST_HOOK_GPU_OBJS)
+	$(TEST_HOOK_LINK) -o $@ $^ $(TEST_HOOK_LDLIBS)
 
 tests/test_tp_tcp.o: tests/test_tp_tcp.c ds4_tp.c ds4_tp.h ds4.h ds4_gpu_tp.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
-tests/test_tp_tcp: tests/test_tp_tcp.o $(filter-out ds4_tp.o,$(CPU_CORE_OBJS))
-	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+tests/test_tp_tcp: tests/test_tp_tcp.o $(filter-out ds4_tp.o,$(CPU_CORE_OBJS)) $(TEST_HOOK_GPU_OBJS)
+	$(TEST_HOOK_LINK) -o $@ $^ $(TEST_HOOK_LDLIBS)
 
 .PHONY: test-session-state
 test-session-state: tests/test_session_state tests/test_tp_commands tests/test_tp_rdma tests/test_tp_tcp
