@@ -302,9 +302,46 @@ __global__ static void glm53_rocm_matvec_bf16_row_f32_kernel(
     const uint16_t *wrow = weights + (uint64_t)col * in_dim;
     const float *xrow = x + (uint64_t)row * in_dim;
     float sum = 0.0f;
-    for (uint32_t i = threadIdx.x; i < in_dim; i += blockDim.x) {
-        const float w = __uint_as_float((uint32_t)wrow[i] << 16);
-        sum = fmaf(w, xrow[i], sum);
+    if ((in_dim & 7u) == 0u) {
+        /* One block streams a whole 8-32 KB row, so these launches are
+         * latency bound: issue eight independent 128-bit weight loads per
+         * thread before consuming them instead of a dependent 2-byte load
+         * per iteration (16 us -> a few us per launch on gfx1151). */
+        const uint4 *w8 = (const uint4 *)wrow;
+        const float4 *x4 = (const float4 *)xrow;
+        const uint32_t vecs = in_dim >> 3u;
+        for (uint32_t base = threadIdx.x; base < vecs; base += 8u * blockDim.x) {
+            uint4 w[8];
+            float4 xa[8], xb[8];
+#pragma unroll
+            for (uint32_t k = 0; k < 8u; k++) {
+                const uint32_t v = base + k * blockDim.x;
+                w[k] = make_uint4(0u, 0u, 0u, 0u);
+                xa[k] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                xb[k] = xa[k];
+                if (v < vecs) {
+                    w[k] = w8[v];
+                    xa[k] = x4[2u * v];
+                    xb[k] = x4[2u * v + 1u];
+                }
+            }
+#pragma unroll
+            for (uint32_t k = 0; k < 8u; k++) {
+                sum = fmaf(__uint_as_float((w[k].x & 0xFFFFu) << 16), xa[k].x, sum);
+                sum = fmaf(__uint_as_float((w[k].x >> 16) << 16), xa[k].y, sum);
+                sum = fmaf(__uint_as_float((w[k].y & 0xFFFFu) << 16), xa[k].z, sum);
+                sum = fmaf(__uint_as_float((w[k].y >> 16) << 16), xa[k].w, sum);
+                sum = fmaf(__uint_as_float((w[k].z & 0xFFFFu) << 16), xb[k].x, sum);
+                sum = fmaf(__uint_as_float((w[k].z >> 16) << 16), xb[k].y, sum);
+                sum = fmaf(__uint_as_float((w[k].w & 0xFFFFu) << 16), xb[k].z, sum);
+                sum = fmaf(__uint_as_float((w[k].w >> 16) << 16), xb[k].w, sum);
+            }
+        }
+    } else {
+        for (uint32_t i = threadIdx.x; i < in_dim; i += blockDim.x) {
+            const float w = __uint_as_float((uint32_t)wrow[i] << 16);
+            sum = fmaf(w, xrow[i], sum);
+        }
     }
     __shared__ float partial[256];
     partial[threadIdx.x] = sum;
