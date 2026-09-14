@@ -388,7 +388,62 @@ static double ds4_cubic(double x, double a) {
     return 0.0;
 }
 
-static void ds4_resize_rgb_bicubic(
+/* A tap weight depends only on the output coordinate and on which source
+ * sample it lands on, never on the pixel being accumulated, so ds4_cubic()
+ * was evaluated once per contributing pixel for a value that repeats across
+ * every output row and column. One weight row per output sample removes the
+ * repeated evaluation while keeping the accumulation identical, term by term
+ * and in the same order, so the filtered image is unchanged bit for bit. */
+typedef struct {
+    int    *first;    /* First source sample feeding each output sample. */
+    int    *count;    /* Taps per output sample, after edge clamping. */
+    double *weight;   /* max_taps weights per output sample. */
+    int     max_taps;
+} ds4_resize_taps;
+
+static void ds4_resize_taps_free(ds4_resize_taps *taps) {
+    free(taps->first);
+    free(taps->count);
+    free(taps->weight);
+    memset(taps, 0, sizeof(*taps));
+}
+
+static int ds4_resize_taps_build(
+        ds4_resize_taps *taps,
+        uint32_t src_n,
+        uint32_t dst_n) {
+    memset(taps, 0, sizeof(*taps));
+    double scale = (double)src_n / dst_n;
+    double filter = scale >= 1.0 ? 1.0 / scale : 1.0;
+    double support = scale >= 1.0 ? 2.0 * scale : 2.0;
+
+    /* A clamped window never spans more than floor(2*support)+1 samples. */
+    taps->max_taps = (int)(2.0 * support) + 2;
+    taps->first = malloc((size_t)dst_n * sizeof(*taps->first));
+    taps->count = malloc((size_t)dst_n * sizeof(*taps->count));
+    taps->weight = malloc((size_t)dst_n * taps->max_taps * sizeof(*taps->weight));
+    if (!taps->first || !taps->count || !taps->weight) {
+        ds4_resize_taps_free(taps);
+        return 0;
+    }
+    for (uint32_t d = 0; d < dst_n; d++) {
+        double center = scale * ((double)d + 0.5);
+        int i0 = (int)(center - support + 0.5);
+        int i1 = (int)(center + support + 0.5);
+        if (i0 < 0) i0 = 0;
+        if (i1 > (int)src_n) i1 = (int)src_n;
+        double *weight = taps->weight + (size_t)d * taps->max_taps;
+        for (int i = i0; i < i1; i++) {
+            weight[i - i0] = ds4_cubic(((double)i + 0.5 - center) * filter, -0.5);
+        }
+        taps->first[d] = i0;
+        taps->count[d] = i1 - i0;
+    }
+    return 1;
+}
+
+/* Returns 0 only when the tap tables cannot be allocated. */
+static int ds4_resize_rgb_bicubic(
         const uint8_t *src,
         uint32_t src_width,
         uint32_t src_height,
@@ -396,36 +451,28 @@ static void ds4_resize_rgb_bicubic(
         uint32_t dst_width,
         uint32_t dst_height,
         uint32_t dst_stride) {
-    double scale_x = (double)src_width / dst_width;
-    double scale_y = (double)src_height / dst_height;
-    double filter_x = scale_x >= 1.0 ? 1.0 / scale_x : 1.0;
-    double filter_y = scale_y >= 1.0 ? 1.0 / scale_y : 1.0;
-    double support_x = scale_x >= 1.0 ? 2.0 * scale_x : 2.0;
-    double support_y = scale_y >= 1.0 ? 2.0 * scale_y : 2.0;
+    ds4_resize_taps xtaps, ytaps;
+    if (!ds4_resize_taps_build(&xtaps, src_width, dst_width)) return 0;
+    if (!ds4_resize_taps_build(&ytaps, src_height, dst_height)) {
+        ds4_resize_taps_free(&xtaps);
+        return 0;
+    }
 
     for (uint32_t dy = 0; dy < dst_height; dy++) {
-        double center_y = scale_y * ((double)dy + 0.5);
-        int y0 = (int)(center_y - support_y + 0.5);
-        int y1 = (int)(center_y + support_y + 0.5);
-        if (y0 < 0) y0 = 0;
-        if (y1 > (int)src_height) y1 = (int)src_height;
+        const double *weight_y = ytaps.weight + (size_t)dy * ytaps.max_taps;
+        int y0 = ytaps.first[dy], taps_y = ytaps.count[dy];
         for (uint32_t dx = 0; dx < dst_width; dx++) {
-            double center_x = scale_x * ((double)dx + 0.5);
-            int x0 = (int)(center_x - support_x + 0.5);
-            int x1 = (int)(center_x + support_x + 0.5);
-            if (x0 < 0) x0 = 0;
-            if (x1 > (int)src_width) x1 = (int)src_width;
+            const double *weight_x = xtaps.weight + (size_t)dx * xtaps.max_taps;
+            int x0 = xtaps.first[dx], taps_x = xtaps.count[dx];
             double sum[3] = {0, 0, 0};
             double weight_sum = 0;
-            for (int iy = y0; iy < y1; iy++) {
-                double wy = ds4_cubic(((double)iy + 0.5 - center_y) * filter_y,
-                                      -0.5);
-                for (int ix = x0; ix < x1; ix++) {
-                    double wx = ds4_cubic(((double)ix + 0.5 - center_x) * filter_x,
-                                          -0.5);
-                    double weight = wx * wy;
-                    const uint8_t *pixel = src +
-                        ((size_t)iy * src_width + (uint32_t)ix) * 3;
+            for (int ky = 0; ky < taps_y; ky++) {
+                double wy = weight_y[ky];
+                const uint8_t *row =
+                    src + ((size_t)(y0 + ky) * src_width + (uint32_t)x0) * 3;
+                for (int kx = 0; kx < taps_x; kx++) {
+                    double weight = weight_x[kx] * wy;
+                    const uint8_t *pixel = row + (size_t)kx * 3;
                     sum[0] += pixel[0] * weight;
                     sum[1] += pixel[1] * weight;
                     sum[2] += pixel[2] * weight;
@@ -441,6 +488,10 @@ static void ds4_resize_rgb_bicubic(
             }
         }
     }
+
+    ds4_resize_taps_free(&xtaps);
+    ds4_resize_taps_free(&ytaps);
+    return 1;
 }
 
 int ds4_image_preprocess_glm53(
@@ -495,9 +546,12 @@ int ds4_image_preprocess_glm53(
                 dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2];
             }
         }
-    } else {
-        ds4_resize_rgb_bicubic(image->rgb, image->width, image->height,
-                               canvas, content_width, content_height, target_width);
+    } else if (!ds4_resize_rgb_bicubic(image->rgb, image->width, image->height,
+                                       canvas, content_width, content_height,
+                                       target_width)) {
+        free(canvas);
+        ds4_image_error(error, error_cap, "unable to resize image");
+        return 0;
     }
 
     for (uint32_t y = 0; y < target_height; y++) {
@@ -725,8 +779,13 @@ static int ds4_image_preprocess_deepseek(
     }
 
     float *resized = canvas + ((size_t)offset_y * best_width + offset_x) * 3u;
-    ds4_resize_rgb_bicubic(image->rgb, image->width, image->height,
-                           resized, content_width, content_height, best_width);
+    if (!ds4_resize_rgb_bicubic(image->rgb, image->width, image->height,
+                                resized, content_width, content_height,
+                                best_width)) {
+        free(canvas);
+        ds4_image_error(error, error_cap, "unable to resize image");
+        return 0;
+    }
     for (size_t i = 0; i < canvas_values; i++) {
         canvas[i] = canvas[i] / 127.5f - 1.0f;
     }
