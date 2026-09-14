@@ -12,7 +12,11 @@ Q2 = "DeepSeek-V4.1-Flash-Q2.gguf"
 Q4 = "DeepSeek-V4.1-Flash-Q4.gguf"
 PART1, PART2 = Q4 + ".part1", Q4 + ".part2"
 VISION = "DeepSeek-V4.1-Flash-Vision.gguf"
+QWEN_Q2 = "Qwen3.8-Flash-Next-Q2.gguf"
+QWEN_Q4 = "Qwen3.8-Flash-Next-Q4.gguf"
 ARTIFACTS = {
+    QWEN_Q2: (147207127040, "b1b93fa69aca5f187b0fb813aca8f3ec1beb5cf8cf0bd38cf041b93e0b6ccac9"),
+    QWEN_Q4: (177280286720, "680944460a8cbe93ba8b6d7b6107213ffb7e22320bd913000e563ca0a0f25a8a"),
     Q2: (365713686528, "1ce6a8f8806205c13330d7ca287bd198331dc5ca35ccc5d8a9a92a188a6f6f42"),
     Q4: (518596067328, "a5e2e2c3ada4b2e98d9f9e4b50f6d9c2a12c2c96f5da165c07e13aff9264984e"),
     PART1: (480000000000, "6442b1f9224079662c02003c0ef9ef6be6e2aff509510f681dab9e6cc41df246"),
@@ -52,7 +56,8 @@ from pathlib import Path
 import sys
 args = sys.argv[1:]
 assert args[0] == 'download'
-assert args[1] == 'antirez/deepseek-v4.1-flash-gguf'
+assert args[1] == ('antirez/qwen3.8-flash-next-gguf' if args[2].startswith('Qwen')
+                   else 'antirez/deepseek-v4.1-flash-gguf')
 if os.environ.get('FAIL_DOWNLOAD'):
     sys.exit(7)
 out = Path(args[args.index('--local-dir') + 1])
@@ -86,7 +91,8 @@ out.mkdir(parents=True, exist_ok=True)
 
     def test_truncated_and_corrupt_artifacts(self):
         self.out.mkdir()
-        for target, name in (("ds41f-q2", Q2), ("ds41f-q4", Q4), ("ds41f-vision", VISION)):
+        for target, name in (("ds41f-q2", Q2), ("ds41f-q4", Q4), ("ds41f-vision", VISION),
+                             ("qwen38-q2", QWEN_Q2), ("qwen38-q4k", QWEN_Q4)):
             with self.subTest(target=target):
                 path = self.out / name
                 path.write_bytes(b"short")
@@ -95,6 +101,16 @@ out.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(b"x" * len(payload(name)))
                 self.assertIn("Checksum mismatch", self.run_download(target, ok=False))
                 self.assertFalse((self.root / "ds4flash.gguf").exists())
+
+    def test_qwen_is_one_verified_file(self):
+        for target, name in (("qwen38-q2", QWEN_Q2), ("qwen38-q4k", QWEN_Q4)):
+            self.assertIn("Verifying SHA-256", self.run_download(target))
+            self.assertEqual((self.root / "ds4flash.gguf").resolve(), self.out / name)
+            self.assertEqual((self.out / name).read_bytes(), payload(name))
+        self.assertEqual({p.name for p in self.out.iterdir()}, {QWEN_Q2, QWEN_Q4})
+        self.assertIn("Already downloaded", self.run_download("qwen38-iq2"))
+        self.assertEqual((self.root / "ds4flash.gguf").resolve(), self.out / QWEN_Q2)
+        self.assertNotIn("--ple", self.run_download("--help"))
 
     def test_failure_does_not_replace_link(self):
         self.run_download("ds41f-q2")

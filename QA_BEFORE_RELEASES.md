@@ -2197,6 +2197,11 @@ Never load this Q2 model resident on a 128 GB Spark. Its 341 GiB file includes
   pooling, and the 8,192-row projection launch boundary. The cache oracle
   checks IQ2/Q2_K, Q4_K and MXFP4, eviction, remapped slots, small/zero and
   10,000-slot budgets, and prefill after its source becomes unreadable.
+  Also check next-layer read-ahead: protect active inputs and pending slots,
+  never publish partial reads, and evict unused read-ahead before demand-hot
+  experts. Exercise cancellation, changed budgets/model descriptors and
+  `tests/test_cuda_ssd_cache --prefetch-exit`; repeat with
+  `DS4_CUDA_NO_DIRECT_IO=1` to cover buffered reads.
   Prefill must not accumulate full expert tensors in an unbounded second
   cache. Q8 row projections must match scalar execution
   with ragged shapes, untouched output tails and no padding after the weights.
@@ -2213,6 +2218,14 @@ Never load this Q2 model resident on a 128 GB Spark. Its 341 GiB file includes
   `--cuda-long` for decoder/deferred-state boundaries through 60K. Short
   CUDA IQ2/Q2_K SSD prefills use exact 2..8-row chunks below the 256-token
   matrix-prefill threshold. Check both sides of each dispatch boundary.
+  Compare CUDA SSD read-ahead and medium one-sweep appends with
+  `DS4_CUDA_DISABLE_SSD_PREFETCH=1` and
+  `DS4_CUDA_DISABLE_SSD_MEDIUM_SWEEP=1`. The optimized path must preserve
+  complete logits and saved state. Time actual `/read README.md`, fresh and
+  continued 1K/2K/4K/8K/32K prompts, and the following decode, with both
+  automatic and explicit cache budgets. Check whether prefills displace
+  useful decode experts, and report any decode regression alongside the
+  prefill gain. Unused read-ahead must not count as an actual demand hit.
 - Score the same V4.1 short general and long manifests used on Metal, not the
   V4 Flash vectors. Exercise 8/16/32K sparse frontiers and continued prefill.
   Compare paired probability scores, not sampled-prefix length alone.
@@ -2346,6 +2359,79 @@ with `DS4_TEST_CUDA_SINGLE_GPU=1`, `DS4_TEST_SSD_CACHE_GIB=auto`,
 Mixed five-prefill/three-decode rows also pass exact parity; larger mixed
 prefills retain the correct ordered fallback. These results do not establish
 native CUDA network-TP batching or V4.1 vision support.
+
+#### SSD Read-Ahead and Medium Appends
+
+September 13-14, 2026, single Spark, V4.1 Q2 SSD, 64 GiB expert-cache hint
+(56.88 GiB dynamic experts plus 7.12 GiB prefill reserve), disk-only Engram.
+The control is `a04f46fa`. No arithmetic, expert selection or precision changes.
+Read-ahead uses the admitted expert cache and two 8 MiB staging buffers;
+it starts at 2K tokens when two layers fit. Reading ahead below that threshold
+was slower and is not the default. Medium appends retain their existing
+2048-row arithmetic partitions but visit each layer only once; small tails
+and explicitly reduced prefill chunks retain their previous dispatch.
+
+Actual `/read README.md`, 3,241 prompt tokens, 32K allocated context,
+temperature zero, no thinking, 64 generated tokens, balanced two-run pairs:
+
+| Path | Prefill t/s |
+| --- | ---: |
+| Control | 54.30 / 55.02 |
+| One layer sweep, read-ahead disabled | 81.66 / 81.75 |
+| One layer sweep and read-ahead | 97.88 / 98.60 |
+
+All six 64-token continuations are identical. Generation overlaps the
+control's range, around 6 t/s. Separate size checks use 64K allocated context,
+`promessi_sposi.txt`, and 32 teacher-forced decode tokens per frontier.
+These are single paired measurements, not medians:
+
+| Existing tokens | Added tokens | Control prefill t/s | Optimized prefill t/s |
+| ---: | ---: | ---: | ---: |
+| 0 | 2,048 | 69.31 | 84.90 |
+| 2,048 | 2,048 | 76.67 | 90.70 |
+| 0 | 4,096 | 101.44 | 116.34 |
+| 4,096 | 4,096 | 105.15 | 116.31 |
+| 0 | 8,192 | 202.72 | 228.44 |
+| 8,192 | 4,096 | 102.03 | 111.15 |
+| 0 | 32,768 | 350.47 | 384.45 |
+| 32,768 | 3,241 | 54.21 | 87.77 |
+
+Complete frontier logits match byte-for-byte in every pair. At the last two
+frontiers, generation remains about 6.5 t/s. The mixed-state oracle passes
+through 60,298 tokens and fresh 49,153-token deferred replay: full caches,
+logits, snapshots, cancellation, progress and next decode. Available memory
+stayed above 21 GiB with the two-session state oracle, without swap growth.
+IQ2/Q2_K, Q4_K and MXFP4 cache tests, read failures, cancellation, descriptor
+and budget changes, early exit and buffered fallback pass. Compute Sanitizer
+reports zero errors; the SSD scalar/batch oracle also remains exact.
+
+The 17 official boundary cases reproduce the control score file byte-for-byte:
+NLL 0.405201234, API top-token agreement 126/141. The three long cases
+`000`, `003` and `008` from `deepseek-v4.1-flash-20260911-long`, each with
+a 3,241-token continued suffix, also reproduce the control exactly:
+NLL 0.502778649, 172/192 API top tokens. The native agent reads and edits
+the source, runs the four unchanged tests and completes its coding task.
+The older Flash 0731 ten-case SSD score file is also unchanged:
+NLL 0.418845497, 201/240 top tokens.
+This is focused CUDA SSD QA, not a new Metal, ROCm or physical TP release pass.
+
+With automatic sizing (80.17 GiB dynamic cache), the same 32K-context README
+test reaches 93.18 / 96.41 t/s versus 49.45 / 53.80. Its short 64-token
+decode timings vary: 6.58 / 7.42 versus 7.08 / 7.74 t/s. A balanced four-run
+check with 256 generated tokens confirms a small decode cost in this case:
+
+| Path | Prefill t/s | Generation t/s |
+| --- | ---: | ---: |
+| Optimized, first | 102.92 | 9.23 |
+| Control, first | 51.30 | 9.81 |
+| Control, second | 55.39 | 9.77 |
+| Optimized, second | 100.25 | 9.39 |
+
+All replies are identical. Prefill plus generation averages about 59 seconds
+instead of 87, excluding model loading, but decode alone is about 5% slower.
+Do not call this a decoding speedup or assume this short-reply result holds
+for all prompts and reply lengths. Automatic-cache runs retain at least
+6.59 GiB available memory with no swap growth; the agent retains over 13 GiB.
 
 ### CUDA Network Tensor Parallelism
 
@@ -2613,7 +2699,72 @@ M3 inference, large-Mac residency, GLM/pipeline regression, full vision workflow
 or extended 64/96K official-quality pass was run. CUDA/HIP GPU tests were not
 repeated during consolidation.
 
-## 18. Release Sign-off
+## 18. Qwen3.8 Flash Next
+
+- Use the self-contained Q2 and Q4 GGUFs with original BF16 n-grams. Old
+  main-only files and quantized n-gram sidecars are not the release layout.
+  Run `make test-qwen4-ngrams test-deepseek41-gguf` and
+  `python3 -m unittest discover -s gguf-tools/tests -p test_qwen4_native_ngrams.py`.
+  Repeat the reader with ASan/UBSan. Check exact BF16 values, duplicate and
+  reordered rows, parallel reads, truncated files, invalid IDs and cleanup.
+  Build `tests/test_qwen4_ngram_state` and run it with each real model under
+  Metal validation: prefill, decode and MTP failures must invalidate the live
+  frontier; rebuilding and continuing must match an independent session exactly.
+- Audit every copied main/MTP tensor against its input and every n-gram shard
+  against the pinned BF16 source. Packaging must not requantize the calibrated
+  experts. Verify the final checksum and download target before release.
+- Confirm the table is outside the runtime mapping and all Metal residency
+  views, including weight warming. Measure actual memory during short/long
+  prefill and generation; adding 95.37 GiB on disk must not add that much RAM.
+  Test one model at a time on an M5 Max. Keep space for the complete output
+  plus a reserve during conversion; do not fill the system disk.
+- Run ordinary and MTP decoding, including exact sampling, at small and large
+  initial/continued prefixes. Follow the save/restore, rewind, checkpoint,
+  logit-dump, vision and steering tests in `docs/QWEN38_FLASH_NEXT.md`.
+  A table read failure must stop inference, not consume stale staging data.
+- Exercise native-agent coding and real server tool-result continuations with
+  prefix reuse, then an image turn and a text follow-up. Compare quality and
+  speed against the old table separately: restoring original BF16 changes
+  logits, so byte-identical text is not a quality requirement. Disk-only
+  timings must be taken without concurrent downloads or model copies.
+- Repeat focused DeepSeek and GLM checks after shared loader changes. Record
+  skipped hardware or reference checks explicitly; coherent Qwen replies do
+  not establish parity with the original HF model or a hosted API.
+
+### Native n-gram release, 2026-09-14
+
+M5 Max IT, 128 GiB, one model at a time: Q2 and Q4 payload audits, reader
+ASan/UBSan, Metal kernel validation, failed-read recovery, logit dumps,
+ordinary/MTP generation, checkpoints/restarts/rewinds, CLI images, native-agent
+image/code-edit tasks, steering and full-context save/load passed. Pi completed
+the image/code task through Chat Completions, Responses and Anthropic with Q2,
+including prefix reuse. One earlier native-agent run recovered from a malformed
+tool call; the final Q2/Q4 tasks passed their independent code checks.
+
+The Q4 tail check exposed half-query rounding amplified by nearly tied expert
+scores. Batches of up to eight rows now retain FP32-query attention; the expanded
+full-logit checks pass without changing their tolerance. The steering test also
+found that standalone greedy generation ignored the vector. Both runners now
+load it, and their Q2/Q4 steering continuations match exactly.
+
+Representative timings, no concurrent transfer; these are single runs, not
+medians. The 32K row adds 16K tokens to the existing 16K prefix:
+
+| Model | 16K initial prefill | Continued prefill to 32K | Decode at 32K |
+| --- | ---: | ---: | ---: |
+| Q2 | 1492.40 t/s | 1438.19 t/s | 48.74 t/s |
+| Q4 | 1457.69 t/s | 1330.24 t/s | 48.40 t/s |
+
+Short-prompt MTP measured 68.85/68.10 t/s for Q2/Q4. At 8K context and a
+1024-token prefill chunk, planned memory was 42.86/70.87 GiB; the 95.37 GiB
+n-gram table was excluded. Swap use did not grow. DeepSeek Vision Exp and
+GLM 5.3 Flash Q2 snapshot regressions passed after the loader change.
+The non-Metal-4 paths passed on M5 with Metal 4 disabled. No physical M3,
+64 GiB Mac, CUDA or ROCm tests were run. Original-HF/API matched-checkpoint
+quality scoring and a full HF-to-main conversion were not run; the published
+files reuse audited calibrated main/MTP tensors and original BF16 n-gram bytes.
+
+## 19. Release Sign-off
 
 Do not sign off until:
 

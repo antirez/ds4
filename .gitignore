@@ -36,6 +36,7 @@
 /tests/test_mxfp4_metal
 /tests/test_q4k_dot
 /tests/test_sampling
+/tests/test_web_recovery
 /tests/test_quality_api
 /tests/test_cuda_q8_scratch
 /tests/test_cuda_dspark_moe
@@ -54,6 +55,9 @@
 /tests/test_glm_attention_rocm
 /tests/test_linux_memory
 /tests/test_rocm_memory
+/tests/test_qwen4_kernels
+/tests/test_qwen4_moe_mm_specialize
+/tests/test_qwen4_vision
 /tests/test_deepseek4_vision_image
 /tests/test_deepseek41_metal
 /tests/test_deepseek41_cuda
@@ -64,6 +68,8 @@
 /tests/test_cuda_ssd_batch
 /tests/test_cuda_ssd_repack
 /tests/test_deepseek41_gguf
+/tests/test_qwen4_ngrams
+/tests/test_qwen4_ngram_state
 /tests/test_deepseek41_graph
 /tests/test_deepseek41_prefill
 /tests/test_deepseek41_cli
@@ -77,3 +83,6 @@ __pycache__/
 /misc/
 .*.swp
 .DS_Store
+
+/tests/test_qwen4_conv_parallel
+/tests/test_q8_prefill_variants

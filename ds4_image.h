@@ -82,6 +82,16 @@ int ds4_image_preprocess_glm53(
         char              *error,
         size_t             error_cap);
 
+/* Qwen3-VL style: resize to multiples of 32 within the token budget, normalize
+ * with mean/std 0.5, emit 3*16*16 patches in 2x2 merge-window order. */
+int ds4_image_preprocess_qwen4(
+        ds4_image_patches *out,
+        const ds4_image   *image,
+        uint32_t           min_image_tokens,
+        uint32_t           max_image_tokens,
+        char              *error,
+        size_t             error_cap);
+
 void ds4_image_patches_free(ds4_image_patches *patches);
 
 int ds4_image_preprocess_deepseek4(
