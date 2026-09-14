@@ -265,4 +265,6 @@ int ds4_kvstore_load_payload_region(ds4_session *session, FILE *fp,
                                     uint32_t chunk_size, int n_workers,
                                     char *load_err, size_t load_err_len);
 
+bool ds4_kvstore_quant_bits_supported(int quant_bits);
+
 #endif

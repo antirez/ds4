@@ -16,6 +16,9 @@ The file shape depends on the model:
 
 - DeepSeek V4 Flash: `43 x 4096`.
 - GLM 5.3 Flash: `45 x 4096`. The separate MTP predictor layer is omitted.
+- Qwen3.8 Flash Next: `48 x 2560`. FFN steering is applied to each
+  hyper-connection branch of the residual; dumps average those branches
+  at the last prompt token.
 
 GLM 5.2 steering is not implemented.
 
@@ -179,3 +182,28 @@ Style control:
 The method is not a fine-tune. It is a low-rank runtime edit, so it works best
 for coarse behavior, topic, or style directions that are consistently present in
 the activation captures.
+
+## Qwen3.8 Flash Next
+
+Capture uses `--think` / `--nothink`
+(not `--think-high`). Dumps track the prompt phase explicitly, including
+one-token tails, and retain the last prompt token during ordinary and MTP
+decode. `attn_out` captures the output projection of both GDN and full-attention
+layers, giving one row for each of the 48 trunk layers:
+
+```sh
+python3 dir-steering/tools/build_direction.py \
+  --profile qwen3.8-flash-next \
+  --ds4 ./ds4 \
+  --model gguf/Qwen3.8-Flash-Next-Q4.gguf \
+  --good-file /path/to/target-prompts.txt \
+  --bad-file /path/to/control-prompts.txt \
+  --out dir-steering/out/qwen38-direction.json \
+  --component ffn_out \
+  --ctx 512
+```
+
+Qwen steering is Metal-only. `--mtp-model`, SSD streaming, and `--power`
+remain unsupported for this graph. The bank contains only the 48 trunk layers;
+the embedded MTP predictor remains unsteered. Its drafts are verified by the
+steered target trunk, so `--mtp` remains supported.

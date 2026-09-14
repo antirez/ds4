@@ -37,6 +37,9 @@ static int check_dispatch(void) {
                 uint32_t expected = cold[i];
 #ifdef __APPLE__
                 if (warm && cache == half && remaining[i] < 1024) expected = 1;
+#elif !defined(DS4_ROCM_BUILD)
+                if (remaining[i] > 2048 && remaining[i] < 8192 && remaining[i] % 2048 >= 256)
+                    expected = remaining[i];
 #endif
                 if (ds41_prefill_count(&g, remaining[i]) != expected)
                     fprintf(stderr, "dispatch cache=%u configured=%u warm=%u remaining=%u expected=%u actual=%u\n",
@@ -53,6 +56,17 @@ static int check_dispatch(void) {
         }
     }
     g.pos = 0;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    CHECK(ds41_prefill_count(&g, 2303) == 2048);
+    CHECK(ds41_prefill_count(&g, 2304) == 2304);
+    CHECK(ds41_prefill_count(&g, 3241) == 3241);
+    CHECK(setenv("DS4_CUDA_DISABLE_SSD_MEDIUM_SWEEP", "1", 1) == 0);
+    CHECK(ds41_prefill_count(&g, 3241) == 2048);
+    CHECK(unsetenv("DS4_CUDA_DISABLE_SSD_MEDIUM_SWEEP") == 0);
+    g.prefill_cap = 1024;
+    CHECK(ds41_prefill_count(&g, 3241) == 1024);
+    g.prefill_cap = 8192;
+#endif
     g.tp_world = 2;
     g.streaming = false;
     for (size_t i = 0; i < sizeof(remaining) / sizeof(*remaining); i++) {
@@ -271,7 +285,11 @@ static int check_mixed(const char *model, const char *prompt_path,
         const char *ablation = tp ? "DS4_METAL_DISABLE_V41_TP_DECODE_QUEUE" :
             "DS4_METAL_DISABLE_V41_DEFER_DECODER";
         CHECK(setenv(ablation, "1", 1) == 0);
-        if (cuda && !tp) CHECK(setenv("DS4_CUDA_SESSION_BATCH_MOE", "0", 1) == 0);
+        if (cuda && !tp) {
+            CHECK(setenv("DS4_CUDA_SESSION_BATCH_MOE", "0", 1) == 0);
+            CHECK(setenv("DS4_CUDA_DISABLE_SSD_PREFETCH", "1", 1) == 0);
+            CHECK(setenv("DS4_CUDA_DISABLE_SSD_MEDIUM_SWEEP", "1", 1) == 0);
+        }
         if (cuda && tp && appends[i] < 256) {
             /* Mirror scalar control execution on the worker too. */
             ds4_tokens prefix = tokens;
@@ -280,7 +298,11 @@ static int check_mixed(const char *model, const char *prompt_path,
         } else {
             CHECK(ds4_session_sync(control, &tokens, err, sizeof(err)) == 0);
         }
-        if (cuda && !tp) CHECK(unsetenv("DS4_CUDA_SESSION_BATCH_MOE") == 0);
+        if (cuda && !tp) {
+            CHECK(unsetenv("DS4_CUDA_SESSION_BATCH_MOE") == 0);
+            CHECK(unsetenv("DS4_CUDA_DISABLE_SSD_PREFETCH") == 0);
+            CHECK(unsetenv("DS4_CUDA_DISABLE_SSD_MEDIUM_SWEEP") == 0);
+        }
         CHECK(unsetenv(ablation) == 0);
         prefill_progress p = {.session = mixed, .frontier = start,
             .current = start, .target = tokens.len, .begin = now_sec()};

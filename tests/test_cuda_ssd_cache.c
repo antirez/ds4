@@ -9,6 +9,7 @@
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x); exit(1); } } while (0)
 enum { EXPERTS = 8, LAYERS = 3, ROWS = 129 };
 static uint32_t random_state = 17;
+static int test_prefetch_exit;
 static unsigned char random_byte(void) {
     random_state = random_state * 1664525u + 1013904223u;
     return random_state >> 24;
@@ -88,9 +89,25 @@ static void run(unsigned gate_type, unsigned down_type, unsigned dim, unsigned s
         for (unsigned bi = 0; bi < sizeof(budgets) / sizeof(*budgets); bi++) {
             ds4_gpu_set_streaming_expert_cache_budget(budgets[bi]);
             CHECK(ds4_gpu_stream_expert_cache_configured_count() == budgets[bi]);
+            unsigned prefetched = 0;
             for (unsigned pass = 0; pass < 3; pass++) for (unsigned k = 0; k < LAYERS; k++) {
                 const unsigned l = pass & 1 ? LAYERS - 1 - k : k;
                 const uint64_t g = l * layer_bytes, u = g + EXPERTS * gate_bytes, d = u + EXPERTS * gate_bytes;
+                const ds4_gpu_stream_expert_table current = {
+                    model, model_bytes, l, EXPERTS, g, u, d, gate_bytes, down_bytes};
+                const unsigned next_layer = (l + 1u) % LAYERS;
+                const uint64_t next_gate = next_layer * layer_bytes;
+                const ds4_gpu_stream_expert_table next = {
+                    model, model_bytes, next_layer, EXPERTS, next_gate,
+                    next_gate + EXPERTS * gate_bytes, next_gate + 2 * EXPERTS * gate_bytes,
+                    gate_bytes, down_bytes};
+                const int started = ds4_gpu_stream_expert_cache_prefetch(&current, &next);
+                if (started && test_prefetch_exit) {
+                    fprintf(stderr, "CUDA SSD early exit with an outstanding reader\n");
+                    exit(0);
+                }
+                if (budgets[bi] < 2u * EXPERTS) CHECK(!started);
+                prefetched += started != 0;
                 bool half = false;
                 CHECK(ds4_gpu_routed_moe_batch_tensor(out, gate, up, mid, down, model, model_bytes,
                     g, u, d, gate_type, down_type, gate_bytes, gate_block, down_bytes, down_block,
@@ -100,6 +117,8 @@ static void run(unsigned gate_type, unsigned down_type, unsigned dim, unsigned s
                     CHECK(isfinite(actual[i]) && fabsf(actual[i] - reference[l][i]) <=
                           2e-5f * (1 + fabsf(reference[l][i])));
             }
+            ds4_gpu_stream_expert_cache_prefetch_finish(true);
+            if (budgets[bi] >= 2u * EXPERTS) CHECK(prefetched > 0);
         }
         fprintf(stderr, "CUDA SSD cache types=%u/%u width=%u selected=%u rows=%u eviction/remap/budgets: PASS\n",
                 gate_type, down_type, dim, selected, rows);
@@ -107,6 +126,56 @@ static void run(unsigned gate_type, unsigned down_type, unsigned dim, unsigned s
     const ds4_gpu_stream_expert_table table = {
         model, model_bytes, 0, EXPERTS, 0, EXPERTS * gate_bytes, 2 * EXPERTS * gate_bytes,
         gate_bytes, down_bytes};
+    ds4_gpu_stream_expert_table next = table;
+    next.layer = 1;
+    next.gate_offset += layer_bytes;
+    next.up_offset += layer_bytes;
+    next.down_offset += layer_bytes;
+    const int32_t one[] = {0};
+    int32_t every[EXPERTS];
+    for (unsigned i = 0; i < EXPERTS; i++) every[i] = i;
+    ds4_gpu_set_streaming_expert_cache_budget(2u * EXPERTS);
+    CHECK(ds4_gpu_stream_expert_cache_begin_selected_load(&table, one, 1));
+    CHECK(ds4_gpu_stream_expert_cache_prefetch(&table, &next));
+    /* Fill the rest of the active layer while the next layer's slots are
+     * reserved. Neither the GPU's inputs nor the pending writes may be evicted. */
+    CHECK(ds4_gpu_stream_expert_cache_begin_selected_load(&table, every, EXPERTS));
+    ds4_gpu_stream_expert_cache_prefetch_finish(false);
+    CHECK(ftruncate(fd, 0) == 0);
+    CHECK(ds4_gpu_stream_expert_cache_begin_selected_load(&next, every, EXPERTS));
+    CHECK(ds4_gpu_stream_expert_cache_begin_selected_load(&table, every, EXPERTS));
+    fprintf(stderr, "CUDA SSD prefetch protects current inputs and publishes complete next layer: PASS\n");
+    CHECK(pwrite(fd, model, model_bytes, 0) == (ssize_t)model_bytes);
+    ds4_gpu_stream_expert_cache_release_resident();
+    CHECK(ds4_gpu_stream_expert_cache_begin_selected_load(&table, every, EXPERTS));
+    CHECK(ds4_gpu_stream_expert_cache_prefetch(&table, &next));
+    ds4_gpu_stream_expert_cache_prefetch_finish(false);
+    ds4_gpu_stream_expert_table third = next;
+    third.layer++;
+    third.gate_offset += layer_bytes;
+    third.up_offset += layer_bytes;
+    third.down_offset += layer_bytes;
+    CHECK(ds4_gpu_stream_expert_cache_begin_selected_load(&third, one, 1));
+    CHECK(ftruncate(fd, 0) == 0);
+    CHECK(ds4_gpu_stream_expert_cache_begin_selected_load(&table, every, EXPERTS));
+    CHECK(pwrite(fd, model, model_bytes, 0) == (ssize_t)model_bytes);
+    fprintf(stderr, "CUDA SSD unused read-ahead evicts before demand-loaded experts: PASS\n");
+    for (unsigned action = 0; action < 4; action++) {
+        ds4_gpu_stream_expert_cache_release_resident();
+        ds4_gpu_set_streaming_expert_cache_budget(2u * EXPERTS);
+        CHECK(ds4_gpu_stream_expert_cache_begin_selected_load(&table, one, 1));
+        if (action == 1) CHECK(ftruncate(fd, 0) == 0);
+        CHECK(ds4_gpu_stream_expert_cache_prefetch(&table, &next));
+        if (action == 0) ds4_gpu_stream_expert_cache_prefetch_finish(true);
+        if (action == 1) ds4_gpu_stream_expert_cache_prefetch_finish(false);
+        if (action == 2) ds4_gpu_set_streaming_expert_cache_budget(3);
+        if (action == 3) CHECK(ds4_gpu_set_model_fd_for_map(fd, model));
+        CHECK(ftruncate(fd, 0) == 0);
+        CHECK(!ds4_gpu_stream_expert_cache_begin_selected_load(&next, one, 1));
+        CHECK(pwrite(fd, model, model_bytes, 0) == (ssize_t)model_bytes);
+        CHECK(ds4_gpu_stream_expert_cache_begin_selected_load(&next, every, EXPERTS));
+    }
+    fprintf(stderr, "CUDA SSD prefetch cancellation/read failure/budget/FD teardown do not publish partial slots: PASS\n");
     ds4_gpu_set_streaming_expert_cache_budget(3);
     const int32_t first[] = {0, 1}, protected_hits[] = {2, 0, 1}, hit[] = {0}, miss[] = {7};
     CHECK(ds4_gpu_stream_expert_cache_begin_selected_load(&table, first, 2));
@@ -184,7 +253,9 @@ static void run(unsigned gate_type, unsigned down_type, unsigned dim, unsigned s
     close(fd); free(alias); free(model);
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--prefetch-exit")) test_prefetch_exit = 1;
+    else CHECK(argc == 1);
     run(16, 10, 512, 2);
     run(12, 12, 512, 2);
     run(39, 39, 512, 2);

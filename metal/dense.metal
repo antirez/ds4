@@ -1336,6 +1336,7 @@ void kernel_mul_mv_t_t_4_disp(
         ushort tiisg,
         ushort sgitg) {
     switch (args.nr0) {
+        case 1: kernel_mul_mv_t_t_4_impl<T0, T04, T1, T14, 1, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
         case 2: kernel_mul_mv_t_t_4_impl<T0, T04, T1, T14, 2, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
         case 4: kernel_mul_mv_t_t_4_impl<T0, T04, T1, T14, 4, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
     };
@@ -2014,6 +2015,22 @@ void dequantize_q8_0_pairs(device const block_q8_0 *xb, short il, thread half4x4
     }
 
     reg = (half4x4) reg_f;
+}
+
+/* Materialize the same half-rounded Q8 weights used by tiled matmul once
+ * per projection. Eight threads cover each block, four adjacent values each. */
+kernel void kernel_q8_prefill_unpack(
+        constant uint &n_blocks,
+        device const block_q8_0 *src,
+        device half4 *dst,
+        uint gid [[thread_position_in_grid]]) {
+    const uint block = gid / 8u;
+    if (block >= n_blocks) return;
+    const uint i = (gid % 8u) * 4u;
+    const float d = (float)src[block].d;
+    float4 values;
+    for (uint j = 0; j < 4; j++) values[j] = (float)src[block].qs[i+j] * d;
+    dst[gid] = half4(values);
 }
 
 template <typename type4>

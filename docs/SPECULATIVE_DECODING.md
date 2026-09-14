@@ -57,6 +57,26 @@ GLM's draft block is already in its main GGUF:
 The current GLM cycle commits up to two tokens. No external support file is
 needed, and ordinary decode remains the default.
 
+## Qwen3.8: built-in MTP
+
+Both Qwen downloads include MTP and native BF16 n-grams in the main GGUF:
+
+```sh
+./download_model.sh qwen38-q4k
+./ds4 --mtp
+```
+
+Ordinary decode uses the same file with `--mtp` omitted. For non-zero
+temperature, add `--mtp-exact-sampling` to preserve the target sampling
+distribution. See [Qwen setup](QWEN38_FLASH_NEXT.md) for the Metal runtime.
+
+The cycle drafts one token ahead by default and engages a **second, chained
+draft** (one extra nextn-layer step conditioned on the predictor's own
+stream, verified in a 3-row pass) while recent first-draft acceptance is
+perfect, disengaging after repeated second-draft rejections.
+`DS4_QWEN4_MTP_DEPTH=2` or `=3` fixes the depth;
+`0` (default) is the adaptive policy.
+
 ## Sampling and reproducibility
 
 At temperature zero, accepted drafts must match the target's greedy
@@ -68,6 +88,13 @@ not match. This is deliberately more deterministic than ordinary sampling.
 Use `--mtp-exact-sampling` to preserve the ordinary target sampling
 distribution. Exact mode accepts greedy proposals with their target
 probability and samples from the remaining distribution on rejection.
+
+When a verified block crosses a tool sampling-mode boundary (for example
+entering tool-call syntax during server decoding), the server rewinds to the
+block start and re-evaluates the boundary token so the next sample uses the
+new mode. Under exact sampling that rewind restores a pre-verify snapshot of
+the recurrent state instead of resetting the graph, so long retained
+contexts are not replayed at every boundary.
 
 Accepted tokens keep the state produced by the batched verifier. Floating-point
 reduction order can differ from one-token decode, so long greedy continuations

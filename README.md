@@ -9,7 +9,7 @@ a small native inference engine optimized first for
 **DeepSeek V4 Flash** (including the experimental vision model),
 **DeepSeek V4.1 Flash** (Metal, and text inference on CUDA),
 and additionally **GLM 5.2 and 5.3**, **GLM 5.3 Flash** and
-**DeepSeek V4 PRO**. The code is self-contained and
+**DeepSeek V4 PRO**, and **Qwen3.8 Flash Next** (Metal). The code is self-contained and
 deliberately narrow, not a general GGUF runner: you need to use the
 GGUF files the project produces, that are part of the project
 itself.
@@ -162,7 +162,8 @@ the [client setup guide](docs/CLIENTS.md).
 
 [Models and vision](docs/MODELS.md) lists the supported downloads and memory
 requirements. DeepSeek Vision Experimental uses a different checkpoint from
-Flash 0731; GLM 5.3 Flash adds vision to the same text model.
+Flash 0731; GLM 5.3 Flash and Qwen3.8 Flash Next add vision to the same text
+model through a separate encoder.
 
 DeepSeek V4.1 Flash text and vision run on Metal; text also runs on a DGX Spark.
 Q2 runs with SSD streaming on one 128 GB Mac or Spark, or resident across two
@@ -174,7 +175,24 @@ and setup.
 With the matching encoder passed as `--vision FILE`, use `/read image.png`
 in the CLI or `view_image` in the native agent.
 
-Speculative decoding is opt-in. GLM uses `--mtp`; V4 Flash DSpark needs a matching
+Qwen3.8's smaller Q2 release has **41.73 GiB** of main/MTP weights,
+with imatrix IQ2_XXS gate/up experts and padded Q2_K down projections.
+It is the starting option for 64 GB Macs.
+The GGUF also contains 95.37 GiB of original BF16 n-grams, read directly
+from disk rather than loaded into RAM. Keep it on a fast SSD. Start with 8K context:
+
+```sh
+./download_model.sh qwen38-q2
+./ds4 --ctx 8192 --prefill-chunk 1024
+```
+
+The download fetches one 137.10 GiB file and updates `ds4flash.gguf`.
+Add `--mtp` for speculative decoding. The larger
+`qwen38-q4k` target is also available. Download the optional vision encoder
+with `./download_model.sh qwen38-vision` and pass it with `--vision`.
+See [Qwen setup](docs/QWEN38_FLASH_NEXT.md) for details.
+
+Speculative decoding is opt-in. GLM and Qwen use `--mtp`; V4 Flash DSpark needs a matching
 support GGUF. It can improve generation, but not every workload benefits.
 Read [speculative decoding](docs/SPECULATIVE_DECODING.md) for setup and the
 difference between default opportunistic sampling and `--mtp-exact-sampling`.
@@ -232,10 +250,11 @@ DGX Spark results, comparison conditions, and benchmark commands.
 
 ## Detailed Guides
 
-- [Models and vision](docs/MODELS.md): Flash, PRO, GLM, and matching encoders.
+- [Models and vision](docs/MODELS.md): Flash, PRO, GLM, Qwen, and matching encoders.
+- [Qwen3.8 Flash Next](docs/QWEN38_FLASH_NEXT.md): model setup, MTP, vision, and validation.
 - [SSD streaming](docs/SSD_STREAMING.md): run larger than RAM and size the cache.
 - [Inference across machines](docs/DISTRIBUTED.md): two-Mac TP/RDMA and layer pipelines.
-- [Speculative decoding](docs/SPECULATIVE_DECODING.md): DSpark, GLM MTP, and sampling.
+- [Speculative decoding](docs/SPECULATIVE_DECODING.md): DSpark, GLM and Qwen MTP, and sampling.
 - [Serving](docs/SERVER.md): APIs, images, batching, and disk KV caches.
 - [Coding agent clients](docs/CLIENTS.md): Pi, OpenCode, Codex CLI, and Claude Code.
 - [Performance](docs/PERFORMANCE.md): reproducible measurements and recorded baselines.

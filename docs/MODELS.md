@@ -117,6 +117,33 @@ or the [server image API](SERVER.md#images). V4 Flash vision encoders do not
 work with V4.1. See [conversion](../gguf-tools/README.md#convert-deepseek-v41-flash)
 to build the GGUFs from safetensors.
 
+## Qwen3.8 Flash Next
+
+`./download_model.sh qwen38-q2` downloads one **137.10 GiB** GGUF: 41.73 GiB
+of main/MTP weights and 95.37 GiB of original BF16 n-grams kept on disk.
+Its gate/up experts use IQ2_XXS; down experts use Q2_K with 640 logical inputs
+padded to 768 in the weight file. It replaces the larger MXFP4-down IQ2 release.
+For 64 GB Macs, start at 8K context with a 1,024-token prefill chunk; runtime
+allocations add to the main weights, but the n-gram table is not mapped or
+preloaded. Keep the GGUF on a fast local SSD.
+The larger `qwen38-q4k` target uses 165.11 GiB on disk and 69.74 GiB for
+resident weights, before runtime buffers.
+This model runs on Metal.
+The script links `ds4flash.gguf` to the combined GGUF:
+
+```sh
+./ds4 --ctx 8192 --prefill-chunk 1024
+```
+
+Add `--mtp` for speculation; no second file is needed.
+See [Qwen setup](QWEN38_FLASH_NEXT.md)
+for memory, conversion, vision, and sampling details.
+
+Vision uses a separate encoder. `./download_model.sh qwen38-vision` downloads
+llama.cpp's Q8_0 mmproj from
+[ggml-org/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/ggml-org/Qwen3.8-Flash-Next-GGUF);
+pass it at runtime with `--vision`.
+
 ## GLM 5.3 Flash
 
 | Target | Approximate file size | Use |
@@ -207,3 +234,17 @@ be saved with `/save`.
 For two-Mac TP, pass the same encoder on both ranks. The coordinator encodes
 the image and sends the projected visual tokens to the worker.
 For HTTP image formats and limits, see [serving](SERVER.md#images).
+
+### Qwen3.8 Flash Next
+
+The text GGUF stays the same. Download and add the encoder explicitly:
+
+```sh
+./download_model.sh qwen38-vision
+./ds4 --mtp \
+  --vision gguf/mmproj-Qwen3.8-Flash-Next-Q8_0.gguf
+```
+
+The encoder is llama.cpp's Q8_0 mmproj conversion of the model's Qwen3-VL
+tower. Use `/read image.png` in `ds4` or `image_url` parts over HTTP; see
+[Qwen setup](QWEN38_FLASH_NEXT.md) for image limits and resize behavior.

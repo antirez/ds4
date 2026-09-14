@@ -880,11 +880,19 @@ int main(int argc, char **argv) {
 
         ds4_tokens prompt = {0};
         ds4_tokens target = {0};
-        if (rendered_prompt)
+        if (rendered_prompt) {
             ds4_tokenize_rendered_chat(engine, prompt_text, &prompt);
-        else
+        } else {
             ds4_encode_chat_prompt(engine, NULL, prompt_text, DS4_THINK_NONE, &prompt);
+        }
         ds4_tokenize_text(engine, cont_text, &target);
+        if (getenv("DS4_SCORE_DEBUG")) {
+            fprintf(stderr, "%s prompt ids (%d):", id, prompt.len);
+            for (int i = 0; i < prompt.len; i++) fprintf(stderr, " %d", prompt.v[i]);
+            fprintf(stderr, "\n%s target ids (%d):", id, target.len);
+            for (int i = 0; i < target.len; i++) fprintf(stderr, " %d", target.v[i]);
+            fprintf(stderr, "\n");
+        }
 
         if (prompt.len + target.len + 1 >= ctx_size) {
             fprintf(stderr, "%s exceeds ctx=%d\n", id, ctx_size);
@@ -952,6 +960,11 @@ int main(int argc, char **argv) {
 
             if (api_aligned) {
                 const api_pos *ap = &ref.pos[i];
+                if (getenv("DS4_SCORE_DEBUG")) {
+                    const int ref_tok = ap->n_alts > 0 ? api_alt_token_id(engine, &ap->alts[0]) : -1;
+                    fprintf(stderr, "  pos %d: target=%d ref_top=%d target_lp=%.3f ref_lp=%.3f greedy=%d\n",
+                            i, target.v[i], ref_tok, target_lp, ap->logprob, greedy);
+                }
                 if (isfinite(ap->logprob)) {
                     const double delta = target_lp - ap->logprob;
                     cm.target_count++;

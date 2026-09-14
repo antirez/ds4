@@ -40,11 +40,14 @@ Both need the complete GGUF on their local SSD. V4.1 CUDA vision and DSpark
 are not supported. The [model guide](MODELS.md#deepseek-v41-flash) covers
 thinking levels and the separate Metal configurations.
 
-September 12, 2026, Q2 SSD with automatic cache sizing and 64K allocated
-context: two runs reached 332 and 359 t/s for a 32K initial prefill, and
-183 and 187 t/s when adding 8K at that frontier. Generation was about
-7-8 t/s, measured over 32 teacher-forced tokens. Smaller prompts have lower
-prefill throughput. These are SSD-streamed V4.1 results, not resident V4 Flash numbers.
+September 13-14, 2026, Q2 SSD with automatic cache sizing: a 3,241-token
+`/read README.md` prefill reached 93-96 t/s, up from 49-54 t/s, with 32K
+allocated context. No extra flag is needed. A separate 64 GiB cache-budget
+run with 64K allocated context reached 384 t/s for a 32K initial prefill and
+88 t/s for a 3.2K append. These are SSD-streamed V4.1 results, not resident
+V4 Flash numbers; speed depends on prompt length and the expert cache.
+The automatic-cache 256-token reply test decoded about 5% slower, but
+prefill plus the reply fell from about 87 to 59 seconds.
 See the [QA record](../QA_BEFORE_RELEASES.md#cuda-ssd-streaming) for conditions
 and longer-context measurements.
 

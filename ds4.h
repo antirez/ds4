@@ -26,6 +26,8 @@ typedef enum {
     DS4_THINK_NONE,
     DS4_THINK_HIGH,
     DS4_THINK_MAX,
+    DS4_THINK_LOW,      /* Qwen3.8 reasoning_effort low/medium; other models render them as HIGH */
+    DS4_THINK_MEDIUM,
 } ds4_think_mode;
 /* Explicit numeric effort lives outside the stable named-mode values. */
 #define DS4_THINK_LEVEL_BASE 1000
@@ -305,6 +307,9 @@ bool ds4_engine_glm_layer_payload_bytes(ds4_engine *e,
 int ds4_engine_model_id(ds4_engine *e);
 bool ds4_engine_is_glm_dsa(ds4_engine *e);
 bool ds4_engine_is_glm53(ds4_engine *e);
+bool ds4_engine_is_qwen4(ds4_engine *e);
+/* Qwen3.8 reasoning-effort system instruction for a think mode (NULL when none) */
+const char *ds4_qwen4_reasoning_effort_text(ds4_think_mode mode);
 const char *ds4_backend_name(ds4_backend backend);
 bool ds4_think_mode_enabled(ds4_think_mode mode);
 int ds4_think_mode_level(ds4_think_mode mode);
