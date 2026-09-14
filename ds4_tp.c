@@ -2590,18 +2590,9 @@ int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
     ds4_tp_gate_header h = { DS4_TP_BATCH_MAGIC, (uint16_t)layer,
                              (uint16_t)rows, seq };
     if (tp->odl_active) {
-        if (!tp_write_full(tp->data_fd, &h, sizeof(h))) return 0;
-        ds4_tp_gate_header ph;
-        if (!tp_read_full_wait(tp, tp->data_fd, &ph, sizeof(ph))) return 0;
-        if (ph.magic != DS4_TP_BATCH_MAGIC || ph.layer != layer ||
-            ph.gate != rows || ph.seq != seq) {
-            fprintf(stderr,
-                    "ds4-tp: batch gate desync: got l=%u rows=%u seq=%llu, "
-                    "want l=%u rows=%u seq=%llu\n",
-                    ph.layer, ph.gate, (unsigned long long)ph.seq,
-                    layer, rows, (unsigned long long)seq);
-            return 0;
-        }
+        /* The odl exchange numbers rounds itself and validates the chunk
+         * sizes, so no header rendezvous is needed (it cost a TCP round
+         * trip per gate). */
         return tp_odl_bulk_exchange(
                 tp,
                 tp->slab + ds4_tp_slab_batch_out_offset(tp, layer),
@@ -2678,6 +2669,7 @@ int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
 int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
                              const void *out, void *in, uint64_t bytes) {
     if (tp->data_fd < 0 || !out || !in || bytes == 0) return 0;
+    if (tp->odl_active) return tp_odl_bulk_exchange(tp, out, in, bytes);
 #ifdef DS4_TP_HAVE_VERBS
     static int dbg = -1;
     if (dbg < 0) dbg = getenv("DS4_TP_BIG_GATE_DEBUG") != NULL;
@@ -2698,7 +2690,6 @@ int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
                 layer, (unsigned long long)seq);
         return 0;
     }
-    if (tp->odl_active) return tp_odl_bulk_exchange(tp, out, in, bytes);
 #ifdef DS4_TP_HAVE_VERBS
     if (tp->rdma_active && tp_rdma_big_gate_capable(tp)) {
         if (!tp_rdma_drain_decode_window(tp)) return 0;
