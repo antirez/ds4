@@ -1,3 +1,5 @@
+#include "ds4_rocm_q4_qb_epilogue_layout.cuh"
+
 __global__ static void rms_norm_plain_kernel(float *out, const float *x, uint32_t n, uint32_t rows, float eps) {
     uint32_t row = blockIdx.x;
     if (row >= rows) return;
@@ -169,6 +171,89 @@ __global__ static void head_rms_norm_rope_tail_kernel(
         tail[i] = x0 * c - x1 * s;
         tail[i + 1] = x0 * s + x1 * c;
     }
+}
+
+// Q4 F32-output prefill epilogue; the generic/Q8 norm path is unchanged.
+__launch_bounds__(256)
+__global__ static void rocm_q4_qb_f32_epilogue_wave32_kernel(
+        float *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim,
+        uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, int inverse,
+        float freq_base, float freq_scale, float ext_factor, float attn_factor,
+        float beta_fast, float beta_slow, float eps) {
+#if defined(__HIP_DEVICE_COMPILE__) && __HIP_DEVICE_COMPILE__ && \
+    defined(__gfx1151__) && \
+    (!defined(__AMDGCN_WAVEFRONT_SIZE__) || __AMDGCN_WAVEFRONT_SIZE__ == 32)
+    namespace ep = ds4_rocm_q4_qb_epilogue;
+    const uint32_t row = blockIdx.x * ep::heads_per_block + threadIdx.x / 32u;
+    if (row >= n_tok * n_head) return; // Uniform over the complete wave.
+    const uint32_t lane = threadIdx.x & 31u;
+    const MASK_T mask = static_cast<MASK_T>(0xffffffffu);
+    const uint32_t t = row / n_head;
+    float *xr = x + (uint64_t)row * head_dim;
+    float v[ep::values];
+#pragma unroll
+    for (uint32_t j = 0; j < ep::values; ++j)
+        v[j] = xr[ep::column(lane, j)];
+
+    float sum;
+    {
+#pragma clang fp reassociate(off) contract(on)
+        sum = ep::fold_columns(v);
+#pragma unroll
+        for (uint32_t stride = 16u; stride; stride >>= 1u) {
+            const float other = __shfl_down_sync(mask, sum, stride, 32);
+            if (lane < stride) sum += other;
+        }
+        sum = __shfl_sync(mask, sum, 0, 32);
+    }
+    const float scale = rsqrtf(sum / (float)head_dim + eps);
+#pragma unroll
+    for (uint32_t j = 0; j < 14u; ++j)
+        xr[ep::column(lane, j)] = v[j] * scale;
+
+    // Each lane now owns one rotary pair. Both 32-value source halves must
+    // be shuffled before selecting: a lane-dependent source register would
+    // mix the halves when reading a lane on the other side of the wave.
+    const uint32_t source = (lane & 15u) * 2u;
+    const float lo0 = __shfl_sync(mask, v[14], source, 32);
+    const float lo1 = __shfl_sync(mask, v[14], source + 1u, 32);
+    const float hi0 = __shfl_sync(mask, v[15], source, 32);
+    const float hi1 = __shfl_sync(mask, v[15], source + 1u, 32);
+    const float x0 = (lane < 16u ? lo0 : hi0) * scale;
+    const float x1 = (lane < 16u ? lo1 : hi1) * scale;
+
+    // Retain the generic kernel's YaRN expressions and F32 boundary.
+    float corr0 = 0.0f, corr1 = 0.0f;
+    if (ext_factor != 0.0f) {
+        float denom = 2.0f * logf(freq_base);
+        corr0 = floorf((float)n_rot * logf((float)n_ctx_orig / (beta_fast * 2.0f * (float)M_PI)) / denom);
+        corr1 = ceilf((float)n_rot * logf((float)n_ctx_orig / (beta_slow * 2.0f * (float)M_PI)) / denom);
+        corr0 = fmaxf(0.0f, corr0);
+        corr1 = fminf((float)(n_rot - 1), corr1);
+    }
+    const float theta_scale = powf(freq_base, -2.0f / (float)n_rot);
+    const uint32_t i = lane * 2u;
+    const float theta_extrap = (float)(pos0 + t) * powf(theta_scale, (float)lane);
+    const float theta_interp = freq_scale * theta_extrap;
+    float theta = theta_interp;
+    float mscale = attn_factor;
+    if (ext_factor != 0.0f) {
+        const float ramp_mix = rope_yarn_ramp_dev(corr0, corr1, (int)i) * ext_factor;
+        theta = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+        mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+    }
+    const float c = cosf(theta) * mscale;
+    float s = sinf(theta) * mscale;
+    if (inverse) s = -s;
+    float *tail = xr + head_dim - n_rot;
+    tail[i] = x0 * c - x1 * s;
+    tail[i + 1u] = x0 * s + x1 * c;
+#else
+    (void)x; (void)n_tok; (void)n_head; (void)head_dim; (void)n_rot;
+    (void)pos0; (void)n_ctx_orig; (void)inverse; (void)freq_base;
+    (void)freq_scale; (void)ext_factor; (void)attn_factor;
+    (void)beta_fast; (void)beta_slow; (void)eps;
+#endif
 }
 
 __global__ static void head_rms_norm_rope_tail_from_half_kernel(
@@ -529,9 +614,91 @@ extern "C" int ds4_gpu_head_rms_norm_rope_tail_tensor(ds4_gpu_tensor *x, uint32_
     head_rms_norm_rope_tail_kernel<<<(uint32_t)rows64, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, eps);
     return cuda_ok(cudaGetLastError(), "head_rms_norm_rope_tail launch");
 }
-extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
+static uint64_t g_rocm_q4_qb_f32_epilogue_calls;
+static pthread_once_t g_rocm_q4_qb_f32_epilogue_stats_once = PTHREAD_ONCE_INIT;
+
+static void rocm_q4_qb_f32_epilogue_report(void) {
+    fprintf(stderr, DS4_GPU_LOG_PREFIX "Q4 q_b F32 epilogue: wave32_calls=%llu\n",
+            (unsigned long long)__atomic_load_n(
+                &g_rocm_q4_qb_f32_epilogue_calls, __ATOMIC_RELAXED));
+}
+static void rocm_q4_qb_f32_epilogue_register_report(void) {
+    (void)atexit(rocm_q4_qb_f32_epilogue_report);
+}
+extern "C" void ds4_rocm_test_q4_qb_f32_epilogue_reset(void) {
+    __atomic_store_n(&g_rocm_q4_qb_f32_epilogue_calls, 0u, __ATOMIC_RELAXED);
+}
+extern "C" uint64_t ds4_rocm_test_q4_qb_f32_epilogue_get_calls(void) {
+    return __atomic_load_n(&g_rocm_q4_qb_f32_epilogue_calls, __ATOMIC_RELAXED);
+}
+
+static bool rocm_q4_qb_gfx1151_wave32_device(void) {
+#if defined(__HIP_PLATFORM_AMD__)
+    int device = -1;
+    if (cudaGetDevice(&device) != cudaSuccess) return false;
+    static thread_local int cached_device = -1;
+    static thread_local bool compatible = false;
+    if (device != cached_device) {
+        cudaDeviceProp prop = {};
+        if (cudaGetDeviceProperties(&prop, device) != cudaSuccess) return false;
+        compatible = prop.warpSize == 32 &&
+            strncmp(prop.gcnArchName, "gfx1151", 7) == 0 &&
+            (prop.gcnArchName[7] == '\0' || prop.gcnArchName[7] == ':');
+        cached_device = device;
+    }
+    return compatible;
+#else
+    return false;
+#endif
+}
+
+// Invoked only by the Q4 transient F16 GEMM with F32 output. Do not
+// install in the untyped public norm API: that would also change Q8/decode.
+static int rocm_q4_qb_f32_epilogue_tensor(
+        ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim,
+        uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse,
+        float freq_base, float freq_scale, float ext_factor, float attn_factor,
+        float beta_fast, float beta_slow, float eps) {
+    namespace ep = ds4_rocm_q4_qb_epilogue;
+    if (getenv("DS4_ROCM_Q4_QB_F32_EPILOGUE_STATS") != NULL)
+        pthread_once(&g_rocm_q4_qb_f32_epilogue_stats_once,
+                     rocm_q4_qb_f32_epilogue_register_report);
+    const bool disabled = rocm_q4_attn_q_b_env_bool(
+        "DS4_ROCM_DISABLE_Q4_QB_F32_EPILOGUE") == 1;
+    if (!ep::select(n_tok, n_head, head_dim, n_rot,
+                    !disabled && !g_quality_mode && !g_ssd_streaming_mode &&
+                        ep::shape(n_tok, n_head, head_dim, n_rot) &&
+                        rocm_q4_qb_gfx1151_wave32_device(),
+                    g_quality_mode, g_ssd_streaming_mode, disabled)) {
+        return ds4_gpu_head_rms_norm_rope_tail_tensor(
+            x, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig, inverse,
+            freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, eps);
+    }
+    if (!cuda_tensor_has_elems3(x, n_tok, n_head, head_dim, sizeof(float))) return 0;
+    const uint32_t rows = n_tok * n_head; // Bounded by the strict shape gate.
+    rocm_q4_qb_f32_epilogue_wave32_kernel<<<
+        (rows + ep::heads_per_block - 1u) / ep::heads_per_block, ep::threads>>>(
+            (float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig,
+            inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor,
+            beta_fast, beta_slow, eps);
+    const int ok = cuda_ok(cudaGetLastError(), "Q4 q_b F32 wave32 epilogue launch");
+    if (ok) __atomic_fetch_add(&g_rocm_q4_qb_f32_epilogue_calls, 1u, __ATOMIC_RELAXED);
+    return ok; // Never replay over an accepted or failed in-flight writer.
+}
+
+// Native oracle hook: same validation and dispatch as production.
+extern "C" int ds4_rocm_test_q4_qb_f32_epilogue(
+        ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim,
+        uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse,
+        float freq_base, float freq_scale, float ext_factor, float attn_factor,
+        float beta_fast, float beta_slow, float eps) {
+    return rocm_q4_qb_f32_epilogue_tensor(
+        x, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig, inverse,
+        freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, eps);
+}
+
+static int rocm_q4_attn_q_b_transient_f16_head_rms_rope_tail_tensor(
         ds4_gpu_tensor       *out,
-        ds4_gpu_tensor       *q_half,
         const void           *model_map,
         uint64_t              model_size,
         uint64_t              weight_offset,
@@ -552,7 +719,181 @@ extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
         float                 beta_fast,
         float                 beta_slow,
         float                 eps) {
-    if (!g_cublas_ready || !out || !q_half || !x || !model_map || n_tok == 0 ||
+    if (!ds4_gpu_execution_phase_allows_prefill(ds4_gpu_get_execution_phase()) ||
+        (uint64_t)n_tok <
+            rocm_q4_attn_q_b_transient_f16_min_tokens()) {
+        return 0;
+    }
+
+    uint64_t x_elems = 0;
+    uint64_t out_elems = 0;
+    uint64_t head_rows = 0;
+    uint64_t x_bytes = 0;
+    uint64_t out_bytes = 0;
+    if (!rocm_q4_attn_q_b_transient_f16_policy_allowed() ||
+        rocm_q4_attn_q_b_f16_circuit_open() ||
+        !g_cublas_ready || !out || !out->ptr ||
+        !x || !x->ptr || !model_map ||
+        model_map != g_model_host_base ||
+        model_size != g_model_registered_size ||
+        in_dim != DS4_ROCM_Q4_ATTN_Q_B_IN_DIM ||
+        out_dim != DS4_ROCM_Q4_ATTN_Q_B_OUT_DIM ||
+        n_head == 0u || head_dim == 0u ||
+        out_dim != (uint64_t)n_head * head_dim ||
+        n_rot > head_dim || (n_rot & 1u) != 0u ||
+        n_tok > (uint32_t)INT_MAX ||
+        pos0 > (uint32_t)INT_MAX - n_tok ||
+        !cuda_u64_mul_checked(n_tok, in_dim, &x_elems) ||
+        !cuda_u64_mul_checked(n_tok, out_dim, &out_elems) ||
+        !cuda_u64_mul_checked(n_tok, n_head, &head_rows) ||
+        head_rows > UINT32_MAX ||
+        (x_elems + 255u) / 256u > UINT32_MAX ||
+        !cuda_u64_mul_checked(x_elems, sizeof(float), &x_bytes) ||
+        !cuda_u64_mul_checked(out_elems, sizeof(float), &out_bytes) ||
+        x->bytes < x_bytes || out->bytes < out_bytes) {
+        return rocm_q4_attn_q_b_f16_fallback(0, 1, 0);
+    }
+
+    uint64_t row_bytes = 0;
+    uint64_t weight_bytes = 0;
+    const uint64_t blocks_per_row = in_dim / CUDA_QK_K;
+    if (!cuda_u64_mul_checked(blocks_per_row,
+                              sizeof(cuda_block_q4_K), &row_bytes) ||
+        !cuda_u64_mul_checked(out_dim, row_bytes, &weight_bytes) ||
+        !cuda_model_range_fits(model_size, weight_offset, weight_bytes)) {
+        return rocm_q4_attn_q_b_f16_fallback(0, 1, 0);
+    }
+
+    __half *w_f16 = NULL;
+    __half *x_f16 = NULL;
+    if (!rocm_q4_attn_q_b_transient_f16_acquire(
+            n_tok, &w_f16, &x_f16)) {
+        return rocm_q4_attn_q_b_f16_fallback(0, 0, 0);
+    }
+    const char *w_q4 = rocm_q4_attn_q_b_device_resident_source(
+        model_map, weight_offset, weight_bytes);
+    if (!w_q4) {
+        rocm_q4_attn_q_b_transient_f16_release_acquired();
+        return rocm_q4_attn_q_b_f16_fallback(0, 0, 1);
+    }
+
+    const uint64_t total_chunks = out_dim * (in_dim / 16u);
+    if (ds4_q4_dequant::select(
+            in_dim, out_dim, n_tok, (uintptr_t)w_q4, (uintptr_t)w_f16,
+            rocm_q4_qb_gfx1151_wave32_device(), g_quality_mode, g_ssd_streaming_mode,
+            getenv("DS4_ROCM_DISABLE_Q4_PREFILL_DEQUANT_VEC") != NULL)) {
+        ds4_q4_dequant_f16_pair32_kernel<<<
+            (uint32_t)((total_chunks / 2u + 255u) / 256u), 256>>>(
+                w_f16, (const cuda_block_q4_K *)w_q4, out_dim * blocks_per_row);
+    } else {
+        rocm_dequant_q4_K_attn_q_b_f16_kernel<<<
+            (uint32_t)((total_chunks + 255u) / 256u), 256>>>(
+                w_f16, (const cuda_block_q4_K *)w_q4,
+                in_dim, out_dim);
+    }
+    cudaError_t launch_err = cudaGetLastError();
+    if (launch_err != cudaSuccess) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX
+                "Q4 attn_q_b transient dequant launch failed: %s\n",
+                cudaGetErrorString(launch_err));
+        (void)cudaGetLastError();
+        rocm_q4_attn_q_b_transient_f16_release_acquired();
+        return rocm_q4_attn_q_b_f16_fallback(0, 0, 1);
+    }
+
+    f32_to_f16_kernel<<<(x_elems + 255u) / 256u, 256>>>(
+        x_f16, (const float *)x->ptr, x_elems);
+    launch_err = cudaGetLastError();
+    if (launch_err != cudaSuccess) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX
+                "Q4 attn_q_b transient activation conversion failed: %s\n",
+                cudaGetErrorString(launch_err));
+        (void)cudaGetLastError();
+        rocm_q4_attn_q_b_transient_f16_release_acquired();
+        return rocm_q4_attn_q_b_f16_fallback(0, 0, 1);
+    }
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    // Preserve the F32 output consumed by the production RMS/RoPE epilogue.
+    const cublasStatus_t st = cublasGemmEx(
+        g_cublas,
+        CUBLAS_OP_T,
+        CUBLAS_OP_N,
+        (int)out_dim,
+        (int)n_tok,
+        (int)in_dim,
+        &alpha,
+        w_f16,
+        CUDA_R_16F,
+        (int)in_dim,
+        x_f16,
+        CUDA_R_16F,
+        (int)in_dim,
+        &beta,
+        out->ptr,
+        CUDA_R_32F,
+        (int)out_dim,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT);
+    if (st != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX
+                DS4_GPU_BLAS_NAME
+                " transient Q4 attn q_b F16/F16-to-F32 matmul failed: "
+                "status %d\n",
+                (int)st);
+        rocm_q4_attn_q_b_transient_f16_release_acquired();
+        return rocm_q4_attn_q_b_f16_fallback(0, 0, 1);
+    }
+
+    const int tail_ok = rocm_q4_qb_f32_epilogue_tensor(
+        out, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig,
+        inverse, freq_base, freq_scale, ext_factor, attn_factor,
+        beta_fast, beta_slow, eps);
+    rocm_q4_attn_q_b_transient_f16_release_acquired();
+    if (!tail_ok) {
+        /* GEMM was accepted and may already be executing.  Returning zero
+         * would make the graph replay native Q4 over an in-flight writer. */
+        return rocm_q4_attn_q_b_f16_fallback(1, 0, 1);
+    }
+    return 1;
+}
+
+extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *q_half,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              weight_type,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_tok,
+        uint32_t              n_head,
+        uint32_t              head_dim,
+        uint32_t              n_rot,
+        uint32_t              pos0,
+        uint32_t              n_ctx_orig,
+        bool                  inverse,
+        float                 freq_base,
+        float                 freq_scale,
+        float                 ext_factor,
+        float                 attn_factor,
+        float                 beta_fast,
+        float                 beta_slow,
+        float                 eps) {
+    if (weight_type == DS4_ROCM_Q4_K_TYPE) {
+        return rocm_q4_attn_q_b_transient_f16_head_rms_rope_tail_tensor(
+            out, model_map, model_size, weight_offset,
+            in_dim, out_dim, x, n_tok, n_head, head_dim, n_rot, pos0,
+            n_ctx_orig, inverse, freq_base, freq_scale, ext_factor,
+            attn_factor, beta_fast, beta_slow, eps);
+    }
+    if (weight_type != 8u || !g_cublas_ready || !out || !q_half || !x || !model_map || n_tok == 0 ||
         n_rot > head_dim || (n_rot & 1u) || out_dim != (uint64_t)n_head * head_dim ||
         x->bytes < (uint64_t)n_tok * in_dim * sizeof(float) ||
         out->bytes < (uint64_t)n_tok * out_dim * sizeof(float) ||

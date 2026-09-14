@@ -343,10 +343,23 @@ static int routed_moe_q2_float_down_launch(
                 const size_t shmem_n2 = (mt * bm * bk + 2u * bk * bn) * sizeof(half) +
                                         (mt * bm * bn) * sizeof(float) + 2u * bn * 84u;
                 if (use_f16_down && hot_mid_f16 && mid_h_hot) {
-                    moe_down_q2K_hotlist_wmma_n2_kernel<4,16,16,16,true,true><<<grid, block, shmem_n2>>>(
-                            NULL, down_h, down_w, NULL, mid_h_hot,
-                            counts, offsets, sorted_pairs, hot_experts_dev, hot_count,
-                            expert_mid_dim, out_dim, down_expert_bytes, down_row_bytes, n_expert);
+                    // gfx1151 prefill reuses each K32 LDS stage for two K16
+                    // MMAs. Other devices and small batches retain K16.
+                    if (n_tokens >= 128u && ds4_rocm_is_gfx1151()) {
+                        constexpr uint32_t stage_k = 32u;
+                        const size_t shmem_k32 =
+                            (mt * bm * stage_k + 2u * stage_k * bn) * sizeof(half) +
+                            2u * bn * 84u; // epilogue C reuses the dead A stage
+                        moe_down_q2K_hotlist_wmma_n2_kernel<4,16,16,16,true,true,false,32><<<grid, block, shmem_k32>>>(
+                                NULL, down_h, down_w, NULL, mid_h_hot,
+                                counts, offsets, sorted_pairs, hot_experts_dev, hot_count,
+                                expert_mid_dim, out_dim, down_expert_bytes, down_row_bytes, n_expert);
+                    } else {
+                        moe_down_q2K_hotlist_wmma_n2_kernel<4,16,16,16,true,true><<<grid, block, shmem_n2>>>(
+                                NULL, down_h, down_w, NULL, mid_h_hot,
+                                counts, offsets, sorted_pairs, hot_experts_dev, hot_count,
+                                expert_mid_dim, out_dim, down_expert_bytes, down_row_bytes, n_expert);
+                    }
                 } else if (use_f16_down) {
                     moe_down_q2K_hotlist_wmma_n2_kernel<4,16,16,16,false,true><<<grid, block, shmem_n2>>>(
                             NULL, down_h, down_w, (const float *)mid->ptr, NULL,
@@ -1099,7 +1112,7 @@ static int routed_moe_launch(
                     ok = cuda_ok(cudaGetLastError(), "routed_moe sorted prefix launch");
                 }
                 if (ok) {
-                    moe_scatter_sorted_pairs_deterministic_kernel<<<bucket_count, 1u>>>(
+                    moe_scatter_sorted_pairs_deterministic_kernel<<<bucket_count, 64u>>>(
                         sorted_pairs,
                         offsets,
                         (const int32_t *)selected_exec->ptr,
@@ -1187,13 +1200,18 @@ static int routed_moe_launch(
             }
         }
         const uint32_t iq2_gate_scalar_max = iq2_gate_hot_count != 0u ? iq2_gate_hot_threshold : 0u;
+        /* Phase gates materialized activation reuse, not the hot WMMA itself:
+         * other batches retain its existing F32-input/F32-mid variants. */
         const int use_iq2_hot_f16_mid =
+            ds4_gpu_execution_phase_allows_prefill(ds4_gpu_get_execution_phase()) &&
             ((use_iq2_gate_wmma && iq2_gate_hot_count != 0u &&
               iq2_gate_hot_threshold == iq2_down_hot_threshold) ||
              use_rocm_mmq_gateup) &&
             (out_dim & 1u) == 0u && !g_quality_mode;
         half *iq2_hot_mid_h = use_iq2_hot_f16_mid ? (half *)gate->ptr : NULL;
-        const int use_iq2_x_f16 = use_iq2_gate_wmma && iq2_gate_hot_count != 0u &&
+        const int use_iq2_x_f16 =
+            ds4_gpu_execution_phase_allows_prefill(ds4_gpu_get_execution_phase()) &&
+            use_iq2_gate_wmma && iq2_gate_hot_count != 0u &&
             up->bytes >= (uint64_t)n_tokens * expert_in_dim * sizeof(half);
         half *iq2_x_h = use_iq2_x_f16 ? (half *)up->ptr : NULL;
         if (ok && use_iq2_x_f16) {
@@ -2257,7 +2275,7 @@ static int routed_moe_launch(
             ok = cuda_ok(cudaGetLastError(), "routed_moe q2 expert prefix launch");
         }
         if (ok) {
-            moe_scatter_sorted_pairs_deterministic_kernel<<<bucket_count, 1u>>>(
+            moe_scatter_sorted_pairs_deterministic_kernel<<<bucket_count, 64u>>>(
                     sorted_pairs,
                     offsets,
                     (const int32_t *)selected_exec->ptr,

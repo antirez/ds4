@@ -54,6 +54,15 @@ routed-prefill headroom and fits the cache to the remaining model, graph,
 context, and backend budget. The effective value may be smaller than requested.
 Non-routed weights and KV state are additional to that expert-cache budget.
 
+On Metal, the manual byte-budget cap reserves graph/context memory and all
+non-routed weights within seven eighths of the recommended working set. The
+combined weight budget uses the same GiB rounding as static-weight pinning;
+a remaining budget below 1 GiB is never rounded upward. A request is reduced
+to the remaining bytes; startup fails if no room remains or the fixed weights
+cannot be measured. Prefill headroom is part of the capped expert budget,
+not an additional allocation allowance. Automatic cache sizing continues to
+use its existing model-aware planner.
+
 A plain number, such as `--ssd-streaming-cache-experts 4000`, requests dynamic
 expert slots rather than a byte budget. It is also subject to memory limits.
 

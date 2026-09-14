@@ -316,5 +316,79 @@ kernel void kernel_argsort_merge_f32_i32(
 
 // Host-visible merge variant used by DS4 top-k selection.
 template [[host_name("kernel_argsort_merge_f32_i32_desc")]] kernel argsort_merge_t kernel_argsort_merge_f32_i32<DS4_SORT_ORDER_DESC>;
+
+// Each input row contains equal-sized sorted runs, except its final run.
+// Output keeps only the first min(K, len0 + len1) elements of each pair.
+// Leaf sorting is unchanged and ties still select the left run first. Thus
+// finite values, infinities and signed zero retain the legacy permutation;
+// NaN ordering, which was never total in the legacy comparator, is unspecified.
+struct ds4_metal_args_argsort_compact_merge {
+    uint64_t score_stride;
+    uint32_t n_rows;
+    uint32_t input_width;
+    uint32_t run_length;
+    uint32_t output_width;
+    uint32_t output_run_length;
+    uint32_t pad;
+};
+
+kernel void kernel_argsort_merge_f32_i32_desc_compact(
+        constant ds4_metal_args_argsort_compact_merge & args,
+        device const char * src0,
+        device const int32_t * tmp,
+        device int32_t * dst,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort3 tpitg [[thread_position_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]]) {
+    const uint im = tgpig.x / args.n_rows;
+    const uint row = tgpig.x % args.n_rows;
+    const uint64_t start = (uint64_t)im * (2ull * args.run_length);
+    if (start >= args.input_width) return;
+    const uint len0 = min((uint64_t)args.run_length, (uint64_t)args.input_width - start);
+    const uint len1 = start + len0 < args.input_width
+        ? min((uint64_t)args.run_length, (uint64_t)args.input_width - start - len0) : 0u;
+    const uint kept = min(args.output_run_length, len0 + len1);
+    device const int32_t * tmp0 = tmp + (uint64_t)row * args.input_width + start;
+    device const int32_t * tmp1 = tmp0 + len0;
+    dst += (uint64_t)row * args.output_width + (uint64_t)im * args.output_run_length;
+    device const float * scores = (device const float *)(src0 + (uint64_t)row * args.score_stride);
+
+    // Distribute retained outputs, not the discarded tail, across threads.
+    const uint chunk = (kept + ntg.x - 1u) / ntg.x;
+    const uint k0 = tpitg.x * chunk;
+    const uint k1 = min(k0 + chunk, kept);
+    if (k0 >= kept) return;
+    uint low = k0 > len1 ? k0 - len1 : 0u;
+    uint high = min(k0, len0);
+    while (low < high) {
+        const uint mid = (low + high) >> 1u;
+        const float val0 = scores[tmp0[mid]];
+        const float val1 = scores[tmp1[k0 - mid - 1u]];
+        if (val0 >= val1) low = mid + 1u;
+        else high = mid;
+    }
+    uint i = low, j = k0 - i;
+    int32_t idx0 = 0, idx1 = 0;
+    float val0 = 0.0f, val1 = 0.0f;
+    if (i < len0) { idx0 = tmp0[i]; val0 = scores[idx0]; }
+    if (j < len1) { idx1 = tmp1[j]; val1 = scores[idx1]; }
+    for (uint k = k0; k < k1; ++k) {
+        if (i >= len0) {
+            while (k < k1) dst[k++] = tmp1[j++];
+            break;
+        }
+        if (j >= len1) {
+            while (k < k1) dst[k++] = tmp0[i++];
+            break;
+        }
+        if (val0 >= val1) {
+            dst[k] = idx0;
+            if (++i < len0) { idx0 = tmp0[i]; val0 = scores[idx0]; }
+        } else {
+            dst[k] = idx1;
+            if (++j < len1) { idx1 = tmp1[j]; val1 = scores[idx1]; }
+        }
+    }
+}
 template [[host_name("kernel_argsort_merge_f32_i32_desc_causal")]] kernel argsort_merge_t kernel_argsort_merge_f32_i32<DS4_SORT_ORDER_DESC, true>;
 template [[host_name("kernel_argsort_merge_f32_i32_desc_causal_prefix")]] kernel argsort_merge_t kernel_argsort_merge_f32_i32<DS4_SORT_ORDER_DESC, true, true>;

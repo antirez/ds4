@@ -2722,3 +2722,11 @@ Do not sign off until:
 - Physical Metal TP batching and CUDA native decode/mixed batching passed when
   those backends are part of the release.
 - Any skipped item is written down with the reason.
+
+## 18. Q4 attention validation
+
+Before releasing AProjQ4 changes, run the host and native backend fixtures in
+[Q4 attention validation](docs/Q4_ATTENTION.md#validation). Native CUDA/ROCm
+device skips do not establish correctness. Include resident and SSD-streaming
+model runs, a same-configuration Q8 regression, and repeated prefill/decode
+measurements; record one-time preparation separately from steady throughput.

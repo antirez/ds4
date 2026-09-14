@@ -13,6 +13,81 @@ static inline float dsv41_bf16(float x) {
     return as_type<float>(bits & 0xffff0000u);
 }
 
+struct ds4_metal_args_dsv41_swiglu {
+    uint count;
+    float limit;
+};
+
+kernel void kernel_dsv41_swiglu_bf16(
+        constant ds4_metal_args_dsv41_swiglu &args,
+        device float *out,
+        device const float *gate,
+        device const float *up,
+        uint i [[thread_position_in_grid]]) {
+    if (i >= args.count) return;
+    float x0 = dsv41_bf16(gate[i]);
+    float x1 = dsv41_bf16(up[i]);
+    if (args.limit > 1.0e-6f) {
+        x0 = min(x0, args.limit);
+        x1 = clamp(x1, -args.limit, args.limit);
+    }
+    const float silu = x0 / (1.0f + exp(-x0));
+    out[i] = dsv41_bf16(silu * x1 * 1.0f);
+}
+
+struct ds4_metal_args_dsv41_hc {
+    uint rows;
+    uint mode;
+};
+
+// Keep expand4's multiplication and four additions in the same order. The
+// BF16 block boundary precedes expansion; rounding only the final HC output
+// would change the released graph even if its storage stayed BF16.
+kernel void kernel_dsv41_hc_expand_bf16(
+        constant ds4_metal_args_dsv41_hc &args,
+        device float *out,
+        device const float *block,
+        device const float *add,
+        device const float *residual,
+        device const float *split,
+        uint i [[thread_position_in_grid]]) {
+    if (i >= args.rows * 5120u) return;
+    const uint d = i % 5120u, t = i / 5120u;
+    float b = block[i];
+    if (args.mode) b += add[i];
+    b = dsv41_bf16(b);
+    const ulong base = (ulong)t * 20480u + d;
+    const float r0 = residual[base];
+    const float r1 = residual[base + 5120u];
+    const float r2 = residual[base + 10240u];
+    const float r3 = residual[base + 15360u];
+    device const float *post = split + (ulong)t * 24u + 4u;
+    device const float *comb = post + 4u;
+    for (uint h = 0; h < 4u; h++) {
+        float acc = b * post[h];
+        acc += comb[h] * r0;
+        acc += comb[h + 4u] * r1;
+        acc += comb[h + 8u] * r2;
+        acc += comb[h + 12u] * r3;
+        out[base + h * 5120u] = dsv41_bf16(acc);
+    }
+}
+
+kernel void kernel_dsv41_hc_sum_bf16(
+        constant ds4_metal_args_dsv41_hc &args,
+        device float *out,
+        device const float *residual,
+        device const float *weights,
+        uint i [[thread_position_in_grid]]) {
+    if (i >= args.rows * 5120u) return;
+    const uint d = i % 5120u, t = i / 5120u;
+    const ulong base = (ulong)t * 20480u + d;
+    device const float *w = weights + (ulong)t * (args.mode ? 24u : 4u);
+    float acc = 0.0f;
+    for (uint h = 0; h < 4u; h++) acc += residual[base + h * 5120u] * w[h];
+    out[i] = dsv41_bf16(acc);
+}
+
 static inline float dsv41_pow2_ceil(float x) {
     const uint bits = as_type<uint>(x);
     return as_type<float>((bits & 0x7f800000u) +
@@ -39,6 +114,34 @@ kernel void kernel_dsv41_bf16_linear(
     }
 }
 
+// The output-A boundary must materialize BF16 in low before narrowing the
+// output-B RHS to half. Converting the original F32 directly would skip a
+// rounding step; keep the integer BF16 operation identical to the linear pass.
+kernel void kernel_dsv41_bf16_f16_rhs(
+        constant ulong &count,
+        device uint *low,
+        device half *rhs,
+        uint gid [[thread_position_in_grid]]) {
+    const ulong first = (ulong)gid * 4u;
+    if (first + 4u <= count) {
+        uint4 bits = *((device uint4 *)(low + first));
+        const bool4 finite = (bits & 0x7f800000u) != 0x7f800000u;
+        bits += select(uint4(0), uint4(0x7fffu) + ((bits >> 16u) & 1u), finite);
+        bits &= 0xffff0000u;
+        *((device uint4 *)(low + first)) = bits;
+        *((device half4 *)(rhs + first)) = half4(as_type<float4>(bits));
+    } else {
+        for (ulong i = first; i < count; i++) {
+            uint bits = low[i];
+            if ((bits & 0x7f800000u) != 0x7f800000u)
+                bits += 0x7fffu + ((bits >> 16u) & 1u);
+            bits &= 0xffff0000u;
+            low[i] = bits;
+            rhs[i] = half(as_type<float>(bits));
+        }
+    }
+}
+
 struct ds4_metal_args_dsv41_rope {
     uint width, heads, rows, start, inverse, stride;
     float frequencies[32];
@@ -55,6 +158,32 @@ kernel void kernel_dsv41_rope(
     const ulong i = ((ulong)group.y * args.heads + group.x) * args.width +
                     args.width - 64u + 2u * lane;
     const float re = x[i], im = x[i + 1u];
+    x[i] = dsv41_bf16(re * c - im * s);
+    x[i + 1u] = dsv41_bf16(re * s + im * c);
+}
+
+// Attention rounds the entire head before undoing RoPE on its tail. Keep
+// both BF16 boundaries, but avoid publishing the intermediate rounded head.
+kernel void kernel_dsv41_bf16_rope(
+        constant ds4_metal_args_dsv41_rope &args,
+        device float *x,
+        uint2 group [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_simdgroup]]) {
+    const ulong base = ((ulong)group.y * args.heads + group.x) * args.width;
+    const uint prefix = args.width - 64u;
+    for (uint vec = lane; vec < prefix / 4u; vec += 32u) {
+        const uint col = vec * 4u;
+        device uint4 *p = (device uint4 *)(x + base + col);
+        uint4 bits = *p;
+        const bool4 finite = (bits & 0x7f800000u) != 0x7f800000u;
+        bits += select(uint4(0), uint4(0x7fffu) + ((bits >> 16u) & 1u), finite);
+        *p = bits & 0xffff0000u;
+    }
+    const float theta = float(args.start + group.y * args.stride) * args.frequencies[lane];
+    const float c = precise::cos(theta);
+    const float s = args.inverse ? -precise::sin(theta) : precise::sin(theta);
+    const ulong i = base + prefix + 2u * lane;
+    const float re = dsv41_bf16(x[i]), im = dsv41_bf16(x[i + 1u]);
     x[i] = dsv41_bf16(re * c - im * s);
     x[i + 1u] = dsv41_bf16(re * s + im * c);
 }

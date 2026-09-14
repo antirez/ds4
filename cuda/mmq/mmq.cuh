@@ -3663,6 +3663,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
         const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop,
+        const int blocks_per_ne00_total,
         const char * __restrict__ x_soa, const int64_t soa_blocks) {
 
     constexpr int              warp_size  = ggml_cuda_get_physical_warp_size();
@@ -3747,7 +3748,13 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 #pragma unroll
                     for (int l0 = 0; l0 < mmq_x * MMQ_TILE_Y_K; l0 += nthreads) {
                         const int l = l0 + linear_tid;
-                        tile_y[l] = by0[l];
+                        // A full column tile can still end mid-workgroup.
+                        // Its shared padding has no corresponding Y input.
+                        if constexpr (mmq_x * MMQ_TILE_Y_K % nthreads == 0) {
+                            tile_y[l] = by0[l];
+                        } else {
+                            tile_y[l] = l < mmq_x * MMQ_TILE_Y_K ? by0[l] : 0;
+                        }
                     }
                 } else {
                     for (int l = linear_tid; l < valid_y_words; l += nthreads) {
@@ -3786,7 +3793,11 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 #pragma unroll
                     for (int l0 = 0; l0 < mmq_x * MMQ_TILE_Y_K; l0 += nthreads) {
                         const int l = l0 + linear_tid;
-                        tile_y[l] = by0[l];
+                        if constexpr (mmq_x * MMQ_TILE_Y_K % nthreads == 0) {
+                            tile_y[l] = by0[l];
+                        } else {
+                            tile_y[l] = l < mmq_x * MMQ_TILE_Y_K ? by0[l] : 0;
+                        }
                     }
                 } else {
                     for (int l = linear_tid; l < valid_y_words; l += nthreads) {
@@ -3816,6 +3827,22 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         vec_dot(tile_x, tile_y, sum, MMQ_TILE_NE_K);
 
         __syncthreads();
+    }
+
+    /* AProjQ4 dense prefill used to run a separate full-output sanitize
+     * kernel after every MMQ.  Preserve that contract in the producer
+     * epilogue instead.  A stream-K block may publish only the leading
+     * partial of a split tile; sanitizing that partial would change the
+     * eventual sum, so only a block that owns the complete K range may fold
+     * non-finite values here.  Split tiles are handled after their final
+     * accumulation in mul_mat_q_stream_k_fixup below. */
+    if constexpr (type == GGML_TYPE_Q4_K && !fixup) {
+        if (kb0_start == 0 && kb0_stop == blocks_per_ne00_total) {
+#pragma unroll
+            for (int l = 0; l < mmq_x*mmq_y / (nwarps*warp_size); ++l) {
+                if (!isfinite(sum[l])) sum[l] = 0.0f;
+            }
+        }
     }
 
     if (fixup) {
@@ -3862,28 +3889,33 @@ static __global__ void mul_mat_q(
 
     const uint32_t nty = (nrows_x + mmq_y - 1) / mmq_y; // Number of tiles y
 
-    // Initialize the ids for writing back data with just the index.
-    // For regular matrix multiplications this is never changed.
-    // For MoE the correct indices are loaded from ids_dst.
+    // Dense write-back already accepts nullptr for the identity mapping.
+    // Avoid publishing and rereading an identity table for every dense CTA;
+    // routed tiles retain their shared map and its publication barriers.
     extern __shared__ int ids_dst_shared[]; // Stored at beginning of shared memory.
+    const int32_t * tile_ids = ids_dst ? ids_dst_shared : nullptr;
+    if (ids_dst) {
 #pragma unroll
-    for (int j0 = 0; j0 < mmq_x; j0 += nwarps*warp_size) {
-        const int j = j0 + threadIdx.y*warp_size + threadIdx.x;
+        for (int j0 = 0; j0 < mmq_x; j0 += nwarps*warp_size) {
+            const int j = j0 + threadIdx.y*warp_size + threadIdx.x;
 
-        if (j0 + nwarps*warp_size > mmq_x && j >= mmq_x) {
-            break;
+            if (j0 + nwarps*warp_size > mmq_x && j >= mmq_x) {
+                break;
+            }
+
+            ids_dst_shared[j] = j;
         }
-
-        ids_dst_shared[j] = j;
+        __syncthreads();
     }
-    __syncthreads();
 
     // On non-CDNA AMD or old CUDA the performance with stream-k was worse, use conventional tiling instead:
 #if (defined(GGML_USE_HIP) && !defined(CDNA)) || __CUDA_ARCH__ < GGML_CUDA_CC_VOLTA
     {
+        int wt = 0;
+        int zt = 0;
         const uint2 tmp2 = fast_div_modulo(blockIdx.z, nchannels_y);
-        const int wt = tmp2.x;
-        const int zt = tmp2.y;
+        wt = tmp2.x;
+        zt = tmp2.y;
         const int jt = blockIdx.y;
         const int it = blockIdx.x;
 
@@ -3936,8 +3968,9 @@ static __global__ void mul_mat_q(
 
         constexpr bool fixup = false;
         mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
-            (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z, x_soa, soa_blocks);
+            (x, offset_x, y + offset_y, tile_ids, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
+             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z,
+             blocks_per_ne00.z, x_soa, soa_blocks);
         return;
     }
 #endif // (defined(GGML_USE_HIP) && !defined(CDNA4) && !defined(CDNA3)) || __CUDA_ARCH__ < GGML_CUDA_CC_VOLTA
@@ -4022,8 +4055,9 @@ static __global__ void mul_mat_q(
 
         constexpr bool fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
         mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
-            (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, x_soa, soa_blocks);
+            (x, offset_x, y + offset_y, tile_ids, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
+             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop,
+             blocks_per_ne00.z, x_soa, soa_blocks);
 
         kbc += blocks_per_ne00.z;
         kbc -= fastmodulo(kbc, blocks_per_ne00);
@@ -4091,8 +4125,9 @@ static __global__ void mul_mat_q(
 
     constexpr bool fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
     mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
-        (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
-         tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, x_soa, soa_blocks);
+        (x, offset_x, y + offset_y, tile_ids, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
+         tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop,
+         blocks_per_ne00.z, x_soa, soa_blocks);
 }
 
 template <ggml_type type, int mmq_x, bool need_check>
@@ -4198,7 +4233,12 @@ static __global__ void mul_mat_q_stream_k_fixup(
                 return;
             }
 
-            dst[j*stride_col_dst + i] += sum[j0/nwarps];
+            const int dst_idx = j*stride_col_dst + i;
+            float value = dst[dst_idx] + sum[j0/nwarps];
+            if constexpr (type == GGML_TYPE_Q4_K) {
+                if (!isfinite(value)) value = 0.0f;
+            }
+            dst[dst_idx] = value;
         }
         return;
     }
@@ -4234,7 +4274,12 @@ static __global__ void mul_mat_q_stream_k_fixup(
             return;
         }
 
-        dst[ids_dst_shared[j]*stride_col_dst + i] += sum[j0/nwarps];
+        const int dst_idx = ids_dst_shared[j]*stride_col_dst + i;
+        float value = dst[dst_idx] + sum[j0/nwarps];
+        if constexpr (type == GGML_TYPE_Q4_K) {
+            if (!isfinite(value)) value = 0.0f;
+        }
+        dst[dst_idx] = value;
     }
 }
 

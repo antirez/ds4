@@ -510,6 +510,438 @@ bool run_q4_K(int M, int N, int K, uint32_t seed, float abs_scale = 0.20f) {
 // multiplies.  The two paths agree to within a few units of grid scale.
 // Loosen abs_scale to 0.20*sqrt(K) which covers observed worst-case
 // disagreement of ~10.5 at K=4096 (db_max ~ 4 * d_max with d_max ~ 0.2).
+bool run_q4_K_dense_pair_parity(
+        int M0, int M1, int N, int K, uint32_t seed) {
+    fprintf(stderr,
+            "=== Q4_K/DENSE_PAIR  M0=%d M1=%d N=%d K=%d seed=%u ===\n",
+            M0, M1, N, K, seed);
+
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    const int blocks_per_row = K / QK_K_LOCAL;
+    std::vector<block_q4_K> W0((size_t)M0 * blocks_per_row);
+    std::vector<block_q4_K> W1((size_t)M1 * blocks_per_row);
+    for (auto &blk : W0) generate_random_block_q4_K(&blk, rng);
+    for (auto &blk : W1) generate_random_block_q4_K(&blk, rng);
+    std::vector<float> X((size_t)N * K);
+    for (auto &v : X) v = nd(rng);
+
+    cudaStream_t stream;
+    cudaStreamCreate(&stream);
+    void *dW0 = nullptr;
+    void *dW1 = nullptr;
+    float *dX = nullptr;
+    float *dRef0 = nullptr;
+    float *dRef1 = nullptr;
+    float *dGot0 = nullptr;
+    float *dGot1 = nullptr;
+    cudaMalloc(&dW0, W0.size() * sizeof(block_q4_K));
+    cudaMalloc(&dW1, W1.size() * sizeof(block_q4_K));
+    cudaMalloc(&dX, X.size() * sizeof(float));
+    cudaMalloc(&dRef0, (size_t)M0 * N * sizeof(float));
+    cudaMalloc(&dRef1, (size_t)M1 * N * sizeof(float));
+    cudaMalloc(&dGot0, (size_t)M0 * N * sizeof(float));
+    cudaMalloc(&dGot1, (size_t)M1 * N * sizeof(float));
+    cudaMemcpyAsync(dW0, W0.data(), W0.size() * sizeof(block_q4_K),
+                    cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(dW1, W1.data(), W1.size() * sizeof(block_q4_K),
+                    cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(dX, X.data(), X.size() * sizeof(float),
+                    cudaMemcpyHostToDevice, stream);
+    cudaMemsetAsync(dRef0, 0xa5, (size_t)M0 * N * sizeof(float), stream);
+    cudaMemsetAsync(dRef1, 0xa5, (size_t)M1 * N * sizeof(float), stream);
+    cudaMemsetAsync(dGot0, 0x5a, (size_t)M0 * N * sizeof(float), stream);
+    cudaMemsetAsync(dGot1, 0x5a, (size_t)M1 * N * sizeof(float), stream);
+
+    const int rc0 = ds4_mmq_q4_K_dense(
+        dW0, dX, dRef0, M0, N, K, stream);
+    const int rc1 = ds4_mmq_q4_K_dense(
+        dW1, dX, dRef1, M1, N, K, stream);
+    const int rcp = ds4_mmq_q4_K_dense_pair(
+        dW0, dW1, dX, dGot0, dGot1, M0, M1, N, K, stream);
+
+    std::vector<float> ref0((size_t)M0 * N);
+    std::vector<float> ref1((size_t)M1 * N);
+    std::vector<float> got0((size_t)M0 * N);
+    std::vector<float> got1((size_t)M1 * N);
+    cudaMemcpyAsync(ref0.data(), dRef0, ref0.size() * sizeof(float),
+                    cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(ref1.data(), dRef1, ref1.size() * sizeof(float),
+                    cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(got0.data(), dGot0, got0.size() * sizeof(float),
+                    cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(got1.data(), dGot1, got1.size() * sizeof(float),
+                    cudaMemcpyDeviceToHost, stream);
+    const cudaError_t sync_err = cudaStreamSynchronize(stream);
+
+    size_t bad0 = 0;
+    size_t bad1 = 0;
+    for (size_t i = 0; i < ref0.size(); i++) {
+        if (std::memcmp(&ref0[i], &got0[i], sizeof(float)) != 0) bad0++;
+    }
+    for (size_t i = 0; i < ref1.size(); i++) {
+        if (std::memcmp(&ref1[i], &got1[i], sizeof(float)) != 0) bad1++;
+    }
+
+    cudaFree(dW0);
+    cudaFree(dW1);
+    cudaFree(dX);
+    cudaFree(dRef0);
+    cudaFree(dRef1);
+    cudaFree(dGot0);
+    cudaFree(dGot1);
+    cudaStreamDestroy(stream);
+
+    const bool ok = rc0 == 0 && rc1 == 0 && rcp == 0 &&
+                    sync_err == cudaSuccess && bad0 == 0 && bad1 == 0;
+    fprintf(stderr,
+            "pair rc=%d/%d/%d sync=%s mismatches=%zu/%zu: %s\n\n",
+            rc0, rc1, rcp, cudaGetErrorString(sync_err), bad0, bad1,
+            ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+// Prefill attention output-A verifier.  The grouped entry consumes
+// X=[N][G][K] and writes out=[N][G][M].  Build the reference with exactly G
+// ordinary dense calls, using D2D 2D copies to pack/unpack each group.  This
+// keeps the quantizer and MMQ reduction tree identical while independently
+// checking the grouped entry's strided quantization and output pitch.
+bool run_q4_K_grouped_dense_parity(
+        int M, int N, int K, int n_groups, uint32_t seed,
+        bool inject_nonfinite = false) {
+    fprintf(stderr,
+            "=== Q4_K/GROUPED_DENSE  M=%d N=%d K=%d groups=%d seed=%u%s ===\n",
+            M, N, K, n_groups, seed,
+            inject_nonfinite ? " nonfinite" : "");
+
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    const int blocks_per_row = K / QK_K_LOCAL;
+    const size_t blocks_per_group = (size_t)M * blocks_per_row;
+    std::vector<block_q4_K> W((size_t)n_groups * blocks_per_group);
+    for (auto &blk : W) generate_random_block_q4_K(&blk, rng);
+    std::vector<float> X((size_t)N * n_groups * K);
+    for (float &v : X) v = nd(rng);
+
+    // One NaN scale makes this row's accumulator non-finite.  Both the
+    // ordinary dense reference and the grouped entry must apply Q4_K's
+    // fused sanitize contract and publish +0.0f for every token.
+    const int nonfinite_group = n_groups / 2;
+    const int nonfinite_row = M / 2;
+    if (inject_nonfinite) {
+        block_q4_K &blk =
+            W[((size_t)nonfinite_group * M + nonfinite_row) *
+              blocks_per_row];
+        set_half_from_u16(blk.data.d, (uint16_t)0x7e00u);
+    }
+
+    constexpr size_t guard_floats = 64;
+    constexpr uint8_t guard_byte = 0xa5;
+    const size_t output_count = (size_t)N * n_groups * M;
+    const size_t output_bytes = output_count * sizeof(float);
+    const size_t guarded_count = output_count + 2u * guard_floats;
+    const size_t guarded_bytes = guarded_count * sizeof(float);
+
+    cudaStream_t stream = nullptr;
+    void *dW = nullptr;
+    float *dX = nullptr;
+    float *dGroupX = nullptr;
+    float *dGroupOut = nullptr;
+    float *dRef = nullptr;
+    float *dGotStorage = nullptr;
+    bool allocated = cudaStreamCreate(&stream) == cudaSuccess &&
+        cudaMalloc(&dW, W.size() * sizeof(block_q4_K)) == cudaSuccess &&
+        cudaMalloc(&dX, X.size() * sizeof(float)) == cudaSuccess &&
+        cudaMalloc(&dGroupX, (size_t)N * K * sizeof(float)) == cudaSuccess &&
+        cudaMalloc(&dGroupOut, (size_t)N * M * sizeof(float)) == cudaSuccess &&
+        cudaMalloc(&dRef, output_bytes) == cudaSuccess &&
+        cudaMalloc(&dGotStorage, guarded_bytes) == cudaSuccess;
+    const auto cleanup = [&]() {
+        if (dGotStorage) cudaFree(dGotStorage);
+        if (dRef) cudaFree(dRef);
+        if (dGroupOut) cudaFree(dGroupOut);
+        if (dGroupX) cudaFree(dGroupX);
+        if (dX) cudaFree(dX);
+        if (dW) cudaFree(dW);
+        if (stream) cudaStreamDestroy(stream);
+    };
+    if (!allocated) {
+        fprintf(stderr, "Q4_K grouped dense parity allocation failed: %s\n\n",
+                cudaGetErrorString(cudaGetLastError()));
+        cleanup();
+        return false;
+    }
+
+    float *const dGot = dGotStorage + guard_floats;
+    cudaError_t enqueue_err = cudaMemcpyAsync(
+        dW, W.data(), W.size() * sizeof(block_q4_K),
+        cudaMemcpyHostToDevice, stream);
+    if (enqueue_err == cudaSuccess) {
+        enqueue_err = cudaMemcpyAsync(
+            dX, X.data(), X.size() * sizeof(float),
+            cudaMemcpyHostToDevice, stream);
+    }
+    if (enqueue_err == cudaSuccess) {
+        enqueue_err = cudaMemsetAsync(dRef, 0x5a, output_bytes, stream);
+    }
+    if (enqueue_err == cudaSuccess) {
+        enqueue_err = cudaMemsetAsync(
+            dGotStorage, guard_byte, guarded_bytes, stream);
+    }
+
+    int rc_ref = enqueue_err == cudaSuccess ? 0 : -100;
+    for (int g = 0; g < n_groups && rc_ref == 0; ++g) {
+        cudaError_t err = cudaMemcpy2DAsync(
+            dGroupX, (size_t)K * sizeof(float),
+            dX + (size_t)g * K,
+            (size_t)n_groups * K * sizeof(float),
+            (size_t)K * sizeof(float), (size_t)N,
+            cudaMemcpyDeviceToDevice, stream);
+        if (err != cudaSuccess) {
+            enqueue_err = err;
+            rc_ref = -101;
+            break;
+        }
+        rc_ref = ds4_mmq_q4_K_dense(
+            (const char *)dW + (size_t)g * blocks_per_group *
+                sizeof(block_q4_K),
+            dGroupX, dGroupOut, M, N, K, stream);
+        if (rc_ref != 0) break;
+        err = cudaMemcpy2DAsync(
+            dRef + (size_t)g * M,
+            (size_t)n_groups * M * sizeof(float),
+            dGroupOut, (size_t)M * sizeof(float),
+            (size_t)M * sizeof(float), (size_t)N,
+            cudaMemcpyDeviceToDevice, stream);
+        if (err != cudaSuccess) {
+            enqueue_err = err;
+            rc_ref = -102;
+        }
+    }
+
+    const int rc_got = enqueue_err == cudaSuccess
+        ? ds4_mmq_q4_K_grouped_dense(
+              dW, dX, dGot, M, N, K, n_groups, stream)
+        : -100;
+
+    std::vector<float> ref(output_count);
+    std::vector<float> got(output_count);
+    std::vector<uint8_t> guarded(guarded_bytes);
+    if (enqueue_err == cudaSuccess) {
+        enqueue_err = cudaMemcpyAsync(
+            ref.data(), dRef, output_bytes, cudaMemcpyDeviceToHost, stream);
+    }
+    if (enqueue_err == cudaSuccess) {
+        enqueue_err = cudaMemcpyAsync(
+            got.data(), dGot, output_bytes, cudaMemcpyDeviceToHost, stream);
+    }
+    if (enqueue_err == cudaSuccess) {
+        enqueue_err = cudaMemcpyAsync(
+            guarded.data(), dGotStorage, guarded_bytes,
+            cudaMemcpyDeviceToHost, stream);
+    }
+    const cudaError_t sync_err = cudaStreamSynchronize(stream);
+
+    size_t mismatches = 0;
+    size_t nonfinite_ref = 0;
+    size_t nonfinite_got = 0;
+    for (size_t i = 0; i < output_count; ++i) {
+        if (std::memcmp(&ref[i], &got[i], sizeof(float)) != 0) mismatches++;
+        if (!std::isfinite(ref[i])) nonfinite_ref++;
+        if (!std::isfinite(got[i])) nonfinite_got++;
+    }
+    const size_t guard_bytes = guard_floats * sizeof(float);
+    size_t canary_mismatches = 0;
+    for (size_t i = 0; i < guard_bytes; ++i) {
+        if (guarded[i] != guard_byte) canary_mismatches++;
+    }
+    for (size_t i = guard_bytes + output_bytes; i < guarded.size(); ++i) {
+        if (guarded[i] != guard_byte) canary_mismatches++;
+    }
+
+    size_t sanitize_mismatches = 0;
+    if (inject_nonfinite) {
+        const uint32_t positive_zero = 0;
+        for (int t = 0; t < N; ++t) {
+            const size_t i =
+                ((size_t)t * n_groups + nonfinite_group) * M +
+                nonfinite_row;
+            uint32_t ref_bits = 0;
+            uint32_t got_bits = 0;
+            std::memcpy(&ref_bits, &ref[i], sizeof(ref_bits));
+            std::memcpy(&got_bits, &got[i], sizeof(got_bits));
+            if (ref_bits != positive_zero || got_bits != positive_zero) {
+                sanitize_mismatches++;
+            }
+        }
+    }
+
+    const bool ok = rc_ref == 0 && rc_got == 0 &&
+        enqueue_err == cudaSuccess && sync_err == cudaSuccess &&
+        mismatches == 0 && nonfinite_ref == 0 && nonfinite_got == 0 &&
+        canary_mismatches == 0 && sanitize_mismatches == 0;
+    fprintf(stderr,
+            "rc_ref=%d rc_grouped=%d enqueue=%s sync=%s "
+            "mismatches=%zu nonfinite=%zu/%zu canary=%zu sanitize=%zu: %s\n\n",
+            rc_ref, rc_got, cudaGetErrorString(enqueue_err),
+            cudaGetErrorString(sync_err), mismatches, nonfinite_ref,
+            nonfinite_got, canary_mismatches, sanitize_mismatches,
+            ok ? "PASS" : "FAIL");
+    cleanup();
+    return ok;
+}
+
+#if !defined(GGML_USE_HIP)
+// The production selector is deliberately GB10-only, but the specialized
+// quantizer uses baseline CUDA operations.  Exercise it directly on every
+// CUDA test device and require the complete block_q8_1_mmq payload to match
+// the canonical strided producer byte-for-byte.
+bool run_q4_K_grouped_q8_1_kernel_parity(int N, uint32_t seed) {
+    fprintf(stderr,
+            "=== Q4_K/GROUPED_Q8_1_K4096_G8X2 N=%d seed=%u ===\n",
+            N, seed);
+
+    constexpr int K = 4096;
+    constexpr int groups = 8;
+    constexpr size_t guard_bytes = 256u;
+    constexpr uint8_t guard_byte = 0xa5u;
+    const size_t q8_bytes =
+        ds4_mmq_q4_K_grouped_q8_1_scratch_bytes_for_test(N);
+    const size_t x_count = (size_t)N * groups * K;
+    if (q8_bytes == 0u ||
+        q8_bytes > SIZE_MAX - 2u * guard_bytes) {
+        fprintf(stderr, "invalid grouped Q8_1 parity shape\n\n");
+        return false;
+    }
+
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<float> X(x_count);
+    for (float &value : X) value = nd(rng);
+
+    cudaStream_t stream = nullptr;
+    float *dX = nullptr;
+    void *dReferenceStorage = nullptr;
+    void *dCandidateStorage = nullptr;
+    const bool allocated = cudaStreamCreate(&stream) == cudaSuccess &&
+        cudaMalloc(&dX, X.size() * sizeof(float)) == cudaSuccess &&
+        cudaMalloc(&dReferenceStorage, q8_bytes + 2u * guard_bytes) ==
+            cudaSuccess &&
+        cudaMalloc(&dCandidateStorage, q8_bytes + 2u * guard_bytes) ==
+            cudaSuccess;
+    const auto cleanup = [&]() {
+        if (dCandidateStorage) cudaFree(dCandidateStorage);
+        if (dReferenceStorage) cudaFree(dReferenceStorage);
+        if (dX) cudaFree(dX);
+        if (stream) cudaStreamDestroy(stream);
+    };
+    if (!allocated) {
+        fprintf(stderr,
+                "grouped Q8_1 parity allocation failed: %s\n\n",
+                cudaGetErrorString(cudaGetLastError()));
+        cleanup();
+        return false;
+    }
+
+    auto *dReference =
+        static_cast<uint8_t *>(dReferenceStorage) + guard_bytes;
+    auto *dCandidate =
+        static_cast<uint8_t *>(dCandidateStorage) + guard_bytes;
+    cudaError_t enqueue_err = cudaMemcpyAsync(
+        dX, X.data(), X.size() * sizeof(float),
+        cudaMemcpyHostToDevice, stream);
+    if (enqueue_err == cudaSuccess) {
+        enqueue_err = cudaMemsetAsync(
+            dReferenceStorage, guard_byte,
+            q8_bytes + 2u * guard_bytes, stream);
+    }
+    if (enqueue_err == cudaSuccess) {
+        enqueue_err = cudaMemsetAsync(
+            dCandidateStorage, guard_byte,
+            q8_bytes + 2u * guard_bytes, stream);
+    }
+
+    const int rc_reference = enqueue_err == cudaSuccess
+        ? ds4_mmq_q4_K_grouped_quantize_q8_1_for_test(
+              dX, dReference, q8_bytes, N, /*use_specialized=*/0, stream)
+        : -100;
+    const int rc_candidate = rc_reference == 0
+        ? ds4_mmq_q4_K_grouped_quantize_q8_1_for_test(
+              dX, dCandidate, q8_bytes, N, /*use_specialized=*/1, stream)
+        : -100;
+
+    std::vector<uint8_t> reference(q8_bytes + 2u * guard_bytes);
+    std::vector<uint8_t> candidate(q8_bytes + 2u * guard_bytes);
+    if (rc_candidate == 0) {
+        enqueue_err = cudaMemcpyAsync(
+            reference.data(), dReferenceStorage, reference.size(),
+            cudaMemcpyDeviceToHost, stream);
+    }
+    if (enqueue_err == cudaSuccess && rc_candidate == 0) {
+        enqueue_err = cudaMemcpyAsync(
+            candidate.data(), dCandidateStorage, candidate.size(),
+            cudaMemcpyDeviceToHost, stream);
+    }
+    const cudaError_t sync_err = cudaStreamSynchronize(stream);
+
+    size_t mismatches = 0;
+    size_t first_mismatch = SIZE_MAX;
+    for (size_t i = 0; i < q8_bytes; ++i) {
+        const size_t offset = guard_bytes + i;
+        if (reference[offset] != candidate[offset]) {
+            if (first_mismatch == SIZE_MAX) first_mismatch = i;
+            mismatches++;
+        }
+    }
+    size_t canary_mismatches = 0;
+    for (size_t i = 0; i < guard_bytes; ++i) {
+        if (reference[i] != guard_byte || candidate[i] != guard_byte) {
+            canary_mismatches++;
+        }
+        const size_t suffix = guard_bytes + q8_bytes + i;
+        if (reference[suffix] != guard_byte ||
+            candidate[suffix] != guard_byte) {
+            canary_mismatches++;
+        }
+    }
+
+    const bool ok = rc_reference == 0 && rc_candidate == 0 &&
+        enqueue_err == cudaSuccess && sync_err == cudaSuccess &&
+        mismatches == 0 && canary_mismatches == 0;
+    const std::string first = first_mismatch == SIZE_MAX
+        ? "none" : std::to_string(first_mismatch);
+    fprintf(stderr,
+            "rc=%d/%d enqueue=%s sync=%s bytes=%zu mismatches=%zu "
+            "first=%s canary=%zu: %s\n\n",
+            rc_reference, rc_candidate, cudaGetErrorString(enqueue_err),
+            cudaGetErrorString(sync_err), q8_bytes, mismatches,
+            first.c_str(), canary_mismatches, ok ? "PASS" : "FAIL");
+    cleanup();
+    return ok;
+}
+
+bool run_q4_K_grouped_q8_1_kernel_suite() {
+    bool ok = true;
+    ok &= run_q4_K_grouped_q8_1_kernel_parity(
+        /*N=*/9, 0xC4810009u);
+    ok &= run_q4_K_grouped_q8_1_kernel_parity(
+        /*N=*/127, 0xC481007Fu);
+    ok &= run_q4_K_grouped_q8_1_kernel_parity(
+        /*N=*/128, 0xC4810080u);
+    ok &= run_q4_K_grouped_q8_1_kernel_parity(
+        /*N=*/129, 0xC4810081u);
+    return ok;
+}
+#endif
+
+// IQ2_XXS internally accumulates in int8 via SIMD intrinsics
+// (__vsub4 / __vcmpne4 in vec_dot_iq2_xxs_q8_1) and applies the scale
+// post-accumulation, while the CPU reference does per-element float
+// multiplies.  The two paths agree to within a few units of grid scale.
+// Loosen abs_scale to 0.20*sqrt(K) which covers observed worst-case
+// disagreement of ~10.5 at K=4096 (db_max ~ 4 * d_max with d_max ~ 0.2).
+
+
 bool run_iq2_xxs(int M, int N, int K, uint32_t seed, float abs_scale = 0.20f) {
     fprintf(stderr, "=== IQ2_XXS M=%d N=%d K=%d  seed=%u ===\n", M, N, K, seed);
     std::mt19937 rng(seed);
@@ -1142,14 +1574,223 @@ bool run_q8_0_dense_vec(int M, int N, int K, uint32_t seed) {
     return ok;
 }
 
+bool run_q4_K_dense_vec_gb10_parity(
+        int M, int N, int K, uint32_t seed) {
+    fprintf(stderr,
+            "=== Q4_K/DENSE_VEC_SCRATCH M=%d N=%d K=%d seed=%u ===\n",
+            M, N, K, seed);
+
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    const int blocks_per_row = K / QK_K_LOCAL;
+    std::vector<block_q4_K> W((size_t)M * blocks_per_row);
+    for (auto &blk : W) generate_random_block_q4_K(&blk, rng);
+    std::vector<float> X((size_t)N * K);
+    for (float &v : X) v = nd(rng);
+
+    cudaStream_t stream = nullptr;
+    void *dW = nullptr;
+    void *scratch = nullptr;
+    float *dX = nullptr;
+    float *dRef = nullptr;
+    float *dGot = nullptr;
+    bool ok = cudaStreamCreate(&stream) == cudaSuccess &&
+              cudaMalloc(&dW, W.size() * sizeof(block_q4_K)) == cudaSuccess &&
+              cudaMalloc(&dX, X.size() * sizeof(float)) == cudaSuccess &&
+              cudaMalloc(&dRef, (size_t)M * N * sizeof(float)) == cudaSuccess &&
+              cudaMalloc(&dGot, (size_t)M * N * sizeof(float)) == cudaSuccess &&
+              cudaMalloc(&scratch, 256u * 1024u) == cudaSuccess;
+    if (!ok) {
+        fprintf(stderr, "Q4_K dense vec parity allocation failed\n");
+        if (scratch) cudaFree(scratch);
+        if (dGot) cudaFree(dGot);
+        if (dRef) cudaFree(dRef);
+        if (dX) cudaFree(dX);
+        if (dW) cudaFree(dW);
+        if (stream) cudaStreamDestroy(stream);
+        return false;
+    }
+    cudaMemcpyAsync(dW, W.data(), W.size() * sizeof(block_q4_K),
+                    cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(dX, X.data(), X.size() * sizeof(float),
+                    cudaMemcpyHostToDevice, stream);
+
+    unsetenv("DS4_CUDA_NO_Q4_GB10_FAST");
+    unsetenv("DS4_CUDA_NO_Q4_DENSE_SCRATCH");
+    ds4_mmq_set_gb10_optimizations(0);
+    ds4_mmq_set_aligned_q81_scratch(nullptr, 0u);
+    const int rc_ref = ds4_mmq_q4_K_dense_vec(
+        dW, dX, dRef, M, N, K, stream);
+    ds4_mmq_set_gb10_optimizations(1);
+    ds4_mmq_set_aligned_q81_scratch(scratch, 256u * 1024u);
+    const int rc_got = ds4_mmq_q4_K_dense_vec(
+        dW, dX, dGot, M, N, K, stream);
+    std::vector<float> ref((size_t)M * N), got((size_t)M * N);
+    const cudaError_t copy_ref = cudaMemcpyAsync(
+        ref.data(), dRef, ref.size() * sizeof(float), cudaMemcpyDeviceToHost, stream);
+    const cudaError_t copy_got = cudaMemcpyAsync(
+        got.data(), dGot, got.size() * sizeof(float), cudaMemcpyDeviceToHost, stream);
+    const cudaError_t sync_err = cudaStreamSynchronize(stream);
+    size_t mismatches = 0;
+    for (size_t i = 0; i < ref.size(); ++i)
+        if (std::memcmp(&ref[i], &got[i], sizeof(float))) ++mismatches;
+    ok = rc_ref == 0 && rc_got == 0 && copy_ref == cudaSuccess &&
+         copy_got == cudaSuccess && sync_err == cudaSuccess && mismatches == 0;
+    fprintf(stderr, "rc_ref=%d rc_scratch=%d mismatches=%zu sync=%s\n%s\n\n",
+            rc_ref, rc_got, mismatches, cudaGetErrorString(sync_err), ok ? "PASS" : "FAIL");
+
+    ds4_mmq_set_aligned_q81_scratch(nullptr, 0u);
+    ds4_mmq_set_gb10_optimizations(0);
+    cudaFree(scratch);
+    cudaFree(dGot);
+    cudaFree(dRef);
+    cudaFree(dX);
+    cudaFree(dW);
+    cudaStreamDestroy(stream);
+    return ok;
+}
+
+bool run_q4_K_grouped_vec_parity(
+        int M, int N, int K, int n_groups, uint32_t seed) {
+    fprintf(stderr,
+            "=== Q4_K/GROUPED_VEC  M=%d N=%d K=%d groups=%d seed=%u ===\n",
+            M, N, K, n_groups, seed);
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    const int blocks_per_row = K / QK_K_LOCAL;
+    const size_t blocks_per_group = (size_t)M * blocks_per_row;
+    std::vector<block_q4_K> W((size_t)n_groups * blocks_per_group);
+    for (auto &blk : W) generate_random_block_q4_K(&blk, rng);
+    std::vector<float> X((size_t)N * n_groups * K);
+    for (float &v : X) v = nd(rng);
+
+    cudaStream_t stream = nullptr;
+    void *dW = nullptr;
+    void *scratch = nullptr;
+    float *dX = nullptr;
+    float *dRef = nullptr;
+    float *dGot = nullptr;
+    const size_t output_count = (size_t)N * n_groups * M;
+    /* Covers the N=8, G=16, K=4096 parity envelope with room for ids. */
+    const size_t scratch_bytes = 1024u * 1024u;
+    bool ok = cudaStreamCreate(&stream) == cudaSuccess &&
+              cudaMalloc(&dW, W.size() * sizeof(block_q4_K)) == cudaSuccess &&
+              cudaMalloc(&dX, X.size() * sizeof(float)) == cudaSuccess &&
+              cudaMalloc(&dRef, output_count * sizeof(float)) == cudaSuccess &&
+              cudaMalloc(&dGot, output_count * sizeof(float)) == cudaSuccess &&
+              cudaMalloc(&scratch, scratch_bytes) == cudaSuccess;
+    if (!ok) {
+        fprintf(stderr, "Q4_K grouped vec parity allocation failed\n");
+        if (scratch) cudaFree(scratch);
+        if (dGot) cudaFree(dGot);
+        if (dRef) cudaFree(dRef);
+        if (dX) cudaFree(dX);
+        if (dW) cudaFree(dW);
+        if (stream) cudaStreamDestroy(stream);
+        return false;
+    }
+    cudaMemcpyAsync(dW, W.data(), W.size() * sizeof(block_q4_K),
+                    cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(dX, X.data(), X.size() * sizeof(float),
+                    cudaMemcpyHostToDevice, stream);
+    unsetenv("DS4_CUDA_NO_Q4_GB10_FAST");
+    unsetenv("DS4_CUDA_NO_Q4_GROUPED_ATTN_A");
+    ds4_mmq_set_gb10_optimizations(1);
+    ds4_mmq_set_aligned_q81_scratch(scratch, scratch_bytes);
+
+    int rc_ref = 0;
+    for (int t = 0; t < N && rc_ref == 0; t++) {
+        for (int g = 0; g < n_groups && rc_ref == 0; g++) {
+            const size_t channel = (size_t)t * n_groups + g;
+            rc_ref = ds4_mmq_q4_K_dense_vec(
+                (const char *)dW + (size_t)g * blocks_per_group *
+                    sizeof(block_q4_K),
+                dX + channel * K,
+                dRef + channel * M,
+                M, 1, K, stream);
+        }
+    }
+
+    const size_t padded_k = ((size_t)K + 511u) & ~(size_t)511u;
+    const size_t q8_bytes = (size_t)n_groups * padded_k * sizeof(block_q8_1) / QK8_1;
+    const size_t required_bytes = ((q8_bytes + 15u) & ~(size_t)15u) +
+                                  (size_t)n_groups * sizeof(int32_t);
+    ds4_mmq_set_aligned_q81_scratch(scratch, required_bytes - 1u);
+    const int rc_short_scratch = ds4_mmq_q4_K_grouped_vec(
+        dW, dX, dGot, M, K, n_groups, stream);
+    ds4_mmq_set_aligned_q81_scratch(scratch, scratch_bytes);
+    int rc_got = 0;
+    for (int t = 0; t < N && rc_got == 0; ++t)
+        rc_got = ds4_mmq_q4_K_grouped_vec(
+            dW, dX + (size_t)t * n_groups * K,
+            dGot + (size_t)t * n_groups * M, M, K, n_groups, stream);
+    setenv("DS4_CUDA_NO_Q4_GB10_FAST", "1", 1);
+    const int rc_disabled = ds4_mmq_q4_K_grouped_vec(
+        dW, dX, dGot, M, K, n_groups, stream);
+    unsetenv("DS4_CUDA_NO_Q4_GB10_FAST");
+
+    std::vector<float> ref(output_count);
+    std::vector<float> got(output_count);
+    cudaMemcpyAsync(ref.data(), dRef, ref.size() * sizeof(float),
+                    cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(got.data(), dGot, got.size() * sizeof(float),
+                    cudaMemcpyDeviceToHost, stream);
+    const cudaError_t sync_err = cudaStreamSynchronize(stream);
+    size_t mismatches = 0;
+    for (size_t i = 0; i < ref.size(); i++) {
+        if (std::memcmp(&ref[i], &got[i], sizeof(float)) != 0) mismatches++;
+    }
+    ok = rc_ref == 0 && rc_got == 0 &&
+         rc_short_scratch == DS4_MMQ_NOT_APPLICABLE &&
+         rc_disabled == DS4_MMQ_NOT_APPLICABLE &&
+         sync_err == cudaSuccess &&
+         mismatches == 0;
+    fprintf(stderr,
+            "rc_ref=%d rc_grouped=%d rc_short_scratch=%d "
+            "rc_disabled=%d "
+            "mismatches=%zu sync=%s\n%s\n\n",
+            rc_ref, rc_got, rc_short_scratch, rc_disabled, mismatches,
+            cudaGetErrorString(sync_err),
+            ok ? "PASS" : "FAIL");
+
+    ds4_mmq_set_aligned_q81_scratch(nullptr, 0u);
+    ds4_mmq_set_gb10_optimizations(0);
+    cudaFree(scratch);
+    cudaFree(dGot);
+    cudaFree(dRef);
+    cudaFree(dX);
+    cudaFree(dW);
+    cudaStreamDestroy(stream);
+    return ok;
+}
+
 } // namespace
 
+
+
 int main(int argc, char ** argv) {
-    (void)argc; (void)argv;
+    if (argc > 2 || (argc == 2 && std::strcmp(argv[1], "--q4-grouped-q81") != 0)) {
+        fprintf(stderr, "Usage: %s [--q4-grouped-q81]\n", argv[0]);
+        return 1;
+    }
+#if !defined(GGML_USE_HIP)
+    const bool q4_grouped_q81_oracle =
+        argc == 2 && std::strcmp(argv[1], "--q4-grouped-q81") == 0;
+#endif
     int rc = ds4_mmq_init(0);
     if (rc != 0) { fprintf(stderr, "ds4_mmq_init failed: %d\n", rc); return 1; }
 
     bool all_ok = true;
+
+#if !defined(GGML_USE_HIP)
+    if (q4_grouped_q81_oracle) {
+        all_ok &= run_q4_K_grouped_q8_1_kernel_suite();
+        fprintf(stderr, "===================\n");
+        fprintf(stderr, "Q4 GROUPED Q8_1 %s\n",
+                all_ok ? "PASS" : "FAILED");
+        return all_ok ? 0 : 1;
+    }
+#endif
 
     // Q8_0
     all_ok &= run_q8_0(/*M=*/64,   /*N=*/4,   /*K=*/256,  0xC0FFEE);
@@ -1174,6 +1815,37 @@ int main(int argc, char ** argv) {
     all_ok &= run_q4_K(/*M=*/128,  /*N=*/8,   /*K=*/512,  0xC4FE2);
     all_ok &= run_q4_K(/*M=*/256,  /*N=*/1,   /*K=*/2048, 0xC4FE3);
     all_ok &= run_q4_K(/*M=*/2048, /*N=*/16,  /*K=*/4096, 0xC4FE4);
+    // Prefill Q-A/KV pair: cover the MMVQ/MMQ boundary, token-tile tails,
+    // asymmetric output dimensions, and a full-width token tile.
+    all_ok &= run_q4_K_dense_pair_parity(
+        /*M0=*/257, /*M1=*/65,  /*N=*/9,   /*K=*/768,  0xC4FE50);
+    all_ok &= run_q4_K_dense_pair_parity(
+        /*M0=*/128, /*M1=*/73,  /*N=*/32,  /*K=*/4096, 0xC4FE51);
+    all_ok &= run_q4_K_dense_pair_parity(
+        /*M0=*/65,  /*M1=*/129, /*N=*/129, /*K=*/1024, 0xC4FE52);
+    all_ok &= run_q4_K_dense_pair_parity(
+        /*M0=*/96,  /*M1=*/33,  /*N=*/128, /*K=*/4096, 0xC4FE53);
+    // Grouped attention output-A prefill: exercise each token-tile tail
+    // around 8/16/32/128, with at least three groups in every case.  The
+    // final case also injects a NaN Q4 scale to verify fused sanitization.
+    all_ok &= run_q4_K_grouped_dense_parity(
+        /*M=*/33, /*N=*/9,   /*K=*/256, /*groups=*/3, 0xC4D009);
+    all_ok &= run_q4_K_grouped_dense_parity(
+        /*M=*/65, /*N=*/17,  /*K=*/512, /*groups=*/4, 0xC4D011);
+    all_ok &= run_q4_K_grouped_dense_parity(
+        /*M=*/47, /*N=*/33,  /*K=*/768, /*groups=*/5, 0xC4D021);
+    all_ok &= run_q4_K_grouped_dense_parity(
+        /*M=*/31, /*N=*/127, /*K=*/256, /*groups=*/3, 0xC4D07F);
+    all_ok &= run_q4_K_grouped_dense_parity(
+        /*M=*/31, /*N=*/128, /*K=*/256, /*groups=*/3, 0xC4D080);
+    all_ok &= run_q4_K_grouped_dense_parity(
+        /*M=*/31, /*N=*/129, /*K=*/512, /*groups=*/3, 0xC4D081,
+        /*inject_nonfinite=*/true);
+#if !defined(GGML_USE_HIP)
+    // Fixed production Q8_1 front-end: cover the first eligible width and
+    // both sides of the canonical 128-token tile boundary.
+    all_ok &= run_q4_K_grouped_q8_1_kernel_suite();
+#endif
 
     // MoE (_id) path.  Small expert counts + small shapes for fast verification.
     // Per-token-distinct routing with top_k=2 or 6.
@@ -1283,6 +1955,31 @@ int main(int argc, char ** argv) {
     all_ok &= run_q8_0_dense_vec(/*M=*/64,   /*N=*/1, /*K=*/256,  0xC0FE40);
     all_ok &= run_q8_0_dense_vec(/*M=*/256,  /*N=*/1, /*K=*/512,  0xC0FE41);
     all_ok &= run_q8_0_dense_vec(/*M=*/1024, /*N=*/1, /*K=*/4096, 0xC0FE42);
+    all_ok &= run_q4_K_dense_vec_gb10_parity(
+        /*M=*/1024, /*N=*/5, /*K=*/4096, 0xC4FE40);
+    all_ok &= run_q4_K_dense_vec_gb10_parity(
+        /*M=*/32768, /*N=*/1, /*K=*/1024, 0xC4FE41);
+    // Preserve coverage of the original one-token grouped ABI.
+    all_ok &= run_q4_K_grouped_vec_parity(
+        /*M=*/64, /*N=*/1, /*K=*/512, /*groups=*/4, 0xC4FE45);
+    all_ok &= run_q4_K_grouped_vec_parity(
+        /*M=*/256, /*N=*/2, /*K=*/8192, /*groups=*/4, 0xC4FE42);
+    // Small synthetic Flash-like case for per-token dispatch coverage.
+    all_ok &= run_q4_K_grouped_vec_parity(
+        /*M=*/128, /*N=*/5, /*K=*/4096, /*groups=*/8, 0xC4FE43);
+    // DeepSeek-V4 Flash AProjQ4 attention-A production shape: each of the
+    // eight output groups owns a [rank=1024, group_dim=4096] Q4_K matrix.
+    // Cover both ordinary one-token decode and repeated microbatch rows.
+    all_ok &= run_q4_K_grouped_vec_parity(
+        /*M=*/1024, /*N=*/1, /*K=*/4096, /*groups=*/8, 0xC4FE46);
+    all_ok &= run_q4_K_grouped_vec_parity(
+        /*M=*/1024, /*N=*/5, /*K=*/4096, /*groups=*/8, 0xC4FE47);
+    // Pro-style maximum group count across eight per-token dispatches.
+    all_ok &= run_q4_K_grouped_vec_parity(
+        /*M=*/64, /*N=*/8, /*K=*/4096, /*groups=*/16, 0xC4FE44);
+    // DeepSeek-V4 Pro has the same rank/group_dim as Flash and 16 groups.
+    all_ok &= run_q4_K_grouped_vec_parity(
+        /*M=*/1024, /*N=*/1, /*K=*/4096, /*groups=*/16, 0xC4FE48);
 
     fprintf(stderr, "===================\n");
     fprintf(stderr, "%s\n", all_ok ? "ALL PASS" : "SOME FAILED");

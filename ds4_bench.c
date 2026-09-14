@@ -814,6 +814,17 @@ int main(int argc, char **argv) {
             .cap = frontier,
         };
 
+        /* Keep one-shot resident-weight preparation outside the prefill TPS
+         * window.  The preflight uses this frontier's real suffix/chunk width,
+         * so decode-only and sub-threshold runs allocate no sidecars. */
+        if (ds4_session_prepare_sync(
+                session, &prefix, err, sizeof(err)) != 0) {
+            fprintf(stderr,
+                    "ds4-bench: prefill preparation to %d failed: %s\n",
+                    frontier, err);
+            rc = 1;
+            break;
+        }
         const double prefill_t0 = bench_now_sec();
 #if defined(DS4_BENCH_HAVE_CUDA_PROFILER)
         const bool cuda_profile_prefill =

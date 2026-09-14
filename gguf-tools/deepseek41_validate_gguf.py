@@ -13,13 +13,15 @@ import sys
 
 from deepseek41_metadata import GGUF_ALIGNMENT
 from deepseek41_quantize import (SourceDB, NativeQuantizer, Imatrix, build_plan,
-                                  validate_scales, scale_name, QUANTIZATION)
+                                  validate_scales, scale_name, QUANTIZATION,
+                                  ATTENTION_PROJ, quantization_recipe, attention_importance)
+from deepseek41_quantize import AttentionImatrix
 from glm53_quantize import (align, read_exact, read_u32, read_u64,
                             read_gguf_string, skip_gguf_value)
 from glm53_validate_gguf import read_selected_metadata
 
 
-def check_payload(fp, offset, item, db, quantizer, imatrix):
+def check_payload(fp, offset, item, db, quantizer, imatrix, attention_imatrix=None):
     if item.role == "engram_disk":
         rows = item.shape[1]
         rng = random.Random(41 + rows)
@@ -45,7 +47,7 @@ def check_payload(fp, offset, item, db, quantizer, imatrix):
                 raise ValueError(f"{item.name}: encoded expert {expert} differs from source recipe")
     else:
         values = quantizer.to_f32(db, item.source)
-        expected = quantizer.encode(values, item.qtype)
+        expected = quantizer.encode(values, item.qtype, attention_importance(attention_imatrix, item))
         fp.seek(offset)
         if len(expected) != item.nbytes or read_exact(fp, item.nbytes, item.name) != expected:
             raise ValueError(f"{item.name}: payload differs from source recipe")
@@ -55,7 +57,11 @@ def validate(args):
     config = json.loads((Path(args.hf) / "config.json").read_text())
     db = SourceDB(args.hf, index_validator=lambda _: None, scale_validator=validate_scales)
     try:
-        plan = build_plan(db, config, args.quant)
+        attention_proj = getattr(args, "attention_proj", "q8_0")
+        attention_path = getattr(args, "attention_imatrix", None)
+        if attention_path and attention_proj != "q4_k":
+            raise ValueError("--attention-imatrix requires --attention-proj q4_k")
+        plan = build_plan(db, config, args.quant, attention_proj)
         with open(args.gguf, "rb") as fp:
             if read_exact(fp, 4, "magic") != b"GGUF" or read_u32(fp, "version") != 3:
                 raise ValueError("expected GGUF v3")
@@ -66,7 +72,8 @@ def validate(args):
                 key = read_gguf_string(fp, "metadata key")
                 kind = read_u32(fp, "metadata type")
                 if key in {"general.architecture", "general.alignment", "general.source.revision",
-                            "deepseek41.calibration", "deepseek41.quantization"}:
+                            "deepseek41.calibration", "deepseek41.quantization",
+                            "deepseek41.attention_calibration", "deepseek41.attention_imatrix.file"}:
                     if key in metadata:
                         raise ValueError(f"duplicate metadata: {key}")
                     metadata[key] = read_selected_metadata(fp, kind)
@@ -74,8 +81,12 @@ def validate(args):
                     skip_gguf_value(fp, kind)
             expected = {"general.architecture": "deepseek41", "general.alignment": GGUF_ALIGNMENT,
                         "general.source.revision": args.source_revision,
-                        "deepseek41.quantization": QUANTIZATION[args.quant],
+                        "deepseek41.quantization": quantization_recipe(args.quant, attention_proj),
                         "deepseek41.calibration": "imatrix" if args.imatrix else "weight-energy bootstrap"}
+            if attention_proj == "q4_k":
+                expected["deepseek41.attention_calibration"] = "imatrix" if attention_path else "uncalibrated"
+                if attention_path:
+                    expected["deepseek41.attention_imatrix.file"] = os.path.basename(attention_path)
             if metadata != expected:
                 raise ValueError(f"metadata mismatch: {metadata}")
             for item in plan:
@@ -95,10 +106,11 @@ def validate(args):
             if args.payload:
                 q = NativeQuantizer(args.quants_library)
                 imatrix = Imatrix(args.imatrix, q.np)
+                attention_imatrix = AttentionImatrix(attention_path, q.np) if attention_path else None
                 if args.imatrix and any(t.is_expert and t.name not in imatrix.entries for t in plan):
                     raise ValueError("imatrix is missing expert tensors")
                 for index, item in enumerate(plan):
-                    check_payload(fp, start + item.offset, item, db, q, imatrix)
+                    check_payload(fp, start + item.offset, item, db, q, imatrix, attention_imatrix)
                     if (index + 1) % 25 == 0 or index + 1 == len(plan):
                         print(f"PASS: source payload checks {index + 1}/{len(plan)}", flush=True)
     finally:
@@ -112,6 +124,8 @@ if __name__ == "__main__":
     parser.add_argument("--source-revision", required=True)
     parser.add_argument("--quant", choices=QUANTIZATION, default="q2")
     parser.add_argument("--imatrix")
+    parser.add_argument("--attention-proj", choices=ATTENTION_PROJ, default="q8_0")
+    parser.add_argument("--attention-imatrix")
     parser.add_argument("--payload", action="store_true")
     suffix = "dylib" if sys.platform == "darwin" else "so"
     parser.add_argument("--quants-library", default=str(Path(__file__).with_name(f"libds4quants.{suffix}")))

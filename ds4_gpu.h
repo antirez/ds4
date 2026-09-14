@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include "ds4_gpu_phase.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -178,6 +179,18 @@ int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
+
+#if defined(DS4_BENCH_CUDA) || (!defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU))
+/* Explicit fixture hooks for strict dispatch and model provenance. */
+int ds4_cuda_test_model_range_is_device_resident(
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t offset,
+        uint64_t bytes,
+        int logical_tier);
+void ds4_cuda_test_set_q4_mmq_strict(int required);
+#endif
+
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map);
 int ds4_gpu_build_derived_artifacts(const void *model_map, uint64_t model_size,
@@ -239,6 +252,36 @@ void ds4_gpu_set_quality(bool quality);
 void ds4_gpu_set_glm_model(bool enabled);
 void ds4_gpu_set_ssd_streaming(bool enabled);
 void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled);
+
+typedef struct ds4_gpu_q4_attn_q_b_f16_sidecar_desc {
+    uint64_t weight_offset;
+    uint64_t weight_bytes;
+    uint64_t in_dim;
+    uint64_t out_dim;
+    uint32_t weight_type;
+    uint32_t layer;
+} ds4_gpu_q4_attn_q_b_f16_sidecar_desc;
+
+/* Backend-neutral prefill preflight for optional Q4_K attn_q_b F16
+ * acceleration.  A backend may prepare resident sidecars or reusable
+ * transient scratch/pipelines according to its policy.  Prepare returns 1
+ * when the selected path is ready, 0 for a policy/safety skip, and -1 when
+ * strict mode requires an unavailable specialization. */
+int ds4_gpu_prepare_q4_attn_q_b_f16_sidecars(
+        const void *model_map,
+        uint64_t model_size,
+        const ds4_gpu_q4_attn_q_b_f16_sidecar_desc *descs,
+        uint32_t count,
+        uint32_t max_prefill_rows,
+        uint64_t working_set_reserve_bytes,
+        uint64_t *prepared_bytes);
+/* Release sidecars at a quiescent backend lifecycle point.  Returns zero
+ * only when pending GPU work could not be synchronized safely. */
+int ds4_gpu_release_q4_attn_q_b_f16_sidecars(void);
+uint64_t ds4_gpu_q4_attn_q_b_f16_cache_generation(void);
+/* Evict resident sidecars before adding a graph to a live-session set. */
+int ds4_gpu_make_room_for_q4_attn_q_b_f16_session(void);
+
 #ifdef __APPLE__
 int ds4_gpu_device_is_pre_m5_apple_silicon(void);
 int ds4_gpu_device_is_m5_apple_silicon(void);
@@ -247,17 +290,112 @@ int ds4_gpu_set_decode_pipeline_fast_lookup(int enabled);
 int ds4_gpu_test_decode_pipeline_fast_lookup(void);
 /* Strict test oracle for the extended decode mul_mv_ext (nsg + nxpsg) cache. */
 int ds4_gpu_test_decode_pipeline_fast_lookup_ext(void);
+typedef struct ds4_gpu_q4_attn_q_b_f16_cache_report {
+    uint64_t entries;
+    uint64_t bytes;
+    uint64_t lookups;
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t builds;
+    uint64_t build_failures;
+    uint64_t candidate_calls;
+    uint64_t fallbacks;
+    uint64_t rejects;
+    uint64_t build_circuit_open;
+    uint64_t transient_exact_views_created;
+    uint64_t transient_exact_views_live;
+    uint64_t model_exact_cache_entries;
+    uint64_t model_exact_cache_bytes;
+} ds4_gpu_q4_attn_q_b_f16_cache_report;
+/* Test observability for the resident Metal Q4_K attn_q_b F16 sidecar. */
+void ds4_gpu_test_q4_attn_q_b_f16_cache_report(
+        ds4_gpu_q4_attn_q_b_f16_cache_report *report);
+void ds4_gpu_test_q4_attn_q_b_f16_cache_reset(void);
+int ds4_gpu_test_q4_attn_q_b_f16_projection_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_tok);
+typedef enum ds4_gpu_test_q4_qb_mm_arm {
+    DS4_GPU_TEST_Q4_QB_MM_Q4_F32 = 0,
+    DS4_GPU_TEST_Q4_QB_MM_Q4_F16 = 1,
+    DS4_GPU_TEST_Q4_QB_MM_F16_F32 = 2,
+    DS4_GPU_TEST_Q4_QB_MM_F16_F16 = 3,
+    DS4_GPU_TEST_Q4_QB_MM_Q4_TRANSIENT_F16_F16 = 4,
+    DS4_GPU_TEST_Q4_QB_MM_ARM_COUNT = 5,
+} ds4_gpu_test_q4_qb_mm_arm;
+/* Runtime capability probe for test-only matmul arms. */
+int ds4_gpu_test_q4_attn_q_b_mm_arm_supported(
+        ds4_gpu_test_q4_qb_mm_arm arm);
+/* Strict projection-only resident benchmark hook.  F16-weight arms require
+ * a READY sidecar; F16-RHS arms optionally include the production copy.  The
+ * transient arm rebuilds its F16 weight matrix for every benchmark/oracle
+ * projection and may consume either a prepacked or freshly copied F16 RHS. */
+int ds4_gpu_test_q4_attn_q_b_mm_variant_tensor(
+        ds4_gpu_tensor              *out_f32,
+        ds4_gpu_tensor              *rhs_f16,
+        const void                  *model_map,
+        uint64_t                     model_size,
+        uint64_t                     weight_offset,
+        uint64_t                     in_dim,
+        uint64_t                     out_dim,
+        const ds4_gpu_tensor        *x_f32,
+        uint32_t                     n_tok,
+        ds4_gpu_test_q4_qb_mm_arm    arm,
+        bool                         materialize_rhs);
+int ds4_gpu_test_q4_attn_q_b_f16_working_set_policy(
+        uint64_t recommended,
+        uint64_t allocated,
+        uint64_t additional);
+
+int ds4_gpu_attention_output_q4_K_batch_hc_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *out_hc,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        ds4_gpu_tensor       *low,
+        ds4_gpu_tensor       *group_tmp,
+        ds4_gpu_tensor       *low_tmp,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              out_a_offset,
+        uint64_t              out_b_offset,
+        uint32_t              out_b_type,
+        uint64_t              group_dim,
+        uint64_t              rank,
+        uint32_t              n_groups,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *heads,
+        uint32_t              n_tokens,
+        uint32_t              n_hc);
 /* Strict test oracle for the generated resident-prefill MXFP4 half LUT. */
 int ds4_gpu_test_mxfp4_down_half_lut(uint16_t *legacy_bits,
                                      uint16_t *lut_bits);
 enum {
     DS4_GPU_TEST_MXFP4_PAIR_TAIL_CULL = 1u << 0,
+    DS4_GPU_TEST_BATCH_ATTN_OUT_Q4_HC_FUSION = 1u << 11,
     DS4_GPU_TEST_MXFP4_PAIR_COMPACT_TILE = 1u << 1,
     DS4_GPU_TEST_MXFP4_MAP_SCATTER = 1u << 2,
     DS4_GPU_TEST_MXFP4_DOWN_TAIL_CULL = 1u << 3,
     DS4_GPU_TEST_MXFP4_DOWN_HALF_LUT = 1u << 4,
     DS4_GPU_TEST_OUTPUT_HC_WEIGHTS4 = 1u << 5,
     DS4_GPU_TEST_HC_RMS_SCALE_PROJ = 1u << 6,
+    DS4_GPU_TEST_INDEXER_TOPK_LEGACY = 1u << 7,
+    DS4_GPU_TEST_INDEXER_HEAD2 = 1u << 8,
+    DS4_GPU_TEST_INDEXER_HEAD4 = 1u << 9,
+    DS4_GPU_TEST_INDEXER_LEGACY_HEADS = 1u << 10,
+    DS4_GPU_TEST_INDEXER_HEAD1 = 1u << 12,
+    DS4_GPU_TEST_V41_PAIR_TAIL_CULL = 1u << 13,
+    DS4_GPU_TEST_V41_DOWN_TAIL_CULL = 1u << 14,
+    DS4_GPU_TEST_V41_MOE_REFERENCE = 1u << 15,
+    DS4_GPU_TEST_V41_MOE_SMALL_TILES = 1u << 16,
+    DS4_GPU_TEST_V41_INDEXED_REFERENCE = 1u << 17,
+    DS4_GPU_TEST_V41_MOE_RHS_F16 = 1u << 18,
+    DS4_GPU_TEST_V41_MOE_Q2_K128 = 1u << 19,
 };
 void ds4_gpu_test_set_flags(uint32_t flags);
 void ds4_gpu_release_zero_prefix_prefill_mask_cache(void);
@@ -266,6 +404,10 @@ static inline int ds4_gpu_device_is_pre_m5_apple_silicon(void) { return 0; }
 static inline int ds4_gpu_device_is_m5_apple_silicon(void) { return 0; }
 #endif
 void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts);
+#ifdef __APPLE__
+/* Allocated weight storage, including unused slab slots and pending loads. */
+uint64_t ds4_gpu_stream_expert_cache_allocated_bytes(void);
+#endif
 void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes);
 uint64_t ds4_gpu_recommended_working_set_size(void);
 uint32_t ds4_gpu_stream_expert_cache_configured_count(void);
@@ -281,6 +423,17 @@ typedef struct ds4_gpu_stream_expert_table {
     uint64_t    gate_expert_bytes;
     uint64_t    down_expert_bytes;
 } ds4_gpu_stream_expert_table;
+#ifdef __APPLE__
+/* Discard dead, detached, complete prefill storage after GPU drain and munlock.
+ * The caller still owns the tensor handle and must free it normally. */
+int ds4_gpu_stream_prefill_discard_buffer(ds4_gpu_tensor *tensor);
+/* Bind explicitly loaded full-layer weights at their original model offsets.
+ * All NULL detaches them. The caller must drain GPU work before either call. */
+int ds4_gpu_stream_prefill_bind_layer(
+        const ds4_gpu_stream_expert_table *table,
+        const ds4_gpu_tensor *gate, const ds4_gpu_tensor *up,
+        const ds4_gpu_tensor *down);
+#endif
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
 /* Optional CUDA look-ahead between completed layers, inside the existing
  * expert cache. The foreground owns slots; the reader cannot publish them
@@ -679,6 +832,21 @@ int ds4_gpu_matmul_q8_0_pair_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
+/* Returns 1 on encoded success, 0 for a clean fallback, -1 on a required or
+ * attempted-path failure. Each output can have a different row count. */
+int ds4_gpu_matmul_q4_K_pair_tensor(
+        ds4_gpu_tensor       *out0,
+        ds4_gpu_tensor       *out1,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight0_offset,
+        uint64_t              weight1_offset,
+        uint64_t              in_dim,
+        uint64_t              out0_dim,
+        uint64_t              out1_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t              n_tok);
+
 int ds4_gpu_matmul_q4_K_pair_decode_tensor(
         ds4_gpu_tensor       *out0,
         ds4_gpu_tensor       *out1,
@@ -842,9 +1010,10 @@ int ds4_gpu_matmul_f16_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
-/* CUDA batch path: fold an input RMS normalization into the FP16 activation
- * conversion used by the following projection. Returns 0 without touching
- * out when the optimized path is unavailable. */
+/* CUDA/ROCm batch path: fold input RMS normalization into the FP16
+ * conversion used by the same projection. Returns 1 on success, 0 when
+ * declined before submission, and -1 on failure after submission may have
+ * begun. Only a zero result permits the caller to run its fallback. */
 int ds4_gpu_matmul_f16_rms_fold_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
@@ -1147,6 +1316,7 @@ int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
         const void           *model_map,
         uint64_t              model_size,
         uint64_t              weight_offset,
+        uint32_t              weight_type,
         uint64_t              in_dim,
         uint64_t              out_dim,
         const ds4_gpu_tensor *x,
@@ -2272,6 +2442,25 @@ int ds4_gpu_attention_output_q8_batch_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *heads,
         uint32_t                n_tokens);
+
+#if !defined(DS4_ROCM_BUILD)
+/* Q4 output-B projection with the canonical HC expansion. */
+int ds4_gpu_matmul_q4_K_hc_expand_available(void);
+int ds4_gpu_matmul_q4_K_hc_expand_tensor(
+        ds4_gpu_tensor       *out_hc,
+        ds4_gpu_tensor       *block_out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t              n_embd,
+        uint32_t              n_hc);
+#endif
+
 int ds4_gpu_attention_output_q4_K_batch_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *low,
@@ -2321,7 +2510,8 @@ int ds4_gpu_attention_output_low_q4_K_slice_tensor(
         uint64_t                rank,
         uint32_t                group0,
         uint32_t                group_cnt,
-        const ds4_gpu_tensor *heads);
+        const ds4_gpu_tensor *heads,
+        int                    resident_decode);
 
 int ds4_gpu_attention_output_low_q8_rows_exact_tensor(
         ds4_gpu_tensor       *low,
@@ -2810,6 +3000,13 @@ int ds4_gpu_hc_split_weighted_sum_norm_tensor(
         float                   eps,
         float                   norm_eps);
 
+/* Single-row HC RMSNorm + F16 projection. Backends keep their established
+ * projection precision and reduction order; this need not be one kernel.
+ * Availability admits automatic graph dispatch; a benchmark may explicitly
+ * call a supported candidate whose automatic dispatch is disabled.
+ * The tensor operation returns
+ * 1 on success, 0 when declined before submission (caller may fall back),
+ * and -1 on failure after work may have been submitted (do not replay). */
 int ds4_gpu_hc_rms_norm_mix_f16_available(void);
 int ds4_gpu_hc_rms_norm_mix_f16_tensor(
         ds4_gpu_tensor       *out,

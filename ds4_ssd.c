@@ -77,6 +77,26 @@ uint32_t ds4_ssd_cache_experts_for_byte_budget(uint64_t bytes,
     return (uint32_t)experts;
 }
 
+bool ds4_ssd_manual_cache_safe_bytes(uint64_t recommended_bytes,
+                                      uint64_t context_bytes,
+                                      uint64_t non_routed_bytes,
+                                      uint64_t *safe_bytes_out) {
+    if (safe_bytes_out) *safe_bytes_out = 0;
+    if (!safe_bytes_out || recommended_bytes == 0) return false;
+
+    /* Compute floor(7 * recommended / 8) without an overflowing product. */
+    const uint64_t target = (recommended_bytes / 8u) * 7u +
+                            ((recommended_bytes % 8u) * 7u) / 8u;
+    uint64_t available = target > context_bytes ? target - context_bytes : 0;
+    /* Match the combined model limit used by Metal static pinning, before
+     * subtracting fixed weights. Retain a genuinely smaller remainder rather
+     * than imposing the legacy planner's minimum of one GiB. */
+    if (available >= DS4_GIB) available -= available % DS4_GIB;
+    *safe_bytes_out = available > non_routed_bytes
+        ? available - non_routed_bytes : 0;
+    return true;
+}
+
 static uint64_t ds4_ssd_auto_cache_percent(uint32_t default_percent) {
     const char *env = getenv("DS4_SSD_AUTO_CACHE_PCT");
     if (env && env[0]) {

@@ -108,6 +108,10 @@ Leave memory for the context and runtime buffers as well as the model.
 See [other models](docs/MODELS.md) or use [SSD streaming](docs/SSD_STREAMING.md)
 on a smaller Mac.
 
+For DeepSeek V4 models with Q4_K attention projections, see
+[Q4 attention support](docs/Q4_ATTENTION.md) for conversion, backend dispatch,
+memory policy, and validation commands.
+
 ## Everyday Use
 
 Once built and with a model downloaded:

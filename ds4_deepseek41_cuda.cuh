@@ -61,6 +61,73 @@ extern "C" int ds4_gpu_dsv41_quantize(ds4_gpu_tensor *x, uint32_t width,
     return cuda_ok(cudaGetLastError(), "V4.1 activation rounding");
 }
 
+/* Keep the legacy hc_expand_kernel's initial multiply and ascending source
+ * accumulation. The plain MAC expressions intentionally retain the build's
+ * contraction policy; forcing FMA would change --fmad=false builds. One
+ * thread reuses the block and residual loads for all four output streams. */
+__global__ static void dsv41_hc_expand_bf16_kernel(
+        float *out, const float *block, const float *add,
+        const float *residual, const float *split, uint32_t rows) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (uint64_t)rows * 5120u) return;
+    const uint32_t d = i % 5120u, row = i / 5120u;
+    float b = block[i];
+    if (add) b = __fadd_rn(b, add[i]);
+    b = dsv41_bf16(b);
+    const uint64_t base = (uint64_t)row * 20480u + d;
+    const float r0 = residual[base];
+    const float r1 = residual[base + 5120u];
+    const float r2 = residual[base + 10240u];
+    const float r3 = residual[base + 15360u];
+    const float *post = split + (uint64_t)row * 24u + 4u;
+    const float *comb = post + 4u;
+    for (uint32_t h = 0u; h < 4u; h++) {
+        float acc = __fmul_rn(b, post[h]);
+        acc += comb[h] * r0;
+        acc += comb[h + 4u] * r1;
+        acc += comb[h + 8u] * r2;
+        acc += comb[h + 12u] * r3;
+        out[base + (uint64_t)h * 5120u] = dsv41_bf16(acc);
+    }
+}
+
+extern "C" int ds4_gpu_dsv41_hc_expand_bf16(ds4_gpu_tensor *out,
+        const ds4_gpu_tensor *block, const ds4_gpu_tensor *add,
+        const ds4_gpu_tensor *residual, const ds4_gpu_tensor *split,
+        uint32_t rows) {
+    const uint64_t n = (uint64_t)rows * 5120u;
+    if (!rows || n > UINT32_MAX || g_quality_mode || g_n_gpus != 1) return 0;
+    const ds4_gpu_tensor *tensors[] = {out, block, add ? add : block, residual, split};
+    const uint64_t counts[] = {n * 4u, n, n, n * 4u, (uint64_t)rows * 24u};
+    for (uint32_t j = 0u; j < 5u; j++) {
+        if (!dsv41_has_floats(tensors[j], counts[j]) || tensors[j]->device_id < -1)
+            return 0;
+        const uintptr_t p = (uintptr_t)tensors[j]->ptr;
+        if ((p & 15u) || counts[j] * sizeof(float) > UINTPTR_MAX - p) return 0;
+    }
+    const uintptr_t dest = (uintptr_t)out->ptr;
+    const uint64_t dest_bytes = counts[0] * sizeof(float);
+    const int tier = ds4_tensor_device_idx(out);
+    if (tier < 0 || tier >= g_n_gpus) return 0;
+    for (uint32_t j = 1u; j < 5u; j++) {
+        const uintptr_t src = (uintptr_t)tensors[j]->ptr;
+        const uint64_t src_bytes = counts[j] * sizeof(float);
+        if (ds4_tensor_device_idx(tensors[j]) != tier ||
+            (dest <= src ? src - dest < dest_bytes : dest - src < src_bytes)) return 0;
+    }
+    int device = -1;
+    if (!cuda_ok(cudaGetDevice(&device), "V4.1 HC device") ||
+        device != g_gpu[tier].device_id) return 0;
+    /* No allocation, weight resolution, device changes, or synchronization:
+     * tensor lifetimes and stream ordering remain with the caller. */
+    dsv41_hc_expand_bf16_kernel<<<(unsigned)((n + 255u) / 256u), 256,
+                                 0, cuda_decode_stream()>>>(
+        (float *)out->ptr, (const float *)block->ptr,
+        add ? (const float *)add->ptr : nullptr,
+        (const float *)residual->ptr, (const float *)split->ptr, rows);
+    return cuda_ok(cudaGetLastError(), "V4.1 HC expand BF16");
+}
+
 extern "C" int ds4_gpu_dsv41_shared_join(void) {
     if (!g_dsv41_shared.pending) return 1;
     g_dsv41_shared.pending = false;
@@ -525,4 +592,221 @@ extern "C" int ds4_gpu_dsv41_attention_output_tp_batch(
     return ds4_gpu_dsv41_quantize(low, 4096u, rows, DS4_V41_BF16) &&
         ds4_gpu_matmul_q8_0_kslice_rows_tensor(out, model_map, model_size,
             b, 8192u, 5120u, rank * 4096u, 4096u, low, rows);
+}
+
+/* Repeat the native decode Q4 dot unchanged over token/group rows. The
+ * full weight-row stride is retained for TP output-B column slices. */
+__global__ static void dsv41_output_q4_native_kernel(
+        float *out, const char *weights, const cuda_block_q8_K *xq,
+        uint32_t outputs, uint32_t blocks, uint32_t full_blocks,
+        uint32_t block0, uint32_t groups, bool output_bf16) {
+    const uint32_t lane = threadIdx.x & 7u;
+    const uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
+    if (row >= groups * outputs) return;
+    const uint32_t token = blockIdx.y;
+    const cuda_block_q8_K *xr = xq +
+        ((uint64_t)token * groups + row / outputs) * blocks;
+    const cuda_block_q4_K *wr = (const cuda_block_q4_K *)(
+        weights + (uint64_t)row * full_blocks * sizeof(cuda_block_q4_K)) + block0;
+    float acc = 0.0f;
+    for (uint32_t b = lane; b < blocks; b += 8u)
+        acc += dev_dot_q4_K_q8_K_block(wr + b, xr + b);
+    acc = quarter_warp_sum_f32(acc, lane);
+    if (lane == 0u)
+        out[(uint64_t)token * groups * outputs + row] = output_bf16 ? dsv41_bf16(acc) : acc;
+}
+
+static int dsv41_output_q4_rows(
+        float *out, const char *weights, const float *input,
+        void *scratch, uint64_t scratch_bytes, uint32_t outputs,
+        uint32_t width, uint32_t full_width, uint32_t k0,
+        uint32_t groups, uint32_t rows, bool use_mmq, bool output_bf16) {
+    if (use_mmq && width == full_width)
+        return ds4_mmq_q4_K_decode_samples(weights, input, out,
+            scratch, (size_t)scratch_bytes, (int)outputs, (int)width,
+            (int)rows, (int)groups, output_bf16, cuda_decode_stream()) == 0;
+    const uint32_t blocks = width / CUDA_QK_K;
+    q8_K_quantize_kernel<<<dim3(blocks, rows * groups), 256, 0, cuda_decode_stream()>>>(
+        (cuda_block_q8_K *)scratch, input, width, rows * groups);
+    if (!cuda_ok(cudaGetLastError(), "V4.1 output Q4 quantize")) return 0;
+    dsv41_output_q4_native_kernel<<<dim3(groups * outputs / 32u, rows), 256,
+                                    0, cuda_decode_stream()>>>(
+        out, weights, (const cuda_block_q8_K *)scratch, outputs, blocks,
+        full_width / CUDA_QK_K, k0 / CUDA_QK_K, groups, output_bf16);
+    return cuda_ok(cudaGetLastError(), "V4.1 output Q4 rows");
+}
+
+static int dsv41_output_q8_rows(
+        float *out, const char *weights, const float *input, void *scratch,
+        uint32_t outputs, uint32_t width, uint32_t full_width, uint32_t k0,
+        uint32_t groups, uint32_t rows) {
+    const uint32_t blocks = width / 32u;
+    const uint64_t qbytes = (uint64_t)rows * groups * width;
+    int8_t *xq = (int8_t *)scratch;
+    float *scales = (float *)((char *)scratch + qbytes);
+    const dim3 qgrid(blocks, rows * groups);
+    if (groups > 1u)
+        ds4_cuda_launch_q8_0_group_slice_quantize(
+            cuda_q8_quant_warp_reduce_enabled(), qgrid, cuda_decode_stream(),
+            xq, scales, input, width, blocks, groups, 0u, groups);
+    else
+        ds4_cuda_launch_q8_0_quantize(
+            cuda_q8_quant_warp_reduce_enabled(), qgrid, cuda_decode_stream(),
+            xq, scales, input, width, blocks);
+    if (!cuda_ok(cudaGetLastError(), "V4.1 output Q8 quantize")) return 0;
+    const dim3 grid(groups * outputs / 8u, rows);
+    const unsigned char *w = (const unsigned char *)weights;
+    const int dp4a = cuda_q8_use_dp4a();
+    if (groups > 1u)
+        grouped_q8_0_a_preq_warp8_kernel<<<grid, 256, 0, cuda_decode_stream()>>>(
+            out, w, xq, scales, width, outputs, groups, rows, blocks, dp4a);
+    else
+        matmul_q8_0_kslice_preq_warp8_kernel<<<grid, 256, 0, cuda_decode_stream()>>>(
+            out, w, xq, scales, width, outputs, full_width / 32u,
+            k0 / 32u, blocks, dp4a);
+    return cuda_ok(cudaGetLastError(), "V4.1 output Q8 rows");
+}
+
+static bool dsv41_output_range(const void *ptr, uint64_t bytes) {
+    return ptr && bytes <= UINTPTR_MAX - (uintptr_t)ptr;
+}
+
+static bool dsv41_output_overlap(const void *a, uint64_t a_bytes,
+                                  const void *b, uint64_t b_bytes) {
+    const uintptr_t x = (uintptr_t)a, y = (uintptr_t)b;
+    return x <= y ? y - x < a_bytes : x - y < b_bytes;
+}
+
+extern "C" int ds4_gpu_dsv41_attention_output_typed_batch(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *low,
+        const void *model_map, uint64_t model_size, uint64_t a, uint64_t b,
+        uint32_t a_type, uint32_t b_type, const ds4_gpu_tensor *heads,
+        uint32_t rows, uint32_t tp_world, uint32_t tp_rank) {
+    if (!rows || (tp_world != 1u && tp_world != 2u) || tp_rank >= tp_world ||
+        (a_type != 8u && a_type != 12u) || (b_type != 8u && b_type != 12u) ||
+        !dsv41_output_range(model_map, model_size)) return 0;
+    const uint32_t groups = 8u / tp_world;
+    const uint32_t low_width = groups * 1024u, heads_width = groups * 4096u;
+    const uint64_t a_row = a_type == 8u ? 128u * 34u : 16u * sizeof(cuda_block_q4_K);
+    const uint64_t b_row = b_type == 8u ? 256u * 34u : 32u * sizeof(cuda_block_q4_K);
+    const uint64_t a_bytes = 8192u * a_row, b_bytes = 5120u * b_row;
+    const uint64_t heads_bytes = (uint64_t)rows * heads_width * sizeof(float);
+    const uint64_t low_bytes = (uint64_t)rows * low_width * sizeof(float);
+    const uint64_t out_bytes = (uint64_t)rows * 5120u * sizeof(float);
+    if (a > model_size || a_bytes > model_size - a ||
+        b > model_size || b_bytes > model_size - b ||
+        !dsv41_has_floats(heads, heads_bytes / sizeof(float)) ||
+        !dsv41_has_floats(low, low_bytes / sizeof(float)) ||
+        !dsv41_has_floats(out, out_bytes / sizeof(float))) return 0;
+    const void *buffers[] = {heads->ptr, low->ptr, out->ptr};
+    const uint64_t sizes[] = {heads_bytes, low_bytes, out_bytes};
+    const char *a_map = (const char *)model_map + a;
+    const char *b_map = (const char *)model_map + b;
+    for (uint32_t i = 0u; i < 3u; i++) {
+        if (((uintptr_t)buffers[i] & (sizeof(float) - 1u)) ||
+            !dsv41_output_range(buffers[i], sizes[i]) ||
+            dsv41_output_overlap(buffers[i], sizes[i], a_map, a_bytes) ||
+            dsv41_output_overlap(buffers[i], sizes[i], b_map, b_bytes)) return 0;
+        for (uint32_t j = 0u; j < i; j++)
+            if (dsv41_output_overlap(buffers[i], sizes[i], buffers[j], sizes[j])) return 0;
+    }
+    const int tier = ds4_tensor_device_idx(out);
+    int device = -1;
+    if (tier < 0 || tier >= g_n_gpus || out->device_id < -1 ||
+        low->device_id < -1 || heads->device_id < -1 ||
+        ds4_tensor_device_idx(heads) != tier || ds4_tensor_device_idx(low) != tier ||
+        !cuda_ok(cudaGetDevice(&device), "V4.1 output device") ||
+        device != g_gpu[tier].device_id) return 0;
+    /* Typed Q4 batches are prefill work; decode capture uses the scalar API.
+     * Reject capture before weight resolution, MMQ init, or scratch growth. */
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    if ((a_type == 12u || b_type == 12u) &&
+        (!cuda_ok(cudaStreamIsCapturing(cuda_decode_stream(), &capture),
+                  "V4.1 output capture status") ||
+         capture != cudaStreamCaptureStatusNone)) return 0;
+    const uint64_t local_a_bytes = (uint64_t)low_width * a_row;
+    const uint64_t local_a = a + (uint64_t)tp_rank * local_a_bytes;
+    const char *wa = cuda_resolve_weight_ptr(model_map, local_a, local_a_bytes,
+                                            tier, "V4.1 output A");
+    const char *wb = cuda_resolve_weight_ptr(model_map, b, b_bytes, tier, "V4.1 output B");
+    if (!wa || !wb || ((uintptr_t)wa & (a_type == 12u ? 3u : 1u)) ||
+        ((uintptr_t)wb & (b_type == 12u ? 3u : 1u)) ||
+        !dsv41_output_range(wa, local_a_bytes) || !dsv41_output_range(wb, b_bytes)) return 0;
+    for (uint32_t i = 0u; i < 3u; i++)
+        if (dsv41_output_overlap(buffers[i], sizes[i], wa, local_a_bytes) ||
+            dsv41_output_overlap(buffers[i], sizes[i], wb, b_bytes)) return 0;
+
+    if (a_type == 8u && b_type == 8u) {
+        if (rows > 65535u) return 0;
+        return tp_world == 2u ?
+            ds4_gpu_dsv41_attention_output_tp_batch(out, low, model_map, model_size,
+                a, b, heads, rows, tp_rank) :
+            ds4_gpu_dsv41_attention_output_batch(out, low, model_map, model_size,
+                a, b, heads, rows);
+    }
+
+    /* One bounded arena is reused in stream order. It fits Q8_K, canonical
+     * Q8_1, and Q8_0+F32 scales for A or B, including packed TP activations. */
+    const uint32_t chunk_rows = min(rows, 64u);
+    const uint64_t block_scratch = std::max((uint64_t)sizeof(cuda_block_q8_K), UINT64_C(288));
+    const uint64_t scratch_bytes = (uint64_t)chunk_rows * groups * 16u * block_scratch;
+    const bool use_mmq = cuda_use_mmq() != 0;
+    /* MMQ's lazy initialization visits physical device zero. Restore the
+     * validated execution device before touching its scratch or launching. */
+    int dispatch_device = -1;
+    if (!cuda_ok(cudaGetDevice(&dispatch_device), "V4.1 output MMQ device") ||
+        (dispatch_device != device &&
+         !cuda_ok(cudaSetDevice(device), "V4.1 output restore device"))) return 0;
+    if (!use_mmq && g_cuda_test_q4_mmq_strict) return 0;
+    for (uint32_t first = 0u; first < rows;) {
+        /* Scalar Q8 B shares this arena; refresh after every nested dispatch
+         * so growing its workspace cannot leave the next chunk a stale view. */
+        void *scratch = cuda_tmp_alloc_on(tier, scratch_bytes, "V4.1 output batch activations");
+        if (!dsv41_output_range(scratch, scratch_bytes) || ((uintptr_t)scratch & 15u) ||
+            dsv41_output_overlap(scratch, scratch_bytes, wa, local_a_bytes) ||
+            dsv41_output_overlap(scratch, scratch_bytes, wb, b_bytes)) return 0;
+        for (uint32_t i = 0u; i < 3u; i++)
+            if (dsv41_output_overlap(scratch, scratch_bytes, buffers[i], sizes[i])) return 0;
+        const uint32_t count = min(rows - first, chunk_rows);
+        const float *x = (const float *)heads->ptr + (uint64_t)first * heads_width;
+        float *l = (float *)low->ptr + (uint64_t)first * low_width;
+        float *y = (float *)out->ptr + (uint64_t)first * 5120u;
+        const int a_ok = a_type == 12u ?
+            dsv41_output_q4_rows(l, wa, x, scratch, scratch_bytes,
+                1024u, 4096u, 4096u, 0u, groups, count, use_mmq, true) :
+            dsv41_output_q8_rows(l, wa, x, scratch,
+                1024u, 4096u, 4096u, 0u, groups, count);
+        if (!a_ok) return 0;
+        /* Q4 rounds only after its complete reduction (after sanitize on
+         * MMVQ). The mixed Q8-A path retains the established separate pass. */
+        if (a_type == 8u) {
+            dsv41_bf16_kernel<<<(uint64_t)count * low_width / 256u, 256,
+                                0, cuda_decode_stream()>>>(l, (uint64_t)count * low_width);
+            if (!cuda_ok(cudaGetLastError(), "V4.1 output low BF16")) return 0;
+        }
+        if (b_type == 8u && tp_world == 1u) {
+            /* Scalar Q8 B may use resident aligned weights. Keep its exact
+             * dispatcher until batching that representation is validated. */
+            for (uint32_t row = 0u; row < count; row++) {
+                ds4_gpu_tensor input_row = *low, output_row = *out;
+                input_row.ptr = l + (uint64_t)row * low_width;
+                input_row.bytes = (uint64_t)low_width * sizeof(float);
+                output_row.ptr = y + (uint64_t)row * 5120u;
+                output_row.bytes = 5120u * sizeof(float);
+                if (!ds4_gpu_matmul_q8_0_tensor(&output_row, model_map, model_size,
+                        b, low_width, 5120u, &input_row, 1u)) return 0;
+            }
+            first += count;
+            continue;
+        }
+        const int b_ok = b_type == 12u ?
+            dsv41_output_q4_rows(y, wb, l, scratch, scratch_bytes,
+                5120u, low_width, 8192u, tp_rank * low_width, 1u, count, use_mmq, false) :
+            dsv41_output_q8_rows(y, wb, l, scratch,
+                5120u, low_width, 8192u, tp_rank * low_width, 1u, count);
+        if (!b_ok) return 0;
+        first += count;
+    }
+    /* Output stays F32: TP reduction and its BF16 boundary belong to caller. */
+    return 1;
 }

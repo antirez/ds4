@@ -19,11 +19,12 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "gguf-tools"))
 from deepseek41_quantize import (NativeQuantizer, validate_scales, write_engram,
-                                write_gguf, scale_name, QUANTIZATION, build_plan)
+                                write_gguf, scale_name, QUANTIZATION, build_plan,
+                                ATTENTION_SUFFIXES, quantization_recipe)
 from deepseek41_metadata import GGUF_ALIGNMENT, engram_layout, metadata
 import deepseek41_validate_gguf as artifact_audit
 from glm53_quantize import (
-    TensorPlan, QTYPE_F32, QTYPE_I8, QTYPE_IQ2_XXS, QTYPE_Q2_K, QTYPE_Q4_K,
+    TensorPlan, QTYPE_F32, QTYPE_I8, QTYPE_IQ2_XXS, QTYPE_Q2_K, QTYPE_Q4_K, QTYPE_Q8_0,
     align, kv_string, kv_u32, load_tokenizer_records, print_plan, qtype_nbytes,
 )
 
@@ -198,6 +199,83 @@ class ConversionTests(unittest.TestCase):
             validate_scales(db.tensors)
         with self.assertRaisesRegex(ValueError, "overflow"):
             self.q.encode(np.array([[65536]], np.float32), 1)
+
+    def test_attention_recipe_independent_of_experts(self):
+        c = dict(hidden_size=256, moe_intermediate_size=256, num_attention_heads=2,
+                 head_dim=256, q_lora_rank=256, o_lora_rank=128, o_groups=2,
+                 hc_mult=2, n_routed_experts=2, vocab_size=256, index_n_heads=2,
+                 index_head_dim=128, num_hidden_layers=1, kv_source_layer_ids=[],
+                 index_source_layer_ids=[], engram_layer_ids=[])
+        tensors = {}
+        def add(name, shape, dtype="F32"):
+            tensors[name] = dict(shape=list(shape), dtype=dtype)
+        add("embed.weight", (256, 256)); add("norm.weight", (256,)); add("head.weight", (256, 256))
+        for site in ("attn", "ffn"):
+            for part, shape in (("fn", (8, 512)), ("base", (8,)), ("scale", (3,))):
+                add(f"layers.0.hc_{site}_{part}", shape)
+            add(f"layers.0.{site}_norm.weight", (256,))
+        for source, shape in (("attn_sink", (2,)), ("wq_a.weight", (256, 256)),
+                              ("wq_b.weight", (512, 256)), ("q_norm.weight", (256,)),
+                              ("wkv.weight", (256, 256)), ("kv_norm.weight", (256,)),
+                              ("wo_a.weight", (256, 256)), ("wo_b.weight", (256, 256))):
+            add("layers.0.attn." + source, shape)
+        add("layers.0.ffn.gate.weight", (2, 256))
+        for suffix in ("bias", "bias_vl"):
+            add("layers.0.ffn.gate." + suffix, (2,))
+        for part in ("w1", "w2", "w3"):
+            add(f"layers.0.ffn.shared_experts.{part}.weight", (256, 256))
+            for expert in range(2):
+                name = f"layers.0.ffn.experts.{expert}.{part}.weight"
+                add(name, (256, 128), "I8"); add(scale_name(name), (256, 8), "F8_E8M0")
+        db = types.SimpleNamespace(tensors=tensors, info=tensors.__getitem__)
+        config = dict(text_config=c, quantization_config=dict(weight_block_size=[32, 32]))
+        baseline = build_plan(db, config)
+        for recipe in ("q2", "q4"):
+            plan = build_plan(db, config, recipe, "q4_k")
+            for before, after in zip(baseline, plan):
+                if after.name in {"blk.0." + suffix for suffix in ATTENTION_SUFFIXES}:
+                    self.assertEqual(before.qtype, QTYPE_Q8_0)
+                    self.assertEqual(after.qtype, QTYPE_Q4_K)
+                elif after.is_expert and recipe == "q4":
+                    self.assertEqual(after.qtype, QTYPE_Q4_K)
+                else:
+                    self.assertEqual(before.qtype, after.qtype)
+
+    def test_attention_calibrated_writer_and_audit(self):
+        name = "blk.0.attn_q_a.weight"
+        values = np.sin(np.arange(512, dtype=np.float32)).reshape(2, 256)
+        db = types.SimpleNamespace(tensors={name: dict(shape=[2, 256], dtype="F32")},
+            info=lambda _: dict(shape=[2, 256], dtype="F32"), read=lambda _: values.tobytes(), close=lambda: None)
+        item = TensorPlan(name, (256, 2), QTYPE_Q4_K, "attention", source=name,
+                          nbytes=qtype_nbytes(QTYPE_Q4_K, (256, 2)))
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
+            calibration = Path(tmp) / "dense.dat"
+            weights = np.linspace(.01, 2., 256, dtype=np.float32)
+            encoded = name.encode()
+            calibration.write_bytes(struct.pack("<ii", 1, len(encoded)) + encoded +
+                                    struct.pack("<ii", 1, 256) + weights.tobytes())
+            records = [kv_string("general.architecture", "deepseek41"), kv_u32("general.alignment", GGUF_ALIGNMENT),
+                       kv_string("general.source.revision", "0" * 40),
+                       kv_string("deepseek41.quantization", quantization_recipe("q2", "q4_k")),
+                       kv_string("deepseek41.calibration", "weight-energy bootstrap"),
+                       kv_string("deepseek41.attention_calibration", "imatrix"),
+                       kv_string("deepseek41.attention_imatrix.file", calibration.name)]
+            args = types.SimpleNamespace(out=str(Path(tmp) / "out.gguf"), imatrix=None,
+                attention_imatrix=str(calibration), attention_proj="q4_k", quants_library=self.q.lib._name,
+                threads=1, resume=False, hf=tmp, gguf=str(Path(tmp) / "out.gguf"), source_revision="0" * 40,
+                quant="q2", payload=True)
+            write_gguf(args, [item], records, db)
+            start, _ = print_plan([item], records, [], GGUF_ALIGNMENT)
+            with open(args.out, "rb") as fp:
+                fp.seek(start)
+                self.assertEqual(fp.read(item.nbytes), self.q.encode(values, QTYPE_Q4_K, weights))
+            (Path(tmp) / "config.json").write_text("{}")
+            with mock.patch.object(artifact_audit, "SourceDB", return_value=db), \
+                 mock.patch.object(artifact_audit, "build_plan", return_value=[item]):
+                artifact_audit.validate(args)
+                args.attention_imatrix = None
+                with self.assertRaisesRegex(ValueError, "metadata mismatch"):
+                    artifact_audit.validate(args)
 
 
 def official_engram(reference_dir, library_path):

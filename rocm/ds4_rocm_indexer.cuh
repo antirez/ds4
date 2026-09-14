@@ -882,15 +882,25 @@ static int indexer_scores_launch(
         uint32_t                ratio,
         float                   scale,
         uint32_t                causal) {
-    if (!scores || !q || !weights || !index_comp ||
-        n_comp == 0 || n_tokens == 0 || n_head == 0 || head_dim == 0 ||
-        q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
-        weights->bytes < (uint64_t)n_tokens * n_head * sizeof(float) ||
-        index_comp->bytes < (uint64_t)n_comp * head_dim * sizeof(float) ||
-        scores->bytes < (uint64_t)n_tokens * n_comp * sizeof(float)) {
-        return 0;
-    }
-    if (causal && ratio == 0) return 0;
+    if (!scores || !q || !weights || !index_comp) return 0;
+    ds4_indexer_plan_request request = {};
+    request.backend = DS4_INDEXER_BACKEND_HIP;
+    request.phase = ds4_gpu_get_execution_phase();
+    request.n_comp = n_comp;
+    request.n_tokens = n_tokens;
+    request.pos0 = causal ? pos0 : 0;
+    request.n_head = n_head;
+    request.head_dim = head_dim;
+    request.ratio = causal ? ratio : 1;
+    request.quality = g_quality_mode;
+    ds4_indexer_plan_caps caps = {};
+    caps.max_buffer_bytes = UINT64_MAX;
+    ds4_indexer_plan plan;
+    // Native kernels keep their shape, precision and dispatch policy. The
+    // shared plan checks products before buffer comparisons or GPU encoding.
+    if (!ds4_indexer_plan_build(&request, &caps, &plan) ||
+        q->bytes < plan.q_bytes || weights->bytes < plan.weight_bytes ||
+        index_comp->bytes < plan.index_bytes || scores->bytes < plan.score_bytes) return 0;
     if (n_tokens == 1u && head_dim == 128u && n_head == 64u) {
         indexer_score_one_direct_kernel<<<n_comp, 128>>>((float *)scores->ptr,
                                                          (const float *)q->ptr,

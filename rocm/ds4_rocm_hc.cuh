@@ -3,6 +3,8 @@
 // Included from ds4_cuda.cu in the same translation unit to preserve current
 // static helper visibility and launch behavior.
 
+#include "../cuda/ds4_hc_norm_mix.cuh"
+
 __device__ static void hc4_split_one(float *out, const float *mix, const float *scale, const float *base, uint32_t sinkhorn_iters, float epsv) {
     const float pre_scale = scale[0];
     const float post_scale = scale[1];

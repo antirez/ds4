@@ -23,13 +23,71 @@ from glm53_quantize import (
     SourceDB, TensorPlan, Quantizer, Imatrix, QTYPE_F32, QTYPE_F16,
     QTYPE_Q8_0, QTYPE_Q2_K, QTYPE_Q4_K, QTYPE_IQ2_XXS, QTYPE_I8, align,
     conversion_signature, kv_string, load_resume_state, print_plan,
-    qtype_nbytes, save_resume_state, tensor_header,
+    qtype_nbytes, read_exact, save_resume_state, tensor_header,
 )
 
 QUANTIZATION = {
     "q2": "IQ2_XXS gate/up; Q2_K down; Q8_0 attention/shared/head",
     "q4": "Q4_K gate/up/down; Q8_0 attention/shared/head",
 }
+ATTENTION_PROJ = {"q8_0": QTYPE_Q8_0, "q4_k": QTYPE_Q4_K}
+ATTENTION_SUFFIXES = ("attn_q_a.weight", "attn_q_b.weight", "attn_kv.weight",
+                      "attn_output_a.weight", "attn_output_b.weight")
+
+
+class AttentionImatrix(Imatrix):
+    """Strict dense input; the file may also contain the existing expert entries."""
+    def __init__(self, path, np):
+        self.np, self.entries = np, {}
+        with open(path, "rb") as fp:
+            count = struct.unpack("<i", read_exact(fp, 4, "imatrix entry count"))[0]
+            if not 1 <= count <= 100000:
+                raise ValueError("invalid attention imatrix entry count")
+            for _ in range(count):
+                length = struct.unpack("<i", read_exact(fp, 4, "imatrix name length"))[0]
+                if not 1 <= length <= 4096:
+                    raise ValueError("invalid attention imatrix name length")
+                name = read_exact(fp, length, "imatrix name").decode("utf-8")
+                if name in self.entries:
+                    raise ValueError(f"duplicate attention imatrix entry {name}")
+                read_exact(fp, 4, "imatrix call count")
+                size = struct.unpack("<i", read_exact(fp, 4, "imatrix value count"))[0]
+                if size <= 0:
+                    raise ValueError(f"invalid attention imatrix value count for {name}")
+                values = np.frombuffer(read_exact(fp, size * 4, "imatrix values"), dtype="<f4").copy()
+                if not np.all(np.isfinite(values)) or np.any(values < 0):
+                    raise ValueError(f"invalid attention importance for {name}")
+                self.entries[name] = values
+
+
+def quantization_recipe(quant, attention_proj="q8_0"):
+    recipe = QUANTIZATION[quant]
+    if attention_proj == "q4_k":
+        return recipe.replace("Q8_0 attention/shared/head", "Q4_K attention; Q8_0 shared/head")
+    if attention_proj != "q8_0":
+        raise ValueError(f"unknown attention projection type: {attention_proj}")
+    return recipe
+
+
+def is_attention_projection(item):
+    return re.fullmatch(r"blk\.\d+\.(?:" + "|".join(re.escape(s) for s in ATTENTION_SUFFIXES) + r")", item.name) is not None
+
+
+def attention_importance(imatrix, item):
+    """One column vector per matrix; O_A aggregates its eight input groups.
+
+    Dense calibration is independent of expert calibration and never guessed.
+    """
+    if imatrix is None or item.qtype != QTYPE_Q4_K or not is_attention_projection(item):
+        return None
+    values = imatrix.entries.get(item.name)
+    if values is None:
+        raise ValueError(f"missing attention imatrix tensor {item.name}")
+    if values.size != item.shape[0]:
+        raise ValueError(f"attention imatrix {item.name} has {values.size} values, expected {item.shape[0]}")
+    if not imatrix.np.all(imatrix.np.isfinite(values)) or imatrix.np.any(values < 0) or not imatrix.np.any(values > 0):
+        raise ValueError(f"invalid attention importance for {item.name}")
+    return values
 
 
 def scale_name(name):
@@ -56,9 +114,10 @@ def validate_scales(tensors):
             raise ValueError(f"{name}: expected E8M0 scales {expected}")
 
 
-def build_plan(db, config, quant="q2"):
+def build_plan(db, config, quant="q2", attention_proj="q8_0"):
     if quant not in QUANTIZATION:
         raise ValueError(f"unknown quantization recipe: {quant}")
+    quantization_recipe(quant, attention_proj)
     c = config["text_config"]
     if config["quantization_config"]["weight_block_size"] != [32, 32]:
         raise ValueError("expected native 32x32 FP8 blocks")
@@ -103,6 +162,8 @@ def build_plan(db, config, quant="q2"):
             ("attn_output_a.weight", "wo_a.weight", (groups * orank, heads * hd // groups), QTYPE_Q8_0),
             ("attn_output_b.weight", "wo_b.weight", (dim, groups * orank), QTYPE_Q8_0),
         ):
+            if target in ATTENTION_SUFFIXES:
+                qt = ATTENTION_PROJ[attention_proj]
             regular(f"{dst}.{target}", f"{src}.attn.{source}", shape, qt, "attention")
         if layer in c["kv_source_layer_ids"]:
             for target, source, shape, qt in (
@@ -218,6 +279,11 @@ def write_engram(fp, item, db, np):
 def write_gguf(args, plan, records, db):
     quantizer = NativeQuantizer(args.quants_library)
     imatrix = Imatrix(args.imatrix, quantizer.np)
+    attention_path = getattr(args, "attention_imatrix", None)
+    attention_imatrix = AttentionImatrix(attention_path, quantizer.np) if attention_path else None
+    if attention_imatrix is not None:
+        for item in plan:
+            attention_importance(attention_imatrix, item)
     if args.imatrix:
         for item in plan:
             if item.is_expert and item.name not in imatrix.entries:
@@ -227,6 +293,8 @@ def write_gguf(args, plan, records, db):
     data_start, data_bytes = print_plan(plan, records, [], GGUF_ALIGNMENT)
     partial, journal = args.out + ".partial", args.out + ".partial.json"
     signature = conversion_signature(plan, records, [], args.imatrix)
+    if attention_path:
+        signature += conversion_signature(plan, [], [], attention_path)
     # A metadata/recipe match alone cannot distinguish two source downloads.
     source_identity = [(name, db.info(name)) for name in sorted(db.tensors)]
     signature = hashlib.sha256((signature + json.dumps(source_identity, sort_keys=True)).encode()).hexdigest()
@@ -280,7 +348,8 @@ def write_gguf(args, plan, records, db):
                         fp.write(data)
                         missing += int(fallback)
             else:
-                fp.write(quantizer.encode(quantizer.to_f32(db, item.source), item.qtype))
+                fp.write(quantizer.encode(quantizer.to_f32(db, item.source), item.qtype,
+                                         attention_importance(attention_imatrix, item)))
             if fp.tell() != data_start + item.offset + item.nbytes:
                 raise ValueError(f"incorrect payload size for {item.name}")
             fp.write(bytes(align(item.nbytes, GGUF_ALIGNMENT) - item.nbytes))
@@ -300,6 +369,8 @@ def main():
     parser.add_argument("--source-revision", required=True)
     parser.add_argument("--quant", choices=QUANTIZATION, default="q2")
     parser.add_argument("--imatrix")
+    parser.add_argument("--attention-proj", choices=ATTENTION_PROJ, default="q8_0")
+    parser.add_argument("--attention-imatrix", help="dense attention importance; requires all Q4 projection tensors")
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
@@ -310,15 +381,26 @@ def main():
         parser.error("source revision must be a full commit hash")
     if not 1 <= args.threads <= 32:
         parser.error("threads must be between 1 and 32")
+    if args.attention_imatrix and args.attention_proj != "q4_k":
+        parser.error("--attention-imatrix requires --attention-proj q4_k")
     config, records = metadata(args.hf, args.source_revision)
     db = SourceDB(args.hf, index_validator=lambda _: None, scale_validator=validate_scales)
     try:
-        plan = build_plan(db, config, args.quant)
-        records.append(kv_string("deepseek41.quantization", QUANTIZATION[args.quant]))
+        plan = build_plan(db, config, args.quant, args.attention_proj)
+        records.append(kv_string("deepseek41.quantization", quantization_recipe(args.quant, args.attention_proj)))
         records.append(kv_string("deepseek41.calibration", "imatrix" if args.imatrix else "weight-energy bootstrap"))
         if args.imatrix:
             records.append(kv_string("quantize.imatrix.file", os.path.basename(args.imatrix)))
+        if args.attention_proj == "q4_k":
+            records.append(kv_string("deepseek41.attention_calibration", "imatrix" if args.attention_imatrix else "uncalibrated"))
+            if args.attention_imatrix:
+                records.append(kv_string("deepseek41.attention_imatrix.file", os.path.basename(args.attention_imatrix)))
         if args.dry_run:
+            if args.attention_imatrix:
+                import numpy as np
+                dense = AttentionImatrix(args.attention_imatrix, np)
+                for item in plan:
+                    attention_importance(dense, item)
             print_plan(plan, records, [], GGUF_ALIGNMENT)
             for item in plan:
                 print(json.dumps(dataclasses.asdict(item), sort_keys=True))

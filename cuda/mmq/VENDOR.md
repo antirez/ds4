@@ -1,10 +1,22 @@
 # Vendored llama.cpp mmq kernels
 
-This directory contains source files copied verbatim from
+This directory contains source files imported from
 [llama.cpp's `ggml-cuda` backend](https://github.com/ggml-org/llama.cpp/tree/master/ggml/src/ggml-cuda),
 plus a thin ds4-side adapter (`ds4_ggml_stubs.{h,cu}` and `ds4_mmq.{h,cu}`)
 that lets the templated CUDA kernels compile and link without the full ggml
 runtime.
+
+The Q4 attention port adds local changes to `mmq.cuh`, `mmvq.{cu,cuh}`, and
+`quantize.{cu,cuh}`: dense write-back without identity maps, bounded HIP
+activation-tile loads, optional Q4 output sanitization, grouped MMVQ output
+mapping, and the fixed-shape grouped Q8_1 activation producer. The
+`ds4_mmq` adapter owns the shared-activation Q4 pair and strided attention-A
+dispatch. `ds4_q4_mmvq_epilogue.h` is a ds4-local policy/bit helper. Preserve
+these changes when resynchronizing the files listed as patched below.
+
+The historical testing matrix below predates this port. Its current checks
+and CUDA/HIP validation limits are recorded in
+[Q4 attention validation](../../docs/Q4_ATTENTION.md#validation).
 
 ## Why these files are vendored, not submoduled
 
@@ -27,11 +39,11 @@ keeps ds4 self-contained at the cost of a periodic re-sync.
 
 | File                  | Origin in llama.cpp                          | Status                                                                   | Lines |
 |-----------------------|----------------------------------------------|--------------------------------------------------------------------------|-------|
-| `mmq.cuh`             | `ggml/src/ggml-cuda/mmq.cuh`                 | verbatim                                                                 |  4176 |
+| `mmq.cuh`             | `ggml/src/ggml-cuda/mmq.cuh`                 | patched: dense IDs, bounded activation loads, Q4 store/fixup epilogue | — |
 | `mma.cuh`             | `ggml/src/ggml-cuda/mma.cuh`                 | verbatim                                                                 |  1456 |
 | `vecdotq.cuh`         | `ggml/src/ggml-cuda/vecdotq.cuh`             | verbatim                                                                 |  1317 |
-| `quantize.cuh`        | `ggml/src/ggml-cuda/quantize.cuh`            | verbatim                                                                 |    41 |
-| `quantize.cu`         | `ggml/src/ggml-cuda/quantize.cu`             | verbatim                                                                 |   443 |
+| `quantize.cuh`        | `ggml/src/ggml-cuda/quantize.cuh`            | patched: grouped Q4 attention activation producer declaration | — |
+| `quantize.cu`         | `ggml/src/ggml-cuda/quantize.cu`             | patched: grouped Q4 attention activation producer | — |
 | `mmid.cuh`            | `ggml/src/ggml-cuda/mmid.cuh`                | verbatim                                                                 |     5 |
 | `mmid.cu`             | `ggml/src/ggml-cuda/mmid.cu`                 | verbatim                                                                 |   164 |
 | `mmvq.cuh`            | `ggml/src/ggml-cuda/mmvq.cuh`                | patched (Step 6): `mul_mat_vec_q_switch_type` proto exposed; ggml-tensor entries gated on `DS4_MMVQ_INCLUDE_GGML_ENTRIES` | ~36 |

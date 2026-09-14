@@ -23,6 +23,13 @@ bool ds4_parse_streaming_cache_experts_arg(const char *s,
 
 uint32_t ds4_ssd_cache_experts_for_byte_budget(uint64_t bytes,
                                                uint64_t per_expert_bytes);
+/* Metal manual NGB target, including routed prefill/full-layer reservations.
+ * False means the working-set limit is unknown; true may return zero when
+ * fixed allocations exhaust it. Headroom is split from this target later. */
+bool ds4_ssd_manual_cache_safe_bytes(uint64_t recommended_bytes,
+                                      uint64_t context_bytes,
+                                      uint64_t non_routed_bytes,
+                                      uint64_t *safe_bytes_out);
 bool ds4_ssd_auto_cache_plan(uint64_t            recommended_bytes,
                              uint32_t            default_percent,
                              uint64_t            model_limit_bytes,

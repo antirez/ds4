@@ -7,6 +7,60 @@
 
 int main(void) {
     const uint64_t gib = 1ull << 30;
+    uint64_t safe = UINT64_MAX;
+    /* Manual targets include routed prefill headroom as well as decode cache.
+     * Fixed weights compete for the same memory on Metal: 56 - 6 - 12 = 38. */
+    assert(ds4_ssd_manual_cache_safe_bytes(64 * gib, 6 * gib, 12 * gib, &safe));
+    assert(safe == 38 * gib);
+    const uint64_t manual_total = safe;
+    assert(ds4_ssd_manual_cache_safe_bytes(64 * gib, 6 * gib, 0, &safe));
+    assert(safe == manual_total + 12 * gib);
+    /* The later planner splits headroom from this total; it is not another
+     * fixed deduction in the working-set cap. */
+    assert(ds4_ssd_cache_experts_for_byte_budget(manual_total - 6 * gib, gib) == 32);
+
+    /* Keep positive fractional-GiB budgets and distinguish exhausted/unknown. */
+    assert(ds4_ssd_manual_cache_safe_bytes(8 * gib, 6 * gib, gib / 2, &safe));
+    assert(safe == gib / 2);
+    assert(ds4_ssd_manual_cache_safe_bytes(8 * gib, 6 * gib + 3 * gib / 4,
+                                          gib / 16, &safe));
+    assert(safe == 3 * gib / 16);
+
+    /* Fractional recommendation and graph sizes must share the pinning
+     * limit: 56.4375 - 6.25 rounds to 50 GiB before fixed weights. */
+    const uint64_t fractional_fixed = 12 * gib + gib / 8;
+    assert(ds4_ssd_manual_cache_safe_bytes(64 * gib + gib / 2,
+                                          6 * gib + gib / 4,
+                                          fractional_fixed, &safe));
+    assert(safe == 37 * gib + 7 * gib / 8);
+    assert(fractional_fixed + safe == 50 * gib);
+    assert(ds4_ssd_manual_cache_safe_bytes(25 * gib, gib / 8,
+                                          6 * gib + gib / 16, &safe));
+    assert(safe == 14 * gib + 15 * gib / 16);
+    assert(6 * gib + gib / 16 + safe == 21 * gib);
+
+    assert(ds4_ssd_manual_cache_safe_bytes(8 * gib, 6 * gib, gib, &safe));
+    assert(safe == 0);
+    assert(ds4_ssd_manual_cache_safe_bytes(8 * gib, 7 * gib, gib, &safe));
+    assert(safe == 0);
+    safe = UINT64_MAX;
+    assert(!ds4_ssd_manual_cache_safe_bytes(0, 0, 0, &safe));
+    assert(safe == 0);
+    assert(!ds4_ssd_manual_cache_safe_bytes(gib, 0, 0, NULL));
+
+    /* The 7/8 target and fixed-allocation accounting cannot wrap at uint64 limits. */
+    assert(ds4_ssd_manual_cache_safe_bytes(UINT64_MAX, 0, 0, &safe));
+    assert(safe == UINT64_C(0xdfffffffc0000000));
+    assert(ds4_ssd_manual_cache_safe_bytes(UINT64_MAX, UINT64_MAX, 1, &safe));
+    assert(safe == 0);
+    assert(ds4_ssd_manual_cache_safe_bytes(UINT64_MAX, 1, UINT64_MAX, &safe));
+    assert(safe == 0);
+    assert(ds4_ssd_manual_cache_safe_bytes(UINT64_MAX,
+                                          UINT64_C(0xdffffffffffffffe), 0, &safe));
+    assert(safe == 1);
+    assert(ds4_ssd_manual_cache_safe_bytes(9, 0, 0, &safe));
+    assert(safe == 7);
+
     ds4_ssd_cache_plan p;
     unsetenv("DS4_SSD_AUTO_CACHE_PCT");
     assert(ds4_ssd_auto_cache_plan(100 * gib, 86, 0, 10 * gib, gib, 1000, &p));

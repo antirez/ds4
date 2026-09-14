@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -23,10 +24,15 @@
 #include <unordered_map>
 #include <vector>
 #include <algorithm>
+#include <mutex>
+#include "cuda/ds4_q4_prefill_reduce.h"
+#include "cuda/ds4_q4_dequant_layout.h"
+#include "cuda/ds4_hc_norm_mix.cuh"
 
 #include "cuda/mmq/ds4_mmq.h"
 #include "cuda/mmq/ds4_repack.h"
 #include "ds4_image.h"
+#include "ds4_indexer_plan.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -69,6 +75,8 @@ typedef struct {
     uint8_t qs[CUDA_QK_K / 2];
 } cuda_block_q4_K;
 
+#include "cuda/ds4_q4_dequant_vec.cuh"
+
 typedef struct {
     float d;
     int8_t qs[CUDA_QK_K];
@@ -81,8 +89,22 @@ typedef struct {
 } cuda_block_iq2_xxs;
 
 #include "ds4_gpu_mgpu.h"
+#include "ds4_gpu_phase.h"
 #include "ds4_gpu_tp.h"
 #include "ds4_iq2_tables_cuda.inc"
+
+static thread_local ds4_gpu_execution_phase g_execution_phase = DS4_GPU_PHASE_AUTO;
+
+extern "C" ds4_gpu_execution_phase ds4_gpu_get_execution_phase(void) {
+    return g_execution_phase;
+}
+
+extern "C" ds4_gpu_execution_phase ds4_gpu_exchange_execution_phase(
+        ds4_gpu_execution_phase phase) {
+    const ds4_gpu_execution_phase previous = g_execution_phase;
+    g_execution_phase = phase;
+    return previous;
+}
 
 typedef struct {
     ds4_gpu_attention_decode_row row[DS4_GPU_ATTENTION_DECODE_BATCH_MAX];
@@ -108,6 +130,28 @@ static int g_model_cache_full;
 static cudaStream_t g_model_prefetch_stream;
 static cudaStream_t g_model_upload_stream;
 static int g_cublas_ready;
+typedef struct ds4_gpu_q4_attn_q_b_f16_sidecar_desc {
+    uint64_t weight_offset;
+    uint64_t weight_bytes;
+    uint64_t in_dim;
+    uint64_t out_dim;
+    uint32_t weight_type;
+    uint32_t layer;
+} ds4_gpu_q4_attn_q_b_f16_sidecar_desc;
+
+static int g_cuda_is_gb10[DS4_MAX_GPUS];
+static int g_cuda_disable_q4_prefill_dequant_vec;
+static int g_cuda_test_q4_mmq_strict;
+static std::mutex g_q4_attn_q_b_f16_state_mutex;
+static std::mutex g_q4_attn_q_b_f16_build_mutex;
+static uint64_t g_q4_attn_q_b_f16_generation = 1u;
+static __half *g_q4_attn_q_b_transient_f16_scratch;
+static uint64_t g_q4_attn_q_b_transient_f16_scratch_bytes;
+static int g_q4_attn_q_b_transient_f16_scratch_device = -1;
+static int g_q4_attn_q_b_transient_f16_runtime_disabled;
+static std::mutex g_q4_attn_q_b_transient_f16_mutex;
+
+
 static int g_quality_mode;
 static int g_decode_fast_attention;
 static int g_decode_score_vec4;
@@ -115,6 +159,7 @@ static int g_xdev_sync_debug;
 static int g_xdev_force_cuda_peer;
 static int g_xdev_force_host_bounce;
 static int g_cuda_disable_qkv_rms_fused;
+static int g_cuda_disable_q8_quant_warp_reduce;
 static int g_cuda_no_window_attention;
 static int g_cuda_decode_heads8_online;
 static int g_cuda_decode_score4;
@@ -308,6 +353,8 @@ static void cuda_xdev_env_refresh(void) {
 }
 
 static void cuda_decode_dispatch_env_refresh(void) {
+    g_cuda_disable_q8_quant_warp_reduce =
+        getenv("DS4_CUDA_DISABLE_Q8_QUANT_WARP_REDUCE") != NULL;
     g_cuda_disable_qkv_rms_fused = getenv("DS4_CUDA_DISABLE_QKV_RMS_FUSED") != NULL;
     g_cuda_no_window_attention = getenv("DS4_CUDA_NO_WINDOW_ATTENTION") != NULL;
     g_cuda_decode_heads8_online = getenv("DS4_CUDA_DECODE_HEADS8_ONLINE") != NULL;
@@ -423,6 +470,20 @@ struct cuda_q8_f32_range {
     float *device_ptr;
     int device_id;          /* physical CUDA device id; 0 in single-tier */
 };
+
+struct cuda_f16_pair_chunk32_range {
+    const void *host_base;
+    uint64_t weight0_offset;
+    uint64_t weight1_offset;
+    uint64_t in_dim;
+    uint32_t width;
+    __half2 *device_ptr;
+    int device_id;
+};
+static std::vector<cuda_f16_pair_chunk32_range> g_f16_pair_chunk32_ranges;
+static std::mutex g_f16_pair_chunk32_mutex;
+static uint64_t g_f16_pair_chunk32_bytes;
+static int g_f16_pair_chunk32_disabled_after_oom;
 
 enum cuda_derived_kind {
     CUDA_DERIVED_IQ2_XXS_ALIGNED_MOE = 4,
@@ -948,6 +1009,8 @@ static_assert(sizeof(ds4_decode_graph_key) == 48u,
 
 struct cuda_decode_graph_entry {
     ds4_decode_graph_key key;
+    /* Phase participates in lookup without changing the public graph-key ABI. */
+    ds4_gpu_execution_phase phase;
     cudaGraphExec_t      exec;
     int                  state;   /* 0 empty, 1 warmed, 2 ready, 3 dead */
     uint64_t             hits;
@@ -958,6 +1021,7 @@ static cuda_decode_graph_entry
                    [CUDA_DECODE_GRAPH_VARIANTS];
 static cudaStream_t g_decode_graph_stream = NULL;
 static int g_decode_graph_capturing = 0;
+static ds4_gpu_execution_phase g_decode_graph_capture_phase = DS4_GPU_PHASE_AUTO;
 static uint64_t g_decode_graph_replays = 0;
 static uint64_t g_decode_graph_captures = 0;
 
@@ -1041,18 +1105,20 @@ extern "C" void ds4_gpu_decode_graphs_invalidate(void) {
 }
 
 static cuda_decode_graph_entry *cuda_decode_graph_find(
-        const ds4_decode_graph_key *key) {
+        const ds4_decode_graph_key *key, ds4_gpu_execution_phase phase) {
     if (key->il >= CUDA_DECODE_GRAPH_LAYERS ||
         key->island >= CUDA_DECODE_GRAPH_ISLANDS) return NULL;
     cuda_decode_graph_entry *slot = NULL;
     for (uint32_t v = 0; v < CUDA_DECODE_GRAPH_VARIANTS; v++) {
         cuda_decode_graph_entry *e = &g_decode_graphs[key->il][key->island][v];
         if (e->state != 0 &&
+            e->phase == phase &&
             memcmp(&e->key, key, sizeof(*key)) == 0) return e;
         if (e->state == 0 && !slot) slot = e;
     }
     if (slot) {
         memcpy(&slot->key, key, sizeof(*key));
+        slot->phase = phase;
         slot->state = 0;   /* caller advances the state machine */
         return slot;
     }
@@ -1062,7 +1128,8 @@ static cuda_decode_graph_entry *cuda_decode_graph_find(
 extern "C" int ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key) {
     if (!key || !ds4_gpu_decode_graphs_supported()) return -1;
     if (g_decode_graph_capturing) return -1;   /* no nesting */
-    cuda_decode_graph_entry *e = cuda_decode_graph_find(key);
+    const ds4_gpu_execution_phase phase = ds4_gpu_get_execution_phase();
+    cuda_decode_graph_entry *e = cuda_decode_graph_find(key, phase);
     if (!e || e->state == 3) return -1;
     if (e->state == 0) {
         /* Warm pass: run eagerly once so lazy allocators (tmp scratch,
@@ -1103,6 +1170,7 @@ extern "C" int ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key) {
         return -1;
     }
     g_decode_graph_capturing = 1;
+    g_decode_graph_capture_phase = phase;
     return 0;
 }
 
@@ -1112,7 +1180,16 @@ extern "C" int ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key) {
     cudaGraph_t graph = NULL;
     cudaError_t err = cudaStreamEndCapture(g_decode_graph_stream, &graph);
     (void)cublasSetStream(cuda_cublas_for_tier(0), NULL);
-    cuda_decode_graph_entry *e = cuda_decode_graph_find(key);
+    cuda_decode_graph_entry *e = cuda_decode_graph_find(key, g_decode_graph_capture_phase);
+    /* A graph must retain the dispatch phase under which its nodes were
+     * selected. Discard an interrupted scope instead of caching mismatched
+     * preparation kernels; the caller can encode the island eagerly. */
+    if (ds4_gpu_get_execution_phase() != g_decode_graph_capture_phase) {
+        if (graph) (void)cudaGraphDestroy(graph);
+        if (e) cuda_decode_graph_entry_kill(e);
+        (void)cudaGetLastError();
+        return -1;
+    }
     if (err != cudaSuccess || graph == NULL) {
         fprintf(stderr, "ds4: decode graph capture failed (il=%u island=%u): %s\n",
                 key->il, key->island, cudaGetErrorString(err));
@@ -1180,6 +1257,10 @@ extern "C" int ds4_cuda_q8_fold_take_q81(const void *src, uint64_t in_dim,
                                          const void **q81) {
     (void)src; (void)in_dim; (void)q81;
     return 0;
+}
+
+extern "C" void ds4_cuda_test_set_q4_mmq_strict(int required) {
+    g_cuda_test_q4_mmq_strict = required != 0;
 }
 
 static int cuda_use_mmq(void) {
@@ -1295,7 +1376,7 @@ extern "C" void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key) {
     (void)cublasSetStream(cuda_cublas_for_tier(0), NULL);
     (void)cudaGetLastError();
     if (key) {
-        cuda_decode_graph_entry *e = cuda_decode_graph_find(key);
+        cuda_decode_graph_entry *e = cuda_decode_graph_find(key, g_decode_graph_capture_phase);
         if (e) cuda_decode_graph_entry_kill(e);
     }
 }
@@ -1465,6 +1546,16 @@ static int cuda_env_flag_enabled(const char *name, int fallback) {
     return strcmp(env, "0") != 0;
 }
 
+static int cuda_q4_gb10_fast_path_enabled(
+        int logical_tier, const char *local_rollback_env) {
+    if (g_n_gpus != 1) return 0;
+    if (logical_tier < 0) logical_tier = 0;
+    if (logical_tier != 0 || !g_cuda_is_gb10[logical_tier]) return 0;
+    if (getenv("DS4_CUDA_NO_Q4_GB10_FAST") != NULL) return 0;
+    if (local_rollback_env && getenv(local_rollback_env) != NULL) return 0;
+    return cuda_use_mmq();
+}
+
 extern "C" int ds4_gpu_set_decode_fast_attention(int enabled) {
     const int old = g_decode_fast_attention;
     g_decode_fast_attention = enabled != 0;
@@ -1482,6 +1573,352 @@ static bool cuda_splitkv_decode_requested(void) {
     return g_decode_fast_attention ||
            cuda_env_flag_enabled("DS4_CUDA_SPLITKV_DECODE", 0);
 }
+
+enum {
+    CUDA_Q4_ATTN_Q_B_TYPE = 12u,
+    CUDA_Q4_ATTN_Q_B_IN_DIM = 1024u,
+    CUDA_Q4_ATTN_Q_B_OUT_DIM = 32768u,
+    CUDA_Q4_ATTN_Q_B_MAX_ENTRIES = 80u,
+};
+
+static uint32_t cuda_q4_attn_q_b_transient_f16_min_tokens(void) {
+    int present = 0;
+    return cuda_parse_u32_env_clamped(
+        "DS4_CUDA_Q4_ATTN_Q_B_TRANSIENT_F16_MIN_TOKENS",
+        4096u, 32u, UINT32_MAX, &present);
+}
+
+static int cuda_q4_attn_q_b_transient_f16_disabled(void) {
+    const char *value = getenv("DS4_CUDA_DISABLE_Q4_ATTN_Q_B_TRANSIENT_F16");
+    if (!value || !value[0]) return 0;
+    return strcmp(value, "0") != 0 && strcasecmp(value, "false") != 0 &&
+           strcasecmp(value, "no") != 0 && strcasecmp(value, "off") != 0;
+}
+
+static int cuda_q4_attn_q_b_transient_f16_scratch_size(
+        uint32_t max_rows,
+        uint64_t *weight_bytes,
+        uint64_t *activation_offset,
+        uint64_t *scratch_bytes) {
+    const uint64_t wh_bytes =
+        (uint64_t)CUDA_Q4_ATTN_Q_B_IN_DIM *
+        CUDA_Q4_ATTN_Q_B_OUT_DIM * sizeof(__half);
+    const uint64_t xh_off = (wh_bytes + 255u) & ~UINT64_C(255);
+    const uint64_t xh_row_bytes =
+        (uint64_t)CUDA_Q4_ATTN_Q_B_IN_DIM * sizeof(__half);
+    if (max_rows == 0u ||
+        (uint64_t)max_rows > (UINT64_MAX - xh_off) / xh_row_bytes) {
+        return 0;
+    }
+    const uint64_t total = xh_off + (uint64_t)max_rows * xh_row_bytes;
+    if (total > SIZE_MAX) return 0;
+    if (weight_bytes) *weight_bytes = wh_bytes;
+    if (activation_offset) *activation_offset = xh_off;
+    if (scratch_bytes) *scratch_bytes = total;
+    return 1;
+}
+
+/* The automatic path is intentionally limited to physical device storage.
+ * cuda_model_range_ptr may also expose managed/HMM or mapped host memory; a
+ * per-layer dequantization from either source would fold migration/PCIe cost
+ * into prefill and could be much slower than the native Q4 kernel. */
+static int cuda_q4_attn_q_b_source_is_device_resident(
+        const void *ptr,
+        int expected_device) {
+    if (!ptr) return 0;
+    cudaPointerAttributes attr = {};
+    const cudaError_t err = cudaPointerGetAttributes(&attr, ptr);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+#if CUDART_VERSION >= 10000
+    return attr.type == cudaMemoryTypeDevice &&
+           attr.device == expected_device;
+#else
+    return attr.memoryType == cudaMemoryTypeDevice &&
+           attr.device == expected_device;
+#endif
+}
+
+extern "C" int ds4_cuda_test_model_range_is_device_resident(
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t offset,
+        uint64_t bytes,
+        int logical_tier) {
+    if (!model_map || model_size == 0u || bytes == 0u ||
+        offset > model_size || bytes > model_size - offset ||
+        g_n_gpus != 1 || logical_tier != 0 ||
+        model_map != g_model_host_base ||
+        model_size != g_model_registered_size ||
+        !g_model_device_owned || !g_model_device_base) {
+        return 0;
+    }
+
+    const char *resolved = g_model_device_base + offset;
+    return cuda_q4_attn_q_b_source_is_device_resident(
+        resolved, g_gpu[logical_tier].device_id);
+}
+
+/* Match the existing CUDA weight-cache safety floor without coupling this
+ * cache to the Q8-specific reserve environment variable.  The explicit
+ * future-session reserve supplied by ds4.c is added independently. */
+static uint64_t cuda_q4_attn_q_b_f16_reserve_bytes(uint64_t total_bytes) {
+    if (total_bytes >= 112ull * 1024ull * 1024ull * 1024ull) {
+        return 512ull * 1048576ull;
+    }
+    if (total_bytes >= 40ull * 1024ull * 1024ull * 1024ull) {
+        const uint64_t min_reserve = 768ull * 1048576ull;
+        const uint64_t pct_reserve = total_bytes / 100u;
+        return pct_reserve > min_reserve ? pct_reserve : min_reserve;
+    }
+    const uint64_t min_reserve = 4096ull * 1048576ull;
+    const uint64_t pct_reserve = total_bytes / 20u;
+    return pct_reserve > min_reserve ? pct_reserve : min_reserve;
+}
+
+static int cuda_q4_attn_q_b_transient_f16_scratch_release(void) {
+    std::lock_guard<std::mutex> lock(
+        g_q4_attn_q_b_transient_f16_mutex);
+    if (!g_q4_attn_q_b_transient_f16_scratch) {
+        g_q4_attn_q_b_transient_f16_scratch_bytes = 0;
+        g_q4_attn_q_b_transient_f16_scratch_device = -1;
+        g_q4_attn_q_b_transient_f16_runtime_disabled = 0;
+        return 1;
+    }
+
+    int previous_device = -1;
+    (void)cudaGetDevice(&previous_device);
+    const int owner = g_q4_attn_q_b_transient_f16_scratch_device;
+    if (owner < 0 || cudaSetDevice(owner) != cudaSuccess ||
+        cudaDeviceSynchronize() != cudaSuccess) {
+        (void)cudaGetLastError();
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        return 0;
+    }
+    if (cudaFree(g_q4_attn_q_b_transient_f16_scratch) != cudaSuccess) {
+        (void)cudaGetLastError();
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        return 0;
+    }
+    g_q4_attn_q_b_transient_f16_scratch = NULL;
+    g_q4_attn_q_b_transient_f16_scratch_bytes = 0;
+    g_q4_attn_q_b_transient_f16_scratch_device = -1;
+    g_q4_attn_q_b_transient_f16_runtime_disabled = 0;
+    {
+        std::lock_guard<std::mutex> cache_lock(
+            g_q4_attn_q_b_f16_state_mutex);
+        if (++g_q4_attn_q_b_f16_generation == 0u) {
+            g_q4_attn_q_b_f16_generation = 1u;
+        }
+    }
+    if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+    return 1;
+}
+
+static int cuda_q4_attn_q_b_transient_f16_scratch_ensure(
+        uint32_t max_rows,
+        uint64_t working_set_reserve_bytes,
+        uint64_t *prepared_bytes) {
+    uint64_t scratch_bytes = 0;
+    if (!cuda_q4_attn_q_b_transient_f16_scratch_size(
+            max_rows, NULL, NULL, &scratch_bytes)) {
+        return 0;
+    }
+
+    std::lock_guard<std::mutex> lock(
+        g_q4_attn_q_b_transient_f16_mutex);
+    const int target_device = g_gpu[0].device_id;
+    if (g_q4_attn_q_b_transient_f16_scratch &&
+        g_q4_attn_q_b_transient_f16_scratch_device == target_device &&
+        g_q4_attn_q_b_transient_f16_scratch_bytes >= scratch_bytes) {
+        return 1;
+    }
+    /* A CUDA backend instance does not migrate its single-GPU arena between
+     * physical devices. Cleanup/reinit owns that transition; preserving the
+     * old allocation is safer than partially replacing it here. */
+    if (g_q4_attn_q_b_transient_f16_scratch &&
+        g_q4_attn_q_b_transient_f16_scratch_device != target_device) {
+        return 0;
+    }
+
+    int previous_device = -1;
+    if (cudaGetDevice(&previous_device) != cudaSuccess ||
+        cudaSetDevice(target_device) != cudaSuccess) {
+        (void)cudaGetLastError();
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        return 0;
+    }
+
+    size_t free_bytes = 0;
+    size_t total_bytes = 0;
+    if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) {
+        (void)cudaGetLastError();
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        return 0;
+    }
+    const uint64_t effective_free = (uint64_t)free_bytes;
+    const uint64_t reserve =
+        cuda_q4_attn_q_b_f16_reserve_bytes((uint64_t)total_bytes);
+    uint64_t required_free = scratch_bytes;
+    if (required_free > UINT64_MAX - reserve) {
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        return 0;
+    }
+    required_free += reserve;
+    if (required_free > UINT64_MAX - working_set_reserve_bytes) {
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        return 0;
+    }
+    required_free += working_set_reserve_bytes;
+    if (required_free > effective_free) {
+        if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE") != NULL) {
+            fprintf(stderr,
+                    "ds4: CUDA Q4 attn_q_b transient F16 preflight skipped: "
+                    "need %.2f MiB scratch + %.2f GiB reserve + %.2f GiB "
+                    "future sessions, only %.2f GiB currently free\n",
+                    (double)scratch_bytes / 1048576.0,
+                    (double)reserve / 1073741824.0,
+                    (double)working_set_reserve_bytes / 1073741824.0,
+                    (double)effective_free / 1073741824.0);
+        }
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        return 0;
+    }
+
+    /* Allocate first so a failed grow cannot invalidate the capacity published
+     * by the current generation. The conservative admission above intentionally
+     * does not count the old arena as reclaimable. */
+    __half *scratch = NULL;
+    if (cudaMalloc((void **)&scratch, (size_t)scratch_bytes) != cudaSuccess) {
+        (void)cudaGetLastError();
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        return 0;
+    }
+
+    /* Any old arena can still be referenced by stream work queued by a previous
+     * command batch. Drain before replacing it; this synchronization happens in
+     * prompt-aware preflight, never in the timed layer loop. */
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+        (void)cudaGetLastError();
+        (void)cudaFree(scratch);
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        return 0;
+    }
+    if (g_q4_attn_q_b_transient_f16_scratch) {
+        if (cudaFree(g_q4_attn_q_b_transient_f16_scratch) != cudaSuccess) {
+            (void)cudaGetLastError();
+            (void)cudaFree(scratch);
+            if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+            return 0;
+        }
+    }
+    g_q4_attn_q_b_transient_f16_scratch = scratch;
+    g_q4_attn_q_b_transient_f16_scratch_bytes = scratch_bytes;
+    g_q4_attn_q_b_transient_f16_scratch_device = target_device;
+    g_q4_attn_q_b_transient_f16_runtime_disabled = 0;
+    /* Session preflight caches the backend generation.  Capacity is part of
+     * readiness: after a grow, sessions prepared for a smaller prompt must
+     * revisit preflight before their next larger sync. */
+    {
+        std::lock_guard<std::mutex> cache_lock(
+            g_q4_attn_q_b_f16_state_mutex);
+        if (++g_q4_attn_q_b_f16_generation == 0u) {
+            g_q4_attn_q_b_f16_generation = 1u;
+        }
+    }
+    if (prepared_bytes) *prepared_bytes = scratch_bytes;
+    if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+    fprintf(stderr,
+            "ds4: CUDA prepared reusable Q4 attn_q_b transient F16 scratch "
+            "(%.2f MiB, max batch %u tokens, output F32)\n",
+            (double)scratch_bytes / 1048576.0, max_rows);
+    return 1;
+}
+
+extern "C" uint64_t ds4_gpu_q4_attn_q_b_f16_cache_generation(void) {
+    std::lock_guard<std::mutex> lock(g_q4_attn_q_b_f16_state_mutex);
+    return g_q4_attn_q_b_f16_generation;
+}
+
+/* The public lifecycle API also owns the automatic transient arena. */
+extern "C" int ds4_gpu_release_q4_attn_q_b_f16_sidecars(void) {
+    std::lock_guard<std::mutex> build_lock(g_q4_attn_q_b_f16_build_mutex);
+    return cuda_q4_attn_q_b_transient_f16_scratch_release();
+}
+
+extern "C" int ds4_gpu_make_room_for_q4_attn_q_b_f16_session(void) {
+    return ds4_gpu_release_q4_attn_q_b_f16_sidecars();
+}
+
+extern "C" int ds4_gpu_prepare_q4_attn_q_b_f16_sidecars(
+        const void *model_map,
+        uint64_t model_size,
+        const ds4_gpu_q4_attn_q_b_f16_sidecar_desc *descs,
+        uint32_t count,
+        uint32_t max_prefill_rows,
+        uint64_t working_set_reserve_bytes,
+        uint64_t *prepared_bytes) {
+    if (prepared_bytes) *prepared_bytes = 0;
+    if (cuda_q4_attn_q_b_transient_f16_disabled() ||
+        max_prefill_rows < cuda_q4_attn_q_b_transient_f16_min_tokens() ||
+        g_ssd_streaming_mode || g_quality_mode || g_n_gpus != 1 ||
+        !g_cublas_ready || !g_gpu[0].cublas_ready || !g_gpu[0].cublas ||
+        g_decode_graph_capturing || !model_map || !descs || count == 0u ||
+        count > CUDA_Q4_ATTN_Q_B_MAX_ENTRIES) {
+        return 0;
+    }
+
+    const uint64_t expected_weight_bytes =
+        (uint64_t)CUDA_Q4_ATTN_Q_B_OUT_DIM *
+        (CUDA_Q4_ATTN_Q_B_IN_DIM / CUDA_QK_K) *
+        sizeof(cuda_block_q4_K);
+    for (uint32_t i = 0; i < count; i++) {
+        const ds4_gpu_q4_attn_q_b_f16_sidecar_desc &desc = descs[i];
+        if (desc.weight_type != CUDA_Q4_ATTN_Q_B_TYPE ||
+            desc.in_dim != CUDA_Q4_ATTN_Q_B_IN_DIM ||
+            desc.out_dim != CUDA_Q4_ATTN_Q_B_OUT_DIM ||
+            desc.weight_bytes != expected_weight_bytes ||
+            desc.weight_offset > model_size ||
+            desc.weight_bytes > model_size - desc.weight_offset) {
+            return 0;
+        }
+    }
+
+    /* Serialize capacity publication with lifecycle release. */
+    std::lock_guard<std::mutex> build_lock(g_q4_attn_q_b_f16_build_mutex);
+    int previous_device = -1;
+    if (cudaGetDevice(&previous_device) != cudaSuccess ||
+        cudaSetDevice(g_gpu[0].device_id) != cudaSuccess) {
+        (void)cudaGetLastError();
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        return 0;
+    }
+    int resident =
+        model_map == g_model_host_base &&
+        model_size == g_model_registered_size &&
+        g_model_device_owned && g_model_device_base;
+    for (uint32_t i = 0; i < count; i++) {
+        if (!resident) break;
+        const char *source =
+            g_model_device_base + descs[i].weight_offset;
+        if (!cuda_q4_attn_q_b_source_is_device_resident(
+                source, g_gpu[0].device_id)) {
+            resident = 0;
+            break;
+        }
+    }
+    if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+    if (!resident ||
+        !cuda_q4_attn_q_b_transient_f16_scratch_ensure(
+            max_prefill_rows, working_set_reserve_bytes,
+            prepared_bytes)) {
+        return 0;
+    }
+    return 1;
+}
+
 
 static uint64_t cuda_q8_f16_cache_limit_bytes(void) {
     int present = 0;
@@ -2622,7 +3059,27 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
     return 1;
 }
 
+static void cuda_f16_pair_chunk32_release_all(void) {
+    std::lock_guard<std::mutex> lock(g_f16_pair_chunk32_mutex);
+    if (!g_f16_pair_chunk32_ranges.empty()) {
+        /* Captured consumers must not retain the immutable cache pointers
+         * across model changes. cudaFree drains their submitted device work. */
+        ds4_gpu_decode_graphs_invalidate();
+        int previous_device = -1;
+        (void)cudaGetDevice(&previous_device);
+        for (const cuda_f16_pair_chunk32_range &r : g_f16_pair_chunk32_ranges) {
+            (void)cudaSetDevice(r.device_id);
+            (void)cudaFree(r.device_ptr);
+        }
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        g_f16_pair_chunk32_ranges.clear();
+    }
+    g_f16_pair_chunk32_bytes = 0;
+    g_f16_pair_chunk32_disabled_after_oom = 0;
+}
+
 static void cuda_model_range_release_all(void) {
+    cuda_f16_pair_chunk32_release_all();
     for (const cuda_model_range &r : g_model_ranges) {
         if (r.host_registered && r.registered_base) {
             (void)cudaHostUnregister(r.registered_base);
@@ -2663,6 +3120,10 @@ static int cublas_ok(cublasStatus_t st, const char *what) {
 }
 
 extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
+    ds4_mmq_set_gb10_optimizations(0);
+    memset(g_cuda_is_gb10, 0, sizeof(g_cuda_is_gb10));
+    g_cuda_disable_q4_prefill_dequant_vec =
+        getenv("DS4_CUDA_DISABLE_Q4_PREFILL_DEQUANT_VEC") != NULL;
     if (!cfg || cfg->n_gpus < 1 || cfg->n_gpus > DS4_MAX_GPUS) return 0;
     cuda_xdev_env_refresh();
     cuda_decode_dispatch_env_refresh();
@@ -2686,6 +3147,7 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
         if (!cuda_ok(cudaSetDevice(c->device_id), "init set device")) return 0;
         cudaDeviceProp prop;
         if (cudaGetDeviceProperties(&prop, c->device_id) == cudaSuccess) {
+            g_cuda_is_gb10[i] = prop.major == 12 && prop.minor == 1 && prop.integrated;
             if (i == 0) g_device_is_spark =
                 prop.integrated && prop.major == 12 && prop.minor == 1;
             fprintf(stderr, "ds4: CUDA backend initialized on %s (sm_%d%d) dev=%d\n",
@@ -2852,6 +3314,7 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
     }
 
     g_cublas_ready = 1;
+    ds4_mmq_set_gb10_optimizations(g_n_gpus == 1 && g_cuda_is_gb10[0]);
     return 1;
 }
 
@@ -2866,6 +3329,11 @@ extern "C" int ds4_gpu_init(void) {
 extern "C" void ds4_gpu_cleanup(void) {
     ds4_gpu_stream_expert_cache_prefetch_finish(true);
     ds4_gpu_tp_shutdown();
+    ds4_mmq_set_gb10_optimizations(0);
+    if (!ds4_gpu_release_q4_attn_q_b_f16_sidecars()) {
+        fprintf(stderr, "ds4: CUDA Q4 scratch cleanup synchronization failed\n");
+        return;
+    }
     (void)cudaDeviceSynchronize();
     ds4_gpu_decode_graphs_invalidate();
     g_current_logical_tier = -1;
@@ -3796,6 +4264,7 @@ extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(
 extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
     if (!model_map || model_size == 0) return 0;
     if (g_model_host_base == model_map && g_model_registered_size == model_size) return 1;
+    if (!ds4_gpu_release_q4_attn_q_b_f16_sidecars()) return 0;
     cuda_stream_selected_cache_release();
     cuda_model_range_release_all();
     cuda_q8_f16_cache_release_all();
@@ -3972,6 +4441,7 @@ static int cuda_register_model_map(const void *model_map, uint64_t model_size,
                                    bool register_all) {
     if (!model_map || model_size == 0) return 0;
     if (g_model_host_base == model_map && g_model_registered_size == model_size) return 1;
+    if (!ds4_gpu_release_q4_attn_q_b_f16_sidecars()) return 0;
 
     cuda_stream_selected_cache_release();
     cuda_model_range_release_all();
@@ -4741,6 +5211,7 @@ extern "C" void ds4_gpu_print_memory_report(const char *label) {
 }
 
 extern "C" void ds4_gpu_set_quality(bool quality) {
+    (void)ds4_gpu_release_q4_attn_q_b_f16_sidecars();
     g_quality_mode = quality ? 1 : 0;
     const cublasMath_t math_mode =
         (g_quality_mode || getenv("DS4_CUDA_NO_TF32") != NULL)
@@ -5017,6 +5488,79 @@ __global__ static void matmul_f16_pair_ordered_chunks_kernel(
     }
 }
 
+#include "cuda/ds4_f16_compressor.cuh"
+
+/* The caller holds g_f16_pair_chunk32_mutex through the consumer enqueue.
+ * Entries are immutable and never evicted during decode. The bounded cache
+ * is released with the model ranges, after graph invalidation. */
+static int cuda_f16_pair_chunk32_get(
+        const void *model_map,
+        uint64_t weight0_offset,
+        uint64_t weight1_offset,
+        const __half *w0,
+        const __half *w1,
+        uint64_t in_dim,
+        uint32_t width,
+        int device_id,
+        cudaStream_t stream,
+        const __half2 **out) {
+    *out = NULL;
+    for (const cuda_f16_pair_chunk32_range &r : g_f16_pair_chunk32_ranges) {
+        if (r.host_base == model_map && r.weight0_offset == weight0_offset &&
+            r.weight1_offset == weight1_offset && r.in_dim == in_dim &&
+            r.width == width && r.device_id == device_id) {
+            *out = r.device_ptr;
+            return 1;
+        }
+    }
+    if (g_f16_pair_chunk32_disabled_after_oom || g_decode_graph_capturing) {
+        return 0;
+    }
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess ||
+        capture != cudaStreamCaptureStatusNone) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    if (in_dim == 0u || in_dim % 256u != 0u ||
+        (uint64_t)width > SIZE_MAX / sizeof(__half2) / in_dim) return 0;
+    const size_t count = (size_t)width * in_dim;
+    const uint64_t bytes = count * sizeof(__half2);
+    const uint64_t cache_limit = 1ull << 30;
+    if (bytes > cache_limit || g_f16_pair_chunk32_bytes > cache_limit - bytes) {
+        return 0;
+    }
+    __half2 *device_ptr = NULL;
+    cudaError_t err = cudaMalloc(&device_ptr, (size_t)bytes);
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: CUDA F16 compressor transpose disabled after "
+                "allocation failure (%.2f MiB): %s\n",
+                (double)bytes / 1048576.0, cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        g_f16_pair_chunk32_disabled_after_oom = 1;
+        return 0;
+    }
+    f16_pair_chunk32_repack_kernel<<<
+        (unsigned)((count + 255u) / 256u), 256, 0, stream>>>(
+            device_ptr, w0, w1, in_dim, width);
+    err = cudaGetLastError();
+    /* Publish only completed immutable weights. A later capture or another
+     * stream may consume the cached address without inheriting this stream. */
+    if (err == cudaSuccess) err = cudaStreamSynchronize(stream);
+    if (err != cudaSuccess) {
+        (void)cudaFree(device_ptr);
+        (void)cudaGetLastError();
+        return -1;
+    }
+    g_f16_pair_chunk32_ranges.push_back({
+        model_map, weight0_offset, weight1_offset, in_dim, width,
+        device_ptr, device_id});
+    g_f16_pair_chunk32_bytes += bytes;
+    *out = device_ptr;
+    return 1;
+}
+
 /* Preserve the 256-thread halving tree: combine the eight warp partials
  * before reducing within the first warp. Only two block barriers are needed. */
 __device__ __forceinline__ static float block_sum_f32_256(float v, float *partial) {
@@ -5138,84 +5682,29 @@ __device__ __forceinline__ static int32_t dot_i8_block(const int8_t *a, const in
     return dot;
 }
 
-__global__ static void quantize_q8_0_f32_kernel(
-        int8_t *xq,
-        float *xscale,
-        const float *x,
-        uint64_t in_dim,
-        uint64_t blocks) {
-    uint64_t b = blockIdx.x;
-    uint64_t tok = blockIdx.y;
-    if (b >= blocks) return;
-    uint64_t i0 = b * 32;
-    uint64_t bn = in_dim - i0 < 32 ? in_dim - i0 : 32;
-    const float *xr = x + tok * in_dim + i0;
-
-    float a = 0.0f;
-    if (threadIdx.x < bn) a = fabsf(xr[threadIdx.x]);
-    __shared__ float vals[32];
-    vals[threadIdx.x] = a;
-    __syncthreads();
-    for (uint32_t stride = 16; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) vals[threadIdx.x] = fmaxf(vals[threadIdx.x], vals[threadIdx.x + stride]);
-        __syncthreads();
-    }
-    const float d = vals[0] / 127.0f;
-    const float id = d != 0.0f ? 1.0f / d : 0.0f;
-    if (threadIdx.x == 0) xscale[tok * blocks + b] = d;
-    int8_t *dst = xq + (tok * blocks + b) * 32;
-    if (threadIdx.x < bn) {
-        int v = (int)lrintf(xr[threadIdx.x] * id);
-        v = v > 127 ? 127 : (v < -128 ? -128 : v);
-        dst[threadIdx.x] = (int8_t)v;
-    } else {
-        dst[threadIdx.x] = 0;
-    }
+__device__ __forceinline__ static int32_t dot_i8x32_aligned_int4(
+        const int4 &a0, const int4 &a1, const int8_t *b) {
+    const int32_t *bi = (const int32_t *)b;
+    int32_t dot = 0;
+    dot = __dp4a(a0.x, bi[0], dot);
+    dot = __dp4a(a0.y, bi[1], dot);
+    dot = __dp4a(a0.z, bi[2], dot);
+    dot = __dp4a(a0.w, bi[3], dot);
+    dot = __dp4a(a1.x, bi[4], dot);
+    dot = __dp4a(a1.y, bi[5], dot);
+    dot = __dp4a(a1.z, bi[6], dot);
+    dot = __dp4a(a1.w, bi[7], dot);
+    return dot;
 }
 
-__global__ static void quantize_q8_0_group_slice_rows_kernel(
-        int8_t *xq,
-        float *xscale,
-        const float *x,
-        uint64_t group_dim,
-        uint64_t blocks,
-        uint32_t n_groups_total,
-        uint32_t group0,
-        uint32_t group_cnt) {
-    const uint64_t b = blockIdx.x;
-    const uint64_t packed_row = blockIdx.y;
-    if (b >= blocks) return;
-    const uint64_t token = packed_row / group_cnt;
-    const uint64_t group = group0 + packed_row - token * group_cnt;
-    const uint64_t i0 = b * 32u;
-    const uint64_t bn = group_dim - i0 < 32u ? group_dim - i0 : 32u;
-    const float *xr = x +
-        (token * n_groups_total + group) * group_dim + i0;
+#include "cuda/ds4_q8_quantize.cuh"
 
-    float a = 0.0f;
-    if (threadIdx.x < bn) a = fabsf(xr[threadIdx.x]);
-    __shared__ float vals[32];
-    vals[threadIdx.x] = a;
-    __syncthreads();
-    for (uint32_t stride = 16u; stride > 0u; stride >>= 1u) {
-        if (threadIdx.x < stride) {
-            vals[threadIdx.x] =
-                fmaxf(vals[threadIdx.x], vals[threadIdx.x + stride]);
-        }
-        __syncthreads();
-    }
-    const float d = vals[0] / 127.0f;
-    const float id = d != 0.0f ? 1.0f / d : 0.0f;
-    if (threadIdx.x == 0u) xscale[packed_row * blocks + b] = d;
-    int8_t *dst = xq + (packed_row * blocks + b) * 32u;
-    if (threadIdx.x < bn) {
-        int v = (int)lrintf(xr[threadIdx.x] * id);
-        v = v > 127 ? 127 : (v < -128 ? -128 : v);
-        dst[threadIdx.x] = (int8_t)v;
-    } else {
-        dst[threadIdx.x] = 0;
-    }
+static inline bool cuda_q8_quant_warp_reduce_enabled(void) {
+    return !g_quality_mode && !g_cuda_disable_q8_quant_warp_reduce;
 }
+
+
+
 
 __global__ static void matmul_q8_0_preq_kernel(
         float *out,
@@ -5708,6 +6197,74 @@ __global__ static void matmul_q8_0_hc_expand_preq_warp8_kernel(
         const int8_t *xqb = xq + b * 32;
         int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
         acc += __half2float(*scale_h) * xscale[b] * (float)dot;
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0) {
+        const uint32_t d = (uint32_t)row;
+        block_out[d] = acc;
+        float block_v = acc;
+        if (has_owned_slots) {
+            const float routed = moe_owned_packed_combine_row(
+                    owned_home_slots,
+                    owned_peer_packed,
+                    owned_selected,
+                    d,
+                    (uint32_t)out_dim,
+                    owned_expert_split);
+            block_v = __fadd_rn(block_v, routed);
+        } else if (has_add) {
+            float add_v = block_add[d];
+            if (has_add2) add_v += block_add2[d];
+            block_v += add_v;
+        }
+        const float *post = split + n_hc;
+        const float *comb = split + 2u * n_hc;
+        for (uint32_t dst_hc = 0; dst_hc < n_hc; dst_hc++) {
+            float hc_acc = block_v * post[dst_hc];
+            for (uint32_t src_hc = 0; src_hc < n_hc; src_hc++) {
+                const float comb_v = comb[dst_hc + (uint64_t)src_hc * n_hc];
+                const float res_v = residual_hc[(uint64_t)src_hc * n_embd + d];
+                hc_acc += comb_v * res_v;
+            }
+            out_hc[(uint64_t)dst_hc * n_embd + d] = hc_acc;
+        }
+    }
+}
+
+/* The aligned artifact changes only weight loads: preserve the raw kernel's
+ * Q8_0 activation scales, lane/block order and fused HC epilogue. */
+__global__ static void matmul_q8_0_hc_expand_aligned_preq_warp8_kernel(
+        float *out_hc,
+        float *block_out,
+        const float *block_add,
+        const float *block_add2,
+        const float *owned_home_slots,
+        const float *owned_peer_packed,
+        const int32_t *owned_selected,
+        const float *residual_hc,
+        const float *split,
+        const int4 *w_qs,
+        const __half *w_dq,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t out_dim,
+        uint32_t n_embd,
+        uint32_t n_hc,
+        uint64_t blocks,
+        int has_add,
+        int has_add2,
+        int has_owned_slots,
+        uint32_t owned_expert_split) {
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    if (row >= out_dim) return;
+    const uint64_t rbase = row * blocks;
+    float acc = 0.0f;
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        const int4 w0 = w_qs[(rbase + b) * 2u];
+        const int4 w1 = w_qs[(rbase + b) * 2u + 1u];
+        const int32_t dot = dot_i8x32_aligned_int4(w0, w1, xq + b * 32u);
+        acc += __half2float(w_dq[rbase + b]) * xscale[b] * (float)dot;
     }
     acc = warp_sum_f32(acc);
     if (lane == 0) {
@@ -6736,13 +7293,21 @@ __global__ static void dsv4_qkv_rms_norm_rows_kernel(
         sum += v * v;
     }
     __shared__ float partial[256];
-    partial[threadIdx.x] = sum;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+    float total;
+    if (rows > 8u) {
+        // Q-A and KV retain their per-thread products and exact reduction
+        // tree; only prefill replaces the nine shared stages with two fences.
+        total = ds4_q4_prefill_reduce_256(sum, partial);
+    } else {
+        partial[threadIdx.x] = sum;
         __syncthreads();
+        for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+            __syncthreads();
+        }
+        total = partial[0];
     }
-    const float scale = rsqrtf(partial[0] / (float)n + eps);
+    const float scale = rsqrtf(total / (float)n + eps);
     for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
         orow[i] = xr[i] * scale * w[i];
     }
@@ -6806,13 +7371,19 @@ __global__ static void dsv4_qkv_rms_norm_rows_kv_rope_kernel(
         sum += v * v;
     }
     __shared__ float partial[256];
-    partial[threadIdx.x] = sum;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+    float total;
+    if (rows > 8u) {
+        total = ds4_q4_prefill_reduce_256(sum, partial);
+    } else {
+        partial[threadIdx.x] = sum;
         __syncthreads();
+        for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+            __syncthreads();
+        }
+        total = partial[0];
     }
-    const float scale = rsqrtf(partial[0] / (float)n + eps);
+    const float scale = rsqrtf(total / (float)n + eps);
     if (which == 0u) {
         for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
             orow[i] = xr[i] * scale * w[i];
@@ -6864,6 +7435,7 @@ __global__ static void dsv4_qkv_rms_norm_rows_kv_rope_kernel(
     }
 }
 
+template<bool Q4_PREFILL_REDUCE>
 __global__ static void head_rms_norm_rope_tail_kernel(
         float *x,
         uint32_t n_tok,
@@ -6890,13 +7462,19 @@ __global__ static void head_rms_norm_rope_tail_kernel(
         sum += v * v;
     }
     __shared__ float partial[256];
-    partial[threadIdx.x] = sum;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+    float total;
+    if (Q4_PREFILL_REDUCE) {
+        total = ds4_q4_prefill_reduce_256(sum, partial);
+    } else {
+        partial[threadIdx.x] = sum;
         __syncthreads();
+        for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+            __syncthreads();
+        }
+        total = partial[0];
     }
-    const float scale = rsqrtf(partial[0] / (float)head_dim + eps);
+    const float scale = rsqrtf(total / (float)head_dim + eps);
     const uint32_t n_nope = head_dim - n_rot;
     for (uint32_t i = threadIdx.x; i < n_nope; i += blockDim.x) {
         xr[i] *= scale;
@@ -11937,6 +12515,88 @@ __global__ static void hc_split_weighted_sum_norm_fused_kernel(
     }
 }
 
+/* Single-row HC4096 decode: spread the 64 KiB weighted sum over sixteen
+ * CTAs, then replay the reference's per-lane ascending-column sum of squares
+ * and 256-lane reduction tree before a sixteen-CTA normalized store. Keep the
+ * intermediate F32 rounding and arithmetic order of the fused kernel. */
+__global__ static void hc_split_weighted_sum_norm_fused_partial4096_kernel(
+        float *out,
+        float *split,
+        const float *mix,
+        const float *residual_hc,
+        const float *scale,
+        const float *base,
+        uint32_t sinkhorn_iters,
+        float epsv) {
+    constexpr uint32_t n_embd = 4096u;
+    constexpr uint32_t mix_hc = 24u;
+    constexpr uint32_t tile = 256u;
+    const uint32_t d = threadIdx.x;
+    const uint32_t tile0 = blockIdx.x * tile;
+
+    __shared__ float sp[mix_hc];
+    if (d == 0u) {
+        hc4_split_one(sp, mix, scale, base, sinkhorn_iters, epsv);
+    }
+    __syncthreads();
+    if (blockIdx.x == 0u && d < mix_hc) {
+        split[d] = sp[d];
+    }
+
+#pragma unroll
+    for (uint32_t j = 0; j < tile / 256u; j++) {
+        const uint32_t col = tile0 + j * 256u + d;
+        float acc = 0.0f;
+#pragma unroll
+        for (uint32_t h = 0; h < 4u; h++) {
+            acc += residual_hc[(uint64_t)h * n_embd + col] * sp[h];
+        }
+        out[col] = acc;
+    }
+}
+
+__global__ static void hc_split_weighted_sum_norm_fused_reduce4096_kernel(
+        const float *out,
+        float *norm_scale,
+        float norm_eps) {
+    constexpr uint32_t n_embd = 4096u;
+    const uint32_t d = threadIdx.x;
+
+    __shared__ float partial[256];
+    float sum = 0.0f;
+#pragma unroll
+    for (uint32_t j = 0; j < n_embd / 256u; j++) {
+        const uint32_t col = d + j * 256u;
+        sum += out[col] * out[col];
+    }
+    partial[d] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (d < stride) partial[d] += partial[d + stride];
+        __syncthreads();
+    }
+    if (d == 0u) {
+        norm_scale[0] = rsqrtf(partial[0] / (float)n_embd + norm_eps);
+    }
+}
+
+__global__ static void hc_split_weighted_sum_norm_fused_store4096_kernel(
+        const float *out,
+        float *norm_out,
+        const float *norm_w,
+        const float *norm_scale) {
+    constexpr uint32_t tile = 256u;
+    const uint32_t d = threadIdx.x;
+    const uint32_t tile0 = blockIdx.x * tile;
+    const float scale = norm_scale[0];
+#pragma unroll
+    for (uint32_t j = 0; j < tile / 256u; j++) {
+        const uint32_t col = tile0 + j * 256u + d;
+        const float normalized = out[col] * scale * norm_w[col];
+        norm_out[col] = normalized;
+    }
+}
+
 __global__ static void output_hc_weights_kernel(
         float *out,
         const float *pre,
@@ -14300,15 +14960,25 @@ static int indexer_scores_launch(
         uint32_t                ratio,
         float                   scale,
         uint32_t                causal) {
-    if (!scores || !q || !weights || !index_comp ||
-        n_comp == 0 || n_tokens == 0 || n_head == 0 || head_dim == 0 ||
-        q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
-        weights->bytes < (uint64_t)n_tokens * n_head * sizeof(float) ||
-        index_comp->bytes < (uint64_t)n_comp * head_dim * sizeof(float) ||
-        scores->bytes < (uint64_t)n_tokens * n_comp * sizeof(float)) {
-        return 0;
-    }
-    if (causal && ratio == 0) return 0;
+    if (!scores || !q || !weights || !index_comp) return 0;
+    ds4_indexer_plan_request request = {};
+    request.backend = DS4_INDEXER_BACKEND_CUDA;
+    request.phase = ds4_gpu_get_execution_phase();
+    request.n_comp = n_comp;
+    request.n_tokens = n_tokens;
+    request.pos0 = causal ? pos0 : 0;
+    request.n_head = n_head;
+    request.head_dim = head_dim;
+    request.ratio = causal ? ratio : 1;
+    request.quality = g_quality_mode;
+    ds4_indexer_plan_caps caps = {};
+    caps.max_buffer_bytes = UINT64_MAX;
+    ds4_indexer_plan plan;
+    // Native kernels keep their shape, precision and dispatch policy. The
+    // shared plan checks products before buffer comparisons or GPU encoding.
+    if (!ds4_indexer_plan_build(&request, &caps, &plan) ||
+        q->bytes < plan.q_bytes || weights->bytes < plan.weight_bytes ||
+        index_comp->bytes < plan.index_bytes || scores->bytes < plan.score_bytes) return 0;
     const int mxf4 = indexer_scores_mxf4_try(
         scores, q, weights, index_comp, n_comp, n_tokens, pos0,
         n_head, head_dim, ratio, scale);
@@ -15060,7 +15730,9 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     float *xscale = (float *)((char *)tmp + scale_offset);
     const int use_dp4a = cuda_q8_use_dp4a();
     dim3 qgrid((unsigned)blocks, (unsigned)n_tok, 1);
-    quantize_q8_0_f32_kernel<<<qgrid, 32, 0, cuda_decode_stream()>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
+    ds4_cuda_launch_q8_0_quantize(
+            cuda_q8_quant_warp_reduce_enabled(), qgrid, cuda_decode_stream(),
+            xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 quantize launch")) return 0;
     if (n_tok == 1) {
         matmul_q8_0_preq_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256, 0, cuda_decode_stream()>>>(
@@ -15231,12 +15903,9 @@ extern "C" int ds4_gpu_matmul_q8_0_top1_tensor(
                  "matmul_q8_0_top1 clear")) {
         return 0;
     }
-    quantize_q8_0_f32_kernel<<<(unsigned)blocks, 32>>>(
-            xq,
-            xscale,
-            (const float *)x->ptr,
-            in_dim,
-            blocks);
+    ds4_cuda_launch_q8_0_quantize(
+            cuda_q8_quant_warp_reduce_enabled(), (unsigned)blocks, 0,
+            xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0_top1 quantize launch")) return 0;
     matmul_q8_0_top1_preq_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256>>>(
             best_key,
@@ -15298,12 +15967,9 @@ extern "C" int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
     float *xscale = (float *)((char *)tmp + scale_offset);
     const int use_dp4a = cuda_q8_use_dp4a();
     const dim3 qgrid((unsigned)slice_blocks, (unsigned)n_tok, 1u);
-    quantize_q8_0_f32_kernel<<<qgrid, 32, 0, cuda_decode_stream()>>>(
-            xq,
-            xscale,
-            (const float *)x->ptr,
-            in_count,
-            slice_blocks);
+    ds4_cuda_launch_q8_0_quantize(
+            cuda_q8_quant_warp_reduce_enabled(), qgrid, cuda_decode_stream(),
+            xq, xscale, (const float *)x->ptr, in_count, slice_blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0_kslice quantize launch")) return 0;
     const dim3 grid(((unsigned)out_dim + 7u) / 8u,
                     (unsigned)n_tok, 1u);
@@ -15375,12 +16041,9 @@ extern "C" int ds4_gpu_matmul_q8_0_kslice_hc_expand_add_tensor(
     int8_t *xq = (int8_t *)tmp;
     float *xscale = (float *)((char *)tmp + scale_offset);
     const int use_dp4a = cuda_q8_use_dp4a();
-    quantize_q8_0_f32_kernel<<<(unsigned)slice_blocks, 32>>>(
-            xq,
-            xscale,
-            (const float *)x->ptr,
-            in_count,
-            slice_blocks);
+    ds4_cuda_launch_q8_0_quantize(
+            cuda_q8_quant_warp_reduce_enabled(), (unsigned)slice_blocks, 0,
+            xq, xscale, (const float *)x->ptr, in_count, slice_blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0_kslice_hc_expand_add quantize launch")) return 0;
     matmul_q8_0_kslice_hc_expand_add_preq_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256>>>(
             (float *)out_hc->ptr,
@@ -15493,7 +16156,8 @@ extern "C" int ds4_gpu_matmul_q4_K_pair_decode_tensor(
     return ds4_mmq_q4_K_dense_pair_vec(
         w0, w1, (const float *)x->ptr,
         (float *)out0->ptr, (float *)out1->ptr,
-        (int)out_dim, (int)in_dim, cuda_decode_stream()) == 0;
+        (int)out_dim, (int)out_dim, /*N=*/1, (int)in_dim,
+        cuda_decode_stream()) == 0;
 }
 
 extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
@@ -15555,7 +16219,9 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
     float *xscale = (float *)((char *)tmp + scale_offset);
     const int use_dp4a = cuda_q8_use_dp4a();
     dim3 qgrid((unsigned)blocks, (unsigned)n_tok, 1);
-    quantize_q8_0_f32_kernel<<<qgrid, 32, 0, cuda_decode_stream()>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
+    ds4_cuda_launch_q8_0_quantize(
+            cuda_q8_quant_warp_reduce_enabled(), qgrid, cuda_decode_stream(),
+            xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 pair quantize launch")) return 0;
     if (n_tok != 1) {
         if (force_decode_warp &&
@@ -15787,7 +16453,8 @@ extern "C" int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
     int8_t *xq = (int8_t *)tmp;
     float *xscale = (float *)((char *)tmp + scale_offset);
     dim3 qgrid((unsigned)blocks, n_rows, 1u);
-    quantize_q8_0_f32_kernel<<<qgrid, 32>>>(
+    ds4_cuda_launch_q8_0_quantize(
+            cuda_q8_quant_warp_reduce_enabled(), qgrid, 0,
             xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(),
                  "q8_0 decode rows exact quantize launch")) {
@@ -15861,7 +16528,8 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_decode_rows_exact_tensor(
     int8_t *xq = (int8_t *)tmp;
     float *xscale = (float *)((char *)tmp + scale_offset);
     dim3 qgrid((unsigned)blocks, n_rows, 1u);
-    quantize_q8_0_f32_kernel<<<qgrid, 32, 0, cuda_decode_stream()>>>(
+    ds4_cuda_launch_q8_0_quantize(
+            cuda_q8_quant_warp_reduce_enabled(), qgrid, cuda_decode_stream(),
             xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(),
                  "q8_0 pair decode rows exact quantize launch")) {
@@ -15878,6 +16546,33 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_decode_rows_exact_tensor(
             cuda_q8_use_dp4a());
     return cuda_ok(cudaGetLastError(),
                    "q8_0 pair decode rows exact warp launch");
+}
+
+/* GB10 builds these artifacts during model setup. Lookup never allocates or
+ * repacks while a decode graph is being captured; missing artifacts retain
+ * the canonical raw-weight implementation. */
+static const char *cuda_q8_hc_aligned_weight_ptr(
+        const void *model_map,
+        uint64_t weight_offset,
+        uint64_t weight_bytes,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        int logical_tier,
+        int use_dp4a) {
+    if (g_n_gpus != 1 || logical_tier != 0 || !g_cuda_is_gb10[0] ||
+        !model_map || !use_dp4a || !cuda_aligned_q8_enabled() ||
+        getenv("DS4_CUDA_NO_Q8_FUSED_ALIGNED") != NULL ||
+        in_dim == 0u || out_dim == 0u ||
+        in_dim > INT_MAX || out_dim > INT_MAX ||
+        (in_dim % 1024u) != 0u || (out_dim % 128u) != 0u) {
+        return NULL;
+    }
+    const uint64_t aligned_bytes =
+        ds4_mmq_q8_0_aligned_bytes((int)out_dim, (int)in_dim);
+    return aligned_bytes ? cuda_derived_weight_ptr(
+        model_map, weight_offset, weight_bytes,
+        CUDA_DERIVED_Q8_0_ALIGNED_DENSE,
+        in_dim, out_dim, 1u, aligned_bytes) : NULL;
 }
 
 static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
@@ -15927,19 +16622,56 @@ static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
         return 0;
     }
     const int logical_tier = ds4_tensor_device_idx(out_hc);
+    if (logical_tier < 0 || logical_tier >= g_n_gpus) return 0;
     const char *wptr = cuda_resolve_weight_ptr(model_map, weight_offset, weight_bytes, logical_tier, label ? label : "q8_0_hc_expand");
     if (!wptr) return 0;
 
     const uint64_t xq_bytes = blocks * 32u;
     const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
     const uint64_t tmp_bytes = scale_offset + blocks * sizeof(float);
+    /* Capture may only reuse the scratch warmed by the preceding eager pass.
+     * Growing it would free pointers baked into existing graphs. */
+    const bool scratch_ready = g_n_gpus == 1
+        ? g_cuda_tmp && g_cuda_tmp_bytes >= tmp_bytes
+        : g_gpu[logical_tier].scratch &&
+          g_gpu[logical_tier].scratch_bytes >= tmp_bytes;
+    if (g_decode_graph_capturing && !scratch_ready) return 0;
     void *tmp = cuda_tmp_alloc_on(logical_tier, tmp_bytes, "q8_0 hc expand prequant");
     if (!tmp) return 0;
     int8_t *xq = (int8_t *)tmp;
     float *xscale = (float *)((char *)tmp + scale_offset);
     const int use_dp4a = cuda_q8_use_dp4a();
-    quantize_q8_0_f32_kernel<<<(unsigned)blocks, 32, 0, cuda_decode_stream()>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
+    const char *aligned = cuda_q8_hc_aligned_weight_ptr(
+        model_map, weight_offset, weight_bytes, in_dim, out_dim,
+        logical_tier, use_dp4a);
+    ds4_cuda_launch_q8_0_quantize(
+            cuda_q8_quant_warp_reduce_enabled(), (unsigned)blocks, cuda_decode_stream(),
+            xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand quantize launch")) return 0;
+    if (aligned) {
+        const uint64_t nblk = out_dim * blocks;
+        const uint64_t dq_bytes = (nblk * sizeof(__half) + 63u) & ~63ull;
+        matmul_q8_0_hc_expand_aligned_preq_warp8_kernel<<<
+            ((unsigned)out_dim + 7u) / 8u, 256, 0, cuda_decode_stream()>>>(
+                (float *)out_hc->ptr,
+                (float *)block_out->ptr,
+                block_add ? (const float *)block_add->ptr : (const float *)block_out->ptr,
+                block_add2 ? (const float *)block_add2->ptr : (const float *)block_out->ptr,
+                owned_home_slots ? (const float *)owned_home_slots->ptr : NULL,
+                owned_peer_packed ? (const float *)owned_peer_packed->ptr : NULL,
+                owned_selected ? (const int32_t *)owned_selected->ptr : NULL,
+                (const float *)residual_hc->ptr,
+                (const float *)split->ptr,
+                (const int4 *)(aligned + dq_bytes),
+                (const __half *)aligned,
+                xq, xscale, out_dim, n_embd, n_hc, blocks,
+                block_add ? 1 : 0,
+                block_add2 ? 1 : 0,
+                owned_home_slots ? 1 : 0,
+                owned_expert_split);
+        /* A failed submitted writer is an error, never a raw-path retry. */
+        return cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand aligned launch");
+    }
     matmul_q8_0_hc_expand_preq_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256, 0, cuda_decode_stream()>>>(
             (float *)out_hc->ptr,
             (float *)block_out->ptr,
@@ -16073,6 +16805,77 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
     return cuda_ok(cudaGetLastError(), "matmul_f16 launch");
 }
 
+extern "C" int ds4_gpu_hc_rms_norm_mix_f16_available(void) {
+    // Keep the existing one-token cuBLAS policy and single-device scratch
+    // ownership. Other matvec modes have different rounding/reduction trees.
+    if (!g_cublas_ready || g_quality_mode || g_n_gpus != 1 ||
+        getenv("DS4_CUDA_SERIAL_F16_MATMUL") != NULL ||
+        getenv("DS4_CUDA_NO_F16_CUBLAS_ONE") != NULL ||
+        (getenv("DS4_CUDA_F16_SMALL_OUT") != NULL &&
+         getenv("DS4_CUDA_NO_ORDERED_F16_MATMUL") == NULL &&
+         getenv("DS4_CUDA_NO_F16_SMALL_OUT") == NULL)) return 0;
+    int device = -1;
+    if (cudaGetDevice(&device) != cudaSuccess || device != g_gpu[0].device_id) return 0;
+    static thread_local int cached_device = -1;
+    static thread_local int supported = 0;
+    if (cached_device != device) {
+        cudaDeviceProp prop;
+        if (cudaGetDeviceProperties(&prop, device) != cudaSuccess) return 0;
+        supported = prop.major >= 7 && prop.maxThreadsPerBlock >= 256;
+        cached_device = device;
+    }
+    return supported;
+}
+
+extern "C" int ds4_gpu_hc_rms_norm_mix_f16_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint32_t n, uint32_t out_dim, float eps) {
+    using namespace ds4_hc_norm_mix;
+    if (!out || !x ||
+        !eligible(n, out_dim, ds4_gpu_get_execution_phase(), g_quality_mode,
+                  (uintptr_t)out->ptr, out->bytes, (uintptr_t)x->ptr, x->bytes,
+                  (uintptr_t)model_map, model_size, weight_offset) ||
+        !(eps > 0.0f && eps <= FLT_MAX) ||
+        ds4_tensor_device_idx(out) != 0 || ds4_tensor_device_idx(x) != 0 ||
+        !ds4_gpu_hc_rms_norm_mix_f16_available()) return 0;
+
+    // Captured graphs retain this pointer. Scratch growth invalidates them;
+    // never allocate or grow the common scratch while recording a graph.
+    if (g_decode_graph_capturing && (!g_cuda_tmp || g_cuda_tmp_bytes < half_bytes)) return 0;
+    const char *wptr = cuda_resolve_weight_ptr(
+            model_map, weight_offset, weight_bytes, 0, "HC norm/mix f16");
+    if (!range_valid((uintptr_t)wptr, weight_bytes) ||
+        ((uintptr_t)wptr & 1u) != 0u ||
+        overlaps((uintptr_t)out->ptr, out_bytes, (uintptr_t)wptr, weight_bytes)) return 0;
+    // Check the existing slab before an allocation could grow and free it.
+    if (g_cuda_tmp &&
+        (overlaps((uintptr_t)g_cuda_tmp, g_cuda_tmp_bytes, (uintptr_t)out->ptr, out_bytes) ||
+         overlaps((uintptr_t)g_cuda_tmp, g_cuda_tmp_bytes, (uintptr_t)x->ptr, x_bytes) ||
+         overlaps((uintptr_t)g_cuda_tmp, g_cuda_tmp_bytes, (uintptr_t)wptr, weight_bytes))) return 0;
+    __half *xh = (__half *)cuda_tmp_alloc_on(0, half_bytes, "HC norm/mix activations");
+    if (!range_valid((uintptr_t)xh, half_bytes) ||
+        overlaps((uintptr_t)xh, half_bytes, (uintptr_t)out->ptr, out_bytes) ||
+        overlaps((uintptr_t)xh, half_bytes, (uintptr_t)x->ptr, x_bytes) ||
+        overlaps((uintptr_t)xh, half_bytes, (uintptr_t)wptr, weight_bytes)) return 0;
+
+    // Baseline: RMS F32 -> conversion F16 -> cuBLAS. Reuse the established
+    // fused RMS/conversion kernel and exactly the same BLAS arguments/handle.
+    // This removes one launch and the 64 KiB normalized F32 materialization.
+    rms_norm_plain_f16_batch8_kernel<<<1u, 256u, 0, cuda_decode_stream()>>>(
+            xh, (const float *)x->ptr, n, 1u, eps);
+    if (!cuda_ok(cudaGetLastError(), "HC norm/mix activation launch")) return -1;
+    const float alpha = 1.0f, beta = 0.0f;
+    const cublasStatus_t st = cublasGemmEx(
+            cuda_cublas_for_tier(0), CUBLAS_OP_T, CUBLAS_OP_N,
+            (int)out_dim, 1, (int)n, &alpha,
+            (const __half *)wptr, CUDA_R_16F, (int)n,
+            xh, CUDA_R_16F, (int)n, &beta,
+            out->ptr, CUDA_R_32F, (int)out_dim,
+            CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+    return cublas_ok(st, "HC norm/mix matmul") ? 1 : -1;
+}
+
 extern "C" int ds4_gpu_matmul_f16_rms_fold_tensor(
         ds4_gpu_tensor *out,
         const void *model_map,
@@ -16111,7 +16914,7 @@ extern "C" int ds4_gpu_matmul_f16_rms_fold_tensor(
             xh, (const float *)x->ptr, (uint32_t)in_dim,
             (uint32_t)n_tok, norm_eps);
     if (!cuda_ok(cudaGetLastError(), "f16 rms-fold activation launch")) {
-        return 0;
+        return -1;
     }
 
     const float alpha = 1.0f;
@@ -16126,7 +16929,7 @@ extern "C" int ds4_gpu_matmul_f16_rms_fold_tensor(
         &beta,
         out->ptr, CUDA_R_32F, (int)out_dim,
         CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
-    return cublas_ok(st, "f16 rms-fold matmul");
+    return cublas_ok(st, "f16 rms-fold matmul") ? 1 : -1;
 }
 
 extern "C" int ds4_gpu_matmul_f16_router_rows_exact_tensor(
@@ -16346,6 +17149,14 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
     return cuda_ok(cudaGetLastError(), "matmul_f16_pair_ordered_chunks launch");
 }
 
+static bool cuda_f16_compressor_ranges_overlap(
+        const void *a, uint64_t a_bytes, const void *b, uint64_t b_bytes) {
+    if (a_bytes == 0u || b_bytes == 0u) return false;
+    const uintptr_t aa = (uintptr_t)a;
+    const uintptr_t bb = (uintptr_t)b;
+    return aa <= bb ? bb - aa < a_bytes : aa - bb < b_bytes;
+}
+
 extern "C" int ds4_gpu_matmul_f16_pair_compressor_store_tensor(
         ds4_gpu_tensor *out_kv,
         ds4_gpu_tensor *out_score,
@@ -16362,22 +17173,112 @@ extern "C" int ds4_gpu_matmul_f16_pair_compressor_store_tensor(
         const ds4_gpu_tensor *x,
         uint32_t ratio,
         uint32_t pos) {
-    (void)out_kv;
-    (void)out_score;
-    (void)state_kv;
-    (void)state_score;
-    (void)model_map;
-    (void)model_size;
-    (void)weight_kv_offset;
-    (void)weight_score_offset;
-    (void)ape_offset;
-    (void)ape_type;
-    (void)in_dim;
-    (void)width;
-    (void)x;
-    (void)ratio;
-    (void)pos;
-    return 0;
+    if (g_quality_mode || g_n_gpus != 1 || !g_cuda_is_gb10[0] ||
+        getenv("DS4_CUDA_NO_F16_PAIR_COMPRESSOR_STORE") != NULL ||
+        getenv("DS4_CUDA_NO_F16_PAIR_MATMUL") != NULL ||
+        getenv("DS4_CUDA_SERIAL_F16_MATMUL") != NULL ||
+        getenv("DS4_CUDA_SERIAL_ROUTER") != NULL ||
+        getenv("DS4_CUDA_NO_ORDERED_F16_MATMUL") != NULL) return 0;
+    /* The automatic path in ff749b84 covered these Flash/Pro decode shapes.
+     * Keep every other device, shape and quality path on the current fallback. */
+    if (in_dim != 4096u ||
+        !((ratio == 4u && (width == 256u || width == 1024u)) ||
+          (ratio == 128u && width == 512u))) return 0;
+    if (!out_kv || !out_score || !state_kv || !state_score || !x ||
+        !out_kv->ptr || !out_score->ptr || !state_kv->ptr ||
+        !state_score->ptr || !x->ptr || !model_map ||
+        (ape_type != 0u && ape_type != 1u)) return -1;
+
+    const uint64_t weight_bytes = (uint64_t)width * in_dim * sizeof(__half);
+    const uint64_t output_bytes = (uint64_t)width * sizeof(float);
+    const uint64_t input_bytes = in_dim * sizeof(float);
+    const uint64_t ape_bytes = (uint64_t)width * ratio *
+        (ape_type == 1u ? sizeof(__half) : sizeof(float));
+    const uint64_t state_bytes = (uint64_t)width * ratio *
+        (ratio == 4u ? 2u : 1u) * sizeof(float);
+    if (weight_kv_offset > model_size ||
+        weight_bytes > model_size - weight_kv_offset ||
+        weight_score_offset > model_size ||
+        weight_bytes > model_size - weight_score_offset ||
+        ape_offset > model_size || ape_bytes > model_size - ape_offset ||
+        x->bytes < input_bytes || out_kv->bytes < output_bytes ||
+        out_score->bytes < output_bytes || state_kv->bytes < state_bytes ||
+        state_score->bytes < state_bytes) return -1;
+
+    const int logical_tier = ds4_tensor_device_idx(out_kv);
+    if (logical_tier != 0 || ds4_tensor_device_idx(out_score) != logical_tier ||
+        ds4_tensor_device_idx(state_kv) != logical_tier ||
+        ds4_tensor_device_idx(state_score) != logical_tier ||
+        ds4_tensor_device_idx(x) != logical_tier) return 0;
+    const int device_id = g_gpu[logical_tier].device_id;
+    int active_device = -1;
+    if (cudaGetDevice(&active_device) != cudaSuccess ||
+        active_device != device_id) {
+        (void)cudaGetLastError();
+        return -1;
+    }
+    const void *writes[] = {out_kv->ptr, out_score->ptr,
+                            state_kv->ptr, state_score->ptr};
+    const uint64_t write_bytes[] = {output_bytes, output_bytes,
+                                    state_bytes, state_bytes};
+    for (unsigned i = 0; i < 4u; ++i) {
+        if (cuda_f16_compressor_ranges_overlap(
+                writes[i], write_bytes[i], x->ptr, input_bytes)) return 0;
+        for (unsigned j = i + 1u; j < 4u; ++j) {
+            if (cuda_f16_compressor_ranges_overlap(
+                    writes[i], write_bytes[i], writes[j], write_bytes[j])) {
+                return 0;
+            }
+        }
+    }
+    const __half *w_kv = (const __half *)cuda_resolve_weight_ptr(
+        model_map, weight_kv_offset, weight_bytes, logical_tier,
+        "f16 compressor kv");
+    const __half *w_score = (const __half *)cuda_resolve_weight_ptr(
+        model_map, weight_score_offset, weight_bytes, logical_tier,
+        "f16 compressor score");
+    const void *ape = cuda_resolve_weight_ptr(
+        model_map, ape_offset, ape_bytes, logical_tier, "compressor ape");
+    if (!w_kv || !w_score || !ape) return -1;
+    const void *reads[] = {w_kv, w_score, ape};
+    const uint64_t read_bytes[] = {weight_bytes, weight_bytes, ape_bytes};
+    for (unsigned i = 0; i < 4u; ++i) {
+        for (unsigned j = 0; j < 3u; ++j) {
+            if (cuda_f16_compressor_ranges_overlap(
+                    writes[i], write_bytes[i], reads[j], read_bytes[j])) {
+                return 0;
+            }
+        }
+    }
+
+    const cudaStream_t stream = cuda_decode_stream();
+    std::lock_guard<std::mutex> lock(g_f16_pair_chunk32_mutex);
+    const __half2 *w_pair = NULL;
+    if (getenv("DS4_CUDA_NO_F16_PAIR_COMPRESSOR_TRANSPOSE") == NULL &&
+        getenv("DS4_CUDA_NO_F16_PAIR_COMPRESSOR_TRANSPOSE_PREFETCH8") == NULL) {
+        const int cached = cuda_f16_pair_chunk32_get(
+            model_map, weight_kv_offset, weight_score_offset, w_kv, w_score,
+            in_dim, width, device_id, stream, &w_pair);
+        if (cached < 0) return -1;
+    }
+    if (w_pair) {
+        matmul_f16_pair_compressor_store_chunk32_prefetch8_kernel<<<
+            width, 32, 0, stream>>>(
+                (float *)out_kv->ptr, (float *)out_score->ptr,
+                (float *)state_kv->ptr, (float *)state_score->ptr,
+                w_pair, (const float *)x->ptr, ape, ape_type,
+                in_dim, width, ratio, pos);
+    } else {
+        matmul_f16_pair_compressor_store_ordered_chunks_kernel<<<
+            width, 32, 0, stream>>>(
+                (float *)out_kv->ptr, (float *)out_score->ptr,
+                (float *)state_kv->ptr, (float *)state_score->ptr,
+                w_kv, w_score, (const float *)x->ptr, ape, ape_type,
+                in_dim, width, ratio, pos);
+    }
+    /* A writer has been submitted: failures cannot replay the pair+store. */
+    return cuda_ok(cudaGetLastError(), "f16 pair compressor/store launch")
+        ? 1 : -1;
 }
 
 extern "C" int ds4_gpu_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
@@ -16795,7 +17696,13 @@ extern "C" int ds4_gpu_head_rms_norm_tensor(ds4_gpu_tensor *x, uint32_t n_tok, u
 extern "C" int ds4_gpu_head_rms_norm_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow, float eps) {
     if (!x || n_rot > head_dim || (n_rot & 1u) ||
         x->bytes < (uint64_t)n_tok * n_head * head_dim * sizeof(float)) return 0;
-    head_rms_norm_rope_tail_kernel<<<n_tok * n_head, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, eps);
+    // Native Q4, Q8, SSD and quality prefill use the same F32 RMS tree as
+    // the resident Q4 epilogue. Decode and speculative widths retain theirs.
+    if (n_tok > 8u) {
+        head_rms_norm_rope_tail_kernel<true><<<n_tok * n_head, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, eps);
+    } else {
+        head_rms_norm_rope_tail_kernel<false><<<n_tok * n_head, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, eps);
+    }
     return cuda_ok(cudaGetLastError(), "head_rms_norm_rope_tail launch");
 }
 extern "C" int ds4_gpu_dsv4_fp8_kv_quantize_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t head_dim, uint32_t n_rot) {
@@ -18921,11 +19828,9 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
         float *xscale = (float *)((char *)tmp + scale_offset);
         const int use_dp4a = cuda_q8_use_dp4a();
         dim3 qgrid((unsigned)blocks_a, (unsigned)x_rows, 1);
-        quantize_q8_0_f32_kernel<<<qgrid, 32, 0, cuda_decode_stream()>>>(xq,
-                                                xscale,
-                                                (const float *)heads->ptr,
-                                                group_dim,
-                                                blocks_a);
+        ds4_cuda_launch_q8_0_quantize(
+                cuda_q8_quant_warp_reduce_enabled(), qgrid, cuda_decode_stream(),
+                xq, xscale, (const float *)heads->ptr, group_dim, blocks_a);
         if (!cuda_ok(cudaGetLastError(), "attention_output_q8_a prequant launch")) return 0;
         int grouped_mma_done = 0;
         if (n_tokens >= 8u) {
@@ -19056,14 +19961,9 @@ extern "C" int ds4_gpu_attention_output_low_q8_rows_exact_tensor(
     float *xscale = (float *)((char *)tmp + scale_offset);
     const int use_dp4a = cuda_q8_use_dp4a();
     dim3 qgrid((unsigned)blocks_a, (unsigned)x_rows, 1);
-    quantize_q8_0_group_slice_rows_kernel<<<qgrid, 32, 0, cuda_decode_stream()>>>(
-            xq,
-            xscale,
-            (const float *)heads->ptr,
-            group_dim,
-            blocks_a,
-            n_groups_total,
-            group0,
+    ds4_cuda_launch_q8_0_group_slice_quantize(
+            cuda_q8_quant_warp_reduce_enabled(), qgrid, cuda_decode_stream(),
+            xq, xscale, (const float *)heads->ptr, group_dim, blocks_a, n_groups_total, group0,
             group_cnt);
     if (!cuda_ok(cudaGetLastError(),
                  "attention_output_low_q8 rows prequant launch")) return 0;
@@ -19265,7 +20165,8 @@ extern "C" int ds4_gpu_shared_mid_swiglu_q8_0_decode_exact_tensor(
         if (!tmp) return 0;
         xq = (int8_t *)tmp;
         xscale = (float *)((char *)tmp + scale_offset);
-        quantize_q8_0_f32_kernel<<<(unsigned)blocks, 32, 0, cuda_decode_stream()>>>(
+        ds4_cuda_launch_q8_0_quantize(
+                cuda_q8_quant_warp_reduce_enabled(), (unsigned)blocks, cuda_decode_stream(),
                 xq, xscale, (const float *)x->ptr, in_dim, blocks);
         if (!cuda_ok(cudaGetLastError(),
                      "shared mid q8 exact quantize launch")) {
@@ -19563,6 +20464,8 @@ __device__ static float dev_f16_to_f32(uint16_t v) {
     return __half2float(*reinterpret_cast<const __half *>(&v));
 }
 
+/* Callers pass the seven stored sign bits (0..127). The eighth bit is
+ * their parity, so reconstruct it before broadcasting the sign byte. */
 __device__ __forceinline__ static uint32_t dev_unpack_iq2_signs(uint32_t v) {
     const uint32_t p = __popc(v) & 1u;
     const uint32_t s = v ^ (p << 7u);
@@ -19592,19 +20495,18 @@ __device__ static int32_t dev_dot_q2_16(const uint8_t *q2, const int8_t *q8, int
 
 __device__ static int32_t dev_dot_iq2_pair_16(uint8_t grid0, uint32_t sign0, uint8_t grid1, uint32_t sign1, const int8_t *q8) {
     int32_t sum = 0;
-    sum = dev_iq2_dp4a_8(cuda_iq2xxs_grid[grid0], cuda_ksigns_iq2xs[sign0], q8, sum);
-    sum = dev_iq2_dp4a_8(cuda_iq2xxs_grid[grid1], cuda_ksigns_iq2xs[sign1], q8 + 8, sum);
+    sum = dev_iq2_dp4a_8(cuda_iq2xxs_grid[grid0], sign0, q8, sum);
+    sum = dev_iq2_dp4a_8(cuda_iq2xxs_grid[grid1], sign1, q8 + 8, sum);
     return sum;
 }
 
 __device__ __forceinline__ static void dev_iq2_i8x8_lut(
         const uint64_t *grid,
-        const uint8_t *signs,
         uint8_t grid_idx,
         uint32_t sign_idx,
         int32_t *w0,
         int32_t *w1) {
-    const uint32_t s = dev_unpack_iq2_signs(signs[sign_idx]);
+    const uint32_t s = dev_unpack_iq2_signs(sign_idx);
     const int32_t sm0 = __vcmpne4(s & 0x08040201u, 0);
     const int32_t sm1 = __vcmpne4(s & 0x80402010u, 0);
     const uint64_t g = grid[grid_idx];
@@ -19615,8 +20517,7 @@ __device__ __forceinline__ static void dev_iq2_i8x8_lut(
 __device__ static float dev_dot_iq2_xxs_q8_K_block_lut(
         const cuda_block_iq2_xxs *x,
         const cuda_block_q8_K *y,
-        const uint64_t *grid,
-        const uint8_t *signs) {
+        const uint64_t *grid) {
     const float xd = dev_f16_to_f32(x->d);
     const uint16_t *q2 = x->qs;
     const int8_t *q8 = y->qs;
@@ -19627,10 +20528,10 @@ __device__ static float dev_dot_iq2_xxs_q8_K_block_lut(
         q2 += 4;
         const int32_t ls = (int32_t)(2u * (aux1 >> 28) + 1u);
         int32_t w[8];
-        dev_iq2_i8x8_lut(grid, signs, (uint8_t)(aux0 & 0xffu),           (aux1 >> 0)  & 127u, &w[0], &w[1]);
-        dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 8)  & 0xffu),   (aux1 >> 7)  & 127u, &w[2], &w[3]);
-        dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 16) & 0xffu),   (aux1 >> 14) & 127u, &w[4], &w[5]);
-        dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 24) & 0xffu),   (aux1 >> 21) & 127u, &w[6], &w[7]);
+        dev_iq2_i8x8_lut(grid, (uint8_t)(aux0 & 0xffu),           (aux1 >> 0)  & 127u, &w[0], &w[1]);
+        dev_iq2_i8x8_lut(grid, (uint8_t)((aux0 >> 8)  & 0xffu),   (aux1 >> 7)  & 127u, &w[2], &w[3]);
+        dev_iq2_i8x8_lut(grid, (uint8_t)((aux0 >> 16) & 0xffu),   (aux1 >> 14) & 127u, &w[4], &w[5]);
+        dev_iq2_i8x8_lut(grid, (uint8_t)((aux0 >> 24) & 0xffu),   (aux1 >> 21) & 127u, &w[6], &w[7]);
         int32_t sumi = 0;
         sumi = __dp4a(w[0], *(const int32_t *)(q8 + ib32 * 32u + 0),  sumi);
         sumi = __dp4a(w[1], *(const int32_t *)(q8 + ib32 * 32u + 4),  sumi);
@@ -19681,8 +20582,7 @@ __device__ static void dev_dot_iq2_xxs_q8_K_block8_deq_lut(
         const cuda_block_q8_K *y7,
         uint32_t n,
         float acc[8],
-        const uint64_t *grid,
-        const uint8_t *signs) {
+        const uint64_t *grid) {
     const float xd = dev_f16_to_f32(x->d);
     const uint16_t *q2 = x->qs;
     int32_t bsum[8] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -19696,10 +20596,10 @@ __device__ static void dev_dot_iq2_xxs_q8_K_block8_deq_lut(
         q2 += 4;
         const int32_t ls = (int32_t)(2u * (aux1 >> 28) + 1u);
         int32_t w[8];
-        dev_iq2_i8x8_lut(grid, signs, (uint8_t)(aux0 & 0xffu),           (aux1 >> 0)  & 127u, &w[0], &w[1]);
-        dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 8)  & 0xffu),   (aux1 >> 7)  & 127u, &w[2], &w[3]);
-        dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 16) & 0xffu),   (aux1 >> 14) & 127u, &w[4], &w[5]);
-        dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 24) & 0xffu),   (aux1 >> 21) & 127u, &w[6], &w[7]);
+        dev_iq2_i8x8_lut(grid, (uint8_t)(aux0 & 0xffu),           (aux1 >> 0)  & 127u, &w[0], &w[1]);
+        dev_iq2_i8x8_lut(grid, (uint8_t)((aux0 >> 8)  & 0xffu),   (aux1 >> 7)  & 127u, &w[2], &w[3]);
+        dev_iq2_i8x8_lut(grid, (uint8_t)((aux0 >> 16) & 0xffu),   (aux1 >> 14) & 127u, &w[4], &w[5]);
+        dev_iq2_i8x8_lut(grid, (uint8_t)((aux0 >> 24) & 0xffu),   (aux1 >> 21) & 127u, &w[6], &w[7]);
         for (uint32_t p = 0; p < n; p++) {
             const int8_t *q = q8[p] + ib32 * 32;
             int32_t sumi = 0;
@@ -19805,6 +20705,41 @@ __device__ static void dev_q4_K_get_scale_min(
     } else {
         *d_out = (scales[j + 4u] & 0x0fu) | ((scales[j - 4u] >> 6u) << 4u);
         *m_out = (scales[j + 4u] >> 4u) | ((scales[j] >> 6u) << 4u);
+    }
+}
+
+__global__ static void dequant_q4_K_to_f16_kernel(
+        __half *out,
+        const cuda_block_q4_K *w,
+        uint64_t in_dim,
+        uint64_t out_dim) {
+    const uint64_t chunk =
+        (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t chunks_per_row = in_dim / 16u;
+    const uint64_t total_chunks = out_dim * chunks_per_row;
+    if (chunk >= total_chunks) return;
+
+    // Both callers use packed rows with in_dim divisible by 256. A 16-value
+    // chunk stays within one scale group, so neither row division nor
+    // repeated scale/min unpack is needed in the value loop.
+    const cuda_block_q4_K *block = w + (chunk >> 4u);
+    const uint32_t group = (uint32_t)((chunk >> 1u) & 7u);
+    const uint32_t byte0 = (group >> 1u) * 32u +
+                           (uint32_t)(chunk & 1u) * 16u;
+    const float d = dev_f16_to_f32(block->d);
+    const float dmin = dev_f16_to_f32(block->dmin);
+    uint8_t scale_code, min_code;
+    dev_q4_K_get_scale_min(group, block->scales, &scale_code, &min_code);
+
+#pragma unroll
+    for (uint32_t k = 0; k < 16u; k++) {
+        const uint8_t packed = block->qs[byte0 + k];
+        const uint8_t q = (group & 1u) ? (packed >> 4u)
+                                       : (packed & 15u);
+        const float value =
+            (d * (float)scale_code) * (float)q -
+            dmin * (float)min_code;
+        out[chunk * 16u + k] = __float2half_rn(value);
     }
 }
 
@@ -20098,89 +21033,6 @@ __global__ static void q8_K_quantize_kernel(cuda_block_q8_K *out, const float *x
     if (tid == 0) yb->d = 1.0f / iscale_s;
 }
 
-/* Decode-only dual quantizer.  The Q8_0 half mirrors
- * quantize_q8_0_f32_kernel's 32-thread reduction and expression order, while
- * the Q8_K half remains byte-for-byte the ordinary routed-MoE quantizer. */
-__global__ static void q8_K_q8_0_quantize_kernel(
-        cuda_block_q8_K *out,
-        int8_t *q8_0,
-        float *q8_0_scale,
-        const float *x,
-        uint32_t in_dim,
-        uint32_t n_rows) {
-    const uint32_t b = blockIdx.x;
-    const uint32_t row = blockIdx.y;
-    if (row >= n_rows || b >= in_dim / CUDA_QK_K) return;
-    const float *xr = x + (uint64_t)row * in_dim +
-                      (uint64_t)b * CUDA_QK_K;
-    cuda_block_q8_K *yb = out +
-        (uint64_t)row * (in_dim / CUDA_QK_K) + b;
-    __shared__ float abs_part[256];
-    __shared__ float val_part[256];
-    __shared__ float maxv_s;
-    __shared__ float iscale_s;
-    const uint32_t tid = threadIdx.x;
-    const uint32_t lane = tid & 31u;
-    const uint32_t warp = tid >> 5u;
-    const float v = tid < CUDA_QK_K ? xr[tid] : 0.0f;
-
-    abs_part[tid] = tid < CUDA_QK_K ? fabsf(v) : 0.0f;
-    __syncthreads();
-    for (uint32_t stride = 16u; stride > 0u; stride >>= 1u) {
-        if (lane < stride) {
-            abs_part[tid] = fmaxf(abs_part[tid], abs_part[tid + stride]);
-        }
-        __syncthreads();
-    }
-    const uint32_t q8_blocks = in_dim / 32u;
-    const uint32_t q8_block = b * 8u + warp;
-    const float d = abs_part[warp * 32u] / 127.0f;
-    const float id = d != 0.0f ? 1.0f / d : 0.0f;
-    if (lane == 0u) {
-        q8_0_scale[(uint64_t)row * q8_blocks + q8_block] = d;
-    }
-    int qv = (int)lrintf(v * id);
-    qv = qv > 127 ? 127 : (qv < -128 ? -128 : qv);
-    q8_0[((uint64_t)row * q8_blocks + q8_block) * 32u + lane] =
-        (int8_t)qv;
-    __syncthreads();
-
-    abs_part[tid] = tid < CUDA_QK_K ? fabsf(v) : 0.0f;
-    val_part[tid] = v;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride && abs_part[tid + stride] > abs_part[tid]) {
-            abs_part[tid] = abs_part[tid + stride];
-            val_part[tid] = val_part[tid + stride];
-        }
-        __syncthreads();
-    }
-    const float amax = abs_part[0];
-    if (amax == 0.0f) {
-        if (tid == 0) yb->d = 0.0f;
-        if (tid < CUDA_QK_K) yb->qs[tid] = 0;
-        if (tid < CUDA_QK_K / 16) yb->bsums[tid] = 0;
-        return;
-    }
-    if (tid == 0) {
-        maxv_s = val_part[0];
-        iscale_s = -127.0f / maxv_s;
-    }
-    __syncthreads();
-    if (tid < CUDA_QK_K) {
-        int kv = (int)lrintf(iscale_s * xr[tid]);
-        if (kv > 127) kv = 127;
-        if (kv < -128) kv = -128;
-        yb->qs[tid] = (int8_t)kv;
-    }
-    __syncthreads();
-    if (tid < CUDA_QK_K / 16) {
-        int sum = 0;
-        for (int i = 0; i < 16; i++) sum += yb->qs[tid * 16 + i];
-        yb->bsums[tid] = (int16_t)sum;
-    }
-    if (tid == 0) yb->d = 1.0f / iscale_s;
-}
 
 __device__ __forceinline__ static bool moe_owned_local_expert(
         int32_t expert,
@@ -20609,7 +21461,6 @@ __global__ static void moe_gate_up_mid_decode_lut_qwarp32_kernel(
     const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
     __shared__ cuda_block_q8_K sxq[32];
     __shared__ uint64_t s_iq2_grid[256];
-    __shared__ uint8_t s_iq2_signs[128];
     if (xq_blocks <= 32u) {
         /* Cooperatively copy complete Q8_K blocks, including their scales. */
         const uint32_t words = xq_blocks * sizeof(cuda_block_q8_K) / sizeof(uint32_t);
@@ -20619,7 +21470,6 @@ __global__ static void moe_gate_up_mid_decode_lut_qwarp32_kernel(
     }
     /* Wide inputs bypass the shared activation cache, not the lookup tables. */
     for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
-    for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
     __syncthreads();
     for (uint32_t rr = 0; rr < MOE_DECODE_ROW_TILES; rr++) {
         uint32_t row = blockIdx.x * MOE_DECODE_ROWS_PER_BLOCK + row_lane + rr * 32u;
@@ -20629,8 +21479,8 @@ __global__ static void moe_gate_up_mid_decode_lut_qwarp32_kernel(
         float gate = 0.0f;
         float up = 0.0f;
         for (uint32_t b = lane; b < xq_blocks; b += 8u) {
-            gate += dev_dot_iq2_xxs_q8_K_block_lut(gr + b, xqb + b, s_iq2_grid, s_iq2_signs);
-            up += dev_dot_iq2_xxs_q8_K_block_lut(ur + b, xqb + b, s_iq2_grid, s_iq2_signs);
+            gate += dev_dot_iq2_xxs_q8_K_block_lut(gr + b, xqb + b, s_iq2_grid);
+            up += dev_dot_iq2_xxs_q8_K_block_lut(ur + b, xqb + b, s_iq2_grid);
         }
         gate = quarter_warp_sum_f32(gate, lane);
         up = quarter_warp_sum_f32(up, lane);
@@ -20677,7 +21527,6 @@ __global__ static void moe_gate_up_mid_decode_lut_owned_qwarp32_kernel(
     const cuda_block_q8_K *xqb = xq;
     __shared__ cuda_block_q8_K sxq[32];
     __shared__ uint64_t s_iq2_grid[256];
-    __shared__ uint8_t s_iq2_signs[128];
     if (xq_blocks <= 32u) {
         const uint32_t words = xq_blocks * sizeof(cuda_block_q8_K) / sizeof(uint32_t);
         for (uint32_t i = threadIdx.x; i < words; i += blockDim.x)
@@ -20685,7 +21534,6 @@ __global__ static void moe_gate_up_mid_decode_lut_owned_qwarp32_kernel(
         xqb = sxq;
     }
     for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
-    for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
     __syncthreads();
     for (uint32_t rr = 0; rr < MOE_DECODE_ROW_TILES; rr++) {
         uint32_t row = blockIdx.x * MOE_DECODE_ROWS_PER_BLOCK + row_lane + rr * 32u;
@@ -20695,8 +21543,8 @@ __global__ static void moe_gate_up_mid_decode_lut_owned_qwarp32_kernel(
         float gate = 0.0f;
         float up = 0.0f;
         for (uint32_t b = lane; b < xq_blocks; b += 8u) {
-            gate += dev_dot_iq2_xxs_q8_K_block_lut(gr + b, xqb + b, s_iq2_grid, s_iq2_signs);
-            up += dev_dot_iq2_xxs_q8_K_block_lut(ur + b, xqb + b, s_iq2_grid, s_iq2_signs);
+            gate += dev_dot_iq2_xxs_q8_K_block_lut(gr + b, xqb + b, s_iq2_grid);
+            up += dev_dot_iq2_xxs_q8_K_block_lut(ur + b, xqb + b, s_iq2_grid);
         }
         gate = quarter_warp_sum_f32(gate, lane);
         up = quarter_warp_sum_f32(up, lane);
@@ -20717,12 +21565,12 @@ __global__ static void moe_gate_up_mid_decode_lut_owned_qwarp32_kernel(
 }
 
 __device__ __forceinline__ static int32_t iq2_aligned_q8k_partial(
-        uint2 packed, const int8_t *q8, const uint64_t *grid, const uint8_t *signs) {
+        uint2 packed, const int8_t *q8, const uint64_t *grid) {
     int32_t sum = 0;
     #pragma unroll
     for (uint32_t i = 0; i < 4u; i++) {
         int32_t w0, w1;
-        dev_iq2_i8x8_lut(grid, signs, (packed.x >> (i * 8u)) & 255u,
+        dev_iq2_i8x8_lut(grid, (packed.x >> (i * 8u)) & 255u,
             (packed.y >> (i * 7u)) & 127u, &w0, &w1);
         sum = __dp4a(w0, ((const int32_t *)q8)[i * 2u], sum);
         sum = __dp4a(w1, ((const int32_t *)q8)[i * 2u + 1u], sum);
@@ -20746,14 +21594,12 @@ __global__ static void moe_gate_up_mid_aligned_q8k_kernel(
     const cuda_block_q8_K *activation = xq + (uint64_t)token * blocks;
     __shared__ cuda_block_q8_K sxq[32];
     __shared__ uint64_t grid[256];
-    __shared__ uint8_t signs[128];
     if (blocks <= 32u) {
         for (uint32_t i = threadIdx.x; i < blocks * sizeof(cuda_block_q8_K) / 4u; i += blockDim.x)
             ((uint32_t *)sxq)[i] = ((const uint32_t *)activation)[i];
         activation = sxq;
     }
     grid[threadIdx.x] = cuda_iq2xxs_grid[threadIdx.x];
-    if (threadIdx.x < 128u) signs[threadIdx.x] = cuda_ksigns_iq2xs[threadIdx.x];
     __syncthreads();
     if (row >= rows) return;
     const uint32_t lane = threadIdx.x & 31u, sub = lane & 7u, group = lane >> 3u;
@@ -20767,8 +21613,8 @@ __global__ static void moe_gate_up_mid_aligned_q8k_kernel(
             if (b < blocks) {
                 const uint64_t off = (base + b) * 8u + sub;
                 const int8_t *q8 = activation[b].qs + sub * 32u;
-                gs = iq2_aligned_q8k_partial(((const uint2 *)(gate + scale_bytes))[off], q8, grid, signs);
-                us = iq2_aligned_q8k_partial(((const uint2 *)(up + scale_bytes))[off], q8, grid, signs);
+                gs = iq2_aligned_q8k_partial(((const uint2 *)(gate + scale_bytes))[off], q8, grid);
+                us = iq2_aligned_q8k_partial(((const uint2 *)(up + scale_bytes))[off], q8, grid);
             }
             #pragma unroll
             for (uint32_t stride = 4; stride; stride >>= 1) {
@@ -21192,7 +22038,6 @@ __global__ static void moe_gate_up_mid_expert_tile8_row32_kernel(
     uint32_t local_start = tile_starts[tile];
     __shared__ cuda_block_q8_K sxq[8][16];
     __shared__ uint64_t s_iq2_grid[256];
-    __shared__ uint8_t s_iq2_signs[128];
     uint32_t pair[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     uint32_t tok[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     uint32_t slot[8] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -21215,7 +22060,6 @@ __global__ static void moe_gate_up_mid_expert_tile8_row32_kernel(
         for (uint32_t p = 0; p < np; p++) xqb[p] = sxq[p];
     }
     for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
-    for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
     __syncthreads();
     if (row >= expert_mid_dim) return;
     const cuda_block_iq2_xxs *gr = (const cuda_block_iq2_xxs *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
@@ -21227,12 +22071,12 @@ __global__ static void moe_gate_up_mid_expert_tile8_row32_kernel(
                                             xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
                                             xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
                                             xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL, np, gate,
-                                            s_iq2_grid, s_iq2_signs);
+                                            s_iq2_grid);
         dev_dot_iq2_xxs_q8_K_block8_deq_lut(ur + b, xqb[0] ? xqb[0] + b : NULL, xqb[1] ? xqb[1] + b : NULL,
                                             xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
                                             xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
                                             xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL, np, up,
-                                            s_iq2_grid, s_iq2_signs);
+                                            s_iq2_grid);
     }
     for (uint32_t p = 0; p < np; p++) {
         gate[p] = quarter_warp_sum_f32(gate[p], lane);
@@ -21282,7 +22126,6 @@ __global__ static void moe_gate_up_mid_expert_tile8_row2048_kernel(
     uint32_t local_start = tile_starts[tile];
     __shared__ cuda_block_q8_K sxq[8][16];
     __shared__ uint64_t s_iq2_grid[256];
-    __shared__ uint8_t s_iq2_signs[128];
     uint32_t pair[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     uint32_t tok[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     uint32_t slot[8] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -21305,7 +22148,6 @@ __global__ static void moe_gate_up_mid_expert_tile8_row2048_kernel(
         for (uint32_t p = 0; p < np; p++) xqb[p] = sxq[p];
     }
     for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
-    for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
     __syncthreads();
     for (uint32_t rr = 0; rr < 64u; rr++) {
         uint32_t row = blockIdx.x * 2048u + row_lane + rr * 32u;
@@ -21319,12 +22161,12 @@ __global__ static void moe_gate_up_mid_expert_tile8_row2048_kernel(
                                                 xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
                                                 xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
                                                 xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL, np, gate,
-                                                s_iq2_grid, s_iq2_signs);
+                                                s_iq2_grid);
             dev_dot_iq2_xxs_q8_K_block8_deq_lut(ur + b, xqb[0] ? xqb[0] + b : NULL, xqb[1] ? xqb[1] + b : NULL,
                                                 xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
                                                 xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
                                                 xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL, np, up,
-                                                s_iq2_grid, s_iq2_signs);
+                                                s_iq2_grid);
         }
         for (uint32_t p = 0; p < np; p++) {
             gate[p] = quarter_warp_sum_f32(gate[p], lane);
@@ -21376,7 +22218,6 @@ __global__ static void moe_gate_up_mid_expert_tile8_rowspan_kernel(
     uint32_t local_start = tile_starts[tile];
     __shared__ cuda_block_q8_K sxq[8][16];
     __shared__ uint64_t s_iq2_grid[256];
-    __shared__ uint8_t s_iq2_signs[128];
     uint32_t pair[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     uint32_t tok[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     uint32_t slot[8] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -21399,7 +22240,6 @@ __global__ static void moe_gate_up_mid_expert_tile8_rowspan_kernel(
         for (uint32_t p = 0; p < np; p++) xqb[p] = sxq[p];
     }
     for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
-    for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
     __syncthreads();
     for (uint32_t rr = 0; rr < ROW_SPAN / 32u; rr++) {
         uint32_t row = blockIdx.x * ROW_SPAN + row_lane + rr * 32u;
@@ -21413,12 +22253,12 @@ __global__ static void moe_gate_up_mid_expert_tile8_rowspan_kernel(
                                                 xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
                                                 xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
                                                 xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL, np, gate,
-                                                s_iq2_grid, s_iq2_signs);
+                                                s_iq2_grid);
             dev_dot_iq2_xxs_q8_K_block8_deq_lut(ur + b, xqb[0] ? xqb[0] + b : NULL, xqb[1] ? xqb[1] + b : NULL,
                                                 xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
                                                 xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
                                                 xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL, np, up,
-                                                s_iq2_grid, s_iq2_signs);
+                                                s_iq2_grid);
         }
         for (uint32_t p = 0; p < np; p++) {
             gate[p] = quarter_warp_sum_f32(gate[p], lane);
@@ -24540,7 +25380,10 @@ static int routed_moe_launch(
                 rc = 1;
                 const uint64_t assignments =
                     (uint64_t)n_tokens * n_expert;
-                if (!owned_filtered && assignments >= 1024u) {
+                /* Batch size alone does not identify a prefill. Other phases
+                 * retain the general fused-SoA GEMM below. */
+                if (!owned_filtered && assignments >= 1024u &&
+                    ds4_gpu_execution_phase_allows_prefill(ds4_gpu_get_execution_phase())) {
                     size_t input_q8_bytes = 0;
                     size_t down_q8_bytes = 0;
                     size_t work_bytes = 0;
@@ -24867,7 +25710,8 @@ static int routed_moe_launch(
         if (aligned) {
             size_t input_bytes = 0, down_bytes = 0, work_bytes = 0;
             int rc = 1;
-            if (ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_scratch_sizes(
+            if (ds4_gpu_execution_phase_allows_prefill(ds4_gpu_get_execution_phase()) &&
+                ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_scratch_sizes(
                     expert_mid_dim, expert_in_dim, n_tokens, mmq_experts, n_expert,
                     &input_bytes, &down_bytes, &work_bytes) == 0 &&
                 gate->bytes >= input_bytes && up->bytes >= down_bytes && mid->bytes >= work_bytes) {
@@ -26187,9 +27031,9 @@ extern "C" int ds4_gpu_routed_moe_one_owned_tensor(
         int8_t *shared_xq = (int8_t *)shared_prequant->ptr;
         float *shared_scale = (float *)((char *)shared_prequant->ptr +
                                         shared_scale_offset);
-        q8_K_q8_0_quantize_kernel<<<xq_grid, 256>>>(
-                xq, shared_xq, shared_scale, (const float *)x->ptr,
-                expert_in_dim, 1u);
+        ds4_cuda_launch_q8_dual_quantize(
+                cuda_q8_quant_warp_reduce_enabled(), xq_grid, 0,
+                xq, shared_xq, shared_scale, (const float *)x->ptr, expert_in_dim, 1u);
     } else {
         q8_K_quantize_kernel<<<xq_grid, 256>>>(
                 xq, (const float *)x->ptr, expert_in_dim, 1u);
@@ -26562,6 +27406,34 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_tensor(
             n_embd, n_hc, (uint32_t)n_rows, sinkhorn_iters, eps);
     return cuda_ok(cudaGetLastError(), "hc split weighted sum launch");
 }
+/* Concurrent CTAs must not overwrite another CTA's inputs. The reference
+ * remains available for aliases, including in-place output normalization. */
+static bool cuda_hc_split4096_disjoint(
+        const void *out, const void *norm_out, const void *split,
+        const void *mix, const void *residual, const void *scale,
+        const void *base, const void *norm_w, const void *norm_scale) {
+    struct range { uintptr_t ptr; uint64_t bytes; };
+    const range ranges[] = {
+        {(uintptr_t)out, 4096u * sizeof(float)},
+        {(uintptr_t)norm_out, 4096u * sizeof(float)},
+        {(uintptr_t)split, 24u * sizeof(float)},
+        {(uintptr_t)norm_scale, sizeof(float)},
+        {(uintptr_t)mix, 24u * sizeof(float)},
+        {(uintptr_t)residual, 16384u * sizeof(float)},
+        {(uintptr_t)scale, 3u * sizeof(float)},
+        {(uintptr_t)base, 24u * sizeof(float)},
+        {(uintptr_t)norm_w, 4096u * sizeof(float)},
+    };
+    for (unsigned i = 0; i < 4u; ++i) {
+        for (unsigned j = i + 1u; j < sizeof(ranges) / sizeof(ranges[0]); ++j) {
+            const range &a = ranges[i], &b = ranges[j];
+            if (a.ptr <= b.ptr ? b.ptr - a.ptr < a.bytes
+                               : a.ptr - b.ptr < b.bytes) return false;
+        }
+    }
+    return true;
+}
+
 extern "C" int ds4_gpu_hc_split_weighted_sum_norm_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *norm_out,
@@ -26580,7 +27452,8 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_norm_tensor(
         float                   norm_eps) {
     if (getenv("DS4_CUDA_DISABLE_HC_SPLIT_NORM_FUSED") == NULL) {
         if (!out || !norm_out || !split || !mix || !residual_hc || !model_map ||
-            n_embd == 0 || n_hc != 4) {
+            !out->ptr || !norm_out->ptr || !split->ptr ||
+            !mix->ptr || !residual_hc->ptr || n_embd == 0 || n_hc != 4) {
             return 0;
         }
         const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
@@ -26603,6 +27476,11 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_norm_tensor(
                 return 0;
             }
             const int logical_tier = ds4_tensor_device_idx(out);
+            if (logical_tier < 0 || logical_tier >= g_n_gpus ||
+                ds4_tensor_device_idx(norm_out) != logical_tier ||
+                ds4_tensor_device_idx(split) != logical_tier ||
+                ds4_tensor_device_idx(mix) != logical_tier ||
+                ds4_tensor_device_idx(residual_hc) != logical_tier) return 0;
             const float *scale = (const float *)cuda_resolve_weight_ptr(model_map, scale_offset,
                     3ull * sizeof(float), logical_tier, "hc_scale");
             const float *base = (const float *)cuda_resolve_weight_ptr(model_map, base_offset,
@@ -26610,7 +27488,45 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_norm_tensor(
             const float *norm_w = (const float *)cuda_resolve_weight_ptr(model_map, norm_weight_offset,
                     (uint64_t)n_embd * sizeof(float), logical_tier, "hc_norm_weight");
             if (!scale || !base || !norm_w) return 0;
-            hc_split_weighted_sum_norm_fused_kernel<<<(uint32_t)n_rows, 256, 0, cuda_decode_stream()>>>(
+            const cudaStream_t stream = cuda_decode_stream();
+            if (n_embd == 4096u &&
+                getenv("DS4_CUDA_NO_HC_SPLIT_NORM_SPLIT4096") == NULL) {
+                /* Scratch is stream-ordered and owned by the existing tier
+                 * allocator. Resolve it before the first writer. Capture may
+                 * only reuse warmed scratch: growing it can invalidate graphs
+                 * or allocate on an active capture stream. */
+                const bool scratch_ready = g_n_gpus == 1
+                    ? g_cuda_tmp && g_cuda_tmp_bytes >= sizeof(float)
+                    : g_gpu[logical_tier].scratch &&
+                      g_gpu[logical_tier].scratch_bytes >= sizeof(float);
+                float *norm_scale = (!g_decode_graph_capturing || scratch_ready)
+                    ? (float *)cuda_tmp_alloc_on(
+                          logical_tier, sizeof(float), "hc split norm scale")
+                    : NULL;
+                if (norm_scale && cuda_hc_split4096_disjoint(
+                        out->ptr, norm_out->ptr, split->ptr, mix->ptr,
+                        residual_hc->ptr, scale, base, norm_w, norm_scale)) {
+                    hc_split_weighted_sum_norm_fused_partial4096_kernel<<<16u, 256, 0, stream>>>(
+                            (float *)out->ptr, (float *)split->ptr,
+                            (const float *)mix->ptr, (const float *)residual_hc->ptr,
+                            scale, base, sinkhorn_iters, eps);
+                    if (!cuda_ok(cudaGetLastError(),
+                                 "hc split4096 weighted sum launch")) return 0;
+                    hc_split_weighted_sum_norm_fused_reduce4096_kernel<<<1u, 256, 0, stream>>>(
+                            (const float *)out->ptr, norm_scale, norm_eps);
+                    if (!cuda_ok(cudaGetLastError(),
+                                 "hc split4096 norm reduction launch")) return 0;
+                    hc_split_weighted_sum_norm_fused_store4096_kernel<<<16u, 256, 0, stream>>>(
+                            (const float *)out->ptr, (float *)norm_out->ptr,
+                            norm_w, norm_scale);
+                    /* This API returns a boolean, not a fallback sentinel.
+                     * Once a writer was submitted, propagate errors without
+                     * replaying either the fused or the split fallback. */
+                    return cuda_ok(cudaGetLastError(),
+                                   "hc split4096 normalized store launch");
+                }
+            }
+            hc_split_weighted_sum_norm_fused_kernel<<<(uint32_t)n_rows, 256, 0, stream>>>(
                     (float *)out->ptr,
                     (float *)norm_out->ptr,
                     (float *)split->ptr,
@@ -33103,6 +34019,616 @@ extern "C" int ds4_gpu_matmul_quant_rows_scalar_tensor(
     return 0;
 }
 
+/* Dense Q4_K matvec fallback for the AProjQ4 attention projections. MMQ below
+ * handles prefill as a tiled matrix multiply so weights are reused across
+ * tokens; this bandwidth-oriented kernel remains useful for decode and for
+ * shapes MMQ cannot accept. */
+__global__ static void matmul_q4_K_dense_kernel(
+        float *out,
+        const char *w_base,
+        const cuda_block_q8_K *xq,
+        uint64_t row_bytes,
+        uint32_t xq_blocks,
+        uint32_t out_dim,
+        uint32_t n_tok) {
+    uint32_t lane = threadIdx.x & 7u;
+    uint32_t row_lane = threadIdx.x >> 3u;   /* 32 rows per 256-thread block */
+    uint32_t tok = blockIdx.y;
+    uint32_t row = blockIdx.x * 32u + row_lane;
+    if (tok >= n_tok || row >= out_dim) return;
+    const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
+    const cuda_block_q4_K *wr =
+        (const cuda_block_q4_K *)(w_base + (uint64_t)row * row_bytes);
+    float acc = 0.0f;
+    for (uint32_t b = lane; b < xq_blocks; b += 8u) {
+        acc += dev_dot_q4_K_q8_K_block(wr + b, xqb + b);
+    }
+    acc = quarter_warp_sum_f32(acc, lane);
+    if (lane == 0) out[(uint64_t)tok * out_dim + row] = acc;
+}
+
+/* Two independently-sized Q4_K projections over one canonical Q8_K row.
+ * Each accumulator keeps the same block walk and quarter-warp reduction as
+ * matmul_q4_K_dense_kernel; interleaving the weight loads does not alter either
+ * output's arithmetic order. */
+__global__ static void matmul_q4_K_dense_pair_kernel(
+        float *out0,
+        float *out1,
+        const char *w0_base,
+        const char *w1_base,
+        const cuda_block_q8_K *xq,
+        uint64_t row_bytes,
+        uint32_t xq_blocks,
+        uint32_t out0_dim,
+        uint32_t out1_dim,
+        uint32_t n_tok) {
+    const uint32_t lane = threadIdx.x & 7u;
+    const uint32_t row_lane = threadIdx.x >> 3u;
+    const uint32_t tok = blockIdx.y;
+    const uint32_t row = blockIdx.x * 32u + row_lane;
+    if (tok >= n_tok || (row >= out0_dim && row >= out1_dim)) return;
+
+    const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
+    const cuda_block_q4_K *wr0 = row < out0_dim
+        ? (const cuda_block_q4_K *)(w0_base + (uint64_t)row * row_bytes)
+        : NULL;
+    const cuda_block_q4_K *wr1 = row < out1_dim
+        ? (const cuda_block_q4_K *)(w1_base + (uint64_t)row * row_bytes)
+        : NULL;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    for (uint32_t b = lane; b < xq_blocks; b += 8u) {
+        if (wr0) acc0 += dev_dot_q4_K_q8_K_block(wr0 + b, xqb + b);
+        if (wr1) acc1 += dev_dot_q4_K_q8_K_block(wr1 + b, xqb + b);
+    }
+    acc0 = quarter_warp_sum_f32(acc0, lane);
+    acc1 = quarter_warp_sum_f32(acc1, lane);
+    if (lane == 0u) {
+        if (row < out0_dim) out0[(uint64_t)tok * out0_dim + row] = acc0;
+        if (row < out1_dim) out1[(uint64_t)tok * out1_dim + row] = acc1;
+    }
+}
+
+/* Decode attention-output tail for AProjQ4:
+ *
+ *     block_out = input @ Wob(Q4_K)
+ *     out_hc    = HCPost(block_out, residual_hc, split)
+ *
+ * Keep the Q4_K dot-product and quarter-warp reduction identical to
+ * matmul_q4_K_dense_kernel.  The row-owning lane then materializes the
+ * diagnostic block output and immediately expands the same F32 value into
+ * the four HC streams.  This removes the standalone hc_expand launch without
+ * changing the Q4 accumulation order used by the non-MMQ fallback. */
+__global__ static void matmul_q4_K_hc_expand4_kernel(
+        float *out_hc,
+        float *block_out,
+        const float *residual_hc,
+        const float *split,
+        const char *w_base,
+        const cuda_block_q8_K *xq,
+        uint64_t row_bytes,
+        uint32_t xq_blocks,
+        uint32_t out_dim,
+        uint32_t n_embd) {
+    const uint32_t lane = threadIdx.x & 7u;
+    const uint32_t row_lane = threadIdx.x >> 3u;
+    const uint32_t row = blockIdx.x * 32u + row_lane;
+    if (row >= out_dim) return;
+
+    const cuda_block_q4_K *wr =
+        (const cuda_block_q4_K *)(w_base + (uint64_t)row * row_bytes);
+    float acc = 0.0f;
+    const bool vector_aligned = (((uintptr_t)w_base & 15u) == 0u);
+    for (uint32_t b = lane; b < xq_blocks; b += 8u) {
+        if (vector_aligned) {
+            dev_dot_q4_K_q8_K_block_vec(wr + b, xq + b, &acc);
+        } else {
+            acc += dev_dot_q4_K_q8_K_block(wr + b, xq + b);
+        }
+    }
+    acc = quarter_warp_sum_f32(acc, lane);
+
+    if (lane == 0u) {
+        block_out[row] = acc;
+
+        const float *post = split + 4u;
+        const float *comb = split + 8u;
+#pragma unroll
+        for (uint32_t dst_hc = 0; dst_hc < 4u; dst_hc++) {
+            float hc_acc = acc * post[dst_hc];
+#pragma unroll
+            for (uint32_t src_hc = 0; src_hc < 4u; src_hc++) {
+                hc_acc += comb[dst_hc + src_hc * 4u] *
+                          residual_hc[(uint64_t)src_hc * n_embd + row];
+            }
+            out_hc[(uint64_t)dst_hc * n_embd + row] = hc_acc;
+        }
+    }
+}
+
+static int cuda_matmul_q4_K_tensor(
+        ds4_gpu_tensor *out,
+        const void     *model_map,
+        uint64_t        model_size,
+        uint64_t        weight_offset,
+        uint64_t        in_dim,
+        uint64_t        out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t        n_tok) {
+    if (!out || !x || !model_map || n_tok == 0) return 0;
+    if (in_dim == 0 || (in_dim % CUDA_QK_K) != 0) return 0;
+    const uint64_t blocks = in_dim / CUDA_QK_K;
+    const uint64_t row_bytes = blocks * sizeof(cuda_block_q4_K);
+    if (weight_offset > model_size || row_bytes == 0 ||
+        out_dim > UINT64_MAX / row_bytes) {
+        return 0;
+    }
+    const uint64_t weight_bytes = out_dim * row_bytes;
+    if (weight_bytes > model_size - weight_offset) return 0;
+    if (x->bytes < n_tok * in_dim * sizeof(float) ||
+        out->bytes < n_tok * out_dim * sizeof(float)) {
+        return 0;
+    }
+    const int logical_tier = ds4_tensor_device_idx(out);
+    const char *wptr = cuda_resolve_weight_ptr(
+        model_map, weight_offset, weight_bytes, logical_tier,
+        "q4_K dense");
+    if (!wptr) return 0;
+    /* The scalar-token kernel below rereads every weight row for every token,
+     * making prefill scale almost linearly with batch length. MMQ tiles both
+     * axes and shares the Q4_K weights across activation columns, matching the
+     * fast Q8 prefill path while retaining native quantized arithmetic. */
+    if (in_dim <= INT_MAX && out_dim <= INT_MAX && n_tok <= INT_MAX &&
+        cuda_use_mmq()) {
+        /* MMVQ has lower setup cost for decode and speculative micro-batches;
+         * regular MMQ wins once enough token columns can share each weight
+         * tile. Both consume the GGUF Q4_K layout directly. */
+        const int rc = n_tok <= 8u
+            ? ds4_mmq_q4_K_dense_vec(
+                  wptr, (const float *)x->ptr, (float *)out->ptr,
+                  (int)out_dim, (int)n_tok, (int)in_dim,
+                  cuda_decode_stream())
+            : ds4_mmq_q4_K_dense(
+                  wptr, (const float *)x->ptr, (float *)out->ptr,
+                  (int)out_dim, (int)n_tok, (int)in_dim,
+                  cuda_decode_stream());
+        if (rc == 0) return 1;
+        fprintf(stderr,
+                "ds4: Q4_K MMQ returned %d "
+                "(in=%llu out=%llu n_tok=%llu)%s\n",
+                rc, (unsigned long long)in_dim,
+                (unsigned long long)out_dim,
+                (unsigned long long)n_tok,
+                g_cuda_test_q4_mmq_strict
+                    ? "; strict benchmark mode rejects fallback"
+                    : "; falling back");
+        if (g_cuda_test_q4_mmq_strict) return 0;
+    }
+    if (g_cuda_test_q4_mmq_strict) {
+        fprintf(stderr,
+                "ds4: Q4_K strict benchmark mode found no MMQ dispatch "
+                "(in=%llu out=%llu n_tok=%llu)\n",
+                (unsigned long long)in_dim,
+                (unsigned long long)out_dim,
+                (unsigned long long)n_tok);
+        return 0;
+    }
+    void *tmp = cuda_tmp_alloc_on(logical_tier,
+                                  n_tok * blocks * sizeof(cuda_block_q8_K),
+                                  "q4_K dense prequant");
+    if (!tmp) return 0;
+    cuda_block_q8_K *xq = (cuda_block_q8_K *)tmp;
+    dim3 qgrid((unsigned)blocks, (unsigned)n_tok, 1);
+    q8_K_quantize_kernel<<<qgrid, 256, 0, cuda_decode_stream()>>>(
+            xq, (const float *)x->ptr,
+            (uint32_t)in_dim, (uint32_t)n_tok);
+    if (!cuda_ok(cudaGetLastError(), "q4_K dense quantize launch")) return 0;
+    dim3 grid(((unsigned)out_dim + 31u) / 32u, (unsigned)n_tok, 1);
+    matmul_q4_K_dense_kernel<<<grid, 256, 0, cuda_decode_stream()>>>(
+            (float *)out->ptr,
+            wptr,
+            xq,
+            row_bytes,
+            (uint32_t)blocks,
+            (uint32_t)out_dim,
+            (uint32_t)n_tok);
+    return cuda_ok(cudaGetLastError(), "q4_K dense matmul launch");
+}
+
+static int cuda_matmul_q4_K_pair_tensor_impl(
+        ds4_gpu_tensor *out0,
+        ds4_gpu_tensor *out1,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t weight0_offset,
+        uint64_t weight1_offset,
+        uint64_t in_dim,
+        uint64_t out0_dim,
+        uint64_t out1_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t n_tok) {
+    if (!out0 || !out1 || !x || !model_map || n_tok == 0u ||
+        n_tok > INT_MAX ||
+        in_dim == 0u || (in_dim % CUDA_QK_K) != 0u ||
+        in_dim > INT_MAX || out0_dim == 0u || out1_dim == 0u ||
+        out0_dim > INT_MAX || out1_dim > INT_MAX) {
+        return 0;
+    }
+
+    const uint64_t blocks = in_dim / CUDA_QK_K;
+    if (blocks == 0u || blocks > UINT64_MAX / sizeof(cuda_block_q4_K)) {
+        return 0;
+    }
+    const uint64_t row_bytes = blocks * sizeof(cuda_block_q4_K);
+    if (out0_dim > UINT64_MAX / row_bytes ||
+        out1_dim > UINT64_MAX / row_bytes ||
+        weight0_offset > model_size || weight1_offset > model_size) {
+        return 0;
+    }
+    const uint64_t weight0_bytes = out0_dim * row_bytes;
+    const uint64_t weight1_bytes = out1_dim * row_bytes;
+    if (weight0_bytes > model_size - weight0_offset ||
+        weight1_bytes > model_size - weight1_offset ||
+        n_tok > UINT64_MAX / in_dim ||
+        n_tok * in_dim > UINT64_MAX / sizeof(float) ||
+        n_tok > UINT64_MAX / out0_dim ||
+        n_tok * out0_dim > UINT64_MAX / sizeof(float) ||
+        n_tok > UINT64_MAX / out1_dim ||
+        n_tok * out1_dim > UINT64_MAX / sizeof(float)) {
+        return 0;
+    }
+    const uint64_t x_bytes = n_tok * in_dim * sizeof(float);
+    const uint64_t out0_bytes = n_tok * out0_dim * sizeof(float);
+    const uint64_t out1_bytes = n_tok * out1_dim * sizeof(float);
+    if (x->bytes < x_bytes || out0->bytes < out0_bytes ||
+        out1->bytes < out1_bytes) {
+        return 0;
+    }
+    const uintptr_t out0_addr = (uintptr_t)out0->ptr;
+    const uintptr_t out1_addr = (uintptr_t)out1->ptr;
+    const bool outputs_overlap = out0_addr <= out1_addr
+        ? (uint64_t)(out1_addr - out0_addr) < out0_bytes
+        : (uint64_t)(out0_addr - out1_addr) < out1_bytes;
+    if (outputs_overlap) return 0;
+
+    const int logical_tier = ds4_tensor_device_idx(out0);
+    if (logical_tier < 0 || logical_tier >= g_n_gpus ||
+        ds4_tensor_device_idx(out1) != logical_tier ||
+        ds4_tensor_device_idx(x) != logical_tier) {
+        return 0;
+    }
+    const char *w0 = cuda_resolve_weight_ptr(
+        model_map, weight0_offset, weight0_bytes, logical_tier,
+        "q4_K dense pair0");
+    const char *w1 = cuda_resolve_weight_ptr(
+        model_map, weight1_offset, weight1_bytes, logical_tier,
+        "q4_K dense pair1");
+    if (!w0 || !w1) return 0;
+
+    const int gb10_canonical = cuda_q4_gb10_fast_path_enabled(
+        logical_tier, "DS4_CUDA_DISABLE_Q4_DENSE_PAIR");
+    if (cuda_use_mmq()) {
+        /* Share one canonical Q8_1 activation across both projections:
+         * MMVQ covers decode/speculative widths and token-tiled MMQ covers
+         * prefill.  On GB10 a rejected launch fails closed to ds4.c's
+         * independent projections; the Q8_K fallback below remains the
+         * established non-GB10 rollback. */
+        const int rc = n_tok <= 8u
+            ? ds4_mmq_q4_K_dense_pair_vec(
+                  w0, w1, (const float *)x->ptr,
+                  (float *)out0->ptr, (float *)out1->ptr,
+                  (int)out0_dim, (int)out1_dim,
+                  (int)n_tok, (int)in_dim, cuda_decode_stream())
+            : ds4_mmq_q4_K_dense_pair(
+                  w0, w1, (const float *)x->ptr,
+                  (float *)out0->ptr, (float *)out1->ptr,
+                  (int)out0_dim, (int)out1_dim,
+                  (int)n_tok, (int)in_dim, cuda_decode_stream());
+        if (rc == 0) return 1;
+        fprintf(stderr,
+                "ds4: Q4_K %s pair returned %d "
+                "(in=%llu out0=%llu out1=%llu n_tok=%llu)%s\n",
+                n_tok <= 8u ? "MMVQ" : "MMQ", rc,
+                (unsigned long long)in_dim,
+                (unsigned long long)out0_dim,
+                (unsigned long long)out1_dim,
+                (unsigned long long)n_tok,
+                rc == DS4_MMQ_NOT_APPLICABLE
+                    ? (g_cuda_test_q4_mmq_strict
+                           ? "; strict benchmark mode rejects fallback"
+                           : "; falling back")
+                    : "; attempted path failed closed");
+        if (rc != DS4_MMQ_NOT_APPLICABLE) return -1;
+        if (g_cuda_test_q4_mmq_strict) return -1;
+        if (gb10_canonical) return 0;
+    }
+    if (g_cuda_test_q4_mmq_strict) {
+        fprintf(stderr,
+                "ds4: Q4_K pair strict benchmark mode found no MMQ "
+                "dispatch (in=%llu out0=%llu out1=%llu n_tok=%llu)\n",
+                (unsigned long long)in_dim,
+                (unsigned long long)out0_dim,
+                (unsigned long long)out1_dim,
+                (unsigned long long)n_tok);
+        return -1;
+    }
+
+    /* The Q8_K pair is the established decode/microbatch rollback only.
+     * For prefill, preserve DS4_CUDA_MMQ=0 and MMQ rejection semantics by
+     * returning control to the caller's two independent dense projections. */
+    if (n_tok > 8u) return 0;
+
+    if (n_tok > UINT64_MAX / blocks ||
+        n_tok * blocks > UINT64_MAX / sizeof(cuda_block_q8_K)) {
+        return 0;
+    }
+    cuda_block_q8_K *xq = (cuda_block_q8_K *)cuda_tmp_alloc_on(
+        logical_tier, n_tok * blocks * sizeof(cuda_block_q8_K),
+        "q4_K dense pair prequant");
+    if (!xq) return 0;
+
+    const dim3 qgrid((unsigned)blocks, (unsigned)n_tok, 1u);
+    q8_K_quantize_kernel<<<qgrid, 256, 0, cuda_decode_stream()>>>(
+        xq, (const float *)x->ptr, (uint32_t)in_dim, (uint32_t)n_tok);
+    if (!cuda_ok(cudaGetLastError(), "q4_K dense pair quantize launch")) {
+        return -1;
+    }
+
+    const uint64_t max_out = out0_dim > out1_dim ? out0_dim : out1_dim;
+    const dim3 grid(((unsigned)max_out + 31u) / 32u,
+                    (unsigned)n_tok, 1u);
+    matmul_q4_K_dense_pair_kernel<<<grid, 256, 0, cuda_decode_stream()>>>(
+        (float *)out0->ptr,
+        (float *)out1->ptr,
+        w0,
+        w1,
+        xq,
+        row_bytes,
+        (uint32_t)blocks,
+        (uint32_t)out0_dim,
+        (uint32_t)out1_dim,
+        (uint32_t)n_tok);
+    return cuda_ok(cudaGetLastError(), "q4_K dense pair matmul launch")
+        ? 1
+        : -1;
+}
+
+static int cuda_q4_K_hc_expand_canonical(
+        ds4_gpu_tensor       *out_hc,
+        ds4_gpu_tensor       *block_out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split) {
+    /* Reuse the exact ordinary Q4 dispatcher.  With MMQ enabled this is the
+     * canonical MMVQ/Q8_1 path (including sanitize); if MMVQ rejects the
+     * shape it retains the ordinary Q8_K materialized fallback. */
+    if (!cuda_matmul_q4_K_tensor(block_out, model_map, model_size,
+                                 weight_offset, in_dim, out_dim, x, 1u)) {
+        return 0;
+    }
+    /* Use the ordinary one-token HC launch and argument layout. */
+    const uint64_t n_elem = 4u * out_dim;
+    const float *base = (const float *)split->ptr;
+    hc_expand_kernel<<<(unsigned)((n_elem + 255u) / 256u),
+                       256, 0, cuda_decode_stream()>>>(
+        (float *)out_hc->ptr,
+        (const float *)block_out->ptr,
+        (const float *)block_out->ptr,
+        (const float *)block_out->ptr,
+        (const float *)residual_hc->ptr,
+        base + 4u,
+        base + 8u,
+        (uint32_t)out_dim, 4u, 1u, 4u, 16u, 0, 0);
+    return cuda_ok(cudaGetLastError(),
+                   "q4_K canonical MMVQ hc expand launch");
+}
+
+static int cuda_q4_K_hc_expand_q8k_launch(
+        ds4_gpu_tensor       *out_hc,
+        ds4_gpu_tensor       *block_out,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        const char           *wptr,
+        cuda_block_q8_K      *xq,
+        uint64_t              row_bytes,
+        uint32_t              blocks,
+        uint32_t              out_dim,
+        uint32_t              n_embd) {
+    q8_K_quantize_kernel<<<blocks, 256, 0, cuda_decode_stream()>>>(
+        xq, (const float *)x->ptr, blocks * CUDA_QK_K, 1u);
+    if (!cuda_ok(cudaGetLastError(),
+                 "q4_K Q8_K hc expand quantize launch")) {
+        return 0;
+    }
+
+    matmul_q4_K_hc_expand4_kernel<<<(out_dim + 31u) / 32u,
+                                      256, 0, cuda_decode_stream()>>>(
+        (float *)out_hc->ptr,
+        (float *)block_out->ptr,
+        (const float *)residual_hc->ptr,
+        (const float *)split->ptr,
+        wptr,
+        xq,
+        row_bytes,
+        blocks,
+        out_dim,
+        n_embd);
+    return cuda_ok(cudaGetLastError(), "q4_K Q8_K hc expand launch");
+}
+
+extern "C" int ds4_gpu_matmul_q4_K_hc_expand_available(void) {
+    if (getenv("DS4_CUDA_DISABLE_Q4_ATTN_OUT_HC_FUSE") != NULL) return 0;
+    /* GB10 uses canonical MMVQ and HC; the non-MMQ path fuses Q8_K and HC. */
+    return cuda_q4_gb10_fast_path_enabled(g_current_logical_tier, NULL) ||
+           !cuda_use_mmq();
+}
+
+extern "C" int ds4_gpu_matmul_q4_K_hc_expand_tensor(
+        ds4_gpu_tensor       *out_hc,
+        ds4_gpu_tensor       *block_out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t              n_embd,
+        uint32_t              n_hc) {
+    if (!ds4_gpu_matmul_q4_K_hc_expand_available() ||
+        !out_hc || !block_out || !model_map || !x || !residual_hc || !split ||
+        in_dim == 0u || (in_dim % CUDA_QK_K) != 0u ||
+        out_dim == 0u || out_dim != n_embd || (out_dim & 1u) != 0u ||
+        n_hc != 4u || in_dim > UINT32_MAX || out_dim > UINT32_MAX) {
+        return 0;
+    }
+
+    const uint64_t blocks = in_dim / CUDA_QK_K;
+    if (blocks == 0u || blocks > UINT64_MAX / sizeof(cuda_block_q4_K)) {
+        return 0;
+    }
+    const uint64_t row_bytes = blocks * sizeof(cuda_block_q4_K);
+    if (out_dim > UINT64_MAX / row_bytes || weight_offset > model_size) {
+        return 0;
+    }
+    const uint64_t weight_bytes = out_dim * row_bytes;
+    if (weight_bytes > model_size - weight_offset ||
+        in_dim > UINT64_MAX / sizeof(float) ||
+        out_dim > UINT64_MAX / sizeof(float)) {
+        return 0;
+    }
+    const uint64_t x_bytes = in_dim * sizeof(float);
+    const uint64_t embd_bytes = out_dim * sizeof(float);
+    const uint64_t hc_bytes = 4u * embd_bytes;
+    const uint64_t split_bytes = 24u * sizeof(float);
+    if (x->bytes < x_bytes || block_out->bytes < embd_bytes ||
+        residual_hc->bytes < hc_bytes || split->bytes < split_bytes ||
+        out_hc->bytes < hc_bytes) {
+        return 0;
+    }
+
+    const int logical_tier = ds4_tensor_device_idx(out_hc);
+    if (ds4_tensor_device_idx(block_out) != logical_tier ||
+        ds4_tensor_device_idx(x) != logical_tier ||
+        ds4_tensor_device_idx(residual_hc) != logical_tier ||
+        ds4_tensor_device_idx(split) != logical_tier) {
+        return 0;
+    }
+    const char *wptr = cuda_resolve_weight_ptr(
+        model_map, weight_offset, weight_bytes, logical_tier,
+        "q4_K hc expand");
+    if (!wptr) return 0;
+
+    if (cuda_use_mmq()) {
+        return cuda_q4_K_hc_expand_canonical(
+            out_hc, block_out, model_map, model_size, weight_offset,
+            in_dim, out_dim, x, residual_hc, split);
+    }
+
+    cuda_block_q8_K *xq = (cuda_block_q8_K *)cuda_tmp_alloc_on(
+        logical_tier, blocks * sizeof(cuda_block_q8_K),
+        "q4_K hc expand prequant");
+    if (xq && cuda_q4_K_hc_expand_q8k_launch(
+                    out_hc, block_out, x, residual_hc, split,
+                    wptr, xq, row_bytes, (uint32_t)blocks,
+                    (uint32_t)out_dim, n_embd)) {
+        return 1;
+    }
+
+    /* Allocation/launch rejection of the fused fallback must not make
+     * decoding unavailable.  Re-materialize through the ordinary dispatcher
+     * and finish with the ordinary HC epilogue. */
+    return cuda_q4_K_hc_expand_canonical(
+        out_hc, block_out, model_map, model_size, weight_offset,
+        in_dim, out_dim, x, residual_hc, split);
+}
+
+__global__ static void matmul_q4_K_kslice_kernel(
+        float *out,
+        const char *w_base,
+        const cuda_block_q8_K *xq,
+        uint64_t full_row_bytes,
+        uint32_t block0,
+        uint32_t block_count,
+        uint32_t out_dim) {
+    const uint32_t lane = threadIdx.x & 7u;
+    const uint32_t row_lane = threadIdx.x >> 3u;
+    const uint32_t row = blockIdx.x * 32u + row_lane;
+    if (row >= out_dim) return;
+    const cuda_block_q4_K *wr = (const cuda_block_q4_K *)(
+        w_base + (uint64_t)row * full_row_bytes) + block0;
+    float acc = 0.0f;
+    for (uint32_t b = lane; b < block_count; b += 8u) {
+        acc += dev_dot_q4_K_q8_K_block(wr + b, xq + b);
+    }
+    acc = quarter_warp_sum_f32(acc, lane);
+    if (lane == 0) out[row] = acc;
+}
+
+static int cuda_matmul_q4_K_kslice_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t full_in_dim, uint64_t k_off,
+        uint64_t k_cnt, uint64_t out_dim, const ds4_gpu_tensor *x,
+        uint64_t x_elem_off) {
+    if (!out || !x || !model_map || full_in_dim == 0 || k_cnt == 0 ||
+        full_in_dim > UINT32_MAX || k_cnt > UINT32_MAX ||
+        out_dim > UINT32_MAX || out_dim > UINT64_MAX / sizeof(float) ||
+        (full_in_dim % CUDA_QK_K) != 0u ||
+        (k_off % CUDA_QK_K) != 0u || (k_cnt % CUDA_QK_K) != 0u ||
+        k_off > full_in_dim || k_cnt > full_in_dim - k_off ||
+        x_elem_off > x->bytes / sizeof(float) ||
+        k_cnt > x->bytes / sizeof(float) - x_elem_off ||
+        out->bytes < out_dim * sizeof(float)) {
+        return 0;
+    }
+    const uint64_t full_blocks = full_in_dim / CUDA_QK_K;
+    const uint64_t slice_blocks = k_cnt / CUDA_QK_K;
+    if (full_blocks > UINT64_MAX / sizeof(cuda_block_q4_K)) return 0;
+    const uint64_t row_bytes = full_blocks * sizeof(cuda_block_q4_K);
+    if (out_dim > UINT64_MAX / row_bytes || weight_offset > model_size) return 0;
+    const uint64_t weight_bytes = out_dim * row_bytes;
+    if (weight_bytes > model_size - weight_offset) return 0;
+    const int logical_tier = ds4_tensor_device_idx(out);
+    const char *wptr = cuda_resolve_weight_ptr(
+        model_map, weight_offset, weight_bytes, logical_tier, "q4_K kslice");
+    if (!wptr) return 0;
+    cuda_block_q8_K *xq = (cuda_block_q8_K *)cuda_tmp_alloc_on(
+        logical_tier, slice_blocks * sizeof(cuda_block_q8_K),
+        "q4_K kslice prequant");
+    if (!xq) return 0;
+    const float *xptr = (const float *)x->ptr + x_elem_off;
+    q8_K_quantize_kernel<<<(unsigned)slice_blocks, 256>>>(
+        xq, xptr, (uint32_t)k_cnt, 1u);
+    if (!cuda_ok(cudaGetLastError(), "q4_K kslice quantize launch")) return 0;
+    matmul_q4_K_kslice_kernel<<<((unsigned)out_dim + 31u) / 32u, 256>>>(
+        (float *)out->ptr, wptr, xq, row_bytes,
+        (uint32_t)(k_off / CUDA_QK_K), (uint32_t)slice_blocks,
+        (uint32_t)out_dim);
+    return cuda_ok(cudaGetLastError(), "q4_K kslice matmul launch");
+}
+
+extern "C" int ds4_gpu_matmul_q4_K_pair_tensor(
+        ds4_gpu_tensor *out0, ds4_gpu_tensor *out1,
+        const void *model_map, uint64_t model_size,
+        uint64_t weight0_offset, uint64_t weight1_offset,
+        uint64_t in_dim, uint64_t out0_dim, uint64_t out1_dim,
+        const ds4_gpu_tensor *x, uint64_t n_tok) {
+    /* Cross-CUDA pair dispatch predates the GB10 specialization.  Preserve it
+     * verbatim outside GB10; this switch remains its established rollback. */
+    if (getenv("DS4_CUDA_DISABLE_Q4_DENSE_PAIR") != NULL) return 0;
+    return cuda_matmul_q4_K_pair_tensor_impl(
+        out0, out1, model_map, model_size,
+        weight0_offset, weight1_offset,
+        in_dim, out0_dim, out1_dim, x, n_tok);
+}
+
 static int cuda_matmul_mmq_dense_quant(
         ds4_gpu_tensor       *out,
         const void           *model_map,
@@ -33197,8 +34723,10 @@ extern "C" int ds4_gpu_matmul_quant_tensor(
         return ds4_gpu_matmul_f16_tensor(out, model_map, model_size,
                                          weight_offset, in_dim, out_dim,
                                          x, n_tok);
-    case 10u:  /* Q2_K */
     case 12u:  /* Q4_K */
+        return cuda_matmul_q4_K_tensor(out, model_map, model_size,
+                weight_offset, in_dim, out_dim, x, n_tok);
+    case 10u:  /* Q2_K */
     case 16u:  /* IQ2_XXS */
     case 39u:  /* MXFP4 */
         return cuda_matmul_mmq_dense_quant(
@@ -33741,6 +35269,7 @@ extern "C" void ds4_gpu_set_glm_model(bool enabled) {
 }
 
 extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {
+    (void)ds4_gpu_release_q4_attn_q_b_f16_sidecars();
     g_ssd_streaming_mode = enabled ? 1 : 0;
     cuda_stream_selected_cache_invalidate();
     if (!g_ssd_streaming_mode) cuda_stream_selected_cache_release();
@@ -33885,10 +35414,17 @@ extern "C" int ds4_gpu_matmul_quant_kslice_tensor(
         uint64_t out_dim,
         const ds4_gpu_tensor *x,
         uint64_t x_elem_off) {
-    if (weight_type != 8u) return 0;
-    return ds4_gpu_matmul_q8_0_kslice_tensor(
-            out, model_map, model_size, weight_offset,
-            full_in_dim, k_off, k_cnt, out_dim, x, x_elem_off);
+    if (weight_type == 8u) {
+        return ds4_gpu_matmul_q8_0_kslice_tensor(
+                out, model_map, model_size, weight_offset,
+                full_in_dim, k_off, k_cnt, out_dim, x, x_elem_off);
+    }
+    if (weight_type == 12u) {
+        return cuda_matmul_q4_K_kslice_tensor(
+                out, model_map, model_size, weight_offset,
+                full_in_dim, k_off, k_cnt, out_dim, x, x_elem_off);
+    }
+    return 0;
 }
 
 extern "C" int ds4_gpu_matmul_q8_0_f16_out_tensor(
@@ -33908,18 +35444,198 @@ extern "C" int ds4_gpu_matmul_q8_0_f16_out_tensor(
 extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
         ds4_gpu_tensor *out, ds4_gpu_tensor *q_half,
         const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint32_t weight_type,
         uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x,
         uint32_t n_tok, uint32_t n_head, uint32_t head_dim,
         uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse,
         float freq_base, float freq_scale, float ext_factor,
         float attn_factor, float beta_fast, float beta_slow, float eps) {
-    (void)out; (void)q_half; (void)model_map; (void)model_size;
-    (void)weight_offset; (void)in_dim; (void)out_dim; (void)x;
-    (void)n_tok; (void)n_head; (void)head_dim; (void)n_rot; (void)pos0;
-    (void)n_ctx_orig; (void)inverse; (void)freq_base; (void)freq_scale;
-    (void)ext_factor; (void)attn_factor; (void)beta_fast; (void)beta_slow;
-    (void)eps;
-    return 0;
+    (void)q_half;
+    /* Resident Q4 long prefill keeps one expanded matrix and an F32 output. */
+    if (!ds4_gpu_execution_phase_allows_prefill(ds4_gpu_get_execution_phase()) ||
+        weight_type != CUDA_Q4_ATTN_Q_B_TYPE || n_tok < 32u ||
+        cuda_q4_attn_q_b_transient_f16_disabled() ||
+        n_tok < cuda_q4_attn_q_b_transient_f16_min_tokens()) return 0;
+    if (g_ssd_streaming_mode || g_quality_mode || g_n_gpus != 1 ||
+        !g_cublas_ready ||
+        !g_gpu[0].cublas_ready || !g_gpu[0].cublas ||
+        g_decode_graph_capturing || !out || !x || !model_map ||
+        !out->ptr || !x->ptr || n_head == 0u ||
+        head_dim == 0u || in_dim != CUDA_Q4_ATTN_Q_B_IN_DIM ||
+        out_dim != CUDA_Q4_ATTN_Q_B_OUT_DIM ||
+        out_dim != (uint64_t)n_head * head_dim || n_rot > head_dim ||
+        (n_rot & 1u) != 0u ||
+        ds4_tensor_device_idx(out) != 0 ||
+        ds4_tensor_device_idx(x) != 0 ||
+        n_tok > (uint32_t)INT_MAX ||
+        (uint64_t)n_tok * in_dim > (uint64_t)UINT32_MAX * 256u ||
+        (uint64_t)n_tok * n_head > UINT32_MAX ||
+        pos0 > UINT32_MAX - (n_tok - 1u)) {
+        return 0;
+    }
+
+    const uint64_t x_bytes =
+        (uint64_t)n_tok * in_dim * sizeof(float);
+    const uint64_t out_bytes =
+        (uint64_t)n_tok * out_dim * sizeof(float);
+    if (x->bytes < x_bytes || out->bytes < out_bytes) {
+        return 0;
+    }
+    const uint64_t blocks = in_dim / CUDA_QK_K;
+    const uint64_t row_bytes = blocks * sizeof(cuda_block_q4_K);
+    if (out_dim > UINT64_MAX / row_bytes || weight_offset > model_size) {
+        return 0;
+    }
+    const uint64_t weight_bytes = out_dim * row_bytes;
+    if (weight_bytes > model_size - weight_offset) return 0;
+
+    uint64_t transient_weight_bytes = 0;
+    uint64_t xh_offset = 0;
+    uint64_t required_scratch_bytes = 0;
+    if (!cuda_q4_attn_q_b_transient_f16_scratch_size(
+            n_tok, &transient_weight_bytes, &xh_offset,
+            &required_scratch_bytes)) {
+        return 0;
+    }
+
+    /* Protect the shared weight/activation arena for the entire enqueue sequence.
+     * Stream ordering protects reuse after this function returns; host
+     * serialization protects the sequence itself from interleaving with
+     * another session. */
+    std::unique_lock<std::mutex> scratch_use_lock(
+        g_q4_attn_q_b_transient_f16_mutex);
+    if (!g_q4_attn_q_b_transient_f16_scratch ||
+        g_q4_attn_q_b_transient_f16_scratch_device != g_gpu[0].device_id ||
+        g_q4_attn_q_b_transient_f16_scratch_bytes <
+            required_scratch_bytes) {
+        return 0;
+    }
+    __half *const scratch =
+        g_q4_attn_q_b_transient_f16_scratch;
+    __half *const xh = reinterpret_cast<__half *>(
+        reinterpret_cast<char *>(scratch) + xh_offset);
+    const __half *const w_f16 = scratch;
+    if (g_q4_attn_q_b_transient_f16_runtime_disabled) return 0;
+
+    int previous_device = -1;
+    if (cudaGetDevice(&previous_device) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    if (cudaSetDevice(g_gpu[0].device_id) != cudaSuccess) {
+        (void)cudaGetLastError();
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        return 0;
+    }
+
+    const cudaStream_t stream = cuda_decode_stream();
+    const cublasHandle_t handle = cuda_cublas_for_tier(0);
+    cudaStream_t handle_stream = NULL;
+    if (cublasGetStream(handle, &handle_stream) != CUBLAS_STATUS_SUCCESS ||
+        handle_stream != stream) {
+        /* Never mutate the shared handle here.  A non-default stream means
+         * another subsystem owns its ordering; the native Q4 fallback is
+         * safer than racing the activation conversion. */
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        return 0;
+    }
+
+    const uint64_t xh_count = (uint64_t)n_tok * in_dim;
+    const char *source =
+        model_map == g_model_host_base &&
+        model_size == g_model_registered_size &&
+        g_model_device_owned && g_model_device_base
+            ? g_model_device_base + weight_offset : NULL;
+    if (!cuda_q4_attn_q_b_source_is_device_resident(
+            source, g_gpu[0].device_id)) {
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        return 0;
+    }
+    const uint64_t chunks = transient_weight_bytes / (16u * sizeof(__half));
+    if (ds4_q4_dequant::select(
+            in_dim, out_dim, n_tok, (uintptr_t)source, (uintptr_t)scratch,
+            g_n_gpus == 1 && g_cuda_is_gb10[0], g_quality_mode,
+            g_ssd_streaming_mode, g_cuda_disable_q4_prefill_dequant_vec)) {
+        ds4_q4_dequant_f16_pair32_kernel<<<
+            (unsigned)((chunks / 2u + 255u) / 256u), 256, 0, stream>>>(
+                scratch, reinterpret_cast<const cuda_block_q4_K *>(source),
+                out_dim * blocks);
+    } else {
+        dequant_q4_K_to_f16_kernel<<<
+            (unsigned)((chunks + 255u) / 256u), 256, 0, stream>>>(
+                scratch,
+                reinterpret_cast<const cuda_block_q4_K *>(source),
+                in_dim, out_dim);
+    }
+    const cudaError_t dequant_err = cudaGetLastError();
+    if (dequant_err != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: CUDA Q4 attn_q_b transient dequantization failed: "
+                "%s\n",
+                cudaGetErrorString(dequant_err));
+        g_q4_attn_q_b_transient_f16_runtime_disabled = 1;
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        return 0;
+    }
+
+    /* Prefill is deliberately excluded from decode-graph capture above, so
+     * dequantization, activation conversion, cuBLAS, and the epilogue all ride
+     * one stream.  Avoid retargeting the shared handle on this hot path. */
+    f32_to_f16_kernel<<<
+        (unsigned)((xh_count + 255u) / 256u), 256, 0, stream>>>(
+            xh, (const float *)x->ptr, xh_count);
+    cudaError_t launch_err = cudaGetLastError();
+    if (launch_err != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: CUDA Q4 attn_q_b activation conversion failed: %s\n",
+                cudaGetErrorString(launch_err));
+        g_q4_attn_q_b_transient_f16_runtime_disabled = 1;
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        return 0;
+    }
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    const cublasStatus_t status = cublasGemmEx(
+        handle,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        (int)out_dim, (int)n_tok, (int)in_dim,
+        &alpha,
+        w_f16, CUDA_R_16F, (int)in_dim,
+        xh, CUDA_R_16F, (int)in_dim,
+        &beta,
+        out->ptr, CUDA_R_32F, (int)out_dim,
+        CUDA_R_32F,
+        CUBLAS_GEMM_DEFAULT);
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr,
+                "ds4: CUDA Q4 attn_q_b F16 GEMM failed: status %d\n",
+                (int)status);
+        g_q4_attn_q_b_transient_f16_runtime_disabled = 1;
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        return 0;
+    }
+
+    /* cuBLAS has accepted the first output writer.  From this point onward a
+     * native-Q4 replay is unsafe even when the specialization was optional. */
+    head_rms_norm_rope_tail_kernel<true><<<
+        n_tok * n_head, 256, 0, stream>>>(
+            (float *)out->ptr,
+            n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig,
+            inverse ? 1 : 0, freq_base, freq_scale, ext_factor,
+            attn_factor, beta_fast, beta_slow, eps);
+    launch_err = cudaGetLastError();
+    if (launch_err != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: CUDA Q4 attn_q_b F16 RMS/RoPE epilogue failed: %s\n",
+                cudaGetErrorString(launch_err));
+        g_q4_attn_q_b_transient_f16_runtime_disabled = 1;
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        return -1;
+    }
+
+    if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+    return 1;
 }
 
 extern "C" int ds4_gpu_attention_prefill_raw_heads_range_tensor(
@@ -33967,22 +35683,220 @@ extern "C" int ds4_gpu_attention_output_q4_K_batch_tensor(
         uint64_t out_a_offset, uint64_t out_b_offset, uint32_t out_b_type,
         uint64_t group_dim, uint64_t rank, uint32_t n_groups,
         uint64_t out_dim, const ds4_gpu_tensor *heads, uint32_t n_tokens) {
-    (void)out; (void)low; (void)group_tmp; (void)low_tmp;
-    (void)model_map; (void)model_size; (void)out_a_offset;
-    (void)out_b_offset; (void)out_b_type; (void)group_dim; (void)rank;
-    (void)n_groups; (void)out_dim; (void)heads; (void)n_tokens;
-    return 0;
+    const int grouped_prefill_require = cuda_env_flag_enabled(
+        "DS4_CUDA_REQUIRE_Q4_GROUPED_ATTN_A_PREFILL", 0);
+    const int grouped_q81_require = cuda_env_flag_enabled(
+        "DS4_CUDA_REQUIRE_Q4_GROUPED_ATTN_A_Q81", 0);
+    const int any_grouped_require = grouped_prefill_require ||
+        grouped_q81_require;
+    if (!out || !low || !group_tmp || !low_tmp || !heads || !model_map ||
+        group_dim == 0 || rank == 0 || n_groups == 0 || out_dim == 0 ||
+        n_tokens < 2u || group_dim > INT_MAX || rank > INT_MAX ||
+        out_dim > INT_MAX || n_tokens > INT_MAX || !cuda_use_mmq()) {
+        return any_grouped_require ? -1 : 0;
+    }
+    const uint64_t low_dim = (uint64_t)n_groups * rank;
+    if (low_dim > INT_MAX || (group_dim % CUDA_QK_K) != 0u ||
+        (low_dim % CUDA_QK_K) != 0u) {
+        return any_grouped_require ? -1 : 0;
+    }
+    const uint64_t row_a_bytes =
+        (group_dim / CUDA_QK_K) * sizeof(cuda_block_q4_K);
+    if (rank > UINT64_MAX / row_a_bytes ||
+        n_groups > UINT64_MAX / (rank * row_a_bytes)) {
+        return any_grouped_require ? -1 : 0;
+    }
+    const uint64_t out_a_bytes = (uint64_t)n_groups * rank * row_a_bytes;
+    if (out_a_offset > model_size ||
+        out_a_bytes > model_size - out_a_offset ||
+        heads->bytes < (uint64_t)n_tokens * n_groups * group_dim * sizeof(float) ||
+        low->bytes < (uint64_t)n_tokens * low_dim * sizeof(float) ||
+        out->bytes < (uint64_t)n_tokens * out_dim * sizeof(float) ||
+        group_tmp->bytes < (uint64_t)n_tokens * group_dim * sizeof(float) ||
+        low_tmp->bytes < (uint64_t)n_tokens * rank * sizeof(float)) {
+        return any_grouped_require ? -1 : 0;
+    }
+    const int logical_tier = ds4_tensor_device_idx(out);
+    const char *out_a = cuda_resolve_weight_ptr(
+        model_map, out_a_offset, out_a_bytes, logical_tier, "q4 attn_out_a");
+    if (!out_a) {
+        return any_grouped_require ? -1 : 0;
+    }
+    /* The direct-strided eight-grid path preserves the canonical MMQ
+     * reduction tree and is the GB10 prefill default. Exact ENABLE=0 is a
+     * compatibility opt-out; the NO switch remains the rollback. */
+    const int grouped_prefill_enable = cuda_env_flag_enabled(
+        "DS4_CUDA_ENABLE_Q4_GROUPED_ATTN_A_PREFILL", 1);
+    const int grouped_prefill_disable =
+        getenv("DS4_CUDA_NO_Q4_GROUPED_ATTN_A_PREFILL") != NULL;
+    const int grouped_q81_disable =
+        getenv("DS4_CUDA_NO_Q4_GROUPED_ATTN_A_Q81") != NULL;
+    const int grouped_prefill_selected = grouped_prefill_enable ||
+        grouped_prefill_require || grouped_q81_require;
+
+    const int grouped_gb10 =
+        n_tokens <= 8u && n_groups <= INT_MAX &&
+        ds4_tensor_device_idx(low) == logical_tier &&
+        ds4_tensor_device_idx(heads) == logical_tier &&
+        cuda_q4_gb10_fast_path_enabled(
+            logical_tier, "DS4_CUDA_NO_Q4_GROUPED_ATTN_A");
+    const int grouped_prefill_gb10 =
+        n_tokens > 8u && n_groups <= INT_MAX &&
+        ds4_tensor_device_idx(low) == logical_tier &&
+        ds4_tensor_device_idx(heads) == logical_tier &&
+        !grouped_prefill_disable &&
+        cuda_q4_gb10_fast_path_enabled(
+            logical_tier, "DS4_CUDA_NO_Q4_GROUPED_ATTN_A");
+    if (grouped_prefill_require && !grouped_prefill_gb10) {
+        fprintf(stderr,
+                "ds4: required CUDA Q4 grouped attention-A prefill path "
+                "is not eligible\n");
+        return -1;
+    }
+    if (grouped_q81_require &&
+        (grouped_q81_disable || !grouped_prefill_gb10 ||
+         rank != 1024u || group_dim != 4096u || n_groups != 8u ||
+         n_tokens > (uint32_t)(INT32_MAX / (8*4096)))) {
+        fprintf(stderr,
+                "ds4: required CUDA Q4 grouped attention-A K4096/G8 "
+                "Q8_1 quantizer is not eligible\n");
+        return -1;
+    }
+    if (grouped_prefill_selected && grouped_prefill_gb10) {
+        const int rc = ds4_mmq_q4_K_grouped_dense(
+            out_a, (const float *)heads->ptr, (float *)low->ptr,
+            (int)rank, (int)n_tokens, (int)group_dim, (int)n_groups,
+            cuda_decode_stream());
+        if (rc != 0) {
+            fprintf(stderr,
+                    "ds4: CUDA Q4 grouped attention-A prefill returned %d; "
+                    "failing closed after dispatch\n", rc);
+            return -1;
+        }
+    } else if (grouped_gb10) {
+        for (uint32_t t = 0; t < n_tokens; t++) {
+            const int rc = ds4_mmq_q4_K_grouped_vec(
+                out_a,
+                (const float *)heads->ptr +
+                    (uint64_t)t * n_groups * group_dim,
+                (float *)low->ptr + (uint64_t)t * low_dim,
+                (int)rank, (int)group_dim, (int)n_groups,
+                cuda_decode_stream());
+            if (rc != 0) return -1;
+        }
+    } else {
+        /* Existing cross-CUDA path: pack one group at a time, run a
+         * token-batched MMQ, then scatter rank rows back to token-major low.
+         * Keep this byte-for-byte outside the new GB10 dispatch. */
+        for (uint32_t g = 0; g < n_groups; g++) {
+            cudaError_t ce = cudaMemcpy2DAsync(
+                group_tmp->ptr, group_dim * sizeof(float),
+                (const float *)heads->ptr + (uint64_t)g * group_dim,
+                (uint64_t)n_groups * group_dim * sizeof(float),
+                group_dim * sizeof(float), n_tokens,
+                cudaMemcpyDeviceToDevice, cuda_decode_stream());
+            if (!cuda_ok(ce, "q4 attention output heads pack")) return -1;
+            const int rc = ds4_mmq_q4_K_dense(
+                out_a + (uint64_t)g * rank * row_a_bytes,
+                (const float *)group_tmp->ptr, (float *)low_tmp->ptr,
+                (int)rank, (int)n_tokens, (int)group_dim,
+                cuda_decode_stream());
+            if (rc != 0) return -1;
+            ce = cudaMemcpy2DAsync(
+                (float *)low->ptr + (uint64_t)g * rank,
+                low_dim * sizeof(float), low_tmp->ptr, rank * sizeof(float),
+                rank * sizeof(float), n_tokens,
+                cudaMemcpyDeviceToDevice, cuda_decode_stream());
+            if (!cuda_ok(ce, "q4 attention output low unpack")) return -1;
+        }
+    }
+    int b_rc = 0;
+    if (out_b_type == 12u) {
+        b_rc = cuda_matmul_q4_K_tensor(out, model_map, model_size,
+                                       out_b_offset, low_dim, out_dim,
+                                       low, n_tokens);
+    } else if (out_b_type == 8u) {
+        b_rc = cuda_matmul_q8_0_tensor_labeled(
+            out, model_map, model_size, out_b_offset, low_dim, out_dim,
+            low, n_tokens, "q4 attn_output_b");
+    }
+    /* Attention-A has already been enqueued.  A B rejection or launch error
+     * can no longer request whole-operation fallback without replaying A, so
+     * preserve the tri-state compound-operation contract and fail closed. */
+    return b_rc > 0 ? 1 : -1;
 }
 
 extern "C" int ds4_gpu_attention_output_low_q4_K_slice_tensor(
         ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
         uint64_t out_a_offset, uint64_t group_dim, uint64_t rank,
         uint32_t group0, uint32_t group_cnt,
-        const ds4_gpu_tensor *heads) {
-    (void)low; (void)model_map; (void)model_size; (void)out_a_offset;
-    (void)group_dim; (void)rank; (void)group0; (void)group_cnt;
-    (void)heads;
-    return 0;
+        const ds4_gpu_tensor *heads, int resident_decode) {
+    (void)resident_decode;
+    if (!low || !heads || !model_map || group_dim == 0u || rank == 0u ||
+        group_cnt == 0u || group0 > UINT32_MAX - group_cnt ||
+        group_dim > INT_MAX || rank > INT_MAX || group_cnt > INT_MAX ||
+        (group_dim % CUDA_QK_K) != 0u) {
+        return 0;
+    }
+    const int logical_tier = ds4_tensor_device_idx(low);
+    if (ds4_tensor_device_idx(heads) != logical_tier ||
+        !cuda_q4_gb10_fast_path_enabled(
+            logical_tier, "DS4_CUDA_NO_Q4_GROUPED_ATTN_A")) {
+        return 0;
+    }
+
+    const uint64_t blocks = group_dim / CUDA_QK_K;
+    if (blocks == 0u ||
+        blocks > UINT64_MAX / sizeof(cuda_block_q4_K)) {
+        return 0;
+    }
+    const uint64_t row_bytes = blocks * sizeof(cuda_block_q4_K);
+    if (rank > UINT64_MAX / row_bytes ||
+        group_dim > UINT64_MAX / group_cnt ||
+        rank > UINT64_MAX / group_cnt) {
+        return 0;
+    }
+    const uint64_t group_weight_bytes = rank * row_bytes;
+    if ((uint64_t)group0 > UINT64_MAX / group_weight_bytes ||
+        (uint64_t)group_cnt > UINT64_MAX / group_weight_bytes) {
+        return 0;
+    }
+    const uint64_t group_weight_offset =
+        (uint64_t)group0 * group_weight_bytes;
+    const uint64_t selected_weight_bytes =
+        (uint64_t)group_cnt * group_weight_bytes;
+    if (out_a_offset > model_size ||
+        group_weight_offset > model_size - out_a_offset) {
+        return 0;
+    }
+    const uint64_t selected_offset = out_a_offset + group_weight_offset;
+    if (selected_weight_bytes > model_size - selected_offset) return 0;
+
+    const uint64_t heads_elems = (uint64_t)group_cnt * group_dim;
+    const uint64_t low_elems = (uint64_t)group_cnt * rank;
+    if (heads_elems > UINT64_MAX / sizeof(float) ||
+        low_elems > UINT64_MAX / sizeof(float) ||
+        heads->bytes < heads_elems * sizeof(float) ||
+        low->bytes < low_elems * sizeof(float)) {
+        return 0;
+    }
+
+    const char *out_a = cuda_resolve_weight_ptr(
+        model_map, selected_offset, selected_weight_bytes, logical_tier,
+        "q4 grouped attn_out_a");
+    if (!out_a) return 0;
+    cudaStream_t stream = cuda_decode_stream();
+    const int rc = ds4_mmq_q4_K_grouped_vec(
+        out_a, (const float *)heads->ptr, (float *)low->ptr,
+        (int)rank, (int)group_dim, (int)group_cnt, stream);
+    if (rc != 0) {
+        /* NOT_APPLICABLE is pre-enqueue and cleanly retries the established
+         * per-group loop. A negative result may follow a launch and must
+         * propagate so the graph cannot replay work over a partial result. */
+        return rc < 0 ? -1 : 0;
+    }
+
+    return 1;
 }
 
 extern "C" int ds4_gpu_hc_expand_split_half_tensor(

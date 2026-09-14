@@ -874,13 +874,84 @@ int ds4_mmq_q8_0_dense_vec(
     int           K,
     cudaStream_t  stream);
 
+// Optional dispatch rejection before enqueue; negative values are launch failures.
+#define DS4_MMQ_NOT_APPLICABLE 1
+
+int ds4_mmq_q4_K_dense_vec(
+    const void  * W_q4_K,
+    const float * X_f32,
+    float       * out_f32,
+    int           M,
+    int           N,
+    int           K,
+    cudaStream_t  stream);
+
+// V4.1 output projections: repeat the N=1 MMVQ reduction over up to 64
+// token samples, with contiguous groups inside each sample. Scratch is
+// caller-owned canonical Q8_1 storage; no weights or activations are cached.
+// Accepted (M,K,groups): (1024,4096,4/8), (5120,8192,1).
+// output_bf16=1 fuses BF16 rounding after sanitize for output-A; zero keeps
+// the F32 output required before output-B's tensor-parallel rank reduction.
+// Returns 0 on success, nonzero on validation or launch failure.
+int ds4_mmq_q4_K_decode_samples(
+    const void *weights, const float *input, float *out,
+    void *scratch, size_t scratch_bytes,
+    int M, int K, int rows, int groups, int output_bf16, cudaStream_t stream);
+
+int ds4_mmq_q4_K_grouped_vec(
+    const void  * W_q4_K,
+    const float * X_f32,
+    float       * out_f32,
+    int           M,
+    int           K,
+    int           n_groups,
+    cudaStream_t  stream);
+
+int ds4_mmq_q4_K_dense_pair(
+    const void  * W0_q4_K,
+    const void  * W1_q4_K,
+    const float * X_f32,
+    float       * out0_f32,
+    float       * out1_f32,
+    int           M0,
+    int           M1,
+    int           N,
+    int           K,
+    cudaStream_t  stream);
+
+int ds4_mmq_q4_K_grouped_dense(
+    const void  * W_q4_K,
+    const float * X_f32,
+    float       * out_f32,
+    int           M,
+    int           N,
+    int           K,
+    int           n_groups,
+    cudaStream_t  stream);
+
+void ds4_mmq_set_gb10_optimizations(int enabled);
+
+#if !defined(GGML_USE_HIP)
+size_t ds4_mmq_q4_K_grouped_q8_1_scratch_bytes_for_test(int N);
+
+int ds4_mmq_q4_K_grouped_quantize_q8_1_for_test(
+    const float * X_f32,
+    void        * q8_ds4,
+    size_t        q8_bytes,
+    int           N,
+    int           use_specialized,
+    cudaStream_t  stream);
+#endif
+
 int ds4_mmq_q4_K_dense_pair_vec(
     const void  * W0_q4_K,
     const void  * W1_q4_K,
     const float * X_f32,
     float       * out0_f32,
     float       * out1_f32,
-    int           M,
+    int           M0,
+    int           M1,
+    int           N,
     int           K,
     cudaStream_t  stream);
 

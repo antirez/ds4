@@ -184,7 +184,8 @@ static int hipblaslt_prefill_solution_index(
  * validate the dimensions here as well before choosing any fixed-index plan. */
 static int hipblaslt_gemm_tn_f16_out_f32_prefill(
         float *out, const __half *w, const __half *x,
-        uint32_t out_dim, uint32_t n_tok, uint32_t in_dim) {
+        uint32_t out_dim, uint32_t n_tok, uint32_t in_dim,
+        bool stop_on_error = false) {
     const int solution_index = hipblaslt_prefill_solution_index(out_dim, n_tok, in_dim);
     if (solution_index < 0 || !g_hipblaslt_ready || !out || !w || !x ||
         __atomic_load_n(&g_hipblaslt_prefill_state, __ATOMIC_RELAXED) < 0) return 0;
@@ -206,6 +207,13 @@ static int hipblaslt_gemm_tn_f16_out_f32_prefill(
         if (hipblaslt_ok(hipblasLtMatmul(g_hipblaslt, p->desc, &alpha,
                 w, p->a_desc, x, p->b_desc, &beta, out, p->c_desc, out, p->d_desc,
                 &p->algo, NULL, 0, 0), "prefill F16/F32")) return 1;
+        if (stop_on_error) {
+            // The folded producer already submitted work. Distinguish an Lt
+            // call failure from preflight/plan unavailability so its caller
+            // cannot replay a different projection after a partial enqueue.
+            __atomic_store_n(&g_hipblaslt_prefill_state, -1, __ATOMIC_RELAXED);
+            return -1;
+        }
     }
     /* Original same-stream fallback overwrites the whole output. This
      * handles library rejection; asynchronous GPU faults remain fatal. */

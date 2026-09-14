@@ -7,6 +7,519 @@
     fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x); goto done; \
 } } while (0)
 
+/* Exercise the scalar graph's actual HC call sites with bounded F16 mixer
+ * weights. The MoE producer is supplied explicitly; its shared contribution
+ * must survive exactly once whether or not block aliases routed. */
+static int check_scalar_epilogues(void) {
+    enum { E = 5120, PAD = 16 };
+    enum { R, A, B, T, S, P, AS, FS, X, N, FN, M, NT };
+    const uint32_t width[] = {4*E,4*E,E,E,E,4,24,24,E,E,4*E,24};
+    const ds4_shape saved_shape = g_ds4_shape;
+    const ds4_gpu_execution_phase saved_phase = ds4_gpu_get_execution_phase();
+    const char *old_env = getenv("DS4_METAL_DISABLE_V41_EPILOGUE_FUSION");
+    char *saved_env = old_env ? strdup(old_env) : NULL;
+    ds41_gpu_graph *g = calloc(2, sizeof(*g));
+    ds4_imatrix_collector imatrix = {0};
+    ds4_gpu_tensor *slab[2] = {0}, *v[2][NT] = {{0}};
+    uint64_t offset[NT], total = 0;
+    const uint64_t fn_offset = 32768u;
+    const uint64_t model_bytes = fn_offset + (uint64_t)24 * 4 * E * 2;
+    void *map = MAP_FAILED;
+    float routed[E], expected_shared[E];
+    int rc = 1;
+    REQUIRE(g && (!old_env || saved_env));
+    g_ds4_shape = DS4_SHAPE_FLASH41;
+    map = mmap(NULL, model_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    REQUIRE(map != MAP_FAILED);
+    float *params = map;
+    for (unsigned i = 0; i < 3; i++) params[i] = 0.125f * (i + 1);
+    for (unsigned i = 0; i < 24; i++) params[4+i] = ((int)(i % 7) - 3) * 0.125f;
+    for (unsigned i = 0; i < E; i++) params[32+i] = 1 + (i % 5) * 0.0625f;
+    uint16_t *weights = (uint16_t *)((uint8_t *)map + fn_offset);
+    for (uint64_t i = 0; i < (uint64_t)24 * 4 * E; i++)
+        weights[i] = f32_to_f16(((int)(i % 17u) - 8) * 0x1p-12f);
+    ds4_tensor fn = {.type = DS4_TENSOR_F16, .dim = {4*E,24}, .abs_offset = fn_offset};
+    ds4_tensor scale = {.type = DS4_TENSOR_F32, .dim = {3}, .abs_offset = 0};
+    ds4_tensor base = {.type = DS4_TENSOR_F32, .dim = {24}, .abs_offset = 16};
+    ds4_tensor norm = {.type = DS4_TENSOR_F32, .dim = {E}, .abs_offset = 128};
+    ds4_layer_weights layer = {.hc_attn_fn = &fn, .hc_ffn_fn = &fn,
+        .hc_attn_scale = &scale, .hc_ffn_scale = &scale,
+        .hc_attn_base = &base, .hc_ffn_base = &base, .attn_norm = &norm, .ffn_norm = &norm};
+    const ds4_model model = {.map = map, .size = model_bytes};
+    REQUIRE(ds4_gpu_init() && ds4_gpu_set_model_map(map, model_bytes));
+    for (unsigned i = 0; i < NT; i++) {
+        offset[i] = total + PAD * sizeof(float);
+        total += (uint64_t)(width[i] + 2 * PAD) * sizeof(float);
+    }
+    for (unsigned arm = 0; arm < 2; arm++) {
+        REQUIRE((slab[arm] = ds4_gpu_tensor_alloc(total)) != NULL);
+        for (unsigned i = 0; i < NT; i++)
+            REQUIRE((v[arm][i] = ds4_gpu_tensor_view(slab[arm], offset[i], width[i] * sizeof(float))) != NULL);
+        g[arm].residual = v[arm][R]; g[arm].after_attn = v[arm][A];
+        g[arm].block = v[arm][B]; g[arm].shared = v[arm][S]; g[arm].pre = v[arm][P];
+        g[arm].attn_split = v[arm][AS]; g[arm].ffn_split = v[arm][FS];
+        g[arm].x = v[arm][X]; g[arm].norm = v[arm][N];
+        g[arm].flat_norm = v[arm][FN]; g[arm].mix = v[arm][M];
+    }
+    const ds4_gpu_execution_phase phases[] = {DS4_GPU_PHASE_DECODE,
+        DS4_GPU_PHASE_PREFILL, DS4_GPU_PHASE_VERIFY, DS4_GPU_PHASE_BATCH_DECODE,
+        DS4_GPU_PHASE_MIXED, DS4_GPU_PHASE_AUTO};
+    for (unsigned pattern = 0; pattern < 3; pattern++)
+    for (unsigned alias = 0; alias < 2; alias++)
+    for (unsigned mode = 0; mode < 9; mode++) {
+        ds4_gpu_exchange_execution_phase(mode < 6 ? phases[mode] : DS4_GPU_PHASE_DECODE);
+        ds4_gpu_set_quality(mode == 6);
+        for (unsigned arm = 0; arm < 2; arm++) {
+            g[arm].tp_world = mode == 8 ? 2 : 1;
+            g[arm].quality = mode == 6;
+            g[arm].imatrix = mode == 7 ? &imatrix : NULL;
+            g[arm].routed = v[arm][alias ? B : T];
+            uint32_t *data = ds4_gpu_tensor_contents(slab[arm]);
+            REQUIRE(data);
+            for (uint64_t i = 0; i < total / 4; i++) data[i] = 0x7fc12345u;
+            for (unsigned i = 0; i < NT; i++) {
+                float *p = ds4_gpu_tensor_contents(v[arm][i]);
+                for (unsigned j = 0; j < width[i]; j++) {
+                    const float value = ((int)((j * 37u + i * 19u + pattern * 11u) % 257u) - 128) / 64.0f;
+                    p[j] = value;
+                    if (pattern == 1 && i == R)
+                        p[j] = j / E == 0 ? 8192.0f : j / E == 1 ? -8192.0f : value;
+                }
+            }
+        }
+        for (unsigned j = 0; j < E; j++) {
+            /* Straddle ties at the routed+shared BF16 boundary. */
+            routed[j] = (j & 1u ? 1.00390625f : -1.01171875f) +
+                (pattern == 2 ? (j % 3u - 1.0f) * 0x1p-16f : 0);
+            expected_shared[j] = j & 1u ? 0x1p-16f : -0x1p-16f;
+        }
+        for (unsigned stage = 0; stage < 4; stage++) {
+            for (unsigned arm = 0; arm < 2; arm++) {
+                if (arm) REQUIRE(unsetenv("DS4_METAL_DISABLE_V41_EPILOGUE_FUSION") == 0);
+                else REQUIRE(setenv("DS4_METAL_DISABLE_V41_EPILOGUE_FUSION", "1", 1) == 0);
+                REQUIRE(ds41_fused_scalar_epilogues(&g[arm]) == (arm == 1 && mode == 0));
+                if (stage == 2) {
+                    REQUIRE(ds4_gpu_tensor_write(g[arm].routed, 0, routed, sizeof(routed)));
+                    REQUIRE(ds4_gpu_tensor_write(g[arm].shared, 0, expected_shared, sizeof(expected_shared)));
+                }
+                REQUIRE(ds4_gpu_begin_commands());
+                if (stage == 0) REQUIRE(ds41_graph_before_attention(&g[arm], &model, &layer, 0));
+                if (stage == 1) REQUIRE(ds41_graph_after_attention(&g[arm], &model, &layer));
+                if (stage == 2) {
+                    if (ds41_fused_scalar_epilogues(&g[arm])) {
+                        REQUIRE(ds41_graph_moe_epilogue(&g[arm], true));
+                    } else {
+                        REQUIRE(ds4_gpu_add_tensor(g[arm].block, g[arm].routed, g[arm].shared, E));
+                        REQUIRE(ds41_bf16(g[arm].block, E));
+                        REQUIRE(ds41_graph_after_moe(&g[arm]));
+                    }
+                }
+                /* Consume the copied FFN pre-mixer, as the following layer
+                 * and the vocabulary head do after the routed epilogue. */
+                if (stage == 3) REQUIRE(ds41_graph_before_attention(&g[arm], &model, &layer, 2));
+                REQUIRE(ds4_gpu_end_commands());
+                if (stage == 2) {
+                    REQUIRE(!memcmp(ds4_gpu_tensor_contents(g[arm].shared), expected_shared, sizeof(expected_shared)));
+                    REQUIRE(!memcmp(ds4_gpu_tensor_contents(g[arm].pre), ds4_gpu_tensor_contents(g[arm].ffn_split), 16));
+                    if (arm == 1 && mode == 0)
+                        REQUIRE(!memcmp(ds4_gpu_tensor_contents(g[arm].routed), routed, sizeof(routed)));
+                }
+                const uint32_t *data = ds4_gpu_tensor_contents(slab[arm]);
+                for (unsigned i = 0; i < NT; i++) for (unsigned j = 0; j < PAD; j++) {
+                    REQUIRE(data[offset[i]/4 - PAD + j] == 0x7fc12345u);
+                    REQUIRE(data[offset[i]/4 + width[i] + j] == 0x7fc12345u);
+                }
+            }
+            const unsigned outputs[] = {R,A,P,AS,FS,X,N};
+            for (unsigned i = 0; i < sizeof(outputs)/sizeof(*outputs); i++) {
+                const unsigned t = outputs[i];
+                if (memcmp(ds4_gpu_tensor_contents(v[0][t]), ds4_gpu_tensor_contents(v[1][t]), width[t] * 4u)) {
+                    fprintf(stderr, "scalar epilogue pattern=%u alias=%u mode=%u stage=%u tensor=%u mismatch\n",
+                        pattern, alias, mode, stage, t);
+                    goto done;
+                }
+            }
+        }
+    }
+    puts("V4.1 scalar graph HC/MoE epilogues: bitwise calls, recurrence, ties, aliases and decode/TP/quality/imatrix guards PASS");
+    rc = 0;
+done:
+    if (ds4_gpu_commands_active()) ds4_gpu_end_commands();
+    ds4_gpu_set_quality(false);
+    for (unsigned arm = 0; arm < 2; arm++) {
+        for (unsigned i = 0; i < NT; i++) ds4_gpu_tensor_free(v[arm][i]);
+        ds4_gpu_tensor_free(slab[arm]);
+    }
+    ds4_gpu_cleanup();
+    if (map != MAP_FAILED) munmap(map, model_bytes);
+    free(g);
+    if (saved_env) setenv("DS4_METAL_DISABLE_V41_EPILOGUE_FUSION", saved_env, 1);
+    else unsetenv("DS4_METAL_DISABLE_V41_EPILOGUE_FUSION");
+    free(saved_env);
+    ds4_gpu_exchange_execution_phase(saved_phase);
+    g_ds4_shape = saved_shape;
+    return rc;
+}
+
+static bool prefill_stream_moe(const ds4_model *model,
+                               const ds4_layer_weights *layer,
+                               ds4_gpu_tensor *t[8], float *output) {
+    const uint64_t gate_row = routed_expert_row_bytes(layer->ffn_gate_exps);
+    const uint64_t down_row = routed_expert_row_bytes(layer->ffn_down_exps);
+    bool half = false;
+    return ds4_gpu_routed_moe_batch_tensor(t[7], t[3], t[4], t[5], t[6],
+        model->map, model->size, layer->ffn_gate_exps->abs_offset,
+        layer->ffn_up_exps->abs_offset, layer->ffn_down_exps->abs_offset,
+        layer->ffn_gate_exps->type, layer->ffn_down_exps->type,
+        gate_row * DS4_N_FF_EXP, gate_row, down_row * DS4_N_EMBD, down_row,
+        DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD, t[1], t[2], DS4_N_EXPERT,
+        DS4_N_EXPERT_USED, 7.0f, t[0], 0, 32, &half, true) && half &&
+        ds4_gpu_tensor_read(t[7], 0, output, 32u * DS4_N_EMBD * sizeof(float));
+}
+
+static int check_prefill_expert_admission(void) {
+    const struct { uint32_t rows; bool supported; } cases[] = {
+        {0, false}, {1, false}, {31, false}, {32, true}, {256, true}, {437, true},
+        {1023, true}, {1024, true}, {1025, true}, {1241, true}, {2047, true},
+        {2048, true}, {2049, false}, {4096, false}, {8192, false}, {UINT32_MAX, false}
+    };
+    int rc = 1;
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(*cases); i++) {
+        /* Each bit violates one independent lifetime/graph requirement. */
+        for (unsigned excluded = 0; excluded < 32; excluded++) {
+            const bool got = ds41_prefill_expert_sweep_supported(cases[i].rows,
+                (excluded & 1u) != 0, (excluded & 2u) == 0, (excluded & 4u) == 0,
+                (excluded & 8u) != 0, (excluded & 16u) != 0);
+            REQUIRE(got == (cases[i].supported && excluded == 0));
+        }
+    }
+    /* The row limit cannot override the graph's actual chunk capacity. */
+    const uint32_t capacities[] = {1024, 2048, 4096, 8192};
+    for (unsigned i = 0; i < sizeof(capacities) / sizeof(*capacities); i++) {
+        const ds41_gpu_graph graph = {.prefill_cap = capacities[i]};
+        const bool wide = 2048u > ds41_encoder_chunk_cap(&graph, 2048u);
+        REQUIRE(ds41_prefill_expert_sweep_supported(2048u, wide, true, true, false, false) ==
+                (capacities[i] >= 2048u));
+    }
+    puts("V4.1 explicit expert admission: 32..2048 rows, single-chunk boundaries and exclusions: PASS");
+    rc = 0;
+done:
+    return rc;
+}
+
+static int check_prefill_expert_fd(void) {
+    char path[] = "/private/tmp/ds41-expert-fd-XXXXXX";
+    const uint8_t expected[] = {3, 7, 11, 19, 23, 31, 43, 47};
+    uint8_t actual[sizeof(expected)];
+    int source = -1, reader = -1, replacement = -1, rc = 1;
+    int pipes[2] = {-1, -1};
+    bool path_exists = false;
+    struct stat original, reopened;
+    REQUIRE(ds41_prefill_expert_open_nocache_fd(-1) == -1);
+    REQUIRE(pipe(pipes) == 0);
+    REQUIRE(ds41_prefill_expert_open_nocache_fd(pipes[0]) == -1);
+    REQUIRE((source = mkstemp(path)) >= 0);
+    path_exists = true;
+    REQUIRE(write(source, expected, sizeof(expected)) == (ssize_t)sizeof(expected));
+    REQUIRE(lseek(source, 3, SEEK_SET) == 3);
+    REQUIRE((reader = ds41_prefill_expert_open_nocache_fd(source)) >= 0);
+    REQUIRE(reader != source && fstat(source, &original) == 0 && fstat(reader, &reopened) == 0);
+    REQUIRE(original.st_dev == reopened.st_dev && original.st_ino == reopened.st_ino &&
+            original.st_size == reopened.st_size);
+    REQUIRE((fcntl(reader, F_GETFD) & FD_CLOEXEC) != 0);
+    REQUIRE((fcntl(reader, F_GETFL) & O_ACCMODE) == O_RDONLY);
+    /* Independent seek positions distinguish a new open from dup(), which
+     * would also share the caching mode with the model's decode descriptor. */
+    REQUIRE(lseek(reader, 5, SEEK_SET) == 5 && lseek(source, 0, SEEK_CUR) == 3);
+    REQUIRE(pread(reader, actual, sizeof(actual), 0) == (ssize_t)sizeof(actual));
+    REQUIRE(memcmp(actual, expected, sizeof(actual)) == 0);
+    REQUIRE(close(reader) == 0); reader = -1;
+    REQUIRE(fcntl(source, F_GETFD) >= 0);
+    REQUIRE(unlink(path) == 0);
+    path_exists = false;
+    REQUIRE(ds41_prefill_expert_open_nocache_fd(source) == -1);
+    /* Reusing the old pathname must never redirect reads to another inode. */
+    REQUIRE((replacement = open(path, O_CREAT | O_EXCL | O_RDWR, 0600)) >= 0);
+    path_exists = true;
+    REQUIRE(write(replacement, expected, sizeof(expected)) == (ssize_t)sizeof(expected));
+    REQUIRE(fstat(replacement, &reopened) == 0 && original.st_ino != reopened.st_ino);
+    REQUIRE(ds41_prefill_expert_open_nocache_fd(source) == -1);
+    REQUIRE(pread(source, actual, sizeof(actual), 0) == (ssize_t)sizeof(actual));
+    REQUIRE(memcmp(actual, expected, sizeof(actual)) == 0);
+    puts("V4.1 uncached expert descriptor: identity, independent open and unavailable-path fallback: PASS");
+    rc = 0;
+done:
+    if (reader >= 0) close(reader);
+    if (source >= 0) close(source);
+    if (replacement >= 0) close(replacement);
+    if (pipes[0] >= 0) close(pipes[0]);
+    if (pipes[1] >= 0) close(pipes[1]);
+    if (path_exists) unlink(path);
+    return rc;
+}
+
+static int check_prefill_expert_discard(void) {
+    enum { BYTES = 4096 };
+    uint8_t expected[BYTES], actual[BYTES];
+    ds4_gpu_tensor *source = NULL, *output = NULL, *view = NULL, *full_view = NULL;
+    int rc = 1;
+    for (unsigned i = 0; i < BYTES; i++) expected[i] = (uint8_t)(i * 37u + 11u);
+    ds4_gpu_stream_expert_table table = {
+        .model_map = expected, .model_size = BYTES, .n_total_expert = 1,
+        .gate_offset = 0, .up_offset = 1024, .down_offset = 2048,
+        .gate_expert_bytes = 512, .down_expert_bytes = 512
+    };
+    REQUIRE(ds4_gpu_init());
+    ds4_gpu_model_residency_skip(1);
+    REQUIRE((source = ds4_gpu_tensor_alloc(BYTES)) != NULL);
+    REQUIRE((output = ds4_gpu_tensor_alloc(BYTES)) != NULL);
+    REQUIRE(ds4_gpu_tensor_write(source, 0, expected, BYTES));
+    ds4_gpu_set_ssd_streaming(false);
+    REQUIRE(!ds4_gpu_stream_prefill_discard_buffer(source));
+    ds4_gpu_set_ssd_streaming(true);
+    REQUIRE(!ds4_gpu_stream_prefill_discard_buffer(NULL));
+    view = ds4_gpu_tensor_view(source, 4, BYTES - 4);
+    full_view = ds4_gpu_tensor_view(source, 0, BYTES);
+    REQUIRE(view && full_view);
+    REQUIRE(!ds4_gpu_stream_prefill_discard_buffer(view));
+    REQUIRE(!ds4_gpu_stream_prefill_discard_buffer(full_view));
+    REQUIRE(ds4_gpu_stream_prefill_bind_layer(&table, source, source, source));
+    REQUIRE(!ds4_gpu_stream_prefill_discard_buffer(source));
+    REQUIRE(ds4_gpu_stream_prefill_bind_layer(NULL, NULL, NULL, NULL));
+    REQUIRE(ds4_gpu_begin_commands());
+    REQUIRE(ds4_gpu_tensor_copy(output, 0, source, 0, BYTES));
+    REQUIRE(!ds4_gpu_stream_prefill_discard_buffer(source));
+    REQUIRE(ds4_gpu_flush_commands());
+    REQUIRE(!ds4_gpu_stream_prefill_discard_buffer(source));
+    REQUIRE(ds4_gpu_end_commands());
+    REQUIRE(ds4_gpu_tensor_read(output, 0, actual, BYTES));
+    REQUIRE(memcmp(actual, expected, BYTES) == 0);
+    REQUIRE(ds4_gpu_tensor_read(source, 0, actual, BYTES));
+    REQUIRE(memcmp(actual, expected, BYTES) == 0);
+    ds4_gpu_tensor_free(view); view = NULL;
+    ds4_gpu_tensor_free(full_view); full_view = NULL;
+    REQUIRE(ds4_gpu_synchronize());
+    REQUIRE(ds4_gpu_stream_prefill_discard_buffer(source));
+    /* A discarded source is never accessed again. Completed output copies
+     * stay valid, and a subsequent allocation can safely reuse its storage. */
+    ds4_gpu_tensor_free(source); source = NULL;
+    REQUIRE(ds4_gpu_tensor_read(output, 0, actual, BYTES));
+    REQUIRE(memcmp(actual, expected, BYTES) == 0);
+    REQUIRE((source = ds4_gpu_tensor_alloc(BYTES)) != NULL);
+    for (unsigned i = 0; i < BYTES; i++) expected[i] ^= 0x5a;
+    REQUIRE(ds4_gpu_tensor_write(source, 0, expected, BYTES));
+    REQUIRE(ds4_gpu_begin_commands());
+    REQUIRE(ds4_gpu_tensor_copy(output, 0, source, 0, BYTES));
+    REQUIRE(ds4_gpu_end_commands());
+    REQUIRE(ds4_gpu_tensor_read(output, 0, actual, BYTES));
+    REQUIRE(memcmp(actual, expected, BYTES) == 0);
+    REQUIRE(ds4_gpu_stream_prefill_discard_buffer(source));
+    puts("V4.1 explicit expert discard: ownership, binding, queued copies and reuse: PASS");
+    rc = 0;
+done:
+    if (ds4_gpu_commands_active()) ds4_gpu_end_commands();
+    (void)ds4_gpu_synchronize();
+    (void)ds4_gpu_stream_prefill_bind_layer(NULL, NULL, NULL, NULL);
+    ds4_gpu_tensor_free(view);
+    ds4_gpu_tensor_free(full_view);
+    ds4_gpu_tensor_free(source);
+    ds4_gpu_tensor_free(output);
+    ds4_gpu_cleanup();
+    return rc;
+}
+
+static int check_prefill_expert_stream(void) {
+    enum { LAYERS = 3, EXPERTS = 8, WIDTH = 256, ROWS = 32, ROUTES = 6 };
+    const ds4_shape saved_shape = g_ds4_shape;
+    ds4_model model = {.fd = -1};
+    ds4_weights weights = {0};
+    ds4_tensor tensors[LAYERS][3] = {0};
+    ds41_prefill_expert_slot slots[2] = {0};
+    ds41_gpu_graph graph = {.streaming = true, .tp_world = 1};
+    ds4_gpu_tensor *t[8] = {0}, *bad_view = NULL;
+    char model_path[] = "/private/tmp/ds41-expert-stream-XXXXXX";
+    FILE *file = NULL;
+    int model_fd = -1;
+    bool model_path_exists = false;
+    void *map = NULL, *aux = NULL;
+    float *reference[LAYERS] = {0}, *actual = NULL;
+    int rc = 1;
+    const uint64_t page = (uint64_t)getpagesize();
+    const uint64_t sizes[3] = {EXPERTS * WIDTH * sizeof(block_iq2_xxs),
+                               EXPERTS * WIDTH * sizeof(block_iq2_xxs),
+                               EXPERTS * WIDTH * sizeof(block_q2_K)};
+    const uint64_t output_bytes = ROWS * WIDTH * sizeof(float);
+    uint64_t end = page;
+    REQUIRE(check_prefill_expert_admission() == 0);
+    REQUIRE(check_prefill_expert_fd() == 0);
+    g_ds4_shape.n_layer = LAYERS;
+    g_ds4_shape.n_expert = EXPERTS;
+    g_ds4_shape.n_expert_used = ROUTES;
+    g_ds4_shape.n_embd = g_ds4_shape.n_ff_exp = WIDTH;
+    for (unsigned il = 0; il < LAYERS; il++) for (unsigned j = 0; j < 3; j++) {
+        ds4_tensor *w = &tensors[il][j];
+        *w = (ds4_tensor){.ndim = 3, .dim = {WIDTH, WIDTH, EXPERTS},
+            .type = j == 2 ? DS4_TENSOR_Q2_K : DS4_TENSOR_IQ2_XXS,
+            .abs_offset = end + 128, .bytes = sizes[j], .elements = EXPERTS * WIDTH * WIDTH};
+        end = align_up(w->abs_offset + w->bytes, page) + page;
+    }
+    REQUIRE(posix_memalign(&map, page, end) == 0);
+    REQUIRE(posix_memalign(&aux, page, page) == 0);
+    memset(map, 0, end); memset(aux, 0, page);
+    for (unsigned i = 0; i < 4; i++) {
+        ((float *)map)[i * 4 + i] = (float)(i + 1);
+        ((float *)aux)[i * 4 + i] = (float)(i + 5);
+    }
+    for (unsigned il = 0; il < LAYERS; il++) {
+        weights.layer[il].ffn_gate_exps = &tensors[il][0];
+        weights.layer[il].ffn_up_exps = &tensors[il][1];
+        weights.layer[il].ffn_down_exps = &tensors[il][2];
+        for (unsigned j = 0; j < 3; j++) {
+            uint8_t *data = (uint8_t *)map + tensors[il][j].abs_offset;
+            for (uint64_t b = 0; b < sizes[j]; b++) data[b] = (uint8_t)(b * 37 + il * 71 + j * 29);
+            if (j == 2) for (uint64_t b = 0; b < sizes[j] / sizeof(block_q2_K); b++) {
+                ((block_q2_K *)data)[b].d = 0x2000 + il * 0x100;
+                ((block_q2_K *)data)[b].dmin = 0x1800;
+            }
+            else for (uint64_t b = 0; b < sizes[j] / sizeof(block_iq2_xxs); b++)
+                ((block_iq2_xxs *)data)[b].d = 0x1400 + il * 0x100;
+        }
+    }
+    REQUIRE((model_fd = mkstemp(model_path)) >= 0);
+    model_path_exists = true;
+    file = fdopen(model_fd, "w+b");
+    if (file) model_fd = -1;
+    REQUIRE(file && fwrite(map, 1, end, file) == end && fflush(file) == 0);
+    model.fd = fileno(file); model.map = map; model.size = model.file_size = end;
+    for (unsigned j = 0; j < 3; j++) graph.streaming_prefill_bytes += 2 * align_up(sizes[j], page);
+    ds4_gpu_model_residency_skip(1);
+    REQUIRE(ds4_gpu_init());
+    ds4_gpu_set_quality(false);
+    ds4_gpu_set_ssd_streaming(true);
+    REQUIRE(ds4_gpu_set_model_map(model.map, model.size));
+    REQUIRE(ds4_gpu_set_model_map_range(aux, page, 0, page, page));
+    graph.streaming_prefill_bytes--;
+    REQUIRE(!ds41_prefill_expert_buffers_init(&graph, &model, &weights, slots));
+    REQUIRE(!slots[0].tensor[0] && !slots[1].tensor[2]);
+    graph.streaming_prefill_bytes++;
+    REQUIRE(ds41_prefill_expert_buffers_init(&graph, &model, &weights, slots));
+    REQUIRE(setenv("DS4_METAL_STREAMING_PREFILL_LAYER_PREPARE_THREADS", "7", 1) == 0);
+    ds4_model invalid_model = model;
+    invalid_model.fd = -1;
+    REQUIRE(!ds41_prefill_expert_read_start(&slots[0], &invalid_model, &weights.layer[0], 0));
+    for (unsigned il = 0; il < LAYERS; il++) {
+        ds41_prefill_expert_slot *slot = &slots[il & 1u];
+        REQUIRE(ds41_prefill_expert_read_start(slot, &model, &weights.layer[il], il));
+        const int reader = slot->read_fd;
+        REQUIRE(slot->owns_read_fd && reader != model.fd && fcntl(reader, F_GETFD) >= 0);
+        REQUIRE(!ds41_prefill_expert_read_start(slot, &model, &weights.layer[il], il));
+        REQUIRE(ds41_prefill_expert_read_join(slot));
+        REQUIRE(!slot->owns_read_fd && slot->read_fd == -1);
+        REQUIRE(fcntl(reader, F_GETFD) == -1 && errno == EBADF);
+        REQUIRE(fcntl(model.fd, F_GETFD) >= 0);
+        REQUIRE(ds41_prefill_expert_read_join(slot));
+        for (unsigned j = 0; j < 3; j++) REQUIRE(memcmp(ds4_gpu_tensor_contents(slot->tensor[j]),
+            model.map + tensors[il][j].abs_offset, sizes[j]) == 0);
+    }
+    /* Reread layers 0/1 into separate slots, then shadow the complete mmap
+     * reference with layer 1 bytes bound at layer 0 offsets. */
+    for (unsigned i = 0; i < 2; i++) {
+        REQUIRE(ds41_prefill_expert_read_start(&slots[i], &model, &weights.layer[i], i));
+        REQUIRE(ds41_prefill_expert_read_join(&slots[i]));
+    }
+    const uint64_t counts[] = {ROWS * WIDTH, ROWS * ROUTES, ROWS * ROUTES,
+        ROWS * ROUTES * WIDTH, ROWS * ROUTES * WIDTH, ROWS * ROUTES * WIDTH,
+        ROWS * ROUTES * WIDTH, ROWS * WIDTH};
+    for (unsigned i = 0; i < 8; i++) REQUIRE((t[i] = ds4_gpu_tensor_alloc(counts[i] * 4)) != NULL);
+    for (unsigned i = 0; i < LAYERS; i++) REQUIRE((reference[i] = malloc(output_bytes)) != NULL);
+    REQUIRE((actual = malloc(output_bytes)) != NULL);
+    float *x = ds4_gpu_tensor_contents(t[0]), *route_weights = ds4_gpu_tensor_contents(t[2]);
+    int32_t *selected = ds4_gpu_tensor_contents(t[1]);
+    REQUIRE(x && route_weights && selected);
+    for (unsigned i = 0; i < ROWS * WIDTH; i++) x[i] = ((int)(i % 31) - 15) / 64.0f;
+    for (unsigned i = 0; i < ROWS * ROUTES; i++) {
+        selected[i] = i % EXPERTS; route_weights[i] = 1.0f / ROUTES;
+    }
+    for (unsigned il = 0; il < LAYERS; il++) {
+        REQUIRE(prefill_stream_moe(&model, &weights.layer[il], t, reference[il]));
+        for (unsigned i = 0; i < ROWS * WIDTH; i++) REQUIRE(isfinite(reference[il][i]));
+    }
+    REQUIRE(memcmp(reference[0], reference[1], output_bytes) != 0);
+    REQUIRE(ds4_gpu_stream_prefill_bind_layer(&slots[0].table,
+        slots[1].tensor[0], slots[1].tensor[1], slots[1].tensor[2]));
+    REQUIRE(prefill_stream_moe(&model, &weights.layer[0], t, actual));
+    REQUIRE(memcmp(reference[1], actual, output_bytes) == 0);
+    ds4_gpu_stream_expert_table invalid = slots[0].table;
+    invalid.down_offset = model.size;
+    REQUIRE(!ds4_gpu_stream_prefill_bind_layer(&invalid,
+        slots[0].tensor[0], slots[0].tensor[1], slots[0].tensor[2]));
+    bad_view = ds4_gpu_tensor_view(slots[0].tensor[0], 4, sizes[0] - 4);
+    REQUIRE(bad_view && !ds4_gpu_stream_prefill_bind_layer(&slots[0].table,
+        bad_view, slots[0].tensor[1], slots[0].tensor[2]));
+    ds4_gpu_tensor_free(bad_view); bad_view = NULL;
+    REQUIRE(ds4_gpu_begin_commands());
+    REQUIRE(!ds4_gpu_stream_prefill_bind_layer(NULL, NULL, NULL, NULL));
+    REQUIRE(ds4_gpu_end_commands());
+    REQUIRE(prefill_stream_moe(&model, &weights.layer[0], t, actual));
+    REQUIRE(memcmp(reference[1], actual, output_bytes) == 0);
+    for (unsigned i = 0; i < 2; i++) {
+        const void *source = i ? aux : model.map;
+        REQUIRE(ds4_gpu_matmul_f32_tensor(t[7], source, i ? page : model.size, 0, 4, 4, t[0], 1));
+        REQUIRE(ds4_gpu_tensor_read(t[7], 0, actual, 4 * sizeof(float)));
+        for (unsigned j = 0; j < 4; j++) REQUIRE(actual[j] == x[j] * (float)(j + 1 + 4 * i));
+    }
+    REQUIRE(ds4_gpu_stream_prefill_bind_layer(&slots[0].table,
+        slots[0].tensor[0], slots[0].tensor[1], slots[0].tensor[2]));
+    REQUIRE(prefill_stream_moe(&model, &weights.layer[0], t, actual));
+    REQUIRE(memcmp(reference[0], actual, output_bytes) == 0);
+    REQUIRE(ds4_gpu_stream_prefill_bind_layer(NULL, NULL, NULL, NULL));
+    REQUIRE(prefill_stream_moe(&model, &weights.layer[0], t, actual));
+    REQUIRE(memcmp(reference[0], actual, output_bytes) == 0);
+    /* EOF and cancellation cleanup join every worker before releasing slots. */
+    REQUIRE(ftruncate(model.fd, tensors[2][2].abs_offset + sizes[2] / 2) == 0);
+    REQUIRE(ds41_prefill_expert_read_start(&slots[0], &model, &weights.layer[2], 2));
+    int reader = slots[0].read_fd;
+    REQUIRE(slots[0].owns_read_fd);
+    REQUIRE(!ds41_prefill_expert_read_join(&slots[0]));
+    REQUIRE(!slots[0].started && !slots[0].owns_read_fd);
+    REQUIRE(fcntl(reader, F_GETFD) == -1 && errno == EBADF);
+    REQUIRE(ds41_prefill_expert_read_start(&slots[1], &model, &weights.layer[1], 1));
+    reader = slots[1].read_fd;
+    REQUIRE(slots[1].owns_read_fd);
+    /* An unlinked model keeps its original descriptor as a cached fallback;
+     * joining that reader must never close the descriptor needed by decode. */
+    REQUIRE(unlink(model_path) == 0);
+    model_path_exists = false;
+    REQUIRE(ds41_prefill_expert_read_start(&slots[0], &model, &weights.layer[1], 1));
+    REQUIRE(!slots[0].owns_read_fd && slots[0].read_fd == model.fd);
+    REQUIRE(ds41_prefill_expert_read_join(&slots[0]));
+    REQUIRE(fcntl(model.fd, F_GETFD) >= 0);
+    for (unsigned j = 0; j < 3; j++) REQUIRE(memcmp(ds4_gpu_tensor_contents(slots[0].tensor[j]),
+        model.map + tensors[1][j].abs_offset, sizes[j]) == 0);
+    /* Cancellation also closes the owned reader opened before unlink. */
+    REQUIRE(ds41_prefill_expert_buffers_free(slots));
+    REQUIRE(fcntl(reader, F_GETFD) == -1 && errno == EBADF);
+    REQUIRE(fcntl(model.fd, F_GETFD) >= 0);
+    REQUIRE(!slots[0].tensor[0] && !slots[1].tensor[2] && !slots[0].started && !slots[1].started);
+    REQUIRE(ds41_prefill_expert_buffers_free(slots));
+    puts("V4.1 explicit expert reads, binding lifetime, fallback and cancellation cleanup: PASS");
+    rc = 0;
+done:
+    if (ds4_gpu_commands_active()) ds4_gpu_end_commands();
+    if (slots[0].tensor[0] || slots[1].tensor[0]) (void)ds41_prefill_expert_buffers_free(slots);
+    ds4_gpu_tensor_free(bad_view);
+    for (unsigned i = 0; i < 8; i++) ds4_gpu_tensor_free(t[i]);
+    for (unsigned i = 0; i < LAYERS; i++) free(reference[i]);
+    ds4_gpu_cleanup();
+    if (file) fclose(file);
+    if (model_fd >= 0) close(model_fd);
+    if (model_path_exists) unlink(model_path);
+    free(map); free(aux); free(actual);
+    unsetenv("DS4_METAL_STREAMING_PREFILL_LAYER_PREPARE_THREADS");
+    g_ds4_shape = saved_shape;
+    return rc;
+}
+
 static int check_batch_admission(void) {
     int rc = 1;
     ds4_engine engine = {.backend = DS4_BACKEND_METAL};
@@ -176,12 +689,13 @@ static int check_attention_layouts(const char *path) {
                 int status;
                 pid_t done;
                 do { done = waitpid(child, &status, 0); } while (done < 0 && errno == EINTR);
-                assert(done == child && WIFEXITED(status) && WEXITSTATUS(status) == 1);
+                const int expected = types[type] == DS4_TENSOR_Q4_K ? 0 : 1;
+                assert(done == child && WIFEXITED(status) && WEXITSTATUS(status) == expected);
             }
         }
     }
     model_close(&model);
-    puts("V4.1 Q8 attention admitted, unsupported Q4 output layouts rejected before GPU allocation: PASS");
+    puts("V4.1 Q8/Q4_K attention admitted, Q4_0 output layouts rejected before GPU allocation: PASS");
     return 0;
 }
 
@@ -273,6 +787,204 @@ static bool cancel_progress(void *ud) {
     return p->cancel_at > 0 && p->progress >= p->cancel_at;
 }
 
+static int check_attention_identity(void) {
+    const ds4_shape saved_shape = g_ds4_shape;
+    ds4_engine *engine = calloc(1, sizeof(*engine));
+    ds4_session *session = calloc(1, sizeof(*session));
+    ds4_tensor tensors[40][5] = {0};
+    uint32_t tags[200];
+    FILE *file = NULL;
+    int rc = 1;
+    int tokens[] = {101, 102, 103};
+    float logit = 123.0f;
+    g_ds4_shape = DS4_SHAPE_FLASH41;
+    REQUIRE(engine && session);
+    for (unsigned il = 0; il < 40; il++) {
+        for (unsigned p = 0; p < 5; p++) tensors[il][p].type = DS4_TENSOR_Q8_0;
+        ds4_layer_weights *l = &engine->weights.layer[il];
+        l->attn_q_a = &tensors[il][0]; l->attn_q_b = &tensors[il][1];
+        l->attn_kv = &tensors[il][2]; l->attn_output_a = &tensors[il][3];
+        l->attn_output_b = &tensors[il][4];
+    }
+    REQUIRE(ds41_attention_type_id(&engine->weights) == 0x413431u);
+    REQUIRE(ds4_engine_model_id(engine) == (int)DS4_VARIANT_FLASH41);
+    for (unsigned il = 0; il < 40; il++) for (unsigned p = 0; p < 5; p++) {
+        tensors[il][p].type = DS4_TENSOR_Q4_K;
+        const uint32_t tag = ds41_attention_type_id(&engine->weights);
+        REQUIRE((tag & 0x80000080u) == 0x80000080u && tag != 0x413431u);
+        REQUIRE(ds4_engine_model_id(engine) > 0 && (ds4_engine_model_id(engine) & 0x80));
+        REQUIRE((uint32_t)ds4_engine_model_id(engine) == (tag & 0x7fffffffu));
+        for (unsigned j = 0; j < il * 5 + p; j++) REQUIRE(tags[j] != tag);
+        tags[il * 5 + p] = tag;
+        tensors[il][p].type = DS4_TENSOR_Q4_0;
+        REQUIRE(ds41_attention_type_id(&engine->weights) != tag);
+        tensors[il][p].type = DS4_TENSOR_Q8_0;
+    }
+    ds4_tensor *saved_projection = engine->weights.layer[39].attn_output_b;
+    engine->weights.layer[39].attn_output_b = NULL;
+    REQUIRE(ds41_attention_type_id(&engine->weights) != 0x413431u);
+    engine->weights.layer[39].attn_output_b = saved_projection;
+    g_ds4_shape.family = DS4_MODEL_FAMILY_DEEPSEEK4;
+    tensors[0][0].type = DS4_TENSOR_Q4_K;
+    REQUIRE(ds4_engine_model_id(engine) == (int)DS4_VARIANT_FLASH41);
+    g_ds4_shape = DS4_SHAPE_FLASH41;
+    session->engine = engine;
+    session->ds41_graph_ready = session->checkpoint_valid = true;
+    session->ds41_graph.ctx = 16;
+    session->ds41_graph.pos = 3;
+    session->ds41_graph.valid = true;
+    session->checkpoint.v = tokens;
+    session->checkpoint.len = session->checkpoint.cap = 3;
+    session->logits = &logit;
+    uint32_t h[DS4_SESSION_PAYLOAD_U32_FIELDS] = {
+        DS4_SESSION_PAYLOAD_MAGIC, DS4_SESSION_PAYLOAD_VERSION,
+        16, 1, 128, 128, 17, 3, 40, 512, 128, DS4_N_VOCAB, 0
+    };
+    /* Invalid token data proves compatible markers reach payload parsing,
+     * while incompatible markers reject before reading or touching GPU state. */
+    file = tmpfile();
+    REQUIRE(file);
+    const uint32_t invalid_token = UINT32_MAX;
+    REQUIRE(fwrite(&invalid_token, sizeof(invalid_token), 1, file) == 1);
+    const uint64_t remaining = ds41_payload_body_bytes(&session->ds41_graph, 3);
+    for (unsigned q4_model = 0; q4_model < 2; q4_model++) {
+        tensors[0][0].type = q4_model ? DS4_TENSOR_Q4_K : DS4_TENSOR_Q8_0;
+        const uint32_t matching = ds41_attention_type_id(&engine->weights);
+        h[12] = q4_model ? 0x413431u : tags[0];
+        char error[128] = {0};
+        rewind(file);
+        REQUIRE(ds41_load_payload(session, file, h, remaining, error, sizeof(error)) != 0);
+        REQUIRE(ftell(file) == 0 && strstr(error, "attention types") != NULL);
+        REQUIRE(session->checkpoint_valid && session->ds41_graph.valid && session->ds41_graph.pos == 3);
+        REQUIRE(session->checkpoint.v == tokens && session->checkpoint.len == 3 && logit == 123.0f);
+        h[12] = matching;
+        REQUIRE(ds41_load_payload(session, file, h, remaining, error, sizeof(error)) != 0);
+        REQUIRE(ftell(file) == 4 && strstr(error, "snapshot token") != NULL);
+        REQUIRE(session->checkpoint_valid && session->ds41_graph.valid && session->ds41_graph.pos == 3);
+    }
+    puts("V4.1 attention identity: 200 projection positions, quant types, legacy Q8 marker and pre-read snapshot refusal PASS");
+    rc = 0;
+done:
+    if (file) fclose(file);
+    free(session); free(engine);
+    g_ds4_shape = saved_shape;
+    return rc;
+}
+
+static float attention_imatrix_value(unsigned source, uint32_t column) {
+    return ((float)(column % 17u) - 8) / 8 + (float)source;
+}
+
+static int check_attention_imatrix(void) {
+    const ds4_shape saved_shape = g_ds4_shape;
+    ds4_imatrix_collector c = {.dataset_path = "bounded attention fixture", .chunks = 2};
+    ds4_weights weights = {0};
+    ds4_tensor tensors[5] = {0};
+    ds4_gpu_tensor *scratch = NULL, *overwrite = NULL;
+    FILE *file = NULL;
+    char path[] = "/private/tmp/ds41-attention-imatrix-XXXXXX";
+    int fd = -1, rc = 1;
+    const char *names[] = {"blk.0.attn_q_a.weight", "blk.0.attn_q_b.weight", "blk.0.attn_kv.weight",
+                           "blk.0.attn_output_a.weight", "blk.0.attn_output_b.weight"};
+    const unsigned source[] = {0, 1, 0, 2, 3};
+    g_ds4_shape = DS4_SHAPE_FLASH41;
+    g_ds4_shape.n_layer = 1;
+    const uint32_t widths[] = {DS4_N_EMBD, DS4_N_LORA_Q, DS4_N_HEAD * DS4_N_HEAD_DIM,
+                               DS4_N_OUT_GROUP * DS4_N_LORA_O};
+    REQUIRE(ds4_gpu_init());
+    c.attention_buf = malloc((size_t)widths[2] * sizeof(float));
+    scratch = ds4_gpu_tensor_alloc((uint64_t)widths[2] * sizeof(float));
+    overwrite = ds4_gpu_tensor_alloc((uint64_t)widths[2] * sizeof(float));
+    REQUIRE(c.attention_buf && scratch && overwrite);
+    REQUIRE(ds4_gpu_tensor_fill_f32(overwrite, 99.0f, widths[2]));
+    for (unsigned p = 0; p < 5; p++) {
+        c.attention_sum2[p] = calloc(imatrix_attention_width(p), sizeof(float));
+        REQUIRE(c.attention_sum2[p]);
+        tensors[p].name.ptr = names[p];
+        tensors[p].name.len = strlen(names[p]);
+    }
+    weights.layer[0].attn_q_a = &tensors[0];
+    weights.layer[0].attn_q_b = &tensors[1];
+    weights.layer[0].attn_kv = &tensors[2];
+    weights.layer[0].attn_output_a = &tensors[3];
+    weights.layer[0].attn_output_b = &tensors[4];
+    for (unsigned s = 0; s < 4; s++) {
+        c.attention_input[s] = ds4_gpu_tensor_alloc((uint64_t)widths[s] * sizeof(float));
+        REQUIRE(c.attention_input[s]);
+        float *input = ds4_gpu_tensor_contents(scratch);
+        REQUIRE(input);
+        for (uint32_t j = 0; j < widths[s]; j++) input[j] = attention_imatrix_value(s, j);
+        /* Match the graph's snapshot-before-reuse ordering within one command
+         * buffer. Collection happens only after the later overwrite drained. */
+        REQUIRE(ds4_gpu_begin_commands());
+        REQUIRE(ds4_gpu_tensor_copy(c.attention_input[s], 0, scratch, 0, (uint64_t)widths[s] * 4));
+        REQUIRE(ds4_gpu_tensor_copy(scratch, 0, overwrite, 0, (uint64_t)widths[s] * 4));
+        REQUIRE(ds4_gpu_end_commands());
+    }
+    REQUIRE(imatrix_collect_attention(&c, 0));
+    REQUIRE(imatrix_collect_attention(&c, 0));
+    for (unsigned p = 0; p < 5; p++) {
+        const uint32_t width = imatrix_attention_width(p), rows = p == 3 ? DS4_N_OUT_GROUP : 1;
+        REQUIRE(c.attention_count[p][0] == 2 * rows);
+        for (uint32_t j = 0; j < width; j++) {
+            float expected = 0;
+            for (unsigned repeat = 0; repeat < 2; repeat++) for (uint32_t row = 0; row < rows; row++) {
+                const float x = attention_imatrix_value(source[p], row * width + j);
+                expected += x * x;
+            }
+            REQUIRE(c.attention_sum2[p][j] == expected);
+        }
+    }
+    REQUIRE(!memcmp(c.attention_sum2[0], c.attention_sum2[2], DS4_N_EMBD * sizeof(float)));
+    fd = mkstemp(path);
+    REQUIRE(fd >= 0);
+    REQUIRE(close(fd) == 0);
+    fd = -1;
+    REQUIRE(imatrix_collector_save(&c, &weights, path));
+    file = fopen(path, "rb");
+    REQUIRE(file);
+    int32_t value;
+    REQUIRE(fread(&value, 4, 1, file) == 1 && value == 5);
+    for (unsigned p = 0; p < 5; p++) {
+        char name[128] = {0};
+        REQUIRE(fread(&value, 4, 1, file) == 1 && value > 0 && value < (int)sizeof(name));
+        REQUIRE(fread(name, 1, value, file) == (size_t)value && !strcmp(name, names[p]));
+        REQUIRE(fread(&value, 4, 1, file) == 1 && value == 1);
+        REQUIRE(fread(&value, 4, 1, file) == 1 && value == (int)imatrix_attention_width(p));
+        REQUIRE(fread(c.attention_buf, sizeof(float), value, file) == (size_t)value);
+        for (int32_t j = 0; j < value; j++)
+            REQUIRE(c.attention_buf[j] == c.attention_sum2[p][j] / c.attention_count[p][0]);
+    }
+    REQUIRE(fread(&value, 4, 1, file) == 1 && value == 2);
+    REQUIRE(fread(&value, 4, 1, file) == 1 && value == (int)strlen(c.dataset_path));
+    char dataset[128] = {0};
+    REQUIRE(fread(dataset, 1, value, file) == (size_t)value && !strcmp(dataset, c.dataset_path));
+    REQUIRE(fgetc(file) == EOF);
+    REQUIRE(!imatrix_collect_attention(&c, 1));
+    c.attention_count[0][0] = UINT32_MAX;
+    REQUIRE(!imatrix_collect_attention(&c, 0));
+    c.attention_count[0][0] = 2;
+    float *bad = ds4_gpu_tensor_contents(c.attention_input[0]);
+    const uint32_t nonfinite[] = {0x7f800000u, 0x7fc00001u, 0x7f7fffffu};
+    for (unsigned i = 0; i < 3; i++) {
+        memcpy(bad, &nonfinite[i], sizeof(float));
+        REQUIRE(!imatrix_collect_attention(&c, 0));
+    }
+    puts("V4.1 attention imatrix: input snapshots, five widths/names, pooled O_A counts, serialized means and finite checks PASS");
+    rc = 0;
+done:
+    if (ds4_gpu_commands_active()) ds4_gpu_end_commands();
+    if (file) fclose(file);
+    if (fd >= 0) close(fd);
+    if (strstr(path, "XXXXXX") == NULL) unlink(path);
+    ds4_gpu_tensor_free(scratch);
+    ds4_gpu_tensor_free(overwrite);
+    imatrix_collector_free(&c);
+    ds4_gpu_cleanup();
+    g_ds4_shape = saved_shape;
+    return rc;
+}
+
 static int check_imatrix_inputs(void) {
     ds4_imatrix_collector c = {0};
     ds4_gpu_tensor *x = NULL, *mid = NULL, *selected = NULL;
@@ -311,7 +1023,7 @@ done:
     return rc;
 }
 
-static int check_sessions(const char *path) {
+static int check_sessions(const char *path, bool lifecycle_only) {
     int cwd_fd = open(".", O_RDONLY);
     ds4_engine *engine = NULL;
     ds4_session *s = NULL, *restored = NULL, *too_large = NULL;
@@ -326,8 +1038,38 @@ static int check_sessions(const char *path) {
     REQUIRE(ds4_engine_open(&engine, &opt) == 0);
     REQUIRE(cwd_fd >= 0 && chdir("/") == 0);
     REQUIRE(ds4_session_create(&s, engine, 256) == 0);
+    REQUIRE(s->engine_session_counted && engine->live_session_count == 1);
     REQUIRE(ds4_session_create(&restored, engine, 256) == 0);
+    REQUIRE(restored->engine_session_counted && engine->live_session_count == 2);
     REQUIRE(fchdir(cwd_fd) == 0);
+    if (lifecycle_only) {
+        /* Exercise session ownership and the public preflight without
+         * submitting a prompt or evaluating any model projections. */
+        const uint64_t allocation_bytes = engine->ds41_session_bytes;
+        REQUIRE(allocation_bytes > 0);
+        for (int i = 0; i < 3; i++) ds4_tokens_push(&tokens, 100 + i);
+        ds4_session *sessions[] = {s, restored};
+        for (unsigned i = 0; i < 2; i++) {
+            ds4_session *current = sessions[i];
+            REQUIRE(current->ds41_graph_ready && current->ds41_graph.pos == 0);
+            REQUIRE(current->graph.prefill_cap == 0);
+            REQUIRE(ds4_session_prepare_sync(current, &tokens, err, sizeof(err)) == 0);
+            REQUIRE(current->q4_attn_q_b_f16_sidecars_generation == 0 &&
+                    current->q4_attn_q_b_f16_prepared_rows == 0);
+            REQUIRE(current->ds41_graph.pos == 0 && current->checkpoint.len == 0 &&
+                    !current->checkpoint_valid);
+        }
+        REQUIRE(engine->live_session_count == 2 &&
+                engine->ds41_session_bytes == allocation_bytes);
+        ds4_session_free(restored); restored = NULL;
+        REQUIRE(engine->live_session_count == 1 &&
+                engine->ds41_session_bytes == s->ds41_graph.allocation_bytes);
+        ds4_session_free(s); s = NULL;
+        REQUIRE(engine->live_session_count == 0 && engine->ds41_session_bytes == 0);
+        puts("V4.1 session lifecycle: two sessions, V4 preflight skipped, exact cleanup; no inference PASS");
+        rc = 0;
+        goto done;
+    }
     REQUIRE(check_imatrix_inputs() == 0);
     ds4_session_set_progress(s, note_progress, &progress);
     for (int i = 0; i < 129; i++) ds4_tokens_push(&tokens, 100 + i);
@@ -420,7 +1162,12 @@ static int check_sessions(const char *path) {
     REQUIRE(!s->checkpoint_valid);
     REQUIRE(ds4_session_sync(s, &tokens, err, sizeof(err)) == 0);
     REQUIRE(ds4_session_create(&too_large, engine, 1048577) != 0 && too_large == NULL);
-    puts("V4.1 public sessions, prefix reuse, snapshots, cancellation and bounds: PASS");
+    REQUIRE(engine->live_session_count == 2);
+    ds4_session_free(restored); restored = NULL;
+    REQUIRE(engine->live_session_count == 1);
+    ds4_session_free(s); s = NULL;
+    REQUIRE(engine->live_session_count == 0 && engine->ds41_session_bytes == 0);
+    puts("V4.1 public sessions, prefix reuse, snapshots, cancellation, bounds and live counts: PASS");
     rc = 0;
 done:
     if (rc) fprintf(stderr, "session error: %s\n", err);
@@ -1454,9 +2201,10 @@ static int check_attention_batches(const char *path, bool batch_index) {
                 REQUIRE(memcmp(ds4_gpu_tensor_contents(sa[j].tensor),
                     ds4_gpu_tensor_contents(sb[j].tensor), (size_t)sa[j].bytes) == 0);
             }
-            REQUIRE(memcmp(ds4_gpu_tensor_contents(old->batch.selected_comp),
-                ds4_gpu_tensor_contents(fast->batch.selected_comp),
-                (size_t)count * DS4_N_INDEXER_TOP_K * sizeof(int32_t)) == 0);
+            if (ratio && (start + count) / ratio >= DS4_N_INDEXER_TOP_K)
+                REQUIRE(memcmp(ds4_gpu_tensor_contents(old->batch.selected_comp),
+                    ds4_gpu_tensor_contents(fast->batch.selected_comp),
+                    (size_t)count * DS4_N_INDEXER_TOP_K * sizeof(int32_t)) == 0);
             const float *expected = ds4_gpu_tensor_contents(old->batch.heads);
             const float *actual = ds4_gpu_tensor_contents(fast->batch.heads);
             double error = 0, norm = 0, worst = 0;
@@ -1479,6 +2227,143 @@ done:
     unsetenv("DS4_METAL_DISABLE_V41_BATCH_COMPRESS");
     if (ds4_gpu_commands_active()) ds4_gpu_end_commands();
     ds4_session_free(b); ds4_session_free(a); ds4_engine_close(engine);
+    return rc;
+}
+
+/* Compare the same attention kernels while the existing index diagnostic
+ * forces the old per-row selection work. No full routed layer is loaded. */
+static int check_attention_index_bypass(const char *path) {
+    enum { CONTEXT = 1100 };
+    ds4_model model = {.fd = -1};
+    ds4_weights weights = {0};
+    ds41_gpu_graph old = {.table = {{.fd = -1}, {.fd = -1}}};
+    ds41_gpu_graph fast = {.table = {{.fd = -1}, {.fd = -1}}};
+    ds4_model_map_span_vec mapped = {0};
+    uint64_t *offsets = NULL, *sizes = NULL;
+    const uint32_t layers[] = {0, 2, 3, 20, 24, 39};
+    const char *diagnostic = "DS4_METAL_DISABLE_V41_BATCH_INDEX";
+    int rc = 1;
+    model_open(&model, path, true, false);
+    config_validate_model(&model);
+    REQUIRE(DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41);
+    weights_bind(&weights, &model, false, 0, UINT32_MAX, true, false);
+    ds4_gpu_model_residency_skip(1);
+    REQUIRE(ds4_gpu_init());
+    ds4_gpu_set_quality(false);
+    ds4_gpu_set_ssd_streaming(true);
+    ds4_gpu_set_streaming_expert_cache_budget(12);
+    REQUIRE(ds4_gpu_set_model_fd(model.fd));
+    for (unsigned i = 0; i < sizeof(layers) / sizeof(*layers); i++) {
+        const ds4_layer_weights *l = &weights.layer[layers[i]];
+        model_map_span_vec_include_one(&mapped, l->attn_sinks);
+        if (ds41_kv_source(layers[i])) {
+            model_map_span_vec_include_one(&mapped, l->attn_compressor_kv);
+            model_map_span_vec_include_one(&mapped, l->attn_compressor_gate);
+            model_map_span_vec_include_one(&mapped, l->attn_compressor_norm);
+            model_map_span_vec_include_one(&mapped, l->indexer_attn_k);
+            model_map_span_vec_include_one(&mapped, l->indexer_k_norm);
+        }
+        if (ds41_index_source(layers[i])) {
+            model_map_span_vec_include_one(&mapped, l->indexer_attn_q_b);
+            model_map_span_vec_include_one(&mapped, l->indexer_proj);
+        }
+    }
+    offsets = malloc(mapped.len * sizeof(*offsets));
+    sizes = malloc(mapped.len * sizeof(*sizes));
+    REQUIRE(offsets && sizes);
+    for (uint32_t i = 0; i < mapped.len; i++) {
+        offsets[i] = mapped.v[i].off;
+        sizes[i] = mapped.v[i].end - mapped.v[i].off;
+    }
+    REQUIRE(ds4_gpu_set_model_map_spans(model.map, model.size, offsets, sizes,
+                                       mapped.len, mapped.max_tensor_bytes));
+    REQUIRE(ds41_graph_alloc(&old, &model, &weights, path, CONTEXT, true));
+    REQUIRE(ds41_graph_alloc(&fast, &model, &weights, path, CONTEXT, true));
+    const uint32_t ratios[] = {0, 2, 1};
+    for (unsigned scenario = 0; scenario < sizeof(ratios) / sizeof(*ratios); scenario++) {
+        const uint32_t ratio = ratios[scenario];
+        uint32_t start = ratio ? 500u * ratio : 127u;
+        const uint32_t counts[] = {ratio ? 11u * ratio - 1u : 1u, 1u,
+                                   ratio ? ratio : 2u, ratio ? 3u * ratio : 31u};
+        ds41_state_span sa[54], sb[54];
+        /* Include all owner caches and unfinished pairs, even those this
+         * scenario does not consume, to detect unwanted writes. */
+        const uint32_t spans = ds41_state_spans(&old, CONTEXT - 1u, sa);
+        REQUIRE(spans == ds41_state_spans(&fast, CONTEXT - 1u, sb));
+        for (uint32_t j = 0; j < spans; j++) {
+            REQUIRE(sa[j].bytes == sb[j].bytes);
+            float *x = ds4_gpu_tensor_contents(sa[j].tensor);
+            REQUIRE(x && ds4_gpu_tensor_contents(sb[j].tensor));
+            for (uint64_t k = 0; k < sa[j].bytes / sizeof(float); k++)
+                x[k] = (float)((int)((k * 13u + j * 7u) % 101u) - 50) / 128.0f;
+            memcpy(ds4_gpu_tensor_contents(sb[j].tensor), x, (size_t)sa[j].bytes);
+        }
+        memset(ds4_gpu_tensor_contents(old.batch.selected_comp), 0xff,
+               (size_t)ds4_gpu_tensor_bytes(old.batch.selected_comp));
+        memset(ds4_gpu_tensor_contents(fast.batch.selected_comp), 0xff,
+               (size_t)ds4_gpu_tensor_bytes(fast.batch.selected_comp));
+        memset(ds4_gpu_tensor_contents(old.batch.block_mask), 0,
+               (size_t)ds4_gpu_tensor_bytes(old.batch.block_mask));
+        memset(ds4_gpu_tensor_contents(fast.batch.block_mask), 0,
+               (size_t)ds4_gpu_tensor_bytes(fast.batch.block_mask));
+        for (unsigned stage = 0; stage < sizeof(counts) / sizeof(*counts); stage++) {
+            const uint32_t count = counts[stage];
+            REQUIRE(start + count < CONTEXT && count <= old.prefill_cap);
+            old.pos = fast.pos = start;
+            for (unsigned li = 0; li < sizeof(layers) / sizeof(*layers); li++) {
+                const uint32_t il = layers[li];
+                if (ds4_layer_compress_ratio(il) != ratio) continue;
+                ds4_gpu_tensor *inputs[] = {old.batch.norm, old.batch.qr, old.batch.q, old.batch.kv};
+                ds4_gpu_tensor *copies[] = {fast.batch.norm, fast.batch.qr, fast.batch.q, fast.batch.kv};
+                const uint32_t widths[] = {DS4_N_EMBD, DS4_N_LORA_Q,
+                                           DS4_N_HEAD * DS4_N_HEAD_DIM, DS4_N_HEAD_DIM};
+                for (unsigned j = 0; j < sizeof(inputs) / sizeof(*inputs); j++) {
+                    float *x = ds4_gpu_tensor_contents(inputs[j]);
+                    REQUIRE(x && ds4_gpu_tensor_contents(copies[j]));
+                    for (uint64_t k = 0; k < (uint64_t)count * widths[j]; k++)
+                        x[k] = (float)((int)((k * 17u + j * 11u + il * 3u + stage) % 97u) - 48) / 64.0f;
+                    memcpy(ds4_gpu_tensor_contents(copies[j]), x,
+                           (size_t)count * widths[j] * sizeof(float));
+                }
+                REQUIRE(setenv(diagnostic, "1", 1) == 0);
+                REQUIRE(ds4_gpu_begin_commands());
+                REQUIRE(ds41_attention_batch(&old, &model, &weights.layer[il], il, count));
+                REQUIRE(ds4_gpu_end_commands());
+                REQUIRE(unsetenv(diagnostic) == 0);
+                REQUIRE(ds4_gpu_begin_commands());
+                REQUIRE(ds41_attention_batch(&fast, &model, &weights.layer[il], il, count));
+                REQUIRE(ds4_gpu_end_commands());
+                for (uint32_t j = 0; j < spans; j++)
+                    REQUIRE(!memcmp(ds4_gpu_tensor_contents(sa[j].tensor),
+                        ds4_gpu_tensor_contents(sb[j].tensor), (size_t)sa[j].bytes));
+                const uint64_t head_values = (uint64_t)count * DS4_N_HEAD * DS4_N_HEAD_DIM;
+                const float *a = ds4_gpu_tensor_contents(old.batch.heads);
+                const float *b = ds4_gpu_tensor_contents(fast.batch.heads);
+                for (uint64_t j = 0; j < head_values; j++) REQUIRE(isfinite(b[j]));
+                if (memcmp(a, b, (size_t)head_values * sizeof(float))) {
+                    fprintf(stderr, "V4.1 index bypass heads mismatch layer=%u start=%u count=%u\n",
+                            il, start, count);
+                    goto done;
+                }
+                if (ratio && (start + count) / ratio >= DS4_N_INDEXER_TOP_K)
+                    REQUIRE(!memcmp(ds4_gpu_tensor_contents(old.batch.selected_comp),
+                        ds4_gpu_tensor_contents(fast.batch.selected_comp),
+                        (size_t)count * DS4_N_INDEXER_TOP_K * sizeof(int32_t)));
+                fprintf(stderr, "V4.1 index bypass layer=%u start=%u count=%u: exact heads/KV\n",
+                        il, start, count);
+            }
+            start += count;
+        }
+    }
+    puts("V4.1 full-KV index bypass: exact heads/KV across raw, 511/512 compressed rows and indexed suffix PASS");
+    rc = 0;
+done:
+    unsetenv(diagnostic);
+    if (ds4_gpu_commands_active()) ds4_gpu_end_commands();
+    ds41_graph_free(&fast); ds41_graph_free(&old);
+    ds4_gpu_cleanup();
+    free(sizes); free(offsets); free(mapped.v);
+    model_close(&model);
     return rc;
 }
 
@@ -1624,26 +2509,33 @@ static int check_session_accounting(const char *path) {
         .context_size = 16384, .power_percent = 100, .ssd_streaming = true,
         .ssd_streaming_cache_bytes = UINT64_C(16) << 30};
     REQUIRE(ds4_engine_open(&engine, &opt) == 0);
+    REQUIRE(engine->live_session_count == 0);
     setenv("DS4_METAL_DISABLE_V41_WIDE_CHUNK", "1", 1);
     REQUIRE(ds4_session_create(&small, engine, opt.context_size) == 0);
+    REQUIRE(small->engine_session_counted && engine->live_session_count == 1);
     const uint64_t first = engine->ds41_session_bytes;
     REQUIRE(first);
     unsetenv("DS4_METAL_DISABLE_V41_WIDE_CHUNK");
     REQUIRE(ds4_session_create(&wide, engine, opt.context_size) == 0);
+    REQUIRE(wide->engine_session_counted && engine->live_session_count == 2);
     const uint64_t second = engine->ds41_session_bytes - first;
     REQUIRE(second > first);
     /* Debug settings and logical sweep limits may change after allocation. */
     small->ds41_graph.carry_cap = 8192;
     ds4_session_free(small); small = NULL;
     REQUIRE(engine->ds41_session_bytes == second);
+    REQUIRE(engine->live_session_count == 1);
     setenv("DS4_METAL_DISABLE_V41_WIDE_CHUNK", "1", 1);
     ds4_session_free(wide); wide = NULL;
     REQUIRE(engine->ds41_session_bytes == 0);
+    REQUIRE(engine->live_session_count == 0);
     REQUIRE(ds4_session_create(&small, engine, opt.context_size) == 0);
     REQUIRE(engine->ds41_session_bytes == first);
+    REQUIRE(small->engine_session_counted && engine->live_session_count == 1);
     ds4_session_free(small); small = NULL;
     REQUIRE(engine->ds41_session_bytes == 0);
-    puts("V4.1 session accounting retains allocation sizes across debug settings: PASS");
+    REQUIRE(engine->live_session_count == 0);
+    puts("V4.1 session accounting retains allocation sizes and live counts across debug settings: PASS");
     rc = 0;
 done:
     unsetenv("DS4_METAL_DISABLE_V41_WIDE_CHUNK");
@@ -1864,6 +2756,22 @@ done:
 }
 
 int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--scalar-epilogues"))
+        return check_scalar_epilogues();
+    if (argc == 2 && !strcmp(argv[1], "--attention-identity"))
+        return check_attention_identity();
+    if (argc == 2 && !strcmp(argv[1], "--attention-imatrix"))
+        return check_attention_imatrix();
+    if (argc == 2 && !strcmp(argv[1], "--prefill-expert-stream"))
+        return check_prefill_expert_stream();
+    if (argc == 2 && !strcmp(argv[1], "--prefill-expert-admission"))
+        return check_prefill_expert_admission();
+    if (argc == 2 && !strcmp(argv[1], "--prefill-expert-discard"))
+        return check_prefill_expert_discard();
+    if (argc == 2 && !strcmp(argv[1], "--prefill-expert-fd"))
+        return check_prefill_expert_fd();
+    if (argc == 3 && !strcmp(argv[1], "--attention-index-bypass"))
+        return check_attention_index_bypass(argv[2]);
     if (argc == 2 && !strcmp(argv[1], "--batch-admission"))
         return check_batch_admission();
     if (argc == 3 && !strcmp(argv[2], "--batch-head"))
@@ -1955,10 +2863,12 @@ int main(int argc, char **argv) {
     if (argc == 3 && strcmp(argv[1], "--rope-reference") == 0)
         return check_rope_reference(argv[2]);
     if (argc == 3 && strcmp(argv[2], "--session-fixture") == 0)
-        return check_sessions(argv[1]);
+        return check_sessions(argv[1], false);
+    if (argc == 3 && strcmp(argv[2], "--session-lifecycle") == 0)
+        return check_sessions(argv[1], true);
     if (argc < 3 || argc > 4 ||
         (!strncmp(argv[2], "--", 2) && strcmp(argv[2], "--zero-fixture"))) {
-        fprintf(stderr, "usage: %s MODEL (--zero-fixture | --session-fixture | "
+        fprintf(stderr, "usage: %s MODEL (--zero-fixture | --session-fixture | --session-lifecycle | "
                         "--long-sessions PROMPT_FILE | --prefill-parity PROMPT_FILE | "
                         "--thread-prefill PROMPT_FILE | --thread-sessions PROMPT_FILE | "
                         "--encoder-parity PROMPT_FILE | --encoder-long-parity PROMPT_FILE | "
