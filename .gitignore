@@ -79,3 +79,4 @@ __pycache__/
 .DS_Store
 /tests/test_kv_lz4
 /tests/test_kv_lz4_nofwrap
+/tests/test_kv_lz4_store

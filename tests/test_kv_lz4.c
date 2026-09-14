@@ -39,6 +39,7 @@ static void check_shuffle(size_t n) {
     uint8_t *ref = malloc(n + 1), *back = malloc(n + 1);
     assert(in && sh && ref && back);
     fill(in, n, 1);
+    in[n] = 0; /* Also initialize the allocation when testing n == 0. */
     /* Guard byte catches a one-past-the-end write in either direction. */
     sh[n] = 0xA5; back[n] = 0x5A;
 
@@ -150,6 +151,11 @@ static void test_reader_rejects_empty_region(void) {
     assert(fseek(fp, 0, SEEK_SET) == 0);
     uint64_t total = 0;
     assert(kv_lz4_reader_open(fp, 0, 1u << 16, 1, &total) == NULL);
+    rewind(fp);
+    /* A complete zero-total/zero-chunk frame used to allocate eight pools of
+     * maximum-sized scratch despite representing no payload at all. */
+    assert(kv_lz4_reader_open(fp, 12, DS4_KVSTORE_MAX_CHUNK_BYTES,
+                              8, &total) == NULL);
     fclose(fp);
     printf("  reader rejects an empty payload region: ok\n");
 }
@@ -251,6 +257,17 @@ static void test_reader_rejects_impossible_framing(void) {
     /* Framing consumes all 12 bytes, leaving nothing for the chunk record. */
     assert(kv_lz4_reader_open(fp, sizeof(framing), DS4_KVSTORE_MAX_CHUNK_BYTES,
                               8, &total) == NULL);
+    /* Nonempty framing must not bypass the same resource guard merely by
+     * including enough bytes for the advertised record headers. */
+    rewind(fp);
+    kv_le_put64(framing, (uint64_t)DS4_KVSTORE_MAX_CHUNK_BYTES * 8u);
+    ds4_kvstore_le_put32(framing + 8, 8);
+    assert(fwrite(framing, 1, sizeof(framing), fp) == sizeof(framing));
+    const uint8_t records[8 * 8] = {0};
+    assert(fwrite(records, 1, sizeof(records), fp) == sizeof(records));
+    rewind(fp);
+    assert(kv_lz4_reader_open(fp, sizeof(framing) + sizeof(records),
+                              DS4_KVSTORE_MAX_CHUNK_BYTES, 8, &total) == NULL);
     fclose(fp);
     printf("  reader rejects a region too small for the chunks it claims: ok\n");
 }

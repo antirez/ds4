@@ -186,7 +186,7 @@ static void kv_unshuffle_byte4(const uint8_t *in, uint8_t *out, size_t n) {
 #define KV_CACHE_MIN_EFFECTIVE_HITS 0.01
 /* A continued checkpoint that is a strict prefix of the incoming store is a
  * routine waypoint on the same path. Keep recent hits meaningful, but make
- * never-hit or stale waypoints cheap victims while pre-evicting for the new
+ * never-hit or stale waypoints cheap victims while making room for the new
  * store. */
 #define KV_CACHE_CONTINUED_PREFIX_MIN_FACTOR 0.05
 #define KV_CACHE_CONTINUED_PREFIX_HIT_FACTOR 0.45
@@ -314,7 +314,7 @@ static void kv_logf(ds4_kvstore *kc, ds4_kvstore_log_type type,
 static void kv_le_put64(uint8_t *p, uint64_t v);
 static uint64_t kv_le_get64(const uint8_t *p);
 
-/* Cap at 8 so a save cannot starve inference cores.  CLI overrides env. */
+/* Default to at most 8 workers to limit cache I/O CPU cost. CLI overrides env. */
 static int kv_cache_default_compression_threads(void) {
     if (!KV_LZ4_HAVE_FWRAP) return 0;
     const char *env = getenv("DS4_KV_CACHE_COMPRESSION_THREADS");
@@ -356,6 +356,7 @@ static FILE *kv_lz4_fwrap_open(void *cookie, const char *mode,
     (void)mode;
 #if !KV_LZ4_HAVE_FWRAP
     (void)cookie; (void)writefn; (void)readfn; (void)closefn;
+    errno = ENOTSUP;
     return NULL;
 #elif defined(__APPLE__)
     return funopen(cookie, readfn, writefn, NULL, closefn);
@@ -369,6 +370,7 @@ static FILE *kv_lz4_fwrap_open(void *cookie, const char *mode,
     return fopencookie(cookie, mode, io);
 #else
     (void)cookie; (void)writefn; (void)readfn; (void)closefn;
+    errno = ENOTSUP;
     return NULL;
 #endif
 }
@@ -829,16 +831,25 @@ FILE *kv_lz4_reader_open(FILE *in, uint64_t payload_bytes,
      * would otherwise reserve gigabytes before a single payload byte is
      * checked. */
     if (!kv_lz4_reader_read_framing(r)) goto fail;
+    /* The writer stores empty payloads raw. An empty compressed frame must
+     * not use its advertised chunk size to allocate worker scratch. */
+    if (r->uncompressed_total == 0) goto fail;
     if (uncompressed_total_out) *uncompressed_total_out = r->uncompressed_total;
     /* Each chunk record costs at least its 8-byte length pair, so the region
      * itself bounds how many chunks can be real. */
     if ((uint64_t)r->chunk_count * 8u > r->payload_bytes) goto fail;
+    /* LZ4 length-extension bytes add at most 255 decoded bytes each. Even a
+     * conservative 256:1 bound rules out tiny regions advertising huge scratch
+     * requirements; include record overhead to keep this bound permissive. */
+    if (r->uncompressed_total / 256u + (r->uncompressed_total % 256u != 0) >
+        r->payload_bytes) goto fail;
+    if ((uint32_t)n_workers > r->chunk_count) n_workers = (int)r->chunk_count;
+    r->n_workers = r->batch_cap = n_workers;
     /* No chunk can exceed the declared total, so size the scratch by whichever
      * of the two is smaller. */
     r->alloc_size = chunk_size;
-    if (r->uncompressed_total > 0 && r->uncompressed_total < (uint64_t)chunk_size)
+    if (r->uncompressed_total < (uint64_t)chunk_size)
         r->alloc_size = (uint32_t)r->uncompressed_total;
-    if (r->alloc_size == 0) r->alloc_size = 1;
     comp_bound = LZ4_compressBound((int)r->alloc_size);
     if (comp_bound <= 0) goto fail;
     r->comp_capacity = comp_bound;
@@ -917,6 +928,7 @@ int ds4_kvstore_load_payload_region(ds4_session *session, FILE *fp,
                                     char *load_err, size_t load_err_len) {
     const off_t payload_start = ftello(fp);
     int rc;
+    int load_errno;
     if (codec == DS4_KVSTORE_CODEC_LZ4) {
         /* The engine reads UNCOMPRESSED bytes from cr and requires the
          * remaining budget to be exactly the uncompressed payload size, so the
@@ -926,21 +938,26 @@ int ds4_kvstore_load_payload_region(ds4_session *session, FILE *fp,
                                       n_workers > 0 ? n_workers : 1,
                                       &uncompressed_total);
         if (!cr) {
+            load_errno = errno;
             snprintf(load_err, load_err_len, "failed to open lz4 reader");
             if (payload_start >= 0)
                 (void)fseeko(fp, payload_start + (off_t)payload_bytes, SEEK_SET);
+            errno = load_errno;
             return 1;
         }
         rc = ds4_session_load_payload(session, cr, uncompressed_total,
                                       load_err, load_err_len);
+        load_errno = errno;
         fclose(cr);
     } else {
         rc = ds4_session_load_payload(session, fp, payload_bytes,
                                       load_err, load_err_len);
+        load_errno = errno;
     }
     if (payload_start >= 0) {
         (void)fseeko(fp, payload_start + (off_t)payload_bytes, SEEK_SET);
     }
+    errno = load_errno;
     return rc;
 }
 
@@ -1365,9 +1382,10 @@ double ds4_kvstore_entry_eviction_score(
     return score;
 }
 
-void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
-                       uint64_t extra_bytes,
-                       const ds4_kvstore_eviction_context *incoming) {
+static void kv_cache_evict(ds4_kvstore *kc, const ds4_tokens *live,
+                            uint64_t extra_bytes,
+                            const ds4_kvstore_eviction_context *incoming,
+                            const char *protected_path) {
     if (!kc->enabled || kc->budget_bytes == 0) return;
     if (extra_bytes > kc->budget_bytes) return;
     kv_cache_refresh(kc);
@@ -1376,15 +1394,14 @@ void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
     for (int i = 0; i < kc->len; i++) total += kc->entry[i].file_size;
     const uint64_t target = kc->budget_bytes - extra_bytes;
     while (total > target && kc->len > 0) {
-        int victim = 0;
-        double victim_score =
-            ds4_kvstore_entry_eviction_score(&kc->entry[0], live, now,
-                                             incoming);
-        for (int i = 1; i < kc->len; i++) {
+        int victim = -1;
+        double victim_score = 0.0;
+        for (int i = 0; i < kc->len; i++) {
+            if (protected_path && !strcmp(kc->entry[i].path, protected_path)) continue;
             double score =
                 ds4_kvstore_entry_eviction_score(&kc->entry[i], live, now,
                                                  incoming);
-            if (score < victim_score ||
+            if (victim < 0 || score < victim_score ||
                 (score == victim_score &&
                  kc->entry[i].last_used < kc->entry[victim].last_used))
             {
@@ -1392,6 +1409,7 @@ void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
                 victim_score = score;
             }
         }
+        if (victim < 0) break;
         ds4_kvstore_entry e = kc->entry[victim];
         if (unlink(e.path) == 0) {
             kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
@@ -1411,6 +1429,12 @@ void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
                 (size_t)(kc->len - victim - 1) * sizeof(kc->entry[0]));
         kc->len--;
     }
+}
+
+void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
+                       uint64_t extra_bytes,
+                       const ds4_kvstore_eviction_context *incoming) {
+    kv_cache_evict(kc, live, extra_bytes, incoming, NULL);
 }
 
 bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
@@ -1663,15 +1687,9 @@ static bool kv_cache_existing_compatible(ds4_kvstore *kc, const char *path,
                       e.ctx_size <= (uint32_t)ctx_size &&
                       kv_cache_file_text_matches(path, sha, text, text_len);
     ds4_kvstore_entry_free(&e);
-    if (!compatible) {
-        if (unlink(path) == 0) {
-            kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
-                    "%s: kv cache replaced incompatible file %s",
-                    kv_log_name(kc), path);
-        }
-        return false;
-    }
-    return true;
+    /* A different model/context may still use this file. Leave it intact until
+     * a successful store replaces it atomically, just like other cache entries. */
+    return compatible;
 }
 
 static bool kv_trailer_serialized_size(const ds4_kvstore_trailer_hooks *hooks,
@@ -1834,7 +1852,10 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     uint64_t payload_bytes = staged.bytes;
 
     uint64_t est_file_bytes = 0, est_required_bytes = 0;
-    if (!ds4_kvstore_file_size_fits(kc, (uint64_t)text_len, payload_bytes,
+    /* A raw payload's size is known already. For compression, admission must
+     * wait for the encoded size (including a possible raw fallback). */
+    if (kc->opt.compression_threads == 0 &&
+        !ds4_kvstore_file_size_fits(kc, (uint64_t)text_len, payload_bytes,
                                     trailer_est_bytes,
                                     &est_file_bytes, &est_required_bytes)) {
         kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
@@ -1860,8 +1881,6 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         .ctx_size = (uint32_t)ds4_session_ctx(session),
         .reject_different_quant = kc->reject_different_quant,
     };
-    ds4_kvstore_evict(kc, live_tokens, est_file_bytes, &incoming);
-
     kv_buf tmpb = {0};
     kv_buf_printf(&tmpb, "%s.tmp.%ld", path, (long)getpid());
     char *tmp = kv_buf_take(&tmpb);
@@ -1937,8 +1956,8 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     }
     uint64_t final_file_bytes = 0, final_required_bytes = 0;
     bool final_size_over_budget = false;
-    /* Use the real on-disk payload size — generally smaller than the
-     * uncompressed estimate, never larger. */
+    /* LZ4 can expand incompressible data, or fall back to raw storage. Include
+     * the actual payload and trailer sizes before admitting either format. */
     if (ok && !ds4_kvstore_file_size_fits(kc, (uint64_t)text_len, on_disk_payload,
                                           trailer_bytes,
                                           &final_file_bytes,
@@ -1950,6 +1969,12 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     if (ok && rename(tmp, path) != 0) {
         saved_errno = errno;
         ok = false;
+    }
+    if (ok) {
+        /* Preserve existing entries until the new checkpoint is complete and
+         * published. Evict using actual sizes, protecting this admitted file.
+         * The temporary write needs free disk space beyond the cache budget. */
+        kv_cache_evict(kc, live_tokens, 0, &incoming, path);
     }
     const double save_ms = (kv_now_sec() - save_t0) * 1000.0;
     if (!ok) {
@@ -2131,11 +2156,14 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
     char err[160] = {0};
     int loaded = 0;
     int load_rc = 1;
+    int load_errno = 0;
     if (header_ok) {
+        errno = 0;
         load_rc = ds4_kvstore_load_payload_region(session, fp, hdr.codec,
                                                   hdr.payload_bytes, hdr.chunk_size,
                                                   kc->opt.compression_threads,
                                                   err, sizeof(err));
+        load_errno = errno;
     }
     if (load_rc == 0) {
         const ds4_tokens *loaded_tokens = ds4_session_tokens(session);
@@ -2165,6 +2193,10 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
         }
     } else {
         if (header_ok) ds4_session_invalidate(session);
+        /* A rejected payload must not block its replacement after a clean
+         * prefill. Keep valid files when loading failed for a resource or I/O
+         * reason instead; those failures do not establish payload corruption. */
+        if (header_ok && load_errno == 0) unlink(path);
         kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
                 "%s: kv cache load failed%s%s %s: %s load=%.1f ms",
                 kv_log_name(kc),

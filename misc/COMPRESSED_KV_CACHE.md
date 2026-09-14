@@ -1,110 +1,174 @@
 # Compressed Disk KV Cache
 
-Durable notes for the LZ4 payload codec in `ds4_kvstore.c`.  Format
-spec, key constants, and the measurements behind their defaults.
+The shared disk KV store losslessly compresses checkpoint payloads with LZ4-HC
+level 1 after a byte-4 transpose. Server and agent disk checkpoints use this
+path; live inference KV buffers and `ds4-bench` memory snapshots do not.
 
-## On-disk format
+## Format and compatibility
 
-`KV_CACHE_VERSION` is bumped to 2.  The codec lives in two
-previously-reserved bytes of the 48-byte fixed header:
+Cache format version 2 uses two previously reserved bytes of its 48-byte header:
 
-| Offset | Bytes | Field |
-|---:|:---:|---|
-| 21 | 1 | `codec` (`DS4_KVSTORE_CODEC_NONE`=0, `DS4_KVSTORE_CODEC_LZ4`=1) |
-| 22 | 1 | `chunk_size_log2` — `chunk_size = 1 << log2`.  Only meaningful when `codec == LZ4`.  Default 24 (= 16 MiB). |
-| 23 | 1 | reserved (must be zero) |
+| Offset | Field |
+|---:|---|
+| 21 | Codec: 0 = raw, 1 = LZ4 |
+| 22 | Chunk size log2; 24 means 16 MiB, meaningful only for LZ4 |
+| 23 | Reserved |
 
-Version-1 files wrote zero into bytes 21–23, so the reader still accepts
-them and they round-trip as `codec=NONE` / `chunk_size=0` with no special
-case.  The bump exists for the other direction: version-1 binaries rewrite
-the fixed header in place when they refresh a file's trailer, and they
-would zero the codec byte of a compressed file — relabeling LZ4 bytes as a
-raw payload.  Rejecting unknown versions makes old builds treat version-2
-files as a miss instead.
+The reader accepts versions 1 and 2. Version-1 raw files remain readable. Old
+version-1 binaries reject version-2 files, preventing their header/trailer
+updates from clearing a compressed file's codec byte. Enabling compression does
+not rewrite existing compatible raw checkpoints; either codec can be read
+regardless of the current write setting.
 
-When `codec == DS4_KVSTORE_CODEC_LZ4` the payload region is:
+An LZ4 payload contains little-endian framing followed by chunk records:
 
 ```text
 u64 uncompressed_total
 u32 chunk_count
 repeat chunk_count times:
     u32 raw_size
-    u32 comp_size
-    u8[comp_size]    LZ4_compress_HC(.., level=1) block
-                     applied to the chunk after a byte-4 transpose
+    u32 compressed_size
+    u8[compressed_size] LZ4 block of byte-4-transposed input
 ```
 
-The byte-4 transpose collects the bytes at each position-mod-4
-within a chunk together, so a 16 MiB chunk becomes four 4 MiB
-streams of "first bytes," "second bytes," etc.  Real KV state is
-laid out in 4-byte aligned blocks, so the transposed streams have
-much longer match runs and LZ4 finds them at HC1 cost.  Reader is
-symmetric: decompress chunk, then untranspose into the engine's
-payload buffer.
+Every chunk except the last has the declared chunk size. Decoding reverses the
+transpose and recovers the original payload bytes. Trailers remain outside the
+compressed region. Framing checks reject empty compressed frames, inconsistent
+counts, impossible expansion, truncated records, and invalid chunk lengths.
+There is no payload checksum: structural validation cannot detect every content
+mutation. Raw payloads also lack a content checksum.
 
-NEON `vld4q_u8` / `vst4q_u8` on AArch64 does the 4-way transpose in
-a single instruction; SSSE3 `pshufb` builds the same permutation on
-x86_64; a portable scalar fallback covers everything else.
+## Resources and cache policy
 
-`raw_size` equals `chunk_size` for all chunks except possibly the
-last, where it is the remainder.  `chunk_count` therefore equals
-`ceil(uncompressed_total / chunk_size)`; the reader enforces this.
+The default is `min(8, online CPUs)` workers and 16 MiB chunks. The server flag
+`--kv-cache-compression-threads N` overrides
+`DS4_KV_CACHE_COMPRESSION_THREADS`; zero writes raw files. The worker limit is
+64; accepted chunk sizes are bounded by 64 MiB. Unsupported cookie-stream
+platforms default to raw writes. Failure to allocate a writer also falls back
+to raw storage.
 
-`codec == DS4_KVSTORE_CODEC_NONE` is a raw payload, byte-identical to the
-pre-codec format.
+Each writer worker holds raw, shuffled, and encoded buffers: approximately
+`3 * workers * chunk_size`, or 384 MiB at defaults, plus codec and stream state.
+Reader pools are limited to the actual number of chunks and allocate no more
+than the smaller of chunk size and total decoded size per raw/shuffle slot.
 
-## Defaults and bounds
+The engine first stages a complete raw payload into a temporary file. The codec
+then streams that file into the cache's temporary output; it does not require
+an additional full-payload RAM buffer. Temporary disk usage includes raw staging
+and the new output while old cache files still exist.
 
-| Constant | Value | Why |
-|---|---|---|
-| `DS4_KVSTORE_DEFAULT_CHUNK_BYTES` | 16 MiB (`log2 = 24`) | Saturates ~8 P-cores on a 1–2 GiB payload (64–128 chunks); per-chunk preamble overhead is then noise. |
-| `DS4_KVSTORE_MAX_CHUNK_BYTES` | 64 MiB (`log2 = 26`) | Hard cap on chunk_size read from the header so a tampered file can't ask for gigabyte allocations. |
-| default threads | `min(8, online_cpus)` | Matches `ds4_threads_init` in `ds4.c`.  8 P-cores saturate the codec at production chunk sizes. |
-| `--kv-cache-compression-threads N` cap | 64 | Internal writer/reader cap; the CLI clamps at parse time so the startup log matches actual behavior. |
+Admission uses the actual encoded size, including text, trailers and 1% safety
+headroom. Raw writes can reject a known oversize payload early. LZ4 can expand
+incompressible data, and raw fallback can exceed the budget, so the final size
+check applies to both. Only after successful close and atomic rename does the
+store evict entries using actual file sizes, protecting the newly admitted
+checkpoint. Failed writes or publication leave existing entries intact, including
+a same-key file incompatible with the current model or context. This
+requires free temporary disk space beyond the configured cache budget; an
+ENOSPC failure does not justify deleting working cache entries speculatively.
 
-## Measured ratios and timings
+A payload rejected without a reported resource/I/O error is removed so successful
+recomputation can replace it. Files are retained when loading reports a resource
+or I/O failure, such as ENOMEM or an unavailable cookie stream.
 
-`ds4-server` on M1 Ultra (Metal, ctx=600000, IQ2XXS+w2Q2K quant),
-three prompt sizes sent twice each (cold then warm):
+Cold checkpoints can be saved during prefill. Logged `save_ms` excludes the
+initial raw staging, so it must not be described as total checkpoint overhead
+or as work that always happens after the user receives a response.
 
-| Prompt | On-disk size | Compression ratio | Save | Load (warm hit) |
-|---:|---:|:---:|---:|---:|
-|  3.5 K tok |  28 MiB | **2.74×** |  80 ms |  23 ms |
-|   17 K tok | 117 MiB | **2.50×** | 221 ms |  87 ms |
-|   47 K tok | 340 MiB | **2.38×** | 583 ms | 219 ms |
+## Real V4.1 server measurements
 
-Default thread count is `min(8, online_cpus)`, matching
-`ds4_threads_init` in `ds4.c`; 8 P-cores saturate the codec at
-production chunk sizes, and going wider takes cores away from
-inference.
+M1 Ultra, 128 GiB, Metal SSD streaming, 32 GiB expert-cache target,
+`DeepSeek-V4.1-Flash-Q2.gguf`, context 69,632. Default prefill chunk 8,192;
+cache boundary alignment 2,048. Measured on local revision `d83b4ba` before the
+subsequent admission/recovery fixes; the payload encoding is unchanged.
 
-## Why HC level 1
+For each size: empty raw directory, HTTP request, capture the cold file before
+shutdown, restart, repeat and verify disk reuse. Repeat with eight compression
+workers and a separate empty directory. Requests contain mixed prose and source
+code, temperature zero, and at most 64 generated tokens.
 
-Codec sweep over a real 994 MiB transposed payload (47 K-token IQ2XXS
-checkpoint, 63 × 16 MiB chunks, 8 threads, M1 Ultra):
+| Cached tokens | Prompt tokens | Raw file | LZ4 file | Ratio | Raw / LZ4 logged load |
+|---:|---:|---:|---:|---:|---:|
+| 4,096 | 4,141 | 35.52 MiB | 12.15 MiB | 2.92x | 7.5 / 16.5 ms |
+| 16,384 | 16,429 | 110.61 MiB | 36.08 MiB | 3.07x | 23.9 / 31.9 ms |
+| 63,488 | 65,494 | 398.43 MiB | 127.53 MiB | 3.12x | 92.5 / 111.7 ms |
 
-| Codec | Compress | Ratio | Decompress |
-|---|---:|:---:|---:|
-| `LZ4_compress_default` | 6.9 GB/s | 2.16× | 33.9 GB/s |
-| fast, acceleration 8 | 9.6 GB/s | 2.01× | 35.7 GB/s |
-| **HC level 1** | **3.2 GB/s** | **2.38×** | **24.1 GB/s** |
-| HC level 2 | 3.2 GB/s | 2.38× | 23.9 GB/s |
+All twelve response messages matched. Independently decoding each compressed
+checkpoint with upstream LZ4 and a separate inverse transpose reproduced every
+raw payload byte. These are actual filesystem sizes of matching checkpoints,
+not directory totals or API write counters. The largest replay recomputed 2,006
+prompt tokens beyond the saved aligned prefix.
 
-The transposed streams are match-rich, so HC1 runs at ~400 MB/s/core —
-nothing like its cost on generic data — and still beats fast mode by
-~10% on disk.  At 3.2 GB/s the compressor is no longer the bottleneck
-of a save (the write side is), so trading ratio for more speed buys
-little; HC2+ costs the same and gains nothing.
+The chat endpoint did not return requested log probabilities. An initial audit
+incorrectly compared absent values; the corrected audit reports them unavailable.
+The response check is not a numerical-logit comparison or a long-horizon quality
+assessment. Initial timing runs did not clear OS page cache or balance run order
+and therefore establish no inference-speed improvement or no-regression bound.
 
-## Streaming, not snapshot
+V4.1 stores BF16/FP8/FP4-rounded values in float-addressable buffers. In two
+16 MiB samples of the largest checkpoint, the low two bytes of every four-byte
+word were zero. Byte shuffling groups these redundant bytes into runs. One
+sample compressed 2.56x directly and 3.00x with the shuffle, without introducing
+additional numerical loss. Ratios depend on payload representation and workload.
 
-Compression goes through a `funopen`/`fopencookie` wrapper around
-`ds4_session_save_payload` / `load_payload`.  Each worker holds three
-chunk-sized buffers — raw, byte-4 shuffle scratch, and the LZ4 output
-(`LZ4_compressBound(chunk_size)`, ~= chunk_size) — so peak extra RAM
-during a save is `~3 * threads * chunk_size` (~384 MiB at the defaults),
-independent of context length; the worker never holds the full
-1–16 GiB uncompressed buffer.  The reader allocates the same three
-buffers per worker.
+## What ds4-bench measures
 
-Engine APIs in `ds4.h` are unchanged.
+`ds4-bench` reuses live KV during incremental prefill. Between frontiers it can
+save and restore an uncompressed session snapshot through `fmemopen`; snapshot
+save/restore is outside both throughput timing windows. Its `kvcache_bytes`
+column reports that memory snapshot's payload size, not a disk checkpoint size.
+It also has an expert-weight cache in SSD streaming mode, a separate mechanism.
+
+The executable does not link `ds4_kvstore.o`, `lz4.o`, or `lz4hc.o` and never reads
+the compression-thread setting. An upstream-versus-PR benchmark is an inference
+regression control. It cannot measure disk compression, save/load overhead,
+cache-budget effects or time to first token after restoring a disk checkpoint.
+Those need actual server restart tests and/or a separately labeled codec replay
+benchmark. Changing the compression environment variable for `ds4-bench` is not
+an on/off experiment for this feature.
+
+## Regressions
+
+```sh
+make test-kv-lz4 test-kv-lz4-nofwrap
+make ds4_test ds4_agent_test
+./ds4_test --server
+./ds4_agent_test
+```
+
+The codec suite covers byte-shuffle inversion, chunk boundaries, malformed
+regions, trailer positioning and raw fallback. Store regressions replace only
+the engine boundary and exercise actual staging, compression, admission,
+eviction and publication with deterministic payloads. They cover fitting
+compressed files, unnecessary eviction, write/rename failures, fallback and
+incompressible expansion exceeding budget, protection of an admitted file,
+corrupt-file replacement, retention and retry after reported allocation/I/O
+failures, and atomic replacement of same-key incompatible files. These fixtures
+are not model-generated KV compression-ratio evidence.
+
+## V4.1 throughput through 256K
+
+M1 Ultra / 128 GiB / macOS 26.6.2, Metal SSD streaming, Q2 V4.1 model, 32 GiB expert-cache target, Engram disk-only, prefill chunk 8,192. One process incrementally prefills the same prose corpus to each frontier, generates 64 tokens, and restores the prompt snapshot before continuing. Generation includes the first token; steady generation excludes it.
+
+| Context tokens | Tokens added | Prefill tokens/s | Generation tokens/s | Steady generation tokens/s |
+|---:|---:|---:|---:|---:|
+| 16,384 | 16,384 | 236.91 | 4.85 | 5.50 |
+| 32,768 | 16,384 | 204.91 | 5.17 | 5.64 |
+| 65,536 | 32,768 | 244.39 | 5.06 | 5.42 |
+| 131,072 | 65,536 | 259.51 | 4.85 | 5.25 |
+| 262,144 | 131,072 | 243.16 | 4.42 | 4.95 |
+
+These are single measurements, not repeated-run confidence intervals. Prefill rates apply to the **tokens added** column, not a fresh prompt from zero at every row. The context allocation is 262,209; the planned memory footprint was 51.74 GiB. The complete run, including startup/snapshots/generation, took 1,148 seconds. System-wide VM counters recorded 169.75 MiB of swap-ins and zero swap-outs during the run; these counters do not identify which process caused the traffic. No simultaneous model, compilation or stress test was launched by this task.
+
+All five frontier vectors contain 129,280 finite values. The six same-configuration upstream/PR controls match bit-for-bit at 4K and 16K, including signed zero. The smaller-chunk experiment also matches those vectors. The validator rejects missing entries, nulls and NaNs and detects a deliberately changed finite value. This establishes the tested numerical invariants; it is not an official-reference long-context quality evaluation.
+
+The CSV's final `kvcache_bytes=0` means the final frontier needs no saved snapshot. It does not mean KV memory is absent. At 128K the uncompressed memory snapshot was 850,388,020 bytes (811.0 MiB); this is not a compressed disk-file measurement.
+
+```sh
+mkdir -p /tmp/v41-long-logits
+./ds4-bench -m /path/to/DeepSeek-V4.1-Flash-Q2.gguf \
+  --ssd-streaming --ssd-streaming-cold --ssd-streaming-cache-experts 32GB \
+  --prompt-file speed-bench/promessi_sposi.txt \
+  --ctx-start 16384 --ctx-max 262144 --step-mul 2 --gen-tokens 64 \
+  --csv /tmp/v41-long.csv --dump-frontier-logits-dir /tmp/v41-long-logits
+```
