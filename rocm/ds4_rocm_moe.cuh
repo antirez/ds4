@@ -3260,6 +3260,96 @@ __global__ static void moe_gate_up_mid_decode_q4K_wave_kernel(
     }
 }
 
+/* MMQ prefill path: list the (token, slot) pairs whose expert this rank
+ * owns, token-major, with the expert index relative to the owned table and
+ * the routing weight.  One block scans the pairs in order (block-wide
+ * exclusive scan per stripe, carried across stripes). */
+__global__ static void moe_q4k_mmq_compact_kernel(
+        const int32_t *selected,
+        const float *weights,
+        uint32_t pair_count,
+        uint32_t tp_first,
+        uint32_t tp_count,
+        uint32_t *pair_index,
+        int32_t *ids_local,
+        float *w_compact,
+        uint32_t *count_out) {
+    __shared__ uint32_t warp_sums[32];
+    __shared__ uint32_t carry;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t n_warps = blockDim.x >> 5u;
+    if (threadIdx.x == 0u) carry = 0u;
+    __syncthreads();
+    for (uint32_t base = 0; base < pair_count; base += blockDim.x) {
+        const uint32_t p = base + threadIdx.x;
+        uint32_t owned = 0u;
+        int32_t e = 0;
+        if (p < pair_count) {
+            e = selected[p];
+            if (e < 0) e = 0;
+            owned = (tp_count == 0u ||
+                     ((uint32_t)e >= tp_first && (uint32_t)e < tp_first + tp_count)) ? 1u : 0u;
+        }
+        uint32_t v = owned;
+        for (uint32_t o = 1u; o < 32u; o <<= 1u) {
+            const uint32_t t = (uint32_t)__shfl_up((int)v, o);
+            if (lane >= o) v += t;
+        }
+        if (lane == 31u) warp_sums[warp] = v;
+        __syncthreads();
+        if (warp == 0u) {
+            uint32_t w = lane < n_warps ? warp_sums[lane] : 0u;
+            for (uint32_t o = 1u; o < 32u; o <<= 1u) {
+                const uint32_t t = (uint32_t)__shfl_up((int)w, o);
+                if (lane >= o) w += t;
+            }
+            warp_sums[lane] = w; /* inclusive scan over the warps */
+        }
+        __syncthreads();
+        const uint32_t pos = carry + (warp ? warp_sums[warp - 1u] : 0u) + v - owned;
+        if (owned) {
+            pair_index[pos] = p;
+            ids_local[pos] = e - (int32_t)tp_first;
+            w_compact[pos] = weights[p];
+        }
+        __syncthreads();
+        if (threadIdx.x == 0u) carry += warp_sums[n_warps - 1u];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0u) *count_out = carry;
+}
+
+/* Copy the activation row of each compact pair's token (one block per pair). */
+__global__ static void moe_q4k_mmq_gather_x_kernel(
+        float *xp,
+        const float *x,
+        const uint32_t *pair_index,
+        uint32_t n_expert,
+        uint32_t in_dim,
+        uint32_t n_pairs) {
+    const uint32_t k = blockIdx.x;
+    if (k >= n_pairs) return;
+    const uint32_t tok = pair_index[k] / n_expert;
+    const float *src = x + (uint64_t)tok * in_dim;
+    float *dst = xp + (uint64_t)k * in_dim;
+    for (uint32_t i = threadIdx.x; i < in_dim; i += blockDim.x) dst[i] = src[i];
+}
+
+/* Write each compact pair's down row into its (token, slot) row. */
+__global__ static void moe_q4k_mmq_scatter_down_kernel(
+        float *down,
+        const float *src,
+        const uint32_t *pair_index,
+        uint32_t out_dim,
+        uint32_t n_pairs) {
+    const uint32_t k = blockIdx.x;
+    if (k >= n_pairs) return;
+    const float *s = src + (uint64_t)k * out_dim;
+    float *d = down + (uint64_t)pair_index[k] * out_dim;
+    for (uint32_t i = threadIdx.x; i < out_dim; i += blockDim.x) d[i] = s[i];
+}
+
 template <bool Batch>
 __global__ static void moe_down_mxfp4_sum6_qwarp32_kernel(
         float *out,

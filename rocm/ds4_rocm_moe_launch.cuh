@@ -571,6 +571,151 @@ static int routed_moe_full_table_is_cached(
            cuda_model_range_is_cached(model_map, down_offset, down_bytes);
 }
 
+/* Grow-only device scratch for the MMQ prefill path (two buffers: the
+ * pair lists are alive while the row buffers are resized). */
+static void *g_moe_mmq_small = NULL;
+static uint64_t g_moe_mmq_small_bytes = 0;
+static void *g_moe_mmq_big = NULL;
+static uint64_t g_moe_mmq_big_bytes = 0;
+
+static void *moe_mmq_scratch_grow(void **buf, uint64_t *have, uint64_t bytes) {
+    if (*have >= bytes) return *buf;
+    if (*buf) {
+        (void)cudaDeviceSynchronize();
+        (void)cudaFree(*buf);
+        *buf = NULL;
+        *have = 0;
+    }
+    void *ptr = NULL;
+    if (cudaMalloc(&ptr, (size_t)bytes) != cudaSuccess) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "MMQ MoE scratch alloc failed (%.1f MiB)\n",
+                (double)bytes / 1048576.0);
+        (void)cudaGetLastError();
+        return NULL;
+    }
+    *buf = ptr;
+    *have = bytes;
+    return ptr;
+}
+
+/* Q4_K routed experts for prefill through the vendored MMQ tensor-core GEMMs
+ * (cuda/mmq/ds4_mmq.h).  Only the pairs whose expert this rank owns are
+ * computed: they are compacted token-major and handed to MMQ as one expert
+ * per "token" (n_expert_used = 1), gate and up in one call, then the down
+ * projection over the compact mid rows; the rows go back to their (token,
+ * slot) positions and the moe_sum epilogue skips the other rank's slots as
+ * before.  Returns 1 when done, 0 when MMQ declined (the caller falls back
+ * to the tile kernels), -1 on a launch failure. */
+static int routed_moe_q4k_mmq_launch(
+        ds4_gpu_tensor *out,
+        ds4_gpu_tensor *gate,
+        ds4_gpu_tensor *up,
+        ds4_gpu_tensor *mid,
+        ds4_gpu_tensor *down,
+        const char *gate_w,
+        const char *up_w,
+        const char *down_w,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t n_tokens,
+        uint32_t n_expert,
+        uint32_t n_total_expert,
+        uint32_t tp_first,
+        uint32_t tp_count,
+        uint32_t expert_in_dim,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        float clamp) {
+    static int mmq_ready = -1;
+    if (mmq_ready < 0) mmq_ready = ds4_mmq_init(0) == 0 ? 1 : 0;
+    if (!mmq_ready) return 0;
+    const uint32_t pair_count = n_tokens * n_expert;
+    const uint32_t n_experts_local = tp_count != 0u ? tp_count : n_total_expert;
+    const uint64_t idx_bytes = ((uint64_t)pair_count * 4u + 255u) & ~255ull;
+    char *small = (char *)moe_mmq_scratch_grow(&g_moe_mmq_small, &g_moe_mmq_small_bytes,
+                                               3u * idx_bytes + 256u);
+    if (!small) return -1;
+    uint32_t *pair_index = (uint32_t *)small;
+    int32_t *ids_local = (int32_t *)(small + idx_bytes);
+    float *w_compact = (float *)(small + 2u * idx_bytes);
+    uint32_t *count_dev = (uint32_t *)(small + 3u * idx_bytes);
+    moe_q4k_mmq_compact_kernel<<<1, 1024>>>(
+            (const int32_t *)selected->ptr, (const float *)weights->ptr, pair_count,
+            tp_first, tp_count, pair_index, ids_local, w_compact, count_dev);
+    if (!cuda_ok(cudaGetLastError(), "routed_moe mmq compact launch")) return -1;
+    uint32_t n_pairs = 0;
+    if (cudaMemcpy(&n_pairs, count_dev, sizeof(n_pairs), cudaMemcpyDeviceToHost) != cudaSuccess ||
+        n_pairs > pair_count) {
+        (void)cudaGetLastError();
+        return -1;
+    }
+    if (n_pairs != 0u) {
+        const uint64_t x_bytes = (uint64_t)n_pairs * expert_in_dim * sizeof(float);
+        const uint64_t o_bytes = (uint64_t)n_pairs * out_dim * sizeof(float);
+        char *big = (char *)moe_mmq_scratch_grow(&g_moe_mmq_big, &g_moe_mmq_big_bytes,
+                                                 x_bytes + o_bytes);
+        if (!big) return -1;
+        float *xp = (float *)big;
+        float *dp = (float *)(big + x_bytes);
+        moe_q4k_mmq_gather_x_kernel<<<n_pairs, 256>>>(
+                xp, (const float *)x->ptr, pair_index, n_expert, expert_in_dim, n_pairs);
+        if (!cuda_ok(cudaGetLastError(), "routed_moe mmq gather launch")) return -1;
+        /* The gfx1151 MMQ MoE grids are fed at most 2048 rows per call. */
+        const uint32_t cap = 2048u;
+        for (uint32_t k0 = 0; k0 < n_pairs; k0 += cap) {
+            const uint32_t n = n_pairs - k0 < cap ? n_pairs - k0 : cap;
+            const int rc = ds4_mmq_q4_K_moe_pair(
+                    gate_w, up_w, xp + (uint64_t)k0 * expert_in_dim, ids_local + k0,
+                    (float *)gate->ptr + (uint64_t)k0 * expert_mid_dim,
+                    (float *)up->ptr + (uint64_t)k0 * expert_mid_dim,
+                    (int)expert_mid_dim, (int)expert_in_dim, (int)n,
+                    (int)n_experts_local, 1, (cudaStream_t)0);
+            if (rc != 0) {
+                static int logged = 0;
+                if (!logged) {
+                    logged = 1;
+                    fprintf(stderr, DS4_GPU_LOG_PREFIX "MMQ Q4_K gate/up returned %d; "
+                            "falling back to the tile kernels\n", rc);
+                }
+                (void)cudaGetLastError();
+                return 0;
+            }
+        }
+        const uint64_t n_mid = (uint64_t)n_pairs * expert_mid_dim;
+        moe_swiglu_weighted_f32_kernel<<<(uint32_t)((n_mid + 255u) / 256u), 256>>>(
+                (float *)mid->ptr, (const float *)gate->ptr, (const float *)up->ptr,
+                w_compact, n_mid, expert_mid_dim, clamp);
+        if (!cuda_ok(cudaGetLastError(), "routed_moe mmq swiglu launch")) return -1;
+        for (uint32_t k0 = 0; k0 < n_pairs; k0 += cap) {
+            const uint32_t n = n_pairs - k0 < cap ? n_pairs - k0 : cap;
+            const int rc = ds4_mmq_q4_K_moe(
+                    down_w, (const float *)mid->ptr + (uint64_t)k0 * expert_mid_dim,
+                    ids_local + k0, dp + (uint64_t)k0 * out_dim,
+                    (int)out_dim, (int)expert_mid_dim, (int)n,
+                    (int)n_experts_local, 1, (cudaStream_t)0);
+            if (rc != 0) {
+                static int logged = 0;
+                if (!logged) {
+                    logged = 1;
+                    fprintf(stderr, DS4_GPU_LOG_PREFIX "MMQ Q4_K down returned %d; "
+                            "falling back to the tile kernels\n", rc);
+                }
+                (void)cudaGetLastError();
+                return 0;
+            }
+        }
+        moe_q4k_mmq_scatter_down_kernel<<<n_pairs, 256>>>(
+                (float *)down->ptr, dp, pair_index, out_dim, n_pairs);
+        if (!cuda_ok(cudaGetLastError(), "routed_moe mmq scatter launch")) return -1;
+    }
+    const uint64_t n_out = (uint64_t)n_tokens * out_dim;
+    moe_sum_kernel<<<(uint32_t)((n_out + 255u) / 256u), 256>>>(
+            (float *)out->ptr, (const float *)down->ptr, (const int32_t *)selected->ptr,
+            out_dim, n_expert, n_tokens, tp_first, tp_count);
+    return cuda_ok(cudaGetLastError(), "routed_moe mmq sum launch") ? 1 : -1;
+}
+
 static int routed_moe_launch(
         ds4_gpu_tensor *out,
         ds4_gpu_tensor *gate,
@@ -833,6 +978,28 @@ static int routed_moe_launch(
             !disable_resident_iq2_sorted;
         const uint32_t use_expert_tiles = use_sorted_pairs &&
             getenv("DS4_ROCM_DISABLE_EXPERT_TILES") == NULL;
+        /* Q4_K prefill batches go through the MMQ tensor-core GEMMs on
+         * gfx1151 (DS4_ROCM_MMQ_Q4K=0 keeps the tile kernels). */
+        if (ok && q4k_path && n_tokens >= 16u && !batch_stream_selected &&
+            !batch_stream_split_selected && !split_selected && !compact_selected &&
+            gate_w && up_w && down_w && !add_in &&
+            ds4_rocm_gfx1151_flag("DS4_ROCM_MMQ_Q4K")) {
+            const int mmq_rc = routed_moe_q4k_mmq_launch(
+                    out, gate, up, mid, down, gate_w, up_w, down_w, x, selected_exec,
+                    weights, n_tokens, n_expert, n_total_expert, tp_first, tp_count,
+                    expert_in_dim, expert_mid_dim, out_dim, clamp);
+            if (mmq_rc > 0) {
+                static int logged_mmq_q4k = 0;
+                if (!logged_mmq_q4k) {
+                    logged_mmq_q4k = 1;
+                    fprintf(stderr, DS4_GPU_LOG_PREFIX "routed MoE prefill using MMQ Q4_K "
+                            "tensor-core GEMMs (n_tokens=%u, owned experts %u)\n",
+                            n_tokens, tp_count != 0u ? tp_count : n_total_expert);
+                }
+                return 1;
+            }
+            if (mmq_rc < 0) return 0;
+        }
         const uint32_t expert_tile_m = n_tokens <= 8u ? 4u : 8u;
         const uint32_t write_gate_up = 0u;
         const uint32_t use_p2_sorted = 0u;
