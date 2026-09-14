@@ -457,6 +457,21 @@ extern "C" int ds4_gpu_matmul_q4_K_tensor(
     const char *weight = cuda_model_range_ptr(
         model_map, weight_offset, weight_bytes, "GLM-5.3 Q4_K matrix");
     if (!weight) return 0;
+    // GLM-5.3 KDA Q/K bulk projection. MMQ uses 32-value Q8_1
+    // activation scales instead of this entry's 256-value Q8_K scales.
+    // Keep quality, streaming, small-row and other-model arithmetic intact.
+    if (g_glm_model && !g_quality_mode && !g_ssd_streaming_mode &&
+        ds4_rocm_is_gfx1151() && in_dim == 4096u && out_dim == 8192u &&
+        n_rows >= 128u && n_rows <= 2048u) {
+        const int rc = ds4_mmq_q4_K_dense(
+            weight, (const float *)x->ptr, (float *)out->ptr,
+            (int)out_dim, (int)n_rows, (int)in_dim, (cudaStream_t)0);
+        if (rc != 0) {
+            fprintf(stderr, "ds4: GLM-5.3 Q4_K MMQ failed (%d)\n", rc);
+            return 0;
+        }
+        return 1;
+    }
     cuda_block_q8_K *xq = (cuda_block_q8_K *)cuda_tmp_alloc(
         xq_bytes,
         "GLM-5.3 Q4_K activations");
@@ -1511,6 +1526,56 @@ __global__ static void glm_indexer_scores_batch_kernel(
         __syncthreads();
     }
     if (threadIdx.x == 0u) *dst = score;
+}
+
+/* GLM-5.3 bulk scorer on gfx1151: one wave32 per pooled key/query pair.
+ * Keep FP32 queries, sequential head accumulation, and the scalar tree's
+ * 64/32/16/8/4/2/1 grouping. Four independent waves need no block barriers. */
+__global__ static void glm53_indexer_scores_wave32_kernel(
+        float *scores,
+        const float *q,
+        const float *weights,
+        const __half *indexer_key_cache,
+        uint32_t n_rows,
+        uint32_t n_tokens,
+        uint32_t pos0,
+        float scale) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t row = blockIdx.x * 4u + (threadIdx.x >> 5u);
+    const uint32_t token = blockIdx.y;
+    if (row >= n_rows || token >= n_tokens) return;
+    float *dst = scores + (uint64_t)token * n_rows + row;
+    if (row >= (pos0 + token + 1u) / 4u) {
+        if (lane == 0u) *dst = -INFINITY;
+        return;
+    }
+    const __half *kr = indexer_key_cache + (uint64_t)row * 128u + lane;
+    const float k0 = __half2float(kr[0]);
+    const float k1 = __half2float(kr[32]);
+    const float k2 = __half2float(kr[64]);
+    const float k3 = __half2float(kr[96]);
+    float score = 0.0f;
+    for (uint32_t h = 0; h < 32u; ++h) {
+        const float *qh = q + ((uint64_t)token * 32u + h) * 128u + lane;
+        float dot;
+        {
+            // Preserve the explicit pair tree. The gfx1151 backend can still
+            // fuse product pairs, so rounding differs from the scalar kernel.
+#pragma clang fp reassociate(off)
+#pragma clang fp contract(off)
+            const float p0 = qh[0] * k0;
+            const float p1 = qh[32] * k1;
+            const float p2 = qh[64] * k2;
+            const float p3 = qh[96] * k3;
+            dot = (p0 + p2) + (p1 + p3);
+        }
+        dot = warp_sum_f32(dot);
+        if (lane == 0u) {
+            score += fmaxf(dot * scale, 0.0f) *
+                     weights[(uint64_t)token * 32u + h];
+        }
+    }
+    if (lane == 0u) *dst = score;
 }
 
 __global__ static void glm_attention_indexed_lora_kernel(
@@ -2944,6 +3009,19 @@ extern "C" int ds4_gpu_glm53_indexer_scores_batch_tensor(
         !cuda_tensor_has_elems2(weights, n_tokens, n_head, sizeof(float)) ||
         !glm_rocm_tensor_has_cache2(indexer_key_cache, n_rows, head_dim, elem)) {
         return 0;
+    }
+    if (g_glm_model && !g_quality_mode && !g_ssd_streaming_mode &&
+        ds4_rocm_is_gfx1151() &&
+        cache_f16 && n_head == 32u && head_dim == 128u &&
+        pool_size == 4u && n_tokens >= 128u) {
+        const dim3 grid(n_rows / 4u + (n_rows % 4u != 0u), n_tokens, 1u);
+        glm53_indexer_scores_wave32_kernel<<<grid, 128u>>>(
+                (float *)scores->ptr, (const float *)q->ptr,
+                (const float *)weights->ptr,
+                (const __half *)indexer_key_cache->ptr,
+                n_rows, n_tokens, pos0, scale);
+        return cuda_ok(cudaGetLastError(),
+                       "GLM-5.3 grouped indexer wave32 scores launch");
     }
     const dim3 grid(n_rows, n_tokens, 1u);
     glm_indexer_scores_batch_kernel<<<grid, 256u>>>(

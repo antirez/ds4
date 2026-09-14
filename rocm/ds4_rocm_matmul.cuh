@@ -1,3 +1,8 @@
+/* Existing engine query reads the active model variant; its engine argument
+ * is unused. Keep GLM 5.2's overlapping 2048 -> 4096 indexer unchanged. */
+struct ds4_engine;
+extern "C" bool ds4_engine_is_glm53(struct ds4_engine *e);
+
 __global__ static void matmul_f16_tiny_batch_wave_kernel(
         float *out,
         const half *w,
@@ -428,7 +433,21 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
         !cuda_u64_mul3_checked(n_tok, in_dim, sizeof(float), &x_bytes) ||
         !cuda_u64_mul3_checked(n_tok, out_dim, sizeof(float), &out_bytes) ||
         x->bytes < x_bytes || out->bytes < out_bytes) return 0;
-    if (n_tok > 1 && !g_quality_mode &&
+    /* Tested GLM 5.3 Q8 projections reuse each weight for two quantized rows.
+     * The small 128 -> 8192 KDA projections retain their existing dispatch. */
+    const bool glm_q8_tok2_preq =
+        g_glm_model && !g_ssd_streaming_mode && !g_quality_mode &&
+        n_tok == 2u &&
+        ((in_dim == 4096u &&
+          (out_dim == 64u || out_dim == 128u || out_dim == 512u ||
+           out_dim == 1536u || out_dim == 2048u || out_dim == 8192u ||
+           out_dim == 12288u)) ||
+         (out_dim == 4096u &&
+          (in_dim == 2048u || in_dim == 8192u || in_dim == 12288u ||
+           in_dim == 16384u)) ||
+         (in_dim == 1536u && out_dim == 16384u)) &&
+        ds4_rocm_is_gfx1151() && ds4_engine_is_glm53(NULL);
+    if (n_tok > 1 && !g_quality_mode && !glm_q8_tok2_preq &&
         cuda_runtime_config()->shared_down_cublas && in_dim == 2048u && out_dim == 4096u &&
         cuda_matmul_q8_0_tensor_f16_gemm(out, model_map, model_size, weight_offset,
                                          in_dim, out_dim, x, n_tok, label ? label : "shared_expert")) {
@@ -493,7 +512,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                 blocks);
         return cuda_ok(cudaGetLastError(), "matmul_q8_0 f32 warp launch");
     }
-    if (n_tok > 1) {
+    if (n_tok > 1 && !glm_q8_tok2_preq) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
         if (!g_quality_mode &&
             g_dspark_verify_mode && n_tok <= 6u &&
@@ -611,7 +630,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                 blocks);
         return cuda_ok(cudaGetLastError(), "matmul_q8_0 f32 batch warp launch");
     }
-    if (g_cublas_ready && n_tok > 1) {
+    if (g_cublas_ready && n_tok > 1 && !glm_q8_tok2_preq) {
         const __half *w_f16 = cuda_q8_f16_ptr(model_map, weight_offset, weight_bytes, in_dim, out_dim, label);
         if (w_f16) {
             const uint64_t xh_count = n_tok * in_dim;
@@ -661,6 +680,14 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     dim3 qgrid((unsigned)blocks, (unsigned)n_tok, 1);
     quantize_q8_0_f32_kernel<<<qgrid, 32>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 quantize launch")) return 0;
+    if (glm_q8_tok2_preq) {
+        matmul_q8_0_preq_batch_warp8_tok2_kernel<<<
+                ((unsigned)out_dim + 7u) / 8u, 256u>>>(
+                (float *)out->ptr,
+                reinterpret_cast<const unsigned char *>(wptr),
+                xq, xscale, in_dim, out_dim, blocks, use_dp4a);
+        return cuda_ok(cudaGetLastError(), "matmul_q8_0 GLM tok2 prequant launch");
+    }
     if (n_tok == 1) {
         const uint32_t rows_per_block = cfg->q8_decode_rpb;
         matmul_q8_0_preq_rows_w32_kernel<<<
