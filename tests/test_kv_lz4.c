@@ -226,6 +226,56 @@ static void test_truncated_and_corrupt(void) {
     printf("  truncated framing, truncated region and corrupt body all rejected: ok\n");
 }
 
+/* The payload region must be written and read back byte for byte whether or
+ * not the codec is available.  Where cookie streams are missing the save still
+ * has to succeed, falling back to codec NONE rather than failing. */
+static void test_write_payload_region(void) {
+    const size_t n = 5 * (1u << 12) + 37;
+    uint8_t *data = malloc(n), *back = malloc(n);
+    assert(data && back);
+    fill(data, n, 2);
+
+    char staged_path[] = "/tmp/ds4_kv_lz4_staged_XXXXXX";
+    int sfd = mkstemp(staged_path);
+    assert(sfd >= 0);
+    FILE *sf = fdopen(sfd, "wb");
+    assert(sf && fwrite(data, 1, n, sf) == n);
+    assert(fclose(sf) == 0);
+    const ds4_session_payload_file staged = {.path = staged_path, .bytes = n};
+
+    FILE *fp = tmpfile();
+    assert(fp);
+    uint8_t codec = 0xFF, chunk_log2 = 0xFF;
+    uint64_t on_disk = 0;
+    char err[256] = {0};
+    const bool ok = ds4_kvstore_write_payload_region(
+            fp, &staged, 4, DS4_KVSTORE_DEFAULT_CHUNK_BYTES,
+            &codec, &chunk_log2, &on_disk, err, sizeof(err));
+    assert(ok);
+    assert(codec == (KV_LZ4_HAVE_FWRAP ? DS4_KVSTORE_CODEC_LZ4
+                                       : DS4_KVSTORE_CODEC_NONE));
+    assert(on_disk > 0);
+
+    assert(fseek(fp, 0, SEEK_SET) == 0);
+    if (codec == DS4_KVSTORE_CODEC_LZ4) {
+        uint64_t total = 0;
+        FILE *cr = kv_lz4_reader_open(fp, on_disk, 1u << chunk_log2, 4, &total);
+        assert(cr && total == (uint64_t)n);
+        assert(fread(back, 1, n, cr) == n);
+        assert(fclose(cr) == 0);
+    } else {
+        assert(on_disk == (uint64_t)n);
+        assert(fread(back, 1, n, fp) == n);
+    }
+    assert(memcmp(back, data, n) == 0);
+
+    fclose(fp);
+    unlink(staged_path);
+    free(data); free(back);
+    printf("  payload region round-trips (codec=%s): ok\n",
+           codec == DS4_KVSTORE_CODEC_LZ4 ? "lz4" : "none");
+}
+
 /* Mutated and wholly random regions must fail or return wrong bytes, never
  * crash, read out of bounds or spin.  Deterministic seed so a failure repeats. */
 static void test_fuzz_regions(void) {
@@ -245,12 +295,14 @@ static void test_fuzz_regions(void) {
     assert(fread(blob, 1, (size_t)base_payload, base) == base_payload);
     fclose(base);
 
+    int silent_wrong = 0;
     for (int iter = 0; iter < 3000; iter++) {
         FILE *fp = tmpfile();
         assert(fp);
         uint64_t payload;
         if (iter % 3 == 0) {                       /* wholly random region */
-            payload = 16 + (rng_byte() | ((uint64_t)rng_byte() << 8)) % 4096;
+            const uint8_t plo = rng_byte(), phi = rng_byte();
+            payload = 16 + ((uint64_t)plo | ((uint64_t)phi << 8)) % 4096;
             for (uint64_t i = 0; i < payload; i++) {
                 uint8_t b = rng_byte();
                 assert(fwrite(&b, 1, 1, fp) == 1);
@@ -261,7 +313,8 @@ static void test_fuzz_regions(void) {
             memcpy(m, blob, (size_t)base_payload);
             int flips = 1 + rng_byte() % 8;
             for (int f = 0; f < flips; f++) {
-                uint64_t off = ((uint64_t)rng_byte() << 8 | rng_byte()) % base_payload;
+                const uint8_t hi = rng_byte(), lo = rng_byte();
+                uint64_t off = ((uint64_t)hi << 8 | lo) % base_payload;
                 m[off] ^= (uint8_t)(1u << (rng_byte() & 7));
             }
             payload = base_payload;
@@ -277,7 +330,13 @@ static void test_fuzz_regions(void) {
              * itself allocate without bound. */
             if (total <= 64u * 1024u * 1024u) {
                 size_t want = total < n ? (size_t)total : n;
-                (void)fread(out, 1, want, cr);
+                size_t got = fread(out, 1, want, cr);
+                /* The format carries no payload checksum, so a mutated
+                 * chunk can decode to full-length wrong bytes.  Count it:
+                 * memory safety is the assertion, this number is evidence
+                 * for the missing integrity check. */
+                if (got == want && want == n && memcmp(out, data, n) != 0)
+                    silent_wrong++;
             }
             fclose(cr);
         }
@@ -285,17 +344,46 @@ static void test_fuzz_regions(void) {
     }
     free(blob); free(data); free(out);
     printf("  3000 mutated and random regions handled without crash or hang: ok\n");
+    printf("    (%d decoded to full-length wrong bytes: the payload has no checksum)\n",
+           silent_wrong);
+}
+
+/* Without cookie streams the codec cannot wrap the payload FILE, so it must
+ * disable itself rather than fail every save. */
+static void test_unavailable_codec_degrades(void) {
+    assert(kv_cache_default_compression_threads() == 0);
+    FILE *fp = tmpfile();
+    assert(fp);
+    assert(kv_lz4_writer_open(fp, 1u << 16, 4) == NULL);
+    /* Well-formed framing for a one-chunk stream, so the reader cannot be
+     * rejecting it for a short read; only the missing wrapper explains NULL. */
+    const uint32_t chunk = 1u << 16;
+    uint8_t framing[12] = {0};
+    framing[0] = 1;                      /* chunk_count = 1 */
+    framing[4] = 16;                     /* uncompressed_total = 16 */
+    assert(fwrite(framing, 1, sizeof(framing), fp) == sizeof(framing));
+    assert(fseek(fp, 0, SEEK_SET) == 0);
+    uint64_t total = 0;
+    assert(kv_lz4_reader_open(fp, sizeof(framing), chunk, 4, &total) == NULL);
+    fclose(fp);
+    printf("  codec disables itself where cookie streams are missing: ok\n");
 }
 
 int main(void) {
     rng_seed(0x9E3779B97F4A7C15ull);
     test_shuffle();
-    test_roundtrip();
-    test_incompressible_is_not_larger_than_bound();
-    test_reader_rejects_empty_region();
-    test_reader_rejects_bad_chunk_size();
-    test_truncated_and_corrupt();
-    test_fuzz_regions();
-    printf("Disk KV lz4 codec: PASS\n");
+    if (KV_LZ4_HAVE_FWRAP) {
+        test_roundtrip();
+        test_incompressible_is_not_larger_than_bound();
+        test_reader_rejects_empty_region();
+        test_reader_rejects_bad_chunk_size();
+        test_truncated_and_corrupt();
+        test_fuzz_regions();
+    } else {
+        test_unavailable_codec_degrades();
+    }
+    test_write_payload_region();
+    printf("Disk KV lz4 codec%s: PASS\n",
+           KV_LZ4_HAVE_FWRAP ? "" : ", no cookie streams");
     return 0;
 }

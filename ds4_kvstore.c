@@ -4,6 +4,16 @@
 
 #include <string.h>
 
+/* Cookie streams are how the codec intercepts payload writes; without them
+ * the payload is stored raw. */
+#ifndef KV_LZ4_HAVE_FWRAP
+#  if defined(__APPLE__) || defined(__GLIBC__)
+#    define KV_LZ4_HAVE_FWRAP 1
+#  else
+#    define KV_LZ4_HAVE_FWRAP 0
+#  endif
+#endif
+
 /* Byte-4 transpose for the LZ4 codec: see misc/COMPRESSED_KV_CACHE.md.
  * Tail bytes (n % 4) pass through unmodified. */
 #if defined(__aarch64__) || defined(__arm64__)
@@ -306,6 +316,7 @@ static uint64_t kv_le_get64(const uint8_t *p);
 
 /* Cap at 8 so a save cannot starve inference cores.  CLI overrides env. */
 static int kv_cache_default_compression_threads(void) {
+    if (!KV_LZ4_HAVE_FWRAP) return 0;
     const char *env = getenv("DS4_KV_CACHE_COMPRESSION_THREADS");
     if (env && env[0]) {
         char *end = NULL;
@@ -323,7 +334,8 @@ static int kv_cache_default_compression_threads(void) {
 
 /* fopencookie / funopen wrapper.  Caller owns the outer FILE; closing the
  * wrapper does not close it.  No seek callback because we never seek the
- * wrapper. */
+ * wrapper.  Without cookie streams there is no way to intercept the payload
+ * writes, so the codec is unavailable and the payload is stored raw. */
 #if defined(__APPLE__)
 typedef int    kv_lz4_io_ssize_t;
 typedef int    kv_lz4_io_size_t;
@@ -342,7 +354,10 @@ static FILE *kv_lz4_fwrap_open(void *cookie, const char *mode,
                                kv_lz4_close_fn closefn)
 {
     (void)mode;
-#if defined(__APPLE__)
+#if !KV_LZ4_HAVE_FWRAP
+    (void)cookie; (void)writefn; (void)readfn; (void)closefn;
+    return NULL;
+#elif defined(__APPLE__)
     return funopen(cookie, readfn, writefn, NULL, closefn);
 #elif defined(__GLIBC__)
     cookie_io_functions_t io = (cookie_io_functions_t){
@@ -847,7 +862,10 @@ bool ds4_kvstore_write_payload_region(FILE *fp,
     } else {
         FILE *cw = kv_lz4_writer_open(fp, chunk_bytes, n_workers);
         if (!cw) {
-            ok = false;
+            /* No cookie streams, or no memory for the codec scratch.  Storing
+             * the payload uncompressed keeps the checkpoint usable; codec
+             * stays NONE so every reader handles it. */
+            ok = ds4_session_write_staged_payload(staged, fp, save_err, save_err_len) == 0;
         } else {
             ok = ds4_session_write_staged_payload(staged, cw, save_err, save_err_len) == 0;
             /* fclose on the cookie patches the framing header in fp and does
@@ -859,6 +877,9 @@ bool ds4_kvstore_write_payload_region(FILE *fp,
     const off_t payload_end = ftello(fp);
     if (ok && payload_end < 0) ok = false;
     if (ok) on_disk = (uint64_t)(payload_end - payload_start);
+    /* No bytes means no framing was emitted, so the region is only readable
+     * as a raw (empty) payload. */
+    if (on_disk == 0) codec = DS4_KVSTORE_CODEC_NONE;
     *codec_out = codec;
     *chunk_log2_out = (codec == DS4_KVSTORE_CODEC_LZ4) ? kv_chunk_log2(chunk_bytes) : 0;
     *on_disk_out = on_disk;
@@ -881,6 +902,8 @@ int ds4_kvstore_load_payload_region(ds4_session *session, FILE *fp,
                                       &uncompressed_total);
         if (!cr) {
             snprintf(load_err, load_err_len, "failed to open lz4 reader");
+            if (payload_start >= 0)
+                (void)fseeko(fp, payload_start + (off_t)payload_bytes, SEEK_SET);
             return 1;
         }
         rc = ds4_session_load_payload(session, cr, uncompressed_total,
@@ -1400,7 +1423,7 @@ bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
             kc->opt.boundary_trim_tokens,
             kc->opt.boundary_align_tokens,
             (unsigned long long)DS4_KVSTORE_HIT_HALF_LIFE_SECONDS,
-            kc->opt.compression_threads > 0 ? "lz4" : "none",
+            (KV_LZ4_HAVE_FWRAP && kc->opt.compression_threads > 0) ? "lz4" : "none",
             kc->opt.compression_threads,
             (unsigned int)(DS4_KVSTORE_DEFAULT_CHUNK_BYTES / 1024u));
     return true;

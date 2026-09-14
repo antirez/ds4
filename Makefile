@@ -762,6 +762,16 @@ tests/test_kv_lz4: tests/test_kv_lz4.o rax.o lz4.o lz4hc.o $(CPU_CORE_OBJS)
 test-kv-lz4: tests/test_kv_lz4
 	./tests/test_kv_lz4
 
+tests/test_kv_lz4_nofwrap.o: tests/test_kv_lz4.c ds4_kvstore.c ds4_kvstore.h lz4.h lz4hc.h
+	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_NO_GPU -DKV_LZ4_HAVE_FWRAP=0 -I. -c -o $@ $<
+
+tests/test_kv_lz4_nofwrap: tests/test_kv_lz4_nofwrap.o rax.o lz4.o lz4hc.o $(CPU_CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+.PHONY: test-kv-lz4-nofwrap
+test-kv-lz4-nofwrap: tests/test_kv_lz4_nofwrap
+	./tests/test_kv_lz4_nofwrap
+
 tests/test_tp_commands.o: tests/test_tp_commands.c ds4_tp.c ds4_tp.h ds4.h ds4_gpu_tp.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
@@ -878,6 +888,7 @@ test-frontends: ds4_test ds4_agent_test
 	./ds4_agent_test
 
 test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test test-session-state test-linux-memory test-engram \
+	test-kv-lz4 test-kv-lz4-nofwrap \
 	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
 	tests/test_deepseek4_vision_image tests/test_prompt_prefix $(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
 	./ds4-eval --validate-cases
@@ -965,7 +976,7 @@ clean:
 	rm -f tests/test_glm_attention tests/test_glm_attention_rocm
 	rm -f tests/test_ssd_cache tests/test_engram
 	rm -f tests/test_session_state tests/test_session_state_gpu tests/test_tp_commands
-	rm -f tests/test_kv_lz4
+	rm -f tests/test_kv_lz4 tests/test_kv_lz4_nofwrap
 	rm -f tests/test_tp_rdma tests/test_tp_link tests/test_tp_tcp
 	rm -f tests/test_metal_tp_spec
 	rm -f tests/test_metal_tp_cancel
