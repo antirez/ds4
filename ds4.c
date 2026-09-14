@@ -55652,6 +55652,13 @@ static bool glm_graph_forward_token(
     const uint32_t indexer_top_k = glm_graph_indexer_top_k_limit();
     ds4_gpu_tensor *last_indexer_selected = NULL;
     uint32_t last_indexer_selected_count = 0;
+    /* Number of leading selected slots that are known to index live cache rows.
+     * 0 means "all of them are" -- the producers that fill a contiguous range or
+     * a plain top-k.  The GLM-5.3 pooled expansion instead guarantees only
+     * [0, indexer_top_k) and pads the causal-tail slots above it with
+     * 0xffffffff, so it must never be handed to a kernel level that assumes
+     * every row is valid. */
+    uint32_t last_indexer_guaranteed_prefix = 0;
 #define DS4_GLM_PROFILE_DECODE_STAGE(part_, name_) do { \
         if (ok && decode_stage_profile) { \
             ok = metal_graph_layer_stage_profile_boundary((part_), (name_), il, pos, 1, &decode_stage_t0); \
@@ -55981,12 +55988,14 @@ static bool glm_graph_forward_token(
                     }
                     DS4_GLM_PROFILE_DECODE_STAGE("glm_decode_attn", "indexer_fill");
                     last_indexer_selected_count = visible;
+                    last_indexer_guaranteed_prefix = 0;   /* contiguous range */
                 } else if (ok && (decode_ablate & DS4_GLM_ABLATE_INDEXER)) {
                     /* Ablation: valid selected ids without the score/topk
                      * chain, so downstream attention timing stays real. */
                     ok = ds4_gpu_glm_fill_selected_range_tensor(g->indexer_selected,
                                                                 indexer_top_k) != 0;
                     last_indexer_selected_count = indexer_top_k;
+                    last_indexer_guaranteed_prefix = 0;   /* contiguous range */
                 } else if (ok) {
                     ok = g->glm53 ?
                         glm53_graph_matmul(
@@ -56093,6 +56102,8 @@ static bool glm_graph_forward_token(
                     DS4_GLM_PROFILE_DECODE_STAGE("glm_decode_attn", "indexer_topk");
                     last_indexer_selected_count = g->glm53 ?
                         glm53_graph_indexer_selected_limit() : indexer_top_k;
+                    /* the pooled expansion pads slots >= indexer_top_k */
+                    last_indexer_guaranteed_prefix = g->glm53 ? indexer_top_k : 0;
                 }
                 if (ok) last_indexer_selected = g->indexer_selected;
             } else if (ok && (!last_indexer_selected || last_indexer_selected_count == 0)) {
@@ -56163,7 +56174,7 @@ static bool glm_graph_forward_token(
                                                                                     l->attn_v_b->type,
                                                                                     last_indexer_selected,
                                                                                     last_indexer_selected_count,
-                                                                                    true,
+                                                                                    last_indexer_guaranteed_prefix == 0u,
                                                                                     g->compact_cache_cap,
                                                                                     glm_graph_compact_cache_is_f16(),
                                                                                     tp_split_layer_heads ? tp_head_count : DS4_N_HEAD,
