@@ -3691,6 +3691,150 @@ extern "C" int ds4_gpu_glm_indexer_scores_batch_tensor(
     return cuda_ok(cudaGetLastError(), "glm indexer scores batch launch");
 }
 
+static void *g_glm_idxs_scratch = NULL;
+static uint64_t g_glm_idxs_scratch_bytes = 0;
+
+static void *glm_rocm_idxs_scratch(uint64_t bytes) {
+    if (g_glm_idxs_scratch_bytes >= bytes) return g_glm_idxs_scratch;
+    if (g_glm_idxs_scratch) {
+        (void)cudaDeviceSynchronize();
+        (void)cudaFree(g_glm_idxs_scratch);
+        g_glm_idxs_scratch = NULL;
+        g_glm_idxs_scratch_bytes = 0;
+    }
+    void *ptr = NULL;
+    if (cudaMalloc(&ptr, (size_t)bytes) != cudaSuccess) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "indexer GEMM scratch alloc failed (%.1f MiB)\n",
+                (double)bytes / 1048576.0);
+        (void)cudaGetLastError();
+        return NULL;
+    }
+    g_glm_idxs_scratch = ptr;
+    g_glm_idxs_scratch_bytes = bytes;
+    return ptr;
+}
+
+/* q [n_tokens][n_head][head_dim] f32 -> head-major qh [n_head][n_tokens][head_dim];
+ * keys f16/f32 [n_rows][head_dim] -> kf f32 (the GEMM A operand). */
+__global__ static void glm_indexer_gemm_prep_kernel(
+        float *qh,
+        float *kf,
+        const float *q,
+        const char *keys,
+        uint32_t n_tokens,
+        uint32_t n_rows,
+        uint32_t n_head,
+        uint32_t head_dim,
+        bool cache_f16) {
+    const uint64_t n_q = (uint64_t)n_tokens * n_head * head_dim;
+    const uint64_t n_k = kf ? (uint64_t)n_rows * head_dim : 0u;
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n_q) {
+        const uint32_t d = (uint32_t)(i % head_dim);
+        const uint64_t th = i / head_dim;
+        const uint32_t h = (uint32_t)(th % n_head);
+        const uint32_t t = (uint32_t)(th / n_head);
+        qh[((uint64_t)h * n_tokens + t) * head_dim + d] = q[i];
+    } else if (i - n_q < n_k) {
+        const uint64_t j = i - n_q;
+        kf[j] = glm_rocm_cache_load(keys, j, cache_f16);
+    }
+}
+
+/* scores[t0 + tt][r] = sum_h w[t][h] * relu(scale * S[h][tt][r]), or -inf for
+ * pooled rows past the query's causal limit (as the block kernel). */
+__global__ static void glm_indexer_gemm_reduce_kernel(
+        float *scores,
+        const float *S,
+        const float *weights,
+        uint32_t n_rows,
+        uint32_t n_tokens,
+        uint32_t t0,
+        uint32_t tile,
+        uint32_t pos0,
+        uint32_t pool_size,
+        uint32_t n_head,
+        float scale) {
+    const uint32_t r = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t tt = blockIdx.y;
+    if (r >= n_rows || tt >= tile) return;
+    const uint32_t t = t0 + tt;
+    float *dst = scores + (uint64_t)t * n_rows + r;
+    if (r >= (pos0 + t + 1u) / pool_size) {
+        *dst = -INFINITY;
+        return;
+    }
+    const float *w = weights + (uint64_t)t * n_head;
+    const uint64_t head_stride = (uint64_t)tile * n_rows;
+    const float *sp = S + (uint64_t)tt * n_rows + r;
+    float acc = 0.0f;
+    for (uint32_t h = 0; h < n_head; h++) {
+        acc += fmaxf(sp[(uint64_t)h * head_stride] * scale, 0.0f) * w[h];
+    }
+    *dst = acc;
+}
+
+static int glm53_indexer_scores_gemm(
+        float *scores,
+        const float *q,
+        const float *weights,
+        const char *keys,
+        uint32_t n_rows,
+        uint32_t n_tokens,
+        uint32_t pos0,
+        uint32_t pool_size,
+        uint32_t n_head,
+        uint32_t head_dim,
+        float scale,
+        bool cache_f16) {
+    static int enabled = -1;
+    if (enabled < 0) enabled = ds4_rocm_gfx1151_flag("DS4_ROCM_GLM_INDEXER_GEMM") ? 1 : 0;
+    if (!enabled || !g_cublas_ready || head_dim != 128u || n_head == 0u || n_head > 64u ||
+        n_rows < 128u || n_tokens == 0u) {
+        return 0;
+    }
+    /* Score tiles of `tile` queries: S [n_head][tile][n_rows] f32, ~192 MiB. */
+    const uint64_t per_query = (uint64_t)n_head * n_rows * sizeof(float);
+    uint32_t tile = (uint32_t)((192ull << 20) / per_query);
+    if (tile == 0u) return 0;
+    if (tile > n_tokens) tile = n_tokens;
+    const uint64_t qh_bytes = (uint64_t)n_head * n_tokens * head_dim * sizeof(float);
+    const uint64_t kf_bytes = cache_f16 ? (uint64_t)n_rows * head_dim * sizeof(float) : 0u;
+    const uint64_t s_bytes = per_query * tile;
+    char *scr = (char *)glm_rocm_idxs_scratch(qh_bytes + kf_bytes + s_bytes);
+    if (!scr) return 0;
+    float *qh = (float *)scr;
+    float *kf = cache_f16 ? (float *)(scr + qh_bytes) : NULL;
+    float *S = (float *)(scr + qh_bytes + kf_bytes);
+    const float *kmat = cache_f16 ? kf : (const float *)keys;
+    const uint64_t n_prep = (uint64_t)n_tokens * n_head * head_dim +
+                            (cache_f16 ? (uint64_t)n_rows * head_dim : 0u);
+    glm_indexer_gemm_prep_kernel<<<(unsigned)((n_prep + 255u) / 256u), 256>>>(
+            qh, kf, q, keys, n_tokens, n_rows, n_head, head_dim, cache_f16);
+    if (!cuda_ok(cudaGetLastError(), "glm indexer gemm prep launch")) return 0;
+    const float one = 1.0f, zero = 0.0f;
+    for (uint32_t t0 = 0; t0 < n_tokens; t0 += tile) {
+        const uint32_t cur = n_tokens - t0 < tile ? n_tokens - t0 : tile;
+        /* Column-major view: C_h (n_rows x cur) = K^T (n_rows x 128) . Qh_h[t0..] (128 x cur). */
+        const cublasStatus_t st = cublasGemmStridedBatchedEx(
+                g_cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                (int)n_rows, (int)cur, (int)head_dim,
+                &one,
+                kmat, CUDA_R_32F, (int)head_dim, 0ll,
+                qh + (uint64_t)t0 * head_dim, CUDA_R_32F, (int)head_dim,
+                (long long)n_tokens * head_dim,
+                &zero,
+                S, CUDA_R_32F, (int)n_rows, (long long)cur * n_rows,
+                (int)n_head, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+        if (!cublas_ok(st, "glm indexer scores gemm")) return 0;
+        const dim3 rgrid((n_rows + 255u) / 256u, cur, 1);
+        glm_indexer_gemm_reduce_kernel<<<rgrid, 256>>>(
+                scores, S, weights, n_rows, n_tokens, t0, cur, pos0, pool_size, n_head, scale);
+        if (!cuda_ok(cudaGetLastError(), "glm indexer gemm reduce launch")) return 0;
+    }
+    return 1;
+}
+
 extern "C" int ds4_gpu_glm53_indexer_scores_batch_tensor(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,
@@ -3716,6 +3860,36 @@ extern "C" int ds4_gpu_glm53_indexer_scores_batch_tensor(
         !cuda_tensor_has_elems2(weights, n_tokens, n_head, sizeof(float)) ||
         !glm_rocm_tensor_has_cache2(indexer_key_cache, n_rows, head_dim, elem)) {
         return 0;
+    }
+    static int check_mode = -1;
+    if (check_mode < 0) check_mode = getenv("DS4_ROCM_GLM_INDEXER_GEMM_CHECK") != NULL;
+    float *check_ref = NULL;
+    if (check_mode) {
+        check_ref = (float *)glm_rocm_dsa_check_scratch((uint64_t)n_tokens * n_rows * sizeof(float));
+    }
+    if (glm53_indexer_scores_gemm((float *)scores->ptr, (const float *)q->ptr,
+                                  (const float *)weights->ptr,
+                                  (const char *)indexer_key_cache->ptr,
+                                  n_rows, n_tokens, pos0, pool_size, n_head, head_dim,
+                                  scale, cache_f16)) {
+        static int logged = 0;
+        if (!logged) {
+            logged = 1;
+            fprintf(stderr, DS4_GPU_LOG_PREFIX "GLM-5.3 indexer scores through batched "
+                    "f32 GEMMs (tokens=%u rows=%u heads=%u)\n", n_tokens, n_rows, n_head);
+        }
+        if (!check_ref) return 1;
+        const dim3 grid(n_rows, n_tokens, 1u);
+        glm_indexer_scores_batch_kernel<<<grid, 256u>>>(
+            check_ref, (const float *)q->ptr, (const float *)weights->ptr,
+            (const char *)indexer_key_cache->ptr,
+            n_rows, n_tokens, pos0, pool_size, n_head, head_dim, scale, cache_f16);
+        if (!cuda_ok(cudaGetLastError(), "GLM-5.3 indexer scores check launch")) return 0;
+        static uint32_t calls = 0;
+        static double worst = 0.0;
+        glm_rocm_dsa_check_compare("indexer batch scores", check_ref, (const float *)scores->ptr,
+                                   (uint64_t)n_tokens * n_rows, &calls, &worst);
+        return 1;
     }
     const dim3 grid(n_rows, n_tokens, 1u);
     glm_indexer_scores_batch_kernel<<<grid, 256u>>>(
