@@ -6,7 +6,7 @@ There are two modes:
 
 | Mode | Split | Main use |
 | --- | --- | --- |
-| Tensor parallelism | Routed experts and per-layer work across two Macs | Resident inference with lower per-token work on each GPU |
+| Tensor parallelism | Routed experts and per-layer work across two Macs, or two Sparks for V4.1 Q2 | Resident inference with lower per-token work on each GPU |
 | Pipeline parallelism | Complete layer ranges across several machines | Fit larger models and overlap long prefills |
 
 These are separate from [tensor parallelism across CUDA cards](CUDA_MULTI_GPU.md).
@@ -96,6 +96,43 @@ speculative decoding.
 TP disk-cache restore currently rebuilds the exact saved token prefix on both
 ranks rather than restoring the coordinator alone. Expect prefill on restore.
 See [speculation](SPECULATIVE_DECODING.md) and [serving](SERVER.md).
+
+## Tensor parallelism between two Sparks
+
+V4.1 Flash Q2 text inference supports one GPU per rank, with a 50/50 expert
+split. Each Spark holds about 81 GiB of weights, plus context and runtime
+buffers. Engram tables stay on disk. Do not add `--ssd-streaming` or
+`--cuda-tensor-parallel`: those select different memory/execution modes.
+
+Build the same commit with `make cuda-spark` on both machines and download
+`ds41f-q2` on both. RDMA needs the libibverbs development headers at build time,
+its runtime library, and an active RoCEv2 link. Check `ibv_devinfo -v` and use
+the addresses of the directly connected ports, not the management network.
+
+For example, with the coordinator at `172.31.250.1` on the direct link:
+
+```sh
+# Worker.
+./ds4 --cuda -m gguf/DeepSeek-V4.1-Flash-Q2.gguf --ctx 32768 \
+  --tensor-parallel --role worker --coordinator 172.31.250.1 9911 \
+  --transport rdma
+
+# Coordinator.
+./ds4 --cuda -m gguf/DeepSeek-V4.1-Flash-Q2.gguf --ctx 32768 \
+  --tensor-parallel --role coordinator --listen 172.31.250.1 9911 \
+  --transport rdma
+```
+
+The link address selects the matching verbs device and GID. If selection is
+ambiguous, use `--rdma-device` and `--rdma-gid-index`. The transport stages
+CUDA results through host memory; this is RoCE, not GPUDirect. TCP is also
+available with `--transport tcp` on both peers.
+
+The coordinator can be `ds4-agent`, `ds4-server` or `ds4-bench`. Match context
+sizes on both sides. With five or more ready sessions, the server batches decode
+across both GPUs. Smaller groups run in order, which is faster at those sizes.
+Use `--batched-session 8` on the server; allow memory for all eight contexts.
+Vision, DSpark and other model/quant layouts are not supported by CUDA network TP.
 
 ## Pipeline parallelism
 

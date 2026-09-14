@@ -45,9 +45,11 @@ endif
 CFLAGS ?= -O3 -Wall -Wextra -std=c11 $(NATIVE_CPU_FLAG)
 CPPFLAGS ?= -D_GNU_SOURCE
 
-.PHONY: all clean quality-score quality-llama-score
+.PHONY: all clean quants-shared quality-score quality-llama-score
 
 all: deepseek4-quantize $(QUANTS_SHARED)
+
+quants-shared: $(QUANTS_SHARED)
 
 deepseek4-quantize: deepseek4-quantize.c quants.c quants.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ deepseek4-quantize.c quants.c -lm -pthread

@@ -2,7 +2,7 @@
 
 [README](../README.md) | [Getting started](../README.md#start-here)
 
-This is the single-GPU GB10 path. Use the NVIDIA driver and CUDA development
+Use the NVIDIA driver and CUDA development
 toolkit for the machine; the build needs `nvcc` and cuBLAS.
 Check that `nvidia-smi` sees the GPU before building.
 
@@ -19,6 +19,47 @@ Do not use `--cuda-tensor-parallel` on a single Spark.
 Stop other inference services before loading a model so they do not compete
 for memory. Restore any services you stopped when finished.
 
+## DeepSeek V4.1 Flash
+
+Q2 needs SSD streaming on one 128 GB Spark:
+
+```sh
+./download_model.sh ds41f-q2
+./ds4 --cuda -m gguf/DeepSeek-V4.1-Flash-Q2.gguf \
+  --ssd-streaming --ctx 32768
+```
+
+The file is 341 GiB, including 189 GiB of disk-only Engram tables. Keep it on
+a fast local SSD. The expert cache is sized automatically; leave memory for
+other programs and the context. Use the same options with `ds4-agent` or
+`ds4-server`.
+
+Two Sparks can instead keep half the experts each, using
+[network tensor parallelism](DISTRIBUTED.md#tensor-parallelism-between-two-sparks).
+Both need the complete GGUF on their local SSD. V4.1 CUDA vision and DSpark
+are not supported. The [model guide](MODELS.md#deepseek-v41-flash) covers
+thinking levels and the separate Metal configurations.
+
+September 13-14, 2026, Q2 SSD with automatic cache sizing: a 3,241-token
+`/read README.md` prefill reached 93-96 t/s, up from 49-54 t/s, with 32K
+allocated context. No extra flag is needed. A separate 64 GiB cache-budget
+run with 64K allocated context reached 384 t/s for a 32K initial prefill and
+88 t/s for a 3.2K append. These are SSD-streamed V4.1 results, not resident
+V4 Flash numbers; speed depends on prompt length and the expert cache.
+The automatic-cache 256-token reply test decoded about 5% slower, but
+prefill plus the reply fell from about 87 to 59 seconds.
+See the [QA record](../QA_BEFORE_RELEASES.md#cuda-ssd-streaming) for conditions
+and longer-context measurements.
+
+On two Sparks over RoCE, September 13 measurements averaged **21.9 t/s** for
+one session: Q2, a 1K prompt, 64K allocated context and 2,048 teacher-forced
+decode tokens. This does not use speculative decoding. Separately, eight
+ready sessions reached about **28 aggregate t/s**, not 28 t/s per client. Decode batching
+starts at five ready sessions; smaller groups run in order. Separate long
+runs measured about 400 t/s for a 32K prefill and 290 t/s for an 8K append. The
+[network TP QA record](../QA_BEFORE_RELEASES.md#cuda-network-tensor-parallelism)
+has the timing controls and memory limits.
+
 ## GLM 5.3 Flash
 
 Q2 is the resident target for one Spark:
@@ -28,8 +69,8 @@ Q2 is the resident target for one Spark:
 ./ds4 --cuda -m gguf/GLM-5.3-Flash-Q2.gguf --ctx 16384
 ```
 
-Q4 does not fit resident. Spark-to-Spark RDMA tensor parallelism is not
-implemented; the two-Mac RDMA instructions do not apply here.
+Q4 does not fit resident. GLM Spark-to-Spark tensor parallelism is not
+implemented; the two-Mac RDMA instructions do not apply to GLM on CUDA.
 
 ## Vision and speculative decoding
 
@@ -81,6 +122,8 @@ implementation, continued-context checks and quality comparisons.
 CUDA also has [SSD streaming](SSD_STREAMING.md) paths for larger weights.
 Memory fit and speed depend on the model layout; start with Q2 for normal use.
 
-Single-GPU session serving currently uses ordered decode rather than the
-native grouped decode used by the supported multi-GPU Flash configurations.
+V4.1 Q2 SSD serving batches up to eight decode rows together. An eight-session
+test reached 11.0 aggregate t/s versus 8.4 with ordered execution; this is
+total throughput, not speed per client. Other single-Spark model paths retain
+their existing scheduling.
 See [serving](SERVER.md) and the recorded [benchmarks](PERFORMANCE.md).

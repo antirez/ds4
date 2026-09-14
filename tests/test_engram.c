@@ -176,6 +176,7 @@ static void test_rows(void) {
     bad = 0;
     assert(!ds4_engram_read(&t, &bad, 1, out) && errno == EDOM);
     assert(!ds4_engram_read_batch(&t, batch_ids, 1, STRIDE, batch) && errno == EDOM);
+    assert(!ds4_engram_read_batch(&t, batch_ids, 31, STRIDE, batch) && errno == EDOM);
     assert(pwrite(fd, raw, sizeof(raw), offset) == sizeof(raw));
     nan = 255;
     assert(pwrite(fd, &nan, 1, offset + 256) == 1);
@@ -184,6 +185,7 @@ static void test_rows(void) {
     assert(ftruncate(fd, offset + 260) == 0);
     assert(!ds4_engram_read(&t, &bad, 1, out) && errno == EIO);
     assert(!ds4_engram_read_batch(&t, batch_ids, 1, STRIDE, batch) && errno == EIO);
+    assert(!ds4_engram_read_batch(&t, batch_ids, 31, STRIDE, batch) && errno == EIO);
     free(batch_ids);
     free(batch);
     ds4_engram_table_close(&t);

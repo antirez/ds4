@@ -341,12 +341,16 @@ __global__ static void repack_iq2_xxs_aligned_kernel(
         __half *dq,
         uint2 *qs,
         const unsigned char *raw,
-        uint64_t nblk) {
+        uint64_t nblk,
+        const int32_t *slots = nullptr,
+        uint64_t expert_blocks = 0) {
     const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= nblk * 8ull) return;
     const uint64_t blk = i >> 3;
     const uint32_t p = (uint32_t)(i & 7u);
-    const unsigned char *src = raw + blk * 66ull;
+    const uint64_t source = slots ?
+        (uint64_t)slots[blk / expert_blocks] * expert_blocks + blk % expert_blocks : blk;
+    const unsigned char *src = raw + source * 66ull;
     if (p == 0u) {
         uint16_t h;
         memcpy(&h, src, 2u);
@@ -377,7 +381,8 @@ __global__ static void repack_q2_k_aligned_kernel(
         uint64_t g0,            // absolute raw-block index of raw[0]
         uint64_t cblk,          // raw blocks in this chunk
         uint32_t nb_row,        // blocks per row = K/256
-        uint32_t nrows) {       // rows per expert = M
+        uint32_t nrows,         // rows per expert = M
+        const int32_t *slots = nullptr) {
     const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= cblk * 16ull) return;
     const uint64_t j = i >> 4;
@@ -388,7 +393,10 @@ __global__ static void repack_q2_k_aligned_kernel(
     const uint64_t e = g / ((uint64_t)nb_row * nrows);
     const uint64_t pblk = ((uint64_t)e * (nrows/2u) + r/2u) * nb_row + b;
     const uint32_t parity = r & 1u;
-    const unsigned char *src = raw + j * 84ull;
+    const uint64_t expert_blocks = (uint64_t)nb_row * nrows;
+    const uint64_t source = slots ?
+        (uint64_t)slots[j / expert_blocks] * expert_blocks + j % expert_blocks : j;
+    const unsigned char *src = raw + source * 84ull;
     uint32_t w;
     memcpy(&w, src + 16u + (uint64_t)p * 4u, 4u);
     qs2[pblk * 32ull + (uint64_t)p * 2ull + parity] = w;
@@ -401,6 +409,31 @@ __global__ static void repack_q2_k_aligned_kernel(
         memcpy(&w, src + 80u, 4u);
         dm2[pblk * 2ull + parity] = w;
     }
+}
+
+bool ds4_repack_selected_experts(void *dst, const void *raw, const int32_t *slots,
+                                 uint32_t kind, uint32_t rows, uint32_t cols,
+                                 uint32_t count) {
+    if (!dst || !raw || !slots || !rows || !cols || !count || cols % 256u) return false;
+    const uint64_t expert_blocks = (uint64_t)rows * (cols / 256u);
+    if (expert_blocks > UINT64_MAX / count) return false;
+    const uint64_t blocks = expert_blocks * count;
+    if (blocks > (uint64_t)INT_MAX * 16u) return false;
+    if (kind == DS4_REPACK_IQ2_XXS_ALIGNED_MOE) {
+        const uint64_t scales = (blocks * 2u + 63u) & ~UINT64_C(63);
+        repack_iq2_xxs_aligned_kernel<<<(unsigned)((blocks * 8u + 255u) / 256u), 256>>>(
+            (__half *)dst, (uint2 *)((char *)dst + scales),
+            (const unsigned char *)raw, blocks, slots, expert_blocks);
+    } else if (kind == DS4_REPACK_Q2_K_ALIGNED_MOE && rows % 2u == 0u) {
+        const uint64_t pairs = blocks / 2u;
+        const uint64_t dm_bytes = (pairs * 8u + 63u) & ~UINT64_C(63);
+        const uint64_t sc_bytes = (pairs * 32u + 63u) & ~UINT64_C(63);
+        repack_q2_k_aligned_kernel<<<(unsigned)((blocks * 16u + 255u) / 256u), 256>>>(
+            (uint32_t *)dst, (uint32_t *)((char *)dst + dm_bytes),
+            (uint32_t *)((char *)dst + dm_bytes + sc_bytes),
+            (const unsigned char *)raw, 0, blocks, cols / 256u, rows, slots);
+    } else return false;
+    return cudaGetLastError() == cudaSuccess;
 }
 
 /* One thread per (block, 16B half of the 32B code payload); p==0 additionally

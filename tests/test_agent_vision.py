@@ -18,7 +18,7 @@ def check_output(out, archive_words):
     image_reads = re.findall(r"\[tool:view_image\] ([^\n]+)", output)
     assert [Path(p.strip()).name for p in image_reads] == ["text.png", "spatial.png"], \
         "agent did not inspect both images separately and in order"
-    assert re.search(r"\bedit\s+path=ticket\.py\b", output), "agent did not exercise the edit tool"
+    assert re.search(r"\bedit\s+path=\s*ticket\.py\b", output), "agent did not exercise the edit tool"
     oracle = (
         "import ticket; "
         "assert ticket.ticket() == {'train': 482, 'gate': 'C7', 'access': 'MINT-731'}; "

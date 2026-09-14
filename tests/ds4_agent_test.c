@@ -615,7 +615,7 @@ static void test_unicode_output_and_footer(void) {
     char queued[181];
     for (int i = 0; i < 60; i++) memcpy(queued + i * 3, "\xe4\xb8\xad", 3);
     queued[180] = 0;
-    agent_prompt_queue_push(&q, xstrdup(queued));
+    agent_prompt_queue_push(&q, queued);
     agent_status st = {0};
     char footer[4096];
     build_footer_text(&st, &q, 40, footer, sizeof(footer));
@@ -675,15 +675,16 @@ static void test_footer_only_updates(void) {
 }
 
 static void test_tool_contracts(void) {
-    for (int glm = 0; glm < 2; glm++) {
+    for (int glm = 0; glm < 3; glm++) {
         for (int vision = 0; vision < 2; vision++) {
-            char *prompt = glm ? agent_build_glm_tools_prompt(false, vision) :
+            char *prompt = glm == 2 ? agent_build_qwen_tools_prompt(false, vision) :
+                           glm ? agent_build_glm_tools_prompt(false, vision) :
                                  agent_build_dsml_tools_prompt(false, vision);
             AGENT_TEST_ASSERT((strstr(prompt, "view_image") != NULL) == vision);
             AGENT_TEST_ASSERT(strstr(prompt, "POSIX extended") && strstr(prompt, "128 KiB"));
             AGENT_TEST_ASSERT(strstr(prompt, "&amp;lt;/"));
             char name[64];
-            snprintf(name, sizeof(name), "prompt-%s-%d.txt", glm ? "glm" : "dsml", vision);
+            snprintf(name, sizeof(name), "prompt-%s-%d.txt", glm == 2 ? "qwen" : glm ? "glm" : "dsml", vision);
             test_fixture(name, prompt, strlen(prompt));
             free(prompt);
         }
@@ -857,6 +858,27 @@ static int test_v41_thinking(const char *model) {
     return agent_test_failures ? 1 : 0;
 }
 
+static void test_qwen_tool_syntax(void) {
+    const char text[] =
+        "<think>Plan.</think>\n<tool_call>\n<function=list>\n"
+        "<parameter=path>\n.\n</parameter>\n</function>\n</tool_call>";
+    for (size_t split = 0; split < sizeof(text); split++) {
+        char *first = xstrndup(text, split);
+        const char *chunks[] = {first, text + split};
+        agent_dsml_parser p;
+        char *out = agent_test_stream_capture(AGENT_TOOL_SYNTAX_QWEN, chunks, 2, &p, NULL);
+        AGENT_TEST_ASSERT(p.state == AGENT_DSML_DONE && p.calls.len == 1);
+        if (p.calls.len == 1) AGENT_TEST_ASSERT(!strcmp(p.calls.v[0].name, "list"));
+        free(first);
+        free(out);
+        agent_dsml_parser_free(&p);
+    }
+    AGENT_TEST_ASSERT(agent_syntax_is_xml_tool_call(AGENT_TOOL_SYNTAX_QWEN));
+    AGENT_TEST_ASSERT(agent_syntax_is_xml_tool_call(AGENT_TOOL_SYNTAX_GLM));
+    AGENT_TEST_ASSERT(!agent_syntax_is_xml_tool_call(AGENT_TOOL_SYNTAX_DSML41));
+    AGENT_TEST_ASSERT(!agent_syntax_is_xml_tool_call(AGENT_TOOL_SYNTAX_DSML));
+}
+
 static void test_v41_tool_syntax(void) {
     const char text[] =
         "<think>Plan.</think>\n\n<｜DSML｜ calls>\n"
@@ -909,12 +931,95 @@ static void test_v41_tool_syntax(void) {
     }
 }
 
+/* Model-backed regression: save an unsynchronizable transcript, then rebuild
+ * it in a larger context using the normal stripped-session loader. */
+static int test_full_context_save(const char *model) {
+    ds4_engine_options opt = {.model_path = model, .backend = DS4_BACKEND_METAL,
+        .context_size = 512, .power_percent = 100};
+    agent_config cfg = {.gen = {.ctx_size = 256}, .non_interactive = true};
+    agent_worker w = {.cfg = &cfg, .initialized = true, .user_activity = true,
+        .wake_fd = {-1, -1}, .status = {.state = AGENT_WORKER_IDLE}};
+    pthread_mutex_init(&w.mu, NULL);
+    char dir[] = "/tmp/ds4-agent-full-save-XXXXXX";
+    AGENT_TEST_ASSERT(mkdtemp(dir) != NULL);
+    w.cache_dir = dir;
+    w.session_title = xstrdup("Full transcript recovery");
+    w.session_created_at = 123456;
+    AGENT_TEST_ASSERT(ds4_engine_open(&w.engine, &opt) == 0);
+    if (!w.engine) return 1;
+    ds4_tokens complete = {0};
+    ds4_chat_begin(w.engine, &complete);
+    for (int i = 0; i < 60; i++)
+        ds4_chat_append_message(w.engine, &complete, "user", "Explain the colors of a rainbow.");
+    AGENT_TEST_ASSERT(complete.len > 257);
+    for (int length = 256; length <= 257; length++) {
+        AGENT_TEST_ASSERT(ds4_session_create(&w.session, w.engine, 256) == 0);
+        if (!w.session) break;
+        ds4_tokens slice = complete;
+        slice.len = length;
+        ds4_tokens_copy(&w.transcript, &slice);
+        w.session_dirty = true;
+        char err[256] = {0}, sha[41];
+        int saved_tokens = 0;
+        AGENT_TEST_ASSERT(agent_worker_save_session_now(&w, sha, &saved_tokens, err, sizeof(err)));
+        AGENT_TEST_ASSERT(saved_tokens == length && !w.session_dirty);
+        AGENT_TEST_ASSERT(ds4_session_pos(w.session) == 0);
+        char *path = agent_kv_path_for_sha(dir, sha);
+        FILE *fp = fopen(path, "rb");
+        AGENT_TEST_ASSERT(fp != NULL);
+        if (!fp) { free(path); ds4_session_free(w.session); w.session = NULL; break; }
+        ds4_kvstore_entry hdr = {0};
+        uint32_t text_bytes = 0;
+        AGENT_TEST_ASSERT(ds4_kvstore_read_header(fp, &hdr, &text_bytes));
+        AGENT_TEST_ASSERT(hdr.payload_bytes == 0 && hdr.tokens == (uint32_t)length);
+        char *text = NULL, *title = NULL;
+        AGENT_TEST_ASSERT(agent_kv_read_text(fp, text_bytes, &text, err, sizeof(err)));
+        AGENT_TEST_ASSERT(agent_kv_read_title_trailer(fp, &hdr, &title, err, sizeof(err)));
+        AGENT_TEST_ASSERT(title && !strcmp(title, w.session_title));
+        fclose(fp);
+        size_t expected_len = 0;
+        char *expected = ds4_kvstore_render_tokens_text(w.engine, &w.transcript, &expected_len);
+        AGENT_TEST_ASSERT(text && expected && text_bytes == expected_len && !strcmp(text, expected));
+        free(expected); free(text); free(title);
+        ds4_session_free(w.session);
+        w.session = NULL;
+        AGENT_TEST_ASSERT(ds4_session_create(&w.session, w.engine, 512) == 0);
+        cfg.gen.ctx_size = 512;
+        ds4_tokens restored = {0};
+        agent_kv_session_meta meta = {0};
+        AGENT_TEST_ASSERT(agent_kv_load_path(&w, path, sha, NULL, 0, &restored, &meta, err, sizeof(err)));
+        AGENT_TEST_ASSERT(agent_tokens_equal(&w.transcript, &restored));
+        AGENT_TEST_ASSERT(meta.created_at == w.session_created_at && meta.title && !strcmp(meta.title, w.session_title));
+        ds4_token_score score;
+        AGENT_TEST_ASSERT(ds4_session_top_logprobs(w.session, &score, 1) == 1);
+        agent_kv_session_meta_free(&meta);
+        ds4_tokens_free(&restored);
+        ds4_tokens_free(&w.transcript);
+        ds4_session_free(w.session); w.session = NULL;
+        cfg.gen.ctx_size = 256;
+        unlink(path); free(path);
+    }
+    ds4_tokens_free(&complete);
+    ds4_engine_close(w.engine);
+    free(w.session_title);
+    pthread_mutex_destroy(&w.mu);
+    rmdir(dir);
+    return agent_test_failures ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
+    if (argc == 3 && !strcmp(argv[1], "--full-context-save")) return test_full_context_save(argv[2]);
     if (argc == 3 && !strcmp(argv[1], "--think-fixture")) return test_v41_thinking(argv[2]);
     if (argc == 2 && !strcmp(argv[1], "--terminal-driver")) return test_terminal_driver();
     if (argc == 3 && !strcmp(argv[1], "--terminal-fixtures")) test_output_dir = argv[2];
+    char *options[] = {"ds4-agent", "--model", "qwen.gguf",
+                    "--vision", "mmproj.gguf", "--non-interactive", "-p", "test"};
+    agent_config cfg = parse_options((int)(sizeof(options) / sizeof(options[0])), options);
+    AGENT_TEST_ASSERT(cfg.engine.vision_path && !strcmp(cfg.engine.vision_path, "mmproj.gguf"));
+    AGENT_TEST_ASSERT(cfg.engine.model_path && !strcmp(cfg.engine.model_path, "qwen.gguf"));
     ds4_agent_unit_tests_run();
     test_v41_tool_syntax();
+    test_qwen_tool_syntax();
     test_compaction_boundaries();
     test_observation_error_is_not_context_exhaustion();
     test_atomic_file_tools();

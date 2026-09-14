@@ -106,6 +106,13 @@ void ds4_repack_set_hash(bool on);
 
 uint64_t ds4_repack_fnv1a(const unsigned char *p, uint64_t n, uint64_t h);
 
+/* Gather raw cached experts into one aligned artifact on the default stream.
+ * slots is a device array of count valid source expert indices. The caller
+ * sizes dst using the matching ds4_mmq_*_aligned_bytes layout contract. */
+bool ds4_repack_selected_experts(void *dst, const void *raw, const int32_t *slots,
+                                 uint32_t kind, uint32_t rows, uint32_t cols,
+                                 uint32_t count);
+
 /* Build every candidate's aligned artifact.  On success appends the built
  * artifacts to out, adds their byte total to *repacked_bytes_out (may be
  * NULL), and returns true; on any failure releases every artifact this call

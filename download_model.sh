@@ -5,6 +5,8 @@ GLM_UNSLOTH_REPO="unsloth/GLM-5.2-GGUF"
 GLM_ANTIREZ_REPO="antirez/GLM-5.2-GGUF"
 GLM53_REPO="antirez/glm-5.3-flash-gguf"
 GLM53_FULL_REPO="antirez/glm-5.3-gguf"
+QWEN38_REPO="antirez/qwen3.8-flash-next-gguf"
+QWEN38_MMPROJ_REPO="ggml-org/Qwen3.8-Flash-Next-GGUF"
 REPO="antirez/deepseek-v4-gguf"
 DS41_REPO="antirez/deepseek-v4.1-flash-gguf"
 DS41_Q2_FILE="DeepSeek-V4.1-Flash-Q2.gguf"
@@ -34,6 +36,9 @@ GLM53_Q2_FILE="GLM-5.3-Flash-Q2.gguf"
 GLM53_Q4_FILE="GLM-5.3-Flash-Q4_K.gguf"
 GLM53_FP8_FILE="GLM-5.3-Flash-FP8.gguf"
 GLM53_VISION_FILE="GLM-5.3-Flash-Vision-Encoder.gguf"
+QWEN38_Q4_FILE="Qwen3.8-Flash-Next-Q4.gguf"
+QWEN38_Q2_FILE="Qwen3.8-Flash-Next-Q2.gguf"
+QWEN38_VISION_FILE="mmproj-Qwen3.8-Flash-Next-Q8_0.gguf"
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 OUT_DIR=${DS4_GGUF_DIR:-"$ROOT/gguf"}
@@ -74,6 +79,9 @@ Usage:
   ./download_model.sh glm53-q4 [--token TOKEN]
   ./download_model.sh glm53-fp8 [--token TOKEN]
   ./download_model.sh glm53-vision [--token TOKEN]
+  ./download_model.sh qwen38-q2 [--token TOKEN]
+  ./download_model.sh qwen38-q4k [--token TOKEN]
+  ./download_model.sh qwen38-vision [--token TOKEN]
 
 Targets:
 
@@ -189,6 +197,25 @@ Targets:
        GLM 5.3 Flash vision encoder, about 1.1 GB on disk. Load it separately
        with --vision; this target does not update ./ds4flash.gguf.
 
+  qwen38-q2 (alias: qwen38-iq2)
+       Qwen3.8-Flash-Next Q2: one 137.10 GiB GGUF. Main/MTP weights
+       occupy 41.73 GiB; original BF16 n-grams stay on disk.
+       Imatrix IQ2_XXS gate/up and Q2_K down experts (640 logical inputs,
+       padded to 768 on disk), with higher-precision dense/control tensors.
+       Smaller option for 64 GB Macs: start with --ctx 8192 and
+       --prefill-chunk 1024. Context buffers need additional RAM.
+       Keep the file on a local SSD. Add --mtp for speculation.
+
+  qwen38-q4k
+       Qwen3.8-Flash-Next Q4: one 165.11 GiB GGUF. Main/MTP weights
+       occupy 69.74 GiB; original BF16 n-grams stay on disk.
+       Imatrix Q4_K gate/up and MXFP4 down routed experts. Fits 128 GB
+       Macs with room for context buffers. Add --mtp for speculation.
+
+  qwen38-vision
+       Qwen3.8-Flash-Next vision encoder, about 0.6 GB on disk. Load it
+       with --vision; this target does not update ./ds4flash.gguf.
+
 Options:
   --token TOKEN  Hugging Face token. Otherwise HF_TOKEN or the local HF token
                  cache is used if present.
@@ -204,10 +231,13 @@ Then the default commands work:
   ./ds4 -p "Hello"
   ./ds4-server --ctx 100000
 
+Qwen3.8 includes its n-grams and MTP; add --mtp to enable speculation:
+  ./ds4 --mtp
+
 After downloading DSpark support, enable it explicitly:
   ./ds4 --dspark --mtp-model <download directory>/$DS4F_DSPARK_FILE
 
-PRO, V4.1 and GLM files use the official Hugging Face downloader
+PRO, V4.1, GLM and Qwen files use the official Hugging Face downloader
 because they are too large, sharded, or nested for the curl path used by the
 smaller DeepSeek Flash GGUF files.
 EOF
@@ -331,6 +361,22 @@ case "$MODEL" in
         FORCE_HF_DOWNLOAD=1
         LINK_MODEL=0
         ;;
+    qwen38-q2|qwen38-iq2)
+        REPO=$QWEN38_REPO
+        MODEL_FILE=$QWEN38_Q2_FILE
+        FORCE_HF_DOWNLOAD=1
+        ;;
+    qwen38-q4k)
+        REPO=$QWEN38_REPO
+        MODEL_FILE=$QWEN38_Q4_FILE
+        FORCE_HF_DOWNLOAD=1
+        ;;
+    qwen38-vision)
+        REPO=$QWEN38_MMPROJ_REPO
+        MODEL_FILE=$QWEN38_VISION_FILE
+        FORCE_HF_DOWNLOAD=1
+        LINK_MODEL=0
+        ;;
     -h|--help|help)
         usage
         exit 0
@@ -403,6 +449,14 @@ local_download_name() {
 
 artifact_identity() {
     case "$1" in
+        "$QWEN38_Q2_FILE")
+            expected_bytes=147207127040
+            expected_sha=b1b93fa69aca5f187b0fb813aca8f3ec1beb5cf8cf0bd38cf041b93e0b6ccac9
+            ;;
+        "$QWEN38_Q4_FILE")
+            expected_bytes=177280286720
+            expected_sha=680944460a8cbe93ba8b6d7b6107213ffb7e22320bd913000e563ca0a0f25a8a
+            ;;
         "$DS41_Q2_FILE")
             expected_bytes=365713686528
             expected_sha=1ce6a8f8806205c13330d7ca287bd198331dc5ca35ccc5d8a9a92a188a6f6f42
@@ -647,3 +701,15 @@ fi
 
 echo
 echo "Done."
+if [ "$MODEL" = qwen38-q2 ] || [ "$MODEL" = qwen38-iq2 ]; then
+    echo "Run with an 8K starting context:"
+    echo "  ./ds4 --ctx 8192 --prefill-chunk 1024"
+    echo "Add --mtp to enable speculation."
+elif [ "$MODEL" = qwen38-q4k ]; then
+    echo "Run ./ds4. Add --mtp to enable speculation."
+fi
+if [ "$MODEL" = qwen38-vision ]; then
+    echo
+    echo "Qwen3.8 vision encoder downloaded. Pass it with --vision, for example:"
+    printf '  ./ds4 --vision "%s/%s"\n' "$OUT_DIR" "$QWEN38_VISION_FILE"
+fi

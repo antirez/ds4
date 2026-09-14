@@ -13,6 +13,8 @@
 #include <unistd.h>
 #ifdef __APPLE__
 #include <dispatch/dispatch.h>
+#else
+#include <pthread.h>
 #endif
 
 bool ds4_engram_layout_valid(const ds4_engram_layout *l) {
@@ -218,6 +220,19 @@ static void read_batch_part(void *context, size_t part) {
     }
 }
 
+#ifndef __APPLE__
+typedef struct {
+    engram_batch *batch;
+    size_t part;
+} engram_reader;
+
+static void *read_batch_thread(void *context) {
+    engram_reader *reader = context;
+    read_batch_part(reader->batch, reader->part);
+    return NULL;
+}
+#endif
+
 bool ds4_engram_read_batch(const ds4_engram_table *t, const uint32_t *rows,
                            size_t tokens, size_t stride, float *out) {
     if (!t || t->fd < 0 || (tokens && (!rows || !out || stride < DS4_ENGRAM_COLS)) ||
@@ -252,15 +267,31 @@ bool ds4_engram_read_batch(const ds4_engram_table *t, const uint32_t *rows,
         qsort(request, count, sizeof(*request), request_order);
         engram_batch batch = {.table = t, .request = request, .count = count,
             .out = out + start * DS4_ENGRAM_COLS * DS4_ENGRAM_DIM, .readers = 1};
-#ifdef __APPLE__
         /* Fixed concurrency hides random-read latency without caching the table.
          * Each worker owns disjoint output rows; all finish before GPU use. */
         if (count >= 256) {
             batch.readers = ENGRAM_READERS;
+#ifdef __APPLE__
             dispatch_apply_f(batch.readers,
                 dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &batch, read_batch_part);
-        } else
+#else
+            pthread_t threads[ENGRAM_READERS - 1];
+            engram_reader readers[ENGRAM_READERS - 1];
+            size_t started = 0;
+            for (size_t part = 1; part < batch.readers; part++) {
+                readers[started] = (engram_reader){&batch, part};
+                if (pthread_create(&threads[started], NULL, read_batch_thread,
+                                   &readers[started])) break;
+                started++;
+            }
+            read_batch_part(&batch, 0);
+            /* Thread exhaustion only reduces concurrency, not correctness. */
+            for (size_t part = started + 1; part < batch.readers; part++)
+                read_batch_part(&batch, part);
+            for (size_t part = 0; part < started; part++)
+                if (pthread_join(threads[part], NULL)) abort();
 #endif
+        } else
         read_batch_part(&batch, 0);
         for (size_t i = 0; i < batch.readers; i++) {
             if (batch.error[i]) {
