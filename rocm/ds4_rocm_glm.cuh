@@ -528,6 +528,113 @@ extern "C" int ds4_gpu_glm53_matmul_bf16(
     return cublas_ok(status, "GLM-5.3 BF16 matmul");
 }
 
+/* K-sliced BF16 matvec for tensor parallelism: each output row of the
+ * [out_dim][ld] matrix is read from column k_off for k_cnt columns (the
+ * caller passes weights already advanced by k_off); x holds the k_cnt slice
+ * compactly.  Same unpacking and accumulation as the full matvec. */
+__global__ static void glm53_rocm_matvec_bf16_f32_kslice_kernel(
+        float *out,
+        const uint16_t *weights,
+        const float *x,
+        uint32_t k_cnt,
+        uint32_t ld,
+        uint32_t out_dim) {
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t col = blockIdx.x * 8u + warp;
+    const uint32_t row = blockIdx.y;
+    float sum = 0.0f;
+    if (col < out_dim) {
+        const uint4 *wrow = (const uint4 *)(weights + (uint64_t)col * ld);
+        const float4 *xrow = (const float4 *)(x + (uint64_t)row * k_cnt);
+        const uint32_t vecs = k_cnt >> 3u;
+        for (uint32_t v = lane; v < vecs; v += 32u) {
+            const uint4 w8 = wrow[v];
+            const float4 xa = xrow[v * 2u];
+            const float4 xb = xrow[v * 2u + 1u];
+            sum = fmaf(__uint_as_float((w8.x & 0xFFFFu) << 16), xa.x, sum);
+            sum = fmaf(__uint_as_float((w8.x >> 16) << 16), xa.y, sum);
+            sum = fmaf(__uint_as_float((w8.y & 0xFFFFu) << 16), xa.z, sum);
+            sum = fmaf(__uint_as_float((w8.y >> 16) << 16), xa.w, sum);
+            sum = fmaf(__uint_as_float((w8.z & 0xFFFFu) << 16), xb.x, sum);
+            sum = fmaf(__uint_as_float((w8.z >> 16) << 16), xb.y, sum);
+            sum = fmaf(__uint_as_float((w8.w & 0xFFFFu) << 16), xb.z, sum);
+            sum = fmaf(__uint_as_float((w8.w >> 16) << 16), xb.w, sum);
+        }
+    }
+    sum = warp_sum_f32(sum);
+    if (lane == 0u && col < out_dim) {
+        out[(uint64_t)row * out_dim + col] = sum;
+    }
+}
+
+extern "C" int ds4_gpu_glm53_matmul_bf16_kslice(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              full_in_dim,
+        uint32_t              k_off,
+        uint32_t              k_cnt,
+        uint32_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_rows) {
+    if (!out || !x || !model_map || !g_cublas_ready || full_in_dim == 0u ||
+        k_cnt == 0u || out_dim == 0u || n_rows == 0u ||
+        (k_off & 7u) != 0u || (k_cnt & 7u) != 0u || (full_in_dim & 7u) != 0u ||
+        k_off > full_in_dim - k_cnt || weight_offset > model_size) {
+        return 0;
+    }
+    uint64_t weight_elements = 0, weight_bytes = 0;
+    uint64_t input_elements = 0, input_bytes = 0;
+    uint64_t output_elements = 0, output_bytes = 0;
+    if (!glm53_rocm_mul_u64(out_dim, full_in_dim, &weight_elements) ||
+        !glm53_rocm_mul_u64(weight_elements, sizeof(uint16_t), &weight_bytes) ||
+        !glm53_rocm_mul_u64(n_rows, k_cnt, &input_elements) ||
+        !glm53_rocm_mul_u64(input_elements, sizeof(float), &input_bytes) ||
+        !glm53_rocm_mul_u64(n_rows, out_dim, &output_elements) ||
+        !glm53_rocm_mul_u64(output_elements, sizeof(float), &output_bytes)) {
+        return 0;
+    }
+    if (weight_bytes > model_size - weight_offset ||
+        x->bytes < input_bytes || out->bytes < output_bytes) {
+        return 0;
+    }
+    const char *weights = cuda_model_range_ptr(
+        model_map, weight_offset, weight_bytes,
+        "GLM-5.3 BF16 k-slice matrix");
+    if (!weights) return 0;
+    const uint16_t *w = (const uint16_t *)weights + k_off;
+    if (n_rows <= 8u) {
+        const dim3 grid((out_dim + 7u) / 8u, n_rows, 1u);
+        glm53_rocm_matvec_bf16_f32_kslice_kernel<<<grid, 256u>>>(
+            (float *)out->ptr, w, (const float *)x->ptr, k_cnt, full_in_dim, out_dim);
+        return cuda_ok(cudaGetLastError(), "GLM-5.3 BF16/F32 k-slice matvec launch");
+    }
+    hip_bfloat16 *xb = (hip_bfloat16 *)cuda_tmp_alloc(
+        input_elements * sizeof(hip_bfloat16),
+        "GLM-5.3 BF16 k-slice activations");
+    if (!xb) return 0;
+    glm53_rocm_f32_to_bf16_kernel<<<
+        (unsigned)((input_elements + 255u) / 256u), 256u>>>(
+            xb, (const float *)x->ptr, input_elements);
+    if (!cuda_ok(cudaGetLastError(), "GLM-5.3 BF16 k-slice activation conversion launch")) {
+        return 0;
+    }
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    const cublasStatus_t status = cublasGemmEx(
+        g_cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+        (int)out_dim, (int)n_rows, (int)k_cnt,
+        &alpha,
+        w, HIPBLAS_R_16B, (int)full_in_dim,
+        xb, HIPBLAS_R_16B, (int)k_cnt,
+        &beta,
+        out->ptr, CUDA_R_32F, (int)out_dim,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+    return cublas_ok(status, "GLM-5.3 BF16 k-slice matmul");
+}
+
 __global__ static void glm53_rocm_matmul_q4_K_q8_K_kernel(
         float *out,
         const cuda_block_q4_K *weights,
@@ -637,7 +744,9 @@ __global__ static void glm53_rocm_kda_decode_kernel(
         uint32_t n_heads,
         uint32_t n_rows,
         float lower_bound,
-        float norm_eps) {
+        float norm_eps,
+        uint32_t head0,
+        uint32_t n_heads_total) {
     const uint32_t row = blockIdx.x;
     const uint32_t head = blockIdx.y;
     const uint32_t tid = threadIdx.x;
@@ -658,25 +767,30 @@ __global__ static void glm53_rocm_kda_decode_kernel(
     float *reduce_o = reduce_k + 4;
     float *beta_shared = reduce_o + 4;
 
+    /* q/k/v, gates and the output are compact over the n_heads local heads;
+     * the per-channel weights and the conv/recurrent states span all
+     * n_heads_total heads, this block owning head0 + head (the tensor-
+     * parallel head split runs the kernel on one half of the heads). */
     const uint32_t projection = n_heads * GLM53_ROCM_KDA_DIM;
-    const uint32_t channel = head * GLM53_ROCM_KDA_DIM + tid;
+    const uint32_t state_proj = n_heads_total * GLM53_ROCM_KDA_DIM;
+    const uint32_t channel = (head0 + head) * GLM53_ROCM_KDA_DIM + tid;
     const uint64_t input_base =
         (uint64_t)row * projection + head * GLM53_ROCM_KDA_DIM;
     const uint64_t conv_row_stride =
-        (uint64_t)3 * GLM53_ROCM_KDA_HISTORY * projection;
+        (uint64_t)3 * GLM53_ROCM_KDA_HISTORY * state_proj;
     float *q_state = conv_state + (uint64_t)row * conv_row_stride;
-    float *k_state = q_state + GLM53_ROCM_KDA_HISTORY * projection;
-    float *v_state = k_state + GLM53_ROCM_KDA_HISTORY * projection;
+    float *k_state = q_state + GLM53_ROCM_KDA_HISTORY * state_proj;
+    float *v_state = k_state + GLM53_ROCM_KDA_HISTORY * state_proj;
 
     float q_acc = 0.0f;
     float k_acc = 0.0f;
     float v_acc = 0.0f;
     for (uint32_t w = 0; w < GLM53_ROCM_KDA_HISTORY; w++) {
-        q_acc = fmaf(q_state[(uint64_t)w * projection + channel],
+        q_acc = fmaf(q_state[(uint64_t)w * state_proj + channel],
                      q_conv[(uint64_t)channel * 4u + w], q_acc);
-        k_acc = fmaf(k_state[(uint64_t)w * projection + channel],
+        k_acc = fmaf(k_state[(uint64_t)w * state_proj + channel],
                      k_conv[(uint64_t)channel * 4u + w], k_acc);
-        v_acc = fmaf(v_state[(uint64_t)w * projection + channel],
+        v_acc = fmaf(v_state[(uint64_t)w * state_proj + channel],
                      v_conv[(uint64_t)channel * 4u + w], v_acc);
     }
     const float q_new = q_in[input_base + tid];
@@ -686,22 +800,22 @@ __global__ static void glm53_rocm_kda_decode_kernel(
     k_acc = fmaf(k_new, k_conv[(uint64_t)channel * 4u + 3u], k_acc);
     v_acc = fmaf(v_new, v_conv[(uint64_t)channel * 4u + 3u], v_acc);
 
-    q_state[channel] = q_state[projection + channel];
-    q_state[projection + channel] = q_state[2ull * projection + channel];
-    q_state[2ull * projection + channel] = q_new;
-    k_state[channel] = k_state[projection + channel];
-    k_state[projection + channel] = k_state[2ull * projection + channel];
-    k_state[2ull * projection + channel] = k_new;
-    v_state[channel] = v_state[projection + channel];
-    v_state[projection + channel] = v_state[2ull * projection + channel];
-    v_state[2ull * projection + channel] = v_new;
+    q_state[channel] = q_state[state_proj + channel];
+    q_state[state_proj + channel] = q_state[2ull * state_proj + channel];
+    q_state[2ull * state_proj + channel] = q_new;
+    k_state[channel] = k_state[state_proj + channel];
+    k_state[state_proj + channel] = k_state[2ull * state_proj + channel];
+    k_state[2ull * state_proj + channel] = k_new;
+    v_state[channel] = v_state[state_proj + channel];
+    v_state[state_proj + channel] = v_state[2ull * state_proj + channel];
+    v_state[2ull * state_proj + channel] = v_new;
 
     sq[tid] = glm53_rocm_silu(q_acc);
     sk[tid] = glm53_rocm_silu(k_acc);
     sv[tid] = glm53_rocm_silu(v_acc);
     const float gate = raw_gate[input_base + tid] + dt_bias[channel];
     sd[tid] = expf(lower_bound *
-        glm53_rocm_sigmoid(expf(a_log[head]) * gate));
+        glm53_rocm_sigmoid(expf(a_log[head0 + head]) * gate));
     if (tid == 0u) {
         beta_shared[0] = glm53_rocm_sigmoid(
             raw_beta[(uint64_t)row * n_heads + head]);
@@ -728,7 +842,7 @@ __global__ static void glm53_rocm_kda_decode_kernel(
     const float4 k4 = *(const float4 *)(sk + k0);
     const float4 decay4 = *(const float4 *)(sd + k0);
     const uint64_t state_head =
-        ((uint64_t)row * n_heads + head) *
+        ((uint64_t)row * n_heads_total + head0 + head) *
         GLM53_ROCM_KDA_DIM * GLM53_ROCM_KDA_DIM;
 
     for (uint32_t value = warp; value < GLM53_ROCM_KDA_DIM; value += 4u) {
@@ -924,6 +1038,80 @@ __global__ static void glm53_rocm_kda_prefill_output_kernel(
         glm53_rocm_sigmoid(output_gate[index]);
 }
 
+extern "C" int ds4_gpu_glm53_kda_decode_heads(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *conv_state,
+        ds4_gpu_tensor       *recurrent_state,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        const ds4_gpu_tensor *raw_gate,
+        const ds4_gpu_tensor *raw_beta,
+        const ds4_gpu_tensor *output_gate,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              q_conv_offset,
+        uint64_t              k_conv_offset,
+        uint64_t              v_conv_offset,
+        uint64_t              a_log_offset,
+        uint64_t              dt_bias_offset,
+        uint64_t              output_norm_offset,
+        uint32_t              n_heads,
+        uint32_t              n_rows,
+        float                 gate_lower_bound,
+        float                 norm_eps,
+        uint32_t              head0,
+        uint32_t              n_heads_total) {
+    uint64_t projection = 0, activations = 0, conv_elements = 0;
+    uint64_t state_elements = 0, state_proj = 0, state_rows = 0;
+    if (n_heads == 0u || n_rows == 0u || gate_lower_bound >= 0.0f ||
+        n_heads_total < n_heads || head0 > n_heads_total - n_heads ||
+        !glm53_rocm_mul_u64(n_heads, GLM53_ROCM_KDA_DIM, &projection) ||
+        !glm53_rocm_mul_u64(projection, n_rows, &activations) ||
+        !glm53_rocm_mul_u64(n_heads_total, GLM53_ROCM_KDA_DIM, &state_proj) ||
+        !glm53_rocm_mul_u64(state_proj, n_rows, &state_rows) ||
+        !glm53_rocm_mul_u64(state_rows,
+            3u * GLM53_ROCM_KDA_HISTORY, &conv_elements) ||
+        !glm53_rocm_mul_u64(state_rows,
+            GLM53_ROCM_KDA_DIM, &state_elements) ||
+        !glm53_rocm_tensor_has(q, activations, sizeof(float)) ||
+        !glm53_rocm_tensor_has(k, activations, sizeof(float)) ||
+        !glm53_rocm_tensor_has(v, activations, sizeof(float)) ||
+        !glm53_rocm_tensor_has(raw_gate, activations, sizeof(float)) ||
+        !glm53_rocm_tensor_has(raw_beta,
+            (uint64_t)n_rows * n_heads, sizeof(float)) ||
+        !glm53_rocm_tensor_has(output_gate, activations, sizeof(float)) ||
+        !glm53_rocm_tensor_has(out, activations, sizeof(float)) ||
+        !glm53_rocm_tensor_has(conv_state, conv_elements, sizeof(float)) ||
+        !glm53_rocm_tensor_has(recurrent_state, state_elements, sizeof(float))) {
+        fprintf(stderr, "ds4: GLM-5.3 KDA decode received invalid buffers\n");
+        return 0;
+    }
+    const float *qw = glm53_rocm_weight_f32(model_map, model_size,
+        q_conv_offset, state_proj * 4u, "KDA Q convolution");
+    const float *kw = glm53_rocm_weight_f32(model_map, model_size,
+        k_conv_offset, state_proj * 4u, "KDA K convolution");
+    const float *vw = glm53_rocm_weight_f32(model_map, model_size,
+        v_conv_offset, state_proj * 4u, "KDA V convolution");
+    const float *a_log = glm53_rocm_weight_f32(model_map, model_size,
+        a_log_offset, n_heads_total, "KDA A_log");
+    const float *dt_bias = glm53_rocm_weight_f32(model_map, model_size,
+        dt_bias_offset, state_proj, "KDA dt bias");
+    const float *output_norm = glm53_rocm_weight_f32(model_map, model_size,
+        output_norm_offset, GLM53_ROCM_KDA_DIM, "KDA output norm");
+    if (!qw || !kw || !vw || !a_log || !dt_bias || !output_norm) return 0;
+    const dim3 grid(n_rows, n_heads, 1u);
+    glm53_rocm_kda_decode_kernel<<<grid, GLM53_ROCM_KDA_DIM>>>(
+        (float *)out->ptr, (float *)conv_state->ptr,
+        (float *)recurrent_state->ptr, (const float *)q->ptr,
+        (const float *)k->ptr, (const float *)v->ptr,
+        (const float *)raw_gate->ptr, (const float *)raw_beta->ptr,
+        (const float *)output_gate->ptr, qw, kw, vw, a_log, dt_bias,
+        output_norm, n_heads, n_rows, gate_lower_bound, norm_eps,
+        head0, n_heads_total);
+    return cuda_ok(cudaGetLastError(), "GLM-5.3 KDA decode launch");
+}
+
 extern "C" int ds4_gpu_glm53_kda_decode(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *conv_state,
@@ -946,50 +1134,12 @@ extern "C" int ds4_gpu_glm53_kda_decode(
         uint32_t              n_rows,
         float                 gate_lower_bound,
         float                 norm_eps) {
-    uint64_t projection = 0, activations = 0, conv_elements = 0;
-    uint64_t state_elements = 0;
-    if (n_heads == 0u || n_rows == 0u || gate_lower_bound >= 0.0f ||
-        !glm53_rocm_mul_u64(n_heads, GLM53_ROCM_KDA_DIM, &projection) ||
-        !glm53_rocm_mul_u64(projection, n_rows, &activations) ||
-        !glm53_rocm_mul_u64(activations,
-            3u * GLM53_ROCM_KDA_HISTORY, &conv_elements) ||
-        !glm53_rocm_mul_u64(activations,
-            GLM53_ROCM_KDA_DIM, &state_elements) ||
-        !glm53_rocm_tensor_has(q, activations, sizeof(float)) ||
-        !glm53_rocm_tensor_has(k, activations, sizeof(float)) ||
-        !glm53_rocm_tensor_has(v, activations, sizeof(float)) ||
-        !glm53_rocm_tensor_has(raw_gate, activations, sizeof(float)) ||
-        !glm53_rocm_tensor_has(raw_beta,
-            (uint64_t)n_rows * n_heads, sizeof(float)) ||
-        !glm53_rocm_tensor_has(output_gate, activations, sizeof(float)) ||
-        !glm53_rocm_tensor_has(out, activations, sizeof(float)) ||
-        !glm53_rocm_tensor_has(conv_state, conv_elements, sizeof(float)) ||
-        !glm53_rocm_tensor_has(recurrent_state, state_elements, sizeof(float))) {
-        fprintf(stderr, "ds4: GLM-5.3 KDA decode received invalid buffers\n");
-        return 0;
-    }
-    const float *qw = glm53_rocm_weight_f32(model_map, model_size,
-        q_conv_offset, projection * 4u, "KDA Q convolution");
-    const float *kw = glm53_rocm_weight_f32(model_map, model_size,
-        k_conv_offset, projection * 4u, "KDA K convolution");
-    const float *vw = glm53_rocm_weight_f32(model_map, model_size,
-        v_conv_offset, projection * 4u, "KDA V convolution");
-    const float *a_log = glm53_rocm_weight_f32(model_map, model_size,
-        a_log_offset, n_heads, "KDA A_log");
-    const float *dt_bias = glm53_rocm_weight_f32(model_map, model_size,
-        dt_bias_offset, projection, "KDA dt bias");
-    const float *output_norm = glm53_rocm_weight_f32(model_map, model_size,
-        output_norm_offset, GLM53_ROCM_KDA_DIM, "KDA output norm");
-    if (!qw || !kw || !vw || !a_log || !dt_bias || !output_norm) return 0;
-    const dim3 grid(n_rows, n_heads, 1u);
-    glm53_rocm_kda_decode_kernel<<<grid, GLM53_ROCM_KDA_DIM>>>(
-        (float *)out->ptr, (float *)conv_state->ptr,
-        (float *)recurrent_state->ptr, (const float *)q->ptr,
-        (const float *)k->ptr, (const float *)v->ptr,
-        (const float *)raw_gate->ptr, (const float *)raw_beta->ptr,
-        (const float *)output_gate->ptr, qw, kw, vw, a_log, dt_bias,
-        output_norm, n_heads, n_rows, gate_lower_bound, norm_eps);
-    return cuda_ok(cudaGetLastError(), "GLM-5.3 KDA decode launch");
+    return ds4_gpu_glm53_kda_decode_heads(out, conv_state, recurrent_state, q, k, v,
+                                          raw_gate, raw_beta, output_gate, model_map,
+                                          model_size, q_conv_offset, k_conv_offset,
+                                          v_conv_offset, a_log_offset, dt_bias_offset,
+                                          output_norm_offset, n_heads, n_rows,
+                                          gate_lower_bound, norm_eps, 0u, n_heads);
 }
 
 extern "C" int ds4_gpu_glm53_kda_prefill(

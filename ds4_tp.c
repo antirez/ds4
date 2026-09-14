@@ -3788,6 +3788,11 @@ int ds4_tp_send_glm_mtp(ds4_tp *tp, uint64_t session_id,
     return tp_send_frame(tp->control_fd, DS4_TP_FRAME_GLM_MTP, &msg, sizeof(msg));
 }
 
+int ds4_tp_send_glm_kda_sync(ds4_tp *tp, uint64_t session_id) {
+    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_GLM_KDA_SYNC,
+                         &session_id, sizeof(session_id));
+}
+
 int ds4_tp_send_rewind(ds4_tp *tp, uint64_t session_id, int pos) {
     ds4_tp_value_command msg = { session_id, (int32_t)pos, 0 };
     return tp_send_frame(tp->control_fd, DS4_TP_FRAME_REWIND,
@@ -4140,6 +4145,7 @@ int ds4_tp_recv_command(ds4_tp *tp, ds4_tp_command *command,
     }
     case DS4_TP_FRAME_SESSION_DESTROY:
     case DS4_TP_FRAME_INVALIDATE:
+    case DS4_TP_FRAME_GLM_KDA_SYNC:
         if (bytes != sizeof(command->session_id)) { ok = 0; break; }
         memcpy(&command->session_id, payload, sizeof(command->session_id));
         break;
@@ -4494,6 +4500,14 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
             if (!ds4_tp_send_command_ack(tp, command.session_id,
                                          spec_rc < 0 ? 1 : 0) || spec_rc < 0) {
                 ds4_log(stderr, DS4_LOG_ERROR, "tp worker GLM MTP: %s", err);
+                rc = 1;
+            }
+        } else if (command.type == DS4_TP_FRAME_GLM_KDA_SYNC) {
+            const int sync_rc =
+                ds4_session_glm_kda_state_unsplit(session, err, sizeof(err));
+            if (!ds4_tp_send_command_ack(tp, command.session_id, sync_rc) ||
+                sync_rc != 0) {
+                ds4_log(stderr, DS4_LOG_ERROR, "tp worker GLM KDA sync: %s", err);
                 rc = 1;
             }
         } else if (command.type == DS4_TP_FRAME_VERIFY) {

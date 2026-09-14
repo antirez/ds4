@@ -189,6 +189,9 @@ int ds4_tp_send_eval(ds4_tp *tp, uint64_t session_id,
                      uint64_t seq, int token);
 int ds4_tp_send_glm_mtp(ds4_tp *tp, uint64_t session_id,
                        uint64_t seq, int token, int limit);
+/* GLM KDA head split: ask the worker to re-gather the peer halves of a
+ * session's KDA state together with the leader (acked). */
+int ds4_tp_send_glm_kda_sync(ds4_tp *tp, uint64_t session_id);
 int ds4_tp_send_rewind(ds4_tp *tp, uint64_t session_id, int pos);
 int ds4_tp_send_invalidate(ds4_tp *tp, uint64_t session_id);
 int ds4_tp_send_eval_batch(ds4_tp *tp, const ds4_tp_batch_item *items,
@@ -258,6 +261,7 @@ typedef enum {
     DS4_TP_FRAME_SYNC_GO = 22,       /* fork: mirrored-sync barrier sequence */
     DS4_TP_FRAME_SYNC_CHECKPOINT = 23, /* upstream: prefill-boundary checkpoint */
     DS4_TP_FRAME_ODL_READY = 24,     /* fork: OdinLink data-plane barrier (0 bytes) */
+    DS4_TP_FRAME_GLM_KDA_SYNC = 25,  /* fork: re-gather the head-split KDA state (session_id) */
 } ds4_tp_frame_type;
 
 typedef struct {

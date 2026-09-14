@@ -41348,6 +41348,7 @@ typedef struct {
     uint64_t next_session_id;   /* leader: stable worker-session handle */
     int rank;
     bool vocab_split;           /* DeepSeek: logits halves cross the wire */
+    bool kda_head_split;        /* GLM ROCm: decode KDA layers split by heads */
     bool active;
 } ds4_engine_tp_state;
 
@@ -43979,6 +43980,12 @@ typedef struct ds4_glm_gpu_graph {
     uint32_t tp_world;
     uint32_t tp_rank;
     bool tp_vocab_split;             /* decode head: this rank's vocab half only */
+    bool tp_kda_head_split;          /* decode KDA layers: this rank's heads only */
+    bool kda_state_split;            /* KDA states hold this rank's heads; the
+                                        peer's half is stale until unsplit */
+    ds4_gpu_tensor *kda_check_conv;  /* DS4_GLM_TP_KDA_CHECK scratch */
+    ds4_gpu_tensor *kda_check_rec;
+    ds4_gpu_tensor *kda_check_out;
     ds4_gpu_tensor *tp_logits_half;  /* view of logits for that half */
     ds4_gpu_tensor **tp_out;
     ds4_gpu_tensor **tp_in;
@@ -44118,6 +44125,7 @@ static bool imatrix_collect_glm_one(
 
 static bool glm_graph_reset_kda_state(ds4_glm_gpu_graph *g) {
     if (!g || !g->glm53) return true;
+    g->kda_state_split = false; /* zeros are the same on both ranks */
     for (uint32_t il = g->layer_start; il <= g->layer_end; il++) {
         ds4_gpu_tensor *conv = g->layer_kda_conv_state[il];
         ds4_gpu_tensor *recurrent = g->layer_kda_recurrent_state[il];
@@ -46766,6 +46774,8 @@ static bool glm53_graph_copy_kda_state_layer(ds4_glm_gpu_graph *g,
                                              uint32_t il,
                                              bool save);
 
+static bool glm53_graph_kda_state_unsplit(ds4_glm_gpu_graph *g);
+
 static bool glm53_graph_kda_attention_rows(
         ds4_glm_gpu_graph       *g,
         const ds4_model         *model,
@@ -46779,6 +46789,7 @@ static bool glm53_graph_kda_attention_rows(
         !g->layer_kda_recurrent_state[il]) {
         return false;
     }
+    if (!glm53_graph_kda_state_unsplit(g)) return false;
     const uint32_t projection = DS4_N_KDA_HEAD * DS4_N_KDA_HEAD_DIM;
     const char *failed_stage = "Q projection";
     const ds4_tensor *failed_weight = l->kda_q;
@@ -47001,14 +47012,16 @@ static bool glm53_graph_hc_pre(
     return ok;
 }
 
-static bool glm53_graph_kda_attention(
+static bool glm53_graph_kda_attention_impl(
         ds4_glm_gpu_graph       *g,
         const ds4_model         *model,
         const ds4_layer_weights *l,
-        uint32_t                 il) {
+        uint32_t                 il,
+        ds4_gpu_tensor          *conv_state,
+        ds4_gpu_tensor          *recurrent_state,
+        ds4_gpu_tensor          *attn_out) {
     if (!g || !model || !l || il >= DS4_MAX_LAYER ||
-        !g->layer_kda_conv_state[il] ||
-        !g->layer_kda_recurrent_state[il]) {
+        !conv_state || !recurrent_state || !attn_out) {
         return false;
     }
     const uint32_t projection = DS4_N_KDA_HEAD * DS4_N_KDA_HEAD_DIM;
@@ -47112,8 +47125,8 @@ static bool glm53_graph_kda_attention(
             small_fused ? g->kda_lowrank_g : g->kda_lowrank);
     if (ok) ok = ds4_gpu_glm53_kda_decode(
             g->kda_out,
-            g->layer_kda_conv_state[il],
-            g->layer_kda_recurrent_state[il],
+            conv_state,
+            recurrent_state,
             g->kda_q,
             g->kda_k,
             g->kda_v,
@@ -47132,13 +47145,313 @@ static bool glm53_graph_kda_attention(
             1,
             DS4_KDA_GATE_LOWER_BOUND,
             DS4_RMS_EPS) != 0;
-    if (ok) ok = glm53_graph_matmul(g->attn_out,
+    if (ok) ok = glm53_graph_matmul(attn_out,
                                          model,
                                          l->kda_output,
                                          projection,
                                          DS4_N_EMBD,
                                          g->kda_out);
     return ok;
+}
+
+/* Bytes of one row of a dense GLM projection matrix (0 when unsupported). */
+static uint64_t glm_dense_row_bytes(uint32_t type, uint64_t in_dim) DS4_MAYBE_UNUSED;
+static uint64_t glm_dense_row_bytes(uint32_t type, uint64_t in_dim) {
+    switch (type) {
+    case DS4_TENSOR_Q8_0: return (in_dim / 32u) * 34u;
+    case DS4_TENSOR_Q4_0: return (in_dim / 32u) * 18u;
+    case DS4_TENSOR_Q4_K: return (in_dim / 256u) * 144u;
+    case DS4_TENSOR_BF16: return in_dim * 2u;
+    default: return 0;
+    }
+}
+
+/* Two-rank TP on ROCm splits the KDA attention of single-token decode by
+ * heads: each rank projects q/k/v/gates for its half of the heads, runs the
+ * conv + recurrence on those heads (its half of the layer state), and
+ * K-slices the output projection into the ATTN gate slot; the commutative
+ * add rebuilds attn_out on both ranks.  Only decode is split: the layer
+ * states are then valid for this rank's heads only, and every replicated
+ * KDA path re-gathers the peer's half first (glm53_graph_kda_state_unsplit).
+ * Leading dense layers and the MTP layer have no gate slot in the schedule
+ * and stay replicated. */
+static bool glm53_graph_kda_layer_split(const ds4_glm_gpu_graph *g, uint32_t il) {
+    return g && g->tp_world == 2 && g->tp_kda_head_split && g->tp_out && g->tp_in &&
+           !g->ssd_streaming && il >= DS4_N_LEADING_DENSE &&
+           il < DS4_N_LAYER - DS4_N_NEXTN_PREDICT && ds4_glm53_layer_is_kda(il);
+}
+
+static bool glm_graph_tp_batch_bounce_ready(ds4_glm_gpu_graph *g, uint32_t n_tokens);
+
+/* Re-gather the peer's half of every split KDA layer state: pack this rank's
+ * half (recurrent heads + the conv history planes), swap through the big
+ * gate, unpack the peer's half.  Both ranks call this at the same point of
+ * the graph (start of a replicated KDA path), so the exchange is symmetric. */
+/* Swap one split KDA layer's state halves with the peer: pack this rank's
+ * half (recurrent heads + the conv history planes), exchange through the
+ * big gate, unpack the peer's half.  Symmetric: both ranks call it at the
+ * same point of the graph. */
+static bool glm53_graph_kda_layer_unsplit(ds4_glm_gpu_graph *g, uint32_t il) {
+    const uint32_t heads = DS4_N_KDA_HEAD / 2u;
+    const uint32_t dim = DS4_N_KDA_HEAD_DIM;
+    const uint32_t head0 = g->tp_rank * heads;
+    const uint32_t other0 = (1u - g->tp_rank) * heads;
+    const uint64_t proj_total = (uint64_t)DS4_N_KDA_HEAD * dim;
+    const uint64_t rec_half = (uint64_t)heads * dim * dim * sizeof(float);
+    const uint64_t conv_half = (uint64_t)heads * dim * sizeof(float);
+    ds4_gpu_tensor *rec = g->layer_kda_recurrent_state[il];
+    ds4_gpu_tensor *conv = g->layer_kda_conv_state[il];
+    if (!rec || !conv) return false;
+    const uint64_t conv_bytes = ds4_gpu_tensor_bytes(conv);
+    const uint64_t plane_bytes = proj_total * sizeof(float);
+    const uint32_t planes = (uint32_t)(conv_bytes / plane_bytes);
+    if (ds4_gpu_tensor_bytes(rec) < (uint64_t)DS4_N_KDA_HEAD * dim * dim * sizeof(float) ||
+        planes == 0u || (uint64_t)planes * plane_bytes != conv_bytes) {
+        fprintf(stderr, "ds4: GLM TP KDA unsplit: unexpected state layout (layer %u)\n", il);
+        return false;
+    }
+    const uint64_t bytes = rec_half + (uint64_t)planes * conv_half;
+    const uint32_t rows = (uint32_t)((bytes + (uint64_t)DS4_N_EMBD * sizeof(float) - 1u) /
+                                     ((uint64_t)DS4_N_EMBD * sizeof(float)));
+    if (!glm_graph_tp_batch_bounce_ready(g, rows)) return false;
+    bool ok = ds4_gpu_tensor_copy(g->tp_bounce_out, 0, rec,
+                                  (uint64_t)head0 * dim * dim * sizeof(float), rec_half) != 0;
+    for (uint32_t pl = 0; ok && pl < planes; pl++) {
+        ok = ds4_gpu_tensor_copy(g->tp_bounce_out, rec_half + (uint64_t)pl * conv_half, conv,
+                                 ((uint64_t)pl * proj_total + (uint64_t)head0 * dim) * sizeof(float),
+                                 conv_half) != 0;
+    }
+    if (ok) ok = ds4_gpu_tp_big_gate_encode(il, 1u, g->tp_bounce_out, g->tp_bounce_in, bytes) != 0;
+    if (ok) ok = ds4_gpu_tensor_copy(rec, (uint64_t)other0 * dim * dim * sizeof(float),
+                                     g->tp_bounce_in, 0, rec_half) != 0;
+    for (uint32_t pl = 0; ok && pl < planes; pl++) {
+        ok = ds4_gpu_tensor_copy(conv, ((uint64_t)pl * proj_total + (uint64_t)other0 * dim) * sizeof(float),
+                                 g->tp_bounce_in, rec_half + (uint64_t)pl * conv_half, conv_half) != 0;
+    }
+    return ok;
+}
+
+/* Re-gather the peer's half of every split KDA layer state before a
+ * replicated KDA path runs (rows, session batch, session save). */
+static bool glm53_graph_kda_state_unsplit(ds4_glm_gpu_graph *g) {
+    if (!g || !g->kda_state_split) return true;
+    g->kda_state_split = false;
+    if (g->tp_world != 2 || !g->tp_kda_head_split) return true;
+    const uint32_t normal_layers = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    bool ok = true;
+    for (uint32_t il = g->layer_start; ok && il <= g->layer_end && il < normal_layers; il++) {
+        if (glm53_graph_kda_layer_split(g, il)) ok = glm53_graph_kda_layer_unsplit(g, il);
+    }
+    if (!ok) fprintf(stderr, "ds4: GLM TP KDA state unsplit failed\n");
+    return ok;
+}
+
+#ifdef DS4_ROCM_BUILD
+static bool glm53_graph_kda_check_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("DS4_GLM_TP_KDA_CHECK") != NULL;
+    return enabled != 0;
+}
+
+/* Check mode: run the replicated KDA layer on copies of the states so the
+ * split result can be compared against it afterwards.  After the first
+ * decode token the local state holds a stale peer half, so the layer is
+ * re-gathered first (both ranks run the check, so the swap is symmetric). */
+static bool glm53_graph_kda_check_prepare(
+        ds4_glm_gpu_graph       *g,
+        const ds4_model         *model,
+        const ds4_layer_weights *l,
+        uint32_t                 il) {
+    ds4_gpu_tensor *conv = g->layer_kda_conv_state[il];
+    ds4_gpu_tensor *rec = g->layer_kda_recurrent_state[il];
+    if (g->kda_state_split && !glm53_graph_kda_layer_unsplit(g, il)) return false;
+    const uint64_t conv_bytes = ds4_gpu_tensor_bytes(conv);
+    const uint64_t rec_bytes = ds4_gpu_tensor_bytes(rec);
+    if (!g->kda_check_conv || ds4_gpu_tensor_bytes(g->kda_check_conv) < conv_bytes) {
+        ds4_gpu_tensor_free(g->kda_check_conv);
+        g->kda_check_conv = ds4_gpu_tensor_alloc(conv_bytes);
+    }
+    if (!g->kda_check_rec || ds4_gpu_tensor_bytes(g->kda_check_rec) < rec_bytes) {
+        ds4_gpu_tensor_free(g->kda_check_rec);
+        g->kda_check_rec = ds4_gpu_tensor_alloc(rec_bytes);
+    }
+    if (!g->kda_check_out) g->kda_check_out = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+    if (!g->kda_check_conv || !g->kda_check_rec || !g->kda_check_out) return false;
+    return ds4_gpu_tensor_copy(g->kda_check_conv, 0, conv, 0, conv_bytes) &&
+           ds4_gpu_tensor_copy(g->kda_check_rec, 0, rec, 0, rec_bytes) &&
+           glm53_graph_kda_attention_impl(g, model, l, il, g->kda_check_conv,
+                                          g->kda_check_rec, g->kda_check_out);
+}
+
+static void glm53_graph_kda_check_report(ds4_glm_gpu_graph *g, uint32_t il) {
+    static uint32_t calls = 0;
+    static double worst = 0.0;
+    const uint32_t n = DS4_N_EMBD;
+    float *a = xmalloc((size_t)n * sizeof(float));
+    float *b = xmalloc((size_t)n * sizeof(float));
+    if (ds4_gpu_synchronize() &&
+        ds4_gpu_tensor_read(g->kda_check_out, 0, a, (uint64_t)n * sizeof(float)) &&
+        ds4_gpu_tensor_read(g->attn_out, 0, b, (uint64_t)n * sizeof(float))) {
+        double max_abs = 0.0, max_ref = 0.0, sq_diff = 0.0, sq_ref = 0.0;
+        uint32_t nonfinite = 0;
+        for (uint32_t i = 0; i < n; i++) {
+            if (!isfinite(b[i])) nonfinite++;
+            const double d = (double)a[i] - (double)b[i];
+            if (!isfinite(d)) continue;
+            if (fabs(d) > max_abs) max_abs = fabs(d);
+            if (fabs((double)a[i]) > max_ref) max_ref = fabs((double)a[i]);
+            sq_diff += d * d;
+            sq_ref += (double)a[i] * (double)a[i];
+        }
+        const double rel = sq_ref > 0.0 ? sqrt(sq_diff / sq_ref) : 0.0;
+        if (rel > worst) worst = rel;
+        calls++;
+        if (calls <= 12u || (calls % 200u) == 0u || nonfinite) {
+            fprintf(stderr,
+                    "ds4: GLM TP KDA check layer %u call %u: max|diff| %.3e (max|ref| %.3e) "
+                    "rel-l2 %.3e worst %.3e nonfinite %u\n",
+                    il, calls, max_abs, max_ref, rel, worst, nonfinite);
+        }
+    }
+    free(a);
+    free(b);
+}
+
+static bool glm53_graph_kda_attention_head_split(
+        ds4_glm_gpu_graph       *g,
+        const ds4_model         *model,
+        const ds4_layer_weights *l,
+        uint32_t                 il) {
+    ds4_gpu_tensor *conv_state = g->layer_kda_conv_state[il];
+    ds4_gpu_tensor *rec_state = g->layer_kda_recurrent_state[il];
+    if (!model || !l || !conv_state || !rec_state) return false;
+    const uint32_t heads = DS4_N_KDA_HEAD / 2u;
+    const uint32_t head0 = g->tp_rank * heads;
+    const uint32_t proj = heads * DS4_N_KDA_HEAD_DIM;
+    const uint32_t proj_total = DS4_N_KDA_HEAD * DS4_N_KDA_HEAD_DIM;
+    const uint64_t row0 = (uint64_t)head0 * DS4_N_KDA_HEAD_DIM;
+    const uint32_t slot = il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_ATTN;
+    const bool check = glm53_graph_kda_check_enabled();
+    if (check && !glm53_graph_kda_check_prepare(g, model, l, il)) return false;
+    const uint64_t q_off = l->kda_q->abs_offset + row0 * glm_dense_row_bytes(l->kda_q->type, DS4_N_EMBD);
+    const uint64_t k_off = l->kda_k->abs_offset + row0 * glm_dense_row_bytes(l->kda_k->type, DS4_N_EMBD);
+    const uint64_t v_off = l->kda_v->abs_offset + row0 * glm_dense_row_bytes(l->kda_v->type, DS4_N_EMBD);
+    const uint64_t beta_off = l->kda_beta->abs_offset +
+        (uint64_t)head0 * glm_dense_row_bytes(l->kda_beta->type, DS4_N_EMBD);
+    bool ok = true;
+    bool qkv_done = false;
+    if (l->kda_q->type == DS4_TENSOR_Q8_0 &&
+        l->kda_k->type == DS4_TENSOR_Q8_0 &&
+        l->kda_v->type == DS4_TENSOR_Q8_0) {
+        ds4_gpu_tensor *outs[3] = { g->kda_q, g->kda_k, g->kda_v };
+        const uint64_t offs[3] = { q_off, k_off, v_off };
+        qkv_done = ds4_gpu_matmul_q8_0_multi_tensor(outs, offs, 3, model->map,
+                                                    model->size, DS4_N_EMBD,
+                                                    proj, g->attn_norm) != 0;
+    }
+    if (!qkv_done) {
+        ok = glm53_graph_matmul_at(g->kda_q, model, l->kda_q, q_off, DS4_N_EMBD, proj, g->attn_norm) &&
+             glm53_graph_matmul_at(g->kda_k, model, l->kda_k, k_off, DS4_N_EMBD, proj, g->attn_norm) &&
+             glm53_graph_matmul_at(g->kda_v, model, l->kda_v, v_off, DS4_N_EMBD, proj, g->attn_norm);
+    }
+    /* f_a and g_a are per-dimension (full); beta is per head (this rank's). */
+    bool small_fused = false;
+    if (ok && g->kda_lowrank_g &&
+        l->kda_f_a->type == DS4_TENSOR_BF16 &&
+        l->kda_g_a->type == DS4_TENSOR_BF16 &&
+        l->kda_beta->type == DS4_TENSOR_BF16) {
+        ds4_gpu_tensor *outs[3] = { g->kda_lowrank, g->kda_lowrank_g, g->kda_raw_beta };
+        const uint64_t offs[3] = { l->kda_f_a->abs_offset, l->kda_g_a->abs_offset, beta_off };
+        const uint32_t dims[3] = { DS4_N_KDA_HEAD_DIM, DS4_N_KDA_HEAD_DIM, heads };
+        small_fused = ds4_gpu_glm53_matvec_bf16_multi(outs, offs, dims, 3, model->map,
+                                                      model->size, DS4_N_EMBD,
+                                                      g->attn_norm) != 0;
+    }
+    if (ok && !small_fused) ok = glm53_graph_matmul(
+            g->kda_lowrank, model, l->kda_f_a,
+            DS4_N_EMBD, DS4_N_KDA_HEAD_DIM, g->attn_norm);
+    if (ok) ok = glm53_graph_matmul_at(
+            g->kda_raw_gate, model, l->kda_f_b,
+            l->kda_f_b->abs_offset + row0 * glm_dense_row_bytes(l->kda_f_b->type, DS4_N_KDA_HEAD_DIM),
+            DS4_N_KDA_HEAD_DIM, proj, g->kda_lowrank);
+    if (ok && !small_fused) ok = glm53_graph_matmul_at(
+            g->kda_raw_beta, model, l->kda_beta, beta_off,
+            DS4_N_EMBD, heads, g->attn_norm);
+    if (ok && !small_fused) ok = glm53_graph_matmul(
+            g->kda_lowrank, model, l->kda_g_a,
+            DS4_N_EMBD, DS4_N_KDA_HEAD_DIM, g->attn_norm);
+    if (ok) ok = glm53_graph_matmul_at(
+            g->kda_output_gate, model, l->kda_g_b,
+            l->kda_g_b->abs_offset + row0 * glm_dense_row_bytes(l->kda_g_b->type, DS4_N_KDA_HEAD_DIM),
+            DS4_N_KDA_HEAD_DIM, proj,
+            small_fused ? g->kda_lowrank_g : g->kda_lowrank);
+    if (ok) ok = ds4_gpu_glm53_kda_decode_heads(
+            g->kda_out,
+            conv_state,
+            rec_state,
+            g->kda_q,
+            g->kda_k,
+            g->kda_v,
+            g->kda_raw_gate,
+            g->kda_raw_beta,
+            g->kda_output_gate,
+            model->map,
+            model->size,
+            l->kda_q_conv->abs_offset,
+            l->kda_k_conv->abs_offset,
+            l->kda_v_conv->abs_offset,
+            l->kda_a_log->abs_offset,
+            l->kda_dt_bias->abs_offset,
+            l->kda_o_norm->abs_offset,
+            heads,
+            1,
+            DS4_KDA_GATE_LOWER_BOUND,
+            DS4_RMS_EPS,
+            head0,
+            DS4_N_KDA_HEAD) != 0;
+    /* Output projection over this rank's heads (K-slice) into the ATTN gate
+     * slot; the peer's partial arrives in the in slot. */
+    if (ok) {
+        if (l->kda_output->type == DS4_TENSOR_BF16) {
+            ok = ds4_gpu_glm53_matmul_bf16_kslice(g->tp_out[slot], model->map, model->size,
+                                                  l->kda_output->abs_offset, proj_total,
+                                                  (uint32_t)row0, proj, DS4_N_EMBD,
+                                                  g->kda_out, 1) != 0;
+        } else {
+            ok = ds4_gpu_matmul_quant_kslice_tensor(g->tp_out[slot], model->map, model->size,
+                                                    l->kda_output->abs_offset,
+                                                    l->kda_output->type, proj_total, row0,
+                                                    proj, DS4_N_EMBD, g->kda_out, 0) != 0;
+        }
+    }
+    if (ok) ok = ds4_gpu_tp_gate_encode(il, DS4_TP_GATE_ATTN) != 0;
+    if (ok) ok = ds4_gpu_add_tensor(g->attn_out, g->tp_out[slot], g->tp_in[slot],
+                                    DS4_N_EMBD) != 0;
+    if (!ok) {
+        fprintf(stderr, "ds4: GLM TP KDA head split failed (layer %u)\n", il);
+        return false;
+    }
+    g->kda_state_split = true;
+    if (check) glm53_graph_kda_check_report(g, il);
+    return true;
+}
+#endif /* DS4_ROCM_BUILD */
+
+static bool glm53_graph_kda_attention(
+        ds4_glm_gpu_graph       *g,
+        const ds4_model         *model,
+        const ds4_layer_weights *l,
+        uint32_t                 il) {
+    if (!g || il >= DS4_MAX_LAYER) return false;
+#ifdef DS4_ROCM_BUILD
+    if (glm53_graph_kda_layer_split(g, il)) {
+        return glm53_graph_kda_attention_head_split(g, model, l, il);
+    }
+#endif
+    return glm53_graph_kda_attention_impl(g, model, l, il,
+                                          g->layer_kda_conv_state[il],
+                                          g->layer_kda_recurrent_state[il],
+                                          g->attn_out);
 }
 
 static int glm_graph_matmul_q8_0_decode_profiled_tensor(
@@ -58397,6 +58710,15 @@ static void ds4_session_glm_reset_dense_cache(ds4_session *s) {
     s->glm_mtp_min_pos = 0;
 }
 
+int ds4_session_glm_kda_state_unsplit(ds4_session *s, char *err, size_t errlen) {
+    if (!s || !s->glm_graph_ready) return 0;
+    if (!glm53_graph_kda_state_unsplit(&s->glm_graph)) {
+        snprintf(err, errlen, "GLM KDA state unsplit failed");
+        return 1;
+    }
+    return 0;
+}
+
 static bool ds4_session_glm_reset_kda_state(ds4_session *s) {
     return !s || !s->glm_graph_ready ||
            glm_graph_reset_kda_state(&s->glm_graph);
@@ -60274,6 +60596,26 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
             if (payload_write_u32(fp, index_rows, err, errlen) != 0) return 1;
         }
 
+        if (g->kda_state_split) {
+            /* Head-split decode left the peer's heads stale here: swap the
+             * halves with the worker (it runs the same unsplit on the
+             * GLM_KDA_SYNC frame) before serializing the states. */
+            const bool leader = ds4_session_tp_leader(s);
+            if (leader &&
+                !ds4_tp_send_glm_kda_sync(s->engine->tp.ctx, s->tp_session_id)) {
+                payload_set_err(err, errlen, "tp: GLM KDA sync send failed");
+                return 1;
+            }
+            if (!glm53_graph_kda_state_unsplit(g)) {
+                payload_set_err(err, errlen, "GLM KDA state unsplit failed");
+                return 1;
+            }
+            if (leader &&
+                !ds4_tp_wait_command_ack(s->engine->tp.ctx, s->tp_session_id,
+                                         "GLM KDA sync", err, errlen)) {
+                return 1;
+            }
+        }
         uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
         int rc = 0;
         for (uint32_t il = 0; rc == 0 && il < g->normal_layers; il++) {
@@ -60718,6 +61060,7 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         s->mtp_draft_valid = false;
         ds4_session_glm_reset_dense_cache(s);
 
+        g->kda_state_split = false; /* the restored states are complete */
         uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
         int rc = 0;
         for (uint32_t il = 0; rc == 0 && il < g->normal_layers; il++) {
@@ -68087,6 +68430,42 @@ bool ds4_engine_is_glm53(ds4_engine *e) {
 /* Decode gate firing schedule for the TP transport (see ds4_tp_identity).
  * Resident GLM splits attention and FFN on sparse layers. Streaming keeps
  * attention replicated and exchanges only the routed FFN partial. */
+/* GLM 5.3 two-rank TP on ROCm splits the KDA attention of single-token
+ * decode by heads (see glm53_graph_kda_attention_head_split); the schedule
+ * and the engine flag must agree, so both ask here.  Off with --mtp and SSD
+ * streaming, and when a KDA layer has a projection type the split cannot
+ * slice (the output projection needs Q8_0 or BF16). */
+static bool ds4_engine_tp_kda_head_split_wanted(const ds4_engine *e) {
+#ifdef DS4_ROCM_BUILD
+    if (!e || DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA || !ds4_model_is_glm53() ||
+        e->glm_mtp || e->ssd_streaming || (DS4_N_KDA_HEAD % 2u) != 0u ||
+        getenv("DS4_GLM_TP_KDA_HEAD_SPLIT_DISABLE") != NULL) {
+        return false;
+    }
+    const uint32_t normal_layers = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    for (uint32_t il = DS4_N_LEADING_DENSE; il < normal_layers; il++) {
+        if (!ds4_glm53_layer_is_kda(il)) continue;
+        const ds4_layer_weights *l = &e->weights.layer[il];
+        if (!l->kda_q || !l->kda_k || !l->kda_v || !l->kda_f_b || !l->kda_g_b ||
+            !l->kda_beta || !l->kda_output ||
+            !glm_dense_row_bytes(l->kda_q->type, DS4_N_EMBD) ||
+            !glm_dense_row_bytes(l->kda_k->type, DS4_N_EMBD) ||
+            !glm_dense_row_bytes(l->kda_v->type, DS4_N_EMBD) ||
+            !glm_dense_row_bytes(l->kda_beta->type, DS4_N_EMBD) ||
+            !glm_dense_row_bytes(l->kda_f_b->type, DS4_N_KDA_HEAD_DIM) ||
+            !glm_dense_row_bytes(l->kda_g_b->type, DS4_N_KDA_HEAD_DIM) ||
+            (l->kda_output->type != DS4_TENSOR_Q8_0 &&
+             l->kda_output->type != DS4_TENSOR_BF16)) {
+            return false;
+        }
+    }
+    return true;
+#else
+    (void)e;
+    return false;
+#endif
+}
+
 void ds4_engine_tp_gate_schedule(ds4_engine *e,
                                  uint32_t *start,
                                  uint32_t *step,
@@ -68105,9 +68484,10 @@ void ds4_engine_tp_gate_schedule(ds4_engine *e,
             uint32_t count = 0;
             const uint32_t normal_layers =
                 DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+            const bool kda_split = ds4_engine_tp_kda_head_split_wanted(e);
             for (uint32_t il = DS4_N_LEADING_DENSE;
                  il < normal_layers; il++) {
-                if (!ds4_glm53_layer_is_kda(il)) {
+                if (!ds4_glm53_layer_is_kda(il) || kda_split) {
                     const uint32_t slot =
                         il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_ATTN;
                     mask[slot / 64u] |= UINT64_C(1) << (slot % 64u);
@@ -68791,6 +69171,13 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
         (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && e->backend == DS4_BACKEND_CUDA);
 #ifdef DS4_ROCM_BUILD
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA && !e->glm_mtp) e->tp.vocab_split = true;
+    e->tp.kda_head_split = ds4_engine_tp_kda_head_split_wanted(e);
+    if (e->tp.kda_head_split) {
+        fprintf(stderr,
+                "ds4: GLM TP: KDA attention of single-token decode split by heads "
+                "(%u of %u heads per rank)\n",
+                DS4_N_KDA_HEAD / 2u, DS4_N_KDA_HEAD);
+    }
 #endif
     e->tp.ctx = tp;
     e->tp.rank = ds4_tp_rank(tp);
@@ -69161,6 +69548,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             s->glm_graph.tp_rank = (uint32_t)e->tp.rank;
             s->glm_graph.tp_out = e->tp.out_views;
             s->glm_graph.tp_vocab_split = e->tp.vocab_split;
+            s->glm_graph.tp_kda_head_split = e->tp.kda_head_split;
             s->glm_graph.tp_in = e->tp.in_views;
         }
 #endif
@@ -73851,6 +74239,7 @@ static bool glm53_graph_encode_kda_session_batch(
 
     for (int i = 0; ok && i < count; i++) {
         ds4_glm_gpu_graph *g = &items[i].session->glm_graph;
+        if (!glm53_graph_kda_state_unsplit(g)) { ok = false; break; }
         ds4_gpu_tensor *q = glm_graph_tensor_row_view_strided(
                 batch->batch_kda_q, (uint32_t)i, projection, projection);
         ds4_gpu_tensor *k = glm_graph_tensor_row_view_strided(

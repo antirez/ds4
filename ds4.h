@@ -559,6 +559,9 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
 bool ds4_session_tp_leader(const ds4_session *s);
 int ds4_session_tp_spec_cycle(ds4_session *s, const int *drafts, int draft_n,
                               char *err, size_t errlen);
+/* GLM KDA head split (two-rank TP): re-gather the peer's half of the
+ * session's KDA state; both ranks call it at the same point. */
+int ds4_session_glm_kda_state_unsplit(ds4_session *s, char *err, size_t errlen);
 int ds4_session_glm_tp_spec_cycle(ds4_session *s, int token, int limit,
                                  char *err, size_t errlen);
 void ds4_session_invalidate(ds4_session *s);

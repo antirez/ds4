@@ -3231,6 +3231,49 @@ int ds4_gpu_glm53_kda_decode(
         float                 gate_lower_bound,
         float                 norm_eps);
 
+/* ROCm: the KDA decode step for heads [head0, head0 + n_heads) of a model
+ * with n_heads_total heads.  q/k/v, the gates and out are compact over the
+ * local heads; the conv/recurrent states and the per-channel weights span
+ * every head (GLM tensor-parallel head split). */
+int ds4_gpu_glm53_kda_decode_heads(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *conv_state,
+        ds4_gpu_tensor       *recurrent_state,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        const ds4_gpu_tensor *raw_gate,
+        const ds4_gpu_tensor *raw_beta,
+        const ds4_gpu_tensor *output_gate,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              q_conv_offset,
+        uint64_t              k_conv_offset,
+        uint64_t              v_conv_offset,
+        uint64_t              a_log_offset,
+        uint64_t              dt_bias_offset,
+        uint64_t              output_norm_offset,
+        uint32_t              n_heads,
+        uint32_t              n_rows,
+        float                 gate_lower_bound,
+        float                 norm_eps,
+        uint32_t              head0,
+        uint32_t              n_heads_total);
+
+/* ROCm: BF16 matvec/GEMM over columns [k_off, k_off + k_cnt) of a
+ * [out_dim][full_in_dim] matrix; x holds the k_cnt slice compactly. */
+int ds4_gpu_glm53_matmul_bf16_kslice(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              full_in_dim,
+        uint32_t              k_off,
+        uint32_t              k_cnt,
+        uint32_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_rows);
+
 int ds4_gpu_glm53_kda_prefill(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *conv_state,
