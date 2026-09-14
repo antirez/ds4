@@ -1,0 +1,8 @@
+# Online Softmax in Attention (Simple Variables)
+
+## The Problem
+
+Standard attention computes, for query `q`:
+
+```
+scores[i] = q ·

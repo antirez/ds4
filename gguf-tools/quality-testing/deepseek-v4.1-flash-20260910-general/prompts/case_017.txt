@@ -1,0 +1,1 @@
+Riassumi perche la decodifica speculativa puo mantenere l'output esatto.

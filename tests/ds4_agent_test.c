@@ -203,6 +203,60 @@ static void test_streaming_file_tools(void) {
     free(text);
 }
 
+static void test_shell_spawn(void) {
+    agent_worker w = {0};
+    pthread_mutex_init(&w.mu, NULL);
+    w.wake_fd[0] = w.wake_fd[1] = -1;
+    char err[256], cwd[PATH_MAX];
+    AGENT_TEST_ASSERT(getcwd(cwd, sizeof(cwd)) != NULL);
+    setenv("DS4_TEST_SHELL_ENV", "inherited", 1);
+    for (int closed_stdio = 0; closed_stdio <= 1; closed_stdio++) {
+        int saved[3];
+        if (closed_stdio) {
+            fflush(NULL);
+            for (int i = 0; i < 3; i++) {
+                saved[i] = fcntl(i, F_DUPFD_CLOEXEC, 3);
+                AGENT_TEST_ASSERT(saved[i] >= 0);
+                if (saved[i] < 0) exit(1);
+            }
+            for (int i = 0; i < 3; i++) close(i);
+        }
+        agent_bash_job *job = agent_bash_start(&w,
+            "read line || printf 'stdin-eof\\n'; pwd; "
+            "printf 'env=%s\\n' \"$DS4_TEST_SHELL_ENV\"; "
+            "printf 'stderr-captured\\n' >&2; sleep 0.1; exit 23",
+            5, err, sizeof(err));
+        bool group_ok = job && getpgid(job->pid) == job->pid;
+        double start = now_sec();
+        while (job && agent_bash_is_running(job) && now_sec() - start < 6)
+            usleep(10000);
+        bool finished = false;
+        char *obs = job ? agent_bash_observation(job, true, &finished) : NULL;
+        if (job) {
+            unlink(job->path);
+            agent_bash_remove_job(&w, job);
+        }
+        if (closed_stdio) {
+            for (int i = 0; i < 3; i++) {
+                if (dup2(saved[i], i) < 0) _exit(1);
+                close(saved[i]);
+            }
+        }
+        AGENT_TEST_ASSERT(group_ok && finished && obs);
+        if (obs) {
+            AGENT_TEST_ASSERT(strstr(obs, "exit_status=23"));
+            AGENT_TEST_ASSERT(strstr(obs, "stdin-eof"));
+            AGENT_TEST_ASSERT(strstr(obs, cwd));
+            AGENT_TEST_ASSERT(strstr(obs, "env=inherited"));
+            AGENT_TEST_ASSERT(strstr(obs, "stderr-captured"));
+        }
+        free(obs);
+    }
+    unsetenv("DS4_TEST_SHELL_ENV");
+    free(w.out);
+    pthread_mutex_destroy(&w.mu);
+}
+
 static void test_background_jobs(void) {
     agent_worker w = {0};
     pthread_mutex_init(&w.mu, NULL);
@@ -561,7 +615,7 @@ static void test_unicode_output_and_footer(void) {
     char queued[181];
     for (int i = 0; i < 60; i++) memcpy(queued + i * 3, "\xe4\xb8\xad", 3);
     queued[180] = 0;
-    agent_prompt_queue_push(&q, xstrdup(queued));
+    agent_prompt_queue_push(&q, queued);
     agent_status st = {0};
     char footer[4096];
     build_footer_text(&st, &q, 40, footer, sizeof(footer));
@@ -621,15 +675,16 @@ static void test_footer_only_updates(void) {
 }
 
 static void test_tool_contracts(void) {
-    for (int glm = 0; glm < 2; glm++) {
+    for (int glm = 0; glm < 3; glm++) {
         for (int vision = 0; vision < 2; vision++) {
-            char *prompt = glm ? agent_build_glm_tools_prompt(false, vision) :
+            char *prompt = glm == 2 ? agent_build_qwen_tools_prompt(false, vision) :
+                           glm ? agent_build_glm_tools_prompt(false, vision) :
                                  agent_build_dsml_tools_prompt(false, vision);
             AGENT_TEST_ASSERT((strstr(prompt, "view_image") != NULL) == vision);
             AGENT_TEST_ASSERT(strstr(prompt, "POSIX extended") && strstr(prompt, "128 KiB"));
             AGENT_TEST_ASSERT(strstr(prompt, "&amp;lt;/"));
             char name[64];
-            snprintf(name, sizeof(name), "prompt-%s-%d.txt", glm ? "glm" : "dsml", vision);
+            snprintf(name, sizeof(name), "prompt-%s-%d.txt", glm == 2 ? "qwen" : glm ? "glm" : "dsml", vision);
             test_fixture(name, prompt, strlen(prompt));
             free(prompt);
         }
@@ -741,14 +796,235 @@ static void test_compaction_boundaries(void) {
     AGENT_TEST_ASSERT(agent_compact_image_boundary(NULL, 0, false, 77) == 77);
 }
 
+static int test_v41_thinking(const char *model) {
+    ds4_engine_options opt = {.model_path = model, .backend = DS4_BACKEND_METAL,
+        .ssd_streaming = true, .ssd_streaming_cache_experts = 512,
+        .context_size = 256, .power_percent = 100};
+    agent_config cfg = {.gen = {.ctx_size = 256, .think_mode = DS4_THINK_HIGH}};
+    agent_worker w = {.cfg = &cfg, .initialized = true,
+        .wake_fd = {-1, -1}, .status = {.state = AGENT_WORKER_IDLE}};
+    pthread_mutex_init(&w.mu, NULL);
+    AGENT_TEST_ASSERT(ds4_engine_open(&w.engine, &opt) == 0);
+    if (!w.engine) return 1;
+    AGENT_TEST_ASSERT(ds4_session_create(&w.session, w.engine, 256) == 0);
+    if (!w.session) { ds4_engine_close(w.engine); return 1; }
+    /* Simulate a restored session whose effort differs from the CLI default. */
+    agent_numeric_think_prefix(w.engine, DS4_THINK_MAX, &w.transcript);
+    ds4_tokens suffix = {0};
+    ds4_tokenize_text(w.engine, "System text.\n\n", &suffix);
+    ds4_chat_append_message(w.engine, &suffix, "user", "Hello");
+    ds4_chat_append_message(w.engine, &suffix, "assistant", "Hello again.");
+    const int first_image_offset = w.transcript.len;
+    for (int i = 0; i < suffix.len; i++) ds4_tokens_push(&w.transcript, suffix.v[i]);
+    w.images = calloc(1, sizeof(*w.images));
+    w.image_count = 1;
+    w.images[0].token_start = (uint32_t)first_image_offset;
+    const int levels[] = {25, 0, 100, 1, 75, 75, 0};
+    for (size_t i = 0; i < sizeof(levels) / sizeof(*levels); i++) {
+        char err[160] = {0};
+        AGENT_TEST_ASSERT(ds4_session_sync(w.session, &w.transcript, err, sizeof(err)) == 0);
+        const int before = w.transcript.len;
+        w.requested_think = (ds4_think_mode)(DS4_THINK_LEVEL_BASE + levels[i]);
+        const bool changed = effective_think_mode(&cfg) != w.requested_think;
+        w.think_requested = true;
+        AGENT_TEST_ASSERT(!worker_is_idle(&w));
+        AGENT_TEST_ASSERT(!worker_submit(&w, "must wait"));
+        worker_apply_requested_think(&w);
+        AGENT_TEST_ASSERT(worker_is_idle(&w));
+        AGENT_TEST_ASSERT(ds4_session_pos(w.session) == (changed ? 0 : before));
+        ds4_tokens expected = {0};
+        agent_numeric_think_prefix(w.engine, w.requested_think, &expected);
+        AGENT_TEST_ASSERT(w.images[0].token_start == (uint32_t)expected.len);
+        for (int j = 0; j < suffix.len; j++) ds4_tokens_push(&expected, suffix.v[j]);
+        AGENT_TEST_ASSERT(w.transcript.len == expected.len &&
+                           ds4_tokens_starts_with(&w.transcript, &expected));
+        ds4_tokens_free(&expected);
+    }
+    cfg.gen.raw_prompt = true;
+    w.requested_think = DS4_THINK_MAX;
+    worker_apply_requested_think(&w);
+    AGENT_TEST_ASSERT(ds4_think_mode_level(cfg.gen.think_mode) == 0);
+    AGENT_TEST_ASSERT(strstr(w.out, "requires a V4.1 chat session"));
+    cfg.gen.raw_prompt = false;
+    while (w.transcript.len < 250) ds4_tokens_push(&w.transcript, ds4_token_eos(w.engine));
+    worker_apply_requested_think(&w);
+    AGENT_TEST_ASSERT(ds4_think_mode_level(cfg.gen.think_mode) == 0 && w.transcript.len == 250);
+    AGENT_TEST_ASSERT(strstr(w.out, "no context room"));
+    free(w.out); free(w.images);
+    ds4_tokens_free(&suffix); ds4_tokens_free(&w.transcript);
+    ds4_session_free(w.session); ds4_engine_close(w.engine);
+    pthread_mutex_destroy(&w.mu);
+    puts("V4.1 agent thinking levels, restored prefix, cache invalidation: done");
+    return agent_test_failures ? 1 : 0;
+}
+
+static void test_qwen_tool_syntax(void) {
+    const char text[] =
+        "<think>Plan.</think>\n<tool_call>\n<function=list>\n"
+        "<parameter=path>\n.\n</parameter>\n</function>\n</tool_call>";
+    for (size_t split = 0; split < sizeof(text); split++) {
+        char *first = xstrndup(text, split);
+        const char *chunks[] = {first, text + split};
+        agent_dsml_parser p;
+        char *out = agent_test_stream_capture(AGENT_TOOL_SYNTAX_QWEN, chunks, 2, &p, NULL);
+        AGENT_TEST_ASSERT(p.state == AGENT_DSML_DONE && p.calls.len == 1);
+        if (p.calls.len == 1) AGENT_TEST_ASSERT(!strcmp(p.calls.v[0].name, "list"));
+        free(first);
+        free(out);
+        agent_dsml_parser_free(&p);
+    }
+    AGENT_TEST_ASSERT(agent_syntax_is_xml_tool_call(AGENT_TOOL_SYNTAX_QWEN));
+    AGENT_TEST_ASSERT(agent_syntax_is_xml_tool_call(AGENT_TOOL_SYNTAX_GLM));
+    AGENT_TEST_ASSERT(!agent_syntax_is_xml_tool_call(AGENT_TOOL_SYNTAX_DSML41));
+    AGENT_TEST_ASSERT(!agent_syntax_is_xml_tool_call(AGENT_TOOL_SYNTAX_DSML));
+}
+
+static void test_v41_tool_syntax(void) {
+    const char text[] =
+        "<think>Plan.</think>\n\n<｜DSML｜ calls>\n"
+        "<｜DSML｜ invoke name=\"write\">\n"
+        "<｜DSML｜ parameter name=\"path\" string=\"true\">a.txt</｜DSML｜ parameter>\n"
+        "<｜DSML｜ parameter name=\"content\" string=\"true\">x </think> "
+        "&lt;/｜DSML｜ parameter> &amp;lt;/｜DSML｜ parameter></｜DSML｜ parameter>\n"
+        "</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"list\">\n"
+        "<｜DSML｜ parameter name=\"path\" string=\"true\">.</｜DSML｜ parameter>\n"
+        "</｜DSML｜ invoke>\n</｜DSML｜ calls>";
+    const char expected[] = "x </think> </｜DSML｜ parameter> &lt;/｜DSML｜ parameter>";
+    for (size_t split = 0; split < sizeof(text); split++) {
+        char *first = xstrndup(text, split);
+        const char *chunks[] = {first, text + split};
+        agent_dsml_parser p;
+        char *out = agent_test_stream_capture(AGENT_TOOL_SYNTAX_DSML41, chunks, 2, &p, NULL);
+        AGENT_TEST_ASSERT(p.state == AGENT_DSML_DONE && p.calls.len == 2);
+        if (p.state != AGENT_DSML_DONE || p.calls.len != 2) {
+            fprintf(stderr, "V4.1 split=%zu state=%d calls=%d error=%s raw=%s\n",
+                    split, p.state, p.calls.len, p.error, p.raw ? p.raw : "(none)");
+            free(first); free(out); agent_dsml_parser_free(&p);
+            break;
+        }
+        if (p.calls.len == 2) {
+            AGENT_TEST_ASSERT(!strcmp(p.calls.v[0].name, "write"));
+            AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&p.calls.v[0], "path"), "a.txt"));
+            AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&p.calls.v[0], "content"), expected));
+            AGENT_TEST_ASSERT(!strcmp(p.calls.v[1].name, "list"));
+        }
+        AGENT_TEST_ASSERT(!strstr(out, "<｜DSML｜ calls>"));
+        AGENT_TEST_ASSERT(p.raw && strstr(p.raw, "<｜DSML｜ calls>") == p.raw);
+        free(first); free(out); agent_dsml_parser_free(&p);
+    }
+    const char *inside[] = {"<think><｜DSML｜ calls><｜DSML｜ invoke name=\"list\">"
+        "</｜DSML｜ invoke></｜DSML｜ calls></think>Done"};
+    agent_dsml_parser p;
+    bool early = false;
+    char *out = agent_test_stream_capture(AGENT_TOOL_SYNTAX_DSML41, inside, 1, &p, &early);
+    AGENT_TEST_ASSERT(early && p.calls.len == 0 && strstr(out, "tool call ignored"));
+    free(out); agent_dsml_parser_free(&p);
+    for (int upto = 0; upto < 2; upto++) {
+        char *old = agent_build_dsml_tools_prompt(upto, false);
+        char *prompt = agent_dsml41_tools_prompt(old);
+        AGENT_TEST_ASSERT(strstr(prompt, "<｜DSML｜ calls>"));
+        AGENT_TEST_ASSERT(strstr(prompt, "&amp;lt;/｜DSML｜ parameter>"));
+        AGENT_TEST_ASSERT(!strstr(prompt, "｜DSML｜tool_calls") &&
+                           !strstr(prompt, "｜DSML｜invoke") &&
+                           !strstr(prompt, "｜DSML｜parameter"));
+        free(old); free(prompt);
+    }
+}
+
+/* Model-backed regression: save an unsynchronizable transcript, then rebuild
+ * it in a larger context using the normal stripped-session loader. */
+static int test_full_context_save(const char *model) {
+    ds4_engine_options opt = {.model_path = model, .backend = DS4_BACKEND_METAL,
+        .context_size = 512, .power_percent = 100};
+    agent_config cfg = {.gen = {.ctx_size = 256}, .non_interactive = true};
+    agent_worker w = {.cfg = &cfg, .initialized = true, .user_activity = true,
+        .wake_fd = {-1, -1}, .status = {.state = AGENT_WORKER_IDLE}};
+    pthread_mutex_init(&w.mu, NULL);
+    char dir[] = "/tmp/ds4-agent-full-save-XXXXXX";
+    AGENT_TEST_ASSERT(mkdtemp(dir) != NULL);
+    w.cache_dir = dir;
+    w.session_title = xstrdup("Full transcript recovery");
+    w.session_created_at = 123456;
+    AGENT_TEST_ASSERT(ds4_engine_open(&w.engine, &opt) == 0);
+    if (!w.engine) return 1;
+    ds4_tokens complete = {0};
+    ds4_chat_begin(w.engine, &complete);
+    for (int i = 0; i < 60; i++)
+        ds4_chat_append_message(w.engine, &complete, "user", "Explain the colors of a rainbow.");
+    AGENT_TEST_ASSERT(complete.len > 257);
+    for (int length = 256; length <= 257; length++) {
+        AGENT_TEST_ASSERT(ds4_session_create(&w.session, w.engine, 256) == 0);
+        if (!w.session) break;
+        ds4_tokens slice = complete;
+        slice.len = length;
+        ds4_tokens_copy(&w.transcript, &slice);
+        w.session_dirty = true;
+        char err[256] = {0}, sha[41];
+        int saved_tokens = 0;
+        AGENT_TEST_ASSERT(agent_worker_save_session_now(&w, sha, &saved_tokens, err, sizeof(err)));
+        AGENT_TEST_ASSERT(saved_tokens == length && !w.session_dirty);
+        AGENT_TEST_ASSERT(ds4_session_pos(w.session) == 0);
+        char *path = agent_kv_path_for_sha(dir, sha);
+        FILE *fp = fopen(path, "rb");
+        AGENT_TEST_ASSERT(fp != NULL);
+        if (!fp) { free(path); ds4_session_free(w.session); w.session = NULL; break; }
+        ds4_kvstore_entry hdr = {0};
+        uint32_t text_bytes = 0;
+        AGENT_TEST_ASSERT(ds4_kvstore_read_header(fp, &hdr, &text_bytes));
+        AGENT_TEST_ASSERT(hdr.payload_bytes == 0 && hdr.tokens == (uint32_t)length);
+        char *text = NULL, *title = NULL;
+        AGENT_TEST_ASSERT(agent_kv_read_text(fp, text_bytes, &text, err, sizeof(err)));
+        AGENT_TEST_ASSERT(agent_kv_read_title_trailer(fp, &hdr, &title, err, sizeof(err)));
+        AGENT_TEST_ASSERT(title && !strcmp(title, w.session_title));
+        fclose(fp);
+        size_t expected_len = 0;
+        char *expected = ds4_kvstore_render_tokens_text(w.engine, &w.transcript, &expected_len);
+        AGENT_TEST_ASSERT(text && expected && text_bytes == expected_len && !strcmp(text, expected));
+        free(expected); free(text); free(title);
+        ds4_session_free(w.session);
+        w.session = NULL;
+        AGENT_TEST_ASSERT(ds4_session_create(&w.session, w.engine, 512) == 0);
+        cfg.gen.ctx_size = 512;
+        ds4_tokens restored = {0};
+        agent_kv_session_meta meta = {0};
+        AGENT_TEST_ASSERT(agent_kv_load_path(&w, path, sha, NULL, 0, &restored, &meta, err, sizeof(err)));
+        AGENT_TEST_ASSERT(agent_tokens_equal(&w.transcript, &restored));
+        AGENT_TEST_ASSERT(meta.created_at == w.session_created_at && meta.title && !strcmp(meta.title, w.session_title));
+        ds4_token_score score;
+        AGENT_TEST_ASSERT(ds4_session_top_logprobs(w.session, &score, 1) == 1);
+        agent_kv_session_meta_free(&meta);
+        ds4_tokens_free(&restored);
+        ds4_tokens_free(&w.transcript);
+        ds4_session_free(w.session); w.session = NULL;
+        cfg.gen.ctx_size = 256;
+        unlink(path); free(path);
+    }
+    ds4_tokens_free(&complete);
+    ds4_engine_close(w.engine);
+    free(w.session_title);
+    pthread_mutex_destroy(&w.mu);
+    rmdir(dir);
+    return agent_test_failures ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
+    if (argc == 3 && !strcmp(argv[1], "--full-context-save")) return test_full_context_save(argv[2]);
+    if (argc == 3 && !strcmp(argv[1], "--think-fixture")) return test_v41_thinking(argv[2]);
     if (argc == 2 && !strcmp(argv[1], "--terminal-driver")) return test_terminal_driver();
     if (argc == 3 && !strcmp(argv[1], "--terminal-fixtures")) test_output_dir = argv[2];
+    char *options[] = {"ds4-agent", "--model", "qwen.gguf",
+                    "--vision", "mmproj.gguf", "--non-interactive", "-p", "test"};
+    agent_config cfg = parse_options((int)(sizeof(options) / sizeof(options[0])), options);
+    AGENT_TEST_ASSERT(cfg.engine.vision_path && !strcmp(cfg.engine.vision_path, "mmproj.gguf"));
+    AGENT_TEST_ASSERT(cfg.engine.model_path && !strcmp(cfg.engine.model_path, "qwen.gguf"));
     ds4_agent_unit_tests_run();
+    test_v41_tool_syntax();
+    test_qwen_tool_syntax();
     test_compaction_boundaries();
     test_observation_error_is_not_context_exhaustion();
     test_atomic_file_tools();
     test_streaming_file_tools();
+    test_shell_spawn();
     test_background_jobs();
     test_fragmented_terminal_input();
     test_shell_terminal_controls();

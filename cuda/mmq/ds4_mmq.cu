@@ -1269,7 +1269,8 @@ int ds4_mmq_moe_pair_impl(
         int64_t         soa_blocks = 0,
         /* ds4 (P3): see ds4_mmq_moe_impl. */
         bool            sanitize_out = true,
-        const ds4_mmq_fused_down *fused_down = nullptr) {
+        const ds4_mmq_fused_down *fused_down = nullptr,
+        bool allow_d2r = true) {
 
     const bool direct_gateup_q8 =
         fused_down != nullptr && fused_down->direct_gateup_q8;
@@ -1375,7 +1376,7 @@ int ds4_mmq_moe_pair_impl(
         if (fused_down->input_q8_scratch_bytes < nbytes_src1_q8_1) return -91;
         if (fused_down->q8_scratch_bytes < direct_down_q8_bytes) return -92;
         if (gateup_work_bytes == 0 || down_work_bytes == 0) return -93;
-        if (!d2r_enabled() || !d2r_iq2_enabled()) return -94;
+        if (!allow_d2r || !d2r_enabled() || !d2r_iq2_enabled()) return -94;
         if (ne_get_rows < d2r_min_cols()) return -95;
         if (!ds4_mmq_iq2_xxs_moe_d2r_available(cc) ||
             !ds4_mmq_q2_K_moe_d2r_available(cc)) {
@@ -1664,7 +1665,7 @@ int ds4_mmq_moe_pair_impl(
 
     bool gate_up_done = false;
     if (type == GGML_TYPE_IQ2_XXS && xa_soa != nullptr && xb_soa != nullptr &&
-        d2r_enabled() && d2r_iq2_enabled() && K % 256 == 0 &&
+        allow_d2r && d2r_enabled() && d2r_iq2_enabled() && K % 256 == 0 &&
         ne_get_rows >= d2r_min_cols()) {
         static int d2r_iq2_avail_cc = -1;
         static int d2r_iq2_avail = 0;
@@ -1833,7 +1834,7 @@ int ds4_mmq_moe_pair_impl(
             /*soa_blocks=*/fused_down->soa_blocks,
         };
         bool down_done = false;
-        if (fused_down->W_soa != nullptr && d2r_enabled() &&
+        if (fused_down->W_soa != nullptr && allow_d2r && d2r_enabled() &&
             ne_get_rows >= d2r_min_cols() &&
             ds4_mmq_q2_K_moe_d2r_available(cc)) {
             const size_t work_bytes =
@@ -1990,7 +1991,7 @@ extern "C" int ds4_mmq_iq2_xxs_q2_K_moe_fused_soa(
         float * gate, float * up, float * mid_f32, float * down,
         int expert_mid_dim, int expert_in_dim, int out_dim,
         int n_tokens, int n_experts, int n_expert_used,
-        float clamp, cudaStream_t stream) {
+        float clamp, int preserve_reduction, cudaStream_t stream) {
     if (expert_mid_dim <= 0 || expert_in_dim <= 0 || out_dim <= 0 ||
         n_tokens <= 0 || n_experts <= 0 || n_expert_used <= 0 ||
         n_expert_used > n_experts || expert_in_dim % 256 != 0 ||
@@ -2026,7 +2027,7 @@ extern "C" int ds4_mmq_iq2_xxs_q2_K_moe_fused_soa(
         expert_mid_dim, expert_in_dim, n_tokens, n_experts, n_expert_used,
         stream,
         (const char *)W_gate, (const char *)W_up, iq2_blocks,
-        /*sanitize_out=*/false, &fused_down);
+        /*sanitize_out=*/false, &fused_down, !preserve_reduction);
 }
 
 extern "C" int ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_scratch_sizes(

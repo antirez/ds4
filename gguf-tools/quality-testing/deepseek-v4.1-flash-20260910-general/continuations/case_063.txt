@@ -1,0 +1,6 @@
+# Race Condition Example in C
+
+A classic race condition occurs when multiple threads access shared data concurrently without proper synchronization.
+
+```c
+#include <pthread.h>

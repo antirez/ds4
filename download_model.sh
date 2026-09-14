@@ -5,7 +5,13 @@ GLM_UNSLOTH_REPO="unsloth/GLM-5.2-GGUF"
 GLM_ANTIREZ_REPO="antirez/GLM-5.2-GGUF"
 GLM53_REPO="antirez/glm-5.3-flash-gguf"
 GLM53_FULL_REPO="antirez/glm-5.3-gguf"
+QWEN38_REPO="antirez/qwen3.8-flash-next-gguf"
+QWEN38_MMPROJ_REPO="ggml-org/Qwen3.8-Flash-Next-GGUF"
 REPO="antirez/deepseek-v4-gguf"
+DS41_REPO="antirez/deepseek-v4.1-flash-gguf"
+DS41_Q2_FILE="DeepSeek-V4.1-Flash-Q2.gguf"
+DS41_Q4_FILE="DeepSeek-V4.1-Flash-Q4.gguf"
+DS41_VISION_FILE="DeepSeek-V4.1-Flash-Vision.gguf"
 DS4F_Q2_FILE="DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf"
 DS4F_Q4_FILE="DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf"
 DS4F_MXFP4_FILE="DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf"
@@ -30,6 +36,9 @@ GLM53_Q2_FILE="GLM-5.3-Flash-Q2.gguf"
 GLM53_Q4_FILE="GLM-5.3-Flash-Q4_K.gguf"
 GLM53_FP8_FILE="GLM-5.3-Flash-FP8.gguf"
 GLM53_VISION_FILE="GLM-5.3-Flash-Vision-Encoder.gguf"
+QWEN38_Q4_FILE="Qwen3.8-Flash-Next-Q4.gguf"
+QWEN38_Q2_FILE="Qwen3.8-Flash-Next-Q2.gguf"
+QWEN38_VISION_FILE="mmproj-Qwen3.8-Flash-Next-Q8_0.gguf"
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 OUT_DIR=${DS4_GGUF_DIR:-"$ROOT/gguf"}
@@ -54,6 +63,9 @@ Usage:
   ./download_model.sh ds4f-vision-mxfp4 [--token TOKEN]
   ./download_model.sh ds4f-vision-encoder [--token TOKEN]
   ./download_model.sh ds4f-vision-dspark [--token TOKEN]
+  ./download_model.sh ds41f-q2 [--token TOKEN]
+  ./download_model.sh ds41f-q4 [--token TOKEN]
+  ./download_model.sh ds41f-vision [--token TOKEN]
   ./download_model.sh pro-q2-imatrix [--token TOKEN]
   ./download_model.sh pro-q4-layers00-30 [--token TOKEN]
   ./download_model.sh pro-q4-layers31-output [--token TOKEN]
@@ -67,6 +79,9 @@ Usage:
   ./download_model.sh glm53-q4 [--token TOKEN]
   ./download_model.sh glm53-fp8 [--token TOKEN]
   ./download_model.sh glm53-vision [--token TOKEN]
+  ./download_model.sh qwen38-q2 [--token TOKEN]
+  ./download_model.sh qwen38-q4k [--token TOKEN]
+  ./download_model.sh qwen38-vision [--token TOKEN]
 
 Targets:
 
@@ -112,6 +127,21 @@ Targets:
   ds4f-vision-dspark
        Matching DSpark speculative decoding support for Vision Experimental,
        about 5.6 GiB. It is not compatible with the 0731 language checkpoint.
+
+  ds41f-q2
+       DeepSeek V4.1 Flash calibrated Q2, about 341 GiB on disk. Main weights
+       occupy 152 GiB; Engram tables stay on disk. Metal only: use SSD streaming
+       on one 128 GB Mac, tensor parallelism on two, or a larger resident Mac.
+
+  ds41f-vision
+       Matching V4.1 Flash vision encoder, about 0.9 GiB. Add --vision FILE
+       to the language-model command. Does not update ./ds4flash.gguf.
+
+  ds41f-q4
+       DeepSeek V4.1 Flash calibrated Q4, about 483 GiB on disk. Main weights
+       occupy 294 GiB; Engram tables stay on disk. Metal only: use SSD streaming
+       on smaller Macs or full residency on a 512 GB Mac. Downloads two parts
+       and joins them automatically; allow another 37 GiB of free disk space.
 
   pro-q2-imatrix
        DeepSeek V4 PRO 0813 q2 imatrix quant, as a single GGUF file. About
@@ -167,6 +197,25 @@ Targets:
        GLM 5.3 Flash vision encoder, about 1.1 GB on disk. Load it separately
        with --vision; this target does not update ./ds4flash.gguf.
 
+  qwen38-q2 (alias: qwen38-iq2)
+       Qwen3.8-Flash-Next Q2: one 137.10 GiB GGUF. Main/MTP weights
+       occupy 41.73 GiB; original BF16 n-grams stay on disk.
+       Imatrix IQ2_XXS gate/up and Q2_K down experts (640 logical inputs,
+       padded to 768 on disk), with higher-precision dense/control tensors.
+       Smaller option for 64 GB Macs: start with --ctx 8192 and
+       --prefill-chunk 1024. Context buffers need additional RAM.
+       Keep the file on a local SSD. Add --mtp for speculation.
+
+  qwen38-q4k
+       Qwen3.8-Flash-Next Q4: one 165.11 GiB GGUF. Main/MTP weights
+       occupy 69.74 GiB; original BF16 n-grams stay on disk.
+       Imatrix Q4_K gate/up and MXFP4 down routed experts. Fits 128 GB
+       Macs with room for context buffers. Add --mtp for speculation.
+
+  qwen38-vision
+       Qwen3.8-Flash-Next vision encoder, about 0.6 GB on disk. Load it
+       with --vision; this target does not update ./ds4flash.gguf.
+
 Options:
   --token TOKEN  Hugging Face token. Otherwise HF_TOKEN or the local HF token
                  cache is used if present.
@@ -182,10 +231,13 @@ Then the default commands work:
   ./ds4 -p "Hello"
   ./ds4-server --ctx 100000
 
+Qwen3.8 includes its n-grams and MTP; add --mtp to enable speculation:
+  ./ds4 --mtp
+
 After downloading DSpark support, enable it explicitly:
   ./ds4 --dspark --mtp-model <download directory>/$DS4F_DSPARK_FILE
 
-PRO and GLM files are downloaded with the official Hugging Face downloader
+PRO, V4.1, GLM and Qwen files use the official Hugging Face downloader
 because they are too large, sharded, or nested for the curl path used by the
 smaller DeepSeek Flash GGUF files.
 EOF
@@ -231,6 +283,22 @@ case "$MODEL" in
         ;;
     ds4f-vision-dspark)
         MODEL_FILE=$DS4F_VISION_DSPARK_FILE
+        FORCE_HF_DOWNLOAD=1
+        LINK_MODEL=0
+        ;;
+    ds41f-q2)
+        REPO=$DS41_REPO
+        MODEL_FILE=$DS41_Q2_FILE
+        FORCE_HF_DOWNLOAD=1
+        ;;
+    ds41f-q4)
+        REPO=$DS41_REPO
+        MODEL_FILE=$DS41_Q4_FILE
+        FORCE_HF_DOWNLOAD=1
+        ;;
+    ds41f-vision)
+        REPO=$DS41_REPO
+        MODEL_FILE=$DS41_VISION_FILE
         FORCE_HF_DOWNLOAD=1
         LINK_MODEL=0
         ;;
@@ -290,6 +358,22 @@ case "$MODEL" in
     glm53-vision)
         REPO=$GLM53_REPO
         MODEL_FILE=$GLM53_VISION_FILE
+        FORCE_HF_DOWNLOAD=1
+        LINK_MODEL=0
+        ;;
+    qwen38-q2|qwen38-iq2)
+        REPO=$QWEN38_REPO
+        MODEL_FILE=$QWEN38_Q2_FILE
+        FORCE_HF_DOWNLOAD=1
+        ;;
+    qwen38-q4k)
+        REPO=$QWEN38_REPO
+        MODEL_FILE=$QWEN38_Q4_FILE
+        FORCE_HF_DOWNLOAD=1
+        ;;
+    qwen38-vision)
+        REPO=$QWEN38_MMPROJ_REPO
+        MODEL_FILE=$QWEN38_VISION_FILE
         FORCE_HF_DOWNLOAD=1
         LINK_MODEL=0
         ;;
@@ -363,6 +447,59 @@ local_download_name() {
     fi
 }
 
+artifact_identity() {
+    case "$1" in
+        "$QWEN38_Q2_FILE")
+            expected_bytes=147207127040
+            expected_sha=b1b93fa69aca5f187b0fb813aca8f3ec1beb5cf8cf0bd38cf041b93e0b6ccac9
+            ;;
+        "$QWEN38_Q4_FILE")
+            expected_bytes=177280286720
+            expected_sha=680944460a8cbe93ba8b6d7b6107213ffb7e22320bd913000e563ca0a0f25a8a
+            ;;
+        "$DS41_Q2_FILE")
+            expected_bytes=365713686528
+            expected_sha=1ce6a8f8806205c13330d7ca287bd198331dc5ca35ccc5d8a9a92a188a6f6f42
+            ;;
+        "$DS41_Q4_FILE")
+            expected_bytes=518596067328
+            expected_sha=a5e2e2c3ada4b2e98d9f9e4b50f6d9c2a12c2c96f5da165c07e13aff9264984e
+            ;;
+        "$DS41_Q4_FILE.part1")
+            expected_bytes=480000000000
+            expected_sha=6442b1f9224079662c02003c0ef9ef6be6e2aff509510f681dab9e6cc41df246
+            ;;
+        "$DS41_Q4_FILE.part2")
+            expected_bytes=38596067328
+            expected_sha=7c3e10646c918eeaffbc39305a75ec96117450262c61454ff194cef00d7617f0
+            ;;
+        "$DS41_VISION_FILE")
+            expected_bytes=970555552
+            expected_sha=cc283f032b3e8b8d78aeb5fccaa14e97b859b0c53aae3cd6bffa690ddf0e9e15
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+verify_download() {
+    artifact_identity "$1" || return 0
+    if [ "$(wc -c < "$2")" -ne "$expected_bytes" ]; then
+        echo "Incorrect file size: $2. Move the incomplete file aside and retry." >&2
+        exit 1
+    fi
+    echo "Verifying SHA-256: $2"
+    if command -v sha256sum >/dev/null 2>&1; then
+        actual_sha=$(sha256sum < "$2")
+    else
+        actual_sha=$(shasum -a 256 < "$2")
+    fi
+    actual_sha=${actual_sha%% *}
+    if [ "$actual_sha" != "$expected_sha" ]; then
+        echo "Checksum mismatch: $2. The file was not accepted." >&2
+        exit 1
+    fi
+}
+
 download_one_hf() {
     file=$1
     local_file=$(local_download_name "$file")
@@ -373,6 +510,7 @@ download_one_hf() {
     mkdir -p "$(dirname "$out")"
 
     if [ -s "$out" ]; then
+        verify_download "$file" "$out"
         echo "Already downloaded: $out"
         return
     fi
@@ -412,6 +550,7 @@ download_one_hf() {
         echo "Hugging Face download finished but expected file is missing: $out" >&2
         exit 1
     fi
+    verify_download "$file" "$out"
 }
 
 download_one() {
@@ -453,7 +592,88 @@ download_one() {
     mv "$part" "$out"
 }
 
-if [ -n "$MODEL_FILES" ]; then
+download_ds41_q4() {
+    q4_out="$OUT_DIR/$DS41_Q4_FILE"
+    if [ -e "$q4_out" ]; then
+        verify_download "$DS41_Q4_FILE" "$q4_out"
+        echo "Already downloaded: $q4_out"
+        return
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "Joining the Q4 download requires Python 3." >&2
+        exit 1
+    fi
+    if [ ! -e "$q4_out.assembling" ]; then
+        download_one_hf "$DS41_Q4_FILE.part1"
+    fi
+    download_one_hf "$DS41_Q4_FILE.part2"
+    artifact_identity "$DS41_Q4_FILE"
+    q4_bytes=$expected_bytes
+    q4_sha=$expected_sha
+    artifact_identity "$DS41_Q4_FILE.part1"
+    python3 - "$q4_out" "$expected_bytes" "$q4_bytes" "$q4_sha" <<'PY'
+import fcntl
+import hashlib
+import os
+from pathlib import Path
+import shutil
+import sys
+
+out = Path(sys.argv[1])
+boundary, total = map(int, sys.argv[2:4])
+expected = sys.argv[4]
+first, second, pending = (Path(str(out) + suffix)
+                          for suffix in (".part1", ".part2", ".assembling"))
+
+def verify(path):
+    if path.stat().st_size != total:
+        sys.exit("Incorrect file size: " + str(path))
+    print("Verifying SHA-256: " + str(path), flush=True)
+    digest = hashlib.sha256()
+    with path.open("rb") as fp:
+        for block in iter(lambda: fp.read(16 << 20), b""):
+            digest.update(block)
+    if digest.hexdigest() != expected:
+        sys.exit("Checksum mismatch: " + str(path) +
+                 ". Move this file aside before retrying; it was not accepted.")
+
+# Keep this lock file: unlinking it could allow two different locks for the
+# same download. The first part becomes the output without a second full copy.
+with Path(str(pending) + ".lock").open("a") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    if out.exists():
+        verify(out)
+        sys.exit(0)
+    if not pending.exists():
+        if first.stat().st_size != boundary:
+            sys.exit("Incorrect file size: " + str(first))
+        first.rename(pending)
+    size = pending.stat().st_size
+    if not boundary <= size <= total:
+        sys.exit("Invalid partial assembly: " + str(pending) +
+                 ". Move it aside before retrying.")
+    if second.stat().st_size != total - boundary:
+        sys.exit("Incorrect file size: " + str(second))
+    # An interrupted append restarts only the smaller tail, never the prefix.
+    with pending.open("r+b") as dst:
+        dst.truncate(boundary)
+        dst.seek(boundary)
+        if shutil.disk_usage(out.parent).free < total - boundary + (1 << 30):
+            sys.exit("Not enough disk space to join Q4; keep the parts and retry.")
+        print("Joining Q4 download parts", flush=True)
+        with second.open("rb") as src:
+            shutil.copyfileobj(src, dst, 16 << 20)
+        dst.flush()
+        os.fsync(dst.fileno())
+    verify(pending)
+    pending.rename(out)
+    second.unlink()
+PY
+}
+
+if [ "$MODEL" = "ds41f-q4" ]; then
+    download_ds41_q4
+elif [ -n "$MODEL_FILES" ]; then
     for file in $MODEL_FILES; do
         download_one "$file"
     done
@@ -481,3 +701,15 @@ fi
 
 echo
 echo "Done."
+if [ "$MODEL" = qwen38-q2 ] || [ "$MODEL" = qwen38-iq2 ]; then
+    echo "Run with an 8K starting context:"
+    echo "  ./ds4 --ctx 8192 --prefill-chunk 1024"
+    echo "Add --mtp to enable speculation."
+elif [ "$MODEL" = qwen38-q4k ]; then
+    echo "Run ./ds4. Add --mtp to enable speculation."
+fi
+if [ "$MODEL" = qwen38-vision ]; then
+    echo
+    echo "Qwen3.8 vision encoder downloaded. Pass it with --vision, for example:"
+    printf '  ./ds4 --vision "%s/%s"\n' "$OUT_DIR" "$QWEN38_VISION_FILE"
+fi

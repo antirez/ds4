@@ -60,12 +60,12 @@ template [[host_name("kernel_cpy_f16_f16")]] kernel kernel_cpy_t kernel_cpy_t_t<
 // Contiguous 1D conversions avoid the generic tensor-index reconstruction
 // above. Packed vector types retain scalar alignment, so tensor views whose
 // offsets are float/half aligned do not need additional 16/8-byte alignment.
-// The final vector is converted element-by-element when n is not divisible by
-// four, preserving the generic kernel's bounds and conversion semantics.
+// Bind scalar pointers so Metal also accepts buffers containing fewer than
+// four elements. Vectorize only complete groups; the tail stays scalar.
 kernel void kernel_cpy_contig_f32_f16_4(
         constant uint & n,
-        device const packed_float4 * src,
-        device       packed_half4  * dst,
+        device const float * src,
+        device       half  * dst,
         uint gid [[thread_position_in_grid]]) {
     const uint i = gid * 4u;
     if (i >= n) {
@@ -74,22 +74,20 @@ kernel void kernel_cpy_contig_f32_f16_4(
 
     const uint remaining = n - i;
     if (remaining >= 4u) {
-        const float4 value = float4(src[gid]);
-        dst[gid] = packed_half4(half4(value));
+        const float4 value = float4(((device const packed_float4 *)src)[gid]);
+        ((device packed_half4 *)dst)[gid] = packed_half4(half4(value));
         return;
     }
 
-    device const float * src_scalar = (device const float *)src;
-    device       half  * dst_scalar = (device       half  *)dst;
     for (uint lane = 0; lane < remaining; ++lane) {
-        dst_scalar[i + lane] = half(src_scalar[i + lane]);
+        dst[i + lane] = half(src[i + lane]);
     }
 }
 
 kernel void kernel_cpy_contig_f16_f32_4(
         constant uint & n,
-        device const packed_half4  * src,
-        device       packed_float4 * dst,
+        device const half  * src,
+        device       float * dst,
         uint gid [[thread_position_in_grid]]) {
     const uint i = gid * 4u;
     if (i >= n) {
@@ -98,15 +96,13 @@ kernel void kernel_cpy_contig_f16_f32_4(
 
     const uint remaining = n - i;
     if (remaining >= 4u) {
-        const half4 value = half4(src[gid]);
-        dst[gid] = packed_float4(float4(value));
+        const half4 value = half4(((device const packed_half4 *)src)[gid]);
+        ((device packed_float4 *)dst)[gid] = packed_float4(float4(value));
         return;
     }
 
-    device const half  * src_scalar = (device const half  *)src;
-    device       float * dst_scalar = (device       float *)dst;
     for (uint lane = 0; lane < remaining; ++lane) {
-        dst_scalar[i + lane] = float(src_scalar[i + lane]);
+        dst[i + lane] = float(src[i + lane]);
     }
 }
 
@@ -114,8 +110,8 @@ kernel void kernel_cpy_contig_f16_f32_4(
 // payloads and every other binary16 encoding pass through unchanged.
 kernel void kernel_cpy_contig_f16_f16_bits_4(
         constant uint & n,
-        device const packed_ushort4 * src,
-        device       packed_ushort4 * dst,
+        device const ushort * src,
+        device       ushort * dst,
         uint gid [[thread_position_in_grid]]) {
     const uint i = gid * 4u;
     if (i >= n) {
@@ -124,14 +120,12 @@ kernel void kernel_cpy_contig_f16_f16_bits_4(
 
     const uint remaining = n - i;
     if (remaining >= 4u) {
-        dst[gid] = src[gid];
+        ((device packed_ushort4 *)dst)[gid] = ((device const packed_ushort4 *)src)[gid];
         return;
     }
 
-    device const ushort * src_scalar = (device const ushort *)src;
-    device       ushort * dst_scalar = (device       ushort *)dst;
     for (uint lane = 0; lane < remaining; ++lane) {
-        dst_scalar[i + lane] = src_scalar[i + lane];
+        dst[i + lane] = src[i + lane];
     }
 }
 

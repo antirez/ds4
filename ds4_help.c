@@ -196,7 +196,7 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
             opt(fp, c, "--dspark-confidence F", "DSpark confidence pruning threshold 0..1.");
         }
         opt(fp, c, "--quality", "Prefer exact kernels where faster approximate paths exist.");
-        opt(fp, c, "--warm-weights", "Touch mapped tensor pages at startup to reduce first-use stalls.");
+        opt(fp, c, "--warm-weights", "Touch resident weights at startup to reduce first-use stalls.");
         if (tool == DS4_HELP_DS4 || tool == DS4_HELP_BENCH) {
             opt(fp, c, "--expert-profile FILE", "Metal-only: write routed expert locality/cache simulation JSON.");
         }
@@ -204,7 +204,7 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     fputc('\n', fp);
 }
 
-static void print_sampling(FILE *fp, const help_colors *c, bool full) {
+static void print_sampling(FILE *fp, const help_colors *c, bool full, ds4_help_tool tool) {
     title(fp, c, "Prompt And Sampling");
     opt(fp, c, "-n, --tokens N", "Maximum generated tokens.");
     opt(fp, c, "--temp F", "Sampling temperature. 0 is greedy/deterministic.");
@@ -212,8 +212,10 @@ static void print_sampling(FILE *fp, const help_colors *c, bool full) {
     opt(fp, c, "--min-p F", "Keep tokens scoring at least F times the top token.");
     opt(fp, c, "--seed N", "Sampling seed for reproducible non-greedy runs.");
     para(fp, c, "GLM CLI and agent runs default to temperature 1.0, top-p 0.95, and min-p 0 unless those options are set explicitly.");
-    opt(fp, c, "--think", "Use normal thinking mode.");
-    opt(fp, c, "--think-max", "Use Think Max when context is large enough.");
+    opt(fp, c, "--think", "Use normal thinking mode (V4.1: effort 75).");
+    opt(fp, c, "--think-max", "Use maximum thinking (V4.1: 100; V4: requires ctx >= 393216).");
+    if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT)
+        opt(fp, c, "--think-level N", "V4.1 thinking effort, 1..100; 0 disables thinking.");
     opt(fp, c, "--nothink", "Disable thinking and ask for direct replies.");
     if (full) {
         opt(fp, c, "-sys, --system TEXT", "System prompt. Empty string disables the default where supported.");
@@ -300,7 +302,7 @@ static void print_cli_diagnostics(FILE *fp, const help_colors *c) {
 static void print_cli_commands(FILE *fp, const help_colors *c) {
     title_red(fp, c, "Interactive Commands");
     opt(fp, c, "/help", "Show interactive commands.");
-    opt(fp, c, "/think, /think-max, /nothink", "Switch thinking mode.");
+    opt(fp, c, "/think [N], /think-max, /nothink", "Switch thinking mode; V4.1 accepts effort 0..100.");
     opt(fp, c, "/ctx N", "Restart the interactive session with a new context size.");
     opt(fp, c, "/power N", "Set GPU duty cycle percentage, 1..100.");
     opt(fp, c, "/read FILE", "Submit a text file, PNG, or JPEG as the next user message.");
@@ -333,6 +335,7 @@ static void print_agent_sessions(FILE *fp, const help_colors *c) {
     opt(fp, c, "/strip ID", "Remove KV payload; the text history can be rebuilt later.");
     opt(fp, c, "/history [N]", "Show N recent user turns from the current session.");
     opt(fp, c, "/hints on|off", "Enable or disable brief programming hints. New and resumed sessions start off.");
+    opt(fp, c, "/think [N]", "V4.1: set effort 0..100 (default 75) after this turn; rebuilds the prefix.");
     opt(fp, c, "/power N", "Set GPU duty cycle percentage, 1..100.");
     opt(fp, c, "/new", "Start a fresh session from the system prompt.");
     opt(fp, c, "/quit, /exit", "Exit.");
@@ -528,7 +531,7 @@ static void print_examples(FILE *fp, const help_colors *c, ds4_help_tool tool, c
 static void print_topic(FILE *fp, const help_colors *c, ds4_help_tool tool, const char *topic) {
     if (streq(topic, "all")) {
         print_model_runtime(fp, c, tool, true);
-        if (tool_has_topic(tool, "sampling")) print_sampling(fp, c, true);
+        if (tool_has_topic(tool, "sampling")) print_sampling(fp, c, true, tool);
         if (tool_has_topic(tool, "steering")) print_steering(fp, c);
         print_distributed(fp, c);
         if (tool == DS4_HELP_DS4) {
@@ -550,7 +553,7 @@ static void print_topic(FILE *fp, const help_colors *c, ds4_help_tool tool, cons
     }
 
     if (streq(topic, "runtime")) print_model_runtime(fp, c, tool, true);
-    else if (streq(topic, "sampling")) print_sampling(fp, c, true);
+    else if (streq(topic, "sampling")) print_sampling(fp, c, true, tool);
     else if (streq(topic, "steering")) print_steering(fp, c);
     else if (streq(topic, "distributed")) print_distributed(fp, c);
     else if (tool == DS4_HELP_DS4 && streq(topic, "diagnostics")) print_cli_diagnostics(fp, c);
@@ -575,7 +578,7 @@ static void print_default(FILE *fp, const help_colors *c, ds4_help_tool tool) {
 
     if (tool == DS4_HELP_DS4) {
         print_cli_specific(fp, c, true);
-        print_sampling(fp, c, false);
+        print_sampling(fp, c, false, tool);
     } else if (tool == DS4_HELP_SERVER) {
         print_server_api(fp, c);
         print_kv_cache(fp, c);

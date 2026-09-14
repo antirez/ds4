@@ -43,6 +43,107 @@ path, including pipeline execution for models too large for one host.
 
 To build weights rather than download them, see [GGUF tools](../gguf-tools/README.md).
 
+## DeepSeek V4.1 Flash
+
+V4.1 Flash text and vision inference work on Metal. CUDA supports text with
+Q2 SSD streaming on one Spark or resident shards across two Sparks. It needs its own
+GGUF, tokenizer and inference graph; V4 Flash weights and DSpark support files
+are not interchangeable with it.
+
+| Target | File size | Main weights |
+| --- | ---: | ---: |
+| `ds41f-q2` | 341 GiB | 152 GiB |
+| `ds41f-q4` | 483 GiB | 294 GiB |
+
+Both use imatrix-calibrated routed experts and include 189 GiB of Engram
+tables. Engram rows are read directly from the file as needed in every mode,
+never loaded as a resident table. Keep the GGUF on a fast local SSD.
+
+On one 128 GB Mac, use SSD streaming. Leave the expert cache budget automatic:
+
+```sh
+./download_model.sh ds41f-q2
+./ds4 -m gguf/DeepSeek-V4.1-Flash-Q2.gguf \
+  --ssd-streaming --ctx 32768
+```
+
+Use `ds4-agent` or `ds4-server` with the same model and memory options.
+On a DGX Spark, add `--cuda`; see the [Spark guide](DGX_SPARK.md#deepseek-v41-flash).
+`--think-level 25` sets reasoning effort explicitly; the range is 1 to 100,
+with 0 disabling thinking. `/think 25` changes it in the CLI or native agent.
+`--think` selects 75 and `--think-max` selects 100.
+
+For two 128 GB Macs or Sparks, follow the [TP/RDMA setup](DISTRIBUTED.md), passing this
+GGUF with `-m` on both ranks and omitting `--ssd-streaming`. Each rank holds
+about 81 GiB of main weights, plus context and runtime buffers. Both machines
+need the complete GGUF on disk. A 256 GB or larger Mac can instead hold all
+main weights; full residency has been tested on an M3 Ultra with 512 GB.
+
+Q4 needs SSD streaming on smaller Macs, or a 512 GB Mac for full residency.
+It does not fit resident TP across two 128 GB Macs. Download it with
+`./download_model.sh ds41f-q4` and select `gguf/DeepSeek-V4.1-Flash-Q4.gguf`.
+The download comes in two parts; the script joins and verifies them automatically.
+Allow another 37 GiB of free disk space while joining. Rerun the command to resume an
+interrupted download or join.
+
+Large SSD prefills process layers in wide batches. Metal overlaps computation
+with the next layer's reads; CUDA stages experts into its bounded device cache.
+Short appends keep using the expert cache.
+Resident and TP inference also batch continued prefills automatically.
+
+For concurrent serving, see [session batching](SERVER.md#multiple-sessions).
+Each slot needs its own context memory; start with `--ctx 4096` before
+increasing both context and slot count. CUDA Q2 SSD mode batches up to eight
+decode rows; CUDA network TP currently serves sessions in order. DSpark,
+pipeline execution and ROCm are not implemented for V4.1; vision requires Metal.
+
+Scalar, batched and tensor-parallel execution are not numerically identical.
+Q4 batched prefill shows a small probability-score loss on the short official
+continuation test, with unchanged overall top-token agreement. See the
+[QA results](../QA_BEFORE_RELEASES.md#17-deepseek-v41-flash) for details
+and remaining differences.
+
+For images, download the matching encoder and add it to the same command:
+
+```sh
+./download_model.sh ds41f-vision
+./ds4-agent -m gguf/DeepSeek-V4.1-Flash-Q2.gguf \
+  --ssd-streaming --vision gguf/DeepSeek-V4.1-Flash-Vision.gguf
+```
+
+Vision works with SSD streaming, full residency and two-Mac TP. Pass the encoder
+on both TP ranks. Use `/read image.png` in `ds4`, `view_image` in `ds4-agent`,
+or the [server image API](SERVER.md#images). V4 Flash vision encoders do not
+work with V4.1. See [conversion](../gguf-tools/README.md#convert-deepseek-v41-flash)
+to build the GGUFs from safetensors.
+
+## Qwen3.8 Flash Next
+
+`./download_model.sh qwen38-q2` downloads one **137.10 GiB** GGUF: 41.73 GiB
+of main/MTP weights and 95.37 GiB of original BF16 n-grams kept on disk.
+Its gate/up experts use IQ2_XXS; down experts use Q2_K with 640 logical inputs
+padded to 768 in the weight file. It replaces the larger MXFP4-down IQ2 release.
+For 64 GB Macs, start at 8K context with a 1,024-token prefill chunk; runtime
+allocations add to the main weights, but the n-gram table is not mapped or
+preloaded. Keep the GGUF on a fast local SSD.
+The larger `qwen38-q4k` target uses 165.11 GiB on disk and 69.74 GiB for
+resident weights, before runtime buffers.
+This model runs on Metal.
+The script links `ds4flash.gguf` to the combined GGUF:
+
+```sh
+./ds4 --ctx 8192 --prefill-chunk 1024
+```
+
+Add `--mtp` for speculation; no second file is needed.
+See [Qwen setup](QWEN38_FLASH_NEXT.md)
+for memory, conversion, vision, and sampling details.
+
+Vision uses a separate encoder. `./download_model.sh qwen38-vision` downloads
+llama.cpp's Q8_0 mmproj from
+[ggml-org/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/ggml-org/Qwen3.8-Flash-Next-GGUF);
+pass it at runtime with `--vision`.
+
 ## GLM 5.3 Flash
 
 | Target | Approximate file size | Use |
@@ -100,6 +201,7 @@ Directional steering is supported for GLM 5.3, not GLM 5.2.
 
 PNG and JPEG input works in the CLI, native agent, and HTTP server on Metal,
 single-GPU CUDA, and ROCm. The encoder must match the model.
+V4.1 Flash vision is currently Metal-only; its setup is [above](#deepseek-v41-flash).
 
 ### DeepSeek Flash Vision Experimental
 
@@ -132,3 +234,17 @@ be saved with `/save`.
 For two-Mac TP, pass the same encoder on both ranks. The coordinator encodes
 the image and sends the projected visual tokens to the worker.
 For HTTP image formats and limits, see [serving](SERVER.md#images).
+
+### Qwen3.8 Flash Next
+
+The text GGUF stays the same. Download and add the encoder explicitly:
+
+```sh
+./download_model.sh qwen38-vision
+./ds4 --mtp \
+  --vision gguf/mmproj-Qwen3.8-Flash-Next-Q8_0.gguf
+```
+
+The encoder is llama.cpp's Q8_0 mmproj conversion of the model's Qwen3-VL
+tower. Use `/read image.png` in `ds4` or `image_url` parts over HTTP; see
+[Qwen setup](QWEN38_FLASH_NEXT.md) for image limits and resize behavior.

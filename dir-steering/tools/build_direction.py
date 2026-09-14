@@ -10,6 +10,8 @@ At runtime ds4 applies:
 Positive scale suppresses the target direction.  Negative scale amplifies it.
 """
 
+from __future__ import annotations
+
 import argparse
 import array
 import json
@@ -23,6 +25,7 @@ from pathlib import Path
 MODEL_PROFILES = {
     "deepseek-v4-flash": (43, 4096),
     "glm-5.3-flash": (45, 4096),
+    "qwen3.8-flash-next": (48, 2560),
 }
 
 
@@ -72,6 +75,7 @@ def run_capture(
     env["DS4_METAL_GRAPH_DUMP_PREFIX"] = str(dump_prefix)
     env["DS4_METAL_GRAPH_DUMP_NAME"] = component
     env["DS4_METAL_GRAPH_DUMP_POS"] = "0"
+    env["DS4_QWEN4_PREFILL_CHUNK"] = str(max(ctx, 1024))
 
     cmd = [
         str(ds4),
@@ -79,10 +83,11 @@ def run_capture(
         "--ctx", str(ctx),
         "--prompt-file", str(prompt_path),
         "-n", "1",
+        "--prefill-chunk", str(max(ctx, 1024)),
     ]
     if system:
         cmd += ["--system", system]
-    cmd.append("--think-high" if think else "--nothink")
+    cmd.append("--think" if think else "--nothink")
     result = subprocess.run(cmd, cwd=ds4.parent, env=env, check=False,
                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     if result.returncode != 0:
@@ -128,7 +133,7 @@ def main() -> None:
     ap.add_argument("--system", default="You are a helpful assistant.")
     ap.add_argument("--component", default="ffn_out",
                     choices=("ffn_out", "attn_out"),
-                    help="runtime-editable 4096-wide activation stream")
+                    help="runtime-editable activation stream at the profile's embedding width")
     ap.add_argument("--think", action="store_true",
                     help="capture after <think>; default captures direct answers")
     ap.add_argument("--pair-normalize", action="store_true",

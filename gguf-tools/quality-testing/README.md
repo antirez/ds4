@@ -154,6 +154,71 @@ Use `data/flash/manifest.tsv` for Flash GGUFs and
 care which model produced the manifest; the manifest path selects the
 continuation set.
 
+Add `--continued-prefill N` to process each prompt in two calls, leaving its
+last `N` tokens for the second call. This checks continued-prefill quality
+against the same official answers. Every prompt must contain more than `N`
+tokens; otherwise the scorer fails instead of silently skipping the test.
+
+Add `--session-batch N` (2 to 8) to score an official continuation alongside
+unrelated, independently advancing sessions. The scorer rotates their row
+order on every step. Compare against a run without this option using the same
+manifest, model and context; budget memory for all `N` sessions.
+
+Check session isolation separately on a dedicated Metal host:
+
+```sh
+DS4_TEST_MODEL=MODEL.gguf DS4_TEST_BATCH_ISOLATION=1 \
+  DS4_TEST_SESSION_COUNT=4 DS4_TEST_DECODE_STEPS=32 \
+  MTL_DEBUG_LAYER=1 ./tests/test_metal_session_batch
+```
+
+This requires exact logits when companion prompts and row order change, then
+checks a continued prefill and resumed serial decoding. It also checks that
+invalid batches leave the target unchanged. It does not replace serial/batch
+quality comparisons: different arithmetic can round differently without
+sessions contaminating one another. Use `DS4_TEST_PROMPT_FILE` and
+`DS4_TEST_CONTEXT_SIZE` to repeat at longer prefixes. For physical TP, the test
+also accepts `DS4_TEST_TP_RDMA_DEVICE` and `DS4_TEST_TP_GID_INDEX` alongside
+its coordinator/worker settings. Throughput measurements must run separately
+without Metal API validation.
+
+For Metal V4.1 prefill scheduling changes, also run:
+
+```sh
+make tests/test_deepseek41_prefill
+./tests/test_deepseek41_prefill --dispatch
+MTL_DEBUG_LAYER=1 ./tests/test_deepseek41_prefill MODEL.gguf speed-bench/promessi_sposi.txt
+```
+
+The model test uses SSD streaming and two 128K sessions. Run it alone on a
+dedicated host with at least 128 GiB RAM. It alternates small and large appends
+through 113K context, checking dispatch, progress, unchanged-prefix reuse,
+saved state and subsequent decoding against a control without decoder deferral.
+Keep the official continuation checks too: this scheduling test does not judge
+quality across different floating-point operation orders. Measure speed without
+Metal API validation, separately for initial and continued prefills.
+
+Run the same mixed-prefix test over physical RDMA on two dedicated Metal hosts.
+Start the worker with the same model and a 131072-token context, then the test
+on the coordinator (replace the host and RDMA device names):
+
+```sh
+# Worker
+MTL_DEBUG_LAYER=1 ./ds4 -m MODEL.gguf --ctx 131072 \
+  --tensor-parallel --role worker --coordinator COORDINATOR 19455 \
+  --transport rdma --rdma-device WORKER_DEVICE --rdma-gid-index 1
+
+# Coordinator
+MTL_DEBUG_LAYER=1 ./tests/test_deepseek41_prefill --tensor-parallel \
+  MODEL.gguf speed-bench/promessi_sposi.txt COORDINATOR 19455 COORDINATOR_DEVICE 1
+```
+
+This compares equal TP prefill partitions and queued versus synchronous decode,
+including full logits and cache state. TP snapshots rebuild both ranks from
+tokens, so restoration is compared with an equivalent fresh replay. Also run
+the official scorer in TP mode for initial and continued prompts; scheduling
+parity alone does not establish model quality.
+
 Add `--quality` to disable DS4's speed-oriented numerical shortcuts. For an
 independent llama.cpp comparison of a DeepSeek V4 GGUF, use the same manifest
 and the token-identical DS4 prompt renderer:

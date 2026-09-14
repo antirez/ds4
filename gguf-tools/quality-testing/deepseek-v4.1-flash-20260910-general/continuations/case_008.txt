@@ -1,0 +1,1 @@
+The counterintuitive part is that prefill processes *many* tokens at once while decode processes *one*, yet prefill often achieves far higher throughput (t

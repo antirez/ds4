@@ -1,0 +1,5 @@
+# TCP Echo Server — Design for Slow Clients
+
+## Goal
+Accept TCP connections, echo bytes back, and prevent slow or stalled clients from exhausting server resources.
+
