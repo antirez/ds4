@@ -650,10 +650,44 @@ static int ds4_rocm_tp_stage_grow(uint64_t bytes) {
     return 1;
 }
 
+static uint64_t ds4_rocm_tp_big_gate_kick_impl(uint32_t layer, uint32_t rows,
+                                               const ds4_gpu_tensor *out_t,
+                                               ds4_gpu_tensor *in_t,
+                                               uint64_t bytes, int encode_wait);
+
+/* Kick without the release wait: the caller encodes independent work and
+ * then ds4_gpu_tp_big_gate_wait_encode() before touching in_t.  No other
+ * big gate may be kicked in between (single staging buffer). */
+extern "C" uint64_t ds4_gpu_tp_big_gate_kick_nowait(uint32_t layer, uint32_t rows,
+                                                    const ds4_gpu_tensor *out_t,
+                                                    ds4_gpu_tensor *in_t,
+                                                    uint64_t bytes) {
+    return ds4_rocm_tp_big_gate_kick_impl(layer, rows, out_t, in_t, bytes, 0);
+}
+
+extern "C" int ds4_gpu_tp_big_gate_wait_encode(uint64_t seq, ds4_gpu_tensor *in_t,
+                                               uint64_t bytes) {
+    if (seq == 0u || g_tp_failed || !in_t || bytes == 0u || (bytes & 3ull) != 0ull) return 0;
+    tp_big_gate_wait_kernel<<<1, 256>>>(
+            (volatile unsigned long long *)g_tp_big_release_dev,
+            (unsigned long long)(seq & ROCM_TP_SEQ_MASK),
+            (const float *)g_tp_stage_in_dev,
+            (float *)in_t->ptr,
+            bytes / 4ull);
+    return cuda_ok(cudaGetLastError(), "tp big gate wait encode");
+}
+
 extern "C" uint64_t ds4_gpu_tp_big_gate_kick(uint32_t layer, uint32_t rows,
                                   const ds4_gpu_tensor *out_t,
                                   ds4_gpu_tensor *in_t,
                                   uint64_t bytes) {
+    return ds4_rocm_tp_big_gate_kick_impl(layer, rows, out_t, in_t, bytes, 1);
+}
+
+static uint64_t ds4_rocm_tp_big_gate_kick_impl(uint32_t layer, uint32_t rows,
+                                               const ds4_gpu_tensor *out_t,
+                                               ds4_gpu_tensor *in_t,
+                                               uint64_t bytes, int encode_wait) {
     if (!g_tp_thread_running || g_tp_failed || !out_t || !in_t || bytes == 0u) {
         return 0;
     }
@@ -684,6 +718,7 @@ extern "C" uint64_t ds4_gpu_tp_big_gate_kick(uint32_t layer, uint32_t rows,
     req.big_bytes = bytes;
     req.event_idx = ev;
     if (!ds4_rocm_tp_enqueue(&req)) return 0;
+    if (!encode_wait) return seq;
     tp_big_gate_wait_kernel<<<1, 256>>>(
             (volatile unsigned long long *)g_tp_big_release_dev,
             (unsigned long long)(seq & ROCM_TP_SEQ_MASK),

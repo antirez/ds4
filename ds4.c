@@ -47857,6 +47857,35 @@ static bool glm_graph_tp_batch_bounce_ready(ds4_glm_gpu_graph *g,
     return g->tp_bounce_out && g->tp_bounce_in;
 }
 
+#ifdef DS4_ROCM_BUILD
+/* Two-step combine for the batch FFN: kick the swap of the routed partials,
+ * let the caller encode the shared expert, then wait and add. */
+static uint64_t glm_graph_tp_batch_ffn_kick(ds4_glm_gpu_graph *g,
+                                            uint32_t           il,
+                                            uint32_t           n_tokens) {
+    const uint64_t bytes = (uint64_t)n_tokens * DS4_N_EMBD * sizeof(float);
+    if (!g->tp_bounce_out || !g->tp_bounce_in) return 0;
+    if (getenv("DS4_GLM_ABLATE_COMBINE")) return UINT64_MAX; /* timing probe: no exchange */
+    return ds4_gpu_tp_big_gate_kick_nowait(il, n_tokens, g->tp_bounce_out,
+                                           g->tp_bounce_in, bytes);
+}
+
+static bool glm_graph_tp_batch_ffn_finish(ds4_glm_gpu_graph *g,
+                                          ds4_gpu_tensor    *ffn_out,
+                                          uint32_t           n_tokens,
+                                          uint64_t           seq) {
+    const uint64_t bytes = (uint64_t)n_tokens * DS4_N_EMBD * sizeof(float);
+    if (seq == 0u) return false;
+    if (seq == UINT64_MAX) {
+        return ds4_gpu_add_tensor(ffn_out, g->tp_bounce_out, g->tp_bounce_out,
+                                  (uint32_t)((uint64_t)n_tokens * DS4_N_EMBD)) != 0;
+    }
+    if (!ds4_gpu_tp_big_gate_wait_encode(seq, g->tp_bounce_in, bytes)) return false;
+    return ds4_gpu_add_tensor(ffn_out, g->tp_bounce_out, g->tp_bounce_in,
+                              (uint32_t)((uint64_t)n_tokens * DS4_N_EMBD)) != 0;
+}
+#endif
+
 static bool glm_graph_tp_batch_ffn_combine(
         ds4_glm_gpu_graph *g,
         uint32_t           il,
@@ -50374,6 +50403,25 @@ static bool glm_graph_encode_ffn_batch(
             (uint32_t)g->ffn_mid_elems,
             full_layer_prefill,
             false) != 0;
+#ifdef DS4_ROCM_BUILD
+    /* Kick the routed-partial swap now and encode the shared expert while
+     * the CPUs exchange; the wait + add follow the shared expert. */
+    uint64_t tp_batch_seq = 0;
+    bool tp_batch_pending = false;
+    if (ok && g->tp_world == 2 && !shared_done) {
+        tp_batch_seq = glm_graph_tp_batch_ffn_kick(g, il, n_tokens);
+        tp_batch_pending = tp_batch_seq != 0u;
+        if (!tp_batch_pending) {
+            ok = false;
+            fprintf(stderr, "ds4: GLM TP batch gate kick failed (layer %u)\n", il);
+        }
+    }
+    if (ok && tp_batch_pending) {
+        DS4_GLM_ENCODE_FFN_BATCH_SHARED();
+        if (ok) ok = glm_graph_tp_batch_ffn_finish(g, g->batch_ffn_out, n_tokens, tp_batch_seq);
+        if (!ok) fprintf(stderr, "ds4: GLM TP batch gate failed (layer %u)\n", il);
+    } else
+#endif
     if (ok && g->tp_world == 2) {
         ok = glm_graph_tp_batch_ffn_combine(g, il, g->batch_ffn_out, n_tokens);
         if (!ok) fprintf(stderr, "ds4: GLM TP batch gate failed (layer %u)\n", il);

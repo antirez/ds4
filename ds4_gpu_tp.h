@@ -82,6 +82,14 @@ uint64_t ds4_gpu_tp_big_gate_kick(uint32_t layer, uint32_t rows,
                                   ds4_gpu_tensor *in_t,
                                   uint64_t bytes);
 int ds4_gpu_tp_big_gate_wait(uint64_t seq);
+/* ROCm: kick a big gate without its release wait and encode the wait
+ * (staged peer rows -> in_t) later, so independent work can be encoded in
+ * between; no other big gate may be kicked before the wait. */
+uint64_t ds4_gpu_tp_big_gate_kick_nowait(uint32_t layer, uint32_t rows,
+                                         const ds4_gpu_tensor *out_t,
+                                         ds4_gpu_tensor *in_t,
+                                         uint64_t bytes);
+int ds4_gpu_tp_big_gate_wait_encode(uint64_t seq, ds4_gpu_tensor *in_t, uint64_t bytes);
 
 
 #ifdef __cplusplus
