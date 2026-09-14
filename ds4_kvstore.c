@@ -573,7 +573,7 @@ static int kv_lz4_writer_close(void *cookie) {
             kv_le_put64(hdr, w->uncompressed_total);
             ds4_kvstore_le_put32(hdr + 8, w->chunk_count);
             if (fwrite(hdr, 1, sizeof(hdr), w->out) != sizeof(hdr) ||
-                fseeko(w->out, 0, SEEK_END) != 0)
+                fseeko(w->out, after, SEEK_SET) != 0)
             {
                 w->err = true;
             }
@@ -655,6 +655,8 @@ typedef struct {
 
     uint64_t payload_bytes; /* on-disk payload budget remaining (compressed) */
     uint64_t uncompressed_total;
+    uint64_t raw_seen;      /* raw bytes accepted so far; must reach uncompressed_total */
+    uint32_t alloc_size;    /* scratch size: min(chunk_size, uncompressed_total) */
     uint32_t chunk_count;
     uint32_t chunks_consumed;
     bool framing_read;
@@ -701,7 +703,14 @@ static void kv_lz4_reader_fill_batch(kv_lz4_reader *r) {
         }
         uint32_t raw = ds4_kvstore_le_get32(lens);
         uint32_t comp = ds4_kvstore_le_get32(lens + 4);
-        if (raw == 0 || raw > r->chunk_size || comp == 0 ||
+        /* Only the final chunk may be short, so every earlier one is full. */
+        const bool final_chunk =
+            (r->chunks_consumed + (uint32_t)n + 1u == r->chunk_count);
+        if (raw > r->alloc_size ||
+            (!final_chunk && raw != r->chunk_size) ||
+            r->raw_seen + (uint64_t)raw > r->uncompressed_total ||
+            (final_chunk && r->raw_seen + (uint64_t)raw != r->uncompressed_total) ||
+            raw == 0 || raw > r->chunk_size || comp == 0 ||
             comp > (uint32_t)r->comp_capacity ||
             r->payload_bytes < sizeof(lens) + (uint64_t)comp ||
             fread(r->comp[n], 1, comp, r->in) != comp)
@@ -710,6 +719,7 @@ static void kv_lz4_reader_fill_batch(kv_lz4_reader *r) {
             return;
         }
         r->payload_bytes -= sizeof(lens) + (uint64_t)comp;
+        r->raw_seen += (uint64_t)raw;
         r->raw_sizes[n] = raw;
         r->comp_sizes[n] = comp;
         n++;
@@ -723,6 +733,7 @@ static void kv_lz4_reader_fill_batch(kv_lz4_reader *r) {
         return;
     }
     if (n == 0) return;
+    if (n > 64) { r->err = true; return; }   /* jobs[] capacity */
     kv_lz4_job jobs[64];
     for (int i = 0; i < n; i++) {
         jobs[i] = (kv_lz4_job){
@@ -813,6 +824,24 @@ FILE *kv_lz4_reader_open(FILE *in, uint64_t payload_bytes,
     r->batch_cap = n_workers;
     r->comp_capacity = comp_bound;
     r->payload_bytes = payload_bytes;
+    /* Read the framing before allocating anything: the scratch is sized from
+     * the header's chunk size, so a tiny region claiming the maximum chunk
+     * would otherwise reserve gigabytes before a single payload byte is
+     * checked. */
+    if (!kv_lz4_reader_read_framing(r)) goto fail;
+    if (uncompressed_total_out) *uncompressed_total_out = r->uncompressed_total;
+    /* Each chunk record costs at least its 8-byte length pair, so the region
+     * itself bounds how many chunks can be real. */
+    if ((uint64_t)r->chunk_count * 8u > r->payload_bytes) goto fail;
+    /* No chunk can exceed the declared total, so size the scratch by whichever
+     * of the two is smaller. */
+    r->alloc_size = chunk_size;
+    if (r->uncompressed_total > 0 && r->uncompressed_total < (uint64_t)chunk_size)
+        r->alloc_size = (uint32_t)r->uncompressed_total;
+    if (r->alloc_size == 0) r->alloc_size = 1;
+    comp_bound = LZ4_compressBound((int)r->alloc_size);
+    if (comp_bound <= 0) goto fail;
+    r->comp_capacity = comp_bound;
     r->raw = calloc((size_t)n_workers, sizeof(uint8_t *));
     r->comp = calloc((size_t)n_workers, sizeof(uint8_t *));
     r->shuf = calloc((size_t)n_workers, sizeof(uint8_t *));
@@ -820,14 +849,10 @@ FILE *kv_lz4_reader_open(FILE *in, uint64_t payload_bytes,
     r->comp_sizes = calloc((size_t)n_workers, sizeof(uint32_t));
     if (!r->raw || !r->comp || !r->shuf || !r->raw_sizes || !r->comp_sizes) goto fail;
     for (int i = 0; i < n_workers; i++) {
-        r->raw[i] = malloc(chunk_size);
+        r->raw[i] = malloc(r->alloc_size);
         r->comp[i] = malloc((size_t)comp_bound);
-        r->shuf[i] = malloc(chunk_size);
+        r->shuf[i] = malloc(r->alloc_size);
         if (!r->raw[i] || !r->comp[i] || !r->shuf[i]) goto fail;
-    }
-    if (uncompressed_total_out) {
-        if (!kv_lz4_reader_read_framing(r)) goto fail;
-        *uncompressed_total_out = r->uncompressed_total;
     }
     FILE *fp = kv_lz4_fwrap_open(r, "rb",
                                  NULL, kv_lz4_reader_read, kv_lz4_reader_close);
