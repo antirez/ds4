@@ -13379,7 +13379,11 @@ decode_again:
                 break;
             }
         }
-        if (kept < ntok && !text_stop && !job_cancelled(j) && strcmp(finish, "error")) {
+        if (completion >= max_tokens ||
+            ds4_session_pos(slot->session) >= ds4_session_ctx(slot->session)) {
+            stop_decode = true;
+        }
+        if (!stop_decode && kept < ntok && !text_stop && !job_cancelled(j) && strcmp(finish, "error")) {
             /* Logits after a rewind belong to the discarded suffix. Re-eval
              * the last kept token before sampling under a different mode. */
             int pos = block_start + kept - (resample ? 1 : 0);
@@ -13392,7 +13396,23 @@ decode_again:
                             kept, ntok - kept, resample);
             }
         }
-        if (stop_decode) break;
+        if (stop_decode) {
+            /* Speculative decode commits a whole block, so a stop token can
+             * leave accepted-but-unreported draft tokens past the boundary.
+             * Rewind unconditionally rather than only on engines with a
+             * rollback frontier: leaving the drafts in place lets a live
+             * tool-result continuation append after a token the client never
+             * saw.  DeepSeek has no frontier and invalidates its checkpoint
+             * here, which costs one rebuild on the next request. */
+            if (kept < ntok && !text_stop && !job_cancelled(j) &&
+                strcmp(finish, "error")) {
+                int pos = block_start + kept;
+                pthread_mutex_lock(&s->inference_mu);
+                ds4_session_rewind(slot->session, pos);
+                pthread_mutex_unlock(&s->inference_mu);
+            }
+            break;
+        }
     }
     server_generation_leave(s);
 
