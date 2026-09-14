@@ -354,7 +354,81 @@ static void check_speculative_distribution(void) {
            (double)counts[2] / trials);
 }
 
+static int masked_sample(const float *logits, uint32_t n, float temperature,
+                          int top_k, const uint32_t *allow, size_t allow_words,
+                          const uint32_t *deny, size_t deny_words) {
+    uint64_t rng = 1;
+    return ds4_test_sample_logits_masked(logits, n, temperature, top_k, 1, 0,
+                                         allow, allow_words, deny, deny_words,
+                                         &rng, NULL);
+}
+
+static void check_masked_sampling(void) {
+    const float logits[] = {NAN, INFINITY, -INFINITY, 2, 2, -2.0e30f, -1.5e30f};
+    const uint32_t all = 0x7f, none = 0, nonfinite = 7;
+    const uint32_t low = 0x60, deny_best = 0x18;
+    for (int mode = 0; mode < 3; mode++) {
+        float temperature = mode == 0 ? 0 : 1;
+        int top_k = mode == 2 ? 2 : 0;
+        CHECK(masked_sample(logits, 7, temperature, top_k, &none, 1, NULL, 0) == -1,
+              "empty allow mask mode=%d", mode);
+        CHECK(masked_sample(logits, 7, temperature, top_k, &all, 1, &all, 1) == -1,
+              "empty allow/deny intersection mode=%d", mode);
+        CHECK(masked_sample(logits, 7, temperature, top_k, &nonfinite, 1, NULL, 0) == -1,
+              "nonfinite-only mask mode=%d", mode);
+        int token = masked_sample(logits, 7, temperature, top_k, &all, 1, NULL, 0);
+        CHECK(token == 3 || token == 4, "skip nonfinite logits mode=%d token=%d", mode, token);
+        CHECK(masked_sample(logits, 7, temperature, top_k, &all, 1, &deny_best, 1) == 6,
+              "finite logits below sentinel mode=%d", mode);
+    }
+    CHECK(masked_sample(logits, 7, 0, 0, &all, 1, NULL, 0) == 3,
+          "masked greedy tie selects first allowed token");
+    CHECK(masked_sample(logits, 7, 0, 0, &low, 1, NULL, 0) == 6,
+          "masked greedy below sentinel selects maximum");
+    CHECK(masked_sample(logits, 7, 0, 0, &all, 0, NULL, 0) == -1,
+          "zero-length allow mask");
+
+    float wide[35] = {0};
+    const uint32_t allow[] = {UINT32_C(1) << 2, 3}; /* Tokens 2, 32, 33. */
+    const uint32_t deny[] = {UINT32_C(1) << 2, 1};
+    wide[2] = 10; wide[32] = 20; wide[33] = 30;
+    CHECK(masked_sample(wide, 35, 0, 0, allow, 2, deny, 2) == 33,
+          "allow/deny masks across word boundary");
+    CHECK(masked_sample(wide, 35, 0, 0, allow, 1, NULL, 0) == 2,
+          "short allow mask excludes later words");
+    CHECK(masked_sample(wide, 35, 0, 0, allow, 2, deny, 1) == 33,
+          "short deny mask leaves later words available");
+    const uint32_t tail_only[] = {0, UINT32_C(1) << 31};
+    CHECK(masked_sample(wide, 35, 0, 0, tail_only, 2, NULL, 0) == -1,
+          "padding bits cannot select tokens outside vocabulary");
+
+    /* Compare constrained sampling with an independent sampler over just the
+     * allowed finite candidates, including top-k, top-p, and min-p filtering. */
+    const int ids[] = {2, 32, 33};
+    const float compact[] = {0.5f, 1.0f, 1.5f};
+    for (int i = 0; i < 35; i++) wide[i] = 1000; /* Forbidden high logits. */
+    for (int i = 0; i < 3; i++) wide[ids[i]] = compact[i];
+    float scratch[35] = {0};
+    for (int top_k = 0; top_k <= 3; top_k++) {
+        for (int filtered = 0; filtered <= 1; filtered++) {
+            float top_p = filtered ? 0.8f : 1.0f;
+            float min_p = filtered ? 0.2f : 0.0f;
+            for (uint64_t seed = 1; seed <= 200; seed++) {
+                uint64_t reference_rng = seed, actual_rng = seed;
+                int expected = reference_sample(compact, 3, 0.8f, top_k,
+                                                 top_p, min_p, &reference_rng);
+                int actual = ds4_test_sample_logits_masked(wide, 35, 0.8f,
+                    top_k, top_p, min_p, allow, 2, NULL, 0, &actual_rng, scratch);
+                CHECK(actual == ids[expected] && actual_rng == reference_rng,
+                      "masked distribution top_k=%d filters=%d seed=%llu token=%d expected=%d",
+                      top_k, filtered, (unsigned long long)seed, actual, ids[expected]);
+            }
+        }
+    }
+}
+
 int main(void) {
+    check_masked_sampling();
     check_speculative_distribution();
     const uint32_t semantic_n = 4096;
     float *logits = malloc((size_t)semantic_n * sizeof(*logits));

@@ -84,5 +84,8 @@ __pycache__/
 .*.swp
 .DS_Store
 
+/.llguidance-config
+/.llguidance-config.tmp
+/tests/test_llguidance
 /tests/test_qwen4_conv_parallel
 /tests/test_q8_prefill_variants
