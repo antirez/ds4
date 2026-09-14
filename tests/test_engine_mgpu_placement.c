@@ -73,6 +73,18 @@ size_t ds4_test_compute_entry_bytes_sum_with_prefill(
                                          uint32_t prefill_chunk);
 uint32_t ds4_test_effective_prefill_chunk(bool cuda_tensor_parallel,
                                           uint32_t requested_chunk);
+int ds4_test_streaming_prefill_chunk_path(
+                                          bool ssd_streaming,
+                                          bool quality,
+                                          bool imatrix,
+                                          bool short_decode_allowed,
+                                          uint32_t start,
+                                          uint32_t pos0,
+                                          uint32_t chunk,
+                                          uint32_t remaining,
+                                          uint32_t prefill_cap,
+                                          uint32_t boundary_max,
+                                          uint32_t short_max);
 uint32_t ds4_test_planner_prefill_cap(int prompt_len,
                                       uint32_t prefill_chunk);
 uint32_t ds4_test_planner_raw_cap(int ctx_size, uint32_t prefill_cap);
@@ -703,6 +715,101 @@ static void test_cuda_tp_output_head_moves_to_lower_half(void) {
     restore_env_value("DS4_METAL_PREFILL_CHUNK", old_chunk);
 }
 
+static void test_streaming_prefill_chunk_policy(void) {
+    enum {
+        PATH_LAYER_MAJOR = 0,
+        PATH_BOUNDARY = 1,
+        PATH_SHORT = 2,
+    };
+
+#define PATH(ssd, quality, imatrix, short_ok, start, pos, chunk, remaining, cap, bmax, smax) \
+    ds4_test_streaming_prefill_chunk_path(                                                \
+        (ssd), (quality), (imatrix), (short_ok), (start), (pos), (chunk), (remaining),    \
+        (cap), (bmax), (smax))
+
+    /*
+     * A resumed continuation can contain a short fragment up to the next
+     * prefill-cap boundary followed by an independently short aligned tail:
+     *
+     *   24351 --225--> 24576 --23--> 24599
+     *
+     * The first fragment uses the boundary-head path.  After alignment, the
+     * tail is re-evaluated against the ordinary short-prefill threshold.
+     */
+    CHECK(PATH(true, false, false, true,
+               24351, 24351, 225, 248, 4096, 320, 96) == PATH_BOUNDARY,
+          "225-token boundary head uses boundary decode-prefill");
+
+    CHECK(PATH(true, false, false, true,
+               24351, 24576, 23, 23, 4096, 320, 96) == PATH_SHORT,
+          "23-token aligned tail re-enters short decode-prefill");
+
+    /* Boundary threshold edges. */
+    CHECK(PATH(true, false, false, true,
+               24351, 24351, 225, 248, 4096, 224, 96) == PATH_LAYER_MAJOR,
+          "225-token head is rejected when boundary max is 224");
+
+    CHECK(PATH(true, false, false, true,
+               24351, 24351, 225, 248, 4096, 225, 96) == PATH_BOUNDARY,
+          "225-token head is accepted at exact boundary max");
+
+    CHECK(PATH(true, false, false, true,
+               24351, 24351, 225, 248, 4096, 0, 96) == PATH_LAYER_MAJOR,
+          "zero boundary max disables boundary optimization");
+
+    /* Ordinary short-prefill threshold edges. */
+    CHECK(PATH(true, false, false, true,
+               24351, 24576, 95, 95, 4096, 320, 96) == PATH_SHORT,
+          "95-token aligned tail uses short decode-prefill");
+
+    CHECK(PATH(true, false, false, true,
+               24351, 24576, 96, 96, 4096, 320, 96) == PATH_SHORT,
+          "96-token aligned tail uses short decode-prefill");
+
+    CHECK(PATH(true, false, false, true,
+               24351, 24576, 97, 97, 4096, 320, 96) == PATH_LAYER_MAJOR,
+          "97-token aligned tail remains layer-major");
+
+    /*
+     * Loop-level short-tail optimization is continuation-only.  Cold short
+     * prefills are handled by the existing whole-range fast path before
+     * chunking, so a cold long-prompt tail remains layer-major here.
+     */
+    CHECK(PATH(true, false, false, false,
+               0, 4096, 23, 23, 4096, 320, 96) == PATH_LAYER_MAJOR,
+          "cold chunk tail remains layer-major");
+
+    CHECK(PATH(true, false, false, true,
+               0, 4096, 23, 23, 4096, 320, 96) == PATH_SHORT,
+          "classifier short path remains independently testable");
+
+    /* Safety gates preserved from production policy. */
+    CHECK(PATH(false, false, false, true,
+               24351, 24351, 225, 248, 4096, 320, 96) == PATH_LAYER_MAJOR,
+          "non-streaming execution rejects decode-style optimization");
+
+    CHECK(PATH(true, true, false, true,
+               24351, 24351, 225, 248, 4096, 320, 96) == PATH_LAYER_MAJOR,
+          "quality mode rejects decode-style optimization");
+
+    CHECK(PATH(true, false, true, true,
+               24351, 24351, 225, 248, 4096, 320, 96) == PATH_LAYER_MAJOR,
+          "imatrix execution rejects decode-style optimization");
+
+    /*
+     * Boundary optimization is continuation-only and first-chunk-only.
+     */
+    CHECK(PATH(true, false, false, true,
+               0, 3871, 225, 248, 4096, 320, 96) == PATH_LAYER_MAJOR,
+          "cold prefill cannot use continuation boundary path");
+
+    CHECK(PATH(true, false, false, true,
+               20000, 24351, 225, 248, 4096, 320, 96) == PATH_LAYER_MAJOR,
+          "later chunk cannot masquerade as boundary head");
+
+#undef PATH
+}
+
 int main(void) {
     test_tensor_to_entry();
     test_null_config();
@@ -717,6 +824,7 @@ int main(void) {
     test_glm_memory_guard_budget();
     test_cuda_tp_prefill_default_accounting();
     test_cuda_tp_output_head_moves_to_lower_half();
+    test_streaming_prefill_chunk_policy();
 
     fprintf(stderr, "\ntest_engine_mgpu_placement: %d/%d checks passed (%d failed)\n",
             g_checks - g_failures, g_checks, g_failures);
