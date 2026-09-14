@@ -11305,11 +11305,19 @@ static void trace_write_cache_diag(
     }
 }
 
+/* Return the rewind target, or -1 when no live rewind applies.  *full_prefix
+ * reports that the whole prompt is already cached, so the caller is handing the
+ * final prompt token back to the sampler. */
 static int live_prefix_rewind_target(bool backend_can_rewind,
-                                     int old_pos, int prompt_len, int common) {
-    if (!backend_can_rewind || prompt_len <= 1 || prompt_len >= old_pos) return -1;
-    if (common != prompt_len) return -1;
-    return prompt_len - 1;
+                                     int old_pos, int prompt_len, int common,
+                                     bool *full_prefix) {
+    if (full_prefix) *full_prefix = false;
+    if (!backend_can_rewind || common <= 1 || common >= old_pos) return -1;
+    if (common == prompt_len) {
+        if (full_prefix) *full_prefix = true;
+        return prompt_len - 1;
+    }
+    return common;
 }
 
 static void trace_time(FILE *fp) {
@@ -12670,9 +12678,10 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                    "Anthropic continuation state is not available; retry by replaying the full messages history");
         return;
     } else if (cached == 0 && live_vision_match) {
+        bool full_prefix = false;
         const int rewind_to = live_prefix_rewind_target(
-            ds4_engine_is_glm_dsa(s->engine), old_pos,
-            j->req.prompt.len, common);
+            ds4_engine_can_rewind(s->engine), old_pos,
+            j->req.prompt.len, common, &full_prefix);
         if (rewind_to >= 0) {
             pthread_mutex_lock(&s->inference_mu);
             ds4_session_rewind(slot->session, rewind_to);
@@ -12689,11 +12698,14 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                 cache_source = "memory-rewind";
                 cache_diag.rewind_to = rewind_to;
                 server_log(DS4_LOG_KVCACHE,
-                           "ds4-server: rewound GLM live prefix from %d to %d; final prompt token will be reevaluated",
-                           old_pos, rewind_to);
+                           "ds4-server: rewound live prefix from %d to %d; %s",
+                           old_pos, rewind_to,
+                           full_prefix ?
+                               "final prompt token will be reevaluated" :
+                               "suffix tokens will be evaluated");
             } else {
                 server_log(DS4_LOG_KVCACHE,
-                           "ds4-server: GLM live prefix rewind from %d to %d requires rebuild",
+                           "ds4-server: live prefix rewind from %d to %d requires rebuild",
                            old_pos, rewind_to);
             }
         } else {
@@ -18867,12 +18879,17 @@ static void test_model_metadata_clamps_completion_to_context(void) {
 }
 
 static void test_live_prefix_rewind_target(void) {
-    TEST_ASSERT(live_prefix_rewind_target(true, 17, 8, 8) == 7);
-    TEST_ASSERT(live_prefix_rewind_target(true, 49826, 48379, 48379) == 48378);
-    TEST_ASSERT(live_prefix_rewind_target(false, 17, 8, 8) == -1);
-    TEST_ASSERT(live_prefix_rewind_target(true, 17, 8, 7) == -1);
-    TEST_ASSERT(live_prefix_rewind_target(true, 8, 8, 8) == -1);
-    TEST_ASSERT(live_prefix_rewind_target(true, 17, 1, 1) == -1);
+    bool full = false;
+    TEST_ASSERT(live_prefix_rewind_target(true, 17, 8, 8, &full) == 7 && full);
+    TEST_ASSERT(live_prefix_rewind_target(true, 49826, 48379, 48379, &full) == 48378 && full);
+    TEST_ASSERT(live_prefix_rewind_target(false, 17, 8, 8, &full) == -1 && !full);
+    TEST_ASSERT(live_prefix_rewind_target(true, 17, 8, 7, &full) == 7 && !full);
+    TEST_ASSERT(live_prefix_rewind_target(true, 165755, 4977, 4973, &full) == 4973 && !full);
+    TEST_ASSERT(live_prefix_rewind_target(true, 8, 8, 8, &full) == -1 && !full);
+    TEST_ASSERT(live_prefix_rewind_target(true, 17, 1, 1, &full) == -1 && !full);
+    /* The out-parameter is optional: callers that only need the target pass NULL. */
+    TEST_ASSERT(live_prefix_rewind_target(true, 17, 8, 8, NULL) == 7);
+    TEST_ASSERT(live_prefix_rewind_target(false, 17, 8, 8, NULL) == -1);
 }
 
 static void test_client_socket_nonblocking_flag(void) {

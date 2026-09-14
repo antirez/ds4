@@ -67115,6 +67115,15 @@ bool ds4_engine_is_glm53(ds4_engine *e) {
     return ds4_model_is_glm53();
 }
 
+bool ds4_engine_can_rewind(ds4_engine *e) {
+    if (!e) return false;
+    /* GLM engines keep a rollback frontier.  Metal DSpark snapshots are not
+     * reusable from ds4_session_rewind() yet, so admitting them here would
+     * drop the checkpoint and force the very rebuild this helper exists to
+     * avoid; enable them once that path can restore its state. */
+    return ds4_engine_is_glm_dsa(e) || ds4_engine_is_glm53(e);
+}
+
 /* Decode gate firing schedule for the TP transport (see ds4_tp_identity).
  * Resident GLM splits attention and FFN on sparse layers. Streaming keeps
  * attention replicated and exchanges only the routed FFN partial. */
@@ -78731,6 +78740,8 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     }
     bool state_ok = false;
 #ifndef DS4_NO_GPU
+    /* This block only knows how to roll back GLM state; the glm53/MTP calls
+     * below are meaningless for other engines. */
     if (s->checkpoint_valid && ds4_session_is_glm(s)) {
         state_ok = !s->glm_graph.glm53 || ds4_session_glm_mtp_rewind(s, pos);
     }
