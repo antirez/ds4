@@ -728,6 +728,84 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     return cuda_ok(cudaGetLastError(), "matmul_q8_0 launch");
 }
 
+/* Up to three Q8_0 matrices that share one input (the GLM KDA q/k/v
+ * projections): quantize the input once and cover all rows with a single
+ * launch, each block finding its matrix from the row prefix sums.  Saves
+ * two quantize and two matvec launches per KDA layer. */
+typedef struct {
+    const unsigned char *w[3];
+    float *out[3];
+    uint32_t rows[3];
+    uint32_t n;
+} ds4_rocm_q8_multi;
+
+__global__ static void matmul_q8_0_preq_multi_w32_kernel(
+        ds4_rocm_q8_multi m,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t blocks,
+        uint32_t rows_per_block) {
+    uint32_t row = blockIdx.x * rows_per_block + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    uint32_t seg = 0;
+    while (seg < m.n && row >= m.rows[seg]) {
+        row -= m.rows[seg];
+        seg++;
+    }
+    if (seg >= m.n) return;
+    const unsigned char *wr = m.w[seg] + (uint64_t)row * blocks * 34u;
+    float acc = 0.0f;
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        const unsigned char *blk = wr + b * 34u;
+        const int dot = dot_i8x32_dp4a((const int8_t *)(blk + 2u), xq + b * 32u);
+        acc += __half2float(*(const __half *)blk) * xscale[b] * (float)dot;
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0u) m.out[seg][row] = acc;
+}
+
+extern "C" int ds4_gpu_matmul_q8_0_multi_tensor(
+        ds4_gpu_tensor *const *outs,
+        const uint64_t *weight_offsets,
+        uint32_t n,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        const ds4_gpu_tensor *x) {
+    if (!outs || !weight_offsets || !x || !model_map || n == 0u || n > 3u ||
+        in_dim == 0u || (in_dim & 31u) != 0u || out_dim == 0u || out_dim > UINT32_MAX ||
+        x->bytes < in_dim * sizeof(float)) return 0;
+    const uint64_t blocks = in_dim / 32u;
+    const uint64_t weight_bytes = out_dim * blocks * 34u;
+    ds4_rocm_q8_multi m;
+    memset(&m, 0, sizeof(m));
+    for (uint32_t i = 0; i < n; i++) {
+        if (!outs[i] || outs[i]->bytes < out_dim * sizeof(float) ||
+            weight_offsets[i] > model_size || weight_bytes > model_size - weight_offsets[i]) return 0;
+        m.w[i] = (const unsigned char *)cuda_model_range_ptr(model_map, weight_offsets[i],
+                                                             weight_bytes, "q8_0 multi");
+        if (!m.w[i]) return 0;
+        m.out[i] = (float *)outs[i]->ptr;
+        m.rows[i] = (uint32_t)out_dim;
+    }
+    m.n = n;
+    const uint64_t xq_bytes = blocks * 32u;
+    const uint64_t scale_off = (xq_bytes + 15u) & ~15ull;
+    void *tmp = cuda_tmp_alloc(scale_off + blocks * sizeof(float), "q8_0 multi prequant");
+    if (!tmp) return 0;
+    int8_t *xq = (int8_t *)tmp;
+    float *xscale = (float *)((char *)tmp + scale_off);
+    quantize_q8_0_f32_kernel<<<(unsigned)blocks, 32>>>(xq, xscale, (const float *)x->ptr,
+                                                        in_dim, blocks);
+    if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 multi quantize launch")) return 0;
+    const uint32_t rpb = cuda_runtime_config()->q8_decode_rpb;
+    const uint64_t total = (uint64_t)n * out_dim;
+    matmul_q8_0_preq_multi_w32_kernel<<<(unsigned)((total + rpb - 1u) / rpb), rpb * 32u>>>(
+            m, xq, xscale, blocks, rpb);
+    return cuda_ok(cudaGetLastError(), "matmul_q8_0 multi launch");
+}
+
 extern "C" int ds4_gpu_matmul_q8_0_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
     return cuda_matmul_q8_0_tensor_labeled(out, model_map, model_size, weight_offset,
                                            in_dim, out_dim, x, n_tok, "q8_0");

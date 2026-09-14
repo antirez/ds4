@@ -43840,6 +43840,7 @@ typedef struct ds4_glm_gpu_graph {
     ds4_gpu_tensor *kda_k;
     ds4_gpu_tensor *kda_v;
     ds4_gpu_tensor *kda_lowrank;
+    ds4_gpu_tensor *kda_lowrank_g;   /* g_a output when fused with f_a/beta (ROCm) */
     ds4_gpu_tensor *kda_raw_gate;
     ds4_gpu_tensor *kda_raw_beta;
     ds4_gpu_tensor *kda_output_gate;
@@ -45833,6 +45834,7 @@ static void glm_graph_free(ds4_glm_gpu_graph *g) {
     ds4_gpu_tensor_free(g->kda_raw_beta);
     ds4_gpu_tensor_free(g->kda_raw_gate);
     ds4_gpu_tensor_free(g->kda_lowrank);
+    ds4_gpu_tensor_free(g->kda_lowrank_g);
     ds4_gpu_tensor_free(g->kda_v);
     ds4_gpu_tensor_free(g->kda_k);
     ds4_gpu_tensor_free(g->kda_q);
@@ -46218,6 +46220,8 @@ static bool glm_graph_alloc_slice(
         DS4_GLM_GRAPH_ALLOC_TENSOR(g->kda_k, kda_projection_bytes);
         DS4_GLM_GRAPH_ALLOC_TENSOR(g->kda_v, kda_projection_bytes);
         DS4_GLM_GRAPH_ALLOC_TENSOR(g->kda_lowrank,
+                                   (uint64_t)DS4_N_KDA_HEAD_DIM * sizeof(float));
+        DS4_GLM_GRAPH_ALLOC_TENSOR(g->kda_lowrank_g,
                                    (uint64_t)DS4_N_KDA_HEAD_DIM * sizeof(float));
         DS4_GLM_GRAPH_ALLOC_TENSOR(g->kda_raw_gate, kda_projection_bytes);
         DS4_GLM_GRAPH_ALLOC_TENSOR(g->kda_raw_beta,
@@ -47029,6 +47033,19 @@ static bool glm53_graph_kda_attention(
                 projection,
                 g->attn_norm) != 0;
     }
+#elif defined(DS4_ROCM_BUILD)
+    /* Q8_0 q/k/v share the normalized input: one quantization, one launch. */
+    bool qkv_paired = false;
+    if (l->kda_q->type == DS4_TENSOR_Q8_0 &&
+        l->kda_k->type == DS4_TENSOR_Q8_0 &&
+        l->kda_v->type == DS4_TENSOR_Q8_0) {
+        ds4_gpu_tensor *outs[3] = { g->kda_q, g->kda_k, g->kda_v };
+        const uint64_t offs[3] = { l->kda_q->abs_offset, l->kda_k->abs_offset,
+                                   l->kda_v->abs_offset };
+        qkv_paired = ds4_gpu_matmul_q8_0_multi_tensor(outs, offs, 3, model->map,
+                                                      model->size, DS4_N_EMBD,
+                                                      projection, g->attn_norm) != 0;
+    }
 #else
     const bool qkv_paired = false;
 #endif
@@ -47059,21 +47076,40 @@ static bool glm53_graph_kda_attention(
         ok = glm53_graph_matmul(g->kda_v, model, l->kda_v,
                                 DS4_N_EMBD, projection, g->attn_norm);
     }
-    if (ok) ok = glm53_graph_matmul(
+    /* f_a, g_a and beta all project the normalized input to a few hundred
+     * outputs; on ROCm they go out as one launch, g_a landing in its own
+     * scratch so f_b and g_b can follow in either order. */
+    bool small_fused = false;
+#ifdef DS4_ROCM_BUILD
+    if (ok && g->kda_lowrank_g &&
+        l->kda_f_a->type == DS4_TENSOR_BF16 &&
+        l->kda_g_a->type == DS4_TENSOR_BF16 &&
+        l->kda_beta->type == DS4_TENSOR_BF16) {
+        ds4_gpu_tensor *outs[3] = { g->kda_lowrank, g->kda_lowrank_g, g->kda_raw_beta };
+        const uint64_t offs[3] = { l->kda_f_a->abs_offset, l->kda_g_a->abs_offset,
+                                   l->kda_beta->abs_offset };
+        const uint32_t dims[3] = { DS4_N_KDA_HEAD_DIM, DS4_N_KDA_HEAD_DIM, DS4_N_KDA_HEAD };
+        small_fused = ds4_gpu_glm53_matvec_bf16_multi(outs, offs, dims, 3, model->map,
+                                                      model->size, DS4_N_EMBD,
+                                                      g->attn_norm) != 0;
+    }
+#endif
+    if (ok && !small_fused) ok = glm53_graph_matmul(
             g->kda_lowrank, model, l->kda_f_a,
             DS4_N_EMBD, DS4_N_KDA_HEAD_DIM, g->attn_norm);
     if (ok) ok = glm53_graph_matmul(
             g->kda_raw_gate, model, l->kda_f_b,
             DS4_N_KDA_HEAD_DIM, projection, g->kda_lowrank);
-    if (ok) ok = glm53_graph_matmul(
+    if (ok && !small_fused) ok = glm53_graph_matmul(
             g->kda_raw_beta, model, l->kda_beta,
             DS4_N_EMBD, DS4_N_KDA_HEAD, g->attn_norm);
-    if (ok) ok = glm53_graph_matmul(
+    if (ok && !small_fused) ok = glm53_graph_matmul(
             g->kda_lowrank, model, l->kda_g_a,
             DS4_N_EMBD, DS4_N_KDA_HEAD_DIM, g->attn_norm);
     if (ok) ok = glm53_graph_matmul(
             g->kda_output_gate, model, l->kda_g_b,
-            DS4_N_KDA_HEAD_DIM, projection, g->kda_lowrank);
+            DS4_N_KDA_HEAD_DIM, projection,
+            small_fused ? g->kda_lowrank_g : g->kda_lowrank);
     if (ok) ok = ds4_gpu_glm53_kda_decode(
             g->kda_out,
             g->layer_kda_conv_state[il],

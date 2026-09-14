@@ -616,6 +616,18 @@ int ds4_gpu_matmul_q8_0_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
+/* Up to three Q8_0 matrices sharing one input: one activation quantization,
+ * one launch (ROCm GLM KDA q/k/v). */
+int ds4_gpu_matmul_q8_0_multi_tensor(
+        ds4_gpu_tensor *const *outs,
+        const uint64_t *weight_offsets,
+        uint32_t n,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        const ds4_gpu_tensor *x);
+
 int ds4_gpu_matmul_q8_0_decode_mpp_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
@@ -3060,6 +3072,18 @@ int ds4_gpu_glm53_matmul_bf16(
         uint32_t              out_dim,
         const ds4_gpu_tensor *x,
         uint32_t              n_rows);
+
+/* Up to three small BF16 projections of one input in a single launch (ROCm
+ * GLM KDA f_a/g_a/beta). */
+int ds4_gpu_glm53_matvec_bf16_multi(
+        ds4_gpu_tensor *const *outs,
+        const uint64_t *weight_offsets,
+        const uint32_t *out_dims,
+        uint32_t n,
+        const void *model_map,
+        uint64_t model_size,
+        uint32_t in_dim,
+        const ds4_gpu_tensor *x);
 
 int ds4_gpu_glm53_matmul_bf16_qkv(
         ds4_gpu_tensor       *out_q,

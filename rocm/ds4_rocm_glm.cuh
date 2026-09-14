@@ -290,17 +290,10 @@ __global__ static void glm53_rocm_matvec_bf16_f32_kernel(
     }
 }
 
-__global__ static void glm53_rocm_matvec_bf16_row_f32_kernel(
-        float *out,
-        const uint16_t *weights,
-        const float *x,
-        uint32_t in_dim,
-        uint32_t out_dim) {
-    const uint32_t col = blockIdx.x;
-    const uint32_t row = blockIdx.y;
-    if (col >= out_dim) return;
-    const uint16_t *wrow = weights + (uint64_t)col * in_dim;
-    const float *xrow = x + (uint64_t)row * in_dim;
+/* Block-wide dot of one BF16 weight row with an f32 vector (small-output
+ * projections).  Shared by the single-matrix and the multi-matrix launch. */
+__device__ static float glm53_rocm_bf16_row_dot(const uint16_t *wrow, const float *xrow,
+                                                uint32_t in_dim) {
     float sum = 0.0f;
     if ((in_dim & 7u) == 0u) {
         /* One block streams a whole 8-32 KB row, so these launches are
@@ -352,9 +345,74 @@ __global__ static void glm53_rocm_matvec_bf16_row_f32_kernel(
         }
         __syncthreads();
     }
-    if (threadIdx.x == 0u) {
-        out[(uint64_t)row * out_dim + col] = partial[0];
+    return partial[0];
+}
+
+__global__ static void glm53_rocm_matvec_bf16_row_f32_kernel(
+        float *out,
+        const uint16_t *weights,
+        const float *x,
+        uint32_t in_dim,
+        uint32_t out_dim) {
+    const uint32_t col = blockIdx.x;
+    const uint32_t row = blockIdx.y;
+    if (col >= out_dim) return;
+    const float v = glm53_rocm_bf16_row_dot(weights + (uint64_t)col * in_dim,
+                                            x + (uint64_t)row * in_dim, in_dim);
+    if (threadIdx.x == 0u) out[(uint64_t)row * out_dim + col] = v;
+}
+
+/* Up to three small BF16 projections of the same input in one launch (the
+ * KDA f_a/g_a/beta trio, 4096 -> 128/128/64): one block per output row,
+ * each block finding its matrix from the row prefix sums. */
+typedef struct {
+    const uint16_t *w[3];
+    float *out[3];
+    uint32_t rows[3];
+    uint32_t n;
+} glm53_rocm_bf16_multi;
+
+__global__ static void glm53_rocm_matvec_bf16_row_multi_kernel(
+        glm53_rocm_bf16_multi m, const float *x, uint32_t in_dim) {
+    uint32_t row = blockIdx.x;
+    uint32_t seg = 0;
+    while (seg < m.n && row >= m.rows[seg]) {
+        row -= m.rows[seg];
+        seg++;
     }
+    if (seg >= m.n) return;
+    const float v = glm53_rocm_bf16_row_dot(m.w[seg] + (uint64_t)row * in_dim, x, in_dim);
+    if (threadIdx.x == 0u) m.out[seg][row] = v;
+}
+
+extern "C" int ds4_gpu_glm53_matvec_bf16_multi(
+        ds4_gpu_tensor *const *outs,
+        const uint64_t *weight_offsets,
+        const uint32_t *out_dims,
+        uint32_t n,
+        const void *model_map,
+        uint64_t model_size,
+        uint32_t in_dim,
+        const ds4_gpu_tensor *x) {
+    if (!outs || !weight_offsets || !out_dims || !x || !model_map || n == 0u || n > 3u ||
+        in_dim == 0u || x->bytes < (uint64_t)in_dim * sizeof(float)) return 0;
+    glm53_rocm_bf16_multi m;
+    memset(&m, 0, sizeof(m));
+    uint64_t total = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const uint64_t weight_bytes = (uint64_t)out_dims[i] * in_dim * sizeof(uint16_t);
+        if (!outs[i] || out_dims[i] == 0u || outs[i]->bytes < (uint64_t)out_dims[i] * sizeof(float) ||
+            weight_offsets[i] > model_size || weight_bytes > model_size - weight_offsets[i]) return 0;
+        m.w[i] = (const uint16_t *)cuda_model_range_ptr(model_map, weight_offsets[i], weight_bytes,
+                                                        "GLM-5.3 BF16 rows");
+        if (!m.w[i]) return 0;
+        m.out[i] = (float *)outs[i]->ptr;
+        m.rows[i] = out_dims[i];
+        total += out_dims[i];
+    }
+    m.n = n;
+    glm53_rocm_matvec_bf16_row_multi_kernel<<<(unsigned)total, 256u>>>(m, (const float *)x->ptr, in_dim);
+    return cuda_ok(cudaGetLastError(), "GLM-5.3 BF16 multi row matvec launch");
 }
 
 extern "C" int ds4_gpu_glm53_embedding_bf16(
