@@ -5558,18 +5558,18 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
 
     const uint64_t chunk = ds4_rocm_model_arena_bytes(aligned);
     void *dev = NULL;
-    cudaError_t err = cudaMalloc(&dev, (size_t)chunk);
+    cudaError_t err = ds4_rocm_weights_alloc(&dev, (size_t)chunk);
     if (err != cudaSuccess) {
         (void)cudaGetLastError();
         uint64_t fallback = chunk / 2u;
         while (fallback >= aligned) {
-            err = cudaMalloc(&dev, (size_t)fallback);
+            err = ds4_rocm_weights_alloc(&dev, (size_t)fallback);
             if (err == cudaSuccess) break;
             (void)cudaGetLastError();
             fallback /= 2u;
         }
         if (err != cudaSuccess) {
-            err = cudaMalloc(&dev, (size_t)aligned);
+            err = ds4_rocm_weights_alloc(&dev, (size_t)aligned);
             if (err != cudaSuccess) {
                 fprintf(stderr,
                         DS4_GPU_LOG_PREFIX "model arena alloc failed for %s "
