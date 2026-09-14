@@ -43977,6 +43977,8 @@ typedef struct ds4_glm_gpu_graph {
      * layer.  Views alias the engine's TP slab slots [layer*2 + FFN]. */
     uint32_t tp_world;
     uint32_t tp_rank;
+    bool tp_vocab_split;             /* decode head: this rank's vocab half only */
+    ds4_gpu_tensor *tp_logits_half;  /* view of logits for that half */
     ds4_gpu_tensor **tp_out;
     ds4_gpu_tensor **tp_in;
     /* Prefill batch gate bounce buffers (shared storage; grow on demand). */
@@ -45764,6 +45766,8 @@ static void glm_graph_free(ds4_glm_gpu_graph *g) {
         ds4_gpu_tensor_free(g->layer_value_cache[il]);
         ds4_gpu_tensor_free(g->layer_key_cache[il]);
     }
+    ds4_gpu_tensor_free(g->tp_logits_half);
+    g->tp_logits_half = NULL;
     ds4_gpu_tensor_free(g->logits);
     ds4_gpu_tensor_free(g->batch_router_weights);
     ds4_gpu_tensor_free(g->prefill_seed_router_selected);
@@ -46607,10 +46611,13 @@ static bool glm_graph_weights_are_q8_0(
            glm_graph_weight_type_for_offset(model, offset_b) == DS4_TENSOR_Q8_0;
 }
 
-static bool glm53_graph_matmul(
+/* Dense GLM matmul over a weight range that starts at weight_offset (the
+ * tensor's own offset, or a row window into it for the split head). */
+static bool glm53_graph_matmul_at(
         ds4_gpu_tensor       *out,
         const ds4_model      *model,
         const ds4_tensor     *weight,
+        uint64_t              weight_offset,
         uint32_t              in_dim,
         uint32_t              out_dim,
         const ds4_gpu_tensor *x) {
@@ -46622,7 +46629,7 @@ static bool glm53_graph_matmul(
         return ds4_gpu_glm53_matmul_bf16(out,
                                          model->map,
                                          model->size,
-                                         weight->abs_offset,
+                                         weight_offset,
                                          in_dim,
                                          out_dim,
                                          x,
@@ -46631,12 +46638,23 @@ static bool glm53_graph_matmul(
     return ds4_gpu_matmul_quant_tensor(out,
                                        model->map,
                                        model->size,
-                                       weight->abs_offset,
+                                       weight_offset,
                                        weight->type,
                                        in_dim,
                                        out_dim,
                                        x,
                                        1) != 0;
+}
+
+static bool glm53_graph_matmul(
+        ds4_gpu_tensor       *out,
+        const ds4_model      *model,
+        const ds4_tensor     *weight,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        const ds4_gpu_tensor *x) {
+    return weight && glm53_graph_matmul_at(out, model, weight, weight->abs_offset,
+                                           in_dim, out_dim, x);
 }
 
 static bool glm53_graph_matmul_rows(
@@ -47140,13 +47158,37 @@ static bool glm_graph_encode_output_head_from(
                                              weights->output_norm->abs_offset,
                                              DS4_N_EMBD,
                                              DS4_RMS_EPS) != 0;
-    if (ok) ok = glm53_graph_matmul(g->logits,
-                                    model,
-                                    weights->output,
-                                    DS4_N_EMBD,
-                                    DS4_N_VOCAB,
-                                    g->output_norm);
-    return ok;
+    if (!ok) return false;
+    /* Two-rank TP: each rank projects its half of the vocabulary and the
+     * session swaps the halves over the control channel (the DeepSeek
+     * vocab split), so the 155k-row head is read once per token instead of
+     * once per rank.  The view is graph-owned and created on first use. */
+    const uint64_t vhalf = (uint64_t)DS4_N_VOCAB / 2u;
+    if (g->tp_world == 2 && g->tp_vocab_split &&
+        weights->output->ndim == 2 && weights->output->dim[1] == DS4_N_VOCAB) {
+        if (!g->tp_logits_half) {
+            g->tp_logits_half = ds4_gpu_tensor_view(g->logits,
+                                                    (uint64_t)g->tp_rank * vhalf * sizeof(float),
+                                                    vhalf * sizeof(float));
+        }
+        if (g->tp_logits_half) {
+            const uint64_t row_bytes = weights->output->bytes / weights->output->dim[1];
+            return glm53_graph_matmul_at(g->tp_logits_half,
+                                         model,
+                                         weights->output,
+                                         weights->output->abs_offset +
+                                             (uint64_t)g->tp_rank * vhalf * row_bytes,
+                                         DS4_N_EMBD,
+                                         (uint32_t)vhalf,
+                                         g->output_norm);
+        }
+    }
+    return glm53_graph_matmul(g->logits,
+                              model,
+                              weights->output,
+                              DS4_N_EMBD,
+                              DS4_N_VOCAB,
+                              g->output_norm);
 }
 
 static bool glm_graph_encode_output_head(
@@ -55641,10 +55683,18 @@ glm53_attention_done:
             if (ok) {
                 if (glm_debug_hidden_dump_layer() < 0)
                     glm_debug_dump_hidden_row(g->cur, 0);
-                ok = ds4_gpu_tensor_read(g->logits,
-                                         0,
-                                         logits_out,
-                                         (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+                {
+                    /* Under the vocab split only this rank's half was
+                     * projected; the session fills the other half. */
+                    const uint64_t off = g->tp_logits_half ?
+                        (uint64_t)g->tp_rank * (DS4_N_VOCAB / 2u) : 0u;
+                    const uint64_t cnt = g->tp_logits_half ?
+                        (uint64_t)DS4_N_VOCAB / 2u : (uint64_t)DS4_N_VOCAB;
+                    ok = ds4_gpu_tensor_read(g->logits,
+                                             off * sizeof(float),
+                                             logits_out + off,
+                                             cnt * sizeof(float)) != 0;
+                }
                 if (decode_output_profile) {
                     const double now = now_sec();
                     fprintf(stderr,
@@ -68696,11 +68746,16 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
 #endif
     ds4_gpu_tp_set_big_exchange(ds4_engine_tp_big_exchange);
     ds4_gpu_tp_set_split_exchange(ds4_engine_tp_split_exchange);
-    /* GLM keeps its output head replicated; DeepSeek V4 splits it and the
-     * V4.1 CUDA path reuses the same half-logit frames.  The fork's
-     * kv-split gates stay registered for the DeepSeek paths. */
+    /* DeepSeek V4 splits its output head; the V4.1 CUDA path reuses the
+     * same half-logit frames, and so does GLM 5.3 single-token decode on
+     * the ROCm pair (glm_graph_encode_output_head_from).  The GLM MTP cycle
+     * keeps the replicated head, so the split stays off with --mtp.  The
+     * fork's kv-split gates stay registered for the DeepSeek paths. */
     e->tp.vocab_split = DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK4 ||
         (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && e->backend == DS4_BACKEND_CUDA);
+#ifdef DS4_ROCM_BUILD
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA && !e->glm_mtp) e->tp.vocab_split = true;
+#endif
     e->tp.ctx = tp;
     e->tp.rank = ds4_tp_rank(tp);
     e->tp.eval_seq = 0;
@@ -69069,6 +69124,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             s->glm_graph.tp_world = 2;
             s->glm_graph.tp_rank = (uint32_t)e->tp.rank;
             s->glm_graph.tp_out = e->tp.out_views;
+            s->glm_graph.tp_vocab_split = e->tp.vocab_split;
             s->glm_graph.tp_in = e->tp.in_views;
         }
 #endif
