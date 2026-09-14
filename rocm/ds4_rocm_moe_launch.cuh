@@ -4,6 +4,17 @@ static int routed_moe_u64_add_checked(uint64_t a, uint64_t b, uint64_t *out) {
     return 1;
 }
 
+/* One-wave-per-row Q4_K expert decode kernels (DS4_ROCM_MOE_Q4K_WAVE=0
+ * restores the 8-lanes-per-row forms). */
+static int moe_q4k_wave_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *env = getenv("DS4_ROCM_MOE_Q4K_WAVE");
+        enabled = (env == NULL || atoi(env) != 0) ? 1 : 0;
+    }
+    return enabled;
+}
+
 static int routed_moe_align256_checked(uint64_t v, uint64_t *out) {
     if (!out || v > UINT64_MAX - 255ull) return 0;
     *out = (v + 255ull) & ~255ull;
@@ -1642,7 +1653,27 @@ static int routed_moe_launch(
                 }
             } else if (ok) {
                 dim3 qgrid((expert_mid_dim + 127u) / 128u, pair_count, 1);
-                if (q4k_path) {
+                if (q4k_path && xq_blocks <= 16u && moe_q4k_wave_enabled()) {
+                    dim3 wgrid((expert_mid_dim + 7u) / 8u, pair_count, 1);
+                    moe_gate_up_mid_decode_q4K_wave_kernel<<<wgrid, 256>>>(
+                        (float *)gate->ptr,
+                        (float *)up->ptr,
+                        (float *)mid->ptr,
+                        gate_w,
+                        up_w,
+                        xq,
+                        (const int32_t *)selected_exec->ptr,
+                        (const float *)weights->ptr,
+                        gate_expert_bytes,
+                        gate_row_bytes,
+                        xq_blocks,
+                        expert_mid_dim,
+                        n_expert,
+                        write_gate_up,
+                        tp_first,
+                        tp_count,
+                        clamp);
+                } else if (q4k_path) {
                     moe_gate_up_mid_decode_q4K_qwarp32_kernel<<<qgrid, 256>>>(
                         (float *)gate->ptr,
                         (float *)up->ptr,

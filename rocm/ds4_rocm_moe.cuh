@@ -3150,6 +3150,116 @@ __global__ static void moe_down_q4K_sum6_qwarp32_kernel(
     if (lane == 0) out[row] = total + (add_in ? add_in[row] : 0.0f);
 }
 
+/* Lane-cooperative Q4_K x Q8_K block dot: the 8 lanes of a group each take
+ * one 32-weight sub-block (lane pairs share the packed nibble bytes), the
+ * integer scale/min sums are reduced across the group and the block's value
+ * is formed exactly as dev_dot_q4_K_q8_K_block forms it.  Every lane of the
+ * group returns the same value.  With 4 groups per wave a step reads 4
+ * consecutive blocks (576 contiguous bytes) per load instruction instead of
+ * 32 scattered blocks, which is what keeps the expert stream coalesced. */
+__device__ __forceinline__ static float dev_dot_q4_K_q8_K_block_lane8(
+        const cuda_block_q4_K *x,
+        const cuda_block_q8_K *y,
+        uint32_t j) {
+    uint8_t sc, m;
+    dev_q4_K_get_scale_min(j, x->scales, &sc, &m);
+    const int bsum = (int)y->bsums[2u * j] + (int)y->bsums[2u * j + 1u];
+    int isum = (int)sc * dev_dot_q4_32(x->qs + (j >> 1u) * 32u, y->qs + j * 32u, (j & 1u) ? 4 : 0);
+    int summs = (int)m * bsum;
+    isum += __shfl_xor(isum, 1);
+    isum += __shfl_xor(isum, 2);
+    isum += __shfl_xor(isum, 4);
+    summs += __shfl_xor(summs, 1);
+    summs += __shfl_xor(summs, 2);
+    summs += __shfl_xor(summs, 4);
+    const float xd = dev_f16_to_f32(x->d);
+    const float xmin = dev_f16_to_f32(x->dmin);
+    return y->d * xd * (float)isum - y->d * xmin * (float)summs;
+}
+
+__device__ __forceinline__ static float moe_wave_sum32_f32(float v) {
+    v += __shfl_xor(v, 1);
+    v += __shfl_xor(v, 2);
+    v += __shfl_xor(v, 4);
+    v += __shfl_xor(v, 8);
+    v += __shfl_xor(v, 16);
+    return v;
+}
+
+/* Decode Q4_K gate/up + SwiGLU mid, one wave per row of one (token, expert)
+ * pair: the wave's 4 lane groups walk the row's blocks 4 at a time (gate,
+ * then up), each group computing one block cooperatively, so the weight
+ * stream is contiguous; 8 rows per block give ~1500 blocks per layer.  The
+ * 8-lanes-per-row qwarp32 kernel above streamed the experts at ~130 GB/s. */
+__global__ static void moe_gate_up_mid_decode_q4K_wave_kernel(
+        float *gate_out,
+        float *up_out,
+        float *mid_out,
+        const char *gate_base,
+        const char *up_base,
+        const cuda_block_q8_K *xq,
+        const int32_t *selected,
+        const float *weights,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint32_t xq_blocks,
+        uint32_t expert_mid_dim,
+        uint32_t n_expert,
+        uint32_t write_aux,
+        uint32_t tp_first,
+        uint32_t tp_count,
+        float clamp) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t wave = threadIdx.x >> 5u;
+    const uint32_t group = lane >> 3u;
+    const uint32_t sub = lane & 7u;
+    const uint32_t row = blockIdx.x * 8u + wave;
+    const uint32_t pair = blockIdx.y;
+    const uint32_t tok = pair / n_expert;
+    const uint32_t slot = pair - tok * n_expert;
+    int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
+    if (expert_i < 0) expert_i = 0;
+    /* TP ownership: skip the pair entirely (its consumers skip it too). */
+    if (tp_count != 0u &&
+        ((uint32_t)expert_i < tp_first || (uint32_t)expert_i >= tp_first + tp_count)) {
+        return;
+    }
+    if (row >= expert_mid_dim) return; /* wave-uniform */
+    uint32_t expert = (uint32_t)expert_i;
+    if (tp_count != 0u) expert -= tp_first;
+    const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
+    const cuda_block_q4_K *gr = (const cuda_block_q4_K *)(
+        gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+    const cuda_block_q4_K *ur = (const cuda_block_q4_K *)(
+        up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+    float gate = 0.0f;
+    float up = 0.0f;
+#pragma unroll 4
+    for (uint32_t b = group; b < xq_blocks; b += 4u) {
+        const float g = dev_dot_q4_K_q8_K_block_lane8(gr + b, xqb + b, sub);
+        const float u = dev_dot_q4_K_q8_K_block_lane8(ur + b, xqb + b, sub);
+        if (sub == 0u) {
+            gate += g;
+            up += u;
+        }
+    }
+    gate = moe_wave_sum32_f32(gate);
+    up = moe_wave_sum32_f32(up);
+    if (lane == 0u) {
+        if (clamp > 1.0e-6f) {
+            if (gate > clamp) gate = clamp;
+            if (up > clamp) up = clamp;
+            if (up < -clamp) up = -clamp;
+        }
+        const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
+        if (write_aux) {
+            gate_out[off] = gate;
+            up_out[off] = up;
+        }
+        mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
+    }
+}
+
 template <bool Batch>
 __global__ static void moe_down_mxfp4_sum6_qwarp32_kernel(
         float *out,
