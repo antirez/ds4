@@ -3419,6 +3419,24 @@ int ds4_gpu_qwen4_moe_mm_down_tensor(
         const void *model_map, uint64_t model_size, uint64_t down_offset,
         uint32_t weight_type, uint32_t n_expert, uint32_t n_tokens, uint32_t n_slots, uint32_t n_out,
         uint32_t ff_dim, uint32_t out_dim, uint32_t list_cap);
+/* Metal SSD routed experts. Table sizes are the stored bytes per expert,
+ * including Q2_K down-row padding; ff_dim remains the logical activation width.
+ * NULL lists/counts use the ordinary row kernels, including the shared slot.
+ * Non-NULL lists/counts use the ordinary expert-grouped MM kernels with routed
+ * slots only; the caller computes the shared expert and performs the reduction.
+ * The call completes the router before reading IDs and preserves command-batch
+ * ownership. Cache overflow and off-size layers use explicit owned SSD reads,
+ * never mapped routed weights. Returns zero on invalid input or I/O failure. */
+#ifdef __APPLE__
+int ds4_gpu_qwen4_moe_stream_tensor(
+        ds4_gpu_tensor *mid, ds4_gpu_tensor *part, const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *lists, const ds4_gpu_tensor *counts,
+        const ds4_gpu_stream_expert_table *table,
+        uint32_t gate_type, uint32_t down_type, uint32_t n_tokens, uint32_t n_slots,
+        uint32_t in_dim, uint32_t ff_dim, uint32_t list_cap,
+        uint64_t shared_gate_offset, uint64_t shared_up_offset, uint64_t shared_down_offset,
+        uint32_t shared_type, uint32_t shared_down_type);
+#endif
 /* weight_type covers both the alpha and the beta projection */
 int ds4_gpu_qwen4_gdn_front_tensor(
         ds4_gpu_tensor *qkv, ds4_gpu_tensor *state, const ds4_gpu_tensor *mixed,

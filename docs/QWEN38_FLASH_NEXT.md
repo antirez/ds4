@@ -32,6 +32,58 @@ Q4_K gate/up and MXFP4 down experts. Context and runtime buffers still need
 RAM beyond the resident weights; start Q2 with the context and chunk above
 on a 64 GB machine. Q4 needs a larger machine.
 
+On Metal, SSD streaming keeps a bounded cache of routed experts instead of
+requiring all of them in RAM:
+
+```sh
+./ds4 --ssd-streaming --ctx 4096 --prefill-chunk 128
+```
+
+The Q2 and Q4 packs support streaming during prefill, decode and MTP. Dense
+weights, shared experts, context and runtime buffers still need RAM; the
+n-gram table continues to use its existing disk reads. Missing routed experts
+are read into owned buffers. If a prefill batch needs more experts than the
+cache can hold, or an MTP layer uses a different expert size, it uses explicit
+temporary staging while retaining the normal kernel arithmetic. On devices
+with GPU buffer addresses, this staging contains only the distinct selected
+experts. Selecting every expert, or running without buffer-address support,
+retains the full-layer fallback.
+
+During single-token decode, cache misses overlap with gate/up computation
+for cached experts and the shared expert. Once the reads finish, the missing
+gate/up slots are computed, followed by one down pass and the original ordered
+reduction. Private address snapshots keep the running GPU work independent of
+cache updates. Fully cached selections use one gate/up pass. Batched prefill
+and temporary staging retain their existing schedule; an MTP layer whose
+expert size differs from the main model is staged again on each invocation,
+without replacing the main model's cache entries.
+
+A local M1 Max 32 GiB check compared this compact split schedule with
+`85d37ae`, using the Q2 pack, automatic expert cache, `--ctx 4096`,
+`--prefill-chunk 128`, `-n 100`, `--temp 0 --nothink`, and the prompt
+`narrami la storia di roma`. Three alternating pairs produced:
+
+| Decode | Runs (t/s) | Median (t/s) |
+| --- | --- | --- |
+| Before | 8.40, 8.25, 7.26 | 8.25 |
+| Compact split | 8.44, 8.51, 8.14 | 8.44 |
+
+All generated output was identical. The observed median gain was 2.3%; the
+variation between runs does not establish a 10% improvement. Prefill medians
+were 9.98 and 10.05 t/s; its execution path is unchanged. These are local
+warm-file measurements, not a guarantee for other Macs or cold SSD reads.
+
+Leave the expert-cache budget automatic initially. A plain count passed to
+`--ssd-streaming-cache-experts` requests dynamic cache slots; an `NGB` budget
+also includes the reserved layer-staging space. Startup accounts for the
+context, prefill chunk, static weights, vision weights when present, and
+staging before choosing the cache size. Reduce the context or prefill chunk
+if those fixed requirements leave insufficient memory.
+
+Qwen fills its expert cache on demand, so `--ssd-streaming-cold` does not
+change its preload behavior. Popularity preloading and the GLM-specific
+`--ssd-streaming-full-layers` option are not supported for Qwen.
+
 Use the same model options with `ds4-agent`, `ds4-server`, or
 `ds4-bench`. Add `--mtp` for speculative decoding using the built-in MTP
 weights. `--nothink` disables thinking. The server exposes
@@ -113,15 +165,15 @@ the responses and diagnostics for inspection; it does not grade image content.
 Metal only for now. The Metal graph accepts Q8_0, Q4_0, F16, BF16 and F32
 dense weights, Q8_0/MXFP4/Q4_0/Q4_K/Q2_K/IQ2_XXS experts, F16/F32/Q8_0
 hyper-connection mixers and the original BF16 n-gram table.
-Tensor parallelism, pipeline execution, and SSD expert streaming are not
-implemented for this model yet. CPU code is a correctness reference, not a
-general inference backend.
+Tensor parallelism and pipeline execution are not implemented for this model
+yet. CPU code is a correctness reference, not a general inference backend.
 
 
 ## Validation
 
 ```sh
 make test-qwen4-kernels test-qwen4-q2 test-qwen4-prefill-reuse test-q8-prefill-variants
+make test-qwen4-ssd-experts test-qwen4-memory
 make test-frontends
 make test-qwen4-ngrams
 make tests/test_qwen4_ngram_state
@@ -132,8 +184,25 @@ python3 -m unittest discover -s gguf-tools/tests -p test_qwen4_native_ngrams.py
 
 The kernel tests exercise the active Metal API. Vision and end-to-end model
 checks additionally require the checkpoints described above.
+The SSD test needs no GGUF: a sparse temporary file uses a 512-expert table,
+including indices 383, 384 and 511, with cold and warm selections, eviction,
+prefill staging, different-size MTP layers and failed reads followed by exact recovery. It
+compares routed intermediates, reduced outputs and hyper-connection residuals
+bit for bit against the resident kernels, including the padded Q2 down rows.
+Its test-only backend checks actual `pread` requests against selected expert
+ranges and counts returned bytes: ten experts for off-size MTP, 24 for cache
+overflow, zero reads for cache hits, and the full 512-expert fallback.
+Single-token tests also cover partially cached selections, duplicate IDs,
+optional shared experts and all 16 routed slots. A failed SSD read must leave
+the completed cached/shared gate/up slots exact, preserve the untouched slots,
+and allow an exact retry after draining GPU work.
+The memory-estimate test runs without a GPU or model.
 Run `tests/test_qwen4_ngram_state MODEL.gguf` under Metal validation to check
 failed disk reads during prefill, decode and MTP, then exact recovery.
+For a smaller memory footprint, run
+`tests/test_qwen4_ngram_state MODEL.gguf --ssd-streaming`. This uses a
+256-token context, an eight-token prefill chunk and a 1024-expert cache request
+while keeping both comparison sessions and MTP enabled.
 
 [Checkpoint-fix benchmark charts and measurements](../speed-bench/qwen38-checkpoints/README.md)
 compare prefill, ordinary decode, and MTP decode against the preceding PR head.

@@ -2089,6 +2089,17 @@ kernel void kernel_qwen4_attn_mm(
 
 /* --- routed experts ----------------------------------------------------- */
 
+/* Only SSD cache launches bind address tables. The resident specialization
+ * retains its original contiguous expert addressing and arithmetic. */
+constant bool qwen4_expert_addresses [[function_constant(906)]];
+static inline device const char *qwen4_expert_base(device const char *base,
+                                                  uint expert, uint64_t bytes) {
+    if (is_function_constant_defined(qwen4_expert_addresses) && qwen4_expert_addresses) {
+        return (device const char *)((device const uint64_t *)base)[expert];
+    }
+    return base + (uint64_t)expert * bytes;
+}
+
 #define QWEN4_MOE_NSG 4
 #define QWEN4_MOE_NR0 2
 
@@ -2104,7 +2115,22 @@ struct ds4_metal_args_qwen4_moe {
     uint32_t shared_type;
     uint32_t shared_row_bytes;
     uint32_t n_total_expert;
+    uint32_t slot_mask;    /* mid only: zero executes all slots, including shared */
 };
+
+/* SSD split launches compact the grid, but all addressing keeps the original
+ * routed/shared slot. Resident specializations eliminate this remapping. */
+static inline uint qwen4_moe_mid_slot(constant ds4_metal_args_qwen4_moe &args,
+                                      uint grid_slot) {
+    if (is_function_constant_defined(qwen4_expert_addresses) && qwen4_expert_addresses) {
+        uint mask = args.slot_mask;
+        if (mask) {
+            for (uint i = 0; i < grid_slot && mask; i++) mask &= mask - 1u;
+            return mask ? ctz(mask) : 0xffffffffu;
+        }
+    }
+    return grid_slot;
+}
 
 /* dot of one quantized expert row with x, lanes split as in the K3 kernels:
  * ix = block stride, it = element pair inside the block */
@@ -2287,7 +2313,7 @@ kernel void kernel_qwen4_moe_mid(
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]],
         ushort3 ntg [[threads_per_threadgroup]]) {
-    const uint slot = tgpig.y;
+    const uint slot = qwen4_moe_mid_slot(args, tgpig.y);
     const uint tok = tgpig.z;
     const uint n_out = args.n_slots + args.has_shared;
     const uint nr = is_function_constant_defined(qwen4_mv_rows) ? qwen4_mv_rows : 2u;
@@ -2299,12 +2325,12 @@ kernel void kernel_qwen4_moe_mid(
     const bool shared = slot == args.n_slots;
     const uint type = shared ? st : wt;
     const uint row_bytes = shared ? args.shared_row_bytes : args.row_bytes;
-    device const char *gb = shared ? sh_gate : gate_base;
-    device const char *ub = shared ? sh_up : up_base;
-    const uint64_t ebase = shared ? 0 : (uint64_t)(uint)selected[(uint64_t)tok * args.n_slots + slot] * args.expert_bytes;
+    const uint expert = shared ? 0u : (uint)selected[(uint64_t)tok * args.n_slots + slot];
+    device const char *gb = shared ? sh_gate : qwen4_expert_base(gate_base, expert, args.expert_bytes);
+    device const char *ub = shared ? sh_up : qwen4_expert_base(up_base, expert, args.expert_bytes);
     device const float *xt = x + (uint64_t)tok * args.in_dim;
     for (uint r = row0; r < row0 + nr && r < args.out_rows; r++) {
-        const uint64_t off = ebase + (uint64_t)r * row_bytes;
+        const uint64_t off = (uint64_t)r * row_bytes;
         const float g = qwen4_row_dot(gb + off, xt, type, dim, tiisg);
         const float u = qwen4_row_dot(ub + off, xt, type, dim, tiisg);
         if (tiisg == 0) {
@@ -2331,7 +2357,7 @@ kernel void kernel_qwen4_moe_mid_q4k(
         ushort3 ntg [[threads_per_threadgroup]],
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    const uint slot = tgpig.y, tok = tgpig.z;
+    const uint slot = qwen4_moe_mid_slot(args, tgpig.y), tok = tgpig.z;
     const uint n_out = args.n_slots + args.has_shared;
     const uint row0 = (tgpig.x * (ntg.x / 32) + (uint)sgitg) * NR;
     if (row0 >= args.out_rows || slot >= n_out || tok >= args.n_tokens) return;
@@ -2354,7 +2380,8 @@ kernel void kernel_qwen4_moe_mid_q4k(
         }
         return;
     }
-    const uint64_t ebase = (uint64_t)(uint)expert * args.expert_bytes;
+    device const char *gb = qwen4_expert_base(gate_base, (uint)expert, args.expert_bytes);
+    device const char *ub = qwen4_expert_base(up_base, (uint)expert, args.expert_bytes);
     const uint nb = args.in_dim / 256;
     const uint group = tiisg / 4, l = (tiisg % 4) * 8;
     const uint shift = (group & 1u) * 4u;
@@ -2364,9 +2391,9 @@ kernel void kernel_qwen4_moe_mid_q4k(
         float y[8];
         for (uint i = 0; i < 8; i++) y[i] = yp[i];
         for (uint r = 0; r < NR && row0 + r < args.out_rows; r++) {
-            const uint64_t off = ebase + (uint64_t)(row0 + r) * args.row_bytes + (uint64_t)ib * 144;
-            device const uchar *bg = (device const uchar *)(gate_base + off);
-            device const uchar *bu = (device const uchar *)(up_base + off);
+            const uint64_t off = (uint64_t)(row0 + r) * args.row_bytes + (uint64_t)ib * 144;
+            device const uchar *bg = (device const uchar *)(gb + off);
+            device const uchar *bu = (device const uchar *)(ub + off);
             const float dg = (float)(*(device const half *)bg);
             const float dmg = (float)(*(device const half *)(bg + 2));
             const float du = (float)(*(device const half *)bu);
@@ -2432,12 +2459,12 @@ kernel void kernel_qwen4_moe_down(
     const bool shared = slot == args.n_slots;
     const uint type = shared ? st : wt;
     const uint row_bytes = shared ? args.shared_row_bytes : args.row_bytes;
-    device const char *db = shared ? sh_down : down_base;
     const uint64_t pair = (uint64_t)tok * n_out + slot;
-    const uint64_t ebase = shared ? 0 : (uint64_t)(uint)selected[(uint64_t)tok * args.n_slots + slot] * args.expert_bytes;
+    const uint expert = shared ? 0u : (uint)selected[(uint64_t)tok * args.n_slots + slot];
+    device const char *db = shared ? sh_down : qwen4_expert_base(down_base, expert, args.expert_bytes);
     device const float *m = mid + pair * args.in_dim;
     for (uint r = row0; r < row0 + nr && r < args.out_rows; r++) {
-        const float v = qwen4_row_dot(db + ebase + (uint64_t)r * row_bytes, m, type, dim, tiisg);
+        const float v = qwen4_row_dot(db + (uint64_t)r * row_bytes, m, type, dim, tiisg);
         if (tiisg == 0) part[pair * args.out_rows + r] = v;
     }
 }
@@ -2487,13 +2514,14 @@ kernel void kernel_qwen4_moe_down_mxfp4_pf(
         }
         return;
     }
-    const uint64_t ebase = (uint64_t)(uint)selected[(uint64_t)tok * args.n_slots + slot] * args.expert_bytes;
+    device const char *db = qwen4_expert_base(down_base,
+        (uint)selected[(uint64_t)tok * args.n_slots + slot], args.expert_bytes);
     const uint ix = tiisg / 8, it = tiisg % 8;
     const uint nb = dim / 32;
     for (uint r = row0; r < row0 + nr && r < args.out_rows; r++) {
 #pragma clang fp reassociate(off)
 #pragma clang fp contract(off)
-        device const uchar *row = (device const uchar *)(down_base + ebase + (uint64_t)r * args.row_bytes);
+        device const uchar *row = (device const uchar *)(db + (uint64_t)r * args.row_bytes);
         float acc = 0.0f;
         uint ib = ix;
         for (; ib + 12u < nb; ib += 16u) {
@@ -2877,8 +2905,8 @@ kernel void kernel_qwen4_moe_mm_mid(
     threadgroup half Au[QWEN4_MM_ROWS * QWEN4_MM_KS];
     threadgroup half Bs[QWEN4_MM_KS * TT];
     threadgroup float Cs[4][2][64];
-    device const char *gbase = gate_base + (uint64_t)e * args.expert_bytes;
-    device const char *ubase = up_base + (uint64_t)e * args.expert_bytes;
+    device const char *gbase = qwen4_expert_base(gate_base, e, args.expert_bytes);
+    device const char *ubase = qwen4_expert_base(up_base, e, args.expert_bytes);
     device const int32_t *list = lists + (uint64_t)e * args.list_cap;
     const uint row0 = rb * QWEN4_MM_ROWS;
     const uint nk = args.in_dim / QWEN4_MM_KS;
@@ -3000,7 +3028,7 @@ kernel void kernel_qwen4_moe_mm_down(
     threadgroup half As[QWEN4_MM_ROWS * QWEN4_MM_KS];
     threadgroup half Bs[QWEN4_MM_KS * TT];
     threadgroup float Cs[4][64];
-    device const char *dbase = down_base + (uint64_t)e * args.expert_bytes;
+    device const char *dbase = qwen4_expert_base(down_base, e, args.expert_bytes);
     device const int32_t *list = lists + (uint64_t)e * args.list_cap;
     const uint row0 = rb * QWEN4_MM_ROWS;
     const uint nk = args.in_dim / QWEN4_MM_KS;
@@ -3180,8 +3208,8 @@ kernel void kernel_qwen4_moe_mm_mid_nax_t(
     threadgroup BT *Bs = (threadgroup BT *)(shmem + 8192);            /* [NR1][32] */
     threadgroup half *Br = (threadgroup half *)(shmem + 8192 + NR1 * 64); /* [NR1][32] residual (COMP) */
     threadgroup float *Cs = (threadgroup float *)shmem;               /* [NR1 tok][64 row] after the K loop */
-    device const char *gbase = gate_base + (uint64_t)e * args.expert_bytes;
-    device const char *ubase = up_base + (uint64_t)e * args.expert_bytes;
+    device const char *gbase = qwen4_expert_base(gate_base, e, args.expert_bytes);
+    device const char *ubase = qwen4_expert_base(up_base, e, args.expert_bytes);
     device const int32_t *list = lists + (uint64_t)e * args.list_cap;
     const uint row0 = rb * NR0;
     const uint nk = args.in_dim / NK;
@@ -3337,7 +3365,7 @@ kernel void kernel_qwen4_moe_mm_down_nax_t(
     threadgroup XT *Bs = (threadgroup XT *)(shmem + 4096);            /* [NR1][32] */
     threadgroup half *Br = (threadgroup half *)(shmem + 4096 + NR1 * 64); /* [NR1][32] residual (COMP) */
     threadgroup float *Cs = (threadgroup float *)shmem;               /* [NR1 tok][64 row] after the K loop */
-    device const char *dbase = down_base + (uint64_t)e * args.expert_bytes;
+    device const char *dbase = qwen4_expert_base(down_base, e, args.expert_bytes);
     device const int32_t *list = lists + (uint64_t)e * args.list_cap;
     const uint row0 = rb * NR0;
     const uint nk = args.in_dim / NK;

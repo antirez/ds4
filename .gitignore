@@ -57,6 +57,8 @@
 /tests/test_rocm_memory
 /tests/test_qwen4_kernels
 /tests/test_qwen4_moe_mm_specialize
+/tests/test_qwen4_ssd_experts
+/tests/test_qwen4_memory
 /tests/test_qwen4_vision
 /tests/test_deepseek4_vision_image
 /tests/test_deepseek41_metal

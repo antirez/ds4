@@ -4,13 +4,21 @@
 /* A failed disk lookup must invalidate the recurrent frontier, including
  * speculative snapshots. Retrying must rebuild from the retained tokens. */
 int main(int argc, char **argv) {
-    if (argc != 2) {
-        fprintf(stderr, "usage: %s QWEN_GGUF\n", argv[0]);
+    const bool streaming = argc == 3 && strcmp(argv[2], "--ssd-streaming") == 0;
+    if (argc != 2 && !streaming) {
+        fprintf(stderr, "usage: %s QWEN_GGUF [--ssd-streaming]\n", argv[0]);
         return 2;
     }
     ds4_engine *engine = NULL;
     ds4_engine_options opt = {.model_path = argv[1], .backend = DS4_BACKEND_METAL,
         .glm_mtp = true, .prefill_chunk = 8};
+    if (streaming) {
+        /* Account for the actual context before opening the model and leave
+         * room for the live/control sessions and their speculative snapshots. */
+        opt.context_size = 256;
+        opt.ssd_streaming = true;
+        opt.ssd_streaming_cache_experts = 1024;
+    }
     assert(ds4_engine_open(&engine, &opt) == 0);
     assert(ds4_engine_is_qwen4(engine) && engine->model.ngram_tensor);
     ds4_tokens prompt = {0};
