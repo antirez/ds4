@@ -40809,7 +40809,8 @@ static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
 
 static bool ds41_graph_logits(ds41_gpu_graph *g, const ds4_model *m,
                              const ds4_weights *w, float *logits) {
-    if (!g->valid || !logits || !ds4_gpu_begin_commands()) return false;
+    if (!g->valid || !logits ||
+        (!ds4_gpu_commands_active() && !ds4_gpu_begin_commands())) return false;
     bool ok = ds4_gpu_hc_weighted_sum_tensor(g->x, g->residual, g->pre, DS4_N_EMBD, DS4_N_HC) &&
               ds41_bf16(g->x, DS4_N_EMBD) && ds41_norm(g->norm, g->x, m, w->output_norm) &&
               ds41_output_projection(g, g->tp_logits_half ? g->tp_logits_half : g->logits,
@@ -41255,6 +41256,18 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     for (uint32_t i = 0; !ds41_image_at(g, g->pos) && i < 2; i++) {
         if (!ds4_engram_read(&g->table[i], ids[i], DS4_ENGRAM_COLS, g->rows[i])) return false;
     }
+    /* The prefill staging buffer is idle during scalar decode. Give the
+     * second Engram input its own storage so layer 14 needs no CPU drain. */
+    const bool whole_token =
+#if defined(__APPLE__)
+        g->tp_world == 1 && !g->streaming && !g->quality && !g->imatrix &&
+        !getenv("DS4_METAL_DISABLE_V41_DECODE_QUEUE") &&
+        !getenv("DS4_METAL_DISABLE_V41_WHOLE_TOKEN");
+#else
+        false;
+#endif
+    if (whole_token && !ds41_image_at(g, g->pos) &&
+        !ds4_gpu_tensor_write(g->engram_prefetch, 0, g->rows[1], sizeof(g->rows[1]))) return false;
     const float initial_pre[] = {1, 0, 0, 0};
     if (!ds4_gpu_tensor_write(g->pre, 0, initial_pre, sizeof(initial_pre)) ||
         !ds4_gpu_begin_commands()) return false;
@@ -41263,15 +41276,24 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
      * layer mapped, using the same admitted reserve as layer-major prefill. */
     const bool layer_resident = g->streaming && g->quality;
     if (layer_resident && !ds4_gpu_end_commands()) ok = false;
-    const bool queue_layers = g->tp_world == 2 && !g->imatrix &&
-        !getenv("DS4_METAL_DISABLE_V41_TP_DECODE_QUEUE");
+    /* The token's command buffers stay queued and drain only where the graph
+     * needs it (layer 13, the last layer).  Draining after every one of the
+     * 40 layers instead costs 40 CPU<->GPU round trips per token: measured
+     * 16.9 -> 21.7 t/s on an M3 Ultra with the Q4 model resident, greedy
+     * output byte-identical.  DS4_METAL_DISABLE_V41_DECODE_QUEUE restores
+     * the per-layer drain on a single box. */
+    const bool queue_layers = !g->imatrix &&
+        !getenv(g->tp_world == 2 ? "DS4_METAL_DISABLE_V41_TP_DECODE_QUEUE"
+                                 : "DS4_METAL_DISABLE_V41_DECODE_QUEUE");
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &w->layer[il];
         if (layer_resident)
             ok = metal_graph_stream_map_layer(m, w, il) && ds4_gpu_begin_commands();
+        ds4_gpu_tensor *engram_input = g->engram_rows;
         if (ok && ds41_engram_layer(il)) {
             const uint32_t i = il == 1 ? 0 : 1;
-            ok = ds4_gpu_tensor_write(g->engram_rows, 0, g->rows[i], sizeof(g->rows[i]));
+            if (whole_token && i == 1) g->engram_rows = g->engram_prefetch;
+            else ok = ds4_gpu_tensor_write(g->engram_rows, 0, g->rows[i], sizeof(g->rows[i]));
         }
         if (ok) {
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
@@ -41280,11 +41302,19 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
             ok = ds41_graph_layer(g, m, l, il, token);
 #endif
         }
-        /* TP gates already submit ordered, bounded command buffers. Drain
-         * before overwriting the first Engram table's shared input at layer
-         * 14, and before publishing the completed token to the CPU. */
-        const bool drain = !queue_layers || il == 13 || il + 1u == DS4_N_LAYER;
+        /* Restore the owning pointer after encoding the layer's input binding.
+         * Other placements retain the shared-buffer drain before layer 14. */
+        g->engram_rows = engram_input;
+        const bool drain = !queue_layers ||
+            (!whole_token && (il == 13 || il + 1u == DS4_N_LAYER));
         if (drain && !ds4_gpu_end_commands()) ok = false;
+        /* Commit the queued layer without waiting so the GPU starts it while
+         * the CPU encodes the next one: 21.6 -> 23.1 t/s on top of the queue
+         * (M3 Ultra, Q4 resident, greedy output byte-identical).
+         * DS4_METAL_DISABLE_V41_DECODE_FLUSH keeps the token in one buffer
+         * between drains. */
+        if (ok && !drain && queue_layers && !layer_resident &&
+            !getenv("DS4_METAL_DISABLE_V41_DECODE_FLUSH") && !ds4_gpu_flush_commands()) ok = false;
         if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
         if (ok && g->imatrix)
             ok = imatrix_collect_tensor_batch(g->imatrix, g->norm, g->mid,
@@ -41292,6 +41322,10 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         if (!ok) fprintf(stderr, "ds4: V4.1 layer %u failed at position %u\n", il, g->pos);
         if (ok && drain && !layer_resident && il + 1u < DS4_N_LAYER)
             ok = ds4_gpu_begin_commands() != 0;
+    }
+    if (ok && whole_token && logits) {
+        ok = ds41_graph_logits(g, m, w, logits);
+        logits = NULL;
     }
     if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
     if (layer_resident && !metal_graph_stream_map_decode_static_all(m, w)) ok = false;
