@@ -490,8 +490,8 @@ static void kv_lz4_run_batch(kv_lz4_job *jobs, int n_jobs, int n_workers,
     for (int i = 0; i < n_jobs; i++) pthread_join(tids[i], NULL);
 }
 
-/* Writer cookie state.  Lives only for the duration of one
- * kv_lz4_writer_open / _close pair.  raw[] holds the per-batch raw chunk
+/* Writer state.  Lives from kv_lz4_writer_new to kv_lz4_writer_close.
+ * raw[] holds the per-batch raw chunk
  * scratch; comp[] holds the per-batch compressed output.  current_filled
  * tracks how many bytes are in raw[batch_n] so far. */
 typedef struct {
@@ -648,11 +648,6 @@ static int kv_lz4_writer_close(void *cookie) {
     return rc;
 }
 
-/* Public entry: wrap `out` so subsequent writes are chunked and lz4-encoded.
- * The returned FILE * must be fclose()d; fclose calls our close callback,
- * which patches the framing header in `out`.  `out` remains owned by the
- * caller; the caller measures the on-disk payload size with ftell before
- * opening the wrapper and again after fclose. */
 static kv_lz4_writer *kv_lz4_writer_new(FILE *out, uint32_t chunk_size, int n_workers) {
     if (n_workers < 1) n_workers = 1;
     if (n_workers > 64) n_workers = 64;
@@ -692,23 +687,9 @@ fail:
     return NULL;
 }
 
-FILE *kv_lz4_writer_open(FILE *out, uint32_t chunk_size, int n_workers) {
-    kv_lz4_writer *w = kv_lz4_writer_new(out, chunk_size, n_workers);
-    if (!w) return NULL;
-    FILE *fp = kv_lz4_fwrap_open(w, "wb",
-                                 kv_lz4_writer_write, NULL, kv_lz4_writer_close);
-    if (!fp) {
-        const int saved = errno;
-        (void)kv_lz4_writer_close(w);
-        errno = saved;
-    }
-    return fp;
-}
-
-/* Reader cookie state.  We read one chunk at a time, decompress it, and
- * hand bytes out through kv_lz4_reader_read until the slot is drained.
- * The first call lazily reads the 12-byte framing header so kv_lz4_reader_open
- * can be called before payload bytes are known. */
+/* Reader state.  kv_lz4_reader_new reads and validates the 12-byte framing
+ * before allocating; kv_lz4_reader_read then decodes a batch of chunks and
+ * hands bytes out until each slot is drained. */
 typedef struct {
     FILE *in;
     uint32_t chunk_size;
@@ -881,14 +862,6 @@ static int kv_lz4_reader_close(void *cookie) {
     return 0;
 }
 
-/* Public entry: wrap `in` so subsequent reads transparently decompress.
- * payload_bytes is the on-disk payload byte count from the KVC header
- * (covers framing + all chunks).  chunk_size is also from the header.
- * The reader always applies the byte-4 unshuffle after each chunk
- * decode, matching the writer's mandatory shuffle pass.
- * If uncompressed_total_out != NULL, the framing header is read eagerly
- * so the caller learns the uncompressed payload size before reading.
- * The returned FILE * must be fclose()d when the caller is done. */
 /* Validate framing, then allocate.  On NULL, *corrupt says whether the region
  * itself is malformed, as opposed to an allocation or stream I/O failure. */
 static kv_lz4_reader *kv_lz4_reader_new(FILE *in, uint64_t payload_bytes,
@@ -962,24 +935,6 @@ fail:
         errno = saved;
     }
     return NULL;
-}
-
-FILE *kv_lz4_reader_open(FILE *in, uint64_t payload_bytes,
-                         uint32_t chunk_size, int n_workers,
-                         uint64_t *uncompressed_total_out) {
-    bool corrupt = false;
-    kv_lz4_reader *r = kv_lz4_reader_new(in, payload_bytes, chunk_size,
-                                         n_workers, &corrupt);
-    if (!r) return NULL;
-    if (uncompressed_total_out) *uncompressed_total_out = r->uncompressed_total;
-    FILE *fp = kv_lz4_fwrap_open(r, "rb",
-                                 NULL, kv_lz4_reader_read, kv_lz4_reader_close);
-    if (!fp) {
-        const int saved = errno;
-        (void)kv_lz4_reader_close(r);
-        errno = saved;
-    }
-    return fp;
 }
 
 /* Feed the staged raw payload straight into the writer core. */

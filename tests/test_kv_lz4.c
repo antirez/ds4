@@ -34,6 +34,9 @@ static void fill(uint8_t *p, size_t n, int kind) {
     }
 }
 
+static bool core_read_all(FILE *fp, uint64_t payload, uint32_t chunk, int workers,
+                          uint8_t *out, uint64_t expect_total);
+
 static void check_shuffle(size_t n) {
     uint8_t *in = malloc(n + 1), *sh = malloc(n + 1);
     uint8_t *ref = malloc(n + 1), *back = malloc(n + 1);
@@ -66,15 +69,15 @@ static void test_shuffle(void) {
     printf("  shuffle/unshuffle inverse and reference agreement: ok\n");
 }
 
-/* Write n bytes through the codec; return the on-disk payload size. */
+/* Write n bytes through the writer core; return the on-disk payload size. */
 static uint64_t codec_write(FILE *fp, const uint8_t *data, size_t n,
                             uint32_t chunk, int workers) {
     const long start = ftell(fp);
     assert(start >= 0);
-    FILE *cw = kv_lz4_writer_open(fp, chunk, workers);
-    assert(cw);
-    if (n) assert(fwrite(data, 1, n, cw) == n);
-    assert(fclose(cw) == 0);
+    kv_lz4_writer *w = kv_lz4_writer_new(fp, chunk, workers);
+    assert(w);
+    if (n) assert(kv_lz4_writer_write(w, (const char *)data, (kv_lz4_io_size_t)n) == (kv_lz4_io_ssize_t)n);
+    assert(kv_lz4_writer_close(w) == 0);
     const long end = ftell(fp);
     assert(end >= start);
     return (uint64_t)(end - start);
@@ -91,12 +94,7 @@ static void check_roundtrip(size_t n, uint32_t chunk, int workers, int kind) {
     const uint64_t payload = codec_write(fp, data, n, chunk, workers);
 
     assert(fseek(fp, 0, SEEK_SET) == 0);
-    uint64_t total = 0;
-    FILE *cr = kv_lz4_reader_open(fp, payload, chunk, workers, &total);
-    assert(cr);
-    assert(total == (uint64_t)n);
-    if (n) assert(fread(out, 1, n, cr) == n);
-    assert(fclose(cr) == 0);
+    assert(core_read_all(fp, payload, chunk, workers, out, (uint64_t)n));
     assert(memcmp(out, data, n) == 0);
     assert(out[n] == 0xC3);
 
@@ -141,23 +139,23 @@ static void test_incompressible_is_not_larger_than_bound(void) {
     printf("  incompressible payload stays within the stored-block bound: ok\n");
 }
 
-/* An empty region carries no framing, so opening one must fail rather than
- * read past the region into whatever follows it in the file. */
+/* An empty region carries no framing, so opening one must fail as malformed
+ * rather than read past the region into whatever follows it in the file. */
 static void test_reader_rejects_empty_region(void) {
     FILE *fp = tmpfile();
     assert(fp);
     const uint8_t junk[64] = {0};
     assert(fwrite(junk, 1, sizeof(junk), fp) == sizeof(junk));
     assert(fseek(fp, 0, SEEK_SET) == 0);
-    uint64_t total = 0;
-    assert(kv_lz4_reader_open(fp, 0, 1u << 16, 1, &total) == NULL);
+    bool corrupt = false;
+    assert(kv_lz4_reader_new(fp, 0, 1u << 16, 1, &corrupt) == NULL && corrupt);
     rewind(fp);
     /* A complete zero-total/zero-chunk frame used to allocate eight pools of
      * maximum-sized scratch despite representing no payload at all. */
-    assert(kv_lz4_reader_open(fp, 12, DS4_KVSTORE_MAX_CHUNK_BYTES,
-                              8, &total) == NULL);
+    corrupt = false;
+    assert(kv_lz4_reader_new(fp, 12, DS4_KVSTORE_MAX_CHUNK_BYTES, 8, &corrupt) == NULL && corrupt);
     fclose(fp);
-    printf("  reader rejects an empty payload region: ok\n");
+    printf("  reader rejects an empty payload region as malformed: ok\n");
 }
 
 /* Backed by a stream whose framing is valid, so the rejection has to come from
@@ -173,18 +171,18 @@ static void test_reader_rejects_bad_chunk_size(void) {
     assert(fp);
     const uint64_t payload = codec_write(fp, data, n, chunk, 1);
 
-    uint64_t total = 0;
+    bool corrupt = false;
     assert(fseek(fp, 0, SEEK_SET) == 0);
-    assert(kv_lz4_reader_open(fp, payload, 0, 1, &total) == NULL);
+    assert(kv_lz4_reader_new(fp, payload, 0, 1, &corrupt) == NULL && corrupt);
     assert(fseek(fp, 0, SEEK_SET) == 0);
-    assert(kv_lz4_reader_open(fp, payload, DS4_KVSTORE_MAX_CHUNK_BYTES + 1,
-                              1, &total) == NULL);
+    corrupt = false;
+    assert(kv_lz4_reader_new(fp, payload, DS4_KVSTORE_MAX_CHUNK_BYTES + 1, 1, &corrupt) == NULL && corrupt);
     /* Sanity: the same file does open at its real chunk size, so the two
      * rejections above are attributable to the bound, not a broken fixture. */
     assert(fseek(fp, 0, SEEK_SET) == 0);
-    FILE *ok = kv_lz4_reader_open(fp, payload, chunk, 1, &total);
-    assert(ok && total == (uint64_t)n);
-    fclose(ok);
+    kv_lz4_reader *ok = kv_lz4_reader_new(fp, payload, chunk, 1, &corrupt);
+    assert(ok && !corrupt && ok->uncompressed_total == (uint64_t)n);
+    (void)kv_lz4_reader_close(ok);
 
     fclose(fp);
     free(data);
@@ -234,10 +232,10 @@ static uint64_t emit_stream(FILE *fp, uint64_t total, uint32_t count,
 
 /* Decode a region through the reader core, which needs no cookie streams.
  * Returns true only if every declared byte was produced; out may be NULL. */
-static bool core_read_all(FILE *fp, uint64_t payload, uint32_t chunk,
+static bool core_read_all(FILE *fp, uint64_t payload, uint32_t chunk, int workers,
                           uint8_t *out, uint64_t expect_total) {
     bool corrupt = false;
-    kv_lz4_reader *r = kv_lz4_reader_new(fp, payload, chunk, 2, &corrupt);
+    kv_lz4_reader *r = kv_lz4_reader_new(fp, payload, chunk, workers, &corrupt);
     if (!r) return false;
     bool ok = r->uncompressed_total == expect_total;
     uint8_t *buf = out ? out : (ok ? malloc((size_t)expect_total) : NULL);
@@ -257,7 +255,7 @@ static bool core_read_all(FILE *fp, uint64_t payload, uint32_t chunk,
 static bool stream_accepted(FILE *fp, uint64_t payload, uint32_t chunk,
                             uint64_t expect_total) {
     assert(fseek(fp, 0, SEEK_SET) == 0);
-    return core_read_all(fp, payload, chunk, NULL, expect_total);
+    return core_read_all(fp, payload, chunk, 2, NULL, expect_total);
 }
 
 /* Scratch is sized from the header, so a region too small to hold the chunks
@@ -270,10 +268,10 @@ static void test_reader_rejects_impossible_framing(void) {
     ds4_kvstore_le_put32(framing + 8, 1); /* chunk_count = 1 */
     assert(fwrite(framing, 1, sizeof(framing), fp) == sizeof(framing));
     assert(fseek(fp, 0, SEEK_SET) == 0);
-    uint64_t total = 0;
     /* Framing consumes all 12 bytes, leaving nothing for the chunk record. */
-    assert(kv_lz4_reader_open(fp, sizeof(framing), DS4_KVSTORE_MAX_CHUNK_BYTES,
-                              8, &total) == NULL);
+    bool corrupt = false;
+    assert(kv_lz4_reader_new(fp, sizeof(framing), DS4_KVSTORE_MAX_CHUNK_BYTES,
+                             8, &corrupt) == NULL && corrupt);
     /* Nonempty framing must not bypass the same resource guard merely by
      * including enough bytes for the advertised record headers. */
     rewind(fp);
@@ -283,8 +281,9 @@ static void test_reader_rejects_impossible_framing(void) {
     const uint8_t records[8 * KV_LZ4_RECORD_BYTES] = {0};
     assert(fwrite(records, 1, sizeof(records), fp) == sizeof(records));
     rewind(fp);
-    assert(kv_lz4_reader_open(fp, sizeof(framing) + sizeof(records),
-                              DS4_KVSTORE_MAX_CHUNK_BYTES, 8, &total) == NULL);
+    corrupt = false;
+    assert(kv_lz4_reader_new(fp, sizeof(framing) + sizeof(records),
+                             DS4_KVSTORE_MAX_CHUNK_BYTES, 8, &corrupt) == NULL && corrupt);
     fclose(fp);
     printf("  reader rejects a region too small for the chunks it claims: ok\n");
 }
@@ -348,10 +347,10 @@ static void test_writer_restores_region_end(void) {
     assert(fseek(fp, 0, SEEK_SET) == 0);
 
     const uint8_t small[64] = {0};
-    FILE *cw = kv_lz4_writer_open(fp, chunk, 1);
-    assert(cw);
-    assert(fwrite(small, 1, sizeof(small), cw) == sizeof(small));
-    assert(fclose(cw) == 0);
+    kv_lz4_writer *w = kv_lz4_writer_new(fp, chunk, 1);
+    assert(w);
+    assert(kv_lz4_writer_write(w, (const char *)small, sizeof(small)) == (kv_lz4_io_ssize_t)sizeof(small));
+    assert(kv_lz4_writer_close(w) == 0);
 
     const long pos = ftell(fp);
     assert(pos > 0 && (size_t)pos < sizeof(junk));
@@ -385,17 +384,8 @@ static void test_truncated_and_corrupt(void) {
         }
 
         assert(fseek(fp, 0, SEEK_SET) == 0);
-        uint64_t total = 0;
-        FILE *cr = kv_lz4_reader_open(fp, payload, chunk, 2, &total);
-        bool failed = (cr == NULL);
-        if (cr) {
-            /* Either the read reports short, or the data differs; silently
-             * returning n bytes that do not match the input is a failure. */
-            size_t got = fread(out, 1, n, cr);
-            if (got != n || memcmp(out, data, n) != 0) failed = true;
-            fclose(cr);
-        }
-        assert(failed);
+        /* With per-chunk checksums no mode may produce the full payload. */
+        assert(!core_read_all(fp, payload, chunk, 2, out, n));
         fclose(fp);
     }
     free(data); free(out);
@@ -406,10 +396,11 @@ static void test_truncated_and_corrupt(void) {
  * starting at a nonzero offset as in production, and decodes byte for byte.
  * A chunk size that cannot round-trip through log2 falls back to the default. */
 static void test_write_payload_region(void) {
-    const uint32_t chunks[] = {1u << 12, 5000};
+    const uint32_t chunks[] = {1u << 12, 5000, 0, 128u << 20};
     for (size_t ci = 0; ci < sizeof(chunks) / sizeof(*chunks); ci++) {
         const uint32_t chunk_bytes = chunks[ci];
-        const uint32_t used = (chunk_bytes & (chunk_bytes - 1u))
+        const uint32_t used = (chunk_bytes == 0 || chunk_bytes > DS4_KVSTORE_MAX_CHUNK_BYTES ||
+                               (chunk_bytes & (chunk_bytes - 1u)))
                               ? DS4_KVSTORE_DEFAULT_CHUNK_BYTES : chunk_bytes;
         const size_t n = 9 * (1u << 12) + 37;   /* several 4 KiB chunks */
         uint8_t *data = malloc(n), *back = malloc(n);
@@ -437,10 +428,10 @@ static void test_write_payload_region(void) {
         assert(ok && err[0] == '\0');
         assert(codec == DS4_KVSTORE_CODEC_LZ4);
         assert((1u << chunk_log2) == used);
-        assert(on_disk > 0 && ftell(fp) == (long)(sizeof(lead) + on_disk));
+        assert(on_disk > 0);
 
         assert(fseek(fp, (long)sizeof(lead), SEEK_SET) == 0);
-        assert(core_read_all(fp, on_disk, used, back, n));
+        assert(core_read_all(fp, on_disk, used, 4, back, n));
         assert(memcmp(back, data, n) == 0);
 
         fclose(fp);
@@ -497,20 +488,27 @@ static void test_fuzz_regions(void) {
             free(m);
         }
         assert(fseek(fp, 0, SEEK_SET) == 0);
-        uint64_t total = 0;
-        FILE *cr = kv_lz4_reader_open(fp, payload, chunk, 2, &total);
-        if (cr) {
+        bool corrupt = false;
+        kv_lz4_reader *r = kv_lz4_reader_new(fp, payload, chunk, 2, &corrupt);
+        if (r) {
+            const uint64_t total = r->uncompressed_total;
             /* Cap the claimed size: a mutated header must not make the test
              * itself allocate without bound. */
             if (total <= 64u * 1024u * 1024u) {
                 size_t want = total < n ? (size_t)total : n;
-                size_t got = fread(out, 1, want, cr);
+                size_t got = 0;
+                while (got < want) {
+                    const kv_lz4_io_ssize_t k = kv_lz4_reader_read(
+                            r, (char *)out + got, (kv_lz4_io_size_t)(want - got));
+                    if (k <= 0) break;
+                    got += (size_t)k;
+                }
                 /* Each chunk carries a checksum of its raw bytes, so a
                  * mutation must never decode to full-length wrong bytes. */
                 if (got == want && want == n && memcmp(out, data, n) != 0)
                     silent_wrong++;
             }
-            fclose(cr);
+            (void)kv_lz4_reader_close(r);
         }
         fclose(fp);
     }
@@ -519,29 +517,13 @@ static void test_fuzz_regions(void) {
     printf("  3000 mutated and random regions: no crash, hang or silent wrong bytes: ok\n");
 }
 
-/* Without cookie streams only the stdio wrappers are unavailable: compression
- * stays on by default and the reader core still decodes a valid stream. */
+/* Without cookie streams the only missing piece is the stdio wrapper used to
+ * hand a decoder to the engine: compression stays on by default. */
 static void test_no_cookie_streams(void) {
     const char *env = getenv("DS4_KV_CACHE_COMPRESSION_THREADS");
     if (!env || !env[0]) assert(kv_cache_default_compression_threads() >= 1);
-    const uint32_t chunk = 4096;
-    const uint64_t total = 5000;
-    const uint32_t raws[2] = {4096, 904};
-    uint8_t *src = malloc((size_t)total);
-    assert(src);
-    fill(src, (size_t)total, 3);
-    FILE *fp = tmpfile();
-    assert(fp);
-    const uint64_t payload = emit_stream(fp, total, 2, raws, src, -1);
-    assert(kv_lz4_writer_open(fp, chunk, 4) == NULL);
-    assert(fseek(fp, 0, SEEK_SET) == 0);
-    uint64_t seen = 0;
-    /* The stream is valid, so only the missing wrapper explains this NULL. */
-    assert(kv_lz4_reader_open(fp, payload, chunk, 1, &seen) == NULL);
-    assert(stream_accepted(fp, payload, chunk, total));
-    fclose(fp);
-    free(src);
-    printf("  stdio wrappers absent, codec core still reads and writes: ok\n");
+    assert(kv_lz4_fwrap_open(&env, "rb", NULL, NULL, NULL) == NULL);
+    printf("  no cookie streams: stdio wrapper absent, compression on by default: ok\n");
 }
 
 /* Reference values from xxhsum 0.8.3 -H32, covering the short, 4-byte and
@@ -648,22 +630,19 @@ int main(void) {
     test_shuffle();
     test_xxh32();
     test_header_versions();
+    test_roundtrip();
+    test_incompressible_is_not_larger_than_bound();
+    test_reader_rejects_empty_region();
+    test_reader_rejects_bad_chunk_size();
+    test_reader_rejects_impossible_framing();
     test_reader_enforces_full_non_final_chunks();
     test_reader_enforces_raw_total();
     test_reader_verifies_chunk_checksums();
+    test_writer_restores_region_end();
+    test_truncated_and_corrupt();
+    test_fuzz_regions();
     test_write_payload_region();
-    if (KV_LZ4_HAVE_FWRAP) {
-        test_roundtrip();
-        test_incompressible_is_not_larger_than_bound();
-        test_reader_rejects_empty_region();
-        test_reader_rejects_bad_chunk_size();
-        test_reader_rejects_impossible_framing();
-        test_writer_restores_region_end();
-        test_truncated_and_corrupt();
-        test_fuzz_regions();
-    } else {
-        test_no_cookie_streams();
-    }
+    if (!KV_LZ4_HAVE_FWRAP) test_no_cookie_streams();
     printf("Disk KV lz4 codec%s: PASS\n",
            KV_LZ4_HAVE_FWRAP ? "" : ", no cookie streams");
     return 0;

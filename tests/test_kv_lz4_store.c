@@ -1,6 +1,7 @@
 /* Exercise the real store/eviction/codec paths without loading a model. Only
  * the engine boundary is replaced: snapshots contain a deterministic payload. */
 #include <errno.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 static int fail_rename, fail_alloc, stray_errno;
@@ -20,8 +21,35 @@ static void *test_malloc(size_t n) {
     if (p && stray_errno) errno = EAGAIN;
     return p;
 }
+/* Stream failures inside the codec: mode 1 fails the framing read, mode 2 the
+ * first chunk record, mode 3 the first compressed block. */
+static int io_fail_mode, io_fail_hit, io_read12, fail_tmpfile;
+static size_t test_fread(void *p, size_t size, size_t nmemb, FILE *fp) {
+    const size_t bytes = size * nmemb;
+    if (io_fail_mode && !io_fail_hit) {
+        const bool record = bytes == 12;
+        if (record) io_read12++;
+        if ((io_fail_mode == 1 && record && io_read12 == 1) ||
+            (io_fail_mode == 2 && record && io_read12 == 2) ||
+            (io_fail_mode == 3 && !record && io_read12 == 2))
+        {
+            io_fail_hit = 1;
+            errno = EIO;
+            return 0;
+        }
+    }
+    return fread(p, size, nmemb, fp);
+}
+static int test_ferror(FILE *fp) { return io_fail_hit ? 1 : ferror(fp); }
+static FILE *test_tmpfile(void) {
+    if (fail_tmpfile) { errno = ENOSPC; return NULL; }
+    return tmpfile();
+}
 #define rename test_rename
 #define malloc test_malloc
+#define fread test_fread
+#define ferror test_ferror
+#define tmpfile test_tmpfile
 #define ds4_engine_model_id test_model_id
 #define ds4_engine_routed_quant_bits test_quant_bits
 #define ds4_session_ctx test_ctx
@@ -32,6 +60,9 @@ static void *test_malloc(size_t n) {
 #include "../ds4_kvstore.c"
 #undef rename
 #undef malloc
+#undef fread
+#undef ferror
+#undef tmpfile
 #include <assert.h>
 
 static int token_ids[128];
@@ -74,12 +105,23 @@ int test_load(ds4_session *s, FILE *fp, uint64_t bytes, char *err, size_t errlen
     if (load_errno) { errno = load_errno; snprintf(err, errlen, "injected resource failure"); return 1; }
     /* Engine and GPU failures often report no errno at all. */
     if (load_silent) { snprintf(err, errlen, "injected silent engine failure"); return 1; }
+    assert(bytes == payload_size);
     uint8_t buf[65536];
+    uint64_t rng = 186;
     while (bytes) {
         size_t n = bytes < sizeof(buf) ? (size_t)bytes : sizeof(buf);
         /* A real engine may leave errno from the failed stream read; codec
          * corruption must still be classified by the reader, not errno. */
         if (fread(buf, 1, n, fp) != n) { errno = EIO; return 1; }
+        /* Every byte the engine receives must be the byte that was staged. */
+        for (size_t i = 0; i < n; i++) {
+            uint8_t want = 0;
+            if (random_payload) {
+                rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+                want = (uint8_t)(rng >> 33);
+            }
+            assert(buf[i] == want);
+        }
         bytes -= n;
     }
     return 0;
@@ -251,12 +293,20 @@ static void run_case(const char *name) {
             load_errno = EIO;
         } else if (!strcmp(name, "engine-silent")) {
             load_silent = 1;
+        } else if (!strcmp(name, "stream-io-framing") || !strcmp(name, "stream-io-record") ||
+                   !strcmp(name, "stream-io-block")) {
+            io_fail_mode = !strcmp(name, "stream-io-framing") ? 1 :
+                           !strcmp(name, "stream-io-record") ? 2 : 3;
+            io_read12 = io_fail_hit = 0;
+        } else if (!strcmp(name, "tmpfile-failure")) {
+            fail_tmpfile = 1;
         } else { assert(!"unknown case"); }
         kv_cache_refresh(&kc);
         load_calls = invalidated = 0;
         stray_errno = !strcmp(name, "corrupt-recovery") || !strcmp(name, "checksum-recovery");
         assert(ds4_kvstore_try_load_text(&kc, NULL, NULL, "incoming checkpoint", NULL, NULL, NULL, false) == 0);
         stray_errno = 0;
+        if (io_fail_mode) assert(io_fail_hit == 1);
         assert(invalidated == 1);
         if (!strcmp(name, "corrupt-recovery") || !strcmp(name, "checksum-recovery")) {
             /* With cookie streams the engine starts reading before the bad
@@ -270,7 +320,7 @@ static void run_case(const char *name) {
         } else {
             assert(access(incoming, F_OK) == 0);
         }
-        fail_alloc = load_errno = load_silent = 0;
+        fail_alloc = load_errno = load_silent = io_fail_mode = io_fail_hit = io_read12 = fail_tmpfile = 0;
         assert(ds4_kvstore_try_load_text(&kc, NULL, NULL, "incoming checkpoint",
                                         NULL, NULL, NULL, false) == 128);
     }
@@ -296,8 +346,11 @@ int main(int argc, char **argv) {
     const char *cases[] = {"admission", "eviction", "publish-failure", "write-failure",
         "raw-fallback-budget", "expansion-budget", "protect-published", "payload-past-eof", "legacy-codec",
         "corrupt-recovery", "checksum-recovery",
-        "load-oom", "engine-oom", "engine-io", "engine-silent", "replace-failure", "replace-success"};
+        "load-oom", "engine-oom", "engine-io", "engine-silent",
+        "stream-io-framing", "stream-io-record", "stream-io-block", "replace-failure", "replace-success"};
     for (size_t i = 0; i < sizeof(cases) / sizeof(*cases); i++) run_case(cases[i]);
+    /* Only the no-cookie build decodes through a temporary file. */
+    if (!KV_LZ4_HAVE_FWRAP) run_case("tmpfile-failure");
     printf("Disk KV store%s: PASS\n", KV_LZ4_HAVE_FWRAP ? "" : ", no cookie streams");
     return 0;
 }

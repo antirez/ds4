@@ -22,7 +22,9 @@ Refreshing an entry rewrites its version from its codec, so raw entries end as
 version 1, including raw version-2 files from earlier builds. The reader
 accepts version 1 with codec 0 and version 2 with either codec, and rejects
 version 1 carrying a codec. Codec 1 was an unreleased layout without checksums;
-it is rejected, and refreshing the index removes such files.
+it is rejected, and refreshing the server index removes such files. The agent
+never deletes files, so sessions saved in that layout drop out of its session
+list and must be removed by hand.
 
 An LZ4 payload contains little-endian framing followed by chunk records:
 
@@ -41,8 +43,9 @@ the declared total. Decoding reverses the transpose and verifies each chunk's
 XXH32 before its bytes reach the engine. Framing checks reject empty
 compressed frames, inconsistent counts, impossible expansion, truncated
 records and invalid chunk lengths; the checksum catches content mutations
-those checks cannot. Trailers remain outside the compressed region, and a
-payload size larger than the rest of the file is rejected before any seek.
+those checks cannot. Trailers remain outside the compressed region, and the
+payload loader rejects a payload size larger than the rest of the file before
+it seeks.
 Raw payloads still carry no content checksum.
 
 ## Resources and cache policy
@@ -85,7 +88,8 @@ codec or version are left alone.
 
 Where cookie streams are available the engine reads through the decoder
 directly. Elsewhere the payload is decoded into a temporary file first, which
-needs temporary disk space equal to the uncompressed payload. A decode that
+needs space equal to the uncompressed payload in the C library's temporary
+directory; on Linux that is usually `/tmp`, which may be RAM-backed. A decode that
 fails for lack of that space keeps the entry and is retried on the next lookup.
 
 Cold checkpoints can be saved during prefill. Logged `save_ms` excludes the
@@ -163,11 +167,13 @@ compressed files, unnecessary eviction, write/rename failures, fallback and
 incompressible expansion exceeding budget, protection of an admitted file,
 corrupt-file and checksum-mismatch replacement, removal of the retired codec-1
 layout while other unknown codecs are kept, retention after engine failures
-that report no errno,
+that report no errno and after stream read errors in the framing, a chunk
+record or a block, byte-exact delivery to the engine,
 retention and retry after reported allocation/I/O failures, and atomic
 replacement of same-key incompatible files. `test-kv-lz4-nofwrap` builds both
-suites without cookie streams, so the same store cases load compressed entries
-through the temporary-file path. These fixtures
+suites without cookie streams: every codec test runs there too, and the store
+cases load compressed entries through the temporary-file path, including a
+temporary-file failure that must keep the entry. These fixtures
 are not model-generated KV compression-ratio evidence.
 
 ## V4.1 throughput through 256K

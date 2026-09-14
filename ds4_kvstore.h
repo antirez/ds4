@@ -232,17 +232,6 @@ char *ds4_kvstore_path_for_sha(ds4_kvstore *kc, const char sha[41]);
 void ds4_kvstore_le_put32(uint8_t *p, uint32_t v);
 uint32_t ds4_kvstore_le_get32(const uint8_t *p);
 
-/* Streaming LZ4 cookie wrappers for the payload region.  Both return a FILE *
- * around the raw file handle; closing the wrapper with fclose() patches the
- * framing header and does NOT close the underlying file (the caller owns it).
- * The reader peeks the 12-byte framing eagerly when uncompressed_total_out is
- * non-NULL so the load site learns the uncompressed payload size before any
- * decompression happens.  See misc/COMPRESSED_KV_CACHE.md. */
-FILE *kv_lz4_writer_open(FILE *out, uint32_t chunk_size, int n_workers);
-FILE *kv_lz4_reader_open(FILE *in, uint64_t payload_bytes,
-                         uint32_t chunk_size, int n_workers,
-                         uint64_t *uncompressed_total_out);
-
 /* Write the payload region for `staged` into `fp`, which must be positioned at
  * the payload start.  n_workers == 0 writes a raw payload; >=1 wraps it in the
  * LZ4 codec.  On success sets *codec_out, *chunk_log2_out, and *on_disk_out
