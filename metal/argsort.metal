@@ -31,6 +31,8 @@ struct ds4_metal_args_argsort_merge {
     int32_t  ne3;
     int32_t  top_k;
     int32_t  len;
+    int32_t  total;
+    int32_t  keep_k;
     uint32_t causal_start;
     uint32_t causal_ratio;
     uint32_t block_width;
@@ -177,28 +179,45 @@ kernel void kernel_argsort_merge_f32_i32(
     const int i02 = tgpig[1];
     const int i03 = tgpig[2];
 
-    const int start = im * (2 * args.len);
-    const uint width = causal ? min(uint(args.ne00),
-        (args.causal_start + uint(i01) + 1u) / args.causal_ratio) : 0u;
-    const int work_width = causal ? int(((width - 1u) / args.block_width) * args.block_top_k +
-        min((width - 1u) % args.block_width + 1u, args.block_top_k)) : args.ne0;
+    const int start_read = im * (2 * args.len);
+    int start_write, out_limit;
+    int len0, len1;
+    if (causal) {
+        // Rows have a per-token valid width under the causal mask, so runs stay
+        // packed at stride 2*len: this keeps the original run offsets so the
+        // comparison and tie order agree.
+        start_write = start_read;
+        const uint width = min(uint(args.ne00),
+            (args.causal_start + uint(i01) + 1u) / args.causal_ratio);
+        const int work_width = int(((width - 1u) / args.block_width) * args.block_top_k +
+            min((width - 1u) % args.block_width + 1u, args.block_top_k));
 
-    // A merged run can contribute at most 512 entries to the final result.
-    // Keep the original run offsets so the comparison and tie order agree.
-    const int read_limit = prefix ? min(args.len, 512) : args.len;
-    const int len0 = MIN(read_limit, MAX(0, work_width - start));
-    const int len1 = MIN(read_limit, MAX(0, work_width - (start + args.len)));
+        // A merged run can contribute at most 512 entries to the final result.
+        const int read_limit = prefix ? min(args.len, 512) : args.len;
+        len0 = MIN(read_limit, MAX(0, work_width - start_read));
+        len1 = MIN(read_limit, MAX(0, work_width - (start_read + args.len)));
+        out_limit = prefix ? min(args.top_k, 512) : args.top_k;
+    } else {
+        // Runs are read at stride 2*len within the args.total valid elements of the
+        // row; output is packed at stride new_len so a round keeps at most keep_k.
+        const int new_len = MIN(2 * args.len, args.keep_k);
+        start_write = im * new_len;
+        out_limit = new_len;
+
+        len0 = MIN(args.len, MAX(0, args.total - start_read));
+        len1 = MIN(args.len, MAX(0, args.total - (start_read + args.len)));
+    }
 
     const int total = len0 + len1;
 
-    device const int32_t * tmp0 = tmp + start
+    device const int32_t * tmp0 = tmp + start_read
         + i01*args.ne0
         + i02*args.ne0*args.ne01
         + i03*args.ne0*args.ne01*args.ne02;
 
     device const int32_t * tmp1 = tmp0 + args.len;
 
-    dst += start
+    dst += start_write
         + i01*args.top_k
         + i02*args.top_k*args.ne01
         + i03*args.top_k*args.ne01*args.ne02;
@@ -212,17 +231,16 @@ kernel void kernel_argsort_merge_f32_i32(
         return;
     }
 
-    const int chunk = (total + ntg.x - 1) / ntg.x;
+    const int out   = MIN(total, out_limit);
+    // The packed layout splits the work over the elements written so no thread
+    // idles when pruning binds; the causal layout keeps splitting over the
+    // elements read, which is cheaper on saturated prefill rows.
+    const int chunk = ((causal ? total : out) + ntg.x - 1) / ntg.x;
 
     const int k0 = tpitg.x * chunk;
-    const int limit = prefix ? min(args.top_k, 512) : args.top_k;
-    const int k1 = MIN(MIN(k0 + chunk, total), limit);
+    const int k1 = MIN(k0 + chunk, out);
 
-    if (k0 >= limit) {
-        return;
-    }
-
-    if (k0 >= total) {
+    if (k0 >= out) {
         return;
     }
 
