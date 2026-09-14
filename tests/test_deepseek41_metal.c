@@ -316,6 +316,338 @@ static int check_hc_scaled(void) {
     return 1;
 }
 
+/* The fused decode HC glue (norm+mix, split+collapse+BF16+norm+BF16,
+ * expand+BF16) must be byte-identical to the standalone dispatch sequence
+ * the V4.1 graph ran before it, at V4.1's shape (4 x 5120, 24 mixes). */
+static int check_hc_fuse(void) {
+    enum { D = 5120, HC = 4, N = HC * D, OUT = 24, ITERS = 20 };
+    const float hc_eps = 1e-6f, rms_eps = 1e-20f;
+    const size_t fn_bytes = (size_t)N * OUT * sizeof(_Float16);
+    const size_t scale_off = fn_bytes, base_off = scale_off + 64, normw_off = base_off + 128;
+    const size_t page = (size_t)getpagesize();
+    const size_t mapped = (normw_off + D * sizeof(float) + page - 1) / page * page;
+    void *model = NULL;
+    CHECK(!posix_memalign(&model, page, mapped));
+    _Float16 *fn = model;
+    float *scale = (float *)((char *)model + scale_off);
+    float *base = (float *)((char *)model + base_off);
+    float *normw = (float *)((char *)model + normw_off);
+    for (size_t i = 0; i < (size_t)N * OUT; i++) fn[i] = (_Float16)(random_value() / 64);
+    for (int i = 0; i < 3; i++) scale[i] = 0.5f + random_value() / 8;
+    for (int i = 0; i < OUT; i++) base[i] = random_value() / 4;
+    for (int i = 0; i < D; i++) normw[i] = 1.0f + random_value() / 8;
+    CHECK(ds4_gpu_set_model_map(model, mapped));
+
+    ds4_gpu_tensor *residual = upload(NULL, N * 4), *block = upload(NULL, D * 4), *pre = upload(NULL, 16);
+    ds4_gpu_tensor *flat = upload(NULL, N * 4);
+    ds4_gpu_tensor *mix[2] = {upload(NULL, OUT * 4), upload(NULL, OUT * 4)};
+    ds4_gpu_tensor *split[2] = {upload(NULL, OUT * 4), upload(NULL, OUT * 4)};
+    ds4_gpu_tensor *x[2] = {upload(NULL, D * 4), upload(NULL, D * 4)};
+    ds4_gpu_tensor *norm[2] = {upload(NULL, D * 4), upload(NULL, D * 4)};
+    ds4_gpu_tensor *out[2] = {upload(NULL, N * 4), upload(NULL, N * 4)};
+    ds4_gpu_tensor *pre_next[2] = {upload(NULL, 16), upload(NULL, 16)};
+    CHECK(residual && block && pre && flat && mix[0] && mix[1] && split[0] && split[1] &&
+          x[0] && x[1] && norm[0] && norm[1] && out[0] && out[1] && pre_next[0] && pre_next[1]);
+    float *res = ds4_gpu_tensor_contents(residual), *blk = ds4_gpu_tensor_contents(block);
+    float *p = ds4_gpu_tensor_contents(pre);
+    double elapsed[2] = {0};
+    for (int round = 0; round < 6; round++) {
+        for (int i = 0; i < N; i++) res[i] = bf16(random_value() * (round == 5 ? 0x1p-14f : 1.0f));
+        for (int i = 0; i < D; i++) blk[i] = bf16(random_value());
+        for (int i = 0; i < HC; i++) p[i] = 0.5f + random_value() / 8 + hc_eps;
+        for (int mode = 0; mode < 2; mode++) {
+            const double begin = monotonic_seconds();
+            CHECK(ds4_gpu_begin_commands());
+            if (mode == 0) {
+                CHECK(ds4_gpu_rms_norm_plain_tensor(flat, residual, N, rms_eps));
+                CHECK(ds4_gpu_matmul_f16_tensor(mix[0], model, mapped, 0, N, OUT, flat, 1));
+                CHECK(ds4_gpu_hc_split_sinkhorn_tensor(split[0], mix[0], model, mapped,
+                    scale_off, base_off, HC, ITERS, hc_eps));
+                CHECK(ds4_gpu_hc_weighted_sum_tensor(x[0], residual, pre, D, HC));
+                CHECK(ds4_gpu_dsv41_quantize(x[0], D, 1, DS4_V41_BF16));
+                CHECK(ds4_gpu_rms_norm_weight_tensor(norm[0], x[0], model, mapped, normw_off, D, rms_eps));
+                CHECK(ds4_gpu_dsv41_quantize(norm[0], D, 1, DS4_V41_BF16));
+                CHECK(ds4_gpu_hc_expand_split_tensor(out[0], block, residual, split[0], D, HC));
+                CHECK(ds4_gpu_dsv41_quantize(out[0], N, 1, DS4_V41_BF16));
+                CHECK(ds4_gpu_tensor_copy(pre_next[0], 0, split[0], 0, 16));
+            } else {
+                CHECK(ds4_gpu_hc_rms_norm_mix_f16_tensor(mix[1], residual, model, mapped, 0, N, OUT, rms_eps));
+                CHECK(ds4_gpu_dsv41_hc_collapse_norm(split[1], x[1], norm[1], mix[1], pre, residual,
+                    model, mapped, scale_off, base_off, normw_off, D, HC, ITERS, hc_eps, rms_eps));
+                CHECK(ds4_gpu_dsv41_hc_expand4(out[1], block, residual, split[1], pre_next[1], NULL, NULL, D));
+            }
+            CHECK(ds4_gpu_end_commands());
+            CHECK(ds4_gpu_synchronize());
+            if (round) elapsed[mode] += (monotonic_seconds() - begin) * 1000.0 / 5;
+        }
+        CHECK(!memcmp(ds4_gpu_tensor_contents(mix[0]), ds4_gpu_tensor_contents(mix[1]), OUT * 4));
+        CHECK(!memcmp(ds4_gpu_tensor_contents(split[0]), ds4_gpu_tensor_contents(split[1]), OUT * 4));
+        CHECK(!memcmp(ds4_gpu_tensor_contents(x[0]), ds4_gpu_tensor_contents(x[1]), D * 4));
+        CHECK(!memcmp(ds4_gpu_tensor_contents(norm[0]), ds4_gpu_tensor_contents(norm[1]), D * 4));
+        CHECK(!memcmp(ds4_gpu_tensor_contents(out[0]), ds4_gpu_tensor_contents(out[1]), N * 4));
+        CHECK(!memcmp(ds4_gpu_tensor_contents(pre_next[0]), ds4_gpu_tensor_contents(pre_next[1]), 16));
+        const float *s = ds4_gpu_tensor_contents(split[1]);
+        for (int i = 0; i < OUT; i++) CHECK(isfinite(s[i]));
+    }
+    fprintf(stderr, "HC fuse: 10 dispatches %.3f ms -> 3 dispatches %.3f ms, outputs byte-identical\n",
+            elapsed[0], elapsed[1]);
+    for (int i = 0; i < 2; i++) {
+        ds4_gpu_tensor_free(mix[i]); ds4_gpu_tensor_free(split[i]); ds4_gpu_tensor_free(x[i]);
+        ds4_gpu_tensor_free(norm[i]); ds4_gpu_tensor_free(out[i]); ds4_gpu_tensor_free(pre_next[i]);
+    }
+    ds4_gpu_tensor_free(residual); ds4_gpu_tensor_free(block); ds4_gpu_tensor_free(pre); ds4_gpu_tensor_free(flat);
+    ds4_gpu_cleanup(); free(model);
+    CHECK(ds4_gpu_init());
+    return 1;
+}
+
+static void fill_q8_0(uint8_t *dst, size_t rows, size_t k) {
+    for (size_t r = 0; r < rows; r++) for (size_t b = 0; b < k / 32; b++) {
+        uint8_t *block = dst + (r * (k / 32) + b) * 34;
+        const _Float16 d = (_Float16)(random_value() / 512 + 0.01f);
+        memcpy(block, &d, 2);
+        for (int i = 0; i < 32; i++) block[2 + i] = (uint8_t)(int8_t)(random_value() * 30);
+    }
+}
+
+/* The fused decode MoE glue (router + select, shared gate/up/SwiGLU, shared
+ * down + sum + HC expand) must be byte-identical to the 22-dispatch
+ * standalone sequence at V4.1's shape (5120 x 384 F32 router, 6 of 384,
+ * scale 1.5, Q8_0 shared expert of 2304). */
+static int check_moe_fuse(void) {
+    enum { D = 5120, HC = 4, N = HC * D, E = 384, K = 6, FF = 2304 };
+    const float scale = 1.5f, clamp = 10.0f;
+    const size_t router_bytes = (size_t)D * E * 4, bias_bytes = E * 4;
+    const size_t gate_bytes = (size_t)FF * (D / 32) * 34, down_bytes = (size_t)D * (FF / 32) * 34;
+    const size_t router_off = 0, bias_off = router_bytes, gate_off = bias_off + bias_bytes;
+    const size_t up_off = gate_off + gate_bytes, down_off = up_off + gate_bytes;
+    const size_t page = (size_t)getpagesize();
+    const size_t mapped = (down_off + down_bytes + page - 1) / page * page;
+    void *model = NULL;
+    CHECK(!posix_memalign(&model, page, mapped));
+    float *router = model, *bias = (float *)((char *)model + bias_off);
+    for (size_t i = 0; i < (size_t)D * E; i++) router[i] = random_value() / 64;
+    /* Repeated bias values: with a zero input every score ties within its
+     * group and the canonical order (ascending index among equals) is what
+     * the standalone argsort produces. */
+    for (int i = 0; i < E; i++) bias[i] = (float)(i % 5) / 10;
+    fill_q8_0((uint8_t *)model + gate_off, FF, D);
+    fill_q8_0((uint8_t *)model + up_off, FF, D);
+    fill_q8_0((uint8_t *)model + down_off, D, FF);
+    CHECK(ds4_gpu_set_model_map(model, mapped));
+
+    ds4_gpu_tensor *norm = upload(NULL, D * 4), *routed = upload(NULL, D * 4);
+    ds4_gpu_tensor *residual = upload(NULL, N * 4), *split = upload(NULL, 24 * 4);
+    ds4_gpu_tensor *logits[2] = {upload(NULL, E * 4), upload(NULL, E * 4)};
+    ds4_gpu_tensor *probs[2] = {upload(NULL, E * 4), upload(NULL, E * 4)};
+    ds4_gpu_tensor *selected[2] = {upload(NULL, K * 4), upload(NULL, K * 4)};
+    ds4_gpu_tensor *weights[2] = {upload(NULL, K * 4), upload(NULL, K * 4)};
+    ds4_gpu_tensor *gate = upload(NULL, FF * 4), *up = upload(NULL, FF * 4);
+    ds4_gpu_tensor *mid[2] = {upload(NULL, FF * 4), upload(NULL, FF * 4)};
+    ds4_gpu_tensor *shared[2] = {upload(NULL, D * 4), upload(NULL, D * 4)};
+    ds4_gpu_tensor *block[2] = {upload(NULL, D * 4), upload(NULL, D * 4)};
+    ds4_gpu_tensor *out[2] = {upload(NULL, N * 4), upload(NULL, N * 4)};
+    ds4_gpu_tensor *pre[2] = {upload(NULL, 16), upload(NULL, 16)};
+    CHECK(norm && routed && residual && split && gate && up);
+    for (int i = 0; i < 2; i++)
+        CHECK(logits[i] && probs[i] && selected[i] && weights[i] && mid[i] && shared[i] && block[i] && out[i] && pre[i]);
+    float *x = ds4_gpu_tensor_contents(norm), *r = ds4_gpu_tensor_contents(routed);
+    float *res = ds4_gpu_tensor_contents(residual), *s = ds4_gpu_tensor_contents(split);
+    double elapsed[2] = {0};
+    for (int round = 0; round < 8; round++) {
+        const int ties = round == 3 || round == 7;
+        for (int i = 0; i < D; i++) x[i] = ties ? 0.0f : bf16(random_value());
+        for (int i = 0; i < D; i++) r[i] = bf16(random_value());
+        for (int i = 0; i < N; i++) res[i] = bf16(random_value());
+        for (int i = 0; i < 24; i++) s[i] = i < 4 ? 0.5f + random_value() / 8 : i < 8 ? 1.0f + random_value() / 4 : 0.25f + random_value() / 16;
+        for (int mode = 0; mode < 2; mode++) {
+            const double begin = monotonic_seconds();
+            CHECK(ds4_gpu_begin_commands());
+            if (mode == 0) {
+                CHECK(ds4_gpu_matmul_f32_tensor(logits[0], model, mapped, router_off, D, E, norm, 1));
+                CHECK(ds4_gpu_router_select_tensor(selected[0], weights[0], probs[0], model, mapped,
+                    bias_off, 0, 0, 0, E, K, scale, 0, 0, true, false, logits[0]));
+                CHECK(ds4_gpu_matmul_q8_0_tensor(gate, model, mapped, gate_off, D, FF, norm, 1));
+                CHECK(ds4_gpu_dsv41_quantize(gate, FF, 1, DS4_V41_BF16));
+                CHECK(ds4_gpu_matmul_q8_0_tensor(up, model, mapped, up_off, D, FF, norm, 1));
+                CHECK(ds4_gpu_dsv41_quantize(up, FF, 1, DS4_V41_BF16));
+                CHECK(ds4_gpu_swiglu_tensor(mid[0], gate, up, FF, clamp, 1.0f));
+                CHECK(ds4_gpu_dsv41_quantize(mid[0], FF, 1, DS4_V41_BF16));
+                CHECK(ds4_gpu_matmul_q8_0_tensor(shared[0], model, mapped, down_off, FF, D, mid[0], 1));
+                CHECK(ds4_gpu_dsv41_quantize(shared[0], D, 1, DS4_V41_BF16));
+                CHECK(ds4_gpu_add_tensor(block[0], routed, shared[0], D));
+                CHECK(ds4_gpu_dsv41_quantize(block[0], D, 1, DS4_V41_BF16));
+                CHECK(ds4_gpu_hc_expand_split_tensor(out[0], block[0], residual, split, D, HC));
+                CHECK(ds4_gpu_dsv41_quantize(out[0], N, 1, DS4_V41_BF16));
+                CHECK(ds4_gpu_tensor_copy(pre[0], 0, split, 0, 16));
+            } else {
+                CHECK(ds4_gpu_dsv41_router_select(selected[1], weights[1], probs[1], logits[1], norm,
+                    model, mapped, router_off, bias_off, true, D, E, K, scale));
+                CHECK(ds4_gpu_dsv41_shared_gate_up_swiglu(mid[1], norm, model, mapped, gate_off, up_off, D, FF, clamp));
+                CHECK(ds4_gpu_dsv41_matvec_bf16(shared[1], model, mapped, down_off, DS4_V41_WEIGHT_Q8_0, FF, D, mid[1]) == 1);
+                CHECK(ds4_gpu_dsv41_hc_expand4(out[1], routed, residual, split, pre[1], shared[1], block[1], D));
+            }
+            CHECK(ds4_gpu_end_commands());
+            CHECK(ds4_gpu_synchronize());
+            if (round) elapsed[mode] += (monotonic_seconds() - begin) * 1000.0 / 7;
+        }
+        const int32_t *sel = ds4_gpu_tensor_contents(selected[1]);
+        for (int i = 0; i < K; i++) CHECK(sel[i] >= 0 && sel[i] < E);
+        /* Ties: the fused select orders equal scores by ascending index (the
+         * canonical argsort order); an argsort without that tie-break agrees
+         * on the set but not necessarily on the order. */
+        if (ties) for (int i = 0; i < K; i++) CHECK(sel[i] == 4 + 5 * i);
+        CHECK(!memcmp(ds4_gpu_tensor_contents(logits[0]), ds4_gpu_tensor_contents(logits[1]), E * 4));
+        CHECK(!memcmp(ds4_gpu_tensor_contents(probs[0]), ds4_gpu_tensor_contents(probs[1]), E * 4));
+        if (!ties) {
+            CHECK(!memcmp(ds4_gpu_tensor_contents(selected[0]), sel, K * 4));
+            CHECK(!memcmp(ds4_gpu_tensor_contents(weights[0]), ds4_gpu_tensor_contents(weights[1]), K * 4));
+        }
+        CHECK(!memcmp(ds4_gpu_tensor_contents(mid[0]), ds4_gpu_tensor_contents(mid[1]), FF * 4));
+        CHECK(!memcmp(ds4_gpu_tensor_contents(shared[0]), ds4_gpu_tensor_contents(shared[1]), D * 4));
+        CHECK(!memcmp(ds4_gpu_tensor_contents(block[0]), ds4_gpu_tensor_contents(block[1]), D * 4));
+        CHECK(!memcmp(ds4_gpu_tensor_contents(out[0]), ds4_gpu_tensor_contents(out[1]), N * 4));
+        CHECK(!memcmp(ds4_gpu_tensor_contents(pre[0]), ds4_gpu_tensor_contents(pre[1]), 16));
+    }
+    fprintf(stderr, "MoE fuse: 15 dispatches %.3f ms -> 4-5 dispatches %.3f ms, outputs byte-identical\n",
+            elapsed[0], elapsed[1]);
+    for (int i = 0; i < 2; i++) {
+        ds4_gpu_tensor_free(logits[i]); ds4_gpu_tensor_free(probs[i]); ds4_gpu_tensor_free(selected[i]);
+        ds4_gpu_tensor_free(weights[i]); ds4_gpu_tensor_free(mid[i]); ds4_gpu_tensor_free(shared[i]);
+        ds4_gpu_tensor_free(block[i]); ds4_gpu_tensor_free(out[i]); ds4_gpu_tensor_free(pre[i]);
+    }
+    ds4_gpu_tensor_free(norm); ds4_gpu_tensor_free(routed); ds4_gpu_tensor_free(residual);
+    ds4_gpu_tensor_free(split); ds4_gpu_tensor_free(gate); ds4_gpu_tensor_free(up);
+    ds4_gpu_cleanup(); free(model);
+    CHECK(ds4_gpu_init());
+    return 1;
+}
+
+/* The fused decode attention glue: BF16-on-store matvecs (Q8_0 and F16 at
+ * the graph's shapes, including the nr0=4 F16 dispatch), the q/kv norms
+ * with the KV RoPE/FP8/window tail, the heads' BF16 + inverse RoPE, and the
+ * logits' collapse + norm; each byte-identical to its standalone sequence. */
+static int check_attn_fuse(void) {
+    enum { D = 5120, LQ = 1280, HD = 512, HEADS = 64, QD = HEADS * HD, HC = 4, IDX = 1024 };
+    const float eps = 1e-20f;
+    struct { uint32_t type, in, out; size_t bytes, off; } w[] = {
+        {DS4_V41_WEIGHT_Q8_0, D, LQ, 0, 0},   /* attn_q_a */
+        {DS4_V41_WEIGHT_Q8_0, D, HD, 0, 0},   /* attn_kv */
+        {DS4_V41_WEIGHT_Q8_0, LQ, QD, 0, 0},  /* attn_q_b */
+        {DS4_V41_WEIGHT_F16, D, HD, 0, 0},    /* attn_compressor_kv: the nr0 = 4 dispatch */
+        {DS4_V41_WEIGHT_F16, HD, 128, 0, 0},  /* indexer_attn_k */
+        {DS4_V41_WEIGHT_F16, LQ, IDX, 0, 0},  /* indexer_attn_q_b */
+    };
+    const int nw = sizeof(w) / sizeof(*w);
+    size_t total = 0;
+    for (int i = 0; i < nw; i++) {
+        w[i].bytes = w[i].type == DS4_V41_WEIGHT_Q8_0 ? (size_t)w[i].out * (w[i].in / 32) * 34 : (size_t)w[i].out * w[i].in * 2;
+        w[i].off = total;
+        total += (w[i].bytes + 63) / 64 * 64;
+    }
+    const size_t qnorm_off = total, kvnorm_off = qnorm_off + LQ * 4, onorm_off = kvnorm_off + HD * 4;
+    const size_t page = (size_t)getpagesize();
+    const size_t mapped = (onorm_off + D * 4 + page - 1) / page * page;
+    void *model = NULL;
+    CHECK(!posix_memalign(&model, page, mapped));
+    for (int i = 0; i < nw; i++) {
+        if (w[i].type == DS4_V41_WEIGHT_Q8_0) fill_q8_0((uint8_t *)model + w[i].off, w[i].out, w[i].in);
+        else { _Float16 *h = (_Float16 *)((char *)model + w[i].off); for (size_t k = 0; k < (size_t)w[i].out * w[i].in; k++) h[k] = (_Float16)(random_value() / 64); }
+    }
+    float *qnorm = (float *)((char *)model + qnorm_off), *kvnorm = (float *)((char *)model + kvnorm_off);
+    float *onorm = (float *)((char *)model + onorm_off);
+    for (int i = 0; i < LQ; i++) qnorm[i] = 1.0f + random_value() / 8;
+    for (int i = 0; i < HD; i++) kvnorm[i] = 1.0f + random_value() / 8;
+    for (int i = 0; i < D; i++) onorm[i] = 1.0f + random_value() / 8;
+    CHECK(ds4_gpu_set_model_map(model, mapped));
+
+    ds4_gpu_tensor *xin[2] = {upload(NULL, D * 4), upload(NULL, LQ * 4)};   /* D-wide and LQ/HD-wide inputs */
+    ds4_gpu_tensor *out[2] = {upload(NULL, QD * 4), upload(NULL, QD * 4)};
+    ds4_gpu_tensor *qr[2] = {upload(NULL, LQ * 4), upload(NULL, LQ * 4)};
+    ds4_gpu_tensor *kv[2] = {upload(NULL, HD * 4), upload(NULL, HD * 4)};
+    ds4_gpu_tensor *window[2] = {upload(NULL, 128 * HD * 4), upload(NULL, 128 * HD * 4)};
+    ds4_gpu_tensor *heads[2] = {upload(NULL, QD * 4), upload(NULL, QD * 4)};
+    ds4_gpu_tensor *residual = upload(NULL, HC * D * 4), *pre = upload(NULL, 16);
+    ds4_gpu_tensor *x[2] = {upload(NULL, D * 4), upload(NULL, D * 4)};
+    ds4_gpu_tensor *norm[2] = {upload(NULL, D * 4), upload(NULL, D * 4)};
+    CHECK(xin[0] && xin[1] && residual && pre);
+    for (int i = 0; i < 2; i++) CHECK(out[i] && qr[i] && kv[i] && window[i] && heads[i] && x[i] && norm[i]);
+    float *xd = ds4_gpu_tensor_contents(xin[0]), *xl = ds4_gpu_tensor_contents(xin[1]);
+    for (int round = 0; round < 4; round++) {
+        for (int i = 0; i < D; i++) xd[i] = bf16(random_value());
+        for (int i = 0; i < LQ; i++) xl[i] = bf16(random_value());
+        for (int i = 0; i < nw; i++) {
+            const ds4_gpu_tensor *in = w[i].in == D ? xin[0] : xin[1];
+            CHECK(ds4_gpu_begin_commands());
+            if (w[i].type == DS4_V41_WEIGHT_Q8_0) CHECK(ds4_gpu_matmul_q8_0_tensor(out[0], model, mapped, w[i].off, w[i].in, w[i].out, in, 1));
+            else CHECK(ds4_gpu_matmul_f16_tensor(out[0], model, mapped, w[i].off, w[i].in, w[i].out, in, 1));
+            CHECK(ds4_gpu_dsv41_quantize(out[0], w[i].out, 1, DS4_V41_BF16));
+            CHECK(ds4_gpu_dsv41_matvec_bf16(out[1], model, mapped, w[i].off, w[i].type, w[i].in, w[i].out, in) == 1);
+            CHECK(ds4_gpu_end_commands());
+            CHECK(ds4_gpu_synchronize());
+            if (memcmp(ds4_gpu_tensor_contents(out[0]), ds4_gpu_tensor_contents(out[1]), (size_t)w[i].out * 4)) {
+                fprintf(stderr, "matvec bf16 mismatch: weight %d (type %u, %u -> %u)\n", i, w[i].type, w[i].in, w[i].out);
+                CHECK(0);
+            }
+        }
+        /* q/kv norms + KV tail, both frequency tables and window slots. */
+        const uint32_t pos = 777u + 1000u * round;
+        const int compressed = round & 1;
+        float *q0 = ds4_gpu_tensor_contents(qr[0]), *q1 = ds4_gpu_tensor_contents(qr[1]);
+        float *k0 = ds4_gpu_tensor_contents(kv[0]), *k1 = ds4_gpu_tensor_contents(kv[1]);
+        for (int i = 0; i < LQ; i++) q0[i] = q1[i] = bf16(random_value());
+        for (int i = 0; i < HD; i++) k0[i] = k1[i] = bf16(random_value());
+        const uint64_t slot = (uint64_t)(pos % 128u) * HD * 4u;
+        CHECK(ds4_gpu_begin_commands());
+        CHECK(ds4_gpu_rms_norm_weight_tensor(qr[0], qr[0], model, mapped, qnorm_off, LQ, eps));
+        CHECK(ds4_gpu_dsv41_quantize(qr[0], LQ, 1, DS4_V41_BF16));
+        CHECK(ds4_gpu_rms_norm_weight_tensor(kv[0], kv[0], model, mapped, kvnorm_off, HD, eps));
+        CHECK(ds4_gpu_dsv41_quantize(kv[0], HD, 1, DS4_V41_BF16));
+        CHECK(ds4_gpu_dsv41_rope(kv[0], HD, 1, 1, pos, compressed, false));
+        CHECK(ds4_gpu_dsv41_quantize(kv[0], HD, 1, DS4_V41_FP8_E8M0));
+        CHECK(ds4_gpu_tensor_copy(window[0], slot, kv[0], 0, HD * 4));
+        CHECK(ds4_gpu_dsv41_qkv_norm_kv_tail(qr[1], kv[1], window[1], slot, model, mapped, qnorm_off, kvnorm_off, LQ, HD, eps, pos, compressed));
+        CHECK(ds4_gpu_end_commands());
+        CHECK(ds4_gpu_synchronize());
+        CHECK(!memcmp(q0, q1, LQ * 4));
+        CHECK(!memcmp(k0, k1, HD * 4));
+        CHECK(!memcmp((char *)ds4_gpu_tensor_contents(window[0]) + slot, (char *)ds4_gpu_tensor_contents(window[1]) + slot, HD * 4));
+        /* heads: BF16 over every value, inverse RoPE on each head's last 64 */
+        float *h0 = ds4_gpu_tensor_contents(heads[0]), *h1 = ds4_gpu_tensor_contents(heads[1]);
+        for (int i = 0; i < QD; i++) h0[i] = h1[i] = random_value() * 3.0f;
+        CHECK(ds4_gpu_begin_commands());
+        CHECK(ds4_gpu_dsv41_quantize(heads[0], QD, 1, DS4_V41_BF16));
+        CHECK(ds4_gpu_dsv41_rope(heads[0], HD, HEADS, 1, pos, compressed, true));
+        CHECK(ds4_gpu_dsv41_bf16_rope(heads[1], HD, HEADS, 1, pos, compressed, true));
+        CHECK(ds4_gpu_end_commands());
+        CHECK(ds4_gpu_synchronize());
+        CHECK(!memcmp(h0, h1, QD * 4));
+        /* logits: collapse with the carried pre, BF16, output norm, BF16 */
+        float *res = ds4_gpu_tensor_contents(residual), *p = ds4_gpu_tensor_contents(pre);
+        for (int i = 0; i < HC * D; i++) res[i] = bf16(random_value());
+        for (int i = 0; i < HC; i++) p[i] = 0.5f + random_value() / 8;
+        CHECK(ds4_gpu_begin_commands());
+        CHECK(ds4_gpu_hc_weighted_sum_tensor(x[0], residual, pre, D, HC));
+        CHECK(ds4_gpu_dsv41_quantize(x[0], D, 1, DS4_V41_BF16));
+        CHECK(ds4_gpu_rms_norm_weight_tensor(norm[0], x[0], model, mapped, onorm_off, D, eps));
+        CHECK(ds4_gpu_dsv41_quantize(norm[0], D, 1, DS4_V41_BF16));
+        CHECK(ds4_gpu_dsv41_hc_collapse_norm(NULL, x[1], norm[1], NULL, pre, residual, model, mapped, 0, 0, onorm_off, D, HC, 0, 0.0f, eps));
+        CHECK(ds4_gpu_end_commands());
+        CHECK(ds4_gpu_synchronize());
+        CHECK(!memcmp(ds4_gpu_tensor_contents(x[0]), ds4_gpu_tensor_contents(x[1]), D * 4));
+        CHECK(!memcmp(ds4_gpu_tensor_contents(norm[0]), ds4_gpu_tensor_contents(norm[1]), D * 4));
+    }
+    fprintf(stderr, "attention fuse: matvec bf16 (6 shapes), qkv norm + KV tail, bf16 + rope, logits collapse: byte-identical\n");
+    for (int i = 0; i < 2; i++) {
+        ds4_gpu_tensor_free(xin[i]); ds4_gpu_tensor_free(out[i]); ds4_gpu_tensor_free(qr[i]); ds4_gpu_tensor_free(kv[i]);
+        ds4_gpu_tensor_free(window[i]); ds4_gpu_tensor_free(heads[i]); ds4_gpu_tensor_free(x[i]); ds4_gpu_tensor_free(norm[i]);
+    }
+    ds4_gpu_tensor_free(residual); ds4_gpu_tensor_free(pre);
+    ds4_gpu_cleanup(); free(model);
+    CHECK(ds4_gpu_init());
+    return 1;
+}
+
 #endif
 
 static int check_engram(void) {
@@ -1279,6 +1611,21 @@ int main(int argc, char **argv) {
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }
+    if (argc == 2 && !strcmp(argv[1], "--hc-fuse")) {
+        const int ok = ds4_gpu_init() && check_hc_fuse();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--moe-fuse")) {
+        const int ok = ds4_gpu_init() && check_moe_fuse();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--attn-fuse")) {
+        const int ok = ds4_gpu_init() && check_attn_fuse();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
 #endif
     if (argc == 2 && !strcmp(argv[1], "--bf16-linear")) {
         const int ok = ds4_gpu_init() && check_bf16_linear();
@@ -1315,6 +1662,9 @@ int main(int argc, char **argv) {
              check_candidates() && check_sparse_gather() && check_indexer_batch() &&
              check_embedding() && check_index_projection() && check_general_topk() && check_causal_topk() && check_compact_carry() && check_attention_output(false) &&
              check_tp_attention();
+#ifdef __APPLE__
+    ok = ok && check_hc_fuse() && check_moe_fuse() && check_attn_fuse();
+#endif
     ds4_gpu_cleanup();
     return ok ? 0 : 1;
 }

@@ -1123,8 +1123,9 @@ struct ds4_metal_args_hc_norm_mix {
 // slice, preserving every simd_sum tree), and the matvec keeps the original
 // per-row accumulation order with y = x*scale computed on the fly, which
 // rounds identically to the materialized normalized row.  The host wrapper
-// gates this to n == 16384 && out_dim == 24, where the virtual-thread count
-// is exactly 1024 and the mv tail loop is empty.
+// gates this to n in {16384, 20480} && out_dim == 24, where the virtual-thread
+// count is exactly 1024 and the mv tail loop is empty (n is a multiple of the
+// NSG*NF*NB = 4096-value stride).
 kernel void kernel_dsv4_hc_rms_norm_mix_f16(
         constant ds4_metal_args_hc_norm_mix & args,
         device const char  * x,
