@@ -14263,7 +14263,8 @@ typedef struct {
     uint32_t cap_raw;
 
     uint32_t compress_ratio;
-    uint32_t comp_cap;
+    uint32_t comp_cap;     /* logical max compressed rows (full ctx) */
+    uint32_t comp_alloc;   /* rows physically allocated so far (grows lazily) */
     uint32_t n_comp;
     float *attn_comp_kv;
     float *attn_state_kv;
@@ -14460,6 +14461,24 @@ static void cpu_decode_scratch_free(ds4_cpu_decode_scratch *scratch) {
     memset(scratch, 0, sizeof(*scratch));
 }
 
+/* Initial compressed-row allocation per layer. The comp caches can eventually
+ * hold comp_cap = ctx/ratio rows, but at large ctx that is gigabytes of dirty
+ * pages per session even for an empty conversation. We instead allocate this
+ * many rows up front and grow geometrically as the conversation actually
+ * extends (see kv_cache_grow_comp), so an idle session costs a few MB. */
+#define DS4_KV_COMP_INITIAL_ROWS 4096u
+
+/* Lazy compressed-KV growth applies to the GPU caches on the Metal build only:
+ * CUDA/ROCm tensor allocations may be arena-backed, where the free half of the
+ * alloc-copy-free grow cycle does not return memory to the arena.  Those
+ * builds keep the full-ctx preallocation (comp_alloc == comp_cap, so every
+ * grow call is a no-op).  The CPU F32 reference cache lazy-grows everywhere. */
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+#define DS4_GPU_KV_LAZY_COMP 1
+#else
+#define DS4_GPU_KV_LAZY_COMP 0
+#endif
+
 /* Allocate per-layer KV state: a raw sliding window for all layers, plus
  * compressed attention/indexer caches for layers whose ratio is nonzero. */
 static void kv_cache_init(ds4_kv_cache *cache, uint32_t ctx_size, uint32_t raw_cap) {
@@ -14479,11 +14498,14 @@ static void kv_cache_init(ds4_kv_cache *cache, uint32_t ctx_size, uint32_t raw_c
         if (ratio != 0) {
             const uint32_t coff = ratio == 4 ? 2u : 1u;
             const uint32_t comp_cap = ctx_size / ratio + 2;
+            const uint32_t comp_alloc = comp_cap < DS4_KV_COMP_INITIAL_ROWS
+                                            ? comp_cap : DS4_KV_COMP_INITIAL_ROWS;
             const uint32_t attn_width = coff * DS4_N_HEAD_DIM;
             const uint32_t attn_rows = coff * ratio;
 
             cache->layer[il].comp_cap = comp_cap;
-            cache->layer[il].attn_comp_kv = xmalloc_zeroed((size_t)comp_cap * DS4_N_HEAD_DIM, sizeof(float));
+            cache->layer[il].comp_alloc = comp_alloc;
+            cache->layer[il].attn_comp_kv = xmalloc_zeroed((size_t)comp_alloc * DS4_N_HEAD_DIM, sizeof(float));
             cache->layer[il].attn_state_kv = xmalloc_zeroed((size_t)attn_width * attn_rows, sizeof(float));
             cache->layer[il].attn_state_score = xmalloc((size_t)attn_width * attn_rows * sizeof(float));
             for (uint64_t i = 0; i < (uint64_t)attn_width * attn_rows; i++) {
@@ -14493,7 +14515,7 @@ static void kv_cache_init(ds4_kv_cache *cache, uint32_t ctx_size, uint32_t raw_c
             if (ratio == 4) {
                 const uint32_t index_width = coff * DS4_N_INDEXER_HEAD_DIM;
                 const uint32_t index_rows = coff * ratio;
-                cache->layer[il].index_comp_kv = xmalloc_zeroed((size_t)comp_cap * DS4_N_INDEXER_HEAD_DIM, sizeof(float));
+                cache->layer[il].index_comp_kv = xmalloc_zeroed((size_t)comp_alloc * DS4_N_INDEXER_HEAD_DIM, sizeof(float));
                 cache->layer[il].index_state_kv = xmalloc_zeroed((size_t)index_width * index_rows, sizeof(float));
                 cache->layer[il].index_state_score = xmalloc((size_t)index_width * index_rows * sizeof(float));
                 for (uint64_t i = 0; i < (uint64_t)index_width * index_rows; i++) {
@@ -14539,6 +14561,51 @@ static void kv_cache_push_comp(float *rows, uint32_t *n_rows, uint32_t cap_rows,
     float *dst = rows + (uint64_t)(*n_rows) * row_dim;
     for (uint32_t i = 0; i < row_dim; i++) dst[i] = f16_to_f32(f32_to_f16(kv[i]));
     (*n_rows)++;
+}
+
+/* Ensure the layer's compressed caches can hold at least need_rows, growing
+ * geometrically (capped at comp_cap) so appends stay amortized O(1). Newly
+ * grown rows are eagerly zeroed here rather than lazily on first touch: the
+ * same VM-fault reasoning as xmalloc_zeroed applies (keep faults out of the
+ * decode loop). A moved buffer is safe because every reader re-reads
+ * cache->attn_comp_kv / index_comp_kv fresh. */
+static void kv_cache_grow_comp(ds4_layer_cache *c, uint32_t need_rows) {
+    if (need_rows <= c->comp_alloc) return;
+    uint32_t new_alloc = c->comp_alloc ? c->comp_alloc : DS4_KV_COMP_INITIAL_ROWS;
+    while (new_alloc < need_rows) {
+        if (new_alloc > c->comp_cap - new_alloc) { new_alloc = c->comp_cap; break; }
+        new_alloc *= 2u;
+    }
+    if (new_alloc > c->comp_cap) new_alloc = c->comp_cap;
+    if (new_alloc <= c->comp_alloc) return;
+
+    const uint32_t added = new_alloc - c->comp_alloc;
+    if (c->attn_comp_kv) {
+        c->attn_comp_kv = xrealloc(c->attn_comp_kv,
+                                   (size_t)new_alloc * DS4_N_HEAD_DIM * sizeof(float));
+        memset(c->attn_comp_kv + (size_t)c->comp_alloc * DS4_N_HEAD_DIM, 0,
+               (size_t)added * DS4_N_HEAD_DIM * sizeof(float));
+    }
+    if (c->index_comp_kv) {
+        c->index_comp_kv = xrealloc(c->index_comp_kv,
+                                    (size_t)new_alloc * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+        memset(c->index_comp_kv + (size_t)c->comp_alloc * DS4_N_INDEXER_HEAD_DIM, 0,
+               (size_t)added * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+    }
+    c->comp_alloc = new_alloc;
+}
+
+/* Grow-then-append helpers: the only supported way to add a compressed row.
+ * They keep comp_alloc >= n_comp / n_index_comp so every reader that walks
+ * [0, n_comp) stays in bounds. */
+static void kv_cache_append_attn_comp(ds4_layer_cache *c, const float *kv) {
+    kv_cache_grow_comp(c, c->n_comp + 1u);
+    kv_cache_push_comp(c->attn_comp_kv, &c->n_comp, c->comp_cap, DS4_N_HEAD_DIM, kv);
+}
+
+static void kv_cache_append_index_comp(ds4_layer_cache *c, const float *kv) {
+    kv_cache_grow_comp(c, c->n_index_comp + 1u);
+    kv_cache_push_comp(c->index_comp_kv, &c->n_index_comp, c->comp_cap, DS4_N_INDEXER_HEAD_DIM, kv);
 }
 
 /* After prefill, clear unused compressor state rows so decode starts from the
@@ -15255,7 +15322,7 @@ static void layer_attention_raw_swa_one(
                                   ratio,
                                   il,
                                   pos)) {
-            kv_cache_push_comp(cache->attn_comp_kv, &cache->n_comp, cache->comp_cap, DS4_N_HEAD_DIM, comp);
+            kv_cache_append_attn_comp(cache, comp);
         }
         free(comp);
 
@@ -15273,7 +15340,7 @@ static void layer_attention_raw_swa_one(
                                       ratio,
                                       il,
                                       pos)) {
-                kv_cache_push_comp(cache->index_comp_kv, &cache->n_index_comp, cache->comp_cap, DS4_N_INDEXER_HEAD_DIM, index_comp);
+                kv_cache_append_index_comp(cache, index_comp);
             }
             free(index_comp);
 
@@ -15491,7 +15558,7 @@ static void layer_attention_raw_swa_batch(
                                                          il,
                                                          pos);
             if (have_comp) {
-                kv_cache_push_comp(cache->attn_comp_kv, &cache->n_comp, cache->comp_cap, DS4_N_HEAD_DIM, comp);
+                kv_cache_append_attn_comp(cache, comp);
             }
 
             if (ratio == 4) {
@@ -15509,7 +15576,7 @@ static void layer_attention_raw_swa_batch(
                                                                    il,
                                                                    pos);
                 if (have_index_comp) {
-                    kv_cache_push_comp(cache->index_comp_kv, &cache->n_index_comp, cache->comp_cap, DS4_N_INDEXER_HEAD_DIM, index_comp);
+                    kv_cache_append_index_comp(cache, index_comp);
                 }
                 if (profile) t_tl_compress += now_sec() - tx;
 
@@ -15739,7 +15806,7 @@ static void layer_forward_raw_swa_one(
                                                  il,
                                                  pos,
                                                  scratch)) {
-            kv_cache_push_comp(cache->attn_comp_kv, &cache->n_comp, cache->comp_cap, DS4_N_HEAD_DIM, scratch->comp);
+            kv_cache_append_attn_comp(cache, scratch->comp);
         }
 
         if (ratio == 4) {
@@ -15756,8 +15823,7 @@ static void layer_forward_raw_swa_one(
                                                      il,
                                                      pos,
                                                      scratch)) {
-                kv_cache_push_comp(cache->index_comp_kv, &cache->n_index_comp, cache->comp_cap,
-                                   DS4_N_INDEXER_HEAD_DIM, scratch->index_comp);
+                kv_cache_append_index_comp(cache, scratch->index_comp);
             }
             if (profile) t_compress = now_sec() - t0;
         } else if (profile) {
@@ -17201,6 +17267,12 @@ typedef struct {
      * layer compression ratio instead of pessimistically using the ratio-4 cap
      * for every ratio-128 layer. */
     uint32_t layer_comp_cap[DS4_MAX_LAYER];
+    /* Rows physically allocated per layer for the attention/indexer compressed
+     * caches.  layer_comp_cap is the logical maximum (full ctx); this grows
+     * lazily toward it (see metal_graph_grow_comp) so an idle/short session
+     * does not dirty the full-ctx GPU comp footprint up front.  Mirrors the
+     * CPU comp_alloc split. */
+    uint32_t layer_comp_alloc[DS4_MAX_LAYER];
     uint32_t attn_comp_stage_cap;
 
     /* Class P (per-layer work tensors). Each used tier has its
@@ -19159,9 +19231,15 @@ static bool metal_graph_alloc_raw_cap(
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0) {
             g->layer_comp_cap[il] = 0;
+            g->layer_comp_alloc[il] = 0;
         } else {
             g->layer_comp_cap[il] = ctx_size / ratio + 2u;
             if (g->layer_comp_cap[il] < 2u) g->layer_comp_cap[il] = 2u;
+            /* Seed a small physical allocation and grow lazily toward the cap
+             * as the conversation actually extends (metal_graph_grow_comp). */
+            g->layer_comp_alloc[il] = !DS4_GPU_KV_LAZY_COMP ||
+                    g->layer_comp_cap[il] < DS4_KV_COMP_INITIAL_ROWS
+                    ? g->layer_comp_cap[il] : DS4_KV_COMP_INITIAL_ROWS;
         }
     }
 
@@ -19295,7 +19373,7 @@ static bool metal_graph_alloc_raw_cap(
             g->layer_attn_comp_cache[il] = metal_graph_alloc_kv_cache_tensor_on(
                     managed_kv_cache,
                     layer_tier,
-                    (uint64_t)g->layer_comp_cap[il] * DS4_N_HEAD_DIM *
+                    (uint64_t)g->layer_comp_alloc[il] * DS4_N_HEAD_DIM *
                     (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float)));
             if (layer_tp_partner >= 0) {
                 g->layer_attn_comp_cache_tp[il] = metal_graph_alloc_kv_cache_tensor_on(
@@ -19339,7 +19417,7 @@ static bool metal_graph_alloc_raw_cap(
                 g->layer_index_comp_cache[il] = metal_graph_alloc_kv_cache_tensor_on(
                         managed_kv_cache,
                         layer_tier,
-                        (uint64_t)g->layer_comp_cap[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+                        (uint64_t)g->layer_comp_alloc[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
                 g->layer_index_state_kv[il] = ds4_gpu_tensor_alloc_ptr_on(layer_tier, index_width * index_rows * sizeof(float));
                 g->layer_index_state_score[il] = ds4_gpu_tensor_alloc_ptr_on(layer_tier, index_width * index_rows * sizeof(float));
                 if (enable_frontier_snapshot) {
@@ -22185,6 +22263,127 @@ static uint32_t metal_graph_attn_comp_cache_is_f16(void) {
     return DS4_GPU_ATTN_COMP_CACHE_F16 ? 1u : 0u;
 }
 
+/* Grow the per-layer GPU compressed caches so every layer with a comp cache
+ * can physically hold at least need_rows[il] rows.  The caches are seeded
+ * small (DS4_KV_COMP_INITIAL_ROWS) and doubled geometrically, capped at
+ * layer_comp_cap, so a session only dirties GPU comp pages up to its actual
+ * conversation length.  Mirrors the CPU kv_cache_grow_comp; the structural
+ * difference is that the GPU tensor primitive has no realloc, so a grow is
+ * alloc-new + copy-the-live-prefix + free-old + repoint.
+ *
+ * MUST be called at a GPU-synchronized point with NO active command batch:
+ * the old buffers are freed here, so nothing still in flight may reference
+ * them, and ds4_gpu_tensor_copy needs its own batch.  We synchronize, open a
+ * short-lived batch for the device-to-device copies, and wait (end_commands)
+ * before freeing.  Every comp writer (decode, prefill, verify, restore)
+ * pre-grows through this at its own synchronized boundary BEFORE opening its
+ * store batch, so the moved buffers are always picked up fresh.  On non-lazy
+ * builds comp_alloc == comp_cap and this returns immediately. */
+static bool metal_graph_grow_comp(ds4_gpu_graph *g, const uint32_t *need_rows) {
+    ds4_gpu_tensor *new_attn[DS4_MAX_LAYER];
+    ds4_gpu_tensor *new_index[DS4_MAX_LAYER];
+    uint32_t new_alloc[DS4_MAX_LAYER];
+    bool any = false;
+    bool ok = true;
+
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        new_attn[il] = NULL;
+        new_index[il] = NULL;
+        new_alloc[il] = g->layer_comp_alloc[il];
+    }
+
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (g->layer_attn_comp_cache[il] == NULL) continue;  /* ratio-0 layer */
+        const uint32_t cap = g->layer_comp_cap[il];
+        uint32_t need = need_rows[il];
+        if (need > cap) need = cap;
+        if (need <= g->layer_comp_alloc[il]) continue;
+
+        uint32_t na = g->layer_comp_alloc[il] ? g->layer_comp_alloc[il]
+                                              : DS4_KV_COMP_INITIAL_ROWS;
+        while (na < need) {
+            if (na > cap - na) { na = cap; break; }
+            na *= 2u;
+        }
+        if (na > cap) na = cap;
+        if (na <= g->layer_comp_alloc[il]) continue;
+
+        new_attn[il] = ds4_gpu_tensor_alloc(
+                (uint64_t)na * metal_graph_attn_comp_cache_row_bytes());
+        if (!new_attn[il]) { ok = false; goto done; }
+        if (g->layer_index_comp_cache[il]) {
+            new_index[il] = ds4_gpu_tensor_alloc(
+                    (uint64_t)na * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+            if (!new_index[il]) { ok = false; goto done; }
+        }
+        new_alloc[il] = na;
+        any = true;
+    }
+
+    if (!any) return true;
+
+    if (ds4_gpu_synchronize() == 0) { ok = false; goto done; }
+    if (ds4_gpu_begin_commands() == 0) { ok = false; goto done; }
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        if (!new_attn[il]) continue;
+        if (g->layer_n_comp[il] != 0) {
+            ok = ds4_gpu_tensor_copy(
+                    new_attn[il], 0,
+                    g->layer_attn_comp_cache[il], 0,
+                    (uint64_t)g->layer_n_comp[il] *
+                        metal_graph_attn_comp_cache_row_bytes()) != 0;
+        }
+        if (ok && new_index[il] && g->layer_n_index_comp[il] != 0) {
+            ok = ds4_gpu_tensor_copy(
+                    new_index[il], 0,
+                    g->layer_index_comp_cache[il], 0,
+                    (uint64_t)g->layer_n_index_comp[il] *
+                        DS4_N_INDEXER_HEAD_DIM * sizeof(float)) != 0;
+        }
+    }
+    /* end_commands commits AND waits, so the copies are complete (and the old
+     * buffers quiesced) before we free them below. */
+    if (ds4_gpu_end_commands() == 0) ok = false;
+
+done:
+    if (!ok) {
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            ds4_gpu_tensor_free(new_attn[il]);
+            ds4_gpu_tensor_free(new_index[il]);
+        }
+        return false;
+    }
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (!new_attn[il]) continue;
+        ds4_gpu_tensor_free(g->layer_attn_comp_cache[il]);
+        g->layer_attn_comp_cache[il] = new_attn[il];
+        if (new_index[il]) {
+            ds4_gpu_tensor_free(g->layer_index_comp_cache[il]);
+            g->layer_index_comp_cache[il] = new_index[il];
+        }
+        g->layer_comp_alloc[il] = new_alloc[il];
+    }
+    return true;
+}
+
+/* Pre-grow one graph's comp caches so each layer can append extra more rows
+ * beyond its current attention/indexer row counts. */
+static bool metal_graph_grow_comp_rows(ds4_gpu_graph *g, uint32_t extra) {
+    uint32_t need[DS4_MAX_LAYER];
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t a = g->layer_n_comp[il];
+        const uint32_t b = g->layer_n_index_comp[il];
+        need[il] = (a > b ? a : b) + extra;
+    }
+    return metal_graph_grow_comp(g, need);
+}
+
+/* Pre-grow for a single decode step: each ratio!=0 layer appends at most one
+ * attention row (and, for ratio-4, one indexer row). */
+static bool metal_graph_grow_comp_decode(ds4_gpu_graph *g) {
+    return metal_graph_grow_comp_rows(g, 1u);
+}
+
 static bool metal_graph_store_attn_comp_stage(
         ds4_gpu_graph *g,
         uint32_t       il,
@@ -24896,6 +25095,14 @@ static bool metal_graph_encode_decode_layer_phase(
         }
         if (ok && emit && g->layer_n_comp[il] >= g->layer_comp_cap[il]) {
             fprintf(stderr, "ds4: Metal graph compressed KV cache capacity exceeded at layer %u\n", il);
+            ok = false;
+        }
+        /* Lazy-grow safety net: a writer that reaches this store without
+         * pre-growing (metal_graph_grow_comp) must fail the batch cleanly
+         * before any store is encoded, not write past the physical buffer. */
+        if (ok && emit && (g->layer_n_comp[il] >= g->layer_comp_alloc[il] ||
+                           g->layer_n_index_comp[il] >= g->layer_comp_alloc[il])) {
+            fprintf(stderr, "ds4: Metal graph compressed KV cache under-grown at layer %u\n", il);
             ok = false;
         }
         bool comp_state_already_stored = qkv_pair_quad_fused;
@@ -30798,6 +31005,18 @@ static bool metal_graph_encode_layer_attention_batch(
         uint32_t                pos0,
         uint32_t                n_tokens) {
     if (n_tokens == 0 || n_tokens > g->prefill_cap) return false;
+    /* Lazy-grow safety net: the chunk's stores below write compressed rows up
+     * to (pos0+n_tokens)/ratio.  Callers pre-grow at their synchronized
+     * boundary (metal_graph_grow_comp); an under-grown cache must fail here,
+     * before any store is encoded, not write past the physical buffer. */
+    {
+        const uint32_t guard_ratio = ds4_layer_compress_ratio(il);
+        if (guard_ratio != 0 &&
+            (pos0 + n_tokens) / guard_ratio > g->layer_comp_alloc[il]) {
+            fprintf(stderr, "ds4: Metal graph compressed KV cache under-grown for batch at layer %u\n", il);
+            return false;
+        }
+    }
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
@@ -33494,6 +33713,11 @@ static bool metal_graph_eval_token_raw_swa(
         int                    token,
         uint32_t               pos,
         float                 *logits) {
+    /* Pre-grow the compressed caches (this decode token appends at most one
+     * row per layer) at this synchronized boundary before any store batch
+     * opens.  Covers the streaming and non-streaming paths below, and the
+     * token-by-token prefill that also funnels through this function. */
+    if (g && !metal_graph_grow_comp_decode(g)) return false;
     if (g && g->ssd_streaming) {
         return metal_graph_eval_token_raw_swa_streaming(g, model, weights, token, pos, logits);
     }
@@ -33972,6 +34196,8 @@ static bool metal_graph_eval_token_raw_swa_top(
         bool                   force_fast_attention) {
     if (!top_id) return false;
     if (top2) memset(top2, 0, sizeof(*top2));
+    /* Full decode over all layers below; pre-grow comp caches first. */
+    if (!metal_graph_grow_comp_decode(g)) return false;
 
     const bool fast_attention =
         allow_split_top1 &&
@@ -36585,6 +36811,10 @@ static bool metal_graph_eval_mtp_draft_from_hc(
         float                 *logits,
         int                   *top_id) {
     if (!mtp || !mtp->block.attn_q_a || !g->mtp_raw_cache || !prev_hc || !out_hc) return false;
+    /* The MTP block decodes through the decode-layer encoder, which can
+     * append a compressed row for its layer; pre-grow before opening the
+     * batch. */
+    if (!metal_graph_grow_comp_decode(g)) return false;
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint32_t raw_row = pos % g->raw_cap;
@@ -37460,6 +37690,21 @@ static bool metal_graph_prefill_layer_major(
 #endif
 
     if (!metal_graph_warmup_prefill_kernels(g, model, weights, n_tokens)) return false;
+
+    /* Pre-grow the compressed caches to what this chunk can reach before any
+     * store batch opens (warmup above ends synchronized).  A ratio-r layer
+     * holds at most floor((start+n_tokens)/r) compressed rows after the
+     * chunk; the +2 matches the comp_cap headroom and is itself bounded by
+     * the cap in the grow. */
+    {
+        uint32_t grow_need[DS4_MAX_LAYER];
+        const uint32_t grow_upto = start + n_tokens;
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            const uint32_t ratio = ds4_layer_compress_ratio(il);
+            grow_need[il] = ratio ? grow_upto / ratio + 2u : 0u;
+        }
+        if (!metal_graph_grow_comp(g, grow_need)) return false;
+    }
     if (g->placement &&
         !metal_graph_set_active_tier_no_copy(g, g->emb_tier)) {
         return false;
@@ -38416,6 +38661,18 @@ static bool metal_graph_verify_suffix_tops_impl(
     if (start > (uint32_t)prompt->len || n_tokens > (uint32_t)prompt->len - start) return false;
     const uint32_t top_rows = n_tokens > 1 ? n_tokens - 1 : 0;
     if (top_rows && !row_tops) return false;
+
+    /* The verify batch stores compressed rows for the suffix like a prefill
+     * chunk; pre-grow at this synchronized boundary before any batch opens. */
+    {
+        uint32_t grow_need[DS4_MAX_LAYER];
+        const uint32_t grow_upto = start + n_tokens;
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            const uint32_t ratio = ds4_layer_compress_ratio(il);
+            grow_need[il] = ratio ? grow_upto / ratio + 2u : 0u;
+        }
+        if (!metal_graph_grow_comp(g, grow_need)) return false;
+    }
 
     const double upload_t0 = timing ? now_sec() : 0.0;
     bool ok = metal_graph_upload_prompt_tokens(metal_graph_prefill_tokens(g), prompt, start, n_tokens);
@@ -61714,6 +61971,25 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
     g->mtp_n_raw = 0;
     metal_graph_dspark_cache_reset(g);
 
+    /* Grow the lazily-sized comp caches for the restored layer range before
+     * the bulk writes (counts validated against the caps above); untouched
+     * layers keep their current allocation. */
+    {
+        uint32_t grow_need[DS4_MAX_LAYER];
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) grow_need[il] = 0;
+        for (uint32_t i = 0; i < n_layers; i++) {
+            grow_need[layer_start + i] =
+                n_comp[i] > n_index_comp[i] ? n_comp[i] : n_index_comp[i];
+        }
+        if (!metal_graph_grow_comp(g, grow_need)) {
+            free(n_comp);
+            free(n_index_comp);
+            payload_set_err(err, errlen,
+                            "failed to grow compressed KV cache for shard restore");
+            return 1;
+        }
+    }
+
     uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
     int rc = 0;
     for (uint32_t i = 0; rc == 0 && i < n_layers; i++) {
@@ -63244,6 +63520,10 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
             if (ratio == 0) continue;
             layer->n_comp = n_comp[il];
             layer->n_index_comp = n_index_comp[il];
+            /* Grow the lazily-sized comp buffers to fit the restored rows before
+             * bulk-reading into them (counts were validated <= comp_cap above). */
+            kv_cache_grow_comp(layer, n_comp[il] > n_index_comp[il]
+                                          ? n_comp[il] : n_index_comp[il]);
             if (payload_read_bytes(fp,
                                    layer->attn_comp_kv,
                                    (uint64_t)n_comp[il] * DS4_N_HEAD_DIM * sizeof(float),
@@ -63377,6 +63657,22 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
     ds4_session_dspark_capture_invalidate(s);
     g->mtp_n_raw = 0;
     metal_graph_dspark_cache_reset(g);
+
+    /* Grow the lazily-sized comp caches to fit the restored rows before the
+     * bulk writes below (counts validated against the caps above); we are at
+     * a synchronized point here. */
+    {
+        uint32_t grow_need[DS4_MAX_LAYER];
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            grow_need[il] = n_comp[il] > n_index_comp[il] ? n_comp[il]
+                                                          : n_index_comp[il];
+        }
+        if (!metal_graph_grow_comp(g, grow_need)) {
+            payload_set_err(err, errlen,
+                            "failed to grow compressed KV cache for restore");
+            return 1;
+        }
+    }
 
     uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
     int rc = 0;
@@ -73943,6 +74239,24 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                              layer_start);
         return 1;
     }
+    /* Pre-grow the sliced layers' compressed caches for this step (decode or
+     * chunk) at this synchronized boundary, before any batch opens below. */
+#ifndef DS4_NO_GPU
+    {
+        uint32_t grow_need[DS4_MAX_LAYER];
+        const uint32_t grow_upto = pos0 + n_tokens;
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            const uint32_t ratio = ds4_layer_compress_ratio(il);
+            grow_need[il] = (il >= layer_start && il <= layer_end && ratio)
+                                ? grow_upto / ratio + 2u : 0u;
+        }
+        if (!metal_graph_grow_comp(&s->graph, grow_need)) {
+            if (errlen) snprintf(err, errlen,
+                                 "failed to grow compressed KV cache for layer slice");
+            return 1;
+        }
+    }
+#endif
     if (output_logits && layer_end + 1u != executable_layers) {
         if (errlen) snprintf(err, errlen, "layer-slice logits require final transformer layer");
         return 1;
@@ -78150,6 +78464,19 @@ static int ds4_sessions_eval_batch_native(
         }
     }
 
+    /* Each session appends at most one compressed row per layer this step;
+     * pre-grow every lane at this synchronized boundary before TP batch mode
+     * engages and the shared batch opens (GLM sessions use their own graph
+     * and cache). */
+    for (int i = 0; i < count; i++) {
+        ds4_session *gs = items[i].session;
+        if (!ds4_session_is_glm(gs) &&
+            !metal_graph_grow_comp_decode(&gs->graph)) {
+            if (err && errlen) snprintf(err, errlen,
+                                        "failed to grow compressed KV cache");
+            return 1;
+        }
+    }
 #if defined(__APPLE__)
     if (e->tp.active) ds4_gpu_tp_set_session_batch_mode(1);
 #endif
@@ -78404,6 +78731,31 @@ static int ds4_sessions_eval_batch_with_prefill_metal(
         }
     }
 
+    /* Pre-grow at this synchronized boundary before any batch opens: the
+     * prefill session stores compressed rows for its chunk, and each decode
+     * session appends at most one row per layer. */
+    {
+        uint32_t grow_need[DS4_MAX_LAYER];
+        const uint32_t grow_upto = start + rows;
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            const uint32_t ratio = ds4_layer_compress_ratio(il);
+            grow_need[il] = ratio ? grow_upto / ratio + 2u : 0u;
+        }
+        if (!metal_graph_grow_comp(pg, grow_need)) {
+            if (err && errlen) snprintf(err, errlen,
+                                        "failed to grow compressed KV cache");
+            return 1;
+        }
+    }
+    for (int i = 0; i < count; i++) {
+        ds4_session *gs = items[i].session;
+        if (!ds4_session_is_glm(gs) &&
+            !metal_graph_grow_comp_decode(&gs->graph)) {
+            if (err && errlen) snprintf(err, errlen,
+                                        "failed to grow compressed KV cache");
+            return 1;
+        }
+    }
     bool ok = metal_graph_set_active_tier_batch(pg, pg->emb_tier, rows) &&
               metal_graph_upload_prompt_tokens(
                       metal_graph_prefill_tokens(pg), prefill_prompt,
