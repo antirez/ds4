@@ -311,6 +311,52 @@ done:
     return rc;
 }
 
+static int check_stream_decode_queue(const char *path) {
+    ds4_engine *engine = NULL;
+    ds4_session *control = NULL, *queued = NULL;
+    ds4_tokens tokens = {0};
+    ds4_session_snapshot snap = {0};
+    char err[256] = {0};
+    int rc = 1;
+    ds4_engine_options opt = {.model_path = path, .backend = DS4_BACKEND_METAL,
+        .context_size = 256, .power_percent = 100, .ssd_streaming = true,
+        .ssd_streaming_cache_experts = 512};
+    unsetenv("DS4_METAL_ENABLE_V41_STREAM_DECODE_QUEUE");
+    REQUIRE(ds4_engine_open(&engine, &opt) == 0);
+    REQUIRE(ds4_session_create(&control, engine, 256) == 0);
+    REQUIRE(ds4_session_create(&queued, engine, 256) == 0);
+    for (int i = 0; i < 120; i++) ds4_tokens_push(&tokens, 100 + i);
+    REQUIRE(ds4_session_sync(control, &tokens, err, sizeof(err)) == 0);
+    REQUIRE(ds4_session_save_snapshot(control, &snap, err, sizeof(err)) == 0);
+    REQUIRE(ds4_session_load_snapshot(queued, &snap, err, sizeof(err)) == 0);
+    for (int i = 0; i < 24; i++) {
+        unsetenv("DS4_METAL_ENABLE_V41_STREAM_DECODE_QUEUE");
+        REQUIRE(ds4_session_eval(control, 500 + i, err, sizeof(err)) == 0);
+        setenv("DS4_METAL_ENABLE_V41_STREAM_DECODE_QUEUE", "1", 1);
+        REQUIRE(ds4_session_eval(queued, 500 + i, err, sizeof(err)) == 0);
+        REQUIRE(memcmp(control->logits, queued->logits, DS4_N_VOCAB * sizeof(float)) == 0);
+        for (uint32_t j = 0; j < DS4_N_VOCAB; j++) REQUIRE(isfinite(queued->logits[j]));
+        REQUIRE(memcmp(&control->ds41_graph.history, &queued->ds41_graph.history,
+                       sizeof(control->ds41_graph.history)) == 0);
+        ds41_state_span a[54], b[54];
+        const uint32_t n = ds41_state_spans(&control->ds41_graph, 121 + i, a);
+        REQUIRE(n == ds41_state_spans(&queued->ds41_graph, 121 + i, b));
+        for (uint32_t j = 0; j < n; j++) {
+            REQUIRE(a[j].bytes == b[j].bytes);
+            REQUIRE(memcmp(ds4_gpu_tensor_contents(a[j].tensor),
+                           ds4_gpu_tensor_contents(b[j].tensor), a[j].bytes) == 0);
+        }
+    }
+    puts("V4.1 stream decode queue under cache eviction: exact logits/history/cache spans across positions 121-144: PASS");
+    rc = 0;
+done:
+    unsetenv("DS4_METAL_ENABLE_V41_STREAM_DECODE_QUEUE");
+    ds4_session_snapshot_free(&snap);
+    ds4_tokens_free(&tokens);
+    ds4_session_free(control); ds4_session_free(queued); ds4_engine_close(engine);
+    return rc;
+}
+
 static int check_sessions(const char *path) {
     int cwd_fd = open(".", O_RDONLY);
     ds4_engine *engine = NULL;
@@ -1954,11 +2000,13 @@ int main(int argc, char **argv) {
         return check_chat(argv[2], argv[3], argv[4], argv[5]);
     if (argc == 3 && strcmp(argv[1], "--rope-reference") == 0)
         return check_rope_reference(argv[2]);
+    if (argc == 3 && strcmp(argv[2], "--stream-decode-queue-parity") == 0)
+        return check_stream_decode_queue(argv[1]);
     if (argc == 3 && strcmp(argv[2], "--session-fixture") == 0)
         return check_sessions(argv[1]);
     if (argc < 3 || argc > 4 ||
         (!strncmp(argv[2], "--", 2) && strcmp(argv[2], "--zero-fixture"))) {
-        fprintf(stderr, "usage: %s MODEL (--zero-fixture | --session-fixture | "
+        fprintf(stderr, "usage: %s MODEL (--zero-fixture | --session-fixture | --stream-decode-queue-parity | "
                         "--long-sessions PROMPT_FILE | --prefill-parity PROMPT_FILE | "
                         "--thread-prefill PROMPT_FILE | --thread-sessions PROMPT_FILE | "
                         "--encoder-parity PROMPT_FILE | --encoder-long-parity PROMPT_FILE | "
