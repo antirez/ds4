@@ -533,7 +533,6 @@ download_one_hf() {
     echo "Downloading $file"
     echo "from https://huggingface.co/$REPO"
     echo "using $HF_CMD download"
-    echo "If the download stops, run the same command again to resume it."
 
     if [ -n "$TOKEN" ]; then
         "$HF_CMD" download "$REPO" "$file" --repo-type model --local-dir "$OUT_DIR" --token "$TOKEN"
