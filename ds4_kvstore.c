@@ -1113,34 +1113,31 @@ int ds4_kvstore_load_payload_region(ds4_session *session, FILE *fp,
     struct stat st;
     if (payload_start < 0 || fstat(fileno(fp), &st) != 0) {
         snprintf(load_err, load_err_len, "failed to locate KV payload");
-        return 1;
+        return DS4_KVSTORE_LOAD_FAILED;
     }
-    /* The header's size must fit inside the file before it drives a seek.
-     * errno stays 0: the entry itself is wrong, not the machine. */
+    /* The header's size must fit inside the file before it drives a seek. */
     if ((uint64_t)st.st_size < (uint64_t)payload_start ||
         payload_bytes > (uint64_t)st.st_size - (uint64_t)payload_start)
     {
         snprintf(load_err, load_err_len, "KV payload extends past end of file");
-        errno = 0;
-        return 1;
+        return DS4_KVSTORE_LOAD_CORRUPT;
     }
     const off_t payload_end = payload_start + (off_t)payload_bytes;
     int rc;
-    int load_errno;
+    int saved_errno;
     if (codec == DS4_KVSTORE_CODEC_LZ4) {
         bool corrupt = false;
-        errno = 0;
         kv_lz4_reader *r = kv_lz4_reader_new(fp, payload_bytes, chunk_size,
                                              n_workers > 0 ? n_workers : 1,
                                              &corrupt);
         if (!r) {
-            load_errno = corrupt ? 0 : errno;
+            saved_errno = errno;
             snprintf(load_err, load_err_len, "%s",
                      corrupt ? "corrupt compressed KV payload"
                              : "failed to open lz4 reader");
             (void)fseeko(fp, payload_end, SEEK_SET);
-            errno = load_errno;
-            return 1;
+            errno = saved_errno;
+            return corrupt ? DS4_KVSTORE_LOAD_CORRUPT : DS4_KVSTORE_LOAD_FAILED;
         }
         /* The engine reads UNCOMPRESSED bytes and requires the remaining
          * budget to be exactly the uncompressed payload size. */
@@ -1148,31 +1145,31 @@ int ds4_kvstore_load_payload_region(ds4_session *session, FILE *fp,
         FILE *cr = kv_lz4_fwrap_open(r, "rb",
                                      NULL, kv_lz4_reader_read, kv_lz4_reader_close);
         if (cr) {
-            errno = 0;
             rc = ds4_session_load_payload(session, cr, total,
                                           load_err, load_err_len);
-            load_errno = errno;
+            saved_errno = errno;
             corrupt = r->err && !r->io_err;   /* r stays live until fclose */
             fclose(cr);
         } else {
             rc = kv_lz4_load_via_file(session, r, total,
                                       load_err, load_err_len, &corrupt);
-            load_errno = errno;
+            saved_errno = errno;
             (void)kv_lz4_reader_close(r);
         }
         if (corrupt) {
-            rc = 1;
-            load_errno = 0;
             snprintf(load_err, load_err_len, "corrupt compressed KV payload");
+            rc = DS4_KVSTORE_LOAD_CORRUPT;
+        } else if (rc != 0) {
+            rc = DS4_KVSTORE_LOAD_FAILED;
         }
     } else {
-        errno = 0;
         rc = ds4_session_load_payload(session, fp, payload_bytes,
                                       load_err, load_err_len);
-        load_errno = errno;
+        saved_errno = errno;
+        if (rc != 0) rc = DS4_KVSTORE_LOAD_FAILED;
     }
     (void)fseeko(fp, payload_end, SEEK_SET);
-    errno = load_errno;
+    errno = saved_errno;
     return rc;
 }
 
@@ -1511,6 +1508,18 @@ bool ds4_kvstore_read_entry_file(const char *path, const char sha[41],
     return true;
 }
 
+/* Codec 1 was an unreleased layout without chunk checksums.  Nothing can read
+ * it and eviction never counts it, so it is removed rather than leaked. */
+static bool kv_cache_is_retired_layout(const char *path) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return false;
+    uint8_t h[DS4_KVSTORE_FIXED_HEADER];
+    const bool full = fread(h, 1, sizeof(h), fp) == sizeof(h);
+    fclose(fp);
+    return full && h[0] == KV_CACHE_MAGIC0 && h[1] == KV_CACHE_MAGIC1 &&
+           h[2] == KV_CACHE_MAGIC2 && h[3] == KV_CACHE_VERSION && h[21] == 1u;
+}
+
 static void kv_cache_refresh(ds4_kvstore *kc) {
     if (!kc->enabled) return;
     ds4_kvstore_clear(kc);
@@ -1523,6 +1532,7 @@ static void kv_cache_refresh(ds4_kvstore *kc) {
         char *path = ds4_kvstore_path_join(kc->dir, de->d_name);
         ds4_kvstore_entry e = {0};
         if (ds4_kvstore_read_entry_file(path, sha, &e)) kv_cache_push(kc, e);
+        else if (kv_cache_is_retired_layout(path)) unlink(path);
         free(path);
     }
     closedir(d);
@@ -2378,15 +2388,12 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
     }
     char err[160] = {0};
     int loaded = 0;
-    int load_rc = 1;
-    int load_errno = 0;
+    int load_rc = DS4_KVSTORE_LOAD_FAILED;
     if (header_ok) {
-        errno = 0;
         load_rc = ds4_kvstore_load_payload_region(session, fp, hdr.codec,
                                                   hdr.payload_bytes, hdr.chunk_size,
                                                   kc->opt.compression_threads,
                                                   err, sizeof(err));
-        load_errno = errno;
     }
     if (load_rc == 0) {
         const ds4_tokens *loaded_tokens = ds4_session_tokens(session);
@@ -2416,10 +2423,10 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
         }
     } else {
         if (header_ok) ds4_session_invalidate(session);
-        /* A rejected payload must not block its replacement after a clean
-         * prefill. Keep valid files when loading failed for a resource or I/O
-         * reason instead; those failures do not establish payload corruption. */
-        if (header_ok && load_errno == 0) unlink(path);
+        /* Remove a payload only when its stored bytes are proven wrong, so a
+         * clean prefill can replace it. Engine, GPU, allocation and I/O
+         * failures do not establish that and keep the file. */
+        if (header_ok && load_rc == DS4_KVSTORE_LOAD_CORRUPT) unlink(path);
         kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
                 "%s: kv cache load failed%s%s %s: %s load=%.1f ms",
                 kv_log_name(kc),

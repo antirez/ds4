@@ -3,7 +3,7 @@
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
-static int fail_rename, fail_alloc;
+static int fail_rename, fail_alloc, stray_errno;
 static int test_rename(const char *from, const char *to) {
     if (fail_rename) { errno = EACCES; return -1; }
     return rename(from, to);
@@ -14,7 +14,11 @@ static void *test_malloc(size_t n) {
         errno = ENOMEM;
         return NULL;
     }
-    return malloc(n);
+    void *p = malloc(n);
+    /* Successful library calls may still change errno; classification of a
+     * corrupt payload must not depend on it staying zero. */
+    if (p && stray_errno) errno = EAGAIN;
+    return p;
 }
 #define rename test_rename
 #define malloc test_malloc
@@ -32,7 +36,7 @@ static void *test_malloc(size_t n) {
 
 static int token_ids[128];
 static ds4_tokens tokens = {.v = token_ids, .len = 128, .cap = 128};
-static int load_errno, load_calls, invalidated;
+static int load_errno, load_calls, invalidated, load_silent;
 static bool random_payload;
 static const uint64_t payload_size = 8u << 20;
 
@@ -68,6 +72,8 @@ int test_load(ds4_session *s, FILE *fp, uint64_t bytes, char *err, size_t errlen
     (void)s;
     load_calls++;
     if (load_errno) { errno = load_errno; snprintf(err, errlen, "injected resource failure"); return 1; }
+    /* Engine and GPU failures often report no errno at all. */
+    if (load_silent) { snprintf(err, errlen, "injected silent engine failure"); return 1; }
     uint8_t buf[65536];
     while (bytes) {
         size_t n = bytes < sizeof(buf) ? (size_t)bytes : sizeof(buf);
@@ -168,20 +174,44 @@ static void run_case(const char *name) {
         assert(store(&kc, NULL));
         assert(access(old, F_OK) != 0 && access(incoming, F_OK) == 0);
         assert(header_byte(incoming, 3) == 1 && header_byte(incoming, 21) == DS4_KVSTORE_CODEC_NONE);
+    } else if (!strcmp(name, "payload-past-eof")) {
+        /* The header's payload size is checked against the file before any
+         * seek or engine read; UINT64_MAX would also overflow the seek. */
+        FILE *fp = tmpfile();
+        assert(fp);
+        const uint8_t junk[64] = {0};
+        assert(fwrite(junk, 1, sizeof(junk), fp) == sizeof(junk));
+        const uint64_t sizes[] = {sizeof(junk) - 8 + 1, UINT64_MAX};
+        const uint8_t codecs[] = {DS4_KVSTORE_CODEC_NONE, DS4_KVSTORE_CODEC_LZ4};
+        for (int ci = 0; ci < 2; ci++) {
+            for (int si = 0; si < 2; si++) {
+                char err[160] = {0};
+                assert(fseek(fp, 8, SEEK_SET) == 0);
+                load_calls = 0;
+                assert(ds4_kvstore_load_payload_region(NULL, fp, codecs[ci], sizes[si],
+                        DS4_KVSTORE_DEFAULT_CHUNK_BYTES, 1, err, sizeof(err))
+                       == DS4_KVSTORE_LOAD_CORRUPT);
+                assert(load_calls == 0);
+            }
+        }
+        assert(fclose(fp) == 0);
     } else if (!strcmp(name, "legacy-codec")) {
-        /* The unreleased unchecksummed layout is an unknown codec: not
-         * provably corrupt, so it is left alone and replaced by the next store. */
+        /* The unreleased unchecksummed layout can never be read or evicted, so
+         * refreshing the index removes it.  Any other unknown codec is left. */
         assert(store(&kc, NULL));
         FILE *fp = fopen(incoming, "r+b");
         assert(fp && fseek(fp, 21, SEEK_SET) == 0 && fputc(1, fp) != EOF);
         assert(fclose(fp) == 0);
         kv_cache_refresh(&kc);
-        assert(ds4_kvstore_try_load_text(&kc, NULL, NULL, "incoming checkpoint", NULL, NULL, NULL, false) == 0);
-        assert(access(incoming, F_OK) == 0);
+        assert(access(incoming, F_OK) != 0);
         assert(store(&kc, NULL));
-        assert(header_byte(incoming, 21) == DS4_KVSTORE_CODEC_LZ4);
         kv_cache_refresh(&kc);
         assert(ds4_kvstore_try_load_text(&kc, NULL, NULL, "incoming checkpoint", NULL, NULL, NULL, false) == 128);
+        fp = fopen(incoming, "r+b");
+        assert(fp && fseek(fp, 21, SEEK_SET) == 0 && fputc(7, fp) != EOF);
+        assert(fclose(fp) == 0);
+        kv_cache_refresh(&kc);
+        assert(access(incoming, F_OK) == 0);
     } else if (!strcmp(name, "replace-failure") || !strcmp(name, "replace-success")) {
         free(seed_entry(&kc, "incoming checkpoint", 3u << 20));
         FILE *fp = fopen(incoming, "r+b");
@@ -219,10 +249,14 @@ static void run_case(const char *name) {
             load_errno = ENOMEM;
         } else if (!strcmp(name, "engine-io")) {
             load_errno = EIO;
+        } else if (!strcmp(name, "engine-silent")) {
+            load_silent = 1;
         } else { assert(!"unknown case"); }
         kv_cache_refresh(&kc);
         load_calls = invalidated = 0;
+        stray_errno = !strcmp(name, "corrupt-recovery") || !strcmp(name, "checksum-recovery");
         assert(ds4_kvstore_try_load_text(&kc, NULL, NULL, "incoming checkpoint", NULL, NULL, NULL, false) == 0);
+        stray_errno = 0;
         assert(invalidated == 1);
         if (!strcmp(name, "corrupt-recovery") || !strcmp(name, "checksum-recovery")) {
             /* With cookie streams the engine starts reading before the bad
@@ -236,7 +270,7 @@ static void run_case(const char *name) {
         } else {
             assert(access(incoming, F_OK) == 0);
         }
-        fail_alloc = load_errno = 0;
+        fail_alloc = load_errno = load_silent = 0;
         assert(ds4_kvstore_try_load_text(&kc, NULL, NULL, "incoming checkpoint",
                                         NULL, NULL, NULL, false) == 128);
     }
@@ -260,9 +294,9 @@ static void run_case(const char *name) {
 int main(int argc, char **argv) {
     if (argc == 2) { run_case(argv[1]); return 0; }
     const char *cases[] = {"admission", "eviction", "publish-failure", "write-failure",
-        "raw-fallback-budget", "expansion-budget", "protect-published", "legacy-codec",
+        "raw-fallback-budget", "expansion-budget", "protect-published", "payload-past-eof", "legacy-codec",
         "corrupt-recovery", "checksum-recovery",
-        "load-oom", "engine-oom", "engine-io", "replace-failure", "replace-success"};
+        "load-oom", "engine-oom", "engine-io", "engine-silent", "replace-failure", "replace-success"};
     for (size_t i = 0; i < sizeof(cases) / sizeof(*cases); i++) run_case(cases[i]);
     printf("Disk KV store%s: PASS\n", KV_LZ4_HAVE_FWRAP ? "" : ", no cookie streams");
     return 0;

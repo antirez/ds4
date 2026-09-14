@@ -18,9 +18,11 @@ of the 48-byte header:
 Raw files are written as version 1, exactly the layout older binaries read and
 refresh in place. Only compressed files are version 2, which older binaries
 reject, so their header and trailer updates cannot clear a codec byte.
-Refreshing an entry keeps its version. The reader accepts version 1 with codec 0
-and version 2 with either codec, and rejects version 1 carrying a codec.
-Codec 1 was an unreleased layout without checksums and is rejected as unknown.
+Refreshing an entry rewrites its version from its codec, so raw entries end as
+version 1, including raw version-2 files from earlier builds. The reader
+accepts version 1 with codec 0 and version 2 with either codec, and rejects
+version 1 carrying a codec. Codec 1 was an unreleased layout without checksums;
+it is rejected, and refreshing the index removes such files.
 
 An LZ4 payload contains little-endian framing followed by chunk records:
 
@@ -73,16 +75,18 @@ a same-key file incompatible with the current model or context. This
 requires free temporary disk space beyond the configured cache budget; an
 ENOSPC failure does not justify deleting working cache entries speculatively.
 
-A payload whose content is wrong is removed so successful recomputation can
-replace it: bad framing or chunk records, a checksum mismatch, or a size past
-the end of the file. The decision comes from the reader's own state, not from
-errno. Files are retained when loading reports a resource or stream I/O
-failure such as ENOMEM. A file with an unknown codec or version is not
-provably corrupt, so it is left for the next store to replace.
+A payload is removed only when its stored bytes are proven wrong, so a clean
+recomputation can replace it: bad framing or chunk records, a checksum
+mismatch, or a size past the end of the file. Every other load failure keeps
+the file, including engine, GPU, allocation and stream I/O failures that report
+no errno. Files in the retired codec-1 layout are removed when the index is
+refreshed, since nothing can read or evict them; files with any other unknown
+codec or version are left alone.
 
 Where cookie streams are available the engine reads through the decoder
 directly. Elsewhere the payload is decoded into a temporary file first, which
-needs temporary disk space equal to the uncompressed payload.
+needs temporary disk space equal to the uncompressed payload. A decode that
+fails for lack of that space keeps the entry and is retried on the next lookup.
 
 Cold checkpoints can be saved during prefill. Logged `save_ms` excludes the
 initial raw staging, so it must not be described as total checkpoint overhead
@@ -157,7 +161,9 @@ the engine boundary and exercise actual staging, compression, admission,
 eviction and publication with deterministic payloads. They cover fitting
 compressed files, unnecessary eviction, write/rename failures, fallback and
 incompressible expansion exceeding budget, protection of an admitted file,
-corrupt-file and checksum-mismatch replacement, unknown-codec retention,
+corrupt-file and checksum-mismatch replacement, removal of the retired codec-1
+layout while other unknown codecs are kept, retention after engine failures
+that report no errno,
 retention and retry after reported allocation/I/O failures, and atomic
 replacement of same-key incompatible files. `test-kv-lz4-nofwrap` builds both
 suites without cookie streams, so the same store cases load compressed entries

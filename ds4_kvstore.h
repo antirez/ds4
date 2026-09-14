@@ -259,7 +259,12 @@ bool ds4_kvstore_write_payload_region(FILE *fp,
  * `session`.  codec, payload_bytes, and chunk_size come from the file header.
  * Always leaves `fp` positioned just past the payload region (independent of
  * codec or stdio read-ahead) so a trailing record loads at the right offset.
- * Returns 0 on success; load_err carries the reason on failure. */
+ * Returns DS4_KVSTORE_LOAD_OK, DS4_KVSTORE_LOAD_CORRUPT when the stored bytes
+ * are proven wrong, or DS4_KVSTORE_LOAD_FAILED for any other failure, which is
+ * not evidence against the file.  load_err carries the reason. */
+#define DS4_KVSTORE_LOAD_OK      0
+#define DS4_KVSTORE_LOAD_FAILED  1
+#define DS4_KVSTORE_LOAD_CORRUPT 2
 int ds4_kvstore_load_payload_region(ds4_session *session, FILE *fp,
                                     uint8_t codec, uint64_t payload_bytes,
                                     uint32_t chunk_size, int n_workers,

@@ -607,9 +607,20 @@ static void test_header_versions(void) {
     assert(fputc(DS4_KVSTORE_CODEC_LZ4, fp) != EOF && fputc(24, fp) != EOF);
     assert(fseek(fp, 0, SEEK_SET) == 0);
     assert(!ds4_kvstore_read_header(fp, &e, &text_bytes));
+
+    /* An earlier build stamped raw files as version 2.  They still load, and a
+     * refresh rewrites them as version 1. */
+    assert(fseek(fp, 3, SEEK_SET) == 0 && fputc(2, fp) != EOF);
+    assert(fseek(fp, 21, SEEK_SET) == 0 && fputc(0, fp) != EOF && fputc(0, fp) != EOF);
+    assert(fseek(fp, 0, SEEK_SET) == 0);
+    assert(ds4_kvstore_read_header(fp, &e, &text_bytes));
+    assert(fclose(fp) == 0);
+    assert(ds4_kvstore_touch_file(path, 8));
+    fp = fopen(path, "rb");
+    assert(fp && fseek(fp, 3, SEEK_SET) == 0 && fgetc(fp) == (int)KV_CACHE_VERSION_COMPAT);
     assert(fclose(fp) == 0);
     unlink(path);
-    printf("  raw headers stay version 1 through refresh; v1 with a codec rejected: ok\n");
+    printf("  raw headers end version 1 through refresh; v1 with a codec rejected: ok\n");
 }
 
 /* A stream that is well formed and decodes to the right length must still be
