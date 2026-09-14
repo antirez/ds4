@@ -243,7 +243,12 @@ kernel void kernel_unary_impl(
         }
 
         if (FC_OP == OP_UNARY_NUM_SOFTPLUS) {
-            dst_ptr[i0] = (T) select(log(1 + exp(x)), x, x > 20);
+            // Use a log1p series for small exp(x), where adding 1 loses precision.
+            // Clamp the unselected polynomial branch to keep it finite.
+            const TC ex = exp(x);
+            const TC em = min(ex, (TC)0.03125f);
+            const TC poly = em*(1.0f - em*(0.5f - em*(1.0f/3.0f - 0.25f*em)));
+            dst_ptr[i0] = (T) select(select(log(1 + ex), poly, ex < (TC)0.03125f), x, x > 20);
         }
 
         if (FC_OP == OP_UNARY_NUM_EXPM1) {
@@ -302,7 +307,10 @@ kernel void kernel_dsv4_softplus_sqrt_f32_4(
     device const float4 *s = (device const float4 *)(src + i01*args.nb01);
     device       float4 *d = (device       float4 *)(dst + i01*args.nb1);
     const float4 x = s[i0];
-    const float4 sp = select(log(1.0f + exp(x)), x, x > 20.0f);
+    const float4 ex = exp(x);
+    const float4 em = min(ex, 0.03125f);
+    const float4 poly = em*(1.0f - em*(0.5f - em*(1.0f/3.0f - 0.25f*em)));
+    const float4 sp = select(select(log(1.0f + ex), poly, ex < 0.03125f), x, x > 20.0f);
     d[i0] = sqrt(sp);
 }
 
