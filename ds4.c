@@ -49785,7 +49785,7 @@ static bool glm_graph_encode_sparse_ffn_one(
      * release wait, so the GPU computes it while the CPUs exchange the
      * routed partials instead of idling on the spin kernel; the combine
      * then runs after both.  Metal keeps the single-call gate. */
-    bool tp_gate_pending = false;
+    bool tp_gate_pending DS4_MAYBE_UNUSED = false;
     if (ok && tp_split_ffn) {
 #ifdef DS4_ROCM_BUILD
         ok = ds4_gpu_tp_gate_arrive(il, DS4_TP_GATE_FFN) != 0;
@@ -49851,6 +49851,9 @@ static bool glm_graph_encode_sparse_ffn_one(
                                              1,
                                              stage_t0);
     }
+#ifdef DS4_ROCM_BUILD
+    /* Only the ROCm backend implements the split gate (arrive above); the
+     * other backends took the single-call combine and never reach here. */
     if (ok && tp_gate_pending) {
         ok = ds4_gpu_tp_gate_wait(il, DS4_TP_GATE_FFN) != 0;
         if (ok) ok = ds4_gpu_add_tensor(ffn_out,
@@ -49859,6 +49862,7 @@ static bool glm_graph_encode_sparse_ffn_one(
                                         DS4_N_EMBD) != 0;
         if (!ok) fprintf(stderr, "ds4: GLM TP gate/combine failed (layer %u)\n", il);
     }
+#endif
     if (ok && add_residual && !glm_graph_disable_add3_residual()) {
         ok = ds4_gpu_add3_tensor(next,
                                  after_attn,
