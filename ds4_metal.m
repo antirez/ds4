@@ -18975,6 +18975,59 @@ int ds4_gpu_indexer_scores_decode_batch_tensor(
                                                  scale);
 }
 
+/* Common merge args shared by every round; the compound literal zeroes the
+ * path-specific fields (total/keep_k, or the causal block fields) for the
+ * caller to fill in. */
+static ds4_gpu_kargs_argsort_merge ds4_gpu_argsort_merge_args(
+        uint32_t n_comp, uint32_t n_tokens, int32_t work_width,
+        int32_t top_k_arg, int32_t len) {
+    return (ds4_gpu_kargs_argsort_merge){
+        .ne00 = (int64_t)n_comp,
+        .ne01 = (int64_t)n_tokens,
+        .ne02 = 1,
+        .ne03 = 1,
+        .nb00 = sizeof(float),
+        .nb01 = (uint64_t)n_comp * sizeof(float),
+        .nb02 = (uint64_t)n_comp * n_tokens * sizeof(float),
+        .nb03 = (uint64_t)n_comp * n_tokens * sizeof(float),
+        .ne0 = work_width,
+        .ne1 = (int32_t)n_tokens,
+        .ne2 = 1,
+        .ne3 = 1,
+        .top_k = top_k_arg,
+        .len = len,
+    };
+}
+
+/* Encode one merge round over the scratch ping-pong halves; the final round
+ * (final_merge) writes the selection tensor instead of the next half.
+ * thread_cap is the per-threadgroup work bound: the run length len for the
+ * causal layout, the per-pair output new_len for the packed one. */
+static void ds4_gpu_argsort_merge_round(
+        id<MTLCommandBuffer> cb,
+        id<MTLComputePipelineState> pipeline,
+        const ds4_gpu_kargs_argsort_merge *args,
+        id<MTLBuffer> scorebuf, NSUInteger score_off,
+        id<MTLBuffer> selbuf, NSUInteger sel_off,
+        NSUInteger cur_off, NSUInteger next_off,
+        uint32_t n_tokens, int32_t nm, int32_t thread_cap, bool final_merge) {
+    NSUInteger merge_threads = pipeline.maxTotalThreadsPerThreadgroup;
+    if (merge_threads == 0 || merge_threads > 512u) merge_threads = 512u;
+    if (merge_threads > (NSUInteger)thread_cap) merge_threads = (NSUInteger)thread_cap;
+    if (merge_threads == 0) merge_threads = 1;
+
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    [enc setComputePipelineState:pipeline];
+    [enc setBytes:args length:sizeof(*args) atIndex:0];
+    [enc setBuffer:scorebuf offset:score_off atIndex:1];
+    [enc setBuffer:g_indexer_topk_buffer offset:cur_off atIndex:2];
+    [enc setBuffer:final_merge ? selbuf : g_indexer_topk_buffer
+          offset:final_merge ? sel_off : next_off atIndex:3];
+    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)nm * n_tokens, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(merge_threads, 1, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+}
+
 static int ds4_gpu_indexer_topk_tensor_impl(
         ds4_gpu_tensor       *selected,
         const ds4_gpu_tensor *scores,
@@ -19071,6 +19124,8 @@ static int ds4_gpu_indexer_topk_tensor_impl(
              threadsPerThreadgroup:MTLSizeMake((NSUInteger)nth, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
+        const NSUInteger score_off = ds4_gpu_tensor_offset(scores);
+        const NSUInteger sel_off = ds4_gpu_tensor_offset(selected);
         int32_t len = block_top_k;
         if (causal_ratio) {
             /* Causal rows have a per-token valid width, so the merge keeps the
@@ -19078,44 +19133,17 @@ static int ds4_gpu_indexer_topk_tensor_impl(
              * work_width, pairs dispatched over the widest row. */
             while (len < work_width) {
                 const int32_t nm = (work_width + 2 * len - 1) / (2 * len);
-                const bool final_merge = nm == 1;
-                NSUInteger merge_threads = merge_pipeline.maxTotalThreadsPerThreadgroup;
-                if (merge_threads == 0 || merge_threads > 512u) merge_threads = 512u;
-                if (merge_threads > (NSUInteger)len) merge_threads = (NSUInteger)len;
-                if (merge_threads == 0) merge_threads = 1;
+                ds4_gpu_kargs_argsort_merge merge_args = ds4_gpu_argsort_merge_args(
+                    n_comp, n_tokens, work_width,
+                    nm == 1 ? (int32_t)top_k : work_width, len);
+                merge_args.causal_start = causal_start;
+                merge_args.causal_ratio = causal_ratio;
+                merge_args.block_width = (uint32_t)nth;
+                merge_args.block_top_k = (uint32_t)block_top_k;
 
-                ds4_gpu_kargs_argsort_merge merge_args = {
-                    .ne00 = (int64_t)n_comp,
-                    .ne01 = (int64_t)n_tokens,
-                    .ne02 = 1,
-                    .ne03 = 1,
-                    .nb00 = sizeof(float),
-                    .nb01 = (uint64_t)n_comp * sizeof(float),
-                    .nb02 = (uint64_t)n_comp * n_tokens * sizeof(float),
-                    .nb03 = (uint64_t)n_comp * n_tokens * sizeof(float),
-                    .ne0 = work_width,
-                    .ne1 = (int32_t)n_tokens,
-                    .ne2 = 1,
-                    .ne3 = 1,
-                    .top_k = nm == 1 ? (int32_t)top_k : work_width,
-                    .len = len,
-                    .causal_start = causal_start,
-                    .causal_ratio = causal_ratio,
-                    .block_width = (uint32_t)nth,
-                    .block_top_k = (uint32_t)block_top_k,
-                };
-
-                enc = ds4_gpu_compute_encoder(cb);
-                [enc setComputePipelineState:merge_pipeline];
-                [enc setBytes:&merge_args length:sizeof(merge_args) atIndex:0];
-                [enc setBuffer:scorebuf offset:ds4_gpu_tensor_offset(scores) atIndex:1];
-                [enc setBuffer:g_indexer_topk_buffer offset:cur_off atIndex:2];
-                [enc setBuffer:final_merge ? selbuf : g_indexer_topk_buffer
-                      offset:final_merge ? ds4_gpu_tensor_offset(selected) : next_off
-                     atIndex:3];
-                [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)nm * n_tokens, 1, 1)
-                     threadsPerThreadgroup:MTLSizeMake(merge_threads, 1, 1)];
-                ds4_gpu_end_compute_encoder(cb, enc);
+                ds4_gpu_argsort_merge_round(cb, merge_pipeline, &merge_args,
+                    scorebuf, score_off, selbuf, sel_off, cur_off, next_off,
+                    n_tokens, nm, len, nm == 1);
 
                 const NSUInteger tmp = cur_off;
                 cur_off = next_off;
@@ -19133,10 +19161,6 @@ static int ds4_gpu_indexer_topk_tensor_impl(
                 const bool final_merge = nm == 1;
                 /* Final round: nruns == 2 so total <= 2*len, and total >= top_k, hence new_len == top_k. */
                 const int32_t new_len = (2 * len < (int32_t)top_k) ? 2 * len : (int32_t)top_k;
-                NSUInteger merge_threads = merge_pipeline.maxTotalThreadsPerThreadgroup;
-                if (merge_threads == 0 || merge_threads > 512u) merge_threads = 512u;
-                if (merge_threads > (NSUInteger)new_len) merge_threads = (NSUInteger)new_len;
-                if (merge_threads == 0) merge_threads = 1;
 
                 /* Full pairs write new_len each, the last partial pair writes
                  * min(r, new_len); q is clamped to the pairs actually dispatched. */
@@ -19145,36 +19169,15 @@ static int ds4_gpu_indexer_topk_tensor_impl(
                 const int32_t total_next =
                     MIN(q, nm) * new_len + (q < nm ? MIN(r, new_len) : 0);
 
-                ds4_gpu_kargs_argsort_merge merge_args = {
-                    .ne00 = (int64_t)n_comp,
-                    .ne01 = (int64_t)n_tokens,
-                    .ne02 = 1,
-                    .ne03 = 1,
-                    .nb00 = sizeof(float),
-                    .nb01 = (uint64_t)n_comp * sizeof(float),
-                    .nb02 = (uint64_t)n_comp * n_tokens * sizeof(float),
-                    .nb03 = (uint64_t)n_comp * n_tokens * sizeof(float),
-                    .ne0 = work_width,
-                    .ne1 = (int32_t)n_tokens,
-                    .ne2 = 1,
-                    .ne3 = 1,
-                    .top_k = final_merge ? (int32_t)top_k : work_width,
-                    .len = len,
-                    .total = total,
-                    .keep_k = (int32_t)top_k,
-                };
+                ds4_gpu_kargs_argsort_merge merge_args = ds4_gpu_argsort_merge_args(
+                    n_comp, n_tokens, work_width,
+                    final_merge ? (int32_t)top_k : work_width, len);
+                merge_args.total = total;
+                merge_args.keep_k = (int32_t)top_k;
 
-                enc = ds4_gpu_compute_encoder(cb);
-                [enc setComputePipelineState:merge_pipeline];
-                [enc setBytes:&merge_args length:sizeof(merge_args) atIndex:0];
-                [enc setBuffer:scorebuf offset:ds4_gpu_tensor_offset(scores) atIndex:1];
-                [enc setBuffer:g_indexer_topk_buffer offset:cur_off atIndex:2];
-                [enc setBuffer:final_merge ? selbuf : g_indexer_topk_buffer
-                      offset:final_merge ? ds4_gpu_tensor_offset(selected) : next_off
-                     atIndex:3];
-                [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)nm * n_tokens, 1, 1)
-                     threadsPerThreadgroup:MTLSizeMake(merge_threads, 1, 1)];
-                ds4_gpu_end_compute_encoder(cb, enc);
+                ds4_gpu_argsort_merge_round(cb, merge_pipeline, &merge_args,
+                    scorebuf, score_off, selbuf, sel_off, cur_off, next_off,
+                    n_tokens, nm, new_len, final_merge);
 
                 const NSUInteger tmp = cur_off;
                 cur_off = next_off;
