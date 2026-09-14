@@ -5185,7 +5185,10 @@ kernel void kernel_dsv4_router_transform_finalize_weights_one_simd(
         device const float4 *s = (device const float4 *)logits;
         device float4 *d = (device float4 *)probs;
         const float4 x = s[tid];
-        const float4 sp = select(log(1.0f + exp(x)), x, x > 20.0f);
+        const float4 ex = exp(x);
+        const float4 em = min(ex, 0.03125f);
+        const float4 poly = em*(1.0f - em*(0.5f - em*(1.0f/3.0f - 0.25f*em)));
+        const float4 sp = select(select(log(1.0f + ex), poly, ex < 0.03125f), x, x > 20.0f);
         d[tid] = sqrt(sp);
     }
     threadgroup_barrier(mem_flags::mem_device);
@@ -5346,7 +5349,10 @@ kernel void kernel_dsv4_router_project_select_fused(
             (device volatile const float4 *)logits;
         device float4 *d = (device float4 *)probs;
         const float4 xv = s[tid];
-        const float4 sp = select(log(1.0f + exp(xv)), xv, xv > 20.0f);
+        const float4 ex = exp(xv);
+        const float4 em = min(ex, 0.03125f);
+        const float4 poly = em*(1.0f - em*(0.5f - em*(1.0f/3.0f - 0.25f*em)));
+        const float4 sp = select(select(log(1.0f + ex), poly, ex < 0.03125f), xv, xv > 20.0f);
         d[tid] = sqrt(sp);
     }
     threadgroup_barrier(mem_flags::mem_device);

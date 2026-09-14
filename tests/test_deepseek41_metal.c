@@ -92,13 +92,7 @@ static int check_router(void) {
                     for (unsigned k = 0; k < USED; k++) best[k] = -1;
                     for (unsigned e = 0; e < n; e++) {
                         const double v = logits[t * n + e];
-#ifdef __APPLE__
-                        /* Match Metal's established FP32 addition before log;
-                         * log1p has different rounding near zero. */
-                        ref[e] = sqrtf(v > 20 ? (float)v : logf(1.0f + expf((float)v)));
-#else
                         ref[e] = sqrt(v > 20 ? v : v < -20 ? exp(v) : log1p(exp(v)));
-#endif
                         if (!(fabs(probs[t * n + e] - ref[e]) <= 3e-6 * (1 + ref[e])))
                             fprintf(stderr, "router n=%u mode=%u rows=%u row=%u expert=%u logit=%.9g actual=%.9g ref=%.9g\n",
                                     n, mode, rows, t, e, v, probs[t * n + e], ref[e]);
