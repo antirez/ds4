@@ -854,9 +854,16 @@ tests/test_kv_lz4_nofwrap.o: tests/test_kv_lz4.c ds4_kvstore.c ds4_kvstore.h lz4
 tests/test_kv_lz4_nofwrap: tests/test_kv_lz4_nofwrap.o rax.o lz4.o lz4hc.o $(CPU_CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
+tests/test_kv_lz4_store_nofwrap.o: tests/test_kv_lz4_store.c ds4_kvstore.c ds4_kvstore.h ds4.h lz4.h lz4hc.h
+	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_NO_GPU -DKV_LZ4_HAVE_FWRAP=0 -I. -c -o $@ $<
+
+tests/test_kv_lz4_store_nofwrap: tests/test_kv_lz4_store_nofwrap.o rax.o lz4.o lz4hc.o $(CPU_CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
 .PHONY: test-kv-lz4-nofwrap
-test-kv-lz4-nofwrap: tests/test_kv_lz4_nofwrap
+test-kv-lz4-nofwrap: tests/test_kv_lz4_nofwrap tests/test_kv_lz4_store_nofwrap
 	./tests/test_kv_lz4_nofwrap
+	./tests/test_kv_lz4_store_nofwrap
 
 tests/test_tp_commands.o: tests/test_tp_commands.c ds4_tp.c ds4_tp.h ds4.h ds4_gpu_tp.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
@@ -1072,7 +1079,7 @@ clean:
 	rm -f tests/test_glm_attention tests/test_glm_attention_rocm
 	rm -f tests/test_ssd_cache tests/test_engram
 	rm -f tests/test_session_state tests/test_session_state_gpu tests/test_tp_commands
-	rm -f tests/test_kv_lz4 tests/test_kv_lz4_nofwrap tests/test_kv_lz4_store
+	rm -f tests/test_kv_lz4 tests/test_kv_lz4_nofwrap tests/test_kv_lz4_store tests/test_kv_lz4_store_nofwrap
 	rm -f tests/test_tp_rdma tests/test_tp_link tests/test_tp_tcp
 	rm -f tests/test_metal_tp_spec
 	rm -f tests/test_metal_tp_cancel

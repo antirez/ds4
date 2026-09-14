@@ -6,19 +6,21 @@ path; live inference KV buffers and `ds4-bench` memory snapshots do not.
 
 ## Format and compatibility
 
-Cache format version 2 uses two previously reserved bytes of its 48-byte header:
+Compressed files use cache format version 2 and two previously reserved bytes
+of the 48-byte header:
 
 | Offset | Field |
 |---:|---|
-| 21 | Codec: 0 = raw, 1 = LZ4 |
+| 21 | Codec: 0 = raw, 2 = LZ4 with chunk checksums |
 | 22 | Chunk size log2; 24 means 16 MiB, meaningful only for LZ4 |
 | 23 | Reserved |
 
-The reader accepts versions 1 and 2. Version-1 raw files remain readable. Old
-version-1 binaries reject version-2 files, preventing their header/trailer
-updates from clearing a compressed file's codec byte. Enabling compression does
-not rewrite existing compatible raw checkpoints; either codec can be read
-regardless of the current write setting.
+Raw files are written as version 1, exactly the layout older binaries read and
+refresh in place. Only compressed files are version 2, which older binaries
+reject, so their header and trailer updates cannot clear a codec byte.
+Refreshing an entry keeps its version. The reader accepts version 1 with codec 0
+and version 2 with either codec, and rejects version 1 carrying a codec.
+Codec 1 was an unreleased layout without checksums and is rejected as unknown.
 
 An LZ4 payload contains little-endian framing followed by chunk records:
 
@@ -28,24 +30,28 @@ u32 chunk_count
 repeat chunk_count times:
     u32 raw_size
     u32 compressed_size
+    u32 xxh32_of_raw_bytes
     u8[compressed_size] LZ4 block of byte-4-transposed input
 ```
 
-Every chunk except the last has the declared chunk size. Decoding reverses the
-transpose and recovers the original payload bytes. Trailers remain outside the
-compressed region. Framing checks reject empty compressed frames, inconsistent
-counts, impossible expansion, truncated records, and invalid chunk lengths.
-There is no payload checksum: structural validation cannot detect every content
-mutation. Raw payloads also lack a content checksum.
+Every chunk except the last has the declared chunk size, and raw sizes sum to
+the declared total. Decoding reverses the transpose and verifies each chunk's
+XXH32 before its bytes reach the engine. Framing checks reject empty
+compressed frames, inconsistent counts, impossible expansion, truncated
+records and invalid chunk lengths; the checksum catches content mutations
+those checks cannot. Trailers remain outside the compressed region, and a
+payload size larger than the rest of the file is rejected before any seek.
+Raw payloads still carry no content checksum.
 
 ## Resources and cache policy
 
 The default is `min(8, online CPUs)` workers and 16 MiB chunks. The server flag
 `--kv-cache-compression-threads N` overrides
 `DS4_KV_CACHE_COMPRESSION_THREADS`; zero writes raw files. The worker limit is
-64; accepted chunk sizes are bounded by 64 MiB. Unsupported cookie-stream
-platforms default to raw writes. Failure to allocate a writer also falls back
-to raw storage.
+64; accepted chunk sizes are bounded by 64 MiB, and a size that is not a power
+of two uses the default. Compression does not depend on cookie streams: the
+writer reads the staged payload directly. Failure to allocate a writer falls
+back to raw storage.
 
 Each writer worker holds raw, shuffled, and encoded buffers: approximately
 `3 * workers * chunk_size`, or 384 MiB at defaults, plus codec and stream state.
@@ -67,9 +73,16 @@ a same-key file incompatible with the current model or context. This
 requires free temporary disk space beyond the configured cache budget; an
 ENOSPC failure does not justify deleting working cache entries speculatively.
 
-A payload rejected without a reported resource/I/O error is removed so successful
-recomputation can replace it. Files are retained when loading reports a resource
-or I/O failure, such as ENOMEM or an unavailable cookie stream.
+A payload whose content is wrong is removed so successful recomputation can
+replace it: bad framing or chunk records, a checksum mismatch, or a size past
+the end of the file. The decision comes from the reader's own state, not from
+errno. Files are retained when loading reports a resource or stream I/O
+failure such as ENOMEM. A file with an unknown codec or version is not
+provably corrupt, so it is left for the next store to replace.
+
+Where cookie streams are available the engine reads through the decoder
+directly. Elsewhere the payload is decoded into a temporary file first, which
+needs temporary disk space equal to the uncompressed payload.
 
 Cold checkpoints can be saved during prefill. Logged `save_ms` excludes the
 initial raw staging, so it must not be described as total checkpoint overhead
@@ -136,14 +149,19 @@ make ds4_test ds4_agent_test
 ./ds4_agent_test
 ```
 
-The codec suite covers byte-shuffle inversion, chunk boundaries, malformed
-regions, trailer positioning and raw fallback. Store regressions replace only
+The codec suite covers byte-shuffle inversion, XXH32 against `xxhsum`
+reference values, chunk boundaries, per-chunk checksums, malformed regions,
+header versions through refresh, trailer positioning and raw fallback, and
+asserts that no fuzzed region decodes to full-length wrong bytes. Store regressions replace only
 the engine boundary and exercise actual staging, compression, admission,
 eviction and publication with deterministic payloads. They cover fitting
 compressed files, unnecessary eviction, write/rename failures, fallback and
 incompressible expansion exceeding budget, protection of an admitted file,
-corrupt-file replacement, retention and retry after reported allocation/I/O
-failures, and atomic replacement of same-key incompatible files. These fixtures
+corrupt-file and checksum-mismatch replacement, unknown-codec retention,
+retention and retry after reported allocation/I/O failures, and atomic
+replacement of same-key incompatible files. `test-kv-lz4-nofwrap` builds both
+suites without cookie streams, so the same store cases load compressed entries
+through the temporary-file path. These fixtures
 are not model-generated KV compression-ratio evidence.
 
 ## V4.1 throughput through 256K

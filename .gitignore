@@ -86,6 +86,7 @@ __pycache__/
 /tests/test_kv_lz4
 /tests/test_kv_lz4_nofwrap
 /tests/test_kv_lz4_store
+/tests/test_kv_lz4_store_nofwrap
 
 /tests/test_qwen4_conv_parallel
 /tests/test_q8_prefill_variants
