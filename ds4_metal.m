@@ -40669,7 +40669,11 @@ int ds4_gpu_routed_moe_one_tensor(
             direct_down_sum &&
             g_moe_mul_mv_group6_q4_k_pair_swiglu_pipeline != nil &&
             g_moe_mul_mv_group6_q4_k_sum6_pipeline != nil &&
-            getenv("DS4_METAL_ENABLE_Q4_GROUP6_EXPERT_TABLE") != NULL &&
+            /* Default for DeepSeek V4.1 Flash's routed shape (5120 x 2304, 6
+             * of 384): +2.5 % decode on M3 Ultra, greedy output identical to
+             * the pair_swiglu path.  Other 384-expert models keep it opt-in. */
+            (getenv("DS4_METAL_ENABLE_Q4_GROUP6_EXPERT_TABLE") != NULL ||
+             (expert_in_dim == 5120u && expert_mid_dim == 2304u)) &&
             getenv("DS4_METAL_DISABLE_Q4_GROUP6_EXPERT_TABLE") == NULL;
         const uint32_t q4_group8_expert_group_size = 48;
         const bool use_q4_group8_experts =
