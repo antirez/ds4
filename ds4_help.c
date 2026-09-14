@@ -158,6 +158,7 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     opt(fp, c, "--backend NAME", "Backend name: metal, cuda, or cpu.");
     opt(fp, c, "--gpu-vram N[,N,...]|auto", "CUDA VRAM budgets per device, in GiB, or auto-detect free VRAM.");
     opt(fp, c, "--gpu-devices N[,N,...]", "CUDA device indices used by multi-GPU placement.");
+    opt(fp, c, "--gpu-resident", "CUDA: copy the whole model into VRAM at load (needs VRAM >= model+KV+buffers); far faster decode when it fits, otherwise falls back to host-mapping.");
     if (tool != DS4_HELP_EVAL) {
         opt(fp, c, "--cuda-tensor-parallel", "Enable the paired DeepSeek tensor/expert path on an even multi-GPU CUDA placement.");
     }
