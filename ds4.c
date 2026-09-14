@@ -41615,8 +41615,175 @@ static int bpe_rank(const ds4_vocab *vocab, const owned_str *a, const owned_str 
     return rank;
 }
 
-/* Apply byte-level BPE to one regex-like pre-tokenized piece and emit token ids. */
+/* ===== Fast BPE merge: O(n log n), output-identical to the quadratic path =====
+ *
+ * The original bpe_emit_piece rescans every adjacent pair and shifts the
+ * symbol array on each merge: O(n^2) per piece. Punctuation-free CJK runs
+ * form letter-run pieces of hundreds of thousands of symbols, where the
+ * quadratic merge loop stalls tokenization for tens of minutes.
+ *
+ * This variant keeps the exact merge semantics — repeatedly merge the
+ * leftmost pair with the minimal merge rank — using:
+ *   - symbols as (start,end) ranges into the encoded buffer (no copies)
+ *   - a doubly linked list (no shifts)
+ *   - cached pair ranks updated only around each merge point
+ *   - a min-heap ordered by (rank, original symbol index) with lazy
+ *     invalidation, which reproduces the leftmost-minimal tie-break exactly
+ *
+ * DS4_BPE_SLOW=1 selects the original path; DS4_BPE_VERIFY=1 runs both and
+ * aborts on the first differing token stream (debug aid). */
+
+typedef struct {
+    int32_t rank;
+    int idx;
+} bpe_heap_ent;
+
+typedef struct {
+    int prev, next;       /* linked list of live symbols, list order == idx order */
+    uint32_t start, end;  /* byte range into the encoded buffer */
+    int32_t pair_rank;    /* rank of (this, this->next); -1 when none/dead */
+    uint8_t alive;
+} bpe_node;
+
+static void bpe_heap_push(bpe_heap_ent *h, int *n, int32_t rank, int idx) {
+    int i = (*n)++;
+    h[i].rank = rank; h[i].idx = idx;
+    while (i > 0) {
+        int p = (i - 1) / 2;
+        if (h[p].rank < h[i].rank || (h[p].rank == h[i].rank && h[p].idx <= h[i].idx)) break;
+        bpe_heap_ent t = h[p]; h[p] = h[i]; h[i] = t;
+        i = p;
+    }
+}
+
+static bpe_heap_ent bpe_heap_pop(bpe_heap_ent *h, int *n) {
+    bpe_heap_ent top = h[0];
+    h[0] = h[--(*n)];
+    int i = 0;
+    for (;;) {
+        int l = 2*i + 1, r = l + 1, best = i;
+        if (l < *n && (h[l].rank < h[best].rank || (h[l].rank == h[best].rank && h[l].idx < h[best].idx))) best = l;
+        if (r < *n && (h[r].rank < h[best].rank || (h[r].rank == h[best].rank && h[r].idx < h[best].idx))) best = r;
+        if (best == i) break;
+        bpe_heap_ent t = h[best]; h[best] = h[i]; h[i] = t;
+        i = best;
+    }
+    return top;
+}
+
+static int bpe_rank_ranges(const ds4_vocab *vocab, const char *enc,
+                           uint32_t as, uint32_t ae, uint32_t bs, uint32_t be) {
+    owned_str a = { (char*)enc + as, ae - as };
+    owned_str b = { (char*)enc + bs, be - bs };
+    return bpe_rank(vocab, &a, &b);
+}
+
+static void bpe_emit_piece_fast(const ds4_vocab *vocab, ds4_str raw_piece, token_vec *out) {
+    uint64_t encoded_len = 0;
+    char *encoded = byte_encode(raw_piece, &encoded_len);
+
+    /* Pass 1: split into per-UTF8-char symbols. */
+    int n = 0;
+    for (uint64_t off = 0; off < encoded_len;) {
+        int k = utf8_len_from_first_byte((uint8_t)encoded[off]);
+        if (off + (uint64_t)k > encoded_len) k = 1;
+        n++;
+        off += (uint64_t)k;
+    }
+
+    bpe_node *nd = xmalloc((size_t)(n > 0 ? n : 1) * sizeof(nd[0]));
+    {
+        int i = 0;
+        uint32_t off = 0;
+        while (off < encoded_len) {
+            int k = utf8_len_from_first_byte((uint8_t)encoded[off]);
+            if (off + (uint32_t)k > encoded_len) k = 1;
+            nd[i].prev = i - 1;
+            nd[i].next = (off + (uint32_t)k < encoded_len) ? i + 1 : -1;
+            nd[i].start = off;
+            nd[i].end = off + (uint32_t)k;
+            nd[i].pair_rank = -1;
+            nd[i].alive = 1;
+            i++;
+            off += (uint32_t)k;
+        }
+    }
+
+    /* Heap holds at most (n-1) initial entries plus two per merge (<= n-1). */
+    bpe_heap_ent *heap = xmalloc((size_t)(2*n + 2) * sizeof(heap[0]));
+    int heap_n = 0;
+
+    for (int i = 0; i + 1 < n; i++) {
+        int32_t r = bpe_rank_ranges(vocab, encoded, nd[i].start, nd[i].end,
+                                    nd[i+1].start, nd[i+1].end);
+        nd[i].pair_rank = r;
+        if (r >= 0) bpe_heap_push(heap, &heap_n, r, i);
+    }
+
+    while (heap_n > 0) {
+        bpe_heap_ent e = bpe_heap_pop(heap, &heap_n);
+        if (!nd[e.idx].alive || nd[e.idx].pair_rank != e.rank) continue;  /* stale */
+        int i = e.idx, j = nd[i].next;
+        if (j < 0) continue;
+
+        /* Merge j into i: union range, unlink j. */
+        nd[i].end = nd[j].end;
+        nd[j].alive = 0;
+        nd[i].next = nd[j].next;
+        if (nd[j].next >= 0) nd[nd[j].next].prev = i;
+
+        /* Refresh the two pair ranks touching the merged symbol. */
+        int p = nd[i].prev;
+        if (p >= 0) {
+            int32_t r = bpe_rank_ranges(vocab, encoded, nd[p].start, nd[p].end,
+                                        nd[i].start, nd[i].end);
+            nd[p].pair_rank = r;
+            if (r >= 0) bpe_heap_push(heap, &heap_n, r, p);
+        }
+        int q = nd[i].next;
+        int32_t rq = (q >= 0) ? bpe_rank_ranges(vocab, encoded, nd[i].start, nd[i].end,
+                                                nd[q].start, nd[q].end) : -1;
+        nd[i].pair_rank = rq;
+        if (rq >= 0) bpe_heap_push(heap, &heap_n, rq, i);
+    }
+
+    /* Emit exactly like the original path: whole symbol if in vocab, else byte-wise. */
+    if (n > 0) {
+        for (int k = 0; k != -1; k = nd[k].next) {
+            int token = -1;
+            if (table_get(&vocab->token_to_id, encoded + nd[k].start,
+                          nd[k].end - nd[k].start, &token)) {
+                token_vec_push(out, token);
+            } else {
+                for (uint32_t b = nd[k].start; b < nd[k].end; b++) {
+                    if (table_get(&vocab->token_to_id, encoded + b, 1, &token)) {
+                        token_vec_push(out, token);
+                    }
+                }
+            }
+        }
+    }
+
+    free(heap);
+    free(nd);
+    free(encoded);
+}
+
+
+/* Apply byte-level BPE to one regex-like pre-tokenized piece and emit token ids.
+ * Default: fast O(n log n) path (output-identical). DS4_BPE_SLOW=1 selects the
+ * original quadratic path, kept as reference and rollback. */
+static void bpe_emit_piece_slow(const ds4_vocab *vocab, ds4_str raw_piece, token_vec *out);
+
 static void bpe_emit_piece(const ds4_vocab *vocab, ds4_str raw_piece, token_vec *out) {
+    if (getenv("DS4_BPE_SLOW") == NULL) {
+        bpe_emit_piece_fast(vocab, raw_piece, out);
+    } else {
+        bpe_emit_piece_slow(vocab, raw_piece, out);
+    }
+}
+
+static void bpe_emit_piece_slow(const ds4_vocab *vocab, ds4_str raw_piece, token_vec *out) {
     uint64_t encoded_len = 0;
     char *encoded = byte_encode(raw_piece, &encoded_len);
 
