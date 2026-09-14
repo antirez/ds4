@@ -71,7 +71,7 @@ endif
 .PHONY: all help clean test test-rocm test-glm53-kda-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
-.PHONY: metal-decode-schedule-bench metal-prefill-variant-bench check-mxfp4-half-lut
+.PHONY: metal-decode-schedule-bench metal-prefill-variant-bench check-mxfp4-half-lut test-indexer-topk
 .PHONY: test-metal-moe-prefill test-metal-dense-mpp
 
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -83,6 +83,7 @@ help:
 	@echo "  make test         Build and run tests"
 	@echo "  make metal-decode-schedule-bench  Build the balanced Metal decode schedule benchmark"
 	@echo "  make metal-prefill-variant-bench  Build the balanced Metal prefill variant benchmark"
+	@echo "  make test-indexer-topk  Compare canonical and streaming indexer top-k"
 	@echo "  make check-mxfp4-half-lut  Verify the checked-in MXFP4 half LUT matches the generator"
 	@echo "  make test-mxfp4-metal  Check the MXFP4 half LUT, then run Metal MXFP4 exactness tests"
 	@echo "  make dspark-verify-depth  Run DSpark speculative verification smoke if support GGUF is present"
@@ -140,6 +141,15 @@ speed-bench/metal_prefill_variant_bench: speed-bench/metal_prefill_variant_bench
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
 metal-prefill-variant-bench: speed-bench/metal_prefill_variant_bench
+
+tests/test_topk_ab.o: tests/test_topk_ab.c ds4_gpu.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -c -o $@ $<
+
+tests/test_topk_ab: tests/test_topk_ab.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+test-indexer-topk: tests/test_topk_ab
+	./tests/test_topk_ab
 
 tests/test_mxfp4_metal.o: tests/test_mxfp4_metal.c ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
@@ -932,6 +942,7 @@ ds4_cpu_test_hooks.o ds4_cuda_test_hooks.o tests/test_session_state.o \
 tests/test_session_state_gpu.o: ds4_tool_text.h
 
 clean:
+	rm -f tests/test_topk_ab
 	rm -f tests/test_metal_ssd_experts
 	rm -f tests/test_metal_command_memory
 	rm -f tests/test_deepseek41_metal
