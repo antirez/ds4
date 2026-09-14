@@ -274,6 +274,11 @@ struct cuda_stream_cache_layer_stats {
 };
 
 static std::vector<cuda_model_range> g_model_ranges;
+/* File spans the engine mlocked because kernels read them straight from
+ * the model mapping. Post-upload page discards must skip them:
+ * fadvise/madvise DONTNEED evicts even mlocked file pages, and the GPU
+ * cannot fault them back in. */
+static std::vector<std::pair<uint64_t, uint64_t>> g_locked_source_spans;
 static std::vector<cuda_model_arena> g_model_arenas;
 static std::vector<cuda_model_image> g_model_images;
 static std::unordered_map<uint64_t, size_t> g_model_range_by_offset;
@@ -4796,8 +4801,21 @@ static const ds4_rocm_runtime_config *cuda_runtime_config(void) {
              cuda_env_present(q8_prequant_env));
         g_rocm_cfg.disable_splitk_attn_out_low = !g_quality_mode;
         g_rocm_cfg.disable_shared_gate_up_fused_w32 = !g_quality_mode;
-        g_rocm_cfg.attention_output_cublas_all = !g_quality_mode;
-        g_rocm_cfg.shared_down_cublas = !g_quality_mode;
+        /* Explicit =0 rollbacks so small speculative-verify batches can be
+         * A/B tested against the Q8 kernels (the f16 copies double the
+         * weight bytes read per matmul). */
+        const char *attn_out_cublas_env =
+            getenv("DS4_ROCM_ATTN_OUTPUT_CUBLAS");
+        g_rocm_cfg.attention_output_cublas_all =
+            !g_quality_mode &&
+            (attn_out_cublas_env == NULL ||
+             cuda_env_present(attn_out_cublas_env));
+        const char *shared_down_cublas_env =
+            getenv("DS4_ROCM_SHARED_DOWN_CUBLAS");
+        g_rocm_cfg.shared_down_cublas =
+            !g_quality_mode &&
+            (shared_down_cublas_env == NULL ||
+             cuda_env_present(shared_down_cublas_env));
         const char *glm_grouped_value_project_env =
             getenv("DS4_ROCM_GLM_GROUPED_VALUE_PROJECT");
         /*
@@ -5324,9 +5342,27 @@ static uint64_t cuda_model_copy_chunk_bytes(void) {
     return 64ull * 1048576ull;
 }
 
+static int cuda_model_span_is_locked(uint64_t offset, uint64_t bytes) {
+    if (bytes == 0) return 1;
+    const uint64_t end = offset + bytes;
+    if (end < offset) return 0;
+    for (const auto &ls : g_locked_source_spans) {
+        const uint64_t l0 = ls.first;
+        const uint64_t l1 = ls.first + ls.second;
+        if (l1 > l0 && offset < l1 && l0 < end) return 1;
+    }
+    return 0;
+}
+
+extern "C" void ds4_gpu_add_locked_source_span(uint64_t offset, uint64_t bytes) {
+    if (bytes == 0) return;
+    g_locked_source_spans.push_back({offset, bytes});
+}
+
 static void cuda_model_discard_source_pages(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes) {
 #if defined(POSIX_MADV_DONTNEED)
     if (!model_map || bytes == 0 || offset > model_size) return;
+    if (cuda_model_span_is_locked(offset, bytes)) return;
     if (bytes > model_size - offset) bytes = model_size - offset;
     const long page_sz_l = sysconf(_SC_PAGESIZE);
     const uint64_t page_sz = page_sz_l > 0 ? (uint64_t)page_sz_l : 4096u;
@@ -5346,6 +5382,7 @@ static void cuda_model_discard_source_pages(const void *model_map, uint64_t mode
 static void cuda_model_drop_file_pages(uint64_t offset, uint64_t bytes) {
 #if defined(POSIX_FADV_DONTNEED)
     if (g_model_fd < 0 || bytes == 0) return;
+    if (cuda_model_span_is_locked(offset, bytes)) return;
     (void)posix_fadvise(g_model_fd, (off_t)offset, (off_t)bytes, POSIX_FADV_DONTNEED);
 #else
     (void)offset;
@@ -5795,6 +5832,7 @@ static void cuda_model_range_release_ranges_only(void) {
     }
     g_model_arenas.clear();
     g_model_ranges.clear();
+    g_locked_source_spans.clear();
     g_model_range_by_offset.clear();
     g_model_range_bytes = 0;
     g_model_cache_full = 0;
@@ -5969,6 +6007,36 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes) {
     return t;
 }
 
+extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_shared(uint64_t bytes) {
+    if (bytes == 0) bytes = 1;
+    ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
+    if (!t) return NULL;
+    /* Host-mapped pinned memory: kernels reach it through the device alias
+     * (identical to the host pointer on coherent APUs) and the CPU reaches
+     * it directly — exactly what the TP transport slab and the gate service
+     * thread need.  It can also be registered with IB verbs for RDMA. */
+    void *host = NULL;
+    if (!cuda_ok(cudaHostAlloc(&host, (size_t)bytes, cudaHostAllocMapped),
+                 "shared tensor alloc")) {
+        free(t);
+        return NULL;
+    }
+    void *dev = host;
+    if (cudaHostGetDevicePointer(&dev, host, 0) != cudaSuccess) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "shared tensor device alias failed: %s\n",
+                cudaGetErrorString(cudaGetLastError()));
+        cudaFreeHost(host);
+        free(t);
+        return NULL;
+    }
+    memset(host, 0, (size_t)bytes);
+    t->ptr = dev;
+    t->host_alias = host;
+    t->bytes = bytes;
+    t->owner = 1;
+    return t;
+}
+
 static uint64_t cuda_managed_kv_reserve_bytes(uint64_t total_bytes) {
     const uint64_t min_reserve = 8ull * 1073741824ull;
     const uint64_t max_reserve = 40ull * 1073741824ull;
@@ -6017,7 +6085,10 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint6
 
 extern "C" void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor) {
     if (!tensor) return;
-    if (tensor->owner && tensor->ptr) (void)cudaFree(tensor->ptr);
+    if (tensor->owner && tensor->ptr) {
+        if (tensor->host_alias) (void)cudaFreeHost(tensor->host_alias);
+        else (void)cudaFree(tensor->ptr);
+    }
     free(tensor);
 }
 
@@ -6028,7 +6099,7 @@ extern "C" uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor) {
 extern "C" void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor) {
     if (!tensor) return NULL;
     (void)cudaDeviceSynchronize();
-    return tensor->ptr;
+    return tensor->host_alias ? tensor->host_alias : tensor->ptr;
 }
 
 extern "C" int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count) {

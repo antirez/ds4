@@ -126,6 +126,19 @@ static void cuda_launch_q8_batch_sharedx_bt(
     }
 }
 
+/* Verify-sized batches (2..8 tokens) skip the shared-x tile kernel: its
+ * per-chunk block barriers dominate at these sizes while x fits L2, so the
+ * direct kernel streams weights barrier-free.  DS4_ROCM_BATCH_DIRECT=0
+ * restores the tile kernel for A/B runs. */
+static bool cuda_q8_batch_direct_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_ROCM_BATCH_DIRECT");
+        cached = (env == NULL || env[0] != '0') ? 1 : 0;
+    }
+    return cached != 0;
+}
+
 static void cuda_launch_q8_batch_sharedx(
         float *out,
         const unsigned char *w,
@@ -137,6 +150,20 @@ static void cuda_launch_q8_batch_sharedx(
         uint32_t rows_per_block,
         uint32_t tile,
         uint32_t block_tile) {
+    if (n_tok >= 2u && n_tok <= 8u && cuda_q8_batch_direct_enabled()) {
+        const uint32_t direct_rows = 8u;
+        const dim3 dgrid((out_dim + direct_rows - 1u) / direct_rows, 1u, 1u);
+        const uint32_t dthreads = direct_rows * 32u;
+        switch (n_tok) {
+        case 2u: matmul_q8_0_f32_batch_direct_warp_rows_w32_kernel<2u><<<dgrid, dthreads>>>(out, w, x, n_blocks, out_dim, row_bytes); return;
+        case 3u: matmul_q8_0_f32_batch_direct_warp_rows_w32_kernel<3u><<<dgrid, dthreads>>>(out, w, x, n_blocks, out_dim, row_bytes); return;
+        case 4u: matmul_q8_0_f32_batch_direct_warp_rows_w32_kernel<4u><<<dgrid, dthreads>>>(out, w, x, n_blocks, out_dim, row_bytes); return;
+        case 5u: matmul_q8_0_f32_batch_direct_warp_rows_w32_kernel<5u><<<dgrid, dthreads>>>(out, w, x, n_blocks, out_dim, row_bytes); return;
+        case 6u: matmul_q8_0_f32_batch_direct_warp_rows_w32_kernel<6u><<<dgrid, dthreads>>>(out, w, x, n_blocks, out_dim, row_bytes); return;
+        case 7u: matmul_q8_0_f32_batch_direct_warp_rows_w32_kernel<7u><<<dgrid, dthreads>>>(out, w, x, n_blocks, out_dim, row_bytes); return;
+        default: matmul_q8_0_f32_batch_direct_warp_rows_w32_kernel<8u><<<dgrid, dthreads>>>(out, w, x, n_blocks, out_dim, row_bytes); return;
+        }
+    }
     const dim3 grid((out_dim + rows_per_block - 1u) / rows_per_block,
                     (n_tok + tile - 1u) / tile,
                     1u);
@@ -699,6 +726,84 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                                            in_dim, out_dim, n_tok, blocks,
                                            use_dp4a);
     return cuda_ok(cudaGetLastError(), "matmul_q8_0 launch");
+}
+
+/* Up to three Q8_0 matrices that share one input (the GLM KDA q/k/v
+ * projections): quantize the input once and cover all rows with a single
+ * launch, each block finding its matrix from the row prefix sums.  Saves
+ * two quantize and two matvec launches per KDA layer. */
+typedef struct {
+    const unsigned char *w[3];
+    float *out[3];
+    uint32_t rows[3];
+    uint32_t n;
+} ds4_rocm_q8_multi;
+
+__global__ static void matmul_q8_0_preq_multi_w32_kernel(
+        ds4_rocm_q8_multi m,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t blocks,
+        uint32_t rows_per_block) {
+    uint32_t row = blockIdx.x * rows_per_block + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    uint32_t seg = 0;
+    while (seg < m.n && row >= m.rows[seg]) {
+        row -= m.rows[seg];
+        seg++;
+    }
+    if (seg >= m.n) return;
+    const unsigned char *wr = m.w[seg] + (uint64_t)row * blocks * 34u;
+    float acc = 0.0f;
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        const unsigned char *blk = wr + b * 34u;
+        const int dot = dot_i8x32_dp4a((const int8_t *)(blk + 2u), xq + b * 32u);
+        acc += __half2float(*(const __half *)blk) * xscale[b] * (float)dot;
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0u) m.out[seg][row] = acc;
+}
+
+extern "C" int ds4_gpu_matmul_q8_0_multi_tensor(
+        ds4_gpu_tensor *const *outs,
+        const uint64_t *weight_offsets,
+        uint32_t n,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        const ds4_gpu_tensor *x) {
+    if (!outs || !weight_offsets || !x || !model_map || n == 0u || n > 3u ||
+        in_dim == 0u || (in_dim & 31u) != 0u || out_dim == 0u || out_dim > UINT32_MAX ||
+        x->bytes < in_dim * sizeof(float)) return 0;
+    const uint64_t blocks = in_dim / 32u;
+    const uint64_t weight_bytes = out_dim * blocks * 34u;
+    ds4_rocm_q8_multi m;
+    memset(&m, 0, sizeof(m));
+    for (uint32_t i = 0; i < n; i++) {
+        if (!outs[i] || outs[i]->bytes < out_dim * sizeof(float) ||
+            weight_offsets[i] > model_size || weight_bytes > model_size - weight_offsets[i]) return 0;
+        m.w[i] = (const unsigned char *)cuda_model_range_ptr(model_map, weight_offsets[i],
+                                                             weight_bytes, "q8_0 multi");
+        if (!m.w[i]) return 0;
+        m.out[i] = (float *)outs[i]->ptr;
+        m.rows[i] = (uint32_t)out_dim;
+    }
+    m.n = n;
+    const uint64_t xq_bytes = blocks * 32u;
+    const uint64_t scale_off = (xq_bytes + 15u) & ~15ull;
+    void *tmp = cuda_tmp_alloc(scale_off + blocks * sizeof(float), "q8_0 multi prequant");
+    if (!tmp) return 0;
+    int8_t *xq = (int8_t *)tmp;
+    float *xscale = (float *)((char *)tmp + scale_off);
+    quantize_q8_0_f32_kernel<<<(unsigned)blocks, 32>>>(xq, xscale, (const float *)x->ptr,
+                                                        in_dim, blocks);
+    if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 multi quantize launch")) return 0;
+    const uint32_t rpb = cuda_runtime_config()->q8_decode_rpb;
+    const uint64_t total = (uint64_t)n * out_dim;
+    matmul_q8_0_preq_multi_w32_kernel<<<(unsigned)((total + rpb - 1u) / rpb), rpb * 32u>>>(
+            m, xq, xscale, blocks, rpb);
+    return cuda_ok(cudaGetLastError(), "matmul_q8_0 multi launch");
 }
 
 extern "C" int ds4_gpu_matmul_q8_0_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {

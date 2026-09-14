@@ -11406,6 +11406,15 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
                                   uint8_t *loaded_ext_flags_out,
                                   bool responses_protocol) {
     if (!s || !slot) return 0;
+    /* Tensor parallelism mirrors to the worker only the tokens the leader
+     * actually evaluates.  A disk-cache restore short-circuits the
+     * leader's prefill without mirroring it, so the ranks would run
+     * different prefill graphs (leader: restored suffix only; worker:
+     * full transcript) and the per-layer gate sequences diverge.  Skip
+     * restores on the TP leader until the worker can restore its own KV
+     * shard from disk; the leader then re-prefills the full transcript
+     * and mirrors it exactly. */
+    if (slot->session && ds4_session_tp_leader(slot->session)) return 0;
     if (loaded_path_out) *loaded_path_out = NULL;
     if (loaded_ext_flags_out) *loaded_ext_flags_out = 0;
     ds4_kvstore_load_result lr = {0};
@@ -13789,9 +13798,20 @@ decode_again:
         int toks[17];
         int ntok = 0;
         const int block_start = ds4_session_pos(slot->session);
-        if (!s->batched_mode &&
+        const bool can_mtp_spec =
+            (!s->batched_mode || s->slot_count <= 1) &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
-            getenv("DS4_MTP_SPEC_DISABLE") == NULL)
+            getenv("DS4_MTP_SPEC_DISABLE") == NULL;
+        if (getenv("DS4_MTP_SPEC_LOG")) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: mtp spec gate batched=%d slots=%d temp=%.3f drafts=%d -> %s",
+                       s->batched_mode ? 1 : 0,
+                       s->slot_count,
+                       temperature,
+                       ds4_engine_mtp_draft_tokens(s->engine),
+                       can_mtp_spec ? "run" : "skip");
+        }
+        if (can_mtp_spec)
         {
             if (j->req.ignore_eos) {
                 ntok = ds4_session_eval_speculative_argmax_ignoring_eos(
@@ -15553,11 +15573,6 @@ static server_config parse_options(int argc, char **argv) {
         server_log(DS4_LOG_DEFAULT, "ds4-server: %s", tp_err);
         exit(2);
     }
-    if (c.engine.tp.role == DS4_TP_WORKER) {
-        server_log(DS4_LOG_DEFAULT,
-                   "ds4-server: --role worker is a serving mode; start tensor-parallel workers with ./ds4");
-        exit(2);
-    }
     return c;
 }
 
@@ -15639,6 +15654,11 @@ int main(int argc, char **argv) {
         return rc;
     }
 
+    if (cfg.engine.tp.role == DS4_TP_WORKER) {
+        int rc = ds4_tp_worker_run(engine, &cfg.engine.tp);
+        ds4_engine_close(engine);
+        return rc;
+    }
     ds4_tp *tp_leader = NULL;
     if (cfg.engine.tp.role == DS4_TP_LEADER) {
         char tp_err[256] = "";

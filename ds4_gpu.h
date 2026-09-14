@@ -46,6 +46,9 @@ void ds4_gpu_cleanup(void);
 
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes);
+/* Transport-shared allocation: memory both GPU kernels and the CPU can
+ * access directly (TP gate slab).  Metal: identical to tensor_alloc. */
+ds4_gpu_tensor *ds4_gpu_tensor_alloc_shared(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes);
 void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor);
 uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor);
@@ -238,6 +241,9 @@ int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t contex
 void ds4_gpu_set_quality(bool quality);
 void ds4_gpu_set_glm_model(bool enabled);
 void ds4_gpu_set_ssd_streaming(bool enabled);
+/* Register an mlocked model-file span whose source pages must survive
+ * the post-upload DONTNEED discards (GPU cannot fault file pages). */
+void ds4_gpu_add_locked_source_span(uint64_t offset, uint64_t bytes);
 void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled);
 #ifdef __APPLE__
 int ds4_gpu_device_is_pre_m5_apple_silicon(void);
@@ -500,6 +506,30 @@ int ds4_gpu_indexer_score_one_tensor(
         uint32_t                head_dim,
         float                   scale);
 
+/* KV-split indexer: rank-scoped scoring (dense local output) plus the
+ * candidate-list pack and merge around the split gate. */
+int ds4_gpu_indexer_score_one_split_tensor(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *index_comp,
+        uint32_t                n_comp,
+        uint32_t                ratio,
+        float                   scale,
+        uint32_t                rank);
+int ds4_gpu_indexer_topk_split_pack_tensor(
+        ds4_gpu_tensor       *payload,
+        const ds4_gpu_tensor *local_selected,
+        const ds4_gpu_tensor *scores,
+        uint32_t                local_n,
+        uint32_t                top_k,
+        uint32_t                rank);
+int ds4_gpu_indexer_topk_split_merge_tensor(
+        ds4_gpu_tensor       *selected,
+        const ds4_gpu_tensor *local_payload,
+        const ds4_gpu_tensor *peer_payload,
+        uint32_t                top_k);
+
 int ds4_gpu_indexer_scores_prefill_tensor(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,
@@ -608,6 +638,18 @@ int ds4_gpu_qwen4_matmul_q8_0_tensor(
 #else
 #define ds4_gpu_qwen4_matmul_q8_0_tensor ds4_gpu_matmul_q8_0_tensor
 #endif
+
+/* Up to three Q8_0 matrices sharing one input: one activation quantization,
+ * one launch (ROCm GLM KDA q/k/v). */
+int ds4_gpu_matmul_q8_0_multi_tensor(
+        ds4_gpu_tensor *const *outs,
+        const uint64_t *weight_offsets,
+        uint32_t n,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        const ds4_gpu_tensor *x);
 
 int ds4_gpu_matmul_q8_0_decode_mpp_tensor(
         ds4_gpu_tensor       *out,
@@ -3054,6 +3096,18 @@ int ds4_gpu_glm53_matmul_bf16(
         const ds4_gpu_tensor *x,
         uint32_t              n_rows);
 
+/* Up to three small BF16 projections of one input in a single launch (ROCm
+ * GLM KDA f_a/g_a/beta). */
+int ds4_gpu_glm53_matvec_bf16_multi(
+        ds4_gpu_tensor *const *outs,
+        const uint64_t *weight_offsets,
+        const uint32_t *out_dims,
+        uint32_t n,
+        const void *model_map,
+        uint64_t model_size,
+        uint32_t in_dim,
+        const ds4_gpu_tensor *x);
+
 int ds4_gpu_glm53_matmul_bf16_qkv(
         ds4_gpu_tensor       *out_q,
         ds4_gpu_tensor       *out_k,
@@ -3199,6 +3253,49 @@ int ds4_gpu_glm53_kda_decode(
         uint32_t              n_rows,
         float                 gate_lower_bound,
         float                 norm_eps);
+
+/* ROCm: the KDA decode step for heads [head0, head0 + n_heads) of a model
+ * with n_heads_total heads.  q/k/v, the gates and out are compact over the
+ * local heads; the conv/recurrent states and the per-channel weights span
+ * every head (GLM tensor-parallel head split). */
+int ds4_gpu_glm53_kda_decode_heads(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *conv_state,
+        ds4_gpu_tensor       *recurrent_state,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        const ds4_gpu_tensor *raw_gate,
+        const ds4_gpu_tensor *raw_beta,
+        const ds4_gpu_tensor *output_gate,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              q_conv_offset,
+        uint64_t              k_conv_offset,
+        uint64_t              v_conv_offset,
+        uint64_t              a_log_offset,
+        uint64_t              dt_bias_offset,
+        uint64_t              output_norm_offset,
+        uint32_t              n_heads,
+        uint32_t              n_rows,
+        float                 gate_lower_bound,
+        float                 norm_eps,
+        uint32_t              head0,
+        uint32_t              n_heads_total);
+
+/* ROCm: BF16 matvec/GEMM over columns [k_off, k_off + k_cnt) of a
+ * [out_dim][full_in_dim] matrix; x holds the k_cnt slice compactly. */
+int ds4_gpu_glm53_matmul_bf16_kslice(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              full_in_dim,
+        uint32_t              k_off,
+        uint32_t              k_cnt,
+        uint32_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_rows);
 
 int ds4_gpu_glm53_kda_prefill(
         ds4_gpu_tensor       *out,

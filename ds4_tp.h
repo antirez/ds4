@@ -30,6 +30,15 @@ enum {
     DS4_TP_GATE_ATTN = 0,
     DS4_TP_GATE_FFN = 1,
     DS4_TP_GATES_PER_LAYER = 2,
+    /* KV-split gate kinds (DS4_TP_KV_SPLIT): exchanged on the dedicated
+     * split channel, not the row-gate schedule. */
+    DS4_TP_SPLIT_GATE_INDEXER = 0,
+    DS4_TP_SPLIT_GATE_ATTN_SCORES = 1,
+    DS4_TP_SPLIT_GATES_PER_LAYER = 2,
+    /* Bytes reserved per split-gate slot: the attention score partials are
+     * 32 heads x 256 rows in fp16 (16 KiB); the indexer merge carries 512
+     * (id, fp32 score) candidates (4 KiB). */
+    DS4_TP_SPLIT_SLOT_BYTES = 16384,
     /* Max rows in a verify-block batch gate (speculative blocks are <=5). */
     DS4_TP_BATCH_MAX_ROWS = 8,
 };
@@ -103,6 +112,7 @@ void ds4_tp_free(ds4_tp *tp);
 
 int ds4_tp_rank(const ds4_tp *tp);
 bool ds4_tp_is_rdma(const ds4_tp *tp);
+bool ds4_tp_is_odl(const ds4_tp *tp);
 uint32_t ds4_tp_peer_ctx(const ds4_tp *tp);
 bool ds4_tp_failed(const ds4_tp *tp);
 void ds4_tp_mark_failed(ds4_tp *tp);
@@ -124,7 +134,11 @@ uint64_t ds4_tp_slab_out_offset(const ds4_tp *tp, uint32_t layer, uint32_t gate)
 uint64_t ds4_tp_slab_in_offset(const ds4_tp *tp, uint32_t layer, uint32_t gate);
 uint64_t ds4_tp_slab_batch_out_offset(const ds4_tp *tp, uint32_t layer);
 uint64_t ds4_tp_slab_batch_in_offset(const ds4_tp *tp, uint32_t layer);
+uint64_t ds4_tp_slab_split_out_offset(const ds4_tp *tp, uint32_t layer, uint32_t kind);
+uint64_t ds4_tp_slab_split_in_offset(const ds4_tp *tp, uint32_t layer, uint32_t kind);
 uint64_t ds4_tp_slab_gpu_flags_offset(const ds4_tp *tp);
+/* Offset of the per-slot u64 in-flags words (backend release protocol). */
+uint64_t ds4_tp_slab_in_flags_offset(const ds4_tp *tp);
 int ds4_tp_attach_slab(ds4_tp *tp, void *base, char *err, size_t errlen);
 /* Stop the data plane before freeing its registered buffers. No more gates
  * may be issued; free the transport after the engine has been unbound. */
@@ -150,6 +164,12 @@ int ds4_tp_batch_block_end(ds4_tp *tp);
 int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
                              const void *out, void *in, uint64_t bytes);
 
+/* KV-split gate: small fixed-slot payload exchange (indexer candidates,
+ * attention score partials) on the dedicated split channel.  Both ranks
+ * derive (layer, kind, bytes) from seq through the lockstep order. */
+int ds4_tp_split_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t kind,
+                               uint64_t seq, uint64_t bytes);
+
 /* Lockstep mirroring (leader side) and worker loop primitives. */
 typedef struct {
     uint64_t session_id;
@@ -169,6 +189,9 @@ int ds4_tp_send_eval(ds4_tp *tp, uint64_t session_id,
                      uint64_t seq, int token);
 int ds4_tp_send_glm_mtp(ds4_tp *tp, uint64_t session_id,
                        uint64_t seq, int token, int limit);
+/* GLM KDA head split: ask the worker to re-gather the peer halves of a
+ * session's KDA state together with the leader (acked). */
+int ds4_tp_send_glm_kda_sync(ds4_tp *tp, uint64_t session_id);
 int ds4_tp_send_rewind(ds4_tp *tp, uint64_t session_id, int pos);
 int ds4_tp_send_invalidate(ds4_tp *tp, uint64_t session_id);
 int ds4_tp_send_eval_batch(ds4_tp *tp, const ds4_tp_batch_item *items,
@@ -180,6 +203,27 @@ int ds4_tp_send_mixed_batch(ds4_tp *tp, uint64_t prefill_session_id,
 int ds4_tp_send_command_ack(ds4_tp *tp, uint64_t session_id, int status);
 int ds4_tp_wait_command_ack(ds4_tp *tp, uint64_t session_id,
                             const char *operation, char *err, size_t errlen);
+/* Status-aware variant: returns 1 when a well-formed ack for session_id
+ * arrived and copies its status out (the worker forwards
+ * DS4_SESSION_SYNC_INTERRUPTED for a lockstep-cancelled sync), 0 on
+ * transport failure or session mismatch.  timeout_sec 0 waits forever,
+ * negative uses the pair timeout; on expiry the pair is poisoned. */
+int ds4_tp_wait_command_ack_status(ds4_tp *tp, uint64_t session_id,
+                                   const char *operation, double timeout_sec,
+                                   int *status, char *err, size_t errlen);
+/* Mirrored-sync lockstep barrier.  Prefill can only stop at the cooperative
+ * cancellation checks inside ds4_session_sync(); the leader publishes its
+ * verdict (go or stop) at every check and the worker blocks until it
+ * arrives, so a cancelled sync leaves both ranks at the same chunk boundary
+ * with identical live prefixes instead of stranding the worker inside gate
+ * exchanges the leader no longer serves.  Rides the control socket, which
+ * is otherwise idle during a mirrored sync. */
+int ds4_tp_send_sync_go(ds4_tp *tp, int stop);
+int ds4_tp_recv_sync_go(ds4_tp *tp, int *stop);
+/* Hard-failure poison: mark the pair failed and shut both sockets down so a
+ * peer blocked in a gate or ack read unblocks with an error instead of
+ * waiting forever. */
+void ds4_tp_poison(ds4_tp *tp);
 int ds4_tp_wait_command_status(ds4_tp *tp, uint64_t session_id, int *status,
                                const char *operation, char *err, size_t errlen);
 /* Both ranks call at matching prefill boundaries. Cancellation is agreed
@@ -214,7 +258,10 @@ typedef enum {
     DS4_TP_FRAME_RDMA_WARM = 19,
     DS4_TP_FRAME_RDMA_POSTED = 20,
     DS4_TP_FRAME_GLM_MTP = 21,
-    DS4_TP_FRAME_SYNC_CHECKPOINT = 22,
+    DS4_TP_FRAME_SYNC_GO = 22,       /* fork: mirrored-sync barrier sequence */
+    DS4_TP_FRAME_SYNC_CHECKPOINT = 23, /* upstream: prefill-boundary checkpoint */
+    DS4_TP_FRAME_ODL_READY = 24,     /* fork: OdinLink data-plane barrier (0 bytes) */
+    DS4_TP_FRAME_GLM_KDA_SYNC = 25,  /* fork: re-gather the head-split KDA state (session_id) */
 } ds4_tp_frame_type;
 
 typedef struct {
