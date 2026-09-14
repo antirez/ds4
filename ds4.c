@@ -72182,7 +72182,7 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
     e->tp.active = true;
     ds4_log(stderr, DS4_LOG_OK,
             "tensor parallelism bound: rank %d, 50/50 expert split, %s transport",
-            e->tp.rank, ds4_tp_is_rdma(tp) ? "rdma" : "tcp");
+            e->tp.rank, ds4_tp_is_odl(tp) ? "odl" : ds4_tp_is_rdma(tp) ? "rdma" : "tcp");
     return 1;
 fail:
     ds4_engine_tp_unbind(e);

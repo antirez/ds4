@@ -111,6 +111,7 @@ typedef enum {
     DS4_TP_TRANSPORT_AUTO = 0,
     DS4_TP_TRANSPORT_RDMA,
     DS4_TP_TRANSPORT_TCP,
+    DS4_TP_TRANSPORT_ODL,
 } ds4_tp_transport;
 
 typedef struct {
