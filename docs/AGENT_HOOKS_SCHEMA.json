@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ds4-agent hook event",
+  "type": "object",
+  "required": ["event", "pid", "response_index", "generated_tokens", "interrupted", "tool_call"],
+  "properties": {
+    "event": {"enum": ["before_response", "after_response"]},
+    "pid": {"type": "integer", "minimum": 1},
+    "model": {"type": ["string", "null"]},
+    "user_text": {"type": ["string", "null"]},
+    "response_text": {"type": ["string", "null"]},
+    "response_index": {"type": "integer", "minimum": 0},
+    "generated_tokens": {"type": "integer", "minimum": 0},
+    "interrupted": {"type": "boolean"},
+    "tool_call": {"type": "boolean"},
+    "user_text_truncated": {"type": "boolean"},
+    "response_text_truncated": {"type": "boolean"}
+  },
+  "additionalProperties": false
+}
