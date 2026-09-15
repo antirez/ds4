@@ -69,7 +69,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-rocm test-glm53-kda-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test test-kv-restart-restore test-rocm test-glm53-kda-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
 .PHONY: metal-decode-schedule-bench metal-prefill-variant-bench check-mxfp4-half-lut
@@ -82,6 +82,7 @@ help:
 	@echo "  make              Build Metal ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
 	@echo "  make cpu          Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
 	@echo "  make test         Build and run tests"
+	@echo "  make test-kv-restart-restore  Restart/restore KV disk checkpoint smoke (needs DS4_TEST_MODEL)"
 	@echo "  make metal-decode-schedule-bench  Build the balanced Metal decode schedule benchmark"
 	@echo "  make metal-prefill-variant-bench  Build the balanced Metal prefill variant benchmark"
 	@echo "  make check-mxfp4-half-lut  Verify the checked-in MXFP4 half LUT matches the generator"
@@ -972,6 +973,12 @@ dspark-acceptance: ds4
 	DS4_DSPARK_MODEL="$(DS4_DSPARK_MODEL)" \
 	DS4_DSPARK_SUPPORT="$(DS4_DSPARK_SUPPORT)" \
 	sh tests/dspark_acceptance_fixture.sh
+
+# Issue #1053: warm-started tool conversation must be restored from the
+# shutdown KV checkpoint after a restart.  Skips when the model is missing.
+test-kv-restart-restore: ds4-server
+	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" DS4_SERVER_BIN=./ds4-server \
+	sh tests/kv_restart_restore_smoke.sh
 
 dspark-verify-depth: ds4_test
 	@if [ ! -f "$(DS4_TEST_MODEL)" ]; then \
