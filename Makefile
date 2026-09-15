@@ -166,6 +166,19 @@ tests/test_metal_moe_prefill: tests/test_metal_moe_prefill.o $(CORE_OBJS)
 test-metal-moe-prefill: tests/test_metal_moe_prefill
 	./tests/test_metal_moe_prefill
 
+tests/test_metal_slab_residency: tests/test_metal_slab_residency.m ds4_metal.m ds4_gpu.h ds4_image.o $(METAL_SRCS)
+	$(CC) $(OBJCFLAGS) -I. -o $@ $< ds4_image.o $(METAL_LDLIBS)
+
+.PHONY: test-metal-slab-residency
+test-metal-slab-residency: tests/test_metal_slab_residency
+	MTL_DEBUG_LAYER=1 ./tests/test_metal_slab_residency
+
+speed-bench/metal_slab_residency_bench: speed-bench/metal_slab_residency_bench.m
+	$(CC) $(OBJCFLAGS) -o $@ $< $(METAL_LDLIBS)
+
+.PHONY: metal-slab-residency-bench
+metal-slab-residency-bench: speed-bench/metal_slab_residency_bench
+
 tests/test_qwen4_moe_mm_specialize.o: tests/test_qwen4_moe_mm_specialize.c ds4_gpu.h
 	$(CC) $(CFLAGS) -fno-fast-math -I. -c -o $@ $<
 
@@ -1023,6 +1036,7 @@ clean:
 	rm -f tests/test_web_recovery
 	rm -f tests/test_metal_ssd_experts
 	rm -f tests/test_metal_command_memory
+	rm -f tests/test_metal_slab_residency speed-bench/metal_slab_residency_bench
 	rm -f tests/test_deepseek41_metal
 	rm -f tests/test_deepseek41_cuda
 	rm -f tests/test_cuda_q8_rows

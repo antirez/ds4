@@ -28,6 +28,8 @@
 /tests/test_metal_tp_spec
 /tests/test_metal_tp_cancel
 /tests/test_metal_moe_prefill
+/tests/test_metal_slab_residency
+/speed-bench/metal_slab_residency_bench
 /tests/test_metal_ssd_experts
 /tests/test_metal_command_memory
 /tests/test_metal_dense_mpp

@@ -1,0 +1,5 @@
+run,variant,ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,gen_first_ms,gen_steady_tokens,gen_steady_tps,kvcache_bytes
+bench-0-control,control,2048,2048,72.13,8,0.24,4289.607,7,0.24,0
+bench-1-candidate,candidate,2048,2048,67.99,8,9.35,333.096,7,13.41,0
+bench-2-candidate,candidate,2048,2048,67.81,8,9.27,336.455,7,13.31,0
+bench-3-control,control,2048,2048,61.97,8,0.24,4037.232,7,0.24,0
