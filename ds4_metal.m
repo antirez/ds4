@@ -36092,12 +36092,31 @@ static int ds4_gpu_glm_indexer_scores_batch_grouped_tensor(
             return 0;
         }
 
-        const bool force_scalar = g_quality_mode;
+        /* DS4_METAL_V41_INDEX_SCALAR=1 keeps every decode-sized call on the
+         * scalar kernel (the tiled one sums in a different order). */
+        static int scalar_env = -1;
+        if (scalar_env < 0) scalar_env = getenv("DS4_METAL_V41_INDEX_SCALAR") != NULL;
+        const bool force_scalar = g_quality_mode || (scalar_env && n_tokens < 8u);
         const bool use_tiled_f32 = tiled_f32;
-        const bool use_tiled = !force_scalar && n_tokens >= 8u &&
+        /* The scalar kernel runs one 32-thread threadgroup per (row, token)
+         * and re-reads the token's whole q per row: at 125k tokens of V4.1
+         * context that is 6 ms per call, 49 ms per decode step, and it grows
+         * with the context. The tiled kernel pads a decode's few tokens to
+         * its 8-token tile and is ~100x cheaper on a long context, so it
+         * takes any wide enough row range, not only the prefill's batches. */
+        const bool use_tiled = !force_scalar && (n_tokens >= 8u || n_rows >= 1024u) &&
                                n_head == 32u && head_dim == 128u;
+        /* A decode step over a long context: the token's q sits in
+         * threadgroup memory and each simdgroup streams its rows of the key
+         * cache once, instead of one threadgroup per row re-reading q. */
+        const bool use_decode = use_tiled && use_tiled_f32 && n_tokens <= 8u &&
+                                !getenv("DS4_METAL_DISABLE_V41_INDEX_DECODE");
         id<MTLComputePipelineState> pipeline =
-            use_tiled
+            use_decode
+                ? ds4_gpu_get_pipeline(getenv("DS4_METAL_V41_INDEX_DECODE_ROWS") ?
+                                       "kernel_dsv41_indexer_scores_decode_rows" :
+                                       "kernel_dsv41_indexer_scores_decode")
+                : use_tiled
                 ? ds4_gpu_hot_pipeline(use_tiled_f32 ? g_glm_indexer_scores_tiled_f32_pipeline
                                                      : g_glm_indexer_scores_tiled_pipeline,
                                        use_tiled_f32 ? "kernel_glm_indexer_scores_tiled_f32"
@@ -36134,7 +36153,31 @@ static int ds4_gpu_glm_indexer_scores_batch_grouped_tensor(
         [enc setBuffer:weightsbuf offset:ds4_gpu_tensor_offset(weights) atIndex:2];
         [enc setBuffer:cachebuf offset:ds4_gpu_tensor_offset(indexer_key_cache) atIndex:3];
         [enc setBuffer:scoresbuf offset:ds4_gpu_tensor_offset(scores) atIndex:4];
-        if (use_tiled) {
+        if (use_decode) {
+            /* One dispatch per token; 8 simdgroups per threadgroup, each
+             * streaming rows_per_sg rows, sized so ~2k threadgroups cover
+             * the context. */
+            uint32_t rows_per_sg = (n_rows + 8191u) / 8192u;
+            rows_per_sg = (rows_per_sg + 7u) & ~7u;
+            if (rows_per_sg < 8u) rows_per_sg = 8u;
+            const NSUInteger groups = ((NSUInteger)n_rows + (NSUInteger)rows_per_sg * 8u - 1u) /
+                                      ((NSUInteger)rows_per_sg * 8u);
+            [enc setThreadgroupMemoryLength:(32u * 128u + 32u + 8u * 256u) * sizeof(float) atIndex:0];
+            for (uint32_t t = 0; t < n_tokens; t++) {
+                const struct {
+                    uint32_t n_rows, token, pos0, row_group_size, rows_per_sg, n_head;
+                    uint64_t q_token_stride, weights_token_stride, score_token_stride;
+                    float scale;
+                } dargs = {
+                    n_rows, t, pos0, row_group_size, rows_per_sg, n_head,
+                    args.q_token_stride, args.weights_token_stride, args.score_token_stride,
+                    scale,
+                };
+                [enc setBytes:&dargs length:sizeof(dargs) atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+                     threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
+            }
+        } else if (use_tiled) {
             const NSUInteger q_shared = 8u * 128u;
             const NSUInteger k_shared = 32u * 128u;
             const NSUInteger dot_shared = 8u * 32u;
@@ -36159,6 +36202,60 @@ static int ds4_gpu_glm_indexer_scores_batch_grouped_tensor(
         ds4_gpu_end_compute_encoder(cb, enc);
 
         if (!ds4_gpu_finish_command_buffer(cb, owned, "GLM indexer batch scores")) return 0;
+
+        /* DS4_METAL_V41_INDEX_CHECK: rerun the scalar kernel and report the
+         * largest disagreement, to validate the decode kernel's numerics. */
+        if (use_decode && getenv("DS4_METAL_V41_INDEX_CHECK") != NULL) {
+            static int checks;
+            if (checks < 8) {
+                checks++;
+                if (!ds4_gpu_end_commands()) return 0;
+                float *mine = malloc(score_bytes);
+                ds4_gpu_tensor *ref = ds4_gpu_tensor_alloc(score_bytes);
+                if (mine && ref && ds4_gpu_tensor_read(scores, 0, mine, score_bytes)) {
+                    id<MTLComputePipelineState> scalar =
+                        ds4_gpu_hot_pipeline(g_glm_indexer_scores_batch_pipeline,
+                                             "kernel_glm_indexer_scores_batch");
+                    if (scalar && ds4_gpu_begin_commands()) {
+                        int o2 = 0;
+                        id<MTLCommandBuffer> cb2 = ds4_gpu_command_buffer(&o2);
+                        id<MTLComputeCommandEncoder> e2 = ds4_gpu_compute_encoder(cb2);
+                        [e2 setComputePipelineState:scalar];
+                        [e2 setBytes:&args length:sizeof(args) atIndex:0];
+                        [e2 setBuffer:qbuf offset:ds4_gpu_tensor_offset(q) atIndex:1];
+                        [e2 setBuffer:weightsbuf offset:ds4_gpu_tensor_offset(weights) atIndex:2];
+                        [e2 setBuffer:cachebuf offset:ds4_gpu_tensor_offset(indexer_key_cache) atIndex:3];
+                        [e2 setBuffer:ds4_gpu_tensor_buffer(ref) offset:0 atIndex:4];
+                        [e2 setThreadgroupMemoryLength:nth * sizeof(float) atIndex:0];
+                        [e2 dispatchThreadgroups:MTLSizeMake((NSUInteger)n_rows, (NSUInteger)n_tokens, 1)
+                             threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+                        ds4_gpu_end_compute_encoder(cb2, e2);
+                        (void)ds4_gpu_finish_command_buffer(cb2, o2, "index check");
+                        if (ds4_gpu_end_commands()) {
+                            float *theirs = malloc(score_bytes);
+                            if (theirs && ds4_gpu_tensor_read(ref, 0, theirs, score_bytes)) {
+                                double worst = 0.0, worst_ref = 0.0; uint64_t worst_i = 0, ninf_mismatch = 0;
+                                const uint64_t n = (uint64_t)n_rows * n_tokens;
+                                for (uint64_t i = 0; i < n; i++) {
+                                    const float a = mine[i], b = theirs[i];
+                                    if (isinf(a) != isinf(b)) { ninf_mismatch++; continue; }
+                                    if (isinf(a)) continue;
+                                    const double d = fabs((double)a - (double)b);
+                                    if (d > worst) { worst = d; worst_ref = b; worst_i = i; }
+                                }
+                                fprintf(stderr, "ds4: index check rows=%u tokens=%u worst |diff|=%.3e at %llu (ref %.5f) inf-mismatch=%llu\n",
+                                        n_rows, n_tokens, worst, (unsigned long long)worst_i, worst_ref,
+                                        (unsigned long long)ninf_mismatch);
+                            }
+                            free(theirs);
+                        }
+                        (void)ds4_gpu_begin_commands();
+                    }
+                }
+                free(mine);
+                ds4_gpu_tensor_free(ref);
+            }
+        }
     }
 
     return 1;

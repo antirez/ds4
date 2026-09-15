@@ -40633,6 +40633,13 @@ static bool ds41_attention_publish(ds41_gpu_graph *g, const ds4_model *m,
     return true;
 }
 
+/* DS4_METAL_V41_INDEX_SCALAR=1 keeps the one-row indexer kernel for decode. */
+static bool ds41_index_scalar(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_METAL_V41_INDEX_SCALAR") != NULL;
+    return v != 0;
+}
+
 static bool ds41_attention_candidates(ds41_gpu_graph *g, uint32_t il) {
     const uint32_t pos = g->pos, ratio = ds4_layer_compress_ratio(il);
     const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
@@ -40667,8 +40674,14 @@ static bool ds41_attention_select_published(ds41_gpu_graph *g, const ds4_model *
             !ds4_gpu_dsv41_quantize(g->index_q, 128, DS4_N_INDEXER_HEAD, DS4_V41_FP4_E8M0) ||
             !ds41_matmul(g->index_weights, m, l->indexer_proj, g->norm, true) ||
 #ifdef __APPLE__
-            !ds4_gpu_glm_indexer_score_one_tensor(g->index_scores, g->index_q, g->index_weights,
-                g->index_cache[owner], n_comp, DS4_N_INDEXER_HEAD, 128, 1.0f / 64.0f, false)) return false;
+            /* The one-row kernel re-reads q per compressed row (16 KiB each):
+             * past a few thousand rows the tiled batch kernel, padded to one
+             * token, reads the cache once and is far cheaper. */
+            !(n_comp >= 1024u && !ds41_index_scalar() ?
+              ds4_gpu_dsv41_indexer_scores_batch(g->index_scores, g->index_q, g->index_weights,
+                g->index_cache[owner], n_comp, 1, pos, ratio) :
+              ds4_gpu_glm_indexer_score_one_tensor(g->index_scores, g->index_q, g->index_weights,
+                g->index_cache[owner], n_comp, DS4_N_INDEXER_HEAD, 128, 1.0f / 64.0f, false))) return false;
 #else
             !ds4_gpu_dsv41_indexer_scores_batch(g->index_scores, g->index_q, g->index_weights,
                 g->index_cache[owner], n_comp, 1, pos, ratio)) return false;
