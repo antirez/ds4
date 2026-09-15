@@ -53,6 +53,12 @@ static volatile sig_atomic_t g_listen_fd = -1;
 #define DS4_SERVER_MAYBE_UNUSED
 #endif
 
+/*
+ * Forward declaration for early request-parsing diagnostics.
+ * ds4_log_type is provided by the DS4 headers included above.
+ */
+static void server_log(ds4_log_type type, const char *fmt, ...);
+
 static void stop_signal_handler(int sig) {
     (void)sig;
     if (g_stop_requested) _exit(130);
@@ -791,9 +797,14 @@ static void stop_list_clear(stop_list *stops);
 static bool id_list_contains(const stop_list *ids, const char *id);
 static void id_list_push_unique(stop_list *ids, const char *id);
 static void id_list_free(stop_list *ids);
+static void normalize_openai_visible_assistant_reasoning(chat_msgs *msgs);
 static bool responses_live_has_call_id(server *s, const char *id);
 static bool anthropic_live_has_call_id(server *s, const char *id);
 static stop_list live_tool_call_order(server *s, api_style api, const stop_list *ids);
+
+#define OPENAI_COMPACT_DEPTH_MAX 8
+
+
 
 typedef struct {
     req_kind kind;
@@ -808,6 +819,46 @@ typedef struct {
     stop_list stops;
     char *raw_body;
     char *prompt_text;
+
+    /*
+     * OpenAI / Chatbox client-visible replay surface.
+     *
+     * The real model prompt stays in prompt_text.  This alternate rendering is
+     * used only to identify a previously sampled live KV frontier when clients
+     * serialize semantically identical tool results differently on later turns.
+     */
+    char *openai_visible_prompt_text;
+
+    /*
+     * Chatbox merged-assistant replay key.
+     *
+     * Chatbox may flatten:
+     *
+     *   assistant(content=A, tool_calls)
+     *   tool(result)
+     *   assistant(content=B)
+     *
+     * into:
+     *
+     *   assistant(content=A+B)
+     *
+     * on later history replay.  This alternate text is used only for
+     * identifying an existing live KV frontier; it never replaces prompt_text.
+     */
+    char *openai_merged_visible_prompt_text;
+
+    /*
+     * Chatbox partial merged-assistant replay keys.
+     *
+     * depth N means: flatten only the oldest N completed OpenAI tool
+     * history chains into Chatbox-style assistant-visible messages.
+     *
+     * These are cache-identification candidates only. They never replace
+     * prompt_text and never alter model inference.
+     */
+    char *openai_merged_depth_prompt_text[OPENAI_COMPACT_DEPTH_MAX];
+    int openai_merged_depth_count;
+
     tool_schema_orders tool_orders;
     int max_tokens;
     int top_k;
@@ -855,6 +906,11 @@ typedef struct {
     bool anthropic_requires_live_tool_state;
     stop_list anthropic_live_call_ids;
     char *anthropic_live_suffix_text;
+
+    /* OpenAI /v1/chat/completions live tool-result continuation. */
+    stop_list openai_live_call_ids;
+    char *openai_live_suffix_text;
+
     tool_replay_stats tool_replay;
 } request;
 
@@ -1019,12 +1075,21 @@ static void request_free(request *r) {
     free(r->stops.v);
     free(r->raw_body);
     free(r->prompt_text);
+    free(r->openai_visible_prompt_text);
+    free(r->openai_merged_visible_prompt_text);
+    for (int i = 0; i < OPENAI_COMPACT_DEPTH_MAX; i++) {
+        free(r->openai_merged_depth_prompt_text[i]);
+        r->openai_merged_depth_prompt_text[i] = NULL;
+    }
     stop_list_clear(&r->responses_live_call_ids);
     free(r->responses_live_call_ids.v);
     free(r->responses_live_suffix_text);
     stop_list_clear(&r->anthropic_live_call_ids);
     free(r->anthropic_live_call_ids.v);
     free(r->anthropic_live_suffix_text);
+    stop_list_clear(&r->openai_live_call_ids);
+    free(r->openai_live_call_ids.v);
+    free(r->openai_live_suffix_text);
     tool_schema_orders_free(&r->tool_orders);
     memset(r, 0, sizeof(*r));
 }
@@ -3063,6 +3128,542 @@ static void append_tool_calls_text_for_syntax(buf *b,
     }
 }
 
+
+/* -------------------------------------------------------------------------
+ * OpenAI / Chatbox code_execution visible-result canonicalization.
+ *
+ * Chatbox can use two wire representations for the same code_execution
+ * result:
+ *
+ *     Exit code: 0
+ *
+ *     Stdout:
+ *     hello
+ *
+ * and, when replaying history:
+ *
+ *     {"stdout":"hello\n","stderr":"","exitCode":0}
+ *
+ * Those strings are not byte-identical even though they describe the same
+ * tool observation.  The sampled model KV must not be rewritten merely to
+ * accommodate this client-side serialization change.
+ *
+ * Convert the structured JSON form into the text form used by the live tool
+ * continuation.  This helper is intentionally conservative: if the value is
+ * not exactly the small code_execution result object we recognize, return an
+ * unchanged copy.
+ * ------------------------------------------------------------------------- */
+
+static const json_arg *json_args_find_const(const json_args *args,
+                                            const char *key) {
+    if (!args || !key) return NULL;
+    for (int i = 0; i < args->len; i++) {
+        if (args->v[i].key && !strcmp(args->v[i].key, key))
+            return &args->v[i];
+    }
+    return NULL;
+}
+
+static char *canonicalize_code_execution_result_text(const char *src) {
+    if (!src) return xstrdup("");
+
+    json_args args = {0};
+    if (!json_args_parse(src, &args))
+        return xstrdup(src);
+
+    const json_arg *stdout_arg = json_args_find_const(&args, "stdout");
+    const json_arg *stderr_arg = json_args_find_const(&args, "stderr");
+    const json_arg *exit_arg   = json_args_find_const(&args, "exitCode");
+
+    /*
+     * Fail closed.  Do not reinterpret arbitrary JSON tool output as a code
+     * execution result merely because one familiar member happens to exist.
+     */
+    if (args.len != 3 ||
+        !stdout_arg || !stderr_arg || !exit_arg ||
+        !stdout_arg->is_string || !stderr_arg->is_string ||
+        exit_arg->is_string)
+    {
+        json_args_free(&args);
+        return xstrdup(src);
+    }
+
+    char *end = NULL;
+    errno = 0;
+    long exit_code = strtol(exit_arg->value ? exit_arg->value : "", &end, 10);
+    if (errno || !end || *end) {
+        json_args_free(&args);
+        return xstrdup(src);
+    }
+
+    buf out = {0};
+    buf_printf(&out, "Exit code: %ld", exit_code);
+
+    const char *stdout_text = stdout_arg->value ? stdout_arg->value : "";
+    const char *stderr_text = stderr_arg->value ? stderr_arg->value : "";
+
+    if (stdout_text[0]) {
+        buf_puts(&out, "\n\nStdout:\n");
+        /*
+         * Preserve stdout exactly as decoded from the tool-result JSON.
+         *
+         * Chatbox's immediate post-tool transcript keeps the terminal newline
+         * produced by console.log(), e.g.
+         *
+         *   Exit code: 0
+         *
+         *   Stdout:
+         *   121932631112635260\n
+         *
+         * The same tool result may later be replayed as JSON.  Removing that
+         * final newline makes the visible-cache key differ by one byte and
+         * defeats thinking_live continuation.
+         */
+        buf_puts(&out, stdout_text);
+    }
+
+    if (stderr_text[0]) {
+        buf_puts(&out, "\n\nStderr:\n");
+        /*
+         * stderr follows the same rule as stdout: preserve the tool payload
+         * byte-for-byte so later JSON replay canonicalizes to the same visible
+         * transcript that was remembered immediately after tool execution.
+         */
+        buf_puts(&out, stderr_text);
+    }
+
+    json_args_free(&args);
+    return buf_take(&out);
+}
+
+/*
+ * Canonicalize only role=tool/function messages whose call id resolves to a
+ * code_execution assistant call in the same OpenAI transcript.
+ *
+ * The caller gives us a private copy of chat_msgs.  Mutating content here
+ * therefore affects only the visible-cache key, never the model prompt.
+ */
+static void normalize_openai_code_execution_tool_results(chat_msgs *msgs) {
+    if (!msgs || msgs->len == 0) return;
+
+    rax *tool_names = raxNew();
+
+    for (int i = 0; i < msgs->len; i++) {
+        chat_msg *m = &msgs->v[i];
+
+        if (!strcmp(m->role, "assistant")) {
+            for (int k = 0; k < m->calls.len; k++) {
+                const tool_call *tc = &m->calls.v[k];
+                if (!tc->id || !tc->id[0] || !tc->name)
+                    continue;
+
+                if (!strcmp(tc->name, "code_execution")) {
+                    raxInsert(tool_names,
+                              (unsigned char *)tc->id,
+                              strlen(tc->id),
+                              (void *)1,
+                              NULL);
+                }
+            }
+            continue;
+        }
+
+        if (strcmp(m->role, "tool") && strcmp(m->role, "function"))
+            continue;
+
+        bool is_code_execution = false;
+
+        if (m->tool_call_id && m->tool_call_id[0]) {
+            void *v = raxFind(tool_names,
+                              (unsigned char *)m->tool_call_id,
+                              strlen(m->tool_call_id));
+            is_code_execution = v != raxNotFound;
+        }
+
+        for (int k = 0;
+             !is_code_execution && k < m->tool_call_ids_len;
+             k++)
+        {
+            const char *id = m->tool_call_ids[k];
+            if (!id || !id[0]) continue;
+
+            void *v = raxFind(tool_names,
+                              (unsigned char *)id,
+                              strlen(id));
+            is_code_execution = v != raxNotFound;
+        }
+
+        if (!is_code_execution)
+            continue;
+
+        char *canonical =
+            canonicalize_code_execution_result_text(m->content);
+
+        if (canonical) {
+            free(m->content);
+            m->content = canonical;
+        }
+    }
+
+    raxFree(tool_names);
+}
+
+
+
+/* -------------------------------------------------------------------------
+ * OpenAI / Chatbox semantic tool-history compaction.
+ *
+ * Chatbox may later replay a completed tool round as only the final visible
+ * assistant message:
+ *
+ *     assistant(tool_calls)
+ *     tool
+ *     assistant(final)
+ *
+ * becomes:
+ *
+ *     assistant(final)
+ *
+ * A request that is currently immediately after tool output has no final
+ * assistant message in `msgs` yet:
+ *
+ *     assistant(tool_calls)
+ *     tool
+ *     [model is now generating assistant(final)]
+ *
+ * For the alternate checkpoint rendering, drop that trailing tool exchange.
+ * The preceding user message then naturally renders the pending
+ * <Assistant><think> prefix, to which remember_thinking_checkpoint() appends
+ * the newly generated final content.
+ *
+ * This code only builds an alternate visible-cache key.  It does not mutate
+ * the real request prompt or authorize cache reuse.
+ * ------------------------------------------------------------------------- */
+
+static bool openai_compact_call_id_in_calls(const tool_calls *calls,
+                                            const char *id) {
+    if (!calls || !id || !id[0]) return false;
+
+    for (int i = 0; i < calls->len; i++) {
+        if (calls->v[i].id &&
+            !strcmp(calls->v[i].id, id))
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool openai_compact_tool_msg_matches_calls(const chat_msg *m,
+                                                  const tool_calls *calls) {
+    if (!m || !calls || calls->len == 0) return false;
+
+    if (strcmp(m->role ? m->role : "", "tool") &&
+        strcmp(m->role ? m->role : "", "function"))
+    {
+        return false;
+    }
+
+    bool saw_id = false;
+
+    if (m->tool_call_id && m->tool_call_id[0]) {
+        saw_id = true;
+
+        if (!openai_compact_call_id_in_calls(calls,
+                                             m->tool_call_id))
+        {
+            return false;
+        }
+    }
+
+    for (int i = 0; i < m->tool_call_ids_len; i++) {
+        const char *id = m->tool_call_ids[i];
+
+        if (!id || !id[0])
+            continue;
+
+        saw_id = true;
+
+        if (!openai_compact_call_id_in_calls(calls, id))
+            return false;
+    }
+
+    /*
+     * Fail closed.  A bare role=tool message with no binding is not sufficient
+     * evidence that this is the tool round we are trying to compact.
+     */
+    return saw_id;
+}
+
+static void openai_compact_clone_chat_msg(chat_msg *dst,
+                                          const chat_msg *src) {
+    memset(dst, 0, sizeof(*dst));
+
+    dst->role = xstrdup(src && src->role ? src->role : "");
+    dst->content = xstrdup(src && src->content ? src->content : "");
+
+    if (src && src->reasoning)
+        dst->reasoning = xstrdup(src->reasoning);
+
+    if (src && src->tool_call_id)
+        dst->tool_call_id = xstrdup(src->tool_call_id);
+
+    if (src) {
+        for (int i = 0; i < src->tool_call_ids_len; i++) {
+            const char *id = src->tool_call_ids[i];
+            if (id && id[0])
+                chat_msg_add_tool_call_id(dst, id);
+        }
+
+        for (int i = 0; i < src->calls.len; i++) {
+            const tool_call *in = &src->calls.v[i];
+            tool_call out = {0};
+
+            if (in->id) out.id = xstrdup(in->id);
+            if (in->name) out.name = xstrdup(in->name);
+            if (in->arguments) out.arguments = xstrdup(in->arguments);
+
+            tool_calls_push(&dst->calls, out);
+        }
+
+        if (src->calls.raw_tool_text)
+            dst->calls.raw_tool_text =
+                xstrdup(src->calls.raw_tool_text);
+    }
+}
+
+static void openai_compact_push_clone(chat_msgs *dst,
+                                      const chat_msg *src) {
+    chat_msg copy = {0};
+    openai_compact_clone_chat_msg(&copy, src);
+    chat_msgs_push(dst, copy);
+}
+
+/*
+ * Build a compact semantic copy.
+ *
+ * Returns the number of tool chains removed/collapsed.
+ *
+ * This recognizes one or more consecutive:
+ *
+ *     assistant(calls) -> tool result(s)
+ *
+ * rounds.  If they terminate in assistant(final), only that final assistant
+ * is copied.  If they terminate at end-of-request, the entire trailing tool
+ * chain is omitted because the current model generation will become the final
+ * assistant message.
+ */
+
+/*
+ * Build the Chatbox-style flattened visible history.
+ *
+ * A completed tool sequence such as:
+ *
+ *   assistant(content=A, calls)
+ *   tool(...)
+ *   assistant(content=B)
+ *
+ * is represented by Chatbox on later replay as:
+ *
+ *   assistant(content=A+B)
+ *
+ * Multiple immediately chained tool rounds are merged the same way:
+ *
+ *   assistant(A, call)
+ *   tool
+ *   assistant(B, call)
+ *   tool
+ *   assistant(C)
+ *
+ * becomes assistant(A+B+C).
+ *
+ * Alternate visible-cache key only.  The real model prompt is never modified.
+ *
+ * Returns the number of tool rounds flattened.
+ */
+static int build_openai_merged_tool_history_messages_limit(
+        const chat_msgs *src,
+        chat_msgs *dst,
+        int merge_limit) {
+    if (!src || !dst) return 0;
+
+    int merged_rounds = 0;
+    int i = 0;
+
+    while (i < src->len) {
+        /*
+         * Once the requested oldest-N boundary has been reached, preserve the
+         * remaining transcript at message-structure level.
+         */
+        if (merge_limit > 0 && merged_rounds >= merge_limit) {
+            while (i < src->len) {
+                openai_compact_push_clone(dst, &src->v[i]);
+                i++;
+            }
+            break;
+        }
+
+        const chat_msg *start = &src->v[i];
+
+        if (!start->role ||
+            strcmp(start->role, "assistant") ||
+            start->calls.len == 0)
+        {
+            openai_compact_push_clone(dst, start);
+            i++;
+            continue;
+        }
+
+        buf merged_content = {0};
+        buf_puts(&merged_content,
+                 start->content ? start->content : "");
+
+        int pos = i;
+        int rounds = 0;
+        bool valid = true;
+        bool completed = false;
+
+        for (;;) {
+            const chat_msg *call_msg = &src->v[pos];
+
+            if (!call_msg->role ||
+                strcmp(call_msg->role, "assistant") ||
+                call_msg->calls.len == 0)
+            {
+                valid = false;
+                break;
+            }
+
+            pos++;
+
+            int tool_count = 0;
+
+            while (pos < src->len) {
+                const chat_msg *tool_msg = &src->v[pos];
+                const char *role =
+                    tool_msg->role ? tool_msg->role : "";
+
+                if (strcmp(role, "tool") &&
+                    strcmp(role, "function"))
+                {
+                    break;
+                }
+
+                if (!openai_compact_tool_msg_matches_calls(
+                        tool_msg,
+                        &call_msg->calls))
+                {
+                    valid = false;
+                    break;
+                }
+
+                tool_count++;
+                pos++;
+            }
+
+            if (!valid || tool_count == 0) {
+                valid = false;
+                break;
+            }
+
+            if (pos >= src->len) {
+                valid = false;
+                break;
+            }
+
+            const chat_msg *next = &src->v[pos];
+
+            if (!next->role ||
+                strcmp(next->role, "assistant"))
+            {
+                valid = false;
+                break;
+            }
+
+            /*
+             * One completed flattening step consumes:
+             *
+             *   assistant(call) + tool result(s) + next assistant
+             *
+             * Preserve next->calls when the merge boundary stops here.  This
+             * is what lets depth=1 turn:
+             *
+             *   A(call1), tool1, B(call2), tool2, C
+             *
+             * into:
+             *
+             *   AB(call2), tool2, C
+             */
+            buf_puts(&merged_content,
+                     next->content ? next->content : "");
+
+            rounds++;
+
+            const bool hit_limit =
+                merge_limit > 0 &&
+                merged_rounds + rounds >= merge_limit;
+
+            if (next->calls.len == 0 || hit_limit) {
+                chat_msg merged = {0};
+
+                /*
+                 * Clone the NEXT assistant, not the first one.  At a partial
+                 * boundary its tool calls are still live and must remain bound
+                 * to the following tool result messages.
+                 */
+                openai_compact_clone_chat_msg(&merged, next);
+
+                free(merged.content);
+                merged.content = buf_take(&merged_content);
+
+                /*
+                 * This is a client-visible replay key. Historical hidden
+                 * reasoning is intentionally absent.
+                 */
+                free(merged.reasoning);
+                merged.reasoning = NULL;
+
+                chat_msgs_push(dst, merged);
+
+                pos++;
+                i = pos;
+                merged_rounds += rounds;
+                completed = true;
+                break;
+            }
+
+            /*
+             * next is another assistant tool-call turn.  Continue flattening
+             * the same chain; its content was already appended above.
+             */
+            /* pos already points at the next assistant call turn. */
+        }
+
+        if (!completed) {
+            buf_free(&merged_content);
+
+            /*
+             * Fail closed: malformed or ambiguous tool history is preserved
+             * unchanged rather than partially rewritten.
+             */
+            openai_compact_push_clone(dst, start);
+            i++;
+        }
+
+        (void)valid;
+    }
+
+    return merged_rounds;
+}
+
+static int build_openai_merged_tool_history_messages(
+        const chat_msgs *src,
+        chat_msgs *dst) {
+    return build_openai_merged_tool_history_messages_limit(
+        src, dst, 0);
+}
+
 static bool role_is_system(const char *role) {
     return !strcmp(role, "system") || !strcmp(role, "developer");
 }
@@ -3996,6 +4597,56 @@ static void responses_prepare_live_continuation(server *s, request *r,
         render_request_live_tool_tail(s, r, msgs, tail_start, &r->responses_live_call_ids);
 }
 
+
+/* Prepare an OpenAI /v1/chat/completions tool-result continuation candidate.
+ *
+ * Unlike Responses, Chat Completions normally replays the visible assistant
+ * tool-call message before the new role=tool message.  The sampled assistant
+ * call is already present in live KV, however, and may include hidden thinking
+ * plus exact sampled DSML that the visible replay cannot reproduce byte-for-
+ * byte.  When every trailing tool result refers to a tool call still known in
+ * tool memory, remember the IDs and render only the semantic tail.  The worker
+ * still has to verify the live frontier before using this candidate. */
+static void openai_prepare_live_continuation(request *r,
+                                             server *s,
+                                             const chat_msgs *msgs) {
+    if (!r || !s || r->api != API_OPENAI || !msgs || msgs->len == 0) return;
+
+    int tail_end = msgs->len;
+    while (tail_end > 0 && role_is_system(msgs->v[tail_end - 1].role)) tail_end--;
+
+    int tail_start = tail_end;
+    while (tail_start > 0) {
+        const chat_msg *m = &msgs->v[tail_start - 1];
+        if (strcmp(m->role, "tool") && strcmp(m->role, "function")) break;
+        tail_start--;
+    }
+    if (tail_start == tail_end) return;
+
+
+    stop_list_clear(&r->openai_live_call_ids);
+    for (int i = tail_start; i < tail_end; i++) {
+        stop_list ids = {0};
+        chat_msg_collect_tool_call_ids(&msgs->v[i], &ids);
+        for (int j = 0; j < ids.len; j++) {
+            if (!tool_memory_has_id(s, ids.v[j])) {
+                id_list_free(&ids);
+                stop_list_clear(&r->openai_live_call_ids);
+                return;
+            }
+            id_list_push_unique(&r->openai_live_call_ids, ids.v[j]);
+        }
+        id_list_free(&ids);
+    }
+
+    if (r->openai_live_call_ids.len == 0) return;
+
+
+    free(r->openai_live_suffix_text);
+    r->openai_live_suffix_text =
+        render_request_live_tool_tail(s, r, msgs, tail_start, &r->openai_live_call_ids);
+}
+
 static bool anthropic_msg_is_tool_result_tail(const chat_msg *m) {
     return m && !strcmp(m->role, "user") &&
            ((m->tool_call_id && m->tool_call_id[0]) ||
@@ -4268,9 +4919,22 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
+    /*
+     * OpenAI Chat Completions normally replays the sampled assistant tool-call
+     * message before appending role=tool output.  Prepare the live continuation
+     * candidate while chat_msgs and tool-call IDs are still available, so
+     * generate_job() can retain the exact sampled KV frontier and append only
+     * the new tool-result tail.
+     */
+    openai_prepare_live_continuation(r, s, &msgs);
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
+
+    /*
+     * Render the real model prompt first, before touching the alternate
+     * client-visible cache surface.
+     */
     r->prompt_text = render_chat_prompt_text_for_syntax(
         r->model_syntax, &msgs, active_tool_schemas,
         &r->tool_orders, r->think_mode);
@@ -4279,6 +4943,107 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
         free(tool_schemas);
         request_free(r);
         return false;
+    }
+
+    /*
+     * Chatbox may serialize code_execution results differently when it replays
+     * history.  Build a second prompt text used only for visible live-cache
+     * matching.  The actual inference prompt above is deliberately unchanged.
+     *
+     * normalize_openai_code_execution_tool_results() mutates msgs, but msgs is
+     * about to be freed and prompt_text has already been rendered/tokenized.
+     */
+    /* Qwen owns its reasoning-preserving replay surface and checkpoints.
+     * Do not apply DeepSeek/GLM Chatbox history aliases to that syntax. */
+    if (r->api == API_OPENAI && r->has_tools &&
+        r->model_syntax != SERVER_MODEL_SYNTAX_QWEN) {
+        normalize_openai_code_execution_tool_results(&msgs);
+        normalize_openai_visible_assistant_reasoning(&msgs);
+
+        r->openai_visible_prompt_text =
+            render_chat_prompt_text_for_syntax(
+                r->model_syntax, &msgs, active_tool_schemas,
+                &r->tool_orders, r->think_mode);
+
+        /*
+         * Build the fully merged Chatbox-visible replay key used to identify
+         * the same sampled live KV frontier after client history compaction.
+         */
+        chat_msgs merged_msgs = {0};
+
+        int merged_rounds =
+            build_openai_merged_tool_history_messages(
+                &msgs, &merged_msgs);
+
+        if (merged_rounds > 0) {
+            r->openai_merged_visible_prompt_text =
+                render_chat_prompt_text_for_syntax(
+                    r->model_syntax,
+                    &merged_msgs,
+                    active_tool_schemas,
+                    &r->tool_orders,
+                    r->think_mode);
+
+            server_log(
+                DS4_LOG_KVCACHE,
+                "ds4-server: merged assistant replay key built "
+                "rounds=%d normal=%zu merged=%zu",
+                merged_rounds,
+                r->openai_visible_prompt_text
+                    ? strlen(r->openai_visible_prompt_text) : 0,
+                r->openai_merged_visible_prompt_text
+                    ? strlen(r->openai_merged_visible_prompt_text) : 0
+            );
+        }
+
+        chat_msgs_free(&merged_msgs);
+
+        /*
+         * Build oldest-N merged replay keys.  depth=1 flattens only the
+         * oldest completed Chatbox-style tool-history chain; depth=2
+         * flattens the oldest two, and so on.  These alternate renderings
+         * identify an existing sampled live KV frontier; they never replace
+         * the authoritative inference prompt.
+         */
+        int merged_depth_max = merged_rounds;
+        if (merged_depth_max > OPENAI_COMPACT_DEPTH_MAX)
+            merged_depth_max = OPENAI_COMPACT_DEPTH_MAX;
+
+        for (int depth = 1; depth <= merged_depth_max; depth++) {
+            chat_msgs depth_msgs = {0};
+
+            int depth_merged =
+                build_openai_merged_tool_history_messages_limit(
+                    &msgs,
+                    &depth_msgs,
+                    depth);
+
+            if (depth_merged == depth) {
+                char *rendered =
+                    render_chat_prompt_text_for_syntax(
+                        r->model_syntax,
+                        &depth_msgs,
+                        active_tool_schemas,
+                        &r->tool_orders,
+                        r->think_mode);
+
+                r->openai_merged_depth_prompt_text[depth - 1] =
+                    rendered;
+
+                if (rendered)
+                    r->openai_merged_depth_count = depth;
+
+                server_log(
+                    DS4_LOG_KVCACHE,
+                    "ds4-server: merged depth replay key built "
+                    "depth=%d bytes=%zu",
+                    depth,
+                    rendered ? strlen(rendered) : 0
+                );
+            }
+
+            chat_msgs_free(&depth_msgs);
+        }
     }
     chat_msgs_free(&msgs);
     free(tool_schemas);
@@ -4495,6 +5260,7 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
     anthropic_prepare_live_continuation(s, r, &msgs);
+    openai_prepare_live_continuation(r, s, &msgs);
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
@@ -9995,6 +10761,22 @@ typedef struct {
     int live_tokens;
     char *visible_text;
     size_t visible_len;
+
+    /*
+     * Chatbox flattened assistant replay key.
+     */
+    char *merged_visible_text;
+    size_t merged_visible_len;
+    visible_image_key merged_images;
+
+    /*
+     * Chatbox oldest-N merged assistant replay keys.
+     */
+    char *merged_depth_text[OPENAI_COMPACT_DEPTH_MAX];
+    size_t merged_depth_len[OPENAI_COMPACT_DEPTH_MAX];
+    visible_image_key merged_depth_images[OPENAI_COMPACT_DEPTH_MAX];
+    int merged_depth_count;
+
     visible_image_key images;
     /* Keep exact disk replay for clients that preserve reasoning. Switch to
      * the visible key once a request actually continues without reasoning. */
@@ -10007,6 +10789,7 @@ struct server_slot {
     ds4_session *session;
     live_tool_state responses_live;
     live_tool_state anthropic_live;
+    live_tool_state openai_live;
     visible_live_state thinking_live;
     int continued_last_store_tokens;
 
@@ -10447,6 +11230,21 @@ static void visible_live_clear_locked(visible_live_state *st) {
     free(st->visible_text);
     st->visible_text = NULL;
     st->visible_len = 0;
+
+    free(st->merged_visible_text);
+    st->merged_visible_text = NULL;
+    st->merged_visible_len = 0;
+    memset(&st->merged_images, 0, sizeof(st->merged_images));
+
+    for (int i = 0; i < OPENAI_COMPACT_DEPTH_MAX; i++) {
+        free(st->merged_depth_text[i]);
+        st->merged_depth_text[i] = NULL;
+        st->merged_depth_len[i] = 0;
+        memset(&st->merged_depth_images[i], 0, sizeof(st->merged_depth_images[i]));
+    }
+    st->merged_depth_count = 0;
+
+
     memset(&st->images, 0, sizeof(st->images));
     st->live_tokens = 0;
     st->valid = false;
@@ -10472,6 +11270,7 @@ static void thinking_live_remember(server *s, server_slot *slot,
     visible_image_key images;
     char *key = visible_prompt_key(req, visible_text, &images);
     pthread_mutex_lock(&s->tool_mu);
+
     visible_live_clear_locked(&slot->thinking_live);
     slot->thinking_live.visible_text = key;
     slot->thinking_live.visible_len = key ? strlen(key) : 0;
@@ -10515,6 +11314,19 @@ static void anthropic_live_remember(server *s, server_slot *slot,
     pthread_mutex_unlock(&s->tool_mu);
 }
 
+static void openai_live_remember(server *s, server_slot *slot,
+                                 const tool_calls *calls) {
+    if (!s || !slot || !calls || calls->len == 0) return;
+    pthread_mutex_lock(&s->tool_mu);
+    live_tool_state_clear_locked(&slot->openai_live);
+    for (int i = 0; i < calls->len; i++) {
+        id_list_push_unique(&slot->openai_live.call_ids, calls->v[i].id);
+    }
+    slot->openai_live.live_tokens = ds4_session_pos(slot->session);
+    slot->openai_live.valid = slot->openai_live.call_ids.len > 0;
+    pthread_mutex_unlock(&s->tool_mu);
+}
+
 static void responses_live_clear(server *s, server_slot *slot) {
     if (!s || !slot) return;
     pthread_mutex_lock(&s->tool_mu);
@@ -10529,10 +11341,20 @@ static void anthropic_live_clear(server *s, server_slot *slot) {
     pthread_mutex_unlock(&s->tool_mu);
 }
 
+static void openai_live_clear(server *s, server_slot *slot);
+
 static void request_live_state_clear(server *s, server_slot *slot) {
     responses_live_clear(s, slot);
     anthropic_live_clear(s, slot);
+    openai_live_clear(s, slot);
     thinking_live_clear(s, slot);
+}
+
+static void openai_live_clear(server *s, server_slot *slot) {
+    if (!s || !slot) return;
+    pthread_mutex_lock(&s->tool_mu);
+    live_tool_state_clear_locked(&slot->openai_live);
+    pthread_mutex_unlock(&s->tool_mu);
 }
 
 static bool responses_live_has_call_id(server *s, const char *id) {
@@ -10561,11 +11383,13 @@ static bool anthropic_live_has_call_id(server *s, const char *id) {
 
 static stop_list live_tool_call_order(server *s, api_style api, const stop_list *ids) {
     stop_list order = {0};
-    if (!s || !ids || !ids->len || (api != API_RESPONSES && api != API_ANTHROPIC)) return order;
+    if (!s || !ids || !ids->len ||
+        (api != API_RESPONSES && api != API_ANTHROPIC && api != API_OPENAI)) return order;
     pthread_mutex_lock(&s->tool_mu);
     for (int i = 0; i < s->slot_count; i++) {
         const live_tool_state *live = api == API_RESPONSES ?
-            &s->slots[i].responses_live : &s->slots[i].anthropic_live;
+            &s->slots[i].responses_live : api == API_ANTHROPIC ?
+            &s->slots[i].anthropic_live : &s->slots[i].openai_live;
         if (!live->valid || live->call_ids.len != ids->len) continue;
         bool match = true;
         for (int j = 0; j < ids->len && match; j++)
@@ -10604,6 +11428,21 @@ static bool anthropic_live_matches_request(server *s, server_slot *slot,
               slot->anthropic_live.call_ids.len == ids->len;
     for (int i = 0; ok && i < ids->len; i++) {
         ok = id_list_contains(&slot->anthropic_live.call_ids, ids->v[i]);
+    }
+    pthread_mutex_unlock(&s->tool_mu);
+    return ok;
+}
+
+static bool openai_live_matches_request(server *s, server_slot *slot,
+                                        const stop_list *ids,
+                                        int live_tokens) {
+    if (!s || !slot || !ids || ids->len == 0) return false;
+    pthread_mutex_lock(&s->tool_mu);
+    bool ok = slot->openai_live.valid &&
+              slot->openai_live.live_tokens == live_tokens &&
+              slot->openai_live.call_ids.len == ids->len;
+    for (int i = 0; ok && i < ids->len; i++) {
+        ok = id_list_contains(&slot->openai_live.call_ids, ids->v[i]);
     }
     pthread_mutex_unlock(&s->tool_mu);
     return ok;
@@ -11574,6 +12413,35 @@ static int anthropic_live_continuation_prompt(server *s, server_slot *slot,
     return live_tokens->len;
 }
 
+/* OpenAI Chat Completions tool-result continuation.
+ *
+ * Chat Completions normally replays the visible assistant tool-call message.
+ * When its call IDs still bind exactly to the current sampled KV frontier,
+ * preserve that real frontier (including hidden reasoning / sampled DSML) and
+ * append only the semantic tool-result tail prepared by the parser.
+ */
+static int openai_live_continuation_prompt(server *s, server_slot *slot,
+                                           const request *req,
+                                           int live_pos,
+                                           ds4_tokens *effective_prompt,
+                                           int *matched_ids) {
+    if (!s || !slot || !req || !effective_prompt) return 0;
+    if (req->api != API_OPENAI || !req->openai_live_suffix_text) return 0;
+    if (req->openai_live_call_ids.len == 0) return 0;
+    if (!openai_live_matches_request(s, slot,
+                                     &req->openai_live_call_ids,
+                                     live_pos)) return 0;
+
+    const ds4_tokens *live_tokens = ds4_session_tokens(slot->session);
+    if (!live_tokens || live_tokens->len != live_pos) return 0;
+
+    if (!build_live_prompt_suffix(s, slot, req, req->openai_live_suffix_text,
+                                  effective_prompt)) return 0;
+
+    if (matched_ids) *matched_ids = req->openai_live_call_ids.len;
+    return live_tokens->len;
+}
+
 /* Visible-replay Responses continuation.
  *
  * Other clients send the full visible transcript on every turn even though the
@@ -11635,6 +12503,61 @@ static int responses_live_visible_prefix_prompt(server *s, server_slot *slot,
  * selects the checkpoint, while the payload stays the exact sampled token
  * frontier.  If the visible key does not match, callers fall back to ordinary
  * token/text/disk matching. */
+
+/*
+ * Tool-less thinking continuation across client-visible history replay.
+ *
+ * The sampled live KV may contain hidden reasoning and exact tool-call bytes
+ * that are absent from a later OpenAI-visible transcript.  Match the normal
+ * visible checkpoint first, then the Chatbox-style merged replay keys produced
+ * for compacted historical tool rounds.
+ *
+ * A successful byte-prefix match identifies the existing sampled KV frontier;
+ * only the newly replayed visible suffix is tokenized and appended.  If no
+ * candidate matches, callers fall back to ordinary prompt/cache handling.
+ */
+/* Called with tool_mu held. Each replay surface has its own image offsets:
+ * flattening earlier tool rounds can move a later image in the visible text. */
+static size_t thinking_live_prefix_match(const visible_live_state *state,
+                                          const request *req, const char *key,
+                                          const visible_image_key *images,
+                                          int live_pos, int *merged_depth) {
+    *merged_depth = 0;
+    if (!state->valid || state->live_tokens != live_pos) return 0;
+    const size_t len = strlen(key);
+    if (state->visible_text && state->visible_len < len &&
+        visible_image_prefix_matches(images, &state->images, state->visible_len) &&
+        byte_prefix_match(key, len, state->visible_text, state->visible_len))
+        return state->visible_len;
+    if (req->api != API_OPENAI) return 0;
+
+    int count = state->merged_depth_count;
+    if (count > OPENAI_COMPACT_DEPTH_MAX) count = OPENAI_COMPACT_DEPTH_MAX;
+    for (int i = 0; i < count; i++) {
+        size_t prefix_len = state->merged_depth_len[i];
+        if (state->merged_depth_text[i] && prefix_len && prefix_len < len &&
+            visible_image_prefix_matches(images, &state->merged_depth_images[i], prefix_len) &&
+            byte_prefix_match(key, len, state->merged_depth_text[i], prefix_len)) {
+            *merged_depth = i + 1;
+            return prefix_len;
+        }
+    }
+    if (state->merged_visible_text && state->merged_visible_len < len &&
+        visible_image_prefix_matches(images, &state->merged_images, state->merged_visible_len) &&
+        byte_prefix_match(key, len, state->merged_visible_text, state->merged_visible_len)) {
+        *merged_depth = -1;
+        return state->merged_visible_len;
+    }
+    return 0;
+}
+
+static const char *thinking_visible_prompt(const request *r) {
+    return r->api == API_OPENAI &&
+           r->model_syntax != SERVER_MODEL_SYNTAX_QWEN &&
+           r->openai_visible_prompt_text
+        ? r->openai_visible_prompt_text : r->prompt_text;
+}
+
 static int thinking_live_visible_prefix_prompt(server *s, server_slot *slot,
                                                const request *req,
                                                int live_pos,
@@ -11642,31 +12565,36 @@ static int thinking_live_visible_prefix_prompt(server *s, server_slot *slot,
     if (!s || !slot || !req || !req->prompt_text || !effective_prompt) return 0;
     if (req->kind != REQ_CHAT || req->api == API_RESPONSES) return 0;
 
+    const char *visible_prompt = thinking_visible_prompt(req);
     visible_image_key images;
-    char *key = visible_prompt_key(req, req->prompt_text, &images);
+    char *key = visible_prompt_key(req, visible_prompt, &images);
     if (!key) return 0;
-    const size_t prompt_len = strlen(key);
-    size_t visible_len = 0;
+    int merged_depth = 0;
     pthread_mutex_lock(&s->tool_mu);
-    bool ok = slot->thinking_live.valid &&
-              slot->thinking_live.live_tokens == live_pos &&
-              slot->thinking_live.visible_text &&
-              slot->thinking_live.visible_len < prompt_len &&
-              visible_image_prefix_matches(&images, &slot->thinking_live.images,
-                                             slot->thinking_live.visible_len) &&
-              byte_prefix_match(key, prompt_len,
-                                slot->thinking_live.visible_text,
-                                slot->thinking_live.visible_len);
-    if (ok) visible_len = slot->thinking_live.visible_len;
+    size_t visible_len = thinking_live_prefix_match(&slot->thinking_live, req,
+                                                    key, &images, live_pos,
+                                                    &merged_depth);
     pthread_mutex_unlock(&s->tool_mu);
     free(key);
-    if (!ok) return 0;
+    if (!visible_len) return 0;
 
     const ds4_tokens *live_tokens = ds4_session_tokens(slot->session);
     if (!live_tokens || live_tokens->len != live_pos) return 0;
 
-    if (!build_live_prompt_suffix(s, slot, req, req->prompt_text + visible_len,
+    /* Marker normalization preserves offsets within this visible surface.
+     * Never apply the matched offset to the differently rendered real prompt.
+     * The shared suffix builder verifies image identity and splices new image
+     * tokens while retaining the exact sampled frontier. */
+    if (!build_live_prompt_suffix(s, slot, req, visible_prompt + visible_len,
                                   effective_prompt)) return 0;
+    if (merged_depth) {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: thinking live continuation match=%s depth=%d "
+                   "cached=%d prompt=%d merged_bytes=%zu incoming_bytes=%zu",
+                   merged_depth > 0 ? "merged-depth" : "merged-assistant",
+                   merged_depth > 0 ? merged_depth : 0,
+                   live_pos, effective_prompt->len, visible_len, strlen(visible_prompt));
+    }
     return live_tokens->len;
 }
 
@@ -12529,11 +13457,21 @@ static bool should_remember_thinking_checkpoint(const request *r,
      * Actual tool calls have their own checkpoint path at the call site. */
     const bool qwen_chat = r->model_syntax == SERVER_MODEL_SYNTAX_QWEN &&
                            r->api != API_RESPONSES && r->api != API_ANTHROPIC;
-    if ((r->has_tools || r->prompt_preserves_reasoning) && !qwen_chat) return false;
+    if (r->model_syntax == SERVER_MODEL_SYNTAX_QWEN) {
+        if ((r->has_tools || r->prompt_preserves_reasoning) && !qwen_chat) return false;
+    } else if (r->prompt_preserves_reasoning && !r->has_tools) {
+        return false;
+    }
     if (!ds4_think_mode_enabled(r->think_mode)) return false;
     if (finish && (!strcmp(finish, "error") || !strcmp(finish, "length"))) return false;
     if (thinking && thinking->inside) return false;
     return true;
+}
+
+static bool thinking_checkpoint_uses_token_text_disk_key(
+        const request *r, bool visible_continuation) {
+    return r->model_syntax == SERVER_MODEL_SYNTAX_QWEN &&
+           r->prompt_preserves_reasoning && !visible_continuation;
 }
 
 static void log_tool_calls_summary(const char *ctx, const tool_calls *calls,
@@ -12757,6 +13695,48 @@ static char *build_responses_visible_assistant_suffix(const request *r,
  * Instead, remember the visible bytes as a key for the current sampled frontier.
  * The next request can then continue from live KV while tokenizing only the new
  * visible suffix. */
+/*
+ * Build the client-visible form of an already-rendered prompt prefix.
+ *
+ * OpenAI Chat Completions clients commonly do not replay reasoning_content
+ * from earlier assistant turns.  In tool-enabled history our renderer
+ * therefore represents those turns on the next request as:
+ *
+ *     <think></think>
+ *
+ * The live KV may still contain the original sampled hidden reasoning.  Keep
+ * that richer KV payload, but normalize completed historical thinking blocks
+ * in the visible checkpoint key so it matches what the client will replay.
+ *
+ * An unmatched/open final <think> is deliberately left untouched; the caller
+ * handles the current assistant prefix separately.
+ */
+static void normalize_openai_visible_assistant_reasoning(
+        chat_msgs *msgs) {
+    if (!msgs) return;
+
+    /*
+     * The alternate OpenAI / Chatbox visible-cache surface intentionally
+     * omits historical assistant reasoning.  Do this at message-structure
+     * level rather than scanning rendered prompt text for <think> tags:
+     * user/system/tool payloads are opaque data and may legitimately contain
+     * literal strings such as "<think>...</think>".
+     *
+     * The real inference prompt has already been rendered before this helper
+     * is called, so clearing reasoning here changes only the visible replay
+     * key used to identify the existing live KV frontier.
+     */
+    for (int i = 0; i < msgs->len; i++) {
+        chat_msg *m = &msgs->v[i];
+
+        if (!m->role || strcmp(m->role, "assistant"))
+            continue;
+
+        free(m->reasoning);
+        m->reasoning = NULL;
+    }
+}
+
 static char *build_thinking_visible_text(const request *r,
                                          const char *content) {
     if (!r || !r->prompt_text) return NULL;
@@ -12776,25 +13756,163 @@ static char *build_thinking_visible_text(const request *r,
         buf_puts(&visible, "<|im_end|>\n");
         return buf_take(&visible);
     }
+    const char *checkpoint_prompt = thinking_visible_prompt(r);
+    pt_len = strlen(checkpoint_prompt);
     const char *think_tag = "<think>";
     size_t tag_len = strlen(think_tag);
     if (pt_len < tag_len ||
-        memcmp(r->prompt_text + pt_len - tag_len, think_tag, tag_len) != 0) {
+        memcmp(checkpoint_prompt + pt_len - tag_len,
+               think_tag, tag_len) != 0) {
         return NULL;
     }
 
     buf visible = {0};
-    buf_append(&visible, r->prompt_text, pt_len - tag_len);
+    /* Use the structure-normalized OpenAI history without interpreting
+     * literal thinking tags in user, system, or tool data. */
+    buf_append(&visible, checkpoint_prompt, pt_len - tag_len);
     if (r->model_syntax == SERVER_MODEL_SYNTAX_GLM) {
         buf_puts(&visible, "<think></think>");
         append_trimmed_text(&visible, content);
     } else {
-        buf_puts(&visible, "</think>");
+        buf_puts(&visible, r->has_tools ? "<think></think>" : "</think>");
         buf_puts(&visible, content ? content : "");
         buf_puts(&visible, "<｜end▁of▁sentence｜>");
     }
     return buf_take(&visible);
 }
+
+
+static char *build_openai_compact_thinking_visible_from_prompt(
+        const request *r,
+        const char *prompt,
+        const char *content) {
+    if (!r ||
+        r->api != API_OPENAI ||
+        !r->has_tools ||
+        !prompt ||
+        !prompt[0] ||
+        !ds4_think_mode_enabled(r->think_mode))
+    {
+        return NULL;
+    }
+
+    const size_t prompt_len = strlen(prompt);
+
+    static const char think_open[] = "<think>";
+    const size_t think_open_len = sizeof(think_open) - 1;
+
+    if (prompt_len < think_open_len ||
+        memcmp(prompt + prompt_len - think_open_len,
+               think_open,
+               think_open_len))
+    {
+        return NULL;
+    }
+
+    buf out = {0};
+
+    /*
+     * prompt was rendered from the structure-normalized OpenAI visible
+     * history.  Copy it directly so literal tag text in non-assistant payloads
+     * is never interpreted as reasoning markup here.
+     */
+    buf_append(&out, prompt, prompt_len - think_open_len);
+
+    buf_puts(&out, "<think></think>");
+    if (r->model_syntax == SERVER_MODEL_SYNTAX_GLM) {
+        append_trimmed_text(&out, content);
+    } else {
+        buf_puts(&out, content ? content : "");
+        buf_puts(&out, "<｜end▁of▁sentence｜>");
+    }
+
+    return buf_take(&out);
+}
+
+
+static char *build_openai_merged_thinking_visible_text(
+        const request *r,
+        const char *content) {
+    if (!r || !r->openai_merged_visible_prompt_text)
+        return NULL;
+
+    return build_openai_compact_thinking_visible_from_prompt(
+        r,
+        r->openai_merged_visible_prompt_text,
+        content);
+}
+
+
+static void thinking_live_remember_merged_depths(
+        server *s,
+        server_slot *slot,
+        const request *r,
+        const char *content) {
+    if (!s || !slot || !r) return;
+    if (r->api != API_OPENAI || !r->has_tools) return;
+
+    char *depth_text[OPENAI_COMPACT_DEPTH_MAX] = {0};
+    size_t depth_len[OPENAI_COMPACT_DEPTH_MAX] = {0};
+    visible_image_key depth_images[OPENAI_COMPACT_DEPTH_MAX] = {0};
+    int count = 0;
+
+    int limit = r->openai_merged_depth_count;
+    if (limit > OPENAI_COMPACT_DEPTH_MAX)
+        limit = OPENAI_COMPACT_DEPTH_MAX;
+
+    for (int i = 0; i < limit; i++) {
+        const char *prompt =
+            r->openai_merged_depth_prompt_text[i];
+
+        if (!prompt)
+            continue;
+
+        char *visible =
+            build_openai_compact_thinking_visible_from_prompt(
+                r,
+                prompt,
+                content);
+
+        if (!visible)
+            continue;
+
+        depth_text[i] = visible_prompt_key(r, visible, &depth_images[i]);
+        free(visible);
+        if (!depth_text[i]) continue;
+        depth_len[i] = strlen(depth_text[i]);
+
+        if (i + 1 > count)
+            count = i + 1;
+    }
+
+    pthread_mutex_lock(&s->tool_mu);
+
+    if (slot->thinking_live.valid) {
+        for (int i = 0; i < OPENAI_COMPACT_DEPTH_MAX; i++) {
+            free(slot->thinking_live.merged_depth_text[i]);
+            slot->thinking_live.merged_depth_text[i] = NULL;
+            slot->thinking_live.merged_depth_len[i] = 0;
+            slot->thinking_live.merged_depth_images[i] = depth_images[i];
+
+            if (depth_text[i]) {
+                slot->thinking_live.merged_depth_text[i] =
+                    depth_text[i];
+                slot->thinking_live.merged_depth_len[i] =
+                    depth_len[i];
+
+                depth_text[i] = NULL;
+            }
+        }
+
+        slot->thinking_live.merged_depth_count = count;
+    }
+
+    pthread_mutex_unlock(&s->tool_mu);
+
+    for (int i = 0; i < OPENAI_COMPACT_DEPTH_MAX; i++)
+        free(depth_text[i]);
+}
+
 
 static void remember_thinking_checkpoint(server *s, server_slot *slot,
                                          const job *j, const char *ctx,
@@ -12803,14 +13921,53 @@ static void remember_thinking_checkpoint(server *s, server_slot *slot,
     char *visible = build_thinking_visible_text(&j->req, content);
     if (!visible) return;
 
-    thinking_live_remember(s, slot, visible, &j->req);
+    thinking_live_remember(
+        s, slot, visible, &j->req);
     pthread_mutex_lock(&s->tool_mu);
+    /* Qwen's exact-reasoning disk replay is independent of the DeepSeek/GLM
+     * Chatbox aliases, which already use the normalized visible surface. */
     slot->thinking_live.token_text_disk_key =
-        j->req.prompt_preserves_reasoning && !visible_continuation;
+        thinking_checkpoint_uses_token_text_disk_key(&j->req, visible_continuation);
     pthread_mutex_unlock(&s->tool_mu);
-    server_log(DS4_LOG_KVCACHE,
-               "ds4-server: thinking live checkpoint remembered ctx=%s live=%d visible=%zu",
-               ctx, ds4_session_pos(slot->session), strlen(visible));
+
+    char *merged_visible =
+        build_openai_merged_thinking_visible_text(
+            &j->req, content);
+
+    visible_image_key merged_images;
+    char *merged_key = merged_visible ?
+        visible_prompt_key(&j->req, merged_visible, &merged_images) : NULL;
+    if (merged_key) {
+        pthread_mutex_lock(&s->tool_mu);
+
+        if (slot->thinking_live.valid &&
+            slot->thinking_live.live_tokens ==
+                ds4_session_pos(slot->session))
+        {
+            free(slot->thinking_live.merged_visible_text);
+            slot->thinking_live.merged_visible_text =
+                xstrdup(merged_key);
+            slot->thinking_live.merged_visible_len = strlen(merged_key);
+            slot->thinking_live.merged_images = merged_images;
+        }
+
+        pthread_mutex_unlock(&s->tool_mu);
+    }
+
+    thinking_live_remember_merged_depths(
+        s, slot, &j->req, content);
+
+    server_log(
+        DS4_LOG_KVCACHE,
+        "ds4-server: thinking live checkpoint remembered "
+        "ctx=%s live=%d visible=%zu",
+        ctx,
+        ds4_session_pos(slot->session),
+        strlen(visible)
+    );
+
+    free(merged_key);
+    free(merged_visible);
     trace_event(s, trace_id,
                 "thinking live checkpoint remembered: live=%d visible=%zu",
                 ds4_session_pos(slot->session), strlen(visible));
@@ -13274,10 +14431,12 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     const bool responses_protocol = j->req.api == API_RESPONSES;
     bool responses_live_continuation = false;
     bool anthropic_live_continuation = false;
+    bool openai_live_continuation = false;
     bool thinking_live_continuation = false;
     const char *responses_live_match = NULL;
     int responses_live_match_ids = 0;
     int anthropic_live_match_ids = 0;
+    int openai_live_match_ids = 0;
     /* Responses gets the first chance to continue from live state.  This is
      * the whole point of the API shape: a request that is bound to prior live
      * output by visible transcript or tool call ids does not need to prove an
@@ -13314,6 +14473,16 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         if (cached > 0) {
             anthropic_live_continuation = true;
             cache_source = "anthropic-tool-output";
+            prompt_for_sync = &effective_prompt;
+        }
+    }
+    if (cached == 0 && live_vision_match) {
+        cached = openai_live_continuation_prompt(s, slot, &j->req, old_pos,
+                                                 &effective_prompt,
+                                                 &openai_live_match_ids);
+        if (cached > 0) {
+            openai_live_continuation = true;
+            cache_source = "openai-tool-output";
             prompt_for_sync = &effective_prompt;
         }
     }
@@ -13474,6 +14643,12 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                    anthropic_live_match_ids,
                    cached,
                    prompt_tokens);
+    } else if (openai_live_continuation) {
+        server_log(DS4_LOG_PREFILL,
+                   "ds4-server: openai live continuation match=tool-output-ids ids=%d cached=%d prompt=%d",
+                   openai_live_match_ids,
+                   cached,
+                   prompt_tokens);
     } else if (thinking_live_continuation) {
         server_log(DS4_LOG_PREFILL,
                    "ds4-server: thinking live continuation match=visible-prefix cached=%d prompt=%d",
@@ -13602,6 +14777,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
      * a binding only when this request explicitly continued from it. */
     if (!responses_live_continuation) responses_live_clear(s, slot);
     if (!anthropic_live_continuation) anthropic_live_clear(s, slot);
+    if (!openai_live_continuation) openai_live_clear(s, slot);
     if (!thinking_live_continuation) thinking_live_clear(s, slot);
     ds4_session_set_progress(slot->session, NULL, NULL);
     ds4_session_set_display_progress(slot->session, NULL, NULL);
@@ -14375,6 +15551,24 @@ decode_again:
         }
     }
 
+    if (j->req.api == API_OPENAI && j->req.kind == REQ_CHAT) {
+        if (parsed_calls.len &&
+            strcmp(final_finish, "error") &&
+            strcmp(final_finish, "length") &&
+            !s->disable_exact_dsml_tool_replay &&
+            parsed_calls.raw_tool_text &&
+            parsed_calls.raw_tool_text[0])
+        {
+            openai_live_remember(s, slot, &parsed_calls);
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: openai live tool frontier remembered ids=%d live=%d",
+                       parsed_calls.len,
+                       ds4_session_pos(slot->session));
+        } else {
+            openai_live_clear(s, slot);
+        }
+    }
+
     if (j->req.kind == REQ_CHAT && parsed_calls.len &&
         j->req.api != API_RESPONSES &&
         should_canonicalize_tool_checkpoint(s, &parsed_calls))
@@ -14603,7 +15797,8 @@ static int job_slot_score(server *s, server_slot *slot, const job *j,
     int live_pos = ds4_session_pos(slot->session);
     const request *req = &j->req;
     visible_image_key images;
-    char *key = req->prompt_text ? visible_prompt_key(req, req->prompt_text, &images) : NULL;
+    const char *visible_prompt = thinking_visible_prompt(req);
+    char *key = visible_prompt ? visible_prompt_key(req, visible_prompt, &images) : NULL;
     bool visible_match = false;
     if (key && req->api == API_RESPONSES) {
         const live_tool_state *state = &slot->responses_live;
@@ -14612,11 +15807,9 @@ static int job_slot_score(server *s, server_slot *slot, const job *j,
             visible_image_prefix_matches(&images, &state->images, state->visible_len) &&
             byte_prefix_match(key, strlen(key), state->visible_text, state->visible_len);
     } else if (key && req->kind == REQ_CHAT) {
-        const visible_live_state *state = &slot->thinking_live;
-        visible_match = state->valid && state->live_tokens == live_pos &&
-            state->visible_text && state->visible_len < strlen(key) &&
-            visible_image_prefix_matches(&images, &state->images, state->visible_len) &&
-            byte_prefix_match(key, strlen(key), state->visible_text, state->visible_len);
+        int merged_depth;
+        visible_match = thinking_live_prefix_match(&slot->thinking_live, req, key,
+                                                    &images, live_pos, &merged_depth) > 0;
     }
     free(key);
     if (visible_match) return live_pos;
@@ -15256,6 +16449,7 @@ static void server_close_resources(server *s) {
         server_slot *slot = &s->slots[i];
         live_tool_state_free(&slot->responses_live);
         live_tool_state_free(&slot->anthropic_live);
+        live_tool_state_free(&slot->openai_live);
         visible_live_free(&slot->thinking_live);
         if (slot->session) ds4_session_free(slot->session);
     }
@@ -16691,6 +17885,8 @@ static void test_openai_stream_reroutes_second_reasoning_pass(void) {
     close(sv[0]);
     close(sv[1]);
 }
+
+
 
 static void test_openai_stream_usage_reports_cache_details(void) {
     int sv[2];
@@ -19079,6 +20275,234 @@ static void test_anthropic_tool_memory_replays_sampled_dsml(void) {
     pthread_mutex_destroy(&s.tool_mu);
 }
 
+
+static void test_openai_code_execution_result_canonicalization(void) {
+    const char *json =
+        "{\"stdout\":\"hello\\n\",\"stderr\":\"\",\"exitCode\":0}";
+
+    char *out = canonicalize_code_execution_result_text(json);
+    TEST_ASSERT(out != NULL);
+    TEST_ASSERT(!strcmp(out, "Exit code: 0\n\nStdout:\nhello\n"));
+    free(out);
+
+    out = canonicalize_code_execution_result_text(
+        "{\"stdout\":\"\",\"stderr\":\"boom\\n\",\"exitCode\":2}");
+    TEST_ASSERT(out != NULL);
+    TEST_ASSERT(!strcmp(out, "Exit code: 2\n\nStderr:\nboom\n"));
+    free(out);
+
+    const char *other =
+        "{\"value\":1,\"stdout\":\"hello\",\"stderr\":\"\",\"exitCode\":0}";
+    out = canonicalize_code_execution_result_text(other);
+    TEST_ASSERT(out != NULL);
+    TEST_ASSERT(!strcmp(out, other));
+    free(out);
+}
+
+static void test_openai_chatbox_merged_history_replay_keys(void) {
+    chat_msgs src = {0};
+
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("calculate");
+    chat_msgs_push(&src, user);
+
+    chat_msg a1 = {0};
+    a1.role = xstrdup("assistant");
+    a1.content = xstrdup("A");
+    tool_call tc1 = {0};
+    tc1.id = xstrdup("call_1");
+    tc1.name = xstrdup("code_execution");
+    tc1.arguments = xstrdup("{\"code\":\"1+1\"}");
+    tool_calls_push(&a1.calls, tc1);
+    chat_msgs_push(&src, a1);
+
+    chat_msg t1 = {0};
+    t1.role = xstrdup("tool");
+    t1.tool_call_id = xstrdup("call_1");
+    t1.content = xstrdup("2");
+    chat_msgs_push(&src, t1);
+
+    chat_msg a2 = {0};
+    a2.role = xstrdup("assistant");
+    a2.content = xstrdup("B");
+    tool_call tc2 = {0};
+    tc2.id = xstrdup("call_2");
+    tc2.name = xstrdup("code_execution");
+    tc2.arguments = xstrdup("{\"code\":\"2+2\"}");
+    tool_calls_push(&a2.calls, tc2);
+    chat_msgs_push(&src, a2);
+
+    chat_msg t2 = {0};
+    t2.role = xstrdup("tool");
+    t2.tool_call_id = xstrdup("call_2");
+    t2.content = xstrdup("4");
+    chat_msgs_push(&src, t2);
+
+    chat_msg final = {0};
+    final.role = xstrdup("assistant");
+    final.content = xstrdup("C");
+    chat_msgs_push(&src, final);
+
+    chat_msgs merged = {0};
+    TEST_ASSERT(build_openai_merged_tool_history_messages(
+                    &src, &merged) == 2);
+    TEST_ASSERT(merged.len == 2);
+    TEST_ASSERT(!strcmp(merged.v[0].role, "user"));
+    TEST_ASSERT(!strcmp(merged.v[1].role, "assistant"));
+    TEST_ASSERT(!strcmp(merged.v[1].content, "ABC"));
+    TEST_ASSERT(merged.v[1].calls.len == 0);
+
+    /*
+     * Partial oldest-N replay:
+     *
+     *   A(call_1), tool_1, B(call_2), tool_2, C
+     *
+     * depth=1 must become:
+     *
+     *   AB(call_2), tool_2, C
+     *
+     * rather than refusing to merge the chained history.
+     */
+    chat_msgs depth1 = {0};
+    TEST_ASSERT(build_openai_merged_tool_history_messages_limit(
+                    &src, &depth1, 1) == 1);
+
+    TEST_ASSERT(depth1.len == 4);
+    TEST_ASSERT(!strcmp(depth1.v[0].role, "user"));
+
+    TEST_ASSERT(!strcmp(depth1.v[1].role, "assistant"));
+    TEST_ASSERT(!strcmp(depth1.v[1].content, "AB"));
+    TEST_ASSERT(depth1.v[1].calls.len == 1);
+    TEST_ASSERT(depth1.v[1].calls.v[0].id != NULL);
+    TEST_ASSERT(!strcmp(depth1.v[1].calls.v[0].id, "call_2"));
+
+    TEST_ASSERT(!strcmp(depth1.v[2].role, "tool"));
+    TEST_ASSERT(depth1.v[2].tool_call_id != NULL);
+    TEST_ASSERT(!strcmp(depth1.v[2].tool_call_id, "call_2"));
+    TEST_ASSERT(!strcmp(depth1.v[2].content, "4"));
+
+    TEST_ASSERT(!strcmp(depth1.v[3].role, "assistant"));
+    TEST_ASSERT(!strcmp(depth1.v[3].content, "C"));
+    TEST_ASSERT(depth1.v[3].calls.len == 0);
+
+    chat_msgs depth2 = {0};
+    TEST_ASSERT(build_openai_merged_tool_history_messages_limit(
+                    &src, &depth2, 2) == 2);
+
+    TEST_ASSERT(depth2.len == 2);
+    TEST_ASSERT(!strcmp(depth2.v[0].role, "user"));
+    TEST_ASSERT(!strcmp(depth2.v[1].role, "assistant"));
+    TEST_ASSERT(!strcmp(depth2.v[1].content, "ABC"));
+    TEST_ASSERT(depth2.v[1].calls.len == 0);
+
+    chat_msgs_free(&depth2);
+    chat_msgs_free(&depth1);
+    chat_msgs_free(&merged);
+    chat_msgs_free(&src);
+}
+
+static void test_openai_live_tail_renders_tool_results_only(void) {
+    server s = {0};
+    pthread_mutex_init(&s.tool_mu, NULL);
+
+    const char *dsml =
+        "\n\n<｜DSML｜tool_calls>\n"
+        "<｜DSML｜invoke name=\"code_execution\">\n"
+        "<｜DSML｜parameter name=\"code\" string=\"true\">1+1</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n"
+        "</｜DSML｜tool_calls>";
+
+    tool_memory_put(&s, "call_live", dsml);
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.think_mode = DS4_THINK_HIGH;
+
+    chat_msgs msgs = {0};
+
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    tool_call tc = {0};
+    tc.id = xstrdup("call_live");
+    tc.name = xstrdup("code_execution");
+    tc.arguments = xstrdup("{\"code\":\"1+1\"}");
+    tool_calls_push(&assistant.calls, tc);
+    chat_msgs_push(&msgs, assistant);
+
+    chat_msg tool = {0};
+    tool.role = xstrdup("tool");
+    tool.tool_call_id = xstrdup("call_live");
+    tool.content = xstrdup("Exit code: 0\n\nStdout:\n2\n");
+    chat_msgs_push(&msgs, tool);
+
+    openai_prepare_live_continuation(&r, &s, &msgs);
+
+    TEST_ASSERT(r.openai_live_call_ids.len == 1);
+    TEST_ASSERT(!strcmp(r.openai_live_call_ids.v[0], "call_live"));
+    TEST_ASSERT(r.openai_live_suffix_text != NULL);
+    TEST_ASSERT(strstr(r.openai_live_suffix_text, "Stdout:") != NULL);
+    TEST_ASSERT(strstr(r.openai_live_suffix_text, "code_execution") == NULL);
+
+    chat_msgs_free(&msgs);
+    request_free(&r);
+    tool_memory_free(&s.tool_mem);
+    pthread_mutex_destroy(&s.tool_mu);
+}
+
+static void test_openai_tool_thinking_visible_checkpoint_normalizes_history(void) {
+    chat_msgs msgs = {0};
+
+    chat_msg user1 = {0};
+    user1.role = xstrdup("user");
+    user1.content =
+        xstrdup("literal user text: <think>do not erase this</think>");
+    chat_msgs_push(&msgs, user1);
+
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    assistant.reasoning = xstrdup("hidden old reasoning");
+    assistant.content = xstrdup("old answer");
+    chat_msgs_push(&msgs, assistant);
+
+    chat_msg user2 = {0};
+    user2.role = xstrdup("user");
+    user2.content = xstrdup("continue");
+    chat_msgs_push(&msgs, user2);
+
+    normalize_openai_visible_assistant_reasoning(&msgs);
+
+    TEST_ASSERT(msgs.v[0].content != NULL);
+    TEST_ASSERT(strstr(msgs.v[0].content,
+                       "<think>do not erase this</think>") != NULL);
+
+    TEST_ASSERT(msgs.v[1].reasoning == NULL);
+    TEST_ASSERT(!strcmp(msgs.v[1].content, "old answer"));
+
+    /*
+     * Supplying tool schemas makes this match the OpenAI tool-history render
+     * path: historical assistant reasoning becomes an empty thinking block.
+     */
+    char *visible_prompt =
+        render_chat_prompt_text(
+            &msgs,
+            "{\"name\":\"code_execution\"}",
+            NULL,
+            DS4_THINK_HIGH);
+
+    TEST_ASSERT(visible_prompt != NULL);
+    TEST_ASSERT(strstr(visible_prompt,
+                       "<think>do not erase this</think>") != NULL);
+    TEST_ASSERT(strstr(visible_prompt,
+                       "hidden old reasoning") == NULL);
+    TEST_ASSERT(strstr(visible_prompt,
+                       "<think></think>old answer") != NULL);
+
+    free(visible_prompt);
+    chat_msgs_free(&msgs);
+}
+
 static void test_anthropic_live_tail_renders_tool_results_only(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
@@ -20471,7 +21895,9 @@ static void test_thinking_checkpoint_remember_gate(void) {
     TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
     r.prompt_preserves_reasoning = false;
     r.has_tools = true;
-    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
+    TEST_ASSERT(should_remember_thinking_checkpoint(&r, &st, "stop"));
+    r.prompt_preserves_reasoning = true;
+    TEST_ASSERT(should_remember_thinking_checkpoint(&r, &st, "stop"));
     r.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
     r.prompt_preserves_reasoning = true;
     TEST_ASSERT(should_remember_thinking_checkpoint(&r, &st, "stop"));
@@ -21587,6 +23013,33 @@ static void test_openai_inline_image_content(void) {
     buf_free(&json);
 }
 
+static void test_openai_tool_replay_requires_vision_for_images(void) {
+    /* Tool replay must still pass through multimodal tokenization before
+     * building alternate Chatbox cache keys, even when the live tail is text. */
+    buf json = {0};
+    buf_puts(&json,
+        "{\"tools\":[{\"type\":\"function\",\"function\":{"
+        "\"name\":\"code_execution\",\"parameters\":{\"type\":\"object\"}}}],"
+        "\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\","
+        "\"image_url\":{\"url\":\"data:image/png;base64,");
+    buf_puts(&json, test_inline_png_base64);
+    buf_puts(&json,
+        "\"}}]},{\"role\":\"assistant\",\"tool_calls\":[{"
+        "\"id\":\"call_image\",\"type\":\"function\",\"function\":{"
+        "\"name\":\"code_execution\",\"arguments\":\"{}\"}}]},"
+        "{\"role\":\"tool\",\"tool_call_id\":\"call_image\","
+        "\"content\":\"image received\"}]}");
+
+    request r;
+    char err[160] = {0};
+    bool ok = parse_chat_request(NULL, NULL, json.ptr, 128, 4096,
+                                 &r, err, sizeof(err));
+    TEST_ASSERT(!ok);
+    TEST_ASSERT(strstr(err, "image input requires starting ds4-server with --vision") != NULL);
+    if (ok) request_free(&r);
+    buf_free(&json);
+}
+
 static void test_http_image_paths_and_urls_are_rejected(void) {
     const char *cases[] = {
         "[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\","
@@ -21925,13 +23378,18 @@ static void test_deepseek41_live_result_order(void) {
     server_slot slot;
     test_server_bind_slot(&s, &slot);
     pthread_mutex_init(&s.tool_mu, NULL);
-    for (int anthropic = 0; anthropic < 2; anthropic++) {
+    tool_memory_put(&s, "a", "sampled first call");
+    tool_memory_put(&s, "b", "sampled second call");
+    const api_style apis[] = {API_RESPONSES, API_ANTHROPIC, API_OPENAI};
+    for (size_t i = 0; i < sizeof(apis) / sizeof(apis[0]); i++) {
+        const bool anthropic = apis[i] == API_ANTHROPIC;
         request r;
         request_init(&r, REQ_CHAT, 128);
         r.model_syntax = SERVER_MODEL_SYNTAX_DEEPSEEK41;
-        r.api = anthropic ? API_ANTHROPIC : API_RESPONSES;
+        r.api = apis[i];
         r.think_mode = DS4_THINK_HIGH;
-        live_tool_state *live = anthropic ? &slot.anthropic_live : &slot.responses_live;
+        live_tool_state *live = anthropic ? &slot.anthropic_live :
+            r.api == API_OPENAI ? &slot.openai_live : &slot.responses_live;
         live->valid = true;
         id_list_push_unique(&live->call_ids, "a");
         id_list_push_unique(&live->call_ids, "b");
@@ -21944,27 +23402,182 @@ static void test_deepseek41_live_result_order(void) {
         chat_msgs msgs = {0};
         TEST_ASSERT(anthropic ? parse_anthropic_messages(&json, &msgs) : parse_messages(&json, &msgs));
         if (anthropic) anthropic_prepare_live_continuation(&s, &r, &msgs);
+        else if (r.api == API_OPENAI) openai_prepare_live_continuation(&r, &s, &msgs);
         else responses_prepare_live_continuation(&s, &r, &msgs);
-        const char *tail = anthropic ? r.anthropic_live_suffix_text : r.responses_live_suffix_text;
+        const char *tail = anthropic ? r.anthropic_live_suffix_text :
+            r.api == API_OPENAI ? r.openai_live_suffix_text : r.responses_live_suffix_text;
         TEST_ASSERT(tail && !strcmp(tail,
             "<｜end▁of▁sentence｜><｜User｜><tool_result>FIRST</tool_result>\n\n"
             "<tool_result>SECOND</tool_result><｜Assistant｜><think>"));
-        live_tool_state_clear_locked(live);
+        live_tool_state_free(live);
         /* Rendered requests own their bytes even if the slot is replaced. */
         TEST_ASSERT(tail && strstr(tail, "FIRST</tool_result>\n\n<tool_result>SECOND"));
-        free(live->call_ids.v);
-        memset(&live->call_ids, 0, sizeof(live->call_ids));
         chat_msgs_free(&msgs);
         request_free(&r);
     }
+    tool_memory_free(&s.tool_mem);
     pthread_mutex_destroy(&s.tool_mu);
 }
 
+/* Normal, fully flattened, and partially flattened replays can place the
+ * same image at different offsets. Match the selected surface's image key,
+ * reject literal marker impersonation, and retain room for new suffix images. */
+static void test_openai_compact_visible_image_matching(void) {
+    const char *prefixes[] = {"normal-nonce_A-done", "mergednonce_A-done",
+                              "partial-prefix-nonce_A-done"};
+    for (int variant = 0; variant < 3; variant++) {
+        char markers[2][SERVER_IMAGE_MARKER_BYTES] = {"nonce_A", "nonce_B"};
+        request r = {.api = API_OPENAI, .image_count = 1, .image_markers = markers};
+        visible_live_state state = {.valid = true, .live_tokens = 42};
+        visible_image_key remembered;
+        char *prefix = visible_prompt_key(&r, prefixes[variant], &remembered);
+        size_t boundary = strlen(prefix);
+        if (variant == 0) {
+            state.visible_text = prefix;
+            state.visible_len = boundary;
+            state.images = remembered;
+        } else if (variant == 1) {
+            state.merged_visible_text = prefix;
+            state.merged_visible_len = boundary;
+            state.merged_images = remembered;
+        } else {
+            state.merged_depth_text[0] = prefix;
+            state.merged_depth_len[0] = boundary;
+            state.merged_depth_images[0] = remembered;
+            state.merged_depth_count = 1;
+        }
+        buf incoming = {0};
+        buf_puts(&incoming, prefixes[variant]);
+        buf_puts(&incoming, "-nextnonce_B");
+        char *nonce = strstr(incoming.ptr, "nonce_A");
+        memcpy(nonce, "nonce_Z", 7);
+        memcpy(markers[0], "nonce_Z", 8);
+        r.image_count = 2;
+        visible_image_key images;
+        char *key = visible_prompt_key(&r, incoming.ptr, &images);
+        int depth = 0;
+        TEST_ASSERT(key != NULL);
+        TEST_ASSERT(thinking_live_prefix_match(&state, &r, key, &images, 42, &depth) == boundary);
+        TEST_ASSERT(depth == (variant == 0 ? 0 : variant == 1 ? -1 : 1));
+        TEST_ASSERT(thinking_live_prefix_match(&state, &r, key, &images, 43, &depth) == 0);
+        state.valid = false;
+        TEST_ASSERT(thinking_live_prefix_match(&state, &r, key, &images, 42, &depth) == 0);
+        state.valid = true;
+        visible_image_key literal = {0};
+        TEST_ASSERT(thinking_live_prefix_match(&state, &r, key, &literal, 42, &depth) == 0);
+        images.offsets[0]++;
+        TEST_ASSERT(thinking_live_prefix_match(&state, &r, key, &images, 42, &depth) == 0);
+        images.offsets[0]--;
+        images.offsets[1] = boundary - 1;
+        TEST_ASSERT(thinking_live_prefix_match(&state, &r, key, &images, 42, &depth) == 0);
+        free(key);
+        buf_free(&incoming);
+        visible_live_clear_locked(&state);
+        TEST_ASSERT(!state.valid && !state.merged_depth_count);
+        TEST_ASSERT(!state.images.count && !state.merged_images.count &&
+                    !state.merged_depth_images[0].count);
+    }
+}
+
+static void test_openai_compact_checkpoint_formats_and_images(void) {
+    char markers[1][SERVER_IMAGE_MARKER_BYTES] = {"nonce_A"};
+    request r = {.api = API_OPENAI, .has_tools = true,
+                 .think_mode = DS4_THINK_HIGH, .model_syntax = SERVER_MODEL_SYNTAX_GLM,
+                 .prompt_text = "real history<|assistant|><think>",
+                 .openai_visible_prompt_text = "visible history<|assistant|><think>",
+                 .image_count = 1, .image_markers = markers};
+    char *normal = build_thinking_visible_text(&r, " answer ");
+    TEST_ASSERT(!strcmp(normal, "visible history<|assistant|><think></think>answer"));
+    free(normal);
+    const char *prompt = "xnonce_A<|assistant|><think>";
+    char *visible = build_openai_compact_thinking_visible_from_prompt(&r, prompt, " answer ");
+    TEST_ASSERT(!strcmp(visible, "xnonce_A<|assistant|><think></think>answer"));
+
+    server s = {0};
+    server_slot slot = {0};
+    pthread_mutex_init(&s.tool_mu, NULL);
+    slot.thinking_live.valid = true;
+    slot.thinking_live.live_tokens = 42;
+    r.openai_merged_depth_prompt_text[0] = (char *)prompt;
+    r.openai_merged_depth_count = 1;
+    thinking_live_remember_merged_depths(&s, &slot, &r, " answer ");
+    TEST_ASSERT(slot.thinking_live.merged_depth_count == 1);
+    TEST_ASSERT(slot.thinking_live.merged_depth_images[0].count == 1);
+    TEST_ASSERT(slot.thinking_live.merged_depth_images[0].offsets[0] == 1);
+    TEST_ASSERT(strstr(slot.thinking_live.merged_depth_text[0], "nonce_A") == NULL);
+    TEST_ASSERT(slot.thinking_live.merged_depth_len[0] == strlen(visible));
+    /* A compaction that dropped an image cannot identify the old frontier. */
+    r.openai_merged_depth_prompt_text[0] = "missing image<|assistant|><think>";
+    thinking_live_remember_merged_depths(&s, &slot, &r, " answer ");
+    TEST_ASSERT(slot.thinking_live.merged_depth_count == 0);
+    TEST_ASSERT(slot.thinking_live.merged_depth_text[0] == NULL);
+    visible_live_free(&slot.thinking_live);
+    pthread_mutex_destroy(&s.tool_mu);
+    free(visible);
+
+    r.model_syntax = SERVER_MODEL_SYNTAX_DEEPSEEK41;
+    visible = build_openai_compact_thinking_visible_from_prompt(
+        &r, "<｜User｜>hi<｜Assistant｜><think>", " answer ");
+    TEST_ASSERT(!strcmp(visible,
+        "<｜User｜>hi<｜Assistant｜><think></think> answer <｜end▁of▁sentence｜>"));
+    free(visible);
+}
+
+/* Resolving Qwen checkpoint conflicts must not erase edited reasoning or
+ * switch DeepSeek/GLM Chatbox checkpoints back to hidden token-text keys. */
+static void test_thinking_checkpoint_syntax_isolation(void) {
+    request r = {.kind = REQ_CHAT, .api = API_OPENAI, .has_tools = true,
+                 .prompt_preserves_reasoning = true, .think_mode = DS4_THINK_HIGH,
+                 .model_syntax = SERVER_MODEL_SYNTAX_QWEN,
+                 .prompt_text = "echoed reasoning<|im_start|>assistant\n<think>\n",
+                 .openai_visible_prompt_text = "normalized<|im_start|>assistant\n<think>\n"};
+    thinking_state thinking = {.inside = false};
+    TEST_ASSERT(should_remember_thinking_checkpoint(&r, &thinking, "stop"));
+    TEST_ASSERT(thinking_visible_prompt(&r) == r.prompt_text);
+    TEST_ASSERT(thinking_checkpoint_uses_token_text_disk_key(&r, false));
+    TEST_ASSERT(!thinking_checkpoint_uses_token_text_disk_key(&r, true));
+    r.prompt_preserves_reasoning = false;
+    TEST_ASSERT(!thinking_checkpoint_uses_token_text_disk_key(&r, false));
+    r.prompt_preserves_reasoning = true;
+
+    char *visible = build_thinking_visible_text(&r, " answer ");
+    TEST_ASSERT(visible != NULL);
+    TEST_ASSERT(visible && !strcmp(visible,
+        "echoed reasoning<|im_start|>assistant\n<think>\n\n</think>\n\nanswer<|im_end|>\n"));
+    free(visible);
+
+    visible_live_state state = {.valid = true, .live_tokens = 42,
+                               .visible_text = "normalized", .visible_len = 10};
+    visible_image_key images = {0};
+    int depth = 0;
+    TEST_ASSERT(thinking_live_prefix_match(&state, &r,
+        thinking_visible_prompt(&r), &images, 42, &depth) == 0);
+
+    const server_model_syntax chatbox_syntaxes[] = {
+        SERVER_MODEL_SYNTAX_DEEPSEEK, SERVER_MODEL_SYNTAX_DEEPSEEK41,
+        SERVER_MODEL_SYNTAX_GLM
+    };
+    for (size_t i = 0; i < sizeof(chatbox_syntaxes) / sizeof(chatbox_syntaxes[0]); i++) {
+        r.model_syntax = chatbox_syntaxes[i];
+        TEST_ASSERT(should_remember_thinking_checkpoint(&r, &thinking, "stop"));
+        TEST_ASSERT(thinking_visible_prompt(&r) == r.openai_visible_prompt_text);
+        TEST_ASSERT(!thinking_checkpoint_uses_token_text_disk_key(&r, false));
+        TEST_ASSERT(thinking_live_prefix_match(&state, &r,
+            thinking_visible_prompt(&r), &images, 42, &depth) == state.visible_len);
+        r.has_tools = false;
+        TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &thinking, "stop"));
+        r.has_tools = true;
+    }
+}
+
 static void ds4_server_unit_tests_run(void) {
+    test_thinking_checkpoint_syntax_isolation();
     test_deepseek41_server_stream();
     test_deepseek41_server_tools();
     test_deepseek41_anthropic_results();
     test_deepseek41_live_result_order();
+    test_openai_compact_visible_image_matching();
+    test_openai_compact_checkpoint_formats_and_images();
     test_visible_image_key();
     test_anthropic_tool_image_output();
     test_responses_tool_image_output();
@@ -22051,6 +23664,10 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_checkpoint_minifies_json_parameters();
     test_tool_memory_replays_sampled_dsml();
     test_anthropic_tool_memory_replays_sampled_dsml();
+    test_openai_code_execution_result_canonicalization();
+    test_openai_chatbox_merged_history_replay_keys();
+    test_openai_live_tail_renders_tool_results_only();
+    test_openai_tool_thinking_visible_checkpoint_normalizes_history();
     test_anthropic_live_tail_renders_tool_results_only();
     test_anthropic_tool_result_id_validation();
     test_anthropic_full_replay_allows_unknown_live_id();
@@ -22075,6 +23692,7 @@ static void ds4_server_unit_tests_run(void) {
     test_thinking_canonical_with_tools_preserves_reasoning();
     test_thinking_canonical_non_thinking_mode_noop();
     test_openai_inline_image_content();
+    test_openai_tool_replay_requires_vision_for_images();
     test_http_image_paths_and_urls_are_rejected();
     test_anthropic_inline_image_content();
     test_responses_inline_image_content();
