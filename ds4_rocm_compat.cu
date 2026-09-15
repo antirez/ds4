@@ -225,49 +225,32 @@ extern "C" int ds4_gpu_set_decode_score_vec4(int enabled) {
     return 0;
 }
 
-extern "C" int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
-        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
-        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
-        const ds4_gpu_tensor *x, uint32_t n_rows) {
-    return ds4_gpu_matmul_q8_0_tensor(out, model_map, model_size,
-                                      weight_offset, in_dim, out_dim, x,
-                                      n_rows);
-}
-
-extern "C" int ds4_gpu_matmul_q8_0_pair_decode_rows_exact_tensor(
-        ds4_gpu_tensor *out0, ds4_gpu_tensor *out1, const void *model_map,
-        uint64_t model_size, uint64_t weight0_offset,
-        uint64_t weight1_offset, uint64_t in_dim, uint64_t out0_dim,
-        uint64_t out1_dim, const ds4_gpu_tensor *x, uint32_t n_rows) {
-    return ds4_gpu_matmul_q8_0_pair_tensor(
-            out0, out1, model_map, model_size, weight0_offset, weight1_offset,
-            in_dim, out0_dim, out1_dim, x, n_rows);
-}
-
 extern "C" int ds4_gpu_matmul_f16_router_rows_exact_tensor(
         ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
         uint64_t weight_offset, const ds4_gpu_tensor *x, uint32_t n_rows) {
-    return ds4_gpu_matmul_f16_tensor(out, model_map, model_size, weight_offset,
-                                     4096u, 256u, x, n_rows);
-}
-
-extern "C" int ds4_gpu_dsv4_qkv_rms_norm_rows_kv_rope_tensor(
-        ds4_gpu_tensor *q_out, const ds4_gpu_tensor *q,
-        const void *model_map, uint64_t model_size,
-        uint64_t q_weight_offset, uint32_t q_n,
-        ds4_gpu_tensor *kv_out, const ds4_gpu_tensor *kv,
-        uint64_t kv_weight_offset, uint32_t kv_n, uint32_t rows,
-        uint32_t kv_n_head, uint32_t kv_head_dim, uint32_t n_rot,
-        uint32_t pos0, uint32_t n_ctx_orig, bool inverse,
-        float freq_base, float freq_scale, float ext_factor,
-        float attn_factor, float beta_fast, float beta_slow, float eps) {
-    return ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
-                   q_out, q, model_map, model_size, q_weight_offset, q_n,
-                   kv_out, kv, kv_weight_offset, kv_n, rows, eps) != 0 &&
-           ds4_gpu_rope_tail_tensor(
-                   kv_out, rows, kv_n_head, kv_head_dim, n_rot, pos0,
-                   n_ctx_orig, inverse, freq_base, freq_scale, ext_factor,
-                   attn_factor, beta_fast, beta_slow) != 0;
+    /* Router logits gate expert selection, so every row must reduce in
+     * the one-row order or batched rows can route to different experts
+     * than solo decode.  The multi-row f16 tiers do not preserve that
+     * order; the router is small enough (4096x256) that evaluating the
+     * rows through the one-row path costs nothing measurable. */
+    if (n_rows <= 1u) {
+        return ds4_gpu_matmul_f16_tensor(out, model_map, model_size,
+                                         weight_offset, 4096u, 256u, x, 1u);
+    }
+    for (uint32_t r = 0; r < n_rows; r++) {
+        ds4_gpu_tensor *out_row = ds4_gpu_tensor_view(
+            out, (uint64_t)r * 256u * sizeof(float), 256u * sizeof(float));
+        ds4_gpu_tensor *x_row = ds4_gpu_tensor_view(
+            (ds4_gpu_tensor *)x, (uint64_t)r * 4096u * sizeof(float),
+            4096u * sizeof(float));
+        const int ok = out_row && x_row &&
+            ds4_gpu_matmul_f16_tensor(out_row, model_map, model_size,
+                                      weight_offset, 4096u, 256u, x_row, 1u);
+        if (out_row) ds4_gpu_tensor_free(out_row);
+        if (x_row) ds4_gpu_tensor_free(x_row);
+        if (!ok) return 0;
+    }
+    return 1;
 }
 
 extern "C" int ds4_gpu_embed_token_quant_tensor(

@@ -159,6 +159,78 @@ __global__ static void matmul_q8_0_preq_rows_w32_kernel(
     if (lane == 0u) out[row] = acc;
 }
 
+/* K-row variant of the preq rows_w32 matvec: one weight pass serves K
+ * resident activation rows.  gfx1151 exposes a 2 MB L2 and no MALL, so a
+ * weight stream re-read by another workgroup or launch always comes back
+ * from DRAM; keeping the K dots live in registers is the only level of the
+ * hierarchy that can share it.  The per-row block loop, operand order, and
+ * warp reduction are copied from matmul_q8_0_preq_rows_w32_kernel, so each
+ * row's result is bit-identical to a one-row launch of the decode tier. */
+template <uint32_t K>
+__global__ static void matmul_q8_0_preq_krow_rows_w32_kernel(
+        float *out,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t blocks,
+        uint32_t rows_per_block,
+        int use_dp4a) {
+    const uint64_t row = (uint64_t)blockIdx.x * rows_per_block + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    if (row >= out_dim) return;
+    const unsigned char *wr = w + row * blocks * 34u;
+    float acc[K];
+#pragma unroll
+    for (uint32_t r = 0; r < K; r++) acc[r] = 0.0f;
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        const uint64_t i0 = b * 32u;
+        const uint64_t bn = in_dim - i0 < 32u ? in_dim - i0 : 32u;
+        const __half *scale_h = (const __half *)(wr + b * 34u);
+        const int8_t *qs = (const int8_t *)(wr + b * 34u + 2u);
+        if (use_dp4a && bn == 32u) {
+            /* Assemble the eight misaligned weight words once; the integer
+             * dot per row is then identical to dot_i8x32_dp4a's, and the
+             * float statement below matches
+             * matmul_q8_0_preq_rows_w32_kernel exactly so fast-math
+             * contraction resolves identically: every row stays bit-equal
+             * to a one-row launch while the weight stream is read once. */
+            int32_t wv[8];
+#pragma unroll
+            for (uint32_t i = 0; i < 8u; i++) {
+                wv[i] = load_i8x4_i32_unaligned(qs + i * 4u);
+            }
+            /* Keep this loop rolled: with -ffast-math an unrolled tail
+             * iteration can contract the accumulate differently from the
+             * body, which breaks row-vs-row bit equality. */
+#pragma unroll 1
+            for (uint32_t r = 0; r < K; r++) {
+                const int8_t *xqb = xq + ((uint64_t)r * blocks + b) * 32u;
+                int32_t d32 = 0;
+#pragma unroll
+                for (uint32_t i = 0; i < 8u; i++) {
+                    d32 = __dp4a(wv[i], load_i8x4_i32_aligned(xqb + i * 4u), d32);
+                }
+                int dot = d32;
+                acc[r] += __half2float(*scale_h) * xscale[(uint64_t)r * blocks + b] * (float)dot;
+            }
+        } else {
+#pragma unroll
+            for (uint32_t r = 0; r < K; r++) {
+                const int8_t *xqb = xq + ((uint64_t)r * blocks + b) * 32u;
+                int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
+                acc[r] += __half2float(*scale_h) * xscale[(uint64_t)r * blocks + b] * (float)dot;
+            }
+        }
+    }
+#pragma unroll
+    for (uint32_t r = 0; r < K; r++) {
+        const float a = warp_sum_f32(acc[r]);
+        if (lane == 0u) out[(uint64_t)r * out_dim + row] = a;
+    }
+}
+
 __global__ static void matmul_q8_0_pair_preq_warp8_kernel(
         float *out0,
         float *out1,
@@ -201,6 +273,165 @@ __global__ static void matmul_q8_0_pair_preq_warp8_kernel(
     if (lane == 0) {
         if (row < out0_dim) out0[row] = acc0;
         if (row < out1_dim) out1[row] = acc1;
+    }
+}
+
+/* K-row variant of the fused pair matvec, same discipline as
+ * matmul_q8_0_preq_krow_rows_w32_kernel: both weight streams are read
+ * once for K rows, weight words are assembled once per block, the row
+ * loop stays rolled, and the accumulate statements mirror
+ * matmul_q8_0_pair_preq_warp8_kernel so every row is bit-equal to a
+ * one-row pair launch. */
+template <uint32_t K>
+__global__ static void matmul_q8_0_pair_preq_krow_warp8_kernel(
+        float *out0,
+        float *out1,
+        const unsigned char *w0,
+        const unsigned char *w1,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t in_dim,
+        uint64_t out0_dim,
+        uint64_t out1_dim,
+        uint64_t blocks,
+        int use_dp4a) {
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    if (row >= out0_dim && row >= out1_dim) return;
+    float acc0[K];
+    float acc1[K];
+#pragma unroll
+    for (uint32_t r = 0; r < K; r++) {
+        acc0[r] = 0.0f;
+        acc1[r] = 0.0f;
+    }
+    const unsigned char *wr0 = row < out0_dim ? w0 + row * blocks * 34u : NULL;
+    const unsigned char *wr1 = row < out1_dim ? w1 + row * blocks * 34u : NULL;
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        const uint64_t i0 = b * 32u;
+        const uint64_t bn = in_dim - i0 < 32u ? in_dim - i0 : 32u;
+        if (use_dp4a && bn == 32u) {
+            int32_t wv0[8];
+            int32_t wv1[8];
+            if (wr0) {
+                const int8_t *qs = (const int8_t *)(wr0 + b * 34u + 2u);
+#pragma unroll
+                for (uint32_t i = 0; i < 8u; i++) {
+                    wv0[i] = load_i8x4_i32_unaligned(qs + i * 4u);
+                }
+            }
+            if (wr1) {
+                const int8_t *qs = (const int8_t *)(wr1 + b * 34u + 2u);
+#pragma unroll
+                for (uint32_t i = 0; i < 8u; i++) {
+                    wv1[i] = load_i8x4_i32_unaligned(qs + i * 4u);
+                }
+            }
+#pragma unroll 1
+            for (uint32_t r = 0; r < K; r++) {
+                const int8_t *xqb = xq + ((uint64_t)r * blocks + b) * 32u;
+                const float xs = xscale[(uint64_t)r * blocks + b];
+                if (wr0) {
+                    const __half *scale_h = (const __half *)(wr0 + b * 34u);
+                    int32_t d32 = 0;
+#pragma unroll
+                    for (uint32_t i = 0; i < 8u; i++) {
+                        d32 = __dp4a(wv0[i], load_i8x4_i32_aligned(xqb + i * 4u), d32);
+                    }
+                    int dot = d32;
+                    acc0[r] += __half2float(*scale_h) * xs * (float)dot;
+                }
+                if (wr1) {
+                    const __half *scale_h = (const __half *)(wr1 + b * 34u);
+                    int32_t d32 = 0;
+#pragma unroll
+                    for (uint32_t i = 0; i < 8u; i++) {
+                        d32 = __dp4a(wv1[i], load_i8x4_i32_aligned(xqb + i * 4u), d32);
+                    }
+                    int dot = d32;
+                    acc1[r] += __half2float(*scale_h) * xs * (float)dot;
+                }
+            }
+        } else {
+#pragma unroll 1
+            for (uint32_t r = 0; r < K; r++) {
+                const int8_t *xqb = xq + ((uint64_t)r * blocks + b) * 32u;
+                const float xs = xscale[(uint64_t)r * blocks + b];
+                if (wr0) {
+                    const __half *scale_h = (const __half *)(wr0 + b * 34u);
+                    const int8_t *qs = (const int8_t *)(wr0 + b * 34u + 2u);
+                    int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
+                    acc0[r] += __half2float(*scale_h) * xs * (float)dot;
+                }
+                if (wr1) {
+                    const __half *scale_h = (const __half *)(wr1 + b * 34u);
+                    const int8_t *qs = (const int8_t *)(wr1 + b * 34u + 2u);
+                    int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
+                    acc1[r] += __half2float(*scale_h) * xs * (float)dot;
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (uint32_t r = 0; r < K; r++) {
+        const float a0 = warp_sum_f32(acc0[r]);
+        const float a1 = warp_sum_f32(acc1[r]);
+        if (lane == 0) {
+            if (row < out0_dim) out0[(uint64_t)r * out0_dim + row] = a0;
+            if (row < out1_dim) out1[(uint64_t)r * out1_dim + row] = a1;
+        }
+    }
+}
+
+__global__ static void shared_gate_up_swiglu_q8_0_pair_preq_warp8_kernel(
+        float *gate,
+        float *up,
+        float *mid,
+        const unsigned char *wg,
+        const unsigned char *wu,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t blocks,
+        int use_dp4a,
+        int store_gate_up,
+        float clamp) {
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    if (row >= out_dim) return;
+    const unsigned char *gr = wg + row * blocks * 34u;
+    const unsigned char *ur = wu + row * blocks * 34u;
+    float g = 0.0f;
+    float u = 0.0f;
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        const uint64_t i0 = b * 32u;
+        const uint64_t bn = in_dim - i0 < 32u ? in_dim - i0 : 32u;
+        const int8_t *xqb = xq + b * 32u;
+        const float xs = xscale[b];
+        const __half *gscale_h = (const __half *)(gr + b * 34u);
+        const int8_t *gqs = (const int8_t *)(gr + b * 34u + 2u);
+        const __half *uscale_h = (const __half *)(ur + b * 34u);
+        const int8_t *uqs = (const int8_t *)(ur + b * 34u + 2u);
+        const int gdot = dot_i8_block(gqs, xqb, bn, use_dp4a);
+        const int udot = dot_i8_block(uqs, xqb, bn, use_dp4a);
+        g += __half2float(*gscale_h) * xs * (float)gdot;
+        u += __half2float(*uscale_h) * xs * (float)udot;
+    }
+    g = warp_sum_f32(g);
+    u = warp_sum_f32(u);
+    if (lane == 0u) {
+        if (store_gate_up) {
+            gate[row] = g;
+            up[row] = u;
+        }
+        float sg = g;
+        float su = u;
+        if (clamp > 1.0e-6f) {
+            sg = fminf(sg, clamp);
+            su = fminf(fmaxf(su, -clamp), clamp);
+        }
+        mid[row] = (sg / (1.0f + expf(-sg))) * su;
     }
 }
 
@@ -340,6 +571,32 @@ __global__ static void matmul_q8_0_f32_warp8_kernel(
     }
     acc = warp_sum_f32(acc);
     if (lane == 0) out[row] = acc;
+}
+
+/* One-token K-slice projection for network TP.  X is compact (or starts at
+ * x_elem_off), while each quantized weight row keeps the full matrix stride. */
+__global__ static void matmul_q8_0_f32_kslice_warp8_kernel(
+        float *out,
+        const unsigned char *w,
+        const float *x,
+        uint64_t full_blocks,
+        uint64_t block0,
+        uint64_t blocks,
+        uint64_t out_dim,
+        uint64_t x_elem_off) {
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    if (row >= out_dim) return;
+    const unsigned char *wr = w + row * full_blocks * 34u;
+    float acc = 0.0f;
+    for (uint64_t b = 0; b < blocks; b++) {
+        const unsigned char *blk = wr + (block0 + b) * 34u;
+        const float d = q8_0_scale_broadcast_w32(blk);
+        const int8_t q = ((const int8_t *)(blk + 2u))[lane];
+        acc += d * (float)q * x[x_elem_off + b * 32u + lane];
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0u) out[row] = acc;
 }
 
 __global__ static void matmul_q8_0_f32_sharedx_warp_rows_w32_kernel(
@@ -613,6 +870,50 @@ __global__ static void matmul_q8_0_f32_batch_sharedx_exact8_kernel(
     }
 }
 
+/* Tiny-batch direct variant for speculative verify rows (2..8 tokens).
+ * The shared-x tile kernel above pays two block-wide barriers per 16-block
+ * chunk with only ~17 KiB of weight reads between them; at verify row
+ * counts the whole activation set fits L2 and is reused by every row
+ * block, so reading x directly and dropping LDS entirely is faster.  One
+ * warp owns one output row with TOK accumulators; weights stream once,
+ * the per-token reduction order matches the tile kernel (blocks ascending,
+ * warp sum last). */
+template <uint32_t TOK>
+__global__ static void matmul_q8_0_f32_batch_direct_warp_rows_w32_kernel(
+        float *out,
+        const unsigned char *w,
+        const float *x,
+        uint32_t n_blocks,
+        uint32_t out_dim,
+        uint64_t row_bytes) {
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t rows_per_block = blockDim.x >> 5u;
+    const uint32_t row = blockIdx.x * rows_per_block + wave;
+    if (row >= out_dim) return;
+    const unsigned char *wr = w + (uint64_t)row * row_bytes;
+    const uint32_t in_dim = n_blocks << 5u;
+    float acc[TOK];
+#pragma unroll
+    for (uint32_t u = 0; u < TOK; u++) acc[u] = 0.0f;
+    for (uint32_t b = 0; b < n_blocks; b++) {
+        const unsigned char *blk = wr + (uint64_t)b * 34u;
+        const float d = q8_0_scale_broadcast_w32(blk);
+        const int8_t q = ((const int8_t *)(blk + 2u))[lane];
+        const float wv = d * (float)q;
+        const uint64_t kk = ((uint64_t)b << 5u) + lane;
+#pragma unroll
+        for (uint32_t u = 0; u < TOK; u++) {
+            acc[u] += wv * x[(uint64_t)u * in_dim + kk];
+        }
+    }
+#pragma unroll
+    for (uint32_t u = 0; u < TOK; u++) {
+        const float s = warp_sum_f32(acc[u]);
+        if (lane == 0u) out[(uint64_t)u * out_dim + row] = s;
+    }
+}
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
 typedef _Float16 __attribute__((ext_vector_type(16))) ds4_q8_half16_t;
 typedef float    __attribute__((ext_vector_type(8)))  ds4_q8_float8_t;

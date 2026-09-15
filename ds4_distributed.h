@@ -72,7 +72,8 @@ int ds4_dist_session_create(
         ds4_session *owner,
         int ctx_size,
         char *err,
-        size_t errlen);
+        size_t errlen,
+        ds4_dist_session *parent);
 void ds4_dist_session_free(ds4_dist_session *d);
 
 /* Returns 1 when the coordinator has full layer coverage, 0 when workers are
@@ -99,6 +100,71 @@ int ds4_dist_session_eval(
         float *logits,
         char *err,
         size_t errlen);
+
+/* Maximum rows in one multi-session decode span. */
+#define DS4_DIST_MAX_MULTI_ROWS 16u
+
+/* True when the route's worker negotiated row-batched decode spans. */
+bool ds4_dist_session_batch_cap(ds4_dist_session *d);
+
+/* DeepSeek live-prefix rewind over the route (see ds4_dist_v3.h,
+ * F_REWIND_CAPTURE / F_REWIND). Supported only on a single-worker route
+ * whose worker negotiated DS4_DIST_V3_CAP_REWIND_V1. The request_* calls
+ * arm the worker-side capture / restore for the next span that starts at
+ * `pos`; ds4_session_capture_rewind_frontier / ds4_session_rewind_frontier
+ * (ds4.c) call them after handling the coordinator's own layer slice. A
+ * request the next span cannot honor is dropped (plain rebuild path). */
+bool ds4_dist_session_rewind_supported(ds4_dist_session *d);
+bool ds4_dist_session_request_rewind_capture(ds4_dist_session *d, uint32_t pos);
+bool ds4_dist_session_request_rewind(ds4_dist_session *d, uint32_t pos);
+bool ds4_dist_session_rewind_pending(const ds4_dist_session *d);
+void ds4_dist_session_rewind_clear(ds4_dist_session *d);
+
+/* Coordinator local layer range for this dist session. */
+int ds4_dist_session_local_layers(const ds4_dist_session *d,
+                                  uint32_t *start,
+                                  uint32_t *end);
+
+/* The session's wire id (per-row ownership in batched spans). */
+uint64_t ds4_dist_session_id(const ds4_dist_session *d);
+
+/* One decode span carrying rows owned by different coordinator sessions:
+ * tokens[i] is evaluated for the session plane row_session_ids[i] with the
+ * precomputed leader-side hidden row hidden_rows + i*hidden_f32_values;
+ * logits_rows receives count × vocab f32 in row order. The owner session
+ * drives request-id sequencing and the span's timeline prefix hash. */
+int ds4_dist_eval_batch_span(
+        ds4_dist_session *owner,
+        ds4_session *owner_session,
+        const int *tokens,
+        const uint64_t *row_session_ids,
+        const float *hidden_rows,
+        uint32_t count,
+        float *logits_rows,
+        char *err,
+        size_t errlen);
+
+/* Legacy-MTP speculative decode cycle over the pipeline split.  Decodes
+ * first_token, then drafts, verifies, and commits as many follow-up tokens
+ * as the worker's MTP head and the target model agree on.  Requires the
+ * --mtp support model and --mtp-draft >= 2 on both machines; otherwise
+ * callers should use the ordinary per-token path. */
+int ds4_dist_session_mtp_spec_cycle(
+        ds4_dist_session *d,
+        ds4_session *owner,
+        int first_token,
+        int max_tokens,
+        int eos_token,
+        int *accepted,
+        int accepted_cap,
+        char *err,
+        size_t errlen);
+
+/* Print the dist speculative-decode telemetry counters accumulated by
+ * ds4_dist_session_mtp_spec_cycle.  Gated by DS4_DSPARK_STATS like the
+ * single-node DSpark stats line, so an external validator can enable both
+ * with the same env knob.  Emits nothing when no speculative cycle ran. */
+void ds4_dist_session_print_spec_stats(const ds4_dist_session *d);
 
 /* Save/load use the normal DSV4 payload format. The coordinator gathers or
  * pushes remote layer shards internally so saved files are topology-neutral.

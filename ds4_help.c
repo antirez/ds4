@@ -246,6 +246,8 @@ static void print_distributed(FILE *fp, const help_colors *c) {
     opt(fp, c, "--dist-prefill-chunk N", "Coordinator prefill pipeline chunk size. Default: session cap.");
     opt(fp, c, "--dist-prefill-window N", "Max prefill chunks in flight. Default: workers+2, capped at 8.");
     opt(fp, c, "--dist-activation-bits N", "Hidden-state transport width: 32, 16, or 8. Default: 32");
+    opt(fp, c, "--dist-transport MODE", "Bulk transport: tcp, auto, or nhi. Default: tcp.");
+    opt(fp, c, "--dist-nhi-device PATH", "Local /dev/tbstream device used by auto/nhi mode.");
     opt(fp, c, "--dist-replay-check", "Diagnostic: reset and replay prompt, then compare logits.");
     opt(fp, c, "--debug", "Print coordinator route/debug logs.");
     fputc('\n', fp);
@@ -254,7 +256,8 @@ static void print_distributed(FILE *fp, const help_colors *c) {
     para(fp, c, "Tensor parallelism uses the same coordinator/worker addresses as distributed mode, but always runs one 50/50 worker. Add --tensor-parallel, omit --layers, start the worker, then start the coordinator.");
     fputc('\n', fp);
     opt(fp, c, "--tensor-parallel", "Switch --role/--listen/--coordinator to two-machine tensor parallelism.");
-    opt(fp, c, "--transport auto|rdma|tcp", "Tensor gate transport. Default: auto");
+    opt(fp, c, "--transport auto|rdma|tcp|nhi", "Tensor gate transport. ROCm NHI requires --nhi-device. Default: auto");
+    opt(fp, c, "--nhi-device PATH", "ROCm NHI tensor-gate device, for example /run/ds4-tbstream/device.");
     opt(fp, c, "--rdma-device NAME", "Select a verbs device when auto-detection is ambiguous.");
     opt(fp, c, "--rdma-gid-index N", "Select the local verbs GID index.");
     opt(fp, c, "--tensor-parallel-token-prefill", "GLM diagnostic: prefill one token at a time for exact arithmetic.");
@@ -349,6 +352,7 @@ static void print_server_api(FILE *fp, const help_colors *c) {
     opt(fp, c, "--cors", "Add Access-Control-Allow-* headers for browser JS clients.");
     opt(fp, c, "--trace FILE", "Write prompts, cache decisions, output, and tool calls.");
     opt(fp, c, "--batched-session N", "Keep N resident sessions and batch decode-ready requests.");
+    opt(fp, c, "--prefill-quantum N", "Prefill slice when no generation is active. Default: 2048. Pipeline builds should set this to several --dist-prefill-chunk depths so the worker window stays full.");
     opt(fp, c, "--mixed-prefill-quantum N", "Prefill chunk while generations are active. Default: 128; GLM-5.3 minimum: 1024");
     para(fp, c, "Endpoints: /v1/chat/completions, /v1/responses, /v1/completions, and /v1/messages.");
     para(fp, c, "Model endpoint aliases include deepseek-v4-flash and deepseek-v4-pro; both serve the loaded GGUF.");

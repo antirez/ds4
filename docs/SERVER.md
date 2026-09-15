@@ -78,6 +78,11 @@ use the ordered fallback.
 
 Long prefills yield to active decoders in bounded intervals, normally 128
 tokens. `--mixed-prefill-quantum N` changes that interval for testing.
+`--prefill-quantum N` is the exclusive prefill slice when no generation is
+active (default 2048). Distributed pipeline serving uses that value even while
+another slot is decoding, because mixed 128-token interleave is not dist-aware.
+Set it to several `--dist-prefill-chunk` depths so `--dist-prefill-window` can
+stay full.
 Session-batched serving uses ordinary target decoding, not MTP/DSpark.
 For the eight-L40S example, see [CUDA GPUs](CUDA_MULTI_GPU.md#serve-multiple-users).
 

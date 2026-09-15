@@ -330,6 +330,49 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads,
                                                 n_tokens, window, n_head, head_dim);
     return cuda_ok(cudaGetLastError(), "attention_prefill_raw launch");
 }
+extern "C" int ds4_gpu_attention_prefill_raw_heads_range_tensor(
+        ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size,
+        uint64_t sinks_offset, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv, uint32_t q_row0, uint32_t n_q,
+        uint32_t n_kv, uint32_t window, uint32_t n_head, uint32_t head_dim) {
+    /* Row-range raw prefill attention for TP attention row splitting.  q and
+     * heads are row-range views covering [q_row0, q_row0 + n_q); raw_kv holds
+     * all n_kv rows.  The causal/window bounds use the absolute token position
+     * q_row0 + local row.  Arithmetic mirrors the full-batch entry point. */
+    if (!heads || !q || !raw_kv || !model_map || n_q == 0 || n_kv == 0 ||
+        sinks_offset > model_size ||
+        model_size - sinks_offset < (uint64_t)n_head * sizeof(float) ||
+        q_row0 > n_kv || n_q > n_kv - q_row0 ||
+        heads->bytes < (uint64_t)n_q * n_head * head_dim * sizeof(float) ||
+        q->bytes < (uint64_t)n_q * n_head * head_dim * sizeof(float) ||
+        raw_kv->bytes < (uint64_t)n_kv * head_dim * sizeof(float) ||
+        window > 256) return 0;
+    const float *sinks = (const float *)cuda_model_range_ptr(
+            model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
+    if (!sinks) return 0;
+    const uint32_t last_abs = q_row0 + n_q;
+    const uint32_t max_score = (window != 0u && window < last_abs) ? window : last_abs;
+    if (n_q > 1 && head_dim == 512 &&
+        !g_quality_mode && max_score <= 768u) {
+        dim3 grid(n_q, (n_head + 7u) / 8u, 1);
+        attention_prefill_raw_heads8_online_range_kernel<<<grid, 256>>>(
+                (float *)heads->ptr,
+                sinks,
+                (const float *)q->ptr,
+                (const float *)raw_kv->ptr,
+                q_row0, n_q, window, n_head, head_dim);
+        return cuda_ok(cudaGetLastError(), "attention raw range window launch");
+    }
+    if (window == 0u && last_abs > 256u) return 0;
+    dim3 grid(n_q, n_head, 1);
+    attention_prefill_raw_range_kernel<<<grid, 128>>>(
+            (float *)heads->ptr,
+            sinks,
+            (const float *)q->ptr,
+            (const float *)raw_kv->ptr,
+            q_row0, n_q, window, n_head, head_dim);
+    return cuda_ok(cudaGetLastError(), "attention_prefill_raw_range launch");
+}
 static int attention_decode_batch_launch(
         ds4_gpu_tensor       *heads,
         const void             *model_map,
@@ -1053,6 +1096,70 @@ extern "C" int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
     return attention_prefill_mixed_launch(heads, model_map, model_size, sinks_offset,
                                        q, raw_kv, comp_kv, NULL, 0, n_tokens,
                                        n_comp, window, ratio, n_head, head_dim);
+}
+
+extern "C" int ds4_gpu_attention_prefill_static_mixed_heads_range_tensor(
+        ds4_gpu_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        const ds4_gpu_tensor *comp_kv,
+        uint32_t                comp_kv_f16,
+        uint32_t                q_row0,
+        uint32_t                n_q,
+        uint32_t                n_tokens,
+        uint32_t                n_comp,
+        uint32_t                window,
+        uint32_t                ratio,
+        uint32_t                n_head,
+        uint32_t                head_dim) {
+    /* Row-range static-mixed prefill attention for TP attention row
+     * splitting.  q and heads are row-range views covering token positions
+     * [q_row0, q_row0 + n_q); raw_kv holds all n_tokens rows and comp_kv all
+     * n_comp rows.  Causal/window bounds and compressed-row visibility use
+     * the absolute position q_row0 + local row.  Arithmetic mirrors the
+     * full-batch scalar path (attention_prefill_mixed_kernel with no comp
+     * mask, which is what the static-mixed entry always uses). */
+    if (comp_kv_f16) return 0;
+    if (!heads || !q || !raw_kv || !model_map || n_q == 0 || ratio == 0 ||
+        (n_comp != 0 && !comp_kv) ||
+        sinks_offset > model_size ||
+        (uint64_t)n_head * sizeof(float) > model_size - sinks_offset ||
+        q_row0 > n_tokens || n_q > n_tokens - q_row0 ||
+        heads->bytes < (uint64_t)n_q * n_head * head_dim * sizeof(float) ||
+        q->bytes < (uint64_t)n_q * n_head * head_dim * sizeof(float) ||
+        raw_kv->bytes < (uint64_t)n_tokens * head_dim * sizeof(float) ||
+        (n_comp && comp_kv->bytes < (uint64_t)n_comp * head_dim * sizeof(float))) {
+        return 0;
+    }
+    const float *sinks = (const float *)cuda_model_range_ptr(
+            model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
+    if (!sinks) return 0;
+    const uint32_t last_abs = q_row0 + n_q;
+    const uint32_t max_raw = (window != 0u && window < last_abs) ? window : last_abs;
+    if ((uint64_t)max_raw + n_comp > DS4_ROCM_ATTENTION_PREFILL_MIXED_SCORE_CAP) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "attention mixed range unsupported for %llu scores "
+                "(cap=%u, q_row0=%u, n_q=%u, comp=%u, window=%u)\n",
+                (unsigned long long)((uint64_t)max_raw + n_comp),
+                DS4_ROCM_ATTENTION_PREFILL_MIXED_SCORE_CAP,
+                q_row0,
+                n_q,
+                n_comp,
+                window);
+        return 0;
+    }
+    dim3 grid(n_q, n_head, 1);
+    attention_prefill_mixed_range_kernel<<<grid, 256>>>((float *)heads->ptr,
+                                                        sinks,
+                                                        (const float *)q->ptr,
+                                                        (const float *)raw_kv->ptr,
+                                                        n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                                                        q_row0, n_q, n_tokens, n_comp,
+                                                        window, ratio, n_head, head_dim);
+    return cuda_ok(cudaGetLastError(), "attention prefill mixed range launch");
 }
 
 extern "C" int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(

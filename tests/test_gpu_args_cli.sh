@@ -8,6 +8,7 @@ cd "$(dirname "$0")/.."
 PASS=0
 FAIL=0
 LOG=$(mktemp)
+ROCM_ONLY=${DS4_TEST_ROCM:-0}
 
 ok()   { PASS=$((PASS+1)); echo "ok $1"; }
 fail() { FAIL=$((FAIL+1)); echo "FAIL $1"; }
@@ -70,11 +71,17 @@ for i in "${!BINS[@]}"; do
         assert_grep "$name --help runtime mentions --dspark-confidence" \
             "--dspark-confidence" "$LOG"
     fi
-    if [ "$name" = "ds4" ]; then
+    if [ "$name" = "ds4" ] || [ "$name" = "ds4-server" ]; then
         "$bin" --help distributed > "$LOG" 2>&1 || true
         assert_grep "$name --help distributed mentions --tensor-parallel-token-prefill" \
             "tensor-parallel-token-prefill" "$LOG"
         assert_not_grep "$name --help distributed omits old --tp spellings" "--tp-" "$LOG"
+        if [ "$ROCM_ONLY" = "1" ]; then
+            assert_grep "$name --help distributed mentions --transport" \
+                "--transport" "$LOG"
+            assert_grep "$name --help distributed mentions --nhi-device" \
+                "--nhi-device" "$LOG"
+        fi
     fi
 done
 
@@ -412,6 +419,34 @@ if [ -x ./ds4-agent ]; then
     rm -f "$PROMPT_FILE"
 fi
 
+# The server must own the same TP parser and lifecycle as the CLI. These
+# probes stop before model loading or at the intentionally invalid model, so
+# they need no accelerator or peer.
+if [ -x ./ds4-server ]; then
+    ./ds4-server --tensor-parallel --role worker -m /dev/null > "$LOG" 2>&1
+    rc=$?
+    if [ $rc -ne 0 ] &&
+       grep -q "requires --coordinator HOST PORT" "$LOG" &&
+       ! grep -q "unknown option" "$LOG"; then
+        ok "ds4-server tensor-parallel worker requires coordinator address"
+    else
+        fail "ds4-server rejected tensor-parallel worker in option parsing"
+        head -10 "$LOG" | sed 's/^/    /'
+    fi
+
+    ./ds4-server --metal --tensor-parallel --role coordinator \
+        --listen 127.0.0.1 9911 --transport tcp -m /dev/null > "$LOG" 2>&1
+    rc=$?
+    if [ $rc -ne 0 ] &&
+       grep -qE "model file is too small|another ds4 process is already running" "$LOG" &&
+       ! grep -q "unknown option" "$LOG"; then
+        ok "ds4-server tensor-parallel leader reaches model loading"
+    else
+        fail "ds4-server tensor-parallel leader did not reach model loading"
+        head -10 "$LOG" | sed 's/^/    /'
+    fi
+fi
+
 # 7: --gpu-vram 40,12 layout line.
 if [ -x ./ds4 ]; then
     ./ds4 --gpu-vram 40,12 -m /dev/null > "$LOG" 2>&1
@@ -422,6 +457,35 @@ if [ -x ./ds4 ]; then
         fail "ds4 --gpu-vram 40,12 missing or malformed layout line"
         head -10 "$LOG" | sed 's/^/    /'
     fi
+fi
+
+# 8: the singleton lock must never follow or truncate a pathname-selected
+# target. Both probes fail before model loading and preserve the sentinel.
+if [ -x ./ds4 ]; then
+    LOCK_DIR=$(mktemp -d)
+    LOCK_TARGET="$LOCK_DIR/target"
+    LOCK_PATH="$LOCK_DIR/ds4.lock"
+    printf 'lock-sentinel\n' > "$LOCK_TARGET"
+
+    ln -s "$LOCK_TARGET" "$LOCK_PATH"
+    DS4_LOCK_FILE="$LOCK_PATH" ./ds4 -m /dev/null > "$LOG" 2>&1
+    rc=$?
+    if [ $rc -ne 0 ] && [ "$(cat "$LOCK_TARGET")" = "lock-sentinel" ]; then
+        ok "ds4 lock rejects a symlink without truncating its target"
+    else
+        fail "ds4 lock followed or modified a symlink target"
+    fi
+
+    rm -f "$LOCK_PATH"
+    ln "$LOCK_TARGET" "$LOCK_PATH"
+    DS4_LOCK_FILE="$LOCK_PATH" ./ds4 -m /dev/null > "$LOG" 2>&1
+    rc=$?
+    if [ $rc -ne 0 ] && [ "$(cat "$LOCK_TARGET")" = "lock-sentinel" ]; then
+        ok "ds4 lock rejects a multiply-linked file without truncation"
+    else
+        fail "ds4 lock accepted or modified a multiply-linked file"
+    fi
+    rm -rf "$LOCK_DIR"
 fi
 
 rm -f "$LOG"
