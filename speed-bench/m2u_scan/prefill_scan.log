@@ -1,0 +1,29 @@
+
+### chunk=2048 | 05:43:06
+ds4-bench: context buffers 966.14 MiB (ctx=65665, backend=metal, prefill_chunk=2048, raw_kv_rows=2304, compressed_kv_rows=16418)
+### done chunk=2048 rc=0 | 05:50:04
+
+### chunk=3072 | 05:50:04
+ds4-bench: context buffers 1180.91 MiB (ctx=65665, backend=metal, prefill_chunk=3072, raw_kv_rows=3328, compressed_kv_rows=16418)
+### done chunk=3072 rc=0 | 05:57:10
+
+### chunk=4096 | 05:57:10
+ds4-bench: context buffers 1395.67 MiB (ctx=65665, backend=metal, prefill_chunk=4096, raw_kv_rows=4352, compressed_kv_rows=16418)
+### done chunk=4096 rc=0 | 06:04:09
+
+### chunk=6144 | 06:04:09
+ds4-bench: context buffers 1825.20 MiB (ctx=65665, backend=metal, prefill_chunk=6144, raw_kv_rows=6400, compressed_kv_rows=16418)
+### done chunk=6144 rc=0 | 06:11:08
+
+### chunk=8192 | 06:11:08
+ds4-bench: context buffers 2233.23 MiB (ctx=65665, backend=metal, prefill_chunk=8192, raw_kv_rows=8192, compressed_kv_rows=16418)
+### done chunk=8192 rc=0 | 06:18:08
+
+### chunk=12288 | 06:18:08
+ds4-bench: context buffers 2748.30 MiB (ctx=65665, backend=metal, prefill_chunk=12288, raw_kv_rows=8192, compressed_kv_rows=16418)
+### done chunk=12288 rc=0 | 06:25:09
+
+### chunk=16384 | 06:25:09
+ds4-bench: context buffers 3263.36 MiB (ctx=65665, backend=metal, prefill_chunk=16384, raw_kv_rows=8192, compressed_kv_rows=16418)
+### done chunk=16384 rc=0 | 06:32:12
+==== PREFILL SCAN COMPLETE Sun Aug 30 06:32:12 CST 2026 ====
