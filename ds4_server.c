@@ -14901,11 +14901,15 @@ static bool send_models(server *s, int fd) {
         buf_putc(&b, ',');
         append_model_json(&b, s, "qwen3.8-flash-next-reasoner");
     } else if (ds4_engine_is_glm_dsa(s->engine)) {
-        append_model_json(&b, s, "glm-5.2");
+        const char *base = server_model_id_from_engine(s->engine);
+        char variant[64];
+        append_model_json(&b, s, base);
         buf_putc(&b, ',');
-        append_model_json(&b, s, "glm-5.2-chat");
+        snprintf(variant, sizeof(variant), "%s-chat", base);
+        append_model_json(&b, s, variant);
         buf_putc(&b, ',');
-        append_model_json(&b, s, "glm-5.2-reasoner");
+        snprintf(variant, sizeof(variant), "%s-reasoner", base);
+        append_model_json(&b, s, variant);
     } else {
         append_model_json(&b, s, "deepseek-v4-flash");
         buf_putc(&b, ',');
