@@ -1,0 +1,362 @@
+/* Exercise the real store/eviction/codec paths without loading a model. Only
+ * the engine boundary is replaced: snapshots contain a deterministic payload. */
+#include <errno.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+static int fail_rename, fail_alloc, stray_errno;
+static int test_rename(const char *from, const char *to) {
+    if (fail_rename) { errno = EACCES; return -1; }
+    return rename(from, to);
+}
+static void *test_malloc(size_t n) {
+    if (fail_alloc && n >= (8u << 20)) {
+        fail_alloc = 0;
+        errno = ENOMEM;
+        return NULL;
+    }
+    void *p = malloc(n);
+    /* Successful library calls may still change errno; classification of a
+     * corrupt payload must not depend on it staying zero. */
+    if (p && stray_errno) errno = EAGAIN;
+    return p;
+}
+/* Stream failures inside the codec: mode 1 fails the framing read, mode 2 the
+ * first chunk record, mode 3 the first compressed block. */
+static int io_fail_mode, io_fail_hit, io_read12, fail_tmpfile;
+static size_t test_fread(void *p, size_t size, size_t nmemb, FILE *fp) {
+    const size_t bytes = size * nmemb;
+    if (io_fail_mode && !io_fail_hit) {
+        const bool record = bytes == 12;
+        if (record) io_read12++;
+        if ((io_fail_mode == 1 && record && io_read12 == 1) ||
+            (io_fail_mode == 2 && record && io_read12 == 2) ||
+            (io_fail_mode == 3 && !record && io_read12 == 2))
+        {
+            io_fail_hit = 1;
+            errno = EIO;
+            return 0;
+        }
+    }
+    return fread(p, size, nmemb, fp);
+}
+static int test_ferror(FILE *fp) { return io_fail_hit ? 1 : ferror(fp); }
+static FILE *test_tmpfile(void) {
+    if (fail_tmpfile) { errno = ENOSPC; return NULL; }
+    return tmpfile();
+}
+#define rename test_rename
+#define malloc test_malloc
+#define fread test_fread
+#define ferror test_ferror
+#define tmpfile test_tmpfile
+#define ds4_engine_model_id test_model_id
+#define ds4_engine_routed_quant_bits test_quant_bits
+#define ds4_session_ctx test_ctx
+#define ds4_session_tokens test_tokens
+#define ds4_session_stage_payload test_stage
+#define ds4_session_load_payload test_load
+#define ds4_session_invalidate test_invalidate
+#include "../ds4_kvstore.c"
+#undef rename
+#undef malloc
+#undef fread
+#undef ferror
+#undef tmpfile
+#include <assert.h>
+
+static int token_ids[128];
+static ds4_tokens tokens = {.v = token_ids, .len = 128, .cap = 128};
+static int load_errno, load_calls, invalidated, load_silent;
+static bool random_payload;
+static const uint64_t payload_size = 8u << 20;
+
+int test_model_id(ds4_engine *e) { (void)e; return 1; }
+int test_quant_bits(ds4_engine *e) { (void)e; return 2; }
+int test_ctx(ds4_session *s) { (void)s; return 65536; }
+const ds4_tokens *test_tokens(ds4_session *s) { (void)s; return &tokens; }
+void test_invalidate(ds4_session *s) { (void)s; invalidated++; }
+int test_stage(ds4_session *s, ds4_session_payload_file *out, char *err, size_t errlen) {
+    (void)s; (void)err; (void)errlen;
+    char path[] = "/tmp/ds4-lz4-stage-XXXXXX";
+    int fd = mkstemp(path);
+    assert(fd >= 0);
+    FILE *fp = fdopen(fd, "wb");
+    assert(fp);
+    uint8_t buf[65536] = {0};
+    uint64_t rng = 186;
+    for (uint64_t off = 0; off < payload_size; off += sizeof(buf)) {
+        if (random_payload) {
+            for (size_t i = 0; i < sizeof(buf); i++) {
+                rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+                buf[i] = (uint8_t)(rng >> 33);
+            }
+        }
+        assert(fwrite(buf, 1, sizeof(buf), fp) == sizeof(buf));
+    }
+    assert(fclose(fp) == 0);
+    out->path = strdup(path);
+    out->bytes = payload_size;
+    return 0;
+}
+int test_load(ds4_session *s, FILE *fp, uint64_t bytes, char *err, size_t errlen) {
+    (void)s;
+    load_calls++;
+    if (load_errno) { errno = load_errno; snprintf(err, errlen, "injected resource failure"); return 1; }
+    /* Engine and GPU failures often report no errno at all. */
+    if (load_silent) { snprintf(err, errlen, "injected silent engine failure"); return 1; }
+    assert(bytes == payload_size);
+    uint8_t buf[65536];
+    uint64_t rng = 186;
+    while (bytes) {
+        size_t n = bytes < sizeof(buf) ? (size_t)bytes : sizeof(buf);
+        /* A real engine may leave errno from the failed stream read; codec
+         * corruption must still be classified by the reader, not errno. */
+        if (fread(buf, 1, n, fp) != n) { errno = EIO; return 1; }
+        /* Every byte the engine receives must be the byte that was staged. */
+        for (size_t i = 0; i < n; i++) {
+            uint8_t want = 0;
+            if (random_payload) {
+                rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+                want = (uint8_t)(rng >> 33);
+            }
+            assert(buf[i] == want);
+        }
+        bytes -= n;
+    }
+    return 0;
+}
+
+static char *entry_path(ds4_kvstore *kc, const char *text) {
+    char sha[41];
+    ds4_kvstore_sha1_bytes_hex(text, strlen(text), sha);
+    return ds4_kvstore_path_for_sha(kc, sha);
+}
+
+/* A structurally valid existing file is enough to exercise eviction; loading
+ * its model payload is deliberately outside this fixture's purpose. */
+static char *seed_entry(ds4_kvstore *kc, const char *text, uint64_t size) {
+    char *path = entry_path(kc, text);
+    FILE *fp = fopen(path, "wb");
+    assert(fp);
+    uint8_t h[DS4_KVSTORE_FIXED_HEADER], tb[4];
+    ds4_kvstore_fill_header(h, 1, 2, DS4_KVSTORE_REASON_COLD, 0, 0, 0,
+                            128, 100, 65536, 1, 1, size - sizeof(h) - 4 - strlen(text));
+    ds4_kvstore_le_put32(tb, (uint32_t)strlen(text));
+    assert(fwrite(h, 1, sizeof(h), fp) == sizeof(h));
+    assert(fwrite(tb, 1, 4, fp) == 4);
+    assert(fwrite(text, 1, strlen(text), fp) == strlen(text));
+    assert(fseeko(fp, (off_t)size - 1, SEEK_SET) == 0 && fputc(0, fp) != EOF);
+    assert(fclose(fp) == 0);
+    return path;
+}
+
+static bool store(ds4_kvstore *kc, const ds4_kvstore_trailer_hooks *hooks) {
+    char err[160] = {0};
+    return ds4_kvstore_store_live_prefix_text(kc, NULL, NULL, &tokens, 128,
+            "cold", "incoming checkpoint", 0, NULL, hooks, err, sizeof(err));
+}
+
+static bool fail_trailer(void *ud, FILE *fp, const char *text, uint64_t *bytes) {
+    (void)ud; (void)fp; (void)text; (void)bytes;
+    errno = ENOSPC;
+    return false;
+}
+
+static int header_byte(const char *path, long off) {
+    FILE *fp = fopen(path, "rb");
+    assert(fp && fseek(fp, off, SEEK_SET) == 0);
+    const int c = fgetc(fp);
+    assert(fclose(fp) == 0);
+    return c;
+}
+
+static void run_case(const char *name) {
+    char dir[] = "/tmp/ds4-lz4-store-XXXXXX";
+    assert(mkdtemp(dir));
+    ds4_kvstore kc;
+    ds4_kvstore_options opt = ds4_kvstore_default_options();
+    opt.min_tokens = 1;
+    opt.compression_threads = 1;
+    assert(ds4_kvstore_open(&kc, dir, 10, false, opt, "test", NULL, NULL));
+    char *old = seed_entry(&kc, "older checkpoint", 3u << 20);
+    char *incoming = entry_path(&kc, "incoming checkpoint");
+    if (!strcmp(name, "admission")) {
+        kc.budget_bytes = 4u << 20;
+        assert(store(&kc, NULL));
+        assert(access(old, F_OK) == 0 && access(incoming, F_OK) == 0);
+    } else if (!strcmp(name, "eviction")) {
+        assert(store(&kc, NULL));
+        assert(access(old, F_OK) == 0 && access(incoming, F_OK) == 0);
+        assert(header_byte(incoming, 3) == 2 && header_byte(incoming, 21) == DS4_KVSTORE_CODEC_LZ4);
+        assert(header_byte(old, 3) == 1);
+    } else if (!strcmp(name, "publish-failure")) {
+        fail_rename = 1;
+        assert(!store(&kc, NULL));
+        fail_rename = 0;
+        assert(access(old, F_OK) == 0 && access(incoming, F_OK) != 0);
+    } else if (!strcmp(name, "write-failure")) {
+        ds4_kvstore_trailer_hooks hooks = {.write = fail_trailer};
+        assert(!store(&kc, &hooks));
+        assert(access(old, F_OK) == 0 && access(incoming, F_OK) != 0);
+    } else if (!strcmp(name, "raw-fallback-budget")) {
+        kc.budget_bytes = 4u << 20;
+        fail_alloc = 1;
+        assert(!store(&kc, NULL));
+        assert(fail_alloc == 0);
+        assert(access(old, F_OK) == 0 && access(incoming, F_OK) != 0);
+    } else if (!strcmp(name, "incompressible-raw")) {
+        /* LZ4 would expand the payload, so it is stored raw with no encoded
+         * bytes left behind, and loads back byte for byte. */
+        random_payload = true;
+        assert(store(&kc, NULL));
+        assert(header_byte(incoming, 3) == 1 && header_byte(incoming, 21) == DS4_KVSTORE_CODEC_NONE);
+        struct stat st;
+        assert(stat(incoming, &st) == 0);
+        assert((uint64_t)st.st_size == 52 + strlen("incoming checkpoint") + payload_size);
+        kv_cache_refresh(&kc);
+        assert(ds4_kvstore_try_load_text(&kc, NULL, NULL, "incoming checkpoint", NULL, NULL, NULL, false) == 128);
+        random_payload = false;
+    } else if (!strcmp(name, "protect-published")) {
+        kc.opt.compression_threads = 0;
+        assert(store(&kc, NULL));
+        assert(access(old, F_OK) != 0 && access(incoming, F_OK) == 0);
+        assert(header_byte(incoming, 3) == 1 && header_byte(incoming, 21) == DS4_KVSTORE_CODEC_NONE);
+    } else if (!strcmp(name, "payload-past-eof")) {
+        /* The header's payload size is checked against the file before any
+         * seek or engine read; UINT64_MAX would also overflow the seek. */
+        FILE *fp = tmpfile();
+        assert(fp);
+        const uint8_t junk[64] = {0};
+        assert(fwrite(junk, 1, sizeof(junk), fp) == sizeof(junk));
+        const uint64_t sizes[] = {sizeof(junk) - 8 + 1, UINT64_MAX};
+        const uint8_t codecs[] = {DS4_KVSTORE_CODEC_NONE, DS4_KVSTORE_CODEC_LZ4};
+        for (int ci = 0; ci < 2; ci++) {
+            for (int si = 0; si < 2; si++) {
+                char err[160] = {0};
+                assert(fseek(fp, 8, SEEK_SET) == 0);
+                load_calls = 0;
+                assert(ds4_kvstore_load_payload_region(NULL, fp, codecs[ci], sizes[si],
+                        DS4_KVSTORE_DEFAULT_CHUNK_BYTES, 1, err, sizeof(err))
+                       == DS4_KVSTORE_LOAD_CORRUPT);
+                assert(load_calls == 0);
+            }
+        }
+        assert(fclose(fp) == 0);
+    } else if (!strcmp(name, "legacy-codec")) {
+        /* The unreleased unchecksummed layout can never be read or evicted, so
+         * refreshing the index removes it.  Any other unknown codec is left. */
+        assert(store(&kc, NULL));
+        FILE *fp = fopen(incoming, "r+b");
+        assert(fp && fseek(fp, 21, SEEK_SET) == 0 && fputc(1, fp) != EOF);
+        assert(fclose(fp) == 0);
+        kv_cache_refresh(&kc);
+        assert(access(incoming, F_OK) != 0);
+        assert(store(&kc, NULL));
+        kv_cache_refresh(&kc);
+        assert(ds4_kvstore_try_load_text(&kc, NULL, NULL, "incoming checkpoint", NULL, NULL, NULL, false) == 128);
+        fp = fopen(incoming, "r+b");
+        assert(fp && fseek(fp, 21, SEEK_SET) == 0 && fputc(7, fp) != EOF);
+        assert(fclose(fp) == 0);
+        kv_cache_refresh(&kc);
+        assert(access(incoming, F_OK) == 0);
+    } else if (!strcmp(name, "replace-failure") || !strcmp(name, "replace-success")) {
+        free(seed_entry(&kc, "incoming checkpoint", 3u << 20));
+        FILE *fp = fopen(incoming, "r+b");
+        assert(fp && fseek(fp, 7, SEEK_SET) == 0);
+        assert(fputc(2, fp) == 2 && fclose(fp) == 0); /* Different model. */
+        fail_rename = !strcmp(name, "replace-failure");
+        assert(store(&kc, NULL) == !fail_rename);
+        fp = fopen(incoming, "rb");
+        assert(fp && fseek(fp, 7, SEEK_SET) == 0);
+        assert(fgetc(fp) == (fail_rename ? 2 : 1));
+        assert(fclose(fp) == 0 && access(old, F_OK) == 0);
+        fail_rename = 0;
+    } else {
+        assert(store(&kc, NULL));
+        if (!strcmp(name, "corrupt-recovery")) {
+            FILE *fp = fopen(incoming, "r+b");
+            assert(fp);
+            uint8_t total[8];
+            kv_le_put64(total, payload_size + DS4_KVSTORE_DEFAULT_CHUNK_BYTES);
+            assert(fseeko(fp, 52 + strlen("incoming checkpoint"), SEEK_SET) == 0);
+            assert(fwrite(total, 1, 8, fp) == 8 && fclose(fp) == 0);
+        } else if (!strcmp(name, "checksum-recovery")) {
+            /* Perturb only chunk 0's checksum: the block still decodes to the
+             * right length, so only the integrity check can reject it. */
+            FILE *fp = fopen(incoming, "r+b");
+            assert(fp);
+            const off_t sum_at = (off_t)(52 + strlen("incoming checkpoint") + 12 + 8);
+            assert(fseeko(fp, sum_at, SEEK_SET) == 0);
+            const int c = fgetc(fp);
+            assert(c != EOF && fseeko(fp, sum_at, SEEK_SET) == 0 && fputc(c ^ 0x5a, fp) != EOF);
+            assert(fclose(fp) == 0);
+        } else if (!strcmp(name, "load-oom")) {
+            fail_alloc = 1;
+        } else if (!strcmp(name, "engine-oom")) {
+            load_errno = ENOMEM;
+        } else if (!strcmp(name, "engine-io")) {
+            load_errno = EIO;
+        } else if (!strcmp(name, "engine-silent")) {
+            load_silent = 1;
+        } else if (!strcmp(name, "stream-io-framing") || !strcmp(name, "stream-io-record") ||
+                   !strcmp(name, "stream-io-block")) {
+            io_fail_mode = !strcmp(name, "stream-io-framing") ? 1 :
+                           !strcmp(name, "stream-io-record") ? 2 : 3;
+            io_read12 = io_fail_hit = 0;
+        } else if (!strcmp(name, "tmpfile-failure")) {
+            fail_tmpfile = 1;
+        } else { assert(!"unknown case"); }
+        kv_cache_refresh(&kc);
+        load_calls = invalidated = 0;
+        stray_errno = !strcmp(name, "corrupt-recovery") || !strcmp(name, "checksum-recovery");
+        assert(ds4_kvstore_try_load_text(&kc, NULL, NULL, "incoming checkpoint", NULL, NULL, NULL, false) == 0);
+        stray_errno = 0;
+        if (io_fail_mode) assert(io_fail_hit == 1);
+        assert(invalidated == 1);
+        if (!strcmp(name, "corrupt-recovery") || !strcmp(name, "checksum-recovery")) {
+            /* With cookie streams the engine starts reading before the bad
+             * chunk surfaces; the file fallback decodes first. */
+            const int expect_calls = strcmp(name, "checksum-recovery") ? 0
+                                     : (KV_LZ4_HAVE_FWRAP ? 1 : 0);
+            assert(load_calls == expect_calls && access(incoming, F_OK) != 0);
+            assert(store(&kc, NULL));
+            kv_cache_refresh(&kc);
+            assert(ds4_kvstore_try_load_text(&kc, NULL, NULL, "incoming checkpoint", NULL, NULL, NULL, false) == 128);
+        } else {
+            assert(access(incoming, F_OK) == 0);
+        }
+        fail_alloc = load_errno = load_silent = io_fail_mode = io_fail_hit = io_read12 = fail_tmpfile = 0;
+        assert(ds4_kvstore_try_load_text(&kc, NULL, NULL, "incoming checkpoint",
+                                        NULL, NULL, NULL, false) == 128);
+    }
+    DIR *dp = opendir(dir);
+    assert(dp);
+    struct dirent *de;
+    while ((de = readdir(dp))) {
+        if (de->d_name[0] == '.') continue;
+        assert(strstr(de->d_name, ".tmp.") == NULL);
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/%s", dir, de->d_name);
+        assert(unlink(path) == 0);
+    }
+    closedir(dp);
+    ds4_kvstore_close(&kc);
+    assert(rmdir(dir) == 0);
+    free(old); free(incoming);
+    printf("  %s: PASS\n", name);
+}
+
+int main(int argc, char **argv) {
+    if (argc == 2) { run_case(argv[1]); return 0; }
+    const char *cases[] = {"admission", "eviction", "publish-failure", "write-failure",
+        "raw-fallback-budget", "incompressible-raw", "protect-published", "payload-past-eof", "legacy-codec",
+        "corrupt-recovery", "checksum-recovery",
+        "load-oom", "engine-oom", "engine-io", "engine-silent",
+        "stream-io-framing", "stream-io-record", "stream-io-block", "replace-failure", "replace-success"};
+    for (size_t i = 0; i < sizeof(cases) / sizeof(*cases); i++) run_case(cases[i]);
+    /* Only the no-cookie build decodes through a temporary file. */
+    if (!KV_LZ4_HAVE_FWRAP) run_case("tmpfile-failure");
+    printf("Disk KV store%s: PASS\n", KV_LZ4_HAVE_FWRAP ? "" : ", no cookie streams");
+    return 0;
+}
