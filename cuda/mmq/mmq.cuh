@@ -7,6 +7,38 @@
 #include <climits>
 #include <cstdint>
 
+#if defined(GGML_USE_HIP)
+#include <cstdint>
+#include <cstddef>
+#if defined(__HIPCC__)
+#define DS4_MMQ_COMPACT_HD __host__ __device__
+#else
+#define DS4_MMQ_COMPACT_HD
+#endif
+namespace ds4_mmq_compact {
+constexpr uint32_t experts = 384, routes = 2048 * 6, tile = 64;
+constexpr uint32_t capacity = (routes + tile - 1) / tile + experts - 1;
+struct Entry { uint32_t expert, column_tile; };
+struct List { uint32_t count, status; Entry entries[capacity]; };
+static_assert(capacity == 575 && sizeof(List) == 4608, "fixed complete list extent");
+// Exact shared host/device prefix routine; bounded counts never overflow.
+DS4_MMQ_COMPACT_HD inline uint32_t prefix(const int32_t *bounds, uint32_t *out) {
+    out[0] = 0;
+    if (bounds[0] != 0 || bounds[experts] != (int32_t)routes) return 1;
+    for (uint32_t e = 0; e < experts; e++) {
+        const int32_t lo = bounds[e], hi = bounds[e + 1];
+        if (lo < 0 || hi < lo || hi > (int32_t)routes || hi - lo > 2048) return 2;
+        const uint32_t n = ((uint32_t)(hi - lo) + tile - 1) / tile;
+        out[e + 1] = out[e] + n;
+        if (out[e + 1] > capacity) return 3;
+    }
+    return 0;
+}
+}
+#undef DS4_MMQ_COMPACT_HD
+
+#endif
+
 using namespace ggml_cuda_mma;
 
 #define MMQ_DP4A_MAX_BATCH_SIZE 64 // Max. batch size to use for dp4a MMQ kernels when FP16 tensor cores are available.
@@ -4238,6 +4270,112 @@ static __global__ void mul_mat_q_stream_k_fixup(
     }
 }
 
+#if defined(GGML_USE_HIP)
+template <ggml_type type, int mmq_x, bool need_check>
+#if defined(RDNA4) || defined(RDNA3) || defined(RDNA2) || defined(CDNA) || defined(GCN)
+    __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), 2)
+#endif // defined(RDNA4) || defined(RDNA3) || defined(RDNA2) || defined(CDNA) || defined(GCN)
+static __global__ void ds4_mmq_compact_mul_mat_q(
+        const char * __restrict__ x, const int * __restrict__ y, const int32_t * __restrict__ ids_dst,
+        const int32_t * __restrict__ expert_bounds, float * __restrict__ dst, float * __restrict__ tmp_fixup,
+        const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
+        const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
+        const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
+        const uint3 ntx, const char * __restrict__ x_soa, const int64_t soa_blocks, const ds4_mmq_compact::List * __restrict__ compact) {
+    static_assert(type==GGML_TYPE_IQ2_XXS && mmq_x==64,"gfx1151 compact tile");
+    if (compact->status || blockIdx.y >= compact->count) return;
+    const ds4_mmq_compact::Entry compact_entry=compact->entries[blockIdx.y];
+
+    // Skip unused template specializations for faster compilation:
+    if (mmq_x > get_mmq_x_max_device() || mmq_x % mmq_get_granularity_device(mmq_x) != 0) {
+        NO_DEVICE_CODE;
+        return;
+    }
+
+    constexpr int nwarps = mmq_get_nwarps_device();
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+
+    constexpr int mmq_y = get_mmq_y_device();
+
+    // Initialize the ids for writing back data with just the index.
+    // For regular matrix multiplications this is never changed.
+    // For MoE the correct indices are loaded from ids_dst.
+    extern __shared__ int ids_dst_shared[]; // Stored at beginning of shared memory.
+#pragma unroll
+    for (int j0 = 0; j0 < mmq_x; j0 += nwarps*warp_size) {
+        const int j = j0 + threadIdx.y*warp_size + threadIdx.x;
+
+        if (j0 + nwarps*warp_size > mmq_x && j >= mmq_x) {
+            break;
+        }
+
+        ids_dst_shared[j] = j;
+    }
+    __syncthreads();
+
+    // This gfx1151-only admission uses conventional tiling.
+    {
+        const int wt = 0;
+        const int zt = compact_entry.expert;
+        const int jt = compact_entry.column_tile;
+        const int it = blockIdx.x;
+
+        // Defaults for regular matrix multiplication:
+        int col_low    = 0;
+        int col_high   = ncols_dst;
+        int col_diff   = ncols_dst;
+        int offset_y   = wt*stride_sample_y   + zt*stride_channel_y;
+        int offset_dst = wt*stride_sample_dst + zt*stride_channel_dst + jt*mmq_x*stride_col_dst;
+
+        if (ids_dst) {
+            col_low  = expert_bounds[zt + 0];
+            col_high = expert_bounds[zt + 1];
+            col_diff = col_high - col_low;
+
+            offset_y   = 0;
+            offset_dst = 0;
+
+            if (jt*mmq_x >= col_diff) {
+                return;
+            }
+
+            // __syncthreads(); // There is no previous tile that could cause a race condition.
+#pragma unroll
+            for (int j0 = 0; j0 < mmq_x; j0 += nwarps*warp_size) {
+                const int j = j0 + threadIdx.y*warp_size + threadIdx.x;
+
+                if (j0 + nwarps*warp_size > mmq_x && j >= mmq_x) {
+                    break;
+                }
+
+                // ds4 (S1.1a): the final column tile of an expert is partial
+                // when col_diff % mmq_x != 0; reading all mmq_x lanes over-reads
+                // ids_dst past col_high (OOB for the last expert -- confirmed by
+                // compute-sanitizer memcheck).  These lanes are masked out of
+                // write-back (tile_y_max_j), so clamp the read to valid columns.
+                const int j_col = jt*mmq_x + j;
+                ids_dst_shared[j] = j_col < col_diff ? ids_dst[col_low + j_col] : 0;
+            }
+            __syncthreads();
+        }
+
+        offset_y   += (col_low + jt*mmq_x)*(sizeof(block_q8_1_mmq)/sizeof(int));
+        offset_dst += it*mmq_y;
+
+        const int tile_x_max_i = nrows_x  - it*mmq_y - 1;
+        const int tile_y_max_j = col_diff - jt*mmq_x - 1;
+
+        const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*mmq_y*stride_row_x;
+
+        constexpr bool fixup = false;
+        mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
+            (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
+             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z, x_soa, soa_blocks);
+        return;
+    }
+}
+#endif
+
 struct mmq_args {
     const char * x; ggml_type type_x; const int * y; const int32_t * ids_dst; const int32_t * expert_bounds; float * dst;
     int64_t ncols_x; int64_t nrows_x; int64_t ncols_dst; int64_t stride_row_x; int64_t ncols_y; int64_t nrows_dst;
@@ -4249,6 +4387,10 @@ struct mmq_args {
     // ignored; soa_blocks = pair count (Q2_K) or block count (IQ2_XXS).
     // Trailing fields so existing aggregate initializers value-init them.
     const char * x_soa; int64_t soa_blocks;
+#if defined(GGML_USE_HIP)
+    const ds4_mmq_compact::List * compact_list = nullptr;
+#endif
+
 };
 
 template<ggml_type type>
@@ -4293,6 +4435,26 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const uint3 nsamples_y_fd      = init_fastdiv_values(args.nsamples_y);
     const uint3 channel_ratio_fd   = init_fastdiv_values(channel_ratio);
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
+
+#if defined(GGML_USE_HIP)
+    if (args.compact_list) {
+        if constexpr (type == GGML_TYPE_IQ2_XXS && mmq_x == 64) {
+            GGML_ASSERT(cc == GGML_CUDA_CC_OFFSET_AMD+0x1151 && mmq_y==64 &&
+                        args.nrows_x==2304 && args.ncols_x==5120 && args.ncols_max==2048 &&
+                        args.nchannels_x==384 && args.nchannels_y==384 && args.nsamples_y==1 &&
+                        args.ids_dst && args.expert_bounds && !args.use_stream_k && !args.x_soa);
+            CUDA_SET_SHARED_MEMORY_LIMIT((ds4_mmq_compact_mul_mat_q<type,64,false>), nbytes_shared);
+            ds4_mmq_compact_mul_mat_q<type,64,false><<<dim3(nty,ds4_mmq_compact::capacity,1),block_dims,nbytes_shared,stream>>>
+                (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr,
+                 blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+                 channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+                 sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+                 ntx_fd, args.x_soa, args.soa_blocks, args.compact_list);
+        } else { GGML_ASSERT(false && "unexpected compact tile selection"); }
+        return;
+    }
+
+#endif
 
     if (!args.use_stream_k) {
         if (args.nrows_x % mmq_y == 0) {

@@ -111,6 +111,7 @@ typedef enum {
     DS4_TP_TRANSPORT_AUTO = 0,
     DS4_TP_TRANSPORT_RDMA,
     DS4_TP_TRANSPORT_TCP,
+    DS4_TP_TRANSPORT_USB4STREAM,
 } ds4_tp_transport;
 
 typedef struct {
@@ -122,8 +123,10 @@ typedef struct {
     int leader_port;
     ds4_tp_transport transport;
     const char *rdma_device;
+    int rdma_port;              /* Linux RoCE port; zero selects port 1 */
     int rdma_gid_index;
     bool rdma_gid_index_set;
+    const char *usb4stream_device; /* configured /dev/tbstreamX; Linux ROCm */
     bool glm_token_prefill;
     int debug_hash;             /* cross-check hidden state every N tokens */
 } ds4_tp_options;

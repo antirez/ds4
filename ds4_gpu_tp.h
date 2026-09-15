@@ -12,7 +12,8 @@ extern "C" {
 
 /* Metal queues each gate on its service thread and orders GPU arrival/release
  * with events or flags. CUDA waits for its local stream and calls the exchange
- * synchronously. Callbacks return nonzero on success; both ranks must issue
+ * synchronously. ROCm queues gates on its service thread using coherent
+ * arrival/release flags and a guarded GPU consumer. Callbacks return nonzero on success; both ranks must issue
  * the same gate sequence. Shutdown precedes transport/slab destruction. */
 typedef int (*ds4_gpu_tp_exchange_fn)(void *ud, uint32_t layer, uint32_t gate, uint64_t seq);
 typedef int (*ds4_gpu_tp_batch_exchange_fn)(void *ud, uint32_t layer,
@@ -50,6 +51,23 @@ void ds4_gpu_tp_keepalive_pause(int paused);
 /* GLM attention head ownership; the caller zeros unowned heads and exchanges
  * the output-projection partials at the big gate. */
 void ds4_gpu_tp_set_attn_head_split(int enabled);
+
+#if defined(DS4_ROCM_BUILD) || defined(__HIP_PLATFORM_AMD__)
+/* Split the bulk arrival from its wait so independent compute may overlap. */
+int ds4_gpu_tp_big_gate_overlap_supported(void);
+int ds4_gpu_tp_big_gate_begin(uint32_t layer, uint32_t rows,
+                            const ds4_gpu_tensor *out_t,
+                            ds4_gpu_tensor *in_t, uint64_t bytes);
+int ds4_gpu_tp_big_gate_join(uint32_t layer, uint32_t rows,
+                           ds4_gpu_tensor *in_t, uint64_t bytes);
+/* Fail the gate and drain GPU users before releasing private scratch. */
+void ds4_gpu_tp_big_gate_abort(void);
+/* Host-coherent slab allocation; views preserve host/device aliases. */
+ds4_gpu_tensor *ds4_gpu_tensor_alloc_coherent(uint64_t bytes);
+/* Release the queue slot after reduction; skip peer data after failure. */
+int ds4_gpu_tp_add_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *a,
+                         const ds4_gpu_tensor *b, uint32_t n);
+#endif
 
 #ifdef __cplusplus
 }

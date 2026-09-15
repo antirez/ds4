@@ -948,6 +948,50 @@ __global__ static DS4_ROCM_UNUSED void moe_gate_up_mid_hwarp16_kernel(
     }
 }
 
+// CUDA-inspired sub-block lane ownership, adapted to raw IQ2 and existing Q8_K input.
+// Each wave owns a row; eight lanes cover the eight32-value groups of each256-value block.
+__device__ __forceinline__ float v41_iq2_pair32(const cuda_block_iq2_xxs *w, const cuda_block_q8_K *x, int p) {
+    const uint16_t *q = w->qs + 4 * p;
+    uint32_t a = (uint32_t) q[0] | ((uint32_t) q[1] << 16), b = (uint32_t) q[2] | ((uint32_t) q[3] << 16);
+    int sum = 0;
+#pragma unroll
+    for (int j = 0; j < 4; j++) sum = dev_iq2_dp4a_8(cuda_iq2xxs_grid[(a >> (8 * j)) & 255], cuda_ksigns_iq2xs[(b >> (7 * j)) & 127], x->qs + p * 32 + j * 8, sum);
+    sum *= 2 * (b >> 28) + 1;
+    return .125f * dev_f16_to_f32(w->d) * x->d * (float) sum;
+}
+template<int Waves> __global__ void moe_v41_gate_up_wave_pairs_kernel(
+        float *gate_out, float *up_out, float *mid_out, const char *gb, const char *ub,
+        const cuda_block_q8_K *xq, const int32_t *ids, const float *weights, uint64_t eb, uint64_t rb,
+        uint32_t B, uint32_t M, uint32_t N, uint32_t aux, uint32_t mask, float clamp) {
+    unsigned lane = threadIdx.x & 31, row = blockIdx.x * Waves + (threadIdx.x >> 5), slot = blockIdx.y;
+    if (row >= M || !(mask & (1u << slot))) return;
+    int id = ids[slot];
+    if (id < 0) id = 0;
+    auto *g = (const cuda_block_iq2_xxs *) (gb + (uint64_t) id * eb + row * rb);
+    auto *u = (const cuda_block_iq2_xxs *) (ub + (uint64_t) id * eb + row * rb);
+    float gv = 0, uv = 0;
+    for (unsigned b = lane >> 3; b < B; b += 4) {
+        gv += v41_iq2_pair32(g + b, xq + b, lane & 7);
+        uv += v41_iq2_pair32(u + b, xq + b, lane & 7);
+    }
+    for (int off = 16; off; off >>= 1) {
+        gv += __shfl_down(gv, off, 32);
+        uv += __shfl_down(uv, off, 32);
+    }
+    if (!lane) {
+        if (clamp > 1e-6f) {
+            gv = fminf(gv, clamp);
+            uv = fmaxf(-clamp, fminf(uv, clamp));
+        }
+        uint64_t i = (uint64_t) slot * M + row;
+        if (aux) {
+            gate_out[i] = gv;
+            up_out[i] = uv;
+        }
+        mid_out[i] = (gv / (1 + expf(-gv))) * uv * weights[slot];
+    }
+}
+
 __global__ static void moe_gate_up_mid_qwarp32_kernel(
         float *gate_out,
         float *up_out,
@@ -2913,6 +2957,87 @@ __global__ static void moe_gate_up_mid_q2K_decode_q8_qwarp32_kernel(
             mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
         }
     }
+}
+
+// Four blocks per wave, eight lanes/block, one 32-value subgroup/lane.
+__device__ __forceinline__ float v41_q2_part32(const cuda_block_q2_K *w, const cuda_block_q8_K *x, int part) {
+    const uint8_t *q = w->qs + (part >> 2) * 32;
+    int shift = (part & 3) * 2;
+    unsigned s0 = w->scales[part * 2], s1 = w->scales[part * 2 + 1];
+    int a = dev_dot_q2_16(q, x->qs + part * 32, shift) * (s0 & 15) + dev_dot_q2_16(q + 16, x->qs + part * 32 + 16, shift) * (s1 & 15);
+    int m = x->bsums[part * 2] * (s0 >> 4) + x->bsums[part * 2 + 1] * (s1 >> 4);
+    return x->d * dev_f16_to_f32(w->d) * a - x->d * dev_f16_to_f32(w->dmin) * m;
+}
+template<int Waves> __global__ void moe_v41_down_wave(
+        float *out, const char *base, const cuda_block_q8_K *xq, const int32_t *ids, uint64_t eb,
+        uint64_t rb, unsigned B, unsigned M, unsigned N) {
+    unsigned lane = threadIdx.x & 31, row = blockIdx.x * Waves + (threadIdx.x >> 5);
+    if (row >= M) return;
+    float total = 0;
+    for (unsigned slot = 0; slot < N; slot++) {
+        int id = ids[slot];
+        if (id < 0) id = 0;
+        auto *w = (const cuda_block_q2_K *) (base + (uint64_t) id * eb + row * rb);
+        auto *x = xq + (uint64_t) slot * B;
+        for (unsigned b = lane >> 3; b < B; b += 4) total += v41_q2_part32(w + b, x + b, lane & 7);
+    }
+    total = warp_sum_f32(total);
+    if (!lane) out[row] = total;
+}
+
+template<int Waves> __global__ void moe_v41_gate_up_wave_ptrs_kernel(
+        float *gate_out, float *up_out, float *mid_out, const char *const * gt, const char *const * ut,
+        const cuda_block_q8_K *xq, const int32_t *ids, const float *weights, uint64_t eb, uint64_t rb,
+        uint32_t B, uint32_t M, uint32_t N, uint32_t aux, uint32_t mask, float clamp) {
+    unsigned lane = threadIdx.x & 31, row = blockIdx.x * Waves + (threadIdx.x >> 5), slot = blockIdx.y;
+    if (row >= M || !(mask & (1u << slot))) return;
+    int id = ids[slot];
+    if (id < 0) id = 0;
+    const char *gb = gt[id];
+    const char *ub = ut[id];
+    if (!gb || !ub) return;
+    auto *g = (const cuda_block_iq2_xxs *) (gb + row * rb);
+    auto *u = (const cuda_block_iq2_xxs *) (ub + row * rb);
+    float gv = 0, uv = 0;
+    for (unsigned b = lane >> 3; b < B; b += 4) {
+        gv += v41_iq2_pair32(g + b, xq + b, lane & 7);
+        uv += v41_iq2_pair32(u + b, xq + b, lane & 7);
+    }
+    for (int off = 16; off; off >>= 1) {
+        gv += __shfl_down(gv, off, 32);
+        uv += __shfl_down(uv, off, 32);
+    }
+    if (!lane) {
+        if (clamp > 1e-6f) {
+            gv = fminf(gv, clamp);
+            uv = fmaxf(-clamp, fminf(uv, clamp));
+        }
+        uint64_t i = (uint64_t) slot * M + row;
+        if (aux) {
+            gate_out[i] = gv;
+            up_out[i] = uv;
+        }
+        mid_out[i] = (gv / (1 + expf(-gv))) * uv * weights[slot];
+    }
+}
+
+template<int Waves> __global__ void moe_v41_down_wave_ptrs_kernel(
+        float *out, const char *const * table, const cuda_block_q8_K *xq, const int32_t *ids,
+        uint64_t eb, uint64_t rb, unsigned B, unsigned M, unsigned N) {
+    unsigned lane = threadIdx.x & 31, row = blockIdx.x * Waves + (threadIdx.x >> 5);
+    if (row >= M) return;
+    float total = 0;
+    for (unsigned slot = 0; slot < N; slot++) {
+        int id = ids[slot];
+        if (id < 0) id = 0;
+        const char *base = table[id];
+        if (!base) continue;
+        auto *w = (const cuda_block_q2_K *) (base + row * rb);
+        auto *x = xq + (uint64_t) slot * B;
+        for (unsigned b = lane >> 3; b < B; b += 4) total += v41_q2_part32(w + b, x + b, lane & 7);
+    }
+    total = warp_sum_f32(total);
+    if (!lane) out[row] = total;
 }
 
 __global__ static void moe_down_sum6_qwarp32_kernel(

@@ -776,6 +776,10 @@ static int routed_moe_launch(
         const uint32_t use_expert_tiles = use_sorted_pairs;
         const uint32_t expert_tile_m = n_tokens <= 8u ? 4u : 8u;
         const uint32_t write_gate_up = 0u;
+        const bool use_v41_wave_gate = g_deepseek41_model && iq2_gate_path &&
+            n_tokens == 1u && n_total_expert == 384u && n_expert == 6u &&
+            expert_in_dim == 5120u && expert_mid_dim == 2304u &&
+            out_dim == 5120u && ds4_rocm_is_gfx1151();
         const uint32_t use_p2_sorted = 0u;
         const uint32_t use_atomic_down =
             !mxfp4_path && use_expert_tiles && n_tokens >= 128u;
@@ -813,9 +817,18 @@ static int routed_moe_launch(
             mxfp4_path && use_expert_tiles && !use_mxfp4_tile32 && !use_mxfp4_ldsB &&
             !use_mxfp4_tile4 && n_tokens >= 8u &&
             getenv("DS4_ROCM_ENABLE_MXFP4_ROW64") != NULL;
+        /* V4.1 Q2 uses canonical IQ2 gate/up rows and Q2_K down rows.
+         * Keep other expert layouts on their existing admissions. */
+        const uint32_t v41_mmq_topology =
+            g_deepseek41_model && n_total_expert == 384u && n_expert == 6u &&
+            expert_in_dim == 5120u && expert_mid_dim == 2304u &&
+            out_dim == 5120u && n_tokens <= 2048u &&
+            gate_row_bytes == 1320u && gate_expert_bytes == 3041280u &&
+            down_row_bytes == 756u && down_expert_bytes == 3870720u &&
+            ds4_rocm_is_gfx1151();
         const uint32_t use_rocm_mmq_gateup =
             ok && iq2_path && n_tokens >= 128u && !g_quality_mode &&
-            n_total_expert <= 256u &&
+            (n_total_expert <= 256u || v41_mmq_topology) &&
             !batch_stream_selected && !batch_stream_split_selected &&
             !split_selected && !compact_selected && gate_w && up_w &&
             (stream_full_layer || full_table_cached) &&
@@ -1250,13 +1263,21 @@ static int routed_moe_launch(
                     logged_mmq_gateup = 1;
                     fprintf(stderr, "ds4: ROCm routed MoE using tuned MMQ IQ2 gate/up\n");
                 }
-            } else {
+            } else if (!v41_mmq_topology) {
                 (void)cudaGetLastError();
                 static int logged_mmq_fallback = 0;
                 if (!logged_mmq_fallback) {
                     logged_mmq_fallback = 1;
                     fprintf(stderr, "ds4: ROCm MMQ IQ2 gate/up returned %d; falling back\n", mmq_rc);
                 }
+            }
+            if (v41_mmq_topology && !mmq_gateup_done) {
+                /* This route skipped Q8_K x preparation. A legacy fallback
+                 * would consume unwritten xq or stale half mid storage. */
+                fprintf(stderr, "ds4: V4.1 MMQ gate/up or epilogue failed (%d)\n", mmq_rc);
+                if (!cuda_ok(cudaStreamSynchronize((cudaStream_t)0),
+                             "V4.1 MMQ failure drain")) abort();
+                return 0;
             }
         }
         int split_gateup_done = 0;
@@ -1271,7 +1292,14 @@ static int routed_moe_launch(
                 stream_missing_mask != 0;
             if (split_supported) {
                 dim3 qgrid((expert_mid_dim + 127u) / 128u, pair_count, 1);
-                if (use_decode_lut_gate) {
+                if (use_v41_wave_gate) {
+                    moe_v41_gate_up_wave_ptrs_kernel<4><<<dim3((expert_mid_dim + 3u) / 4u, n_expert), 128>>>(
+                        (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                        gate_slot_ptrs, up_slot_ptrs, xq,
+                        (const int32_t *)selected_exec->ptr, (const float *)weights->ptr,
+                        0, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
+                        write_gate_up, stream_resident_mask, clamp);
+                } else if (use_decode_lut_gate) {
                     moe_gate_up_mid_decode_lut_qwarp32_ptrs_kernel<<<qgrid, 256>>>(
                         (float *)gate->ptr,
                         (float *)up->ptr,
@@ -1311,7 +1339,14 @@ static int routed_moe_launch(
                 } else {
                     ok = cuda_stream_selected_finish_pending_missing(0);
                 }
-                if (ok && use_decode_lut_gate) {
+                if (ok && use_v41_wave_gate) {
+                    moe_v41_gate_up_wave_ptrs_kernel<4><<<dim3((expert_mid_dim + 3u) / 4u, n_expert), 128>>>(
+                        (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                        gate_slot_ptrs, up_slot_ptrs, xq,
+                        (const int32_t *)selected_exec->ptr, (const float *)weights->ptr,
+                        0, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
+                        write_gate_up, stream_missing_mask, clamp);
+                } else if (ok && use_decode_lut_gate) {
                     moe_gate_up_mid_decode_lut_qwarp32_ptrs_kernel<<<qgrid, 256>>>(
                         (float *)gate->ptr,
                         (float *)up->ptr,
@@ -1621,6 +1656,16 @@ static int routed_moe_launch(
                         n_expert,
                         write_gate_up,
                         clamp);
+                } else if (use_v41_wave_gate) {
+                    // V4.1 scalar: raw IQ2 and existing Q8_K activation.
+                    // Four waves own four output rows; each lane handles32 values.
+                    const dim3 v41_grid((expert_mid_dim + 3u) / 4u, n_expert);
+                    moe_v41_gate_up_wave_pairs_kernel<4><<<v41_grid, 128>>>(
+                        (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                        gate_w, up_w, xq, (const int32_t *)selected_exec->ptr,
+                        (const float *)weights->ptr, gate_expert_bytes, gate_row_bytes,
+                        xq_blocks, expert_mid_dim, n_expert, write_gate_up,
+                        0xffffffffu, clamp);
                 } else if (use_decode_lut_gate) {
                     moe_gate_up_mid_decode_lut_qwarp32_kernel<<<qgrid, 256>>>(
                         (float *)gate->ptr,
@@ -1738,8 +1783,13 @@ static int routed_moe_launch(
             ok && iq2_path && n_tokens > 1u &&
             n_expert <= DS4_ROCM_N_EXPERT_USED &&
             sorted_pairs && sorted_offsets && sorted_counts && tile_experts;
+        const uint32_t use_v41_q8_down =
+            ok && g_deepseek41_model && iq2_path && n_tokens == 1u && !g_quality_mode &&
+            n_total_expert == 384u && n_expert == 6u &&
+            expert_in_dim == 5120u && expert_mid_dim == 2304u &&
+            out_dim == 5120u && ds4_rocm_is_gfx1151();
         const uint32_t use_iq2_q2_decode_float_down =
-            ok && iq2_path && n_tokens == 1u &&
+            ok && iq2_path && n_tokens == 1u && !use_v41_q8_down &&
             n_expert <= DS4_ROCM_N_EXPERT_USED;
         if (ok && !use_iq2_q2_float_down &&
             !use_iq2_q2_decode_float_down) {
@@ -1748,7 +1798,21 @@ static int routed_moe_launch(
             ok = cuda_ok(cudaGetLastError(), "routed_moe mid quantize launch");
         }
         int direct_iq2_down_done = 0;
-        if (ok && use_iq2_q2_decode_float_down) {
+        if (ok && use_v41_q8_down) {
+            if (split_gateup_done) {
+                moe_v41_down_wave_ptrs_kernel<4><<<(out_dim + 3u) / 4u, 128>>>(
+                    (float *)out->ptr, down_slot_ptrs, midq,
+                    (const int32_t *)selected_exec->ptr, 0,
+                    down_row_bytes, midq_blocks, out_dim, n_expert);
+            } else {
+                moe_v41_down_wave<4><<<(out_dim + 3u) / 4u, 128>>>(
+                    (float *)out->ptr, down_w, midq,
+                    (const int32_t *)selected_exec->ptr, down_expert_bytes,
+                    down_row_bytes, midq_blocks, out_dim, n_expert);
+            }
+            ok = cuda_ok(cudaGetLastError(), "V4.1 quantized wave down launch");
+            direct_iq2_down_done = ok;
+        } else if (ok && use_iq2_q2_decode_float_down) {
             const ds4_rocm_runtime_config *runtime_cfg = cuda_runtime_config();
             uint32_t rows_per_block = runtime_cfg->moe_decode_down_rpb;
             if (rows_per_block == 0u) rows_per_block = 1u;

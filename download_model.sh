@@ -130,8 +130,10 @@ Targets:
 
   ds41f-q2
        DeepSeek V4.1 Flash calibrated Q2, about 341 GiB on disk. Main weights
-       occupy 152 GiB; Engram tables stay on disk. Metal only: use SSD streaming
+       occupy 152 GiB; Engram tables stay on disk. Metal supports SSD streaming
        on one 128 GB Mac, tensor parallelism on two, or a larger resident Mac.
+       ROCm gfx1151 supports SSD streaming on a 128 GB Strix Halo or resident
+       inference with more GPU-visible memory; see docs/STRIX_HALO.md.
 
   ds41f-vision
        Matching V4.1 Flash vision encoder, about 0.9 GiB. Add --vision FILE

@@ -33,21 +33,13 @@ the container. Do not mix header versions as a general workaround.
 
 ## GPU-visible memory
 
-Check the memory pool reported by `rocminfo`. Some 128 GB configurations expose
-only about 62 GB to the GPU, which is insufficient for resident Flash Q2 plus
-runtime buffers. Firmware and kernel GTT/TTM settings control this limit.
-
-The native reference setup used these memory parameters:
+Check the GPU-visible memory pool reported by `rocminfo`. Some 128 GB systems expose only about 62 GiB to the GPU. The tested 128 GB Fedora Linux Strix Halo system, running a recent kernel and ROCm 10.0, used these boot parameters:
 
 ```text
-amdgpu.gttsize=126976 ttm.pages_limit=32505856 ttm.page_pool_size=32505856
+amd_iommu=off amdgpu.gttsize=126976 ttm.pages_limit=32505856
 ```
 
-They are a system-specific starting point, not an allocation budget for
-DwarfStar. Preserve existing boot options and consult your kernel's settings
-before changing them. Keep RAM available for the OS even when the GPU can
-address most of it. Do not disable the IOMMU merely to copy another host's
-configuration; doing so changes device isolation.
+The GTT/TTM settings expose about 124 GiB to the GPU. An SSD expert-cache request such as `92GB` is fitted to that GPU-visible limit as well as available system RAM; a stock ~62 GiB pool can therefore yield a much smaller cache. `amd_iommu=off` was part of the tested setup, but is not required for GTT sizing and disables DMA isolation. Keep RAM available for the OS. See the [host configuration guide](https://strix-halo-toolboxes.com/#config) for Fedora, Ubuntu/Debian, and systemd-boot instructions.
 
 ## Build and run Flash
 
@@ -61,6 +53,71 @@ make strix-halo
 larger mixed and Q4 models have substantially higher memory requirements.
 Flash's ROCm resident and pipeline paths should not be confused with the GLM
 SSD-streaming path.
+
+## DeepSeek V4.1 Flash
+
+- ROCm 10.0 supports calibrated V4.1 Flash Q2 text/vision, resident experts, SSD streaming and [two-machine TCP/USB4STREAM/RoCE](CLUSTERING_ROCM.md). Engram remains disk-backed in every mode.
+- Tested SSD configuration: 128 GB Framework Desktop, 16-core Strix Halo engineering sample `100-000001243-50_Y`, Radeon `gfx1151`; Kingston FURY Renegade 2 TB (`SFYRD2000G`, PCIe 4.0 ×4, btrfs) holds the model.
+- Linux `7.2.5-100.fc43.x86_64`, ROCm SDK `10.0.0-4` / HIP `7.15.26333`; TuneD **`accelerator-performance`**, fans at maximum speed. Existing boot flags: the [GTT/TTM settings above](#gpu-visible-memory), plus `pci=realloc pcie_aspm=off`; their individual effects were not isolated.
+
+### SSD performance
+
+Native `ds4-bench`, full fresh text prefix, greedy decoding, no DSpark or images; 92 GiB expert/staging cache. One run per row, startup and a separate GPU readiness warmup excluded; **tokens/s**:
+
+| Prompt tokens | Allocated context | Generated tokens | Prefill | Decode |
+|---:|---:|---:|---:|---:|
+| 16,384 | 69,632 | 128 | 302.12 | 8.68 |
+| 65,536 | 69,632 | 128 | 350.56 | 8.49 |
+
+- All 129,280 frontier logits and complete printed continuations match the corresponding resident runs. Minimum usable RAM: 15.1 GiB; no OOM. Host zram swap-out pages in table order: 0, 0. No cold-cache claim; other qualification runs recorded nonzero host swap.
+- The tuned Engram matrix path requires hipBLASLt 100401, revision `8d1ae90e`; other library versions retain the existing fallback and may have different prefill performance.
+- Actual prompts reach 65,536 tokens; populated 256K was not tested. Cache admission depends on available RAM, context and sessions; images may need a smaller cache. The GPU-visible limit shares system RAM and is not a cache budget.
+- Six resident image/state cases and two focused SSD cases (photo and screenshot) pass on this source. Official probability results are mixed; see [quality and limitations](../QA_BEFORE_RELEASES.md#deepseek-v41-flash-rocmgfx1151). No image-conditioned prefill timing is included.
+
+### Run text or vision
+
+```bash
+make strix-halo ROCM_ARCH=gfx1151
+./download_model.sh ds41f-q2
+./download_model.sh ds41f-vision
+MODEL=gguf/DeepSeek-V4.1-Flash-Q2.gguf
+VISION=gguf/DeepSeek-V4.1-Flash-Vision.gguf
+
+# CLI, text
+./ds4 --rocm -m "$MODEL" --ssd-streaming \
+  --ssd-streaming-cache-experts 92GB --ctx 69632
+
+# HTTP server, text and images; --vision takes the matching sidecar.
+./ds4-server --rocm -m "$MODEL" --vision "$VISION" \
+  --ssd-streaming --ssd-streaming-cache-experts 92GB --ctx 69632 \
+  --batched-session 1 --host 127.0.0.1 --port 8080
+```
+
+For a machine with sufficient RAM for resident experts, omit both SSD options. Keep `--vision` for image requests and set `--ctx` to the required allocation. See [image request examples](MODELS.md#vision).
+
+### Reproduce SSD measurements
+
+Run one configuration per process; preserve the CSV, full frontier files and printed output. The timing input is the repository's `speed-bench/promessi_sposi.txt`.
+
+```bash
+tuned-adm active    # Expect accelerator-performance during the workload
+tuned-adm verify
+MODEL=/absolute/path/DeepSeek-V4.1-Flash-Q2.gguf
+DEPTH=16384
+ALLOC=69632
+GEN=128
+# Other row: DEPTH=65536 ALLOC=69632 GEN=128
+
+DS4_METAL_CB_TIMES=1 ./ds4-bench --backend rocm -m "$MODEL" \
+  --ssd-streaming --ssd-streaming-cache-experts 92GB \
+  --prompt-file speed-bench/promessi_sposi.txt \
+  --ctx-start "$DEPTH" --ctx-max "$DEPTH" --ctx-alloc "$ALLOC" \
+  --gen-tokens "$GEN" --show-output --csv "ssd-$DEPTH-$GEN.csv" \
+  --dump-frontier-logits-dir "ssd-frontiers-$DEPTH-$GEN"
+```
+
+- `DS4_METAL_CB_TIMES` is scoped to this command and prints the measured prefill time window on ROCm too. No tuning override is needed.
+- Check the active power profile during the measurement; save revision/build flags, model filename/size and existing provenance, cache/KV configuration, actual prompt/output counts, and memory/swap/OOM counters. Do not substitute HTTP timings for this native table.
 
 ## GLM 5.3 Flash
 

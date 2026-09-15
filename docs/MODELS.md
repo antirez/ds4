@@ -45,10 +45,7 @@ To build weights rather than download them, see [GGUF tools](../gguf-tools/READM
 
 ## DeepSeek V4.1 Flash
 
-V4.1 Flash text and vision inference work on Metal. CUDA supports text with
-Q2 SSD streaming on one Spark or resident shards across two Sparks. It needs its own
-GGUF, tokenizer and inference graph; V4 Flash weights and DSpark support files
-are not interchangeable with it.
+V4.1 Flash text and vision inference work on Metal and ROCm on Strix Halo (`gfx1151`). ROCm Q2 supports resident expert weights, SSD streaming and two-machine resident clustering; see [Strix Halo setup](STRIX_HALO.md#deepseek-v41-flash) and [clustering commands](CLUSTERING_ROCM.md). CUDA supports text with Q2 SSD streaming on one Spark or resident shards across two Sparks. V4.1 needs its own GGUF, tokenizer and inference graph; V4 Flash weights and DSpark support files are not interchangeable with it.
 
 | Target | File size | Main weights |
 | --- | ---: | ---: |
@@ -93,9 +90,7 @@ Resident and TP inference also batch continued prefills automatically.
 
 For concurrent serving, see [session batching](SERVER.md#multiple-sessions).
 Each slot needs its own context memory; start with `--ctx 4096` before
-increasing both context and slot count. CUDA Q2 SSD mode batches up to eight
-decode rows; CUDA network TP currently serves sessions in order. DSpark,
-pipeline execution and ROCm are not implemented for V4.1; vision requires Metal.
+increasing both context and slot count. CUDA Q2 SSD mode batches up to eight decode rows; CUDA network TP currently serves sessions in order. DSpark and pipeline execution are unsupported for V4.1. ROCm network TP requires resident expert shards; SSD streaming is single-node only.
 
 Scalar, batched and tensor-parallel execution are not numerically identical.
 Q4 batched prefill shows a small probability-score loss on the short official
@@ -111,8 +106,9 @@ For images, download the matching encoder and add it to the same command:
   --ssd-streaming --vision gguf/DeepSeek-V4.1-Flash-Vision.gguf
 ```
 
-Vision works with SSD streaming, full residency and two-Mac TP. Pass the encoder
-on both TP ranks. Use `/read image.png` in `ds4`, `view_image` in `ds4-agent`,
+On Metal, vision works with SSD streaming, full residency and two-Mac TP. ROCm vision is qualified with resident expert weights and SSD streaming. Pass the encoder on both TP ranks.
+
+Use `/read image.png` in `ds4`, `view_image` in `ds4-agent`,
 or the [server image API](SERVER.md#images). V4 Flash vision encoders do not
 work with V4.1. See [conversion](../gguf-tools/README.md#convert-deepseek-v41-flash)
 to build the GGUFs from safetensors.
@@ -201,7 +197,7 @@ Directional steering is supported for GLM 5.3, not GLM 5.2.
 
 PNG and JPEG input works in the CLI, native agent, and HTTP server on Metal,
 single-GPU CUDA, and ROCm. The encoder must match the model.
-V4.1 Flash vision is currently Metal-only; its setup is [above](#deepseek-v41-flash).
+V4.1 Flash vision supports Metal and ROCm on Strix Halo; CUDA V4.1 vision is not implemented. Setup is [above](#deepseek-v41-flash).
 
 ### DeepSeek Flash Vision Experimental
 

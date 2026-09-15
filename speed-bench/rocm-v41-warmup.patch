@@ -1,0 +1,32 @@
+--- a/ds4_bench.c
++++ b/ds4_bench.c
+@@ -807,6 +807,29 @@
+     int previous = 0;
+     int rc = 0;
+ 
++    /* Excluded native warmup for the published ROCm TP measurements. Recreate the session before measurement
++     * so the complete prefix reaches the normal CED scheduling thresholds. */
++    if (!distributed || speculative || prompt.len < 256) {
++        fprintf(stderr, "ds4-bench: warmup requires ordinary TP and >=256 prompt tokens\n");
++        ds4_session_free(session); ds4_tokens_free(&prompt);
++        if (out != stdout) fclose(out);
++        close_engine(engine, tp_leader); return 1;
++    }
++    ds4_tokens warm_prefix = { .v = prompt.v, .len = 256, .cap = 256 };
++    int warm_ok = ds4_session_sync(session, &warm_prefix, err, sizeof(err)) == 0;
++    for (int i = 0; warm_ok && i < 128; ++i) {
++        int token = ds4_session_argmax_excluding(session, eos);
++        warm_ok = token >= 0 && ds4_session_eval(session, token, err, sizeof(err)) == 0;
++    }
++    ds4_session_free(session); session = NULL;
++    if (!warm_ok || ds4_session_create(&session, engine, cfg.ctx_alloc) != 0) {
++        fprintf(stderr, "ds4-bench: excluded warmup/session reset failed: %s\n", err);
++        ds4_session_free(session); ds4_tokens_free(&prompt);
++        if (out != stdout) fclose(out);
++        close_engine(engine, tp_leader); return 1;
++    }
++    fprintf(stderr, "ds4-bench: excluded warmup complete (256 prefix/128 outputs); fresh measured session\n");
++
+     for (int frontier = cfg.ctx_start; ; frontier = next_frontier(&cfg, frontier)) {
+         ds4_tokens prefix = {
+             .v = prompt.v,

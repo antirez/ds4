@@ -1,0 +1,35 @@
+From: Jonathan Yates <me@jyates.dev>
+Subject: thunderbolt: Flush posted MSI-X interrupt clears
+
+Minimal context adaptation of strix-rdma patch11 at d19af99ce91abda691a2bd0f21eb114e0a64bacd to upstream v7.2.5. Tested as a temporary module replacement on Linux 7.2.5-100.fc43.x86_64. Original authorship retained; no RX-prime change.
+
+--- a/drivers/thunderbolt/nhi.c
++++ b/drivers/thunderbolt/nhi.c
+@@ -428,17 +428,26 @@
+ 
+ static void ring_clear_msix(const struct tb_ring *ring)
+ {
++	int index;
+ 	int bit;
+ 
+ 	if (ring->nhi->quirks & QUIRK_AUTO_CLEAR_INT)
+ 		return;
+ 
+-	bit = ring_interrupt_index(ring) & 31;
++	index = ring_interrupt_index(ring);
++	bit = index & 31;
+ 	if (ring->is_tx)
+ 		iowrite32(BIT(bit), ring->nhi->iobase + REG_RING_INT_CLEAR);
+ 	else
+ 		iowrite32(BIT(bit), ring->nhi->iobase + REG_RING_INT_CLEAR +
+ 			  4 * (ring->nhi->hop_count / 32));
++
++	/*
++	 * Flush the posted clear before ring work can run and a later
++	 * completion can reuse the same status bit without another MSI-X.
++	 */
++	ioread32(ring->nhi->iobase + REG_RING_INTERRUPT_BASE +
++		 index / 32 * 4);
+ }
+ 
+ irqreturn_t ring_msix(int irq, void *data)

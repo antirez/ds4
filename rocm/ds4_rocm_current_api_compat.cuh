@@ -123,6 +123,12 @@ extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {
     g_routed_moe_selected_override_n = 0;
     g_stream_selected_cache.loaded = 0;
     g_stream_batch_selected_cache.loaded = 0;
+    g_stream_free_reserve_bytes = UINT64_C(16) << 30;
+    g_deepseek41_model = false;
+}
+
+extern "C" void ds4_gpu_set_deepseek41_model(bool enabled) {
+    g_deepseek41_model = enabled;
 }
 
 extern "C" void ds4_gpu_set_glm_model(bool enabled) {
@@ -245,6 +251,38 @@ extern "C" int ds4_gpu_stream_expert_cache_prepare_selected_batch(
                                                         1);
 }
 
+extern "C" int ds4_gpu_stream_expert_cache_reserve_layers(
+        const ds4_gpu_stream_expert_table *even,
+        const ds4_gpu_stream_expert_table *odd) {
+    return cuda_stream_layer_expert_cache_reserve(even, odd);
+}
+
+extern "C" int ds4_gpu_stream_expert_cache_note_layer_consumed(
+        const ds4_gpu_stream_expert_table *table) {
+    return cuda_stream_layer_expert_cache_note_consumed(table);
+}
+
+extern "C" int ds4_gpu_stream_expert_cache_quiesce(void) {
+    return cuda_stream_expert_cache_quiesce();
+}
+
+extern "C" int ds4_gpu_stream_expert_cache_get_memory(
+        ds4_gpu_stream_expert_memory *out) {
+    return cuda_stream_expert_cache_get_memory(out);
+}
+
+extern "C" int ds4_gpu_stream_expert_cache_seed_experts_gpu_copy(
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t *expert_ids,
+        const uint32_t *expert_priorities,
+        uint32_t n_experts) {
+    if (!table || !g_ssd_streaming_mode) return 0;
+    return cuda_stream_resident_seed_experts(table->model_map,
+            table->model_size, table->layer, expert_ids, expert_priorities,
+            n_experts, table->n_total_expert, table->gate_offset, table->up_offset,
+            table->down_offset, table->gate_expert_bytes, table->down_expert_bytes, 1);
+}
+
 extern "C" int ds4_gpu_stream_expert_cache_load_layer(
         const ds4_gpu_stream_expert_table *table) {
     if (!table) return 0;
@@ -257,6 +295,22 @@ extern "C" int ds4_gpu_stream_expert_cache_load_layer(
                                                table->down_offset,
                                                table->gate_expert_bytes,
                                                table->down_expert_bytes);
+}
+
+extern "C" int ds4_gpu_dsv41_stream_prepare_layer(
+        const ds4_gpu_stream_expert_table *table,
+        ds4_gpu_dsv41_stream_layer_plan *plan) {
+    return cuda_stream_v41_prepare_layer(table, plan);
+}
+
+extern "C" int ds4_gpu_dsv41_stream_load_layer(
+        const ds4_gpu_dsv41_stream_layer_plan *plan) {
+    return cuda_stream_v41_load_layer(plan);
+}
+
+extern "C" int ds4_gpu_dsv41_stream_cancel_layer(
+        const ds4_gpu_dsv41_stream_layer_plan *plan) {
+    return cuda_stream_v41_cancel_layer(plan);
 }
 
 extern "C" int ds4_gpu_stream_expert_cache_seed_from_layer_selected(
@@ -286,8 +340,7 @@ extern "C" int ds4_gpu_stream_expert_cache_finish_pending_batch(void) {
 }
 
 extern "C" int ds4_gpu_stream_expert_cache_release_layer_cache(void) {
-    cuda_stream_layer_expert_cache_release();
-    return 1;
+    return cuda_stream_layer_expert_cache_release();
 }
 
 extern "C" int ds4_gpu_stream_expert_cache_seed_experts(

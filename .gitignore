@@ -84,5 +84,16 @@ __pycache__/
 .*.swp
 .DS_Store
 
+# Linux TP protocol and ROCm ownership harnesses
+tests/test_tp_linux
+ds4-kernel-v41-tp-attention
+ds4-kernel-v41-tp-moe
+ds4-kernel-v41-tp-gates
+
+/ds4-kernel-v41-tp-mmq
+
+/ds4-kernel-v41-tp-down
+
+/ds4-kernel-v41-tp-bind-failure
 /tests/test_qwen4_conv_parallel
 /tests/test_q8_prefill_variants

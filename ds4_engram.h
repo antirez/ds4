@@ -55,8 +55,9 @@ bool ds4_engram_read(const ds4_engram_table *table, const uint32_t *rows,
                      size_t count, float *out);
 /* Read COLS rows per token, restoring token order after deduplicated disk reads.
  * Input stride is in row IDs; output is packed [token][COLS][DIM]. Temporary
- * storage is bounded to 384 KiB, independent of the table and prefix size.
- * On macOS, large batches use bounded concurrent pread readers. */
+ * request storage is bounded to 384 KiB, independent of table/prefix size.
+ * On macOS and Linux ROCm, large batches use 16 concurrent pread readers;
+ * their bounded worker stacks are additional to request storage. */
 bool ds4_engram_read_batch(const ds4_engram_table *table, const uint32_t *rows,
                            size_t tokens, size_t stride, float *out);
 

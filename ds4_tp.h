@@ -103,6 +103,7 @@ void ds4_tp_free(ds4_tp *tp);
 
 int ds4_tp_rank(const ds4_tp *tp);
 bool ds4_tp_is_rdma(const ds4_tp *tp);
+const char *ds4_tp_transport_name(const ds4_tp *tp);
 uint32_t ds4_tp_peer_ctx(const ds4_tp *tp);
 bool ds4_tp_failed(const ds4_tp *tp);
 void ds4_tp_mark_failed(ds4_tp *tp);
@@ -171,6 +172,11 @@ int ds4_tp_send_glm_mtp(ds4_tp *tp, uint64_t session_id,
                        uint64_t seq, int token, int limit);
 int ds4_tp_send_rewind(ds4_tp *tp, uint64_t session_id, int pos);
 int ds4_tp_send_invalidate(ds4_tp *tp, uint64_t session_id);
+/* Linux V4.1 has replicated KV. Stream a complete checkpoint to the worker
+ * without allocating another checkpoint-sized buffer. fp advances by bytes. */
+int ds4_tp_send_restore_payload(ds4_tp *tp, uint64_t session_id,
+                                FILE *fp, uint64_t bytes,
+                                char *err, size_t errlen);
 int ds4_tp_send_eval_batch(ds4_tp *tp, const ds4_tp_batch_item *items,
                            uint32_t count);
 int ds4_tp_send_mixed_batch(ds4_tp *tp, uint64_t prefill_session_id,
@@ -215,12 +221,14 @@ typedef enum {
     DS4_TP_FRAME_RDMA_POSTED = 20,
     DS4_TP_FRAME_GLM_MTP = 21,
     DS4_TP_FRAME_SYNC_CHECKPOINT = 22,
+    DS4_TP_FRAME_RESTORE_PAYLOAD = 23,
 } ds4_tp_frame_type;
 
 typedef struct {
     ds4_tp_frame_type type;
     uint64_t session_id;
     uint64_t seq;
+    uint64_t payload_bytes;
     int value;
     int limit;
     int *tokens;

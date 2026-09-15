@@ -23,7 +23,7 @@ typedef enum {
 } ds4_v41_activation_format;
 int ds4_gpu_dsv41_quantize(ds4_gpu_tensor *x, uint32_t width, uint32_t rows,
                           ds4_v41_activation_format format);
-#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(__HIP_PLATFORM_AMD__) && !defined(DS4_NO_GPU)
 /* CUDA scalar Q8 shared expert. 1: queued; 0: unsupported, no work queued;
  * -1: failure. After 1, keep the input/output tensors alive and unchanged
  * until join, which orders the result before subsequent main-stream work.
@@ -80,6 +80,11 @@ int ds4_gpu_dsv41_candidate_filter(ds4_gpu_tensor *scores,
                                   uint32_t start, uint32_t ratio);
 /* Causal index scores over ratio-1/2 compressed keys, without an extra cast
  * of the already quantized FP4 queries/keys. Scores have source_rows stride. */
+#ifdef DS4_ROCM_BUILD
+int ds4_gpu_dsv41_indexer_scores_one(ds4_gpu_tensor *scores,
+        const ds4_gpu_tensor *q, const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *keys, uint32_t source_rows);
+#endif
 int ds4_gpu_dsv41_indexer_scores_batch(ds4_gpu_tensor *scores,
                                      const ds4_gpu_tensor *q,
                                      const ds4_gpu_tensor *weights,
@@ -123,6 +128,51 @@ int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out,
 int ds4_gpu_dsv41_gather_kv(ds4_gpu_tensor *out, const ds4_gpu_tensor *source,
                            const ds4_gpu_tensor *ids, uint32_t source_rows,
                            uint32_t selected_rows);
+
+#if defined(DS4_ROCM_BUILD) || defined(__HIP_PLATFORM_AMD__)
+/* V4.1 IQ2_XXS/Q2_K resident rank reference: global routing IDs, one
+ * contiguous half of384 experts, and F32 partial output. */
+int ds4_gpu_dsv41_routed_moe_tp_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up,
+        ds4_gpu_tensor *mid, ds4_gpu_tensor *scratch,
+        const void *model_map, uint64_t model_size,
+        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *x, uint32_t n_tokens, uint32_t tp_rank);
+/* Bulk owned gate/up operator. Global routing is preserved; unowned output
+ * rows are zero. The caller retains the weighted activation/down boundary. */
+int ds4_gpu_dsv41_moe_tp_gate_up(
+        ds4_gpu_tensor *gate, ds4_gpu_tensor *up,
+        const void *model_map, uint64_t model_size,
+        uint64_t gate_offset, uint64_t up_offset,
+        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *x,
+        uint32_t n_tokens, uint32_t tp_rank);
+/* Owned Q2_K down projection with the inherited hot F16-mid and per-expert
+ * F16-output boundaries. Scratch retains six slots, zeroing unowned ones. */
+int ds4_gpu_dsv41_moe_tp_down(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *scratch,
+        const ds4_gpu_tensor *mid, const ds4_gpu_tensor *selected,
+        const void *model_map, uint64_t model_size, uint64_t down_offset,
+        uint32_t n_tokens, uint32_t tp_rank);
+/* HC2048 F32 SGEMM: 1 enqueued, 0 unsupported, -1 failure.
+ * Never fall back after failure. Full heads scratch remains live on stream0;
+ * free the plan before graph tensors. Input is already RMS-normalized;
+ * output remains F32 for Sinkhorn. */
+typedef struct ds4_gpu_dsv41_hc_plan ds4_gpu_dsv41_hc_plan;
+int ds4_gpu_dsv41_hc_project(ds4_gpu_dsv41_hc_plan **plan,
+                            ds4_gpu_tensor *out, const void *model_map,
+                            uint64_t model_size, uint64_t weight_offset,
+                            uint32_t rows, const ds4_gpu_tensor *input,
+                            ds4_gpu_tensor *full_heads_scratch);
+void ds4_gpu_dsv41_hc_plan_free(ds4_gpu_dsv41_hc_plan *plan);
+
+/* Preserve V4.1 activation formats while applying Q8 weights. */
+int ds4_gpu_dsv41_q8_projection_rows(ds4_gpu_tensor *out,
+                                    const void *model_map, uint64_t model_size,
+                                    uint64_t weight_offset, uint32_t width,
+                                    uint32_t outputs, uint32_t rows,
+                                    const ds4_gpu_tensor *in);
+#endif
 
 #ifdef __cplusplus
 }

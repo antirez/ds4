@@ -26,6 +26,29 @@
 #include "mmid.cuh"
 #include "ds4_mmq_d2r.cuh"
 
+#if defined(GGML_USE_HIP)
+// One small producer on the existing stream. Thread0 scans384 bounds;128
+// threads fill all575 slots and then their disjoint active expert records.
+static __global__ void ds4_mmq_compact_produce(const int32_t *bounds, ds4_mmq_compact::List *out) {
+    __shared__ uint32_t offsets[ds4_mmq_compact::experts + 1];
+    __shared__ uint32_t status;
+    const uint32_t t = threadIdx.x;
+    for (uint32_t i = t; i < ds4_mmq_compact::capacity; i += blockDim.x)
+        out->entries[i] = {UINT32_MAX, UINT32_MAX};
+    if (t == 0) {
+        status = ds4_mmq_compact::prefix(bounds, offsets);
+        out->status = status;
+        out->count = status ? 0 : offsets[ds4_mmq_compact::experts];
+    }
+    __syncthreads();
+    if (status) return;
+    for (uint32_t e = t; e < ds4_mmq_compact::experts; e += blockDim.x)
+        for (uint32_t i = offsets[e]; i < offsets[e + 1]; i++)
+            out->entries[i] = {e, i - offsets[e]};
+}
+
+#endif
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1337,6 +1360,11 @@ int ds4_mmq_moe_pair_impl(
     const int64_t s01          = (int64_t)K / blck;
     const int64_t s02          = (int64_t)M * s01;
 
+#if defined(GGML_USE_HIP)
+    // Declared first so the list remains owned through both projections.
+    ggml_cuda_pool_alloc<ds4_mmq_compact::List> compact_alloc;
+    ds4_mmq_compact::List *compact_list = nullptr;
+#endif
     ggml_cuda_pool_alloc<int32_t> ids_src1_alloc;
     ggml_cuda_pool_alloc<int32_t> ids_dst_alloc;
     ggml_cuda_pool_alloc<int32_t> expert_bounds_alloc;
@@ -1471,6 +1499,23 @@ int ds4_mmq_moe_pair_impl(
     const int64_t routed_ncols_max = (fused_down || tight_iq2_ncols)
         ? (int64_t)n_tokens
         : ne_get_rows;
+
+#if defined(GGML_USE_HIP)
+    const bool compact_eligible =
+        type == GGML_TYPE_IQ2_XXS && cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151 &&
+        n_tokens == 2048 && n_experts == 384 && n_expert_used == 6 && K == 5120 && M == 2304 &&
+        !direct_gateup_q8 && !fused_down && !persistent_pair_maps && !xa_soa && !xb_soa &&
+        !use_stream_k && stream == nullptr && routed_ncols_max == 2048 &&
+        get_mmq_y_host(cc) == 64 && get_mmq_x_max_host(cc) == 64 &&
+        ggml_cuda_info().devices[dev].warp_size == 32 && mmq_get_nwarps_host(cc,32) == 4;
+    if (compact_eligible) {
+        compact_list = compact_alloc.alloc(ctx->pool(),1);
+        ds4_mmq_compact_produce<<<1,128,0,stream>>>(expert_bounds,compact_list);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) return -102;
+    }
+
+#endif
 
     /* The materialized path stream-frees gate/up Q8_1 before allocating the
      * down Q8_1. The direct path needs both simultaneously, but writes down
@@ -1722,6 +1767,10 @@ int ds4_mmq_moe_pair_impl(
         /*x_soa=*/xa_soa,
         /*soa_blocks=*/soa_blocks,
     };
+#if defined(GGML_USE_HIP)
+    args.compact_list = compact_list;
+#endif
+
 
     {
         ds4_mmq_nvtx_scope stage(
