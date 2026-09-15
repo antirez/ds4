@@ -136,6 +136,64 @@ word were zero. Byte shuffling groups these redundant bytes into runs. One
 sample compressed 2.56x directly and 3.00x with the shuffle, without introducing
 additional numerical loss. Ratios depend on payload representation and workload.
 
+## Server measurements on M1 Ultra and M5 Max
+
+Base `9139e2a`, macOS 26.6.2. Each prompt was sent through `ds4-server`
+twice, first with `--kv-cache-compression-threads 0` and then with LZ4, so the
+first request stores a checkpoint and the second loads it. M1 Ultra, 128 GiB:
+V4 Flash `DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf`
+and `DeepSeek-V4.1-Flash-Q2.gguf` over SSD streaming with 16 and 24 GiB expert
+caches, because a separate 34 GiB process was running; `Qwen3.8-Flash-Next-Q2.gguf`
+resident. M5 Max, 128 GiB: the same V4 Flash file resident and
+`DeepSeek-V4.1-Flash-Q4.gguf` over SSD streaming with a 32 GiB expert cache.
+
+| Machine | Model | Tokens | Raw | LZ4 | Ratio |
+|---|---|---:|---:|---:|---:|
+| M1 Ultra | V4 Flash | 4,096 | 76.66 MiB | 27.96 MiB | 2.74x |
+| M1 Ultra | V4 Flash | 20,480 | 291.77 MiB | 116.43 MiB | 2.51x |
+| M5 Max | V4 Flash | 4,096 | 76.66 MiB | 26.43 MiB | 2.90x |
+| M5 Max | V4 Flash | 20,480 | 291.77 MiB | 108.79 MiB | 2.68x |
+| M5 Max | V4 Flash | 40,960 | 560.66 MiB | 212.19 MiB | 2.64x |
+| M5 Max | V4 Flash | 60,746 | 820.39 MiB | 321.64 MiB | 2.55x |
+| M1 Ultra | V4.1 Q2 | 4,096 | 35.50 MiB | 12.20 MiB | 2.91x |
+| M1 Ultra | V4.1 Q2 | 21,878 | 144.27 MiB | 46.69 MiB | 3.09x |
+| M5 Max | V4.1 Q4 | 4,096 | 35.52 MiB | 12.85 MiB | 2.76x |
+| M5 Max | V4.1 Q4 | 21,878 | 144.18 MiB | 47.31 MiB | 3.05x |
+
+Checkpoints stored at the end of a request include the reply and compress 2.0x
+to 2.6x on V4 Flash. With a fixed `--kv-disk-space-mb`, six ~10K-token prompts
+kept 9 to 10 LZ4 files against 3 raw on V4 Flash at 600 MiB, and 11 against 3
+on V4.1 at 280 MiB, on both machines.
+
+The request column is the wall time of the request that stored the checkpoint,
+including its prefill.
+
+| Machine | Model | Tokens | Save raw / LZ4 | Load raw / LZ4 | Request |
+|---|---|---:|---:|---:|---:|
+| M1 Ultra | V4 Flash | 4,096 | 74 / 85 ms | 30.0 / 34.6 ms | 36-49 s |
+| M1 Ultra | V4 Flash | 20,480 | 287 / 312 ms | 115.6 / 119.6 ms | 128-153 s |
+| M5 Max | V4 Flash | 4,096 | 29 / 36 ms | 11.2 / 15.1 ms | 7 s |
+| M5 Max | V4 Flash | 20,480 | 50 / 156 ms | 39.6 / 63.8 ms | 31 s |
+| M5 Max | V4 Flash | 40,960 | 71 / 292 ms | 75.1 / 138.4 ms | 85-90 s |
+| M5 Max | V4 Flash | 60,746 | 106 / 393 ms | | 46-49 s |
+| M5 Max | V4.1 Q4 | 4,096 | 16 / 62 ms | 11.2 / 20.0 ms | 67-71 s |
+| M5 Max | V4.1 Q4 | 21,878 | 57 / 99 ms | | 88-94 s |
+
+File I/O dominates on the M1 Ultra, so LZ4 adds a few milliseconds there. The
+M5 Max reads and writes raw files faster, so the codec's share is larger; the
+largest cost, 287 ms on a 60,746-token save, is 0.6% of the request that saved
+it. V4.1 Q2 on the M1 Ultra loaded LZ4 checkpoints in 31 to 53 ms at 4K to 20K
+tokens, with no matching raw phase.
+
+Flipping 8 bytes in the middle of a stored V4 Flash or V4.1 checkpoint on
+either machine made the next load report a corrupt compressed payload in 14.7
+to 19.1 ms; the entry was removed, recomputed and stored again.
+
+Qwen3.8 Flash Next checkpoints compress to 0.996x to 1.002x and are stored raw
+under the 1/64 rule. At 10K tokens a save took 615 to 651 ms with compression
+enabled and 287 to 442 ms with `--kv-cache-compression-threads 0`; loads took
+100 and 126 ms.
+
 ## What ds4-bench measures
 
 `ds4-bench` reuses live KV during incremental prefill. Between frontiers it can
