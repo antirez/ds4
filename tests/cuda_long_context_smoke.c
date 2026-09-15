@@ -156,10 +156,93 @@ static int check_decode_attention_overflow_path(void) {
     return rc;
 }
 
+static int check_tokentile_shape_mixed_prefill(void) {
+    /* Flash mixed attention at the token-tile geometry: 128 tokens, 64 heads,
+     * dk=512, SWA 128, ratio 4. This is the dense HMMA path (n_tokens>=128). */
+    const uint32_t n_tokens = 128;
+    const uint32_t n_head = 64;
+    const uint32_t head_dim = 512;
+    const uint32_t window = 128;
+    const uint32_t ratio = 4;
+    const uint32_t n_comp = n_tokens / ratio;
+    const uint64_t q_count = (uint64_t)n_tokens * n_head * head_dim;
+    const uint64_t raw_count = (uint64_t)n_tokens * head_dim;
+    const uint64_t comp_count = (uint64_t)n_comp * head_dim;
+
+    float *sinks = (float *)calloc(n_head, sizeof(float));
+    float *q_host = (float *)calloc((size_t)q_count, sizeof(float));
+    float *raw_host = (float *)calloc((size_t)raw_count, sizeof(float));
+    float *comp_host = (float *)calloc((size_t)comp_count, sizeof(float));
+    float *heads_host = (float *)calloc((size_t)q_count, sizeof(float));
+    if (!sinks || !q_host || !raw_host || !comp_host || !heads_host) {
+        free(heads_host);
+        free(comp_host);
+        free(raw_host);
+        free(q_host);
+        free(sinks);
+        return 1;
+    }
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        for (uint32_t h = 0; h < n_head; h++) {
+            q_host[((uint64_t)t * n_head + h) * head_dim] = 0.01f;
+        }
+        raw_host[(uint64_t)t * head_dim] = 1.0f;
+    }
+    for (uint32_t c = 0; c < n_comp; c++) {
+        comp_host[(uint64_t)c * head_dim] = 1.0f;
+    }
+
+    ds4_gpu_tensor *heads = ds4_gpu_tensor_alloc(q_count * sizeof(float));
+    ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(q_count * sizeof(float));
+    ds4_gpu_tensor *raw = ds4_gpu_tensor_alloc(raw_count * sizeof(float));
+    ds4_gpu_tensor *comp = ds4_gpu_tensor_alloc(comp_count * sizeof(float));
+    int rc = 1;
+    if (heads && q && raw && comp &&
+        ds4_gpu_tensor_write(q, 0, q_host, q_count * sizeof(float)) &&
+        ds4_gpu_tensor_write(raw, 0, raw_host, raw_count * sizeof(float)) &&
+        ds4_gpu_tensor_write(comp, 0, comp_host, comp_count * sizeof(float)) &&
+        ds4_gpu_attention_prefill_static_mixed_heads_tensor(
+            heads, sinks, n_head * sizeof(float), 0, q, raw, comp, 0,
+            n_tokens, n_comp, window, ratio, n_head, head_dim) &&
+        ds4_gpu_synchronize() &&
+        ds4_gpu_tensor_read(heads, 0, heads_host, q_count * sizeof(float))) {
+        rc = 0;
+        for (uint32_t t = 0; t < n_tokens && rc == 0; t++) {
+            for (uint32_t h = 0; h < n_head; h++) {
+                const float v = heads_host[((uint64_t)t * n_head + h) * head_dim];
+                /* Prefill pads pre-window raw rows with zeros, so t=0 is ~0.5. */
+                if (!(v == v) || v < 0.05f || v > 2.0f) {
+                    fprintf(stderr,
+                            "tokentile mixed prefill bad output t=%u h=%u v=%f\n",
+                            t, h, (double)v);
+                    rc = 1;
+                    break;
+                }
+            }
+        }
+    } else {
+        fprintf(stderr,
+                "tokentile-shape mixed prefill failed n_tokens=%u n_comp=%u\n",
+                n_tokens, n_comp);
+    }
+
+    ds4_gpu_tensor_free(comp);
+    ds4_gpu_tensor_free(raw);
+    ds4_gpu_tensor_free(q);
+    ds4_gpu_tensor_free(heads);
+    free(heads_host);
+    free(comp_host);
+    free(raw_host);
+    free(q_host);
+    free(sinks);
+    return rc;
+}
+
 int main(void) {
     if (!ds4_gpu_init()) return 1;
     int rc = check_large_topk();
     if (check_decode_attention_overflow_path() != 0) rc = 1;
+    if (check_tokentile_shape_mixed_prefill() != 0) rc = 1;
     ds4_gpu_cleanup();
     if (rc == 0) puts("cuda long-context regression: OK");
     return rc;
