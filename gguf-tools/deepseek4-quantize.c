@@ -1592,8 +1592,14 @@ static byte_buf generate_expert(st_db *db, const char *gguf_name, const tensor_m
     const char *wid = expert_part_name(e.part);
     const int64_t ncols = tmpl->ne[0];
     const int64_t nrows = tmpl->ne[1];
-    const size_t per_expert = (size_t)nrows * ds4q_row_size(target, ncols);
-    byte_buf out = { .size = per_expert * (size_t)n_experts, .data = xmalloc(per_expert * (size_t)n_experts) };
+    /* Template dims and expert_count are attacker-influenced; bound the
+     * products like the FP8/FP4 dequant paths (issue #823). */
+    const size_t per_expert = checked_size_product((size_t)nrows,
+                                                   ds4q_row_size(target, ncols),
+                                                   "expert per-expert size");
+    const size_t total_size = checked_size_product(per_expert, (size_t)n_experts,
+                                                   "expert total size");
+    byte_buf out = { .size = total_size, .data = xmalloc(total_size) };
     ds4q_quantize_init(target);
     int worker_count = n_threads > 0 ? n_threads : 8;
     if (worker_count < 1) worker_count = 1;
