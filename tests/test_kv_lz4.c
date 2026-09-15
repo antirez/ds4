@@ -441,6 +441,64 @@ static void test_write_payload_region(void) {
     printf("  payload region compresses without cookie streams and round-trips: ok\n");
 }
 
+/* LZ4 is kept only when it saves at least 1/64 of the payload.  Each fixture's
+ * actual saving is measured through the writer core first, so the bands hold:
+ * expansion and a saving between 1/256 and 1/64 are stored raw, with the file
+ * ending exactly at the raw region; a saving between 1/64 and 1/16 stays LZ4. */
+static void test_write_payload_region_raw_fallback(void) {
+    const size_t zero_runs[] = {0, 300, 700};
+    for (int kind = 0; kind < 3; kind++) {
+    const size_t n = 3 * (1u << 12) + 11;
+    uint8_t *data = malloc(n), *back = malloc(n);
+    assert(data && back);
+    fill(data, n, 1);
+    memset(data + n / 2, 0, zero_runs[kind]);
+
+    FILE *probe = tmpfile();
+    assert(probe);
+    const int64_t saved = (int64_t)n - (int64_t)codec_write(probe, data, n, 1u << 12, 4);
+    fclose(probe);
+    if (kind == 0) assert(saved < 0);
+    if (kind == 1) assert(saved > (int64_t)(n / 256) && saved < (int64_t)(n / 64));
+    if (kind == 2) assert(saved > (int64_t)(n / 64) && saved < (int64_t)(n / 16));
+
+    char staged_path[] = "/tmp/ds4_kv_lz4_staged_XXXXXX";
+    int sfd = mkstemp(staged_path);
+    assert(sfd >= 0);
+    FILE *sf = fdopen(sfd, "wb");
+    assert(sf && fwrite(data, 1, n, sf) == n);
+    assert(fclose(sf) == 0);
+    const ds4_session_payload_file staged = {.path = staged_path, .bytes = n};
+
+    FILE *fp = tmpfile();
+    assert(fp);
+    const uint8_t lead[97] = {0};
+    assert(fwrite(lead, 1, sizeof(lead), fp) == sizeof(lead));
+    uint8_t codec = 0xFF, chunk_log2 = 0xFF;
+    uint64_t on_disk = 0;
+    char err[256] = {0};
+    assert(ds4_kvstore_write_payload_region(fp, &staged, 4, 1u << 12,
+            &codec, &chunk_log2, &on_disk, err, sizeof(err)));
+    if (kind == 2) {
+        assert(codec == DS4_KVSTORE_CODEC_LZ4 && on_disk == (uint64_t)((int64_t)n - saved));
+        assert(fseeko(fp, (off_t)sizeof(lead), SEEK_SET) == 0);
+        assert(core_read_all(fp, on_disk, 1u << 12, 4, back, n));
+        assert(memcmp(back, data, n) == 0);
+    } else {
+        assert(codec == DS4_KVSTORE_CODEC_NONE && chunk_log2 == 0 && on_disk == n);
+        assert(ftello(fp) == (off_t)(sizeof(lead) + n));
+        assert(fseeko(fp, 0, SEEK_END) == 0 && ftello(fp) == (off_t)(sizeof(lead) + n));
+        assert(fseeko(fp, (off_t)sizeof(lead), SEEK_SET) == 0);
+        assert(fread(back, 1, n, fp) == n && memcmp(back, data, n) == 0);
+    }
+
+    fclose(fp);
+    unlink(staged_path);
+    free(data); free(back);
+    }
+    printf("  payload region keeps LZ4 only when it saves at least 1/64: ok\n");
+}
+
 /* Mutated and wholly random regions must fail or return wrong bytes, never
  * crash, read out of bounds or spin.  Deterministic seed so a failure repeats. */
 static void test_fuzz_regions(void) {
@@ -642,6 +700,7 @@ int main(void) {
     test_truncated_and_corrupt();
     test_fuzz_regions();
     test_write_payload_region();
+    test_write_payload_region_raw_fallback();
     if (!KV_LZ4_HAVE_FWRAP) test_no_cookie_streams();
     printf("Disk KV lz4 codec%s: PASS\n",
            KV_LZ4_HAVE_FWRAP ? "" : ", no cookie streams");

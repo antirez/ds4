@@ -1048,8 +1048,20 @@ bool ds4_kvstore_write_payload_region(FILE *fp,
             if (ok) codec = DS4_KVSTORE_CODEC_LZ4;
         }
     }
-    const off_t payload_end = ftello(fp);
+    off_t payload_end = ftello(fp);
     if (ok && payload_end < 0) ok = false;
+    /* A region that saved less than 1/64 of the payload is rewritten raw;
+     * truncate the encoded bytes it may leave past the raw end. */
+    if (ok && codec == DS4_KVSTORE_CODEC_LZ4 &&
+        (uint64_t)(payload_end - payload_start) > staged->bytes - staged->bytes / 64)
+    {
+        codec = DS4_KVSTORE_CODEC_NONE;
+        ok = fseeko(fp, payload_start, SEEK_SET) == 0 &&
+             ds4_session_write_staged_payload(staged, fp, save_err, save_err_len) == 0 &&
+             fflush(fp) == 0 &&
+             (payload_end = ftello(fp)) >= 0 &&
+             ftruncate(fileno(fp), payload_end) == 0;
+    }
     if (ok) on_disk = (uint64_t)(payload_end - payload_start);
     /* No bytes means no framing was emitted, so the region is only readable
      * as a raw (empty) payload. */

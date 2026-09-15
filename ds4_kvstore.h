@@ -234,7 +234,8 @@ uint32_t ds4_kvstore_le_get32(const uint8_t *p);
 
 /* Write the payload region for `staged` into `fp`, which must be positioned at
  * the payload start.  n_workers == 0 writes a raw payload; >=1 wraps it in the
- * LZ4 codec.  On success sets *codec_out, *chunk_log2_out, and *on_disk_out
+ * LZ4 codec, falling back to raw when it saves less than 1/64 of the payload; fp's
+ * file is truncated at the end of the region.  On success sets *codec_out, *chunk_log2_out, and *on_disk_out
  * (payload bytes written, excluding any trailer) for the header patch-back.
  * Returns true on success; save_err carries the reason on failure. */
 bool ds4_kvstore_write_payload_region(FILE *fp,

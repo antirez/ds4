@@ -205,12 +205,18 @@ static void run_case(const char *name) {
         assert(!store(&kc, NULL));
         assert(fail_alloc == 0);
         assert(access(old, F_OK) == 0 && access(incoming, F_OK) != 0);
-    } else if (!strcmp(name, "expansion-budget")) {
+    } else if (!strcmp(name, "incompressible-raw")) {
+        /* LZ4 would expand the payload, so it is stored raw with no encoded
+         * bytes left behind, and loads back byte for byte. */
         random_payload = true;
-        kc.budget_bytes = payload_size + payload_size / 100 + 4096;
-        assert(!store(&kc, NULL));
+        assert(store(&kc, NULL));
+        assert(header_byte(incoming, 3) == 1 && header_byte(incoming, 21) == DS4_KVSTORE_CODEC_NONE);
+        struct stat st;
+        assert(stat(incoming, &st) == 0);
+        assert((uint64_t)st.st_size == 52 + strlen("incoming checkpoint") + payload_size);
+        kv_cache_refresh(&kc);
+        assert(ds4_kvstore_try_load_text(&kc, NULL, NULL, "incoming checkpoint", NULL, NULL, NULL, false) == 128);
         random_payload = false;
-        assert(access(old, F_OK) == 0 && access(incoming, F_OK) != 0);
     } else if (!strcmp(name, "protect-published")) {
         kc.opt.compression_threads = 0;
         assert(store(&kc, NULL));
@@ -344,7 +350,7 @@ static void run_case(const char *name) {
 int main(int argc, char **argv) {
     if (argc == 2) { run_case(argv[1]); return 0; }
     const char *cases[] = {"admission", "eviction", "publish-failure", "write-failure",
-        "raw-fallback-budget", "expansion-budget", "protect-published", "payload-past-eof", "legacy-codec",
+        "raw-fallback-budget", "incompressible-raw", "protect-published", "payload-past-eof", "legacy-codec",
         "corrupt-recovery", "checksum-recovery",
         "load-oom", "engine-oom", "engine-io", "engine-silent",
         "stream-io-framing", "stream-io-record", "stream-io-block", "replace-failure", "replace-success"};

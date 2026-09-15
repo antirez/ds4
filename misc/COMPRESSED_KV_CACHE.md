@@ -56,7 +56,12 @@ The default is `min(8, online CPUs)` workers and 16 MiB chunks. The server flag
 64; accepted chunk sizes are bounded by 64 MiB, and a size that is not a power
 of two uses the default. Compression does not depend on cookie streams: the
 writer reads the staged payload directly. Failure to allocate a writer falls
-back to raw storage.
+back to raw storage, and so does an encoded region that saves less than 1/64 of
+the payload: it is rewritten raw in place and the file truncated, since such a
+file would pay chunk decoding on every load for no useful space. Qwen3.8 Flash
+Next checkpoints take this path, since their dense float state and 16-bit
+key/value caches compress to about 1.00x; they still pay the encode attempt,
+so `--kv-cache-compression-threads 0` saves that time.
 
 Each writer worker holds raw, shuffled, and encoded buffers: approximately
 `3 * workers * chunk_size`, or 384 MiB at defaults, plus codec and stream state.
@@ -69,9 +74,8 @@ an additional full-payload RAM buffer. Temporary disk usage includes raw staging
 and the new output while old cache files still exist.
 
 Admission uses the actual encoded size, including text, trailers and 1% safety
-headroom. Raw writes can reject a known oversize payload early. LZ4 can expand
-incompressible data, and raw fallback can exceed the budget, so the final size
-check applies to both. Only after successful close and atomic rename does the
+headroom. Raw writes can reject a known oversize payload early. Raw fallback can
+exceed the budget, so the final size check applies to both formats. Only after successful close and atomic rename does the
 store evict entries using actual file sizes, protecting the newly admitted
 checkpoint. Failed writes or publication leave existing entries intact, including
 a same-key file incompatible with the current model or context. This
@@ -163,8 +167,8 @@ header versions through refresh, trailer positioning and raw fallback, and
 asserts that no fuzzed region decodes to full-length wrong bytes. Store regressions replace only
 the engine boundary and exercise actual staging, compression, admission,
 eviction and publication with deterministic payloads. They cover fitting
-compressed files, unnecessary eviction, write/rename failures, fallback and
-incompressible expansion exceeding budget, protection of an admitted file,
+compressed files, unnecessary eviction, write/rename failures, raw fallback
+exceeding budget, incompressible payloads stored raw and loaded back, protection of an admitted file,
 corrupt-file and checksum-mismatch replacement, removal of the retired codec-1
 layout while other unknown codecs are kept, retention after engine failures
 that report no errno and after stream read errors in the framing, a chunk
