@@ -1,0 +1,9 @@
+# Comparing Two Model Quantizations Without Relying on a Single Answer
+
+Evaluating quantization quality from one response is unreliable — a single generation can look fine while the model is subtly degraded. Here's a robust methodology:
+
+## 1. Use Aggregate Benchmarks
+Run both models over many prompts and score statistically:
+- **Perplexity (PPL)** on a held-out corpus — the standard first check; lower is better.
+- **Task-specific suites**: MMLU, GSM8K, HellaSwag, etc., depending on your use case.
+- **KL divergence** between output distributions of the

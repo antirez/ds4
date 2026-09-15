@@ -1,0 +1,1 @@
+Spiega perche il prefill GPU puo essere piu veloce del decode token singolo.

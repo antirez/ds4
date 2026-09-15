@@ -1,0 +1,1 @@
+Per capire perché la **cache KV (Key-Value) su disco** è un punto di svolta nelle sessioni agentiche, dobbiamo prima capire cosa succede "sotto il cofano" di un agente AI e perché il contesto è il suo collo di bottiglia principale

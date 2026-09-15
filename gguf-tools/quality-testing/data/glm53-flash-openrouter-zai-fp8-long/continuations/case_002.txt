@@ -1,0 +1,9 @@
+## State owned by the server (per the excerpt)
+
+**Process-global state:**
+
+- `g_stop_requested` and `g_listen_fd` — `volatile sig_atomic_t` shutdown flags touched by `stop_signal_handler` (second SIGINT exits immediately with code 130; first one closes the listen fd to break the accept loop).
+
+**Per-connection / per-request state:**
+
+- `buf` — a growable byte buffer (`ptr`/`len`/`cap`) used for JSON string building, raw values, and minification. Never grows past `SIZE_MAX - len - 1`; always NUL

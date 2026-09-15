@@ -1,0 +1,7 @@
+Here is a comprehensive checklist for validating that a quantized model still follows instructions. This checklist is designed to be used **before** deployment, focusing on both functional correctness and behavioral drift.
+
+---
+
+### Phase 1: Pre-Validation Setup (The Baseline)
+
+Before you test the quantized model, you must establish a "

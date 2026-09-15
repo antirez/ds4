@@ -1,0 +1,8 @@
+Here's a comprehensive comparison of memory-mapped model weights versus copying all weights into private buffers on macOS:
+
+## Memory-Mapped Weights (mmap)
+
+### How It Works
+```swift
+// Example: Memory-mapping a model file
+let fileHandle = FileHandle(forReadingAtPath: modelPath)

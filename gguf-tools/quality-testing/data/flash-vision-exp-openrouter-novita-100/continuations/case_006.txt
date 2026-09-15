@@ -1,0 +1,3 @@
+To understand the tradeoffs between **top-p (nucleus) sampling** and **temperature zero decoding**, it helps to first clarify that they are fundamentally different tools: **temperature zero is a deterministic selection rule**, while **top-p is a stochastic filtering rule**. 
+
+Here is the breakdown of their tradeoffs across accuracy

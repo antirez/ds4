@@ -1,0 +1,1 @@
+Per comprendere la differenza tra **righe KV raw** (grezze) e **righe KV compresse**, dobbiamo prima chiarire che ci stiamo riferendo a sistemi di storage a coppia **Chiave-Valore** (Key-Value store), come RocksDB,

@@ -1,0 +1,10 @@
+# KV Cache Checkpointing in Agentic Sessions
+
+## Background: The Problem
+
+In transformer inference, the **KV cache** stores the key/value tensors for all previously processed tokens. Recomputing them from scratch for every new token would be prohibitively expensive — it's what makes autoregressive generation tractable.
+
+Agentic sessions (long-running LLM workflows with tool calls, multi-turn reasoning, etc.) stress this system in specific ways:
+
+1. **Very long contexts** — agents accumulate thousands of tokens of tool outputs, observations, and intermediate reasoning.
+2. **Many sequential turns** — each turn appends to

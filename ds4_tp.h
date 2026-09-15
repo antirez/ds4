@@ -45,14 +45,17 @@ typedef struct {
     uint32_t quant_bits;
     uint32_t ctx_size;
     /* Decode gate schedule, used to place RDMA recvs into the right slab
-     * slot: slot(seq) = start + ((seq-1) % per_token) * step.
+     * slot. A nonempty mask lists the exact slots in firing order; otherwise
+     * slot(seq) = start + ((seq-1) % per_token) * step.
      * per_token 0 falls back to the identity mapping over all slots
      * (DS4: every layer fires ATTN then FFN). GLM fires one FFN gate per
-     * sparse layer only, so its schedule skips the dense prefix and the
-     * ATTN slots. Exchanged in the hello; both sides must agree. */
+     * sparse layer in streaming mode. Hybrid GLM-5.3 uses the mask because
+     * DSA layers also fire ATTN while KDA layers do not. Exchanged in the
+     * hello; both sides must agree. */
     uint32_t gate_slot_start;
     uint32_t gate_slot_step;
     uint32_t gates_per_token;
+    uint64_t gate_slot_mask[DS4_TP_GATE_MASK_WORDS];
 } ds4_tp_identity;
 
 bool ds4_tp_enabled(const ds4_tp_options *opt);
@@ -123,6 +126,9 @@ uint64_t ds4_tp_slab_batch_out_offset(const ds4_tp *tp, uint32_t layer);
 uint64_t ds4_tp_slab_batch_in_offset(const ds4_tp *tp, uint32_t layer);
 uint64_t ds4_tp_slab_gpu_flags_offset(const ds4_tp *tp);
 int ds4_tp_attach_slab(ds4_tp *tp, void *base, char *err, size_t errlen);
+/* Stop the data plane before freeing its registered buffers. No more gates
+ * may be issued; free the transport after the engine has been unbound. */
+void ds4_tp_detach_slab(ds4_tp *tp);
 
 /* Exchange one gate: send out[layer][gate] to the peer's in[layer][gate]
  * and wait until the peer's partial for `seq` has fully landed locally.
@@ -134,6 +140,10 @@ int ds4_tp_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq
  * the GPU gate service thread. */
 int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
                                uint64_t seq);
+/* Verify-block RDMA window (speculative decoding): call on both ranks right
+ * before/after a verify block with one batch gate per layer. */
+int ds4_tp_batch_block_begin(ds4_tp *tp, uint32_t rows, uint32_t n_layers);
+int ds4_tp_batch_block_end(ds4_tp *tp);
 
 /* Prefill batch gate: arbitrary-size symmetric payload exchange over bulk
  * RDMA, with interleaved 2MB TCP rounds as fallback (see ds4_tp.c). */
@@ -151,8 +161,14 @@ int ds4_tp_send_session_create(ds4_tp *tp, uint64_t session_id, int ctx_size);
 int ds4_tp_send_session_destroy(ds4_tp *tp, uint64_t session_id);
 int ds4_tp_send_sync(ds4_tp *tp, uint64_t session_id,
                      const int *tokens, uint32_t n_tokens);
+int ds4_tp_send_sync_multimodal(ds4_tp *tp, uint64_t session_id,
+                                const int *tokens, uint32_t n_tokens,
+                                const ds4_vision_span *images,
+                                uint32_t image_count);
 int ds4_tp_send_eval(ds4_tp *tp, uint64_t session_id,
                      uint64_t seq, int token);
+int ds4_tp_send_glm_mtp(ds4_tp *tp, uint64_t session_id,
+                       uint64_t seq, int token, int limit);
 int ds4_tp_send_rewind(ds4_tp *tp, uint64_t session_id, int pos);
 int ds4_tp_send_invalidate(ds4_tp *tp, uint64_t session_id);
 int ds4_tp_send_eval_batch(ds4_tp *tp, const ds4_tp_batch_item *items,
@@ -164,6 +180,12 @@ int ds4_tp_send_mixed_batch(ds4_tp *tp, uint64_t prefill_session_id,
 int ds4_tp_send_command_ack(ds4_tp *tp, uint64_t session_id, int status);
 int ds4_tp_wait_command_ack(ds4_tp *tp, uint64_t session_id,
                             const char *operation, char *err, size_t errlen);
+int ds4_tp_wait_command_status(ds4_tp *tp, uint64_t session_id, int *status,
+                               const char *operation, char *err, size_t errlen);
+/* Both ranks call at matching prefill boundaries. Cancellation is agreed
+ * here, never sampled independently while either rank is inside a GPU gate. */
+int ds4_tp_sync_checkpoint(ds4_tp *tp, uint32_t point, int current, int total,
+                            bool requested, bool *cancelled);
 int ds4_tp_send_stop(ds4_tp *tp);
 
 /* Worker: blocks for the next mirrored command.  Frame types below; for
@@ -188,6 +210,11 @@ typedef enum {
     DS4_TP_FRAME_EVAL_BATCH = 15,
     DS4_TP_FRAME_MIXED_BATCH = 16,
     DS4_TP_FRAME_COMMAND_ACK = 17,
+    DS4_TP_FRAME_SYNC_MULTIMODAL = 18,
+    DS4_TP_FRAME_RDMA_WARM = 19,
+    DS4_TP_FRAME_RDMA_POSTED = 20,
+    DS4_TP_FRAME_GLM_MTP = 21,
+    DS4_TP_FRAME_SYNC_CHECKPOINT = 22,
 } ds4_tp_frame_type;
 
 typedef struct {
@@ -195,10 +222,13 @@ typedef struct {
     uint64_t session_id;
     uint64_t seq;
     int value;
+    int limit;
     int *tokens;
     uint32_t n_tokens;
     ds4_tp_batch_item *items;
     uint32_t n_items;
+    ds4_vision_span *images;
+    uint32_t n_images;
 } ds4_tp_command;
 
 int ds4_tp_recv_command(
@@ -219,13 +249,19 @@ int ds4_tp_recv_logits_half(ds4_tp *tp, float *half, uint32_t count);
 
 /* Speculative verify mirroring.  The leader announces a draft block right
  * before both ranks run the expert-split batch verify; the worker then blocks
- * on the commit frame, which carries the leader's decision: full_accept keeps
- * the pushed rows, otherwise both sides roll back and replay replay_n tokens
- * through the gated single-token decode in lockstep. */
+ * on the commit frame. A full commit keeps the entire verified block, a prefix
+ * commit restores the matching verifier prefix on both ranks, and rollback
+ * restores the original frontier before replaying token_count tokens. */
+typedef enum {
+    DS4_TP_VERIFY_ROLLBACK_REPLAY = 0,
+    DS4_TP_VERIFY_COMMIT_FULL = 1,
+    DS4_TP_VERIFY_COMMIT_PREFIX = 2,
+} ds4_tp_verify_commit_mode;
+
 int ds4_tp_send_verify(ds4_tp *tp, uint64_t session_id,
                        const int *drafts, uint32_t n);
-int ds4_tp_send_verify_commit(ds4_tp *tp, int32_t full_accept, int32_t replay_n);
-int ds4_tp_recv_verify_commit(ds4_tp *tp, int32_t *full_accept, int32_t *replay_n);
+int ds4_tp_send_verify_commit(ds4_tp *tp, int32_t mode, int32_t token_count);
+int ds4_tp_recv_verify_commit(ds4_tp *tp, int32_t *mode, int32_t *token_count);
 
 /* Standalone worker mode entry. Loads nothing itself: the engine is already
  * open. */

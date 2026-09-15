@@ -1,0 +1,18 @@
+{
+  "model": "deepseek-flash",
+  "endpoint": "https://api.deepseek.com/chat/completions",
+  "fingerprint": "aeb56401ca74e127821c4f9126dcb669",
+  "thinking": "disabled",
+  "temperature": 1,
+  "max_tokens": 64,
+  "top_logprobs": 20,
+  "prompt_tokens": [
+    65541,
+    65540,
+    65541,
+    98308,
+    98308,
+    98309
+  ],
+  "purpose": "held-out batched prefill quality"
+}

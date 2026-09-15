@@ -1,0 +1,5 @@
+## TCP Echo Server Design for Slow Clients
+
+### Core Architecture
+
+**Thread-per-connection model** with non-blocking

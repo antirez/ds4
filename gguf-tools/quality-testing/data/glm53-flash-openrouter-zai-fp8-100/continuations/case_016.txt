@@ -1,0 +1,12 @@
+# Top-p vs Temperatura Zero
+
+## Temperatura Zero (greedy decoding)
+
+**Pro:**
+- **Deterministica**: stesso input → stesso output, sempre
+- **Riproducibilità**: ideale per test, debugging e applicazioni che richiedono coerenza
+- **Massima "confidenza"**: sceglie sempre il token più probabile secondo il modello
+
+**Contro:**
+- **Ripetitività**: può entrare in loop o produrre frasi generiche e prevedibili
+- **Testo piatto**: manca di varietà stilistica e creatività

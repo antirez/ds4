@@ -1,0 +1,3 @@
+Per rispondere a questa domanda dobbiamo entrare nel dettaglio di come funziona l'architettura grafica di **Metal** (il framework grafico di Apple) e come il *driver* e la *GPU* gestiscono la memoria.
+
+La domanda è controint

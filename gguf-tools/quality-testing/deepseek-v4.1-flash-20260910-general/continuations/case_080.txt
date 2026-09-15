@@ -1,0 +1,1 @@
+A good benchmark should measure **what it claims to measure—accurately, reproducibly, and in a way that reflects real-world performance rather than merely rewarding optimization

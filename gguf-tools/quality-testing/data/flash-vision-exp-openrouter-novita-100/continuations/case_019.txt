@@ -1,0 +1,6 @@
+Ecco tre invarianti fondamentali per una tabella di token speciali (ad esempio, in un compilatore o in un parser):
+
+---
+
+### 1. **Unicità e Identificazione Stabile**
+> **Ogni token speciale ha un identificatore univoco e immutabile.

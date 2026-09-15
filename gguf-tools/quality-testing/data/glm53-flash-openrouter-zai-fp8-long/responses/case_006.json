@@ -1,0 +1,54 @@
+{
+  "id": "gen-1788630705-wYrSv7VHNppiTZlmGjLz",
+  "object": "chat.completion",
+  "created": 1788630705,
+  "model": "z-ai/glm-5.3-flash",
+  "provider": "Z.AI",
+  "system_fingerprint": null,
+  "service_tier": null,
+  "choices": [
+    {
+      "index": 0,
+      "logprobs": null,
+      "finish_reason": "length",
+      "native_finish_reason": "length",
+      "message": {
+        "role": "assistant",
+        "content": "Short answer: the excerpt doesn't actually contain the code that runs when a connection closes — it's almost entirely type definitions, protocol constants, and comments. So a definitive description of the close-hand",
+        "refusal": null,
+        "reasoning": "The excerpt mostly defines types and constants; connection-close handling logic isn't shown. Explain based only on what's visible: state fields (closing, canceled, stop, rc, err, shutting_down, accept thread), error codes DS4_DIST_RECV_TRANSPORT_ERROR / REMOTE_ERROR, pending request queue, error message DS4_DIST_MSG_ERROR — but no actual close handling code visible. So answer: cannot fully determine; describe mechanisms implied.",
+        "reasoning_details": [
+          {
+            "type": "reasoning.text",
+            "text": "The excerpt mostly defines types and constants; connection-close handling logic isn't shown. Explain based only on what's visible: state fields (closing, canceled, stop, rc, err, shutting_down, accept thread), error codes DS4_DIST_RECV_TRANSPORT_ERROR / REMOTE_ERROR, pending request queue, error message DS4_DIST_MSG_ERROR — but no actual close handling code visible. So answer: cannot fully determine; describe mechanisms implied.",
+            "format": "unknown",
+            "index": 0
+          }
+        ]
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 3096,
+    "completion_tokens": 128,
+    "total_tokens": 3224,
+    "cost": 0.0002642,
+    "is_byok": false,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "cache_write_tokens": 0,
+      "audio_tokens": 0,
+      "video_tokens": 0
+    },
+    "cost_details": {
+      "upstream_inference_cost": 0.0002642,
+      "upstream_inference_prompt_cost": 0.0002322,
+      "upstream_inference_completions_cost": 3.2e-05
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 88,
+      "image_tokens": 0,
+      "audio_tokens": 0
+    }
+  }
+}

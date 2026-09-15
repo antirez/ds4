@@ -1,0 +1,5 @@
+Ecco una checklist completa per validare che un modello quantizzato (es. GPTQ, AWQ, GGUF) segua ancora le istruzioni in modo affidabile. La divido in **fasi di test** per coprire sia aspetti funzionali che qualitativi.
+
+---
+
+##

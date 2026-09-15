@@ -1,0 +1,6 @@
+# Why Quantization Error Hits Rare Experts Harder
+
+In Mixture-of-Experts (MoE) models, quantization (compressing weights/activations to lower precision) can disproportionately harm experts that are rarely routed to. Here's why:
+
+## 1. Calibration Data Scarcity
+Quantization typically uses a small calibration dataset to determine scaling factors and

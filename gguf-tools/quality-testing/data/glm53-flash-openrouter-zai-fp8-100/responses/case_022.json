@@ -1,0 +1,46 @@
+{
+  "id": "gen-1787762137-SlCz98Q48rH6cmhRHULI",
+  "object": "chat.completion",
+  "created": 1787762137,
+  "model": "z-ai/glm-5.3-flash",
+  "provider": "Z.AI",
+  "system_fingerprint": null,
+  "service_tier": null,
+  "choices": [
+    {
+      "index": 0,
+      "logprobs": null,
+      "finish_reason": "length",
+      "native_finish_reason": "length",
+      "message": {
+        "role": "assistant",
+        "content": "# Mutex vs. Atomic Counter\n\n## Atomic Counter\nAn atomic counter is a single variable whose operations (increment, decrement, add, compare-and-swap) are guaranteed to be **indivisible** at the hardware level.\n\n```cpp\nstd::atomic<int> count{0};\ncount++;  // Safe under concurrency — uses a CPU atomic instruction (e.g., lock xadd)\n```\n\n- Uses special CPU instructions (e.g., `LOCK XADD`, `CAS`)\n- Lock-free (usually) — threads never \"wait\" for a lock; the hardware arbitrates\n- Very fast: typically tens of nan",
+        "refusal": null,
+        "reasoning": null
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 24,
+    "completion_tokens": 128,
+    "total_tokens": 152,
+    "cost": 3.38e-05,
+    "is_byok": false,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "cache_write_tokens": 0,
+      "audio_tokens": 0,
+      "video_tokens": 0
+    },
+    "cost_details": {
+      "upstream_inference_cost": 3.38e-05,
+      "upstream_inference_prompt_cost": 1.8e-06,
+      "upstream_inference_completions_cost": 3.2e-05
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 0,
+      "image_tokens": 0,
+      "audio_tokens": 0
+    }
+  }
+}

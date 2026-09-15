@@ -1,0 +1,1 @@
+A TCP server must preserve a partially written reply when a client reads slowly because TCP guarantees reliable, in-order delivery of a byte stream, not message boundaries, and the server's send buffer may fill up if the client application isn't reading quickly enough. When a write can only complete partially (for example, a nonblock

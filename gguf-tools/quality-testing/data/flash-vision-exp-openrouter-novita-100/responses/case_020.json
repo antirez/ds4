@@ -1,0 +1,46 @@
+{
+  "id": "gen-1788193289-8YKcYt5rjrTO6g4OM99U",
+  "object": "chat.completion",
+  "created": 1788193289,
+  "model": "deepseek/deepseek-v4-flash-vision-exp",
+  "provider": "Novita",
+  "system_fingerprint": "aa8d6caccae4a22492bb51091cfc8eab",
+  "service_tier": null,
+  "choices": [
+    {
+      "index": 0,
+      "logprobs": null,
+      "finish_reason": "length",
+      "native_finish_reason": "length",
+      "message": {
+        "role": "assistant",
+        "content": "Here's how binary search finds the insertion point in a sorted array:\n\n## The Core Idea\n\nBinary search for insertion point finds the **leftmost position** where a target value can be inserted while maintaining sorted order. This is essentially finding the **lower bound** of the target value.\n\n## The Algorithm\n\nGiven a sorted",
+        "refusal": null,
+        "reasoning": null
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 18,
+    "completion_tokens": 64,
+    "total_tokens": 82,
+    "cost": 9.24e-05,
+    "is_byok": false,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "cache_write_tokens": 0,
+      "audio_tokens": 0,
+      "video_tokens": 0
+    },
+    "cost_details": {
+      "upstream_inference_cost": 9.24e-05,
+      "upstream_inference_prompt_cost": 7.92e-06,
+      "upstream_inference_completions_cost": 8.448e-05
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 0,
+      "image_tokens": 0,
+      "audio_tokens": 0
+    }
+  }
+}

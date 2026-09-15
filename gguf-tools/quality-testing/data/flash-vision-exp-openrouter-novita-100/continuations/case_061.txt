@@ -1,0 +1,5 @@
+To understand why sorted arrays make membership tests faster with binary search, we need to look at the fundamental difference between **linear search** (on an unsorted array) and **binary search** (on a sorted array).
+
+Here is the step-by-step explanation:
+
+### 1. The Problem: Finding a Value in an

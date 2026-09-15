@@ -1,0 +1,46 @@
+{
+  "id": "gen-1787762296-JrT8cWnoRT3bVwzXHK0A",
+  "object": "chat.completion",
+  "created": 1787762296,
+  "model": "z-ai/glm-5.3-flash",
+  "provider": "Z.AI",
+  "system_fingerprint": null,
+  "service_tier": null,
+  "choices": [
+    {
+      "index": 0,
+      "logprobs": null,
+      "finish_reason": "length",
+      "native_finish_reason": "length",
+      "message": {
+        "role": "assistant",
+        "content": "# Tries: Representing Sets of Strings\n\nA **trie** (prefix tree) is a tree data structure where each path from the root to a node represents a prefix of stored strings. Each edge is labeled with a character.\n\n## Structure\n\n- The **root** represents the empty string\n- Each node has children, one per possible next character\n- Strings are typically marked with a special flag (e.g., `is_end_of_word`) at their final node\n\n## Example\n\nStoring the set `{cat, car, card, dog}`:\n\n```\n        (root)\n        /    \\\n       c      d",
+        "refusal": null,
+        "reasoning": null
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 22,
+    "completion_tokens": 128,
+    "total_tokens": 150,
+    "cost": 3.365e-05,
+    "is_byok": false,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "cache_write_tokens": 0,
+      "audio_tokens": 0,
+      "video_tokens": 0
+    },
+    "cost_details": {
+      "upstream_inference_cost": 3.365e-05,
+      "upstream_inference_prompt_cost": 1.65e-06,
+      "upstream_inference_completions_cost": 3.2e-05
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 0,
+      "image_tokens": 0,
+      "audio_tokens": 0
+    }
+  }
+}

@@ -1,0 +1,1 @@
+Il vantaggio principale della cache è **la velocità**: riduce i tempi di accesso ai dati, evitando di doverli recuperare ogni volta dalla memoria principale o dal disco.

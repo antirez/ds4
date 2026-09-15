@@ -309,6 +309,46 @@ __device__ __forceinline__ static bool topk_score_better(float av, uint32_t ai, 
     return av > bv || (av == bv && ai < bi);
 }
 
+template <uint32_t THREADS>
+__global__ static void indexer_top1_rows_kernel(
+        uint32_t *selected,
+        const float *scores,
+        uint32_t n_comp,
+        uint32_t n_tokens) {
+    const uint32_t token = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    if (token >= n_tokens) return;
+
+    const float *row = scores + (uint64_t)token * n_comp;
+    float best_value = -INFINITY;
+    uint32_t best_index = 0u;
+    for (uint32_t i = tid; i < n_comp; i += THREADS) {
+        const float value = row[i];
+        if (topk_score_better(value, i, best_value, best_index)) {
+            best_value = value;
+            best_index = i;
+        }
+    }
+
+    __shared__ float values[THREADS];
+    __shared__ uint32_t indices[THREADS];
+    values[tid] = best_value;
+    indices[tid] = best_index;
+    __syncthreads();
+
+    for (uint32_t stride = THREADS / 2u; stride > 0u; stride >>= 1u) {
+        if (tid < stride &&
+            topk_score_better(values[tid + stride], indices[tid + stride],
+                              values[tid], indices[tid])) {
+            values[tid] = values[tid + stride];
+            indices[tid] = indices[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0u) selected[token] = indices[0];
+}
+
 /* DSpark Markov correction: select argmax(logits + W2 * W1[prev]) without
  * moving the vocabulary row back to the host. W1 and W2 are Q8_0. */
 __global__ static void dspark_markov_argmax_kernel(
@@ -935,6 +975,13 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
         scores->bytes < (uint64_t)n_tokens * n_comp * sizeof(float) ||
         selected->bytes < (uint64_t)n_tokens * top_k * sizeof(uint32_t)) {
         return 0;
+    }
+    if (top_k == 1u) {
+        indexer_top1_rows_kernel<256u><<<n_tokens, 256u>>>(
+                (uint32_t *)selected->ptr,
+                (const float *)scores->ptr,
+                n_comp, n_tokens);
+        return cuda_ok(cudaGetLastError(), "indexer top1 rows launch");
     }
     if (top_k == 512u && n_comp <= 1024u) {
         indexer_topk_1024_kernel<<<n_tokens, 1024>>>((uint32_t *)selected->ptr,

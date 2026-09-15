@@ -1,0 +1,2 @@
+Speculative decoding preserves exact greedy output by using a verification scheme that guarantees the final token sequence is identical to what standard greedy decoding would produce. Here's how:
+

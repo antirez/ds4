@@ -1,0 +1,26 @@
+# Counting Rows Per Category
+
+```sql
+SELECT category, COUNT(*) AS row_count
+FROM products
+GROUP BY category;
+```
+
+**How it works:**
+- `GROUP BY category` groups rows with the same category value
+- `COUNT(*)` counts the number of rows in each group
+- `AS row_count` gives the count column a readable name
+
+**Example output:**
+
+| category | row_count |
+|----------|-----------|
+| Electronics | 42 |
+| Clothing | 87 |
+| Books | 15 |
+
+**Optional variations:**
+
+Sort by count (most common first):
+```sql
+SELECT

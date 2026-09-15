@@ -1,0 +1,1 @@
+**Latenza** e **throughput** sono due concetti fondamentali per misurare le prestazioni di un

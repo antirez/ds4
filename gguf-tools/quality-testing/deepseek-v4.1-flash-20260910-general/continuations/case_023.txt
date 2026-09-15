@@ -1,0 +1,3 @@
+# Backpressure in a Network Server
+
+**Backpressure** is a flow-control mechanism that prevents a fast producer from overwhelming a slow consumer. When one part of

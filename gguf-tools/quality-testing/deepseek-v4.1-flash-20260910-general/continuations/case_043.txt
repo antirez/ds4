@@ -1,0 +1,5 @@
+# Minimal JSON Schema for a Tool Call
+
+```json
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",

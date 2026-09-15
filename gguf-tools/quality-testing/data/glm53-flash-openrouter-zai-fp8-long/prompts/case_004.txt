@@ -1,0 +1,457 @@
+The following is an excerpt from ds4_agent.c:
+```c
+#include "ds4.h"
+#include "ds4_distributed.h"
+#include "ds4_gpu_args.h"
+#include "ds4_help.h"
+#include "ds4_kvstore.h"
+#include "ds4_prompt_prefix.h"
+#include "ds4_tp.h"
+#include "ds4_web.h"
+#include "linenoise.h"
+
+#include <errno.h>
+#include <ctype.h>
+#include <dirent.h>
+#include <fnmatch.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <math.h>
+#include <poll.h>
+#include <pthread.h>
+#include <regex.h>
+#include <signal.h>
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+/* This is intentionally not in linenoise.h, but it is part of the existing
+ * multiplexed editor implementation.  The agent uses it only to restore text
+ * after Enter is pressed while the model is still busy. */
+int linenoiseEditInsert(struct linenoiseState *l, const char *c, size_t clen);
+
+static int set_nonblock(int fd, bool on, int *old_flags);
+static bool agent_parse_bool_default(const char *s, bool def);
+static int agent_read_file_bytes(const char *path, char **data, size_t *len,
+                                 char *err, size_t errlen);
+
+/* ============================================================================
+ * Configuration, Worker State, And Streaming Types
+ * ============================================================================
+ *
+ * The agent is intentionally a single process: the UI thread owns terminal
+ * input/output, while the worker thread owns the live DS4 session and KV state.
+ * These types define the shared state and the small streaming state machines
+ * used to render sampled assistant text and DSML tool calls as they arrive.
+ */
+
+typedef struct {
+    const char *prompt;
+    char *prompt_owned;
+    const char *system;
+    ds4_prompt_prefix prefix;
+    const char *trace_path;
+    bool raw_prompt;
+    int n_predict;
+    int ctx_size;
+    float temperature;
+    float top_p;
+    float min_p;
+    bool temperature_set;
+    bool top_p_set;
+    bool min_p_set;
+    uint64_t seed;
+    ds4_think_mode think_mode;
+} agent_generation_options;
+
+typedef struct {
+    ds4_engine_options engine;
+    agent_generation_options gen;
+    const char *gpu_vram_arg;
+    const char *gpu_devices_arg;
+    const char *chdir_path;
+    bool non_interactive;
+    bool edit_upto;
+} agent_config;
+
+typedef enum {
+    AGENT_WORKER_IDLE,
+    AGENT_WORKER_PREFILL,
+    AGENT_WORKER_GENERATING,
+    AGENT_WORKER_COMPACTING,
+    AGENT_WORKER_DRAINING,
+    AGENT_WORKER_SAVING,
+    AGENT_WORKER_ERROR,
+    AGENT_WORKER_STOPPED,
+} agent_worker_state;
+
+typedef struct {
+    agent_worker_state state;
+    int prefill_done;
+    int prefill_total;
+    unsigned prefill_label;
+    double prefill_tps;
+    int generated;
+    double gen_tps;
+    bool greedy_sampling;
+    int ctx_used;
+    int ctx_size;
+    int power_percent;
+    char error[256];
+} agent_status;
+
+typedef struct agent_bash_job agent_bash_job;
+
+typedef struct {
+    ds4_engine *engine;
+    agent_config *cfg;
+    ds4_session *session;
+    ds4_tokens transcript;
+    ds4_vision_span *images;
+    size_t image_count;
+    size_t image_cap;
+    char *cache_dir;
+    char *sysprompt_path;
+    char session_sha[41];
+    char *session_title;
+    uint64_t session_created_at;
+    char *legacy_session_path_to_delete;
+    bool user_activity;
+    bool session_dirty;
+    pthread_t thread;
+    pthread_mutex_t mu;
+    pthread_cond_t cond;
+    int wake_fd[2];
+    FILE *trace;
+    bool wake_pending;
+    bool stop;
+    bool interrupt;
+    bool initialized;
+    bool save_requested;
+    bool compact_requested;
+    bool power_requested;
+    int requested_power;
+    int progress_base;
+    bool progress_direct;
+    double progress_started_at;
+    char *cmd_text;
+    agent_status status;
+    char *out;
+    size_t out_len;
+    size_t out_cap;
+    ds4_web *web;
+    bool web_approval_pending;
+    bool web_approval_answered;
+    bool web_approval_result;
+    char web_approval_message[256];
+    char web_approval_error[160];
+    bool queued_user_drain_pending;
+    bool queued_user_drain_answered;
+    char *queued_user_drain_text;
+    bool datetime_context_injected;
+    int last_system_prompt_reminder_at;
+    char more_path[PATH_MAX];
+    int more_next_line;
+    bool more_bare;
+    bool more_valid;
+    agent_bash_job *bash_jobs;
+    int next_bash_job_id;
+    bool raw_mode_needs_restore;
+} agent_worker;
+
+static unsigned agent_next_prefill_label(void);
+
+typedef struct agent_tail_capture {
+    char *buf;
+    size_t cap;
+    size_t start;
+    size_t len;
+    size_t total;
+} agent_tail_capture;
+
+typedef enum {
+    AGENT_MD_PENDING_NONE,
+    AGENT_MD_PENDING_STAR,
+    AGENT_MD_PENDING_BACKTICK,
+} agent_markdown_pending;
+
+typedef struct agent_syntax agent_syntax;
+
+typedef struct {
+    ds4_engine *engine;
+    agent_worker *worker;
+    bool format_thinking;
+    bool format_markdown;
+    bool in_think;
+    bool color_open;
+    bool use_color;
+    bool last_output_newline;
+    bool wrote_visible_output;
+    bool md_bold;
+    bool md_italic;
+    bool md_inline_code;
+    bool md_code_block;
+    bool md_fence_info;
+    bool md_code_line_start;
+    bool md_code_in_ml_comment;
+    bool md_syntax_silent;
+    bool md_syntax_has_highlight;
+    agent_markdown_pending md_pending;
+    size_t md_pending_len;
+    const agent_syntax *md_syntax;
+    char md_fence_lang[32];
+    size_t md_fence_lang_len;
+    const char *md_code_line_prefix;
+    const char *md_code_line_prefix_color;
+    bool md_code_highlight_upto;
+    char *md_code_line;
+    size_t md_code_line_len;
+    size_t md_code_line_cap;
+    char pending[16];
+    size_t pending_len;
+    char utf8_pending[4];
+    size_t utf8_pending_len;
+    size_t utf8_pending_need;
+    agent_tail_capture *capture;
+} agent_token_renderer;
+
+typedef struct {
+    char *name;
+    char *value;
+    bool is_string;
+} agent_tool_arg;
+
+typedef struct {
+    char *name;
+    agent_tool_arg *args;
+    int argc;
+    int argcap;
+} agent_tool_call;
+
+typedef struct {
+    agent_tool_call *v;
+    int len;
+    int cap;
+} agent_tool_calls;
+
+typedef struct {
+    char *text;
+    size_t len;
+    size_t cap;
+} agent_tool_text_part;
+
+typedef struct {
+    agent_tool_text_part *parts;
+    size_t part_count;
+    size_t part_cap;
+    ds4_vision_embedding *images;
+    size_t image_count;
+    size_t image_cap;
+} agent_tool_observation;
+
+typedef enum {
+    AGENT_TOOL_SYNTAX_DSML,
+    AGENT_TOOL_SYNTAX_GLM,
+} agent_tool_syntax;
+
+typedef enum {
+    AGENT_DSML_SEARCH,
+    AGENT_DSML_STRUCTURAL,
+    AGENT_DSML_PARAM_VALUE,
+    AGENT_DSML_DONE,
+    AGENT_DSML_ERROR,
+} agent_dsml_state;
+
+typedef struct {
+    agent_tool_syntax syntax;
+    agent_dsml_state state;
+    char search_tail[64];
+    size_t search_len;
+    char *raw;
+    size_t raw_len;
+    size_t raw_cap;
+    size_t parse_pos;
+    agent_tool_call current;
+    char *param_name;
+    bool param_is_string;
+    size_t param_value_start;
+    bool param_close_prefix;
+    bool glm_after_call;
+    agent_tool_calls calls;
+    char error[160];
+} agent_dsml_parser;
+
+typedef enum {
+    AGENT_TOOL_PARAM_NORMAL,
+    AGENT_TOOL_PARAM_PATH,
+    AGENT_TOOL_PARAM_OFFSET,
+    AGENT_TOOL_PARAM_CONTENT,
+    AGENT_TOOL_PARAM_DIFF_OLD,
+    AGENT_TOOL_PARAM_DIFF_NEW,
+    AGENT_TOOL_PARAM_BASH_COMMAND,
+} agent_tool_param_kind;
+
+typedef struct {
+    bool active;
+    bool tool_announced;
+    bool param_active;
+    bool at_line_start;
+    bool last_output_newline;
+    agent_tool_param_kind param_kind;
+    char tool_name[64];
+    char param_name[64];
+    char param_end_tail[64];
+    size_t param_end_len;
+    bool read_style;
+    bool read_prefix_rendered;
+    bool read_line_rendered;
+    char read_path[512];
+    char read_start[32];
+    char read_max[32];
+    char read_whole[8];
+    char tool_path[512];
+    bool code_param_active;
+} agent_tool_visualizer;
+
+typedef struct {
+    char tail[32];
+    size_t len;
+} agent_dsml_marker_detector;
+
+typedef struct {
+    agent_token_renderer *renderer;
+    agent_dsml_parser *parser;
+    agent_tool_syntax syntax;
+    agent_tool_visualizer viz;
+    bool in_think;
+    bool dsml_active;
+    bool dsml_ignored;
+    bool replay;
+    char pending[16];
+    size_t pending_len;
+    char dsml_start_tail[64];
+    size_t dsml_start_len;
+    agent_dsml_marker_detector plain_dsml;
+    agent_dsml_marker_detector think_dsml;
+    bool dsml_in_think;
+    bool dsml_in_think_reported;
+    bool post_think_gap;
+    bool tool_preflight_error;
+    char tool_preflight_error_msg[256];
+} agent_stream_renderer;
+
+typedef struct {
+    bool active;
+    bool done;
+} agent_edit_upto_forcer;
+
+static volatile sig_atomic_t agent_sigint;
+static agent_worker *agent_completion_worker;
+
+static void worker_apply_pending_power(agent_worker *w);
+static void agent_trace(agent_worker *w, const char *fmt, ...);
+static void agent_trace_text(agent_worker *w, const char *label,
+                             const char *text, size_t len);
+static bool agent_stream_wants_greedy_sampling(const agent_stream_renderer *sr);
+static void agent_publish_system_status(agent_worker *w, const char *msg);
+static int agent_web_confirm(void *privdata, const char *message,
+                             char *err, size_t err_len);
+static void agent_web_log(void *privdata, const char *message);
+static bool agent_preflight_edit_old(agent_worker *w, const agent_tool_call *call,
+                                     char *err, size_t err_len);
+static int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
+                                    bool publish_progress,
+                                    char *err, size_t err_len);
+static int agent_read_default_lines(agent_worker *w);
+
+static agent_tool_syntax agent_tool_syntax_for_engine(ds4_engine *engine) {
+    return ds4_engine_is_glm_dsa(engine) ? AGENT_TOOL_SYNTAX_GLM
+                                         : AGENT_TOOL_SYNTAX_DSML;
+}
+
+static bool agent_tool_syntax_assistant_turn_uses_eos(agent_tool_syntax syntax) {
+    return syntax != AGENT_TOOL_SYNTAX_GLM;
+}
+
+static void agent_worker_append_assistant_turn_end(agent_worker *w) {
+    if (agent_tool_syntax_assistant_turn_uses_eos(
+            agent_tool_syntax_for_engine(w->engine)))
+        ds4_tokens_push(&w->transcript, ds4_token_eos(w->engine));
+}
+
+static int agent_worker_effective_ctx_size(const agent_worker *w) {
+    int ctx = 0;
+    if (w && w->session) ctx = ds4_session_ctx(w->session);
+    if (ctx <= 0 && w && w->cfg) ctx = w->cfg->gen.ctx_size;
+    return ctx;
+}
+
+/* ============================================================================
+ * Small Utilities And Command-Line Parsing
+ * ============================================================================
+ */
+
+static void agent_sigint_handler(int sig) {
+    (void)sig;
+    agent_sigint = 1;
+}
+
+static void *xmalloc(size_t n) {
+    void *p = malloc(n ? n : 1);
+    if (!p) {
+        perror("ds4-agent: malloc");
+        exit(1);
+    }
+    return p;
+}
+
+static char *xstrdup(const char *s) {
+    if (!s) s = "";
+    size_t n = strlen(s);
+    char *p = xmalloc(n + 1);
+    memcpy(p, s, n + 1);
+    return p;
+}
+
+static char *xstrndup(const char *s, size_t n) {
+    char *p = xmalloc(n + 1);
+    memcpy(p, s, n);
+    p[n] = '\0';
+    return p;
+}
+
+static void *xrealloc(void *ptr, size_t n) {
+    void *p = realloc(ptr, n ? n : 1);
+    if (!p) {
+        perror("ds4-agent: realloc");
+        exit(1);
+    }
+    return p;
+}
+
+static void agent_worker_images_clear(agent_worker *w) {
+    if (!w) return;
+    for (size_t i = 0; i < w->image_count; i++)
+        ds4_vision_embedding_free(&w->images[i].embedding);
+    free(w->images);
+    w->images = NULL;
+    w->image_count = 0;
+    w->image_cap = 0;
+}
+
+static void agent_worker_images_append(agent_worker *w,
+                                       ds4_vision_span *spans,
+                                       size_t count) {
+    if (!count) return;
+    if (w->image_count + count > w->image_cap) {
+```
+Explain the session and tool state visible here. Identify two ownership or lifetime constraints. Base your answer only on the excerpt.

@@ -1,0 +1,1 @@
+La cache KV (Key-Value) su disco è un componente fondamentale per migliorare le prestazioni e l'effic

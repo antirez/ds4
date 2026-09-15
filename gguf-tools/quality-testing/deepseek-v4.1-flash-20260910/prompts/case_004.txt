@@ -1,0 +1,1 @@
+Explain why a bounds check matters before accessing an array.

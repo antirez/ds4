@@ -1321,7 +1321,7 @@ kernel void kernel_dsv4_hc_rms_norm_mix_f16_cluster2(
     }
 }
 
-kernel void kernel_dsv4_hc_rms_norm_mix_f16_cluster2_pre_norm(
+static inline void ds4_hc_rms_norm_mix_cluster2_pre_norm_body(
         constant ds4_metal_args_hc_norm_mix & args,
         constant ds4_metal_args_dsv4_hc_split_weighted_sum_norm & split_args,
         device const char  * x,
@@ -1334,10 +1334,10 @@ kernel void kernel_dsv4_hc_rms_norm_mix_f16_cluster2_pre_norm(
         device const char  * norm_weight,
         device       char  * norm_dst,
         device atomic_uint * completion,
-        threadgroup  char  * shmem [[threadgroup(0)]],
-        uint3  tgpig [[threadgroup_position_in_grid]],
-        ushort tiisg [[thread_index_in_simdgroup]],
-        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+        threadgroup  char  * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
     constexpr short NSG_CLUSTER = 8;
     constexpr short NCLUSTER = 2;
     constexpr short NSG_TOTAL = NSG_CLUSTER * NCLUSTER;
@@ -1541,4 +1541,95 @@ kernel void kernel_dsv4_hc_rms_norm_mix_f16_cluster2_pre_norm(
                         memory_order_seq_cst,
                         thread_scope_device);
     atomic_store_explicit(completion, 0u, memory_order_relaxed);
+}
+
+kernel void kernel_dsv4_hc_rms_norm_mix_f16_cluster2_pre_norm(
+        constant ds4_metal_args_hc_norm_mix & args,
+        constant ds4_metal_args_dsv4_hc_split_weighted_sum_norm & split_args,
+        device const char  * x,
+        device const char  * weight,
+        device       char  * dst,
+        device const float * hc_scale,
+        device const float * hc_base,
+        device       char  * split,
+        device       char  * collapse_dst,
+        device const char  * norm_weight,
+        device       char  * norm_dst,
+        device atomic_uint * completion,
+        threadgroup  char  * shmem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    ds4_hc_rms_norm_mix_cluster2_pre_norm_body(args, split_args, x, weight, dst, hc_scale, hc_base, split, collapse_dst, norm_weight, norm_dst, completion, shmem, tgpig, tiisg, sgitg);
+}
+
+/* Decode-time fusion of the HC post/expand that follows a TP combine with the
+ * compound HC producer above. Phase 0 spreads kernel_dsv4_hc_expand4 (one
+ * token, HC=4, same per-stream accumulation order) over the six
+ * threadgroups and writes the expanded residual x; a device-scope barrier
+ * across the co-resident threadgroups then orders every read of post/comb
+ * and every write of x before the producer overwrites split and reads x.
+ * The barrier counter is monotonic; the host passes 6 * dispatch count. */
+kernel void kernel_dsv4_hc_expand4_rms_norm_mix_f16_cluster2_pre_norm(
+        constant ds4_metal_args_hc_norm_mix & args,
+        constant ds4_metal_args_dsv4_hc_split_weighted_sum_norm & split_args,
+        constant ds4_metal_args_dsv4_hc_expand & ex,
+        constant uint & barrier_target,
+        device       char  * x,
+        device const char  * weight,
+        device       char  * dst,
+        device const float * hc_scale,
+        device const float * hc_base,
+        device       char  * split,
+        device       char  * collapse_dst,
+        device const char  * norm_weight,
+        device       char  * norm_dst,
+        device atomic_uint * completion,
+        device atomic_uint * barrier,
+        device const char  * block_out,
+        device const char  * block_add,
+        device const char  * residual_prev,
+        device const char  * post,
+        device const char  * comb,
+        threadgroup  char  * shmem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        uint3  tgpg  [[threadgroups_per_grid]],
+        ushort tiitg [[thread_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    if (ex.n_hc == 4 && ex.n_tokens == 1) {
+        const uint nthreads = tgpg.x * 512u;
+        for (uint d = tgpig.x * 512u + (uint)tiitg; d < (uint)ex.n_embd; d += nthreads) {
+            float block_v = *((device const float *)(block_out + d*ex.nb_block0));
+            if (ex.has_add) {
+                block_v += *((device const float *)(block_add + d*ex.nb_add0));
+            }
+            const float r0 = *((device const float *)(residual_prev + d*ex.nb_res0 + 0*ex.nb_res1));
+            const float r1 = *((device const float *)(residual_prev + d*ex.nb_res0 + 1*ex.nb_res1));
+            const float r2 = *((device const float *)(residual_prev + d*ex.nb_res0 + 2*ex.nb_res1));
+            const float r3 = *((device const float *)(residual_prev + d*ex.nb_res0 + 3*ex.nb_res1));
+            for (int64_t dst_hc = 0; dst_hc < 4; ++dst_hc) {
+                float acc = block_v * *((device const float *)(post + dst_hc*ex.nb_post0));
+                acc += *((device const float *)(comb + dst_hc*ex.nb_comb0 + 0*ex.nb_comb1)) * r0;
+                acc += *((device const float *)(comb + dst_hc*ex.nb_comb0 + 1*ex.nb_comb1)) * r1;
+                acc += *((device const float *)(comb + dst_hc*ex.nb_comb0 + 2*ex.nb_comb1)) * r2;
+                acc += *((device const float *)(comb + dst_hc*ex.nb_comb0 + 3*ex.nb_comb1)) * r3;
+                *((device float *)(x + d*ex.nb0 + dst_hc*ex.nb1)) = acc;
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+    if (tiitg == 0) {
+        atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst,
+                            thread_scope_device);
+        atomic_fetch_add_explicit(barrier, 1u, memory_order_relaxed);
+        uint spins = 0u;
+        while (atomic_load_explicit(barrier, memory_order_relaxed) < barrier_target) {
+            if (++spins > 100000000u) break; /* never expected; avoids a GPU hang */
+        }
+        atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst,
+                            thread_scope_device);
+    }
+    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+    ds4_hc_rms_norm_mix_cluster2_pre_norm_body(args, split_args, x, weight, dst, hc_scale, hc_base, split, collapse_dst, norm_weight, norm_dst, completion, shmem, tgpig, tiisg, sgitg);
 }

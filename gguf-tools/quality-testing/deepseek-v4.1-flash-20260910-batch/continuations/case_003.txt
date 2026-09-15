@@ -1,0 +1,9 @@
+Looking at this C code:
+
+```c
+int lookup(int *a, int n, int index) { if (index > n) return -1; return a[index]; }
+```
+
+## The Bug
+
+The bounds check `if (index > n)` is **off by one**. For an array `a`

@@ -1,0 +1,46 @@
+{
+  "id": "gen-1787762332-0lEybPE7oKAwMQaIDPs2",
+  "object": "chat.completion",
+  "created": 1787762332,
+  "model": "z-ai/glm-5.3-flash",
+  "provider": "Z.AI",
+  "system_fingerprint": null,
+  "service_tier": null,
+  "choices": [
+    {
+      "index": 0,
+      "logprobs": null,
+      "finish_reason": "length",
+      "native_finish_reason": "length",
+      "message": {
+        "role": "assistant",
+        "content": "# Il Trie (albero di prefissi)\n\nUn **trie** (o albero di prefissi) è una struttura ad albero che rappresenta un insieme di stringhe memorizzando i caratteri lungo i percorsi dalla radice alle foglie.\n\n## Struttura\n\n- **Radice**: nodo iniziale, corrisponde alla stringa vuota\n- **Archi**: etichettati con caratteri\n- **Nodi**: rappresentano il prefisso dato dal percorso radice→nodo\n- **Nodi marcati** (spesso con un flag booleano): indic",
+        "refusal": null,
+        "reasoning": null
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 22,
+    "completion_tokens": 128,
+    "total_tokens": 150,
+    "cost": 3.365e-05,
+    "is_byok": false,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "cache_write_tokens": 0,
+      "audio_tokens": 0,
+      "video_tokens": 0
+    },
+    "cost_details": {
+      "upstream_inference_cost": 3.365e-05,
+      "upstream_inference_prompt_cost": 1.65e-06,
+      "upstream_inference_completions_cost": 3.2e-05
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 0,
+      "image_tokens": 0,
+      "audio_tokens": 0
+    }
+  }
+}

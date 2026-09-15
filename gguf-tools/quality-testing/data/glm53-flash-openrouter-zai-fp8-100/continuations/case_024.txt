@@ -1,0 +1,13 @@
+# Safe Format for Storing Model Checkpoint Headers
+
+A checkpoint header is the metadata at the start of a serialized model file. Here's a robust design:
+
+## Recommended Structure
+
+```
++---------------------------+
+| Magic Number (4 bytes)    |  e.g., 0x4D434B50 ("MCKP")
+| Version (2 bytes)         |  format version for forward compat
+| Header Size (4 bytes)     |  allows skipping unknown fields
+| Flags (4 bytes)           |  compression, encryption, endianness
+| Payload Length (8 bytes)  |  expected

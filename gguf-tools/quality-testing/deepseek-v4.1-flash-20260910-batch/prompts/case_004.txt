@@ -1,0 +1,38 @@
+The following is background from an archive. Read it, then answer the final task.
+Entry 0000: workshop 000 sent package 0000 to desk 000; status checked.
+Entry 0001: workshop 017 sent package 0029 to desk 011; status checked.
+Entry 0002: workshop 034 sent package 0058 to desk 022; status checked.
+Entry 0003: workshop 051 sent package 0087 to desk 033; status checked.
+Entry 0004: workshop 068 sent package 0116 to desk 044; status checked.
+Entry 0005: workshop 085 sent package 0145 to desk 055; status checked.
+Entry 0006: workshop 102 sent package 0174 to desk 066; status checked.
+Entry 0007: workshop 119 sent package 0203 to desk 077; status checked.
+Entry 0008: workshop 136 sent package 0232 to desk 088; status checked.
+Entry 0009: workshop 153 sent package 0261 to desk 099; status checked.
+Entry 0010: workshop 170 sent package 0290 to desk 110; status checked.
+Entry 0011: workshop 187 sent package 0319 to desk 121; status checked.
+Entry 0012: workshop 204 sent package 0348 to desk 132; status checked.
+Entry 0013: workshop 221 sent package 0377 to desk 143; status checked.
+Entry 0014: workshop 238 sent package 0406 to desk 154; status checked.
+Entry 0015: workshop 255 sent package 0435 to desk 165; status checked.
+Entry 0016: workshop 272 sent package 0464 to desk 176; status checked.
+Entry 0017: workshop 289 sent package 0493 to desk 187; status checked.
+Entry 0018: workshop 306 sent package 0522 to desk 198; status checked.
+Entry 0019: workshop 323 sent package 0551 to desk 209; status checked.
+Entry 0020: workshop 340 sent package 0580 to desk 220; status checked.
+Entry 0021: workshop 357 sent package 0609 to desk 231; status checked.
+Entry 0022: workshop 374 sent package 0638 to desk 242; status checked.
+Entry 0023: workshop 391 sent package 0667 to desk 253; status checked.
+Entry 0024: workshop 408 sent package 0696 to desk 007; status checked.
+Entry 0025: workshop 425 sent package 0725 to desk 018; status checked.
+Entry 0026: workshop 442 sent package 0754 to desk 029; status checked.
+Entry 0027: workshop 459 sent package 0783 to desk 040; status checked.
+Entry 0028: workshop 476 sent package 0812 to desk 051; status checked.
+Entry 0029: workshop 493 sent package 0841 to desk 062; status checked.
+Entry 0030: workshop 510 sent package 0870 to desk 073; status checked.
+Entry 0031: workshop 527 sent package 0899 to desk 084; status checked.
+Entry 0032: workshop 544 sent package 0928 to desk 095; status checked.
+Entry 0033: workshop 561 sent package 0957 to desk 106; status checked.
+Entry 0034: workshop 578 sent package 0986 to
+Final task:
+Explain in one paragraph why a TCP server must preserve a partially written reply when a client reads slowly.

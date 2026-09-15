@@ -14,7 +14,11 @@
 
 #pragma once
 
+#if defined(GGML_USE_HIP)
+#include "vendors/hip.h"
+#else
 #include <cuda_runtime.h>
+#endif
 #include <stddef.h>
 #include <stdint.h>
 
@@ -319,7 +323,8 @@ int ds4_mmq_iq2_xxs_moe_pair_soa(
  * assignment map once, runs the paired gate/up MMQs, computes clamp +
  * SwiGLU + router weighting in mid_f32, then gathers and quantizes those
  * rows for the Q2_K down MMQ through the same ids_dst/expert_bounds.  No
- * second mm_ids_helper; gate/up/mid/down keep the pair-major layout. */
+ * second mm_ids_helper; gate/up/mid/down keep the pair-major layout.
+ * preserve_reduction retains the raw MMQ accumulation order instead of D2R. */
 int ds4_mmq_iq2_xxs_q2_K_moe_fused_soa(
     const void    * W_gate_soa,
     const void    * W_up_soa,
@@ -338,6 +343,7 @@ int ds4_mmq_iq2_xxs_q2_K_moe_fused_soa(
     int             n_experts,
     int             n_expert_used,
     float           clamp,
+    int             preserve_reduction,
     cudaStream_t    stream);
 
 /* Aligned-artifact production fast path: gate/up stay in registers, weighted
@@ -375,6 +381,16 @@ int ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_soa(
     int             n_expert_used,
     float           clamp,
     cudaStream_t    stream);
+
+int ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_scratch_sizes(
+    int     expert_mid_dim,
+    int     expert_in_dim,
+    int     n_tokens,
+    int     n_experts,
+    int     n_expert_used,
+    size_t *input_q8_bytes,
+    size_t *down_q8_bytes,
+    size_t *work_bytes);
 
 int ds4_mmq_q4_K_moe_pair(
     const void    * W_a,
@@ -570,6 +586,19 @@ int ds4_mmq_q8_0_aligned_dense_vec(
     float       * out_f32,
     int           M,
     int           N,
+    int           K,
+    cudaStream_t  stream);
+
+// Decode-only pair: quantize the shared activation once and compute both
+// aligned projections in one row-concatenated launch.
+int ds4_mmq_q8_0_aligned_dense_vec_pair(
+    const void  * W0_aligned,
+    const void  * W1_aligned,
+    const float * X_f32,
+    float       * out0_f32,
+    float       * out1_f32,
+    int           M0,
+    int           M1,
     int           K,
     cudaStream_t  stream);
 
@@ -845,11 +874,22 @@ int ds4_mmq_q8_0_dense_vec(
     int           K,
     cudaStream_t  stream);
 
-// Set the thread-local stream that the internal cuda pool uses for
-// cudaMallocAsync / cudaFreeAsync.  Defaults to cudaStreamPerThread.
+int ds4_mmq_q4_K_dense_pair_vec(
+    const void  * W0_q4_K,
+    const void  * W1_q4_K,
+    const float * X_f32,
+    float       * out0_f32,
+    float       * out1_f32,
+    int           M,
+    int           K,
+    cudaStream_t  stream);
+
+// Set the thread-local stream used for internal stream-ordered scratch.
+// Defaults to cudaStreamPerThread.
 // Step 8 (CUDA Graphs) calls this with the capture stream so pool
 // allocations land on the captured stream and don't invalidate capture.
-// Pass NULL to reset to cudaStreamPerThread.
+// Pass cudaStreamPerThread to restore the default; NULL selects the legacy
+// default stream.
 void ds4_pool_set_stream(cudaStream_t stream);
 
 #ifdef __cplusplus

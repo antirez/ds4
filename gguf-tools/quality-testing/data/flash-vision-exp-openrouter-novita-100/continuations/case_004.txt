@@ -1,0 +1,3 @@
+To understand why **KV cache checkpointing** is a game-changer for agentic sessions, we first have to understand the unique mechanics of how AI agents operate versus standard chatbots. 
+
+In a standard chatbot, you ask a question, get an answer, and the conversation ends. In an **agentic session**, the AI

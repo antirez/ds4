@@ -1,0 +1,9 @@
+# Why mmap Page Residency Differs from Virtual Address Space Size
+
+The virtual address space size of an mmap is just a *reservation* — it says nothing about how much physical memory is actually backing it. Several mechanisms cause the gap:
+
+## 1. Lazy allocation (demand paging)
+`mmap` doesn't allocate physical pages at call time. It only creates virtual mappings. Physical frames are assigned when you first *touch* each page, triggering a page fault. A 1 GB anonymous mapping that's never written may use ~0 bytes of RAM.
+
+## 2. Copy-on-write (COW)
+A `MAP

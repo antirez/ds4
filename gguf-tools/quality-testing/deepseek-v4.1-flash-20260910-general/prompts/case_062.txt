@@ -1,0 +1,1 @@
+What does eventual consistency mean in a distributed database?

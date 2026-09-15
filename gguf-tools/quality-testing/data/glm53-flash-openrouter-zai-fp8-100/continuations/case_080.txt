@@ -1,0 +1,9 @@
+A good benchmark should measure **what it claims to measure — reliably, fairly, and in a way that reflects meaningful performance rather than artifacts of the test itself.**
+
+Depending on context, this can be unpacked as:
+
+- **Validity** — it captures the actual skill, quality, or capability of interest (not just a proxy that's easy to test)
+- **Reliability** — repeated measurements produce consistent results
+- **Discriminative power** — it distinguishes meaningfully between different levels of performance
+- **Fairness** — it doesn't systematically favor certain groups or approaches for irrelevant reasons
+- **

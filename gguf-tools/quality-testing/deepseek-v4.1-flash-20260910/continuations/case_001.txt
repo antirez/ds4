@@ -1,0 +1,8 @@
+# Largest of Three Integers
+
+```c
+int max_of_three(int a, int b, int c)
+{
+    int max = a;
+
+    if

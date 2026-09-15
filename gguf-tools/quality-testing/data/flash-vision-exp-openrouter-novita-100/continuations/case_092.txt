@@ -1,0 +1,12 @@
+Here's a simple SQL query that counts rows per category:
+
+```sql
+SELECT category, COUNT(*) as row_count
+FROM your_table_name
+GROUP BY category
+ORDER BY row_count DESC;
+```
+
+**Explanation:**
+- `SELECT category` - selects the category column
+- `COUNT(*)` - counts all rows

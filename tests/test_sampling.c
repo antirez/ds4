@@ -276,7 +276,86 @@ static double now_sec(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;
 }
 
+static void check_speculative_distribution(void) {
+    const float filter_logits[] = {
+        logf(0.50f), logf(0.30f), logf(0.15f), logf(0.05f),
+    };
+    float probs[4];
+    CHECK(ds4_test_sampling_probabilities(filter_logits, 4, 1.0f,
+                                          3, 0.70f, 0.0f, probs) != 0,
+          "build top-k/top-p probabilities");
+    CHECK(fabsf(probs[0] - 0.625f) < 1e-6f,
+          "top-k/top-p p0 %.9g", probs[0]);
+    CHECK(fabsf(probs[1] - 0.375f) < 1e-6f,
+          "top-k/top-p p1 %.9g", probs[1]);
+    CHECK(probs[2] == 0.0f && probs[3] == 0.0f,
+          "top-k/top-p filtered tail %.9g %.9g", probs[2], probs[3]);
+
+    CHECK(ds4_test_sampling_probabilities(filter_logits, 4, 1.0f,
+                                          0, 1.0f, 0.40f, probs) != 0,
+          "build min-p probabilities");
+    CHECK(fabsf(probs[0] - 0.625f) < 1e-6f,
+          "min-p p0 %.9g", probs[0]);
+    CHECK(fabsf(probs[1] - 0.375f) < 1e-6f,
+          "min-p p1 %.9g", probs[1]);
+    CHECK(probs[2] == 0.0f && probs[3] == 0.0f,
+          "min-p filtered tail %.9g %.9g", probs[2], probs[3]);
+
+    const float target_logits[] = {
+        logf(0.62f), logf(0.27f), logf(0.11f),
+    };
+    const float draft_logits[] = {
+        logf(0.15f), logf(0.55f), logf(0.30f),
+    };
+    uint64_t rng = 0x45f17a9d2c6b0381ULL;
+    uint32_t counts[3] = {0};
+    float target_probs[3];
+    float draft_probs[3];
+    const uint32_t trials = 100000;
+    for (uint32_t i = 0; i < trials; i++) {
+        const int token = ds4_test_speculative_sample(
+            target_logits, draft_logits, 3, 1.0f, 0, 1.0f, 0.0f,
+            &rng, target_probs, draft_probs);
+        CHECK(token >= 0 && token < 3,
+              "speculative sample token %d", token);
+        if (token >= 0 && token < 3) counts[token]++;
+    }
+    const float expected[] = {0.62f, 0.27f, 0.11f};
+    for (uint32_t i = 0; i < 3; i++) {
+        const float observed = (float)counts[i] / (float)trials;
+        CHECK(fabsf(observed - expected[i]) < 0.006f,
+              "speculative distribution token=%u observed=%.6f expected=%.6f",
+              i, observed, expected[i]);
+    }
+    printf("stochastic speculative distribution: %.4f %.4f %.4f\n",
+           (double)counts[0] / trials,
+           (double)counts[1] / trials,
+           (double)counts[2] / trials);
+
+    memset(counts, 0, sizeof(counts));
+    rng = 0x8f76c2b5a149d30eULL;
+    for (uint32_t i = 0; i < trials; i++) {
+        const int token = ds4_test_speculative_delta_sample(
+            target_logits, 3, 0, 1.0f, 0, 1.0f, 0.0f,
+            &rng, target_probs);
+        CHECK(token >= 0 && token < 3,
+              "delta speculative sample token %d", token);
+        if (token >= 0 && token < 3) counts[token]++;
+    }
+    for (uint32_t i = 0; i < 3; i++) {
+        const float observed = (float)counts[i] / (float)trials;
+        CHECK(fabsf(observed - expected[i]) < 0.006f,
+              "delta distribution token=%u observed=%.6f expected=%.6f",
+              i, observed, expected[i]);
+    }
+    printf("delta speculative distribution: %.4f %.4f %.4f\n",
+           (double)counts[0] / trials,
+           (double)counts[1] / trials,
+           (double)counts[2] / trials);
+}
+
 int main(void) {
+    check_speculative_distribution();
     const uint32_t semantic_n = 4096;
     float *logits = malloc((size_t)semantic_n * sizeof(*logits));
     float *scratch = malloc((size_t)semantic_n * sizeof(*scratch));

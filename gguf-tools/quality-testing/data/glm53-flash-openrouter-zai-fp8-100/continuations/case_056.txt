@@ -1,0 +1,10 @@
+# Ruolo del Router nel Mixture-of-Experts (MoE)
+
+Il **router** (o gating network) è il componente centrale che rende il Mixture-of-Experts efficiente. Il suo ruolo principale è:
+
+## Funzione principale
+**Instradare ogni token all'esperto (o agli esperti) più adatto** a processarlo, invece di far passare tutti i token attraverso l'intera rete.
+
+## Come funziona
+
+1. **Calcolo dei punteggi**: per ogni token in ingresso, il router produce un vettore di logits (punteggi)
