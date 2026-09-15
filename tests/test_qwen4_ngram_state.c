@@ -4,13 +4,21 @@
 /* A failed disk lookup must invalidate the recurrent frontier, including
  * speculative snapshots. Retrying must rebuild from the retained tokens. */
 int main(int argc, char **argv) {
-    if (argc != 2) {
-        fprintf(stderr, "usage: %s QWEN_GGUF\n", argv[0]);
+    const bool streaming = argc == 3 && strcmp(argv[2], "--ssd-streaming") == 0;
+    if (argc != 2 && !streaming) {
+        fprintf(stderr, "usage: %s QWEN_GGUF [--ssd-streaming]\n", argv[0]);
         return 2;
     }
     ds4_engine *engine = NULL;
     ds4_engine_options opt = {.model_path = argv[1], .backend = DS4_BACKEND_METAL,
         .glm_mtp = true, .prefill_chunk = 8};
+    if (streaming) {
+        /* Account for the actual context before opening the model and leave
+         * room for the live/control sessions and their speculative snapshots. */
+        opt.context_size = 256;
+        opt.ssd_streaming = true;
+        opt.ssd_streaming_cache_experts = 1024;
+    }
     assert(ds4_engine_open(&engine, &opt) == 0);
     assert(ds4_engine_is_qwen4(engine) && engine->model.ngram_tensor);
     ds4_tokens prompt = {0};
@@ -25,8 +33,16 @@ int main(int argc, char **argv) {
         assert(ds4_session_sync(live, &prompt, error, sizeof(error)) == 0);
         int accepted[3];
         if (mode == 2) {
-            assert(ds4_session_eval_speculative_argmax(live, ds4_session_argmax(live),
-                3, -1, accepted, 3, error, sizeof(error)) == 1);
+            /* Prefix preparation may already seed a proposal. Otherwise run
+             * a cycle, checking its committed frontier rather than assuming
+             * the first call always consumes exactly one token. */
+            for (int attempt = 0; !live->glm_mtp_have && attempt < 3; attempt++) {
+                const int before = ds4_session_pos(live);
+                const int n = ds4_session_eval_speculative_argmax(live, ds4_session_argmax(live),
+                    3, -1, accepted, 3, error, sizeof(error));
+                assert(n >= 1 && n <= 3);
+                assert(ds4_session_pos(live) == before + n);
+            }
             assert(live->glm_mtp_have);
         }
         const ds4_tokens *current = ds4_session_tokens(live);

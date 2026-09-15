@@ -29,6 +29,7 @@
 /tests/test_metal_tp_cancel
 /tests/test_metal_moe_prefill
 /tests/test_metal_ssd_experts
+/tests/test_metal_ssd_reuse
 /tests/test_metal_command_memory
 /tests/test_metal_dense_mpp
 /tests/test_mxfp4_cuda
@@ -57,6 +58,8 @@
 /tests/test_rocm_memory
 /tests/test_qwen4_kernels
 /tests/test_qwen4_moe_mm_specialize
+/tests/test_qwen4_ssd_experts
+/tests/test_qwen4_memory
 /tests/test_qwen4_vision
 /tests/test_deepseek4_vision_image
 /tests/test_deepseek41_metal
@@ -70,6 +73,7 @@
 /tests/test_deepseek41_gguf
 /tests/test_qwen4_ngrams
 /tests/test_qwen4_ngram_state
+/tests/test_qwen4_mtp_prefill
 /tests/test_deepseek41_graph
 /tests/test_deepseek41_prefill
 /tests/test_deepseek41_cli

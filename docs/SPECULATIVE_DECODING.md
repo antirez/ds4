@@ -70,6 +70,39 @@ Ordinary decode uses the same file with `--mtp` omitted. For non-zero
 temperature, add `--mtp-exact-sampling` to preserve the target sampling
 distribution. See [Qwen setup](QWEN38_FLASH_NEXT.md) for the Metal runtime.
 
+For the Q2 model with Metal SSD streaming:
+
+```sh
+./ds4 --metal -m gguf/Qwen3.8-Flash-Next-Q2.gguf \
+  --ssd-streaming --ctx 4096 --prefill-chunk 128 \
+  --mtp-timing --temp 0 --nothink -n 100 \
+  -p "narrami la storia di roma"
+```
+
+`--mtp-timing` enables MTP and reports verification cycles and first-draft
+acceptance. Measure generation throughput against the same command without
+that option: speculative decoding can lose time when too few proposals are
+accepted, especially when loading the predictor's experts from SSD.
+
+Qwen's [official model configuration](https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/config.json)
+contains one MTP layer with no dedicated token embeddings. The same layer
+can be called repeatedly to propose multiple tokens; the number of MTP
+layers is not the draft length. The
+[official blog](https://www.alibabacloud.com/blog/qwen3-8-flash-next-a-new-architecture-towardsultimate-cost-efficiency_603501)
+describes training this module over multiple steps and using QSA in it.
+These weights are already included in the GGUF; no separate draft model is
+needed.
+
+Prompt prefill prepares the predictor's K/V and indexer cache from the
+trunk hidden states and the next prompt token. It skips the predictor's
+attention output, MoE and vocabulary head, so this preparation does not
+stream predictor experts from SSD. The final hidden row is retained until
+the actual next token is known. Snapshot restore and speculative rollback
+retain that row too; this costs 40 KiB per row for this model, at most
+160 KiB including the three verifier snapshots. Qwen payload version 3
+stores the prepared prefix and retained row; older Qwen checkpoints must
+be rebuilt.
+
 The cycle drafts one token ahead by default and engages a **second, chained
 draft** (one extra nextn-layer step conditioned on the predictor's own
 stream, verified in a 3-row pass) while recent first-draft acceptance is

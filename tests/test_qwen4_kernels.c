@@ -414,7 +414,9 @@ static uint64_t arena_iq2_xxs(arena_t *a, uint64_t rows, uint64_t cols, double *
     const uint64_t blocks = cols / 256;
     const uint64_t off = arena_alloc(a, rows * blocks * 66u);
     uint8_t *w = a->base + off;
-    *shadow = malloc(rows * cols * sizeof(double));
+    /* Exact GPU-to-GPU fixtures need packed weights, without a large dense
+     * shadow that would dominate their bounded memory footprint. */
+    if (shadow) *shadow = malloc(rows * cols * sizeof(double));
     for (uint64_t r = 0; r < rows; r++) {
         for (uint64_t b = 0; b < blocks; b++) {
             uint8_t *blk = w + (r * blocks + b) * 66u;
@@ -431,7 +433,7 @@ static uint64_t arena_iq2_xxs(arena_t *a, uint64_t rows, uint64_t cols, double *
                 uint16_t q2[4] = { (uint16_t)aux_g, (uint16_t)(aux_g >> 16), (uint16_t)aux_s, (uint16_t)(aux_s >> 16) };
                 memcpy(blk + 2 + ib32 * 8, q2, 8);
                 const float dl = dq * (0.5f + (float)(aux_s >> 28)) * 0.25f;
-                for (int j = 0; j < 4; j++) {
+                for (int j = 0; shadow && j < 4; j++) {
                     const uint8_t *grid = (const uint8_t *)(iq2xxs_grid + ((aux_g >> (8 * j)) & 0xFF));
                     const uint32_t signs = ksigns_iq2xs[(aux_s >> (7 * j)) & 127];
                     for (int i = 0; i < 8; i++) {
@@ -441,7 +443,7 @@ static uint64_t arena_iq2_xxs(arena_t *a, uint64_t rows, uint64_t cols, double *
             }
         }
     }
-    dump_quant("iq2_xxs", w, rows * blocks * 66u, *shadow, rows * cols);
+    if (shadow) dump_quant("iq2_xxs", w, rows * blocks * 66u, *shadow, rows * cols);
     return off;
 }
 
@@ -1452,12 +1454,20 @@ static void test_moe_types(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, 
         float *bm = malloc(nm * sizeof(float)), *bp = malloc(np * sizeof(float));
         float *am = malloc(nm * sizeof(float)), *ap = malloc(np * sizeof(float));
         require_ok(bm && bp && am && ap, "MoE exact allocation");
-        for (uint32_t mode = 0; mode < 9; mode++) {
+        for (uint32_t mode = 0; mode < 10; mode++) {
             const char *nr[] = {"2", "1", "1", "2", "2", "4", "4", "1", "2"};
             const char *nsg[] = {"4", "4", "8", "4", "8", "4", "8", "16", "16"};
-            setenv("DS4_QWEN4_MOE_MV_SPECIALIZE", mode ? "1" : "0", 1);
-            setenv("DS4_QWEN4_MOE_MV_NR", nr[mode], 1);
-            setenv("DS4_QWEN4_MOE_MV_NSG", nsg[mode], 1);
+            if (mode == 9u) {
+                /* Automatic dispatch must compare against explicit generic
+                 * mode zero, even when a new kernel becomes the default. */
+                unsetenv("DS4_QWEN4_MOE_MV_SPECIALIZE");
+                unsetenv("DS4_QWEN4_MOE_MV_NR");
+                unsetenv("DS4_QWEN4_MOE_MV_NSG");
+            } else {
+                setenv("DS4_QWEN4_MOE_MV_SPECIALIZE", mode ? "1" : "0", 1);
+                setenv("DS4_QWEN4_MOE_MV_NR", nr[mode], 1);
+                setenv("DS4_QWEN4_MOE_MV_NSG", nsg[mode], 1);
+            }
             require_ok(ds4_gpu_qwen4_moe_mid_tensor(gmid, gx, gsel, a->base, a->size,
                 gate_off, up_off, wtype, NE, T, slots, E, F, sg_off, su_off, shared_type), "exact mid");
             require_ok(ds4_gpu_qwen4_moe_down_tensor(gpart, gmid, gsel, a->base, a->size,
@@ -2448,6 +2458,184 @@ static void test_moe_mm_tiles_exact(arena_t *a, uint32_t down_type) {
     ds4_gpu_tensor_free(glists); ds4_gpu_tensor_free(gsel); ds4_gpu_tensor_free(gx);
 }
 
+/* The cache-only path must reproduce full attention preparation, including
+ * half stores and three-axis RoPE, without touching neighboring cache rows. */
+static void test_mtp_cache_prep(arena_t *a) {
+    enum { H = 24, Hkv = 2, D = 256, Hi = 4, Di = 128, cap = 12, guard = 32 };
+    double *shadow = NULL;
+    const uint64_t gq = arena_f32(a, D, &shadow, .5f, 1.5f); free(shadow);
+    const uint64_t gk = arena_f32(a, D, &shadow, .5f, 1.5f); free(shadow);
+    const uint64_t giq = arena_f32(a, Di, &shadow, .5f, 1.5f); free(shadow);
+    uint32_t positions[cap][4];
+    for (unsigned p = 0; p < cap; p++) {
+        positions[p][0] = 101u + p * 3u;
+        positions[p][1] = 307u + p * 5u;
+        positions[p][2] = 911u + p * 7u;
+        positions[p][3] = 0;
+    }
+    ds4_gpu_tensor *pos3 = ds4_gpu_tensor_alloc(sizeof(positions));
+    require_ok(pos3 && ds4_gpu_tensor_write(pos3, 0, positions, sizeof(positions)), "MTP cache mRoPE positions");
+    float freq[32];
+    for (unsigned i = 0; i < 32u; i++) freq[i] = powf(10000000.f, -(float)i / 32.f) * .875f;
+    for (unsigned rope = 0; rope < 2u; rope++) {
+        ds4_gpu_qwen4_set_rope(rope ? freq : NULL, rope ? 32u : 0u, rope ? 1.125f : 1.f);
+        for (uint32_t T = 1u; T <= 3u; T++) {
+            const uint64_t counts[5] = {T * H * 2u * D, T * Hkv * D, T * Hkv * D, T * Hi * Di, T * Di};
+            float *input[5]; ds4_gpu_tensor *in[5];
+            for (unsigned i = 0; i < 5u; i++) { input[i] = rand_vec(counts[i], 1.f); in[i] = upload(input[i], counts[i]); }
+            ds4_gpu_tensor *q = upload(NULL, T * H * D), *gate = upload(NULL, T * H * D);
+            ds4_gpu_tensor *iq = upload(NULL, T * Hi * Di);
+            const uint64_t row_bytes[3] = {Hkv * D * 2u, Hkv * D * 2u, Di * 4u};
+            ds4_gpu_tensor *back[2][3], *cache[2][3];
+            unsigned char *seed[3], *got[3], *want[3];
+            for (unsigned i = 0; i < 3u; i++) {
+                const uint64_t bytes = cap * row_bytes[i] + 2u * guard;
+                seed[i] = malloc((size_t)bytes); got[i] = malloc((size_t)bytes); want[i] = malloc((size_t)bytes);
+                require_ok(seed[i] && got[i] && want[i], "MTP cache byte buffers");
+                memset(seed[i], 0x55 + (int)i, (size_t)bytes);
+                for (unsigned side = 0; side < 2u; side++) {
+                    back[side][i] = ds4_gpu_tensor_alloc(bytes);
+                    cache[side][i] = ds4_gpu_tensor_view(back[side][i], guard, cap * row_bytes[i]);
+                    require_ok(back[side][i] && cache[side][i], "guarded MTP cache allocation");
+                }
+            }
+            for (unsigned where = 0; where < 2u; where++) {
+                const uint32_t pos = where ? cap - T : 3u;
+                for (unsigned side = 0; side < 2u; side++) for (unsigned i = 0; i < 3u; i++)
+                    require_ok(ds4_gpu_tensor_write(back[side][i], 0, seed[i], cap * row_bytes[i] + 2u * guard),
+                               "poison complete MTP cache and guards");
+                require_ok(ds4_gpu_begin_commands() &&
+                    ds4_gpu_qwen4_attn_prep_tensor(q, gate, cache[0][0], cache[0][1], iq, cache[0][2],
+                        in[0], in[1], in[2], in[3], in[4], pos3, a->base, a->size, gq, gk, giq,
+                        T, H, Hkv, D, 64u, Hi, Di, pos, cap, 10000000.f, 1.e-6f) &&
+                    ds4_gpu_qwen4_attn_cache_prep_tensor(cache[1][0], cache[1][1], cache[1][2],
+                        in[1], in[2], in[4], pos3, a->base, a->size, gk,
+                        T, Hkv, D, 64u, Di, pos, cap, 10000000.f, 1.e-6f) &&
+                    ds4_gpu_end_commands(), "full and cache-only attention preparation");
+                for (unsigned i = 0; i < 3u; i++) {
+                    const uint64_t bytes = cap * row_bytes[i] + 2u * guard;
+                    const uint64_t begin = guard + pos * row_bytes[i], end = begin + T * row_bytes[i];
+                    require_ok(ds4_gpu_tensor_read(back[0][i], 0, want[i], bytes) &&
+                               ds4_gpu_tensor_read(back[1][i], 0, got[i], bytes), "MTP cache comparison read");
+                    require_ok(!memcmp(got[i], want[i], (size_t)bytes), "MTP K/V/IK bitwise full-prep oracle");
+                    require_ok(!memcmp(got[i], seed[i], (size_t)begin) &&
+                               !memcmp(got[i] + end, seed[i] + end, (size_t)(bytes - end)),
+                               "MTP cache untouched prefix, suffix and allocation guards");
+                    require_ok(memcmp(got[i] + begin, seed[i] + begin, (size_t)(end - begin)) != 0,
+                               "MTP cache rows actually written");
+                }
+            }
+            require_ok(!ds4_gpu_qwen4_attn_cache_prep_tensor(cache[1][0], cache[1][0], cache[1][2],
+                in[1], in[2], in[4], pos3, a->base, a->size, gk, T, Hkv, D, 64u, Di, 3u, cap, 1.e7f, 1.e-6f),
+                "MTP cache rejects overlapping K/V outputs");
+            require_ok(!ds4_gpu_qwen4_attn_cache_prep_tensor(cache[1][0], cache[1][1], cache[1][2],
+                in[1], in[2], in[4], pos3, a->base, a->size, gk, T, Hkv, D, 64u, Di, cap, cap, 1.e7f, 1.e-6f),
+                "MTP cache rejects an out-of-range row");
+            require_ok(!ds4_gpu_qwen4_attn_cache_prep_tensor(cache[1][0], cache[1][1], cache[1][2],
+                in[1], in[2], in[4], pos3, a->base, a->size, gk, T, Hkv, D, 63u, Di, 3u, cap, 1.e7f, 1.e-6f),
+                "MTP cache rejects odd rotary width");
+            for (unsigned i = 0; i < 5u; i++) {
+                float *unchanged = download(in[i], counts[i]);
+                check_exact_f32("MTP cache input remains unchanged", unchanged, input[i], counts[i]);
+                free(unchanged); free(input[i]); ds4_gpu_tensor_free(in[i]);
+            }
+            for (unsigned i = 0; i < 3u; i++) {
+                for (unsigned side = 0; side < 2u; side++) {
+                    ds4_gpu_tensor_free(cache[side][i]); ds4_gpu_tensor_free(back[side][i]);
+                }
+                free(want[i]); free(got[i]); free(seed[i]);
+            }
+            ds4_gpu_tensor_free(iq); ds4_gpu_tensor_free(gate); ds4_gpu_tensor_free(q);
+            printf("  MTP cache prep T=%u rope=%u: K/V/IK, mRoPE axes, guards and input immutability exact\n", T, rope);
+        }
+    }
+    uint32_t unchanged[cap][4];
+    require_ok(ds4_gpu_tensor_read(pos3, 0, unchanged, sizeof(unchanged)) &&
+               !memcmp(positions, unchanged, sizeof(positions)), "MTP cache positions remain unchanged");
+    ds4_gpu_qwen4_set_rope(NULL, 0u, 1.f);
+    ds4_gpu_tensor_free(pos3);
+}
+
+static void test_mtp_project(arena_t *a) {
+    enum { E = 2560, hc = 4, guard = 13 };
+    const uint32_t width = 2u * E, blocks = width / 32u;
+    const uint64_t weight_bytes = (uint64_t)E * blocks * 34u;
+    double *shadow = NULL;
+    const uint64_t finite_off = arena_q8_0(a, E, width, &shadow, .05f); free(shadow);
+    const uint64_t special_off = arena_alloc(a, weight_bytes);
+    memcpy(a->base + special_off, a->base + finite_off, (size_t)weight_bytes);
+    /* Non-finite scales occur once in each half. Even an inactive half must
+     * retain zero*Inf/NaN behavior; it cannot blindly skip those blocks. */
+    const uint16_t scales[] = {0x7c00u, 0xfc00u, 0x7e00u, 0xfe00u};
+    for (unsigned r = 0; r < 4u; r++) {
+        const uint64_t block = (uint64_t)r * blocks + (r & 1u ? E / 32u : 0u);
+        memcpy(a->base + special_off + block * 34u, scales + r, sizeof(scales[r]));
+    }
+    const char *env_name = "DS4_METAL_Q8_MV_EXT_MAX_TOKENS";
+    const char *incoming = getenv(env_name);
+    char *saved = incoming ? strdup(incoming) : NULL;
+    require_ok(!incoming || saved, "save EH matvec threshold");
+    for (uint32_t T = 1u; T <= 3u; T++) {
+        const uint32_t rows = T * (hc + 1u);
+        const uint64_t input_n = (uint64_t)rows * width, output_n = (uint64_t)rows * E;
+        float *cat = calloc((size_t)input_n, sizeof(float));
+        float *want = malloc((size_t)(output_n + guard) * sizeof(float));
+        float *got = malloc((size_t)(output_n + guard) * sizeof(float));
+        require_ok(cat && want && got, "EH projection comparison allocation");
+        ds4_gpu_tensor *x = upload(NULL, input_n), *ref = upload(NULL, output_n + guard);
+        ds4_gpu_tensor *out = upload(NULL, output_n + guard);
+        for (unsigned mode = 0; mode < 4u; mode++) {
+            for (uint32_t r = 0; r < rows; r++) {
+                const uint32_t active = r % (hc + 1u) ? E : 0u;
+                for (uint32_t c = 0; c < width; c++) {
+                    const bool nonzero = c >= active && c < active + E;
+                    cat[(uint64_t)r * width + c] = mode == 1u ? 0.f : mode == 2u ?
+                        ((c + r) & 1u ? -0.f : 0.f) : nonzero ? frand() : 0.f;
+                }
+            }
+            require_ok(ds4_gpu_tensor_write(x, 0, cat, input_n * sizeof(float)), "EH zero-half input");
+            const uint64_t off = mode == 3u ? special_off : finite_off;
+            for (unsigned fallback = 0; fallback < 2u; fallback++) {
+                require_ok(setenv(env_name, fallback ? "2" : "16", 1) == 0, "select EH matvec/fallback path");
+                require_ok(ds4_gpu_tensor_fill_f32(ref, 127.25f, output_n + guard) &&
+                    ds4_gpu_tensor_fill_f32(out, 127.25f, output_n + guard) &&
+                    ds4_gpu_begin_commands() &&
+                    ds4_gpu_qwen4_matmul_q8_0_tensor(ref, a->base, a->size, off, width, E, x, rows) &&
+                    ds4_gpu_qwen4_mtp_project_tensor(out, x, a->base, a->size, off, E, hc, T) &&
+                    ds4_gpu_end_commands() &&
+                    ds4_gpu_tensor_read(ref, 0, want, (output_n + guard) * sizeof(float)) &&
+                    ds4_gpu_tensor_read(out, 0, got, (output_n + guard) * sizeof(float)),
+                    "original and zero-skipping EH projection");
+                unsigned special = 0;
+                for (uint64_t i = 0; i < output_n + guard; i++) {
+                    uint32_t a_bits, b_bits;
+                    memcpy(&a_bits, got + i, sizeof(a_bits)); memcpy(&b_bits, want + i, sizeof(b_bits));
+                    if ((b_bits & 0x7fffffffu) > 0x7f800000u) {
+                        require_ok((a_bits & 0x7fffffffu) > 0x7f800000u, "EH preserves NaN classification");
+                        special++;
+                    } else {
+                        require_ok(a_bits == b_bits, "EH finite/Inf output and signed-zero bits");
+                        special += (b_bits & 0x7fffffffu) == 0x7f800000u;
+                    }
+                }
+                require_ok(mode == 3u ? special > 0u : special == 0u, "EH exceptional scales actually exercised");
+                for (uint64_t i = output_n; i < output_n + guard; i++)
+                    require_ok(got[i] == 127.25f, "EH projection allocation guard");
+            }
+            float *unchanged = download(x, input_n);
+            require_ok(!memcmp(unchanged, cat, (size_t)input_n * sizeof(float)), "EH input including zeros remains unchanged");
+            free(unchanged);
+        }
+        require_ok(!ds4_gpu_qwen4_mtp_project_tensor(out, x, a->base, a->size, finite_off, E, hc, 0u),
+                   "EH rejects zero tokens");
+        ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(ref); ds4_gpu_tensor_free(x);
+        free(got); free(want); free(cat);
+        printf("  MTP EH T=%u: full Q8 oracle, zero/signed-zero, non-finite scales and fallback exact\n", T);
+    }
+    require_ok((saved ? setenv(env_name, saved, 1) : unsetenv(env_name)) == 0, "restore EH matvec threshold");
+    free(saved);
+}
+
 /* MTP input staging: cat rows [rms(e)*g_e | 0] and [0 | rms(R_s)*g_h_s]
  * (full-row or per-stream RMS), then R_out = proj[0] + proj[1+s]. */
 static void test_mtp(arena_t *a, uint32_t E, uint32_t hc) {
@@ -2574,6 +2762,191 @@ static double hc_norm_median7(const double *samples) {
         sorted[j] = value;
     }
     return sorted[3];
+}
+
+typedef struct {
+    arena_t *arena;
+    bool hc, down;
+    uint32_t E, F, T, NE, slots, shared_type;
+    uint64_t gate, up, shared_gate, shared_up, down_weights, shared_down;
+    ds4_gpu_tensor *x, *low, *selected, *out;
+} m1_reuse_case;
+
+static int m1_reuse_dispatch(const m1_reuse_case *c) {
+    arena_t *a = c->arena;
+    if (c->hc) return ds4_gpu_qwen4_hc_gate_mix_tensor(c->out, c->x, c->low,
+        a->base, a->size, c->up, 1u, c->T, c->E, 4u, c->F);
+    if (c->down) return ds4_gpu_qwen4_moe_down_tensor(c->out, c->x, c->selected,
+        a->base, a->size, c->down_weights, 10u, c->NE, c->T, c->slots,
+        c->F, c->E, c->shared_down, c->shared_type);
+    return ds4_gpu_qwen4_moe_mid_tensor(c->out, c->x, c->selected,
+        a->base, a->size, c->gate, c->up, 16u, c->NE, c->T, c->slots,
+        c->E, c->F, c->shared_gate, c->shared_up, c->shared_type);
+}
+
+static void m1_reuse_select(bool hc, uint32_t mode) {
+    const char *name = hc ? "DS4_QWEN4_HC_MIX_PREFETCH" : "DS4_QWEN4_MOE_MV_SPECIALIZE";
+    require_ok(mode == 1u ? unsetenv(name) == 0 : setenv(name, mode ? "1" : "0", 1) == 0,
+               "select generic, automatic or prefetched kernel");
+}
+
+static double m1_reuse_batch(const m1_reuse_case *c, uint32_t mode, uint32_t calls) {
+    m1_reuse_select(c->hc, mode);
+    const double start = bench_now();
+    require_ok(ds4_gpu_begin_commands(), "reuse benchmark begin");
+    for (uint32_t i = 0; i < calls; i++) require_ok(m1_reuse_dispatch(c), "reuse benchmark dispatch");
+    require_ok(ds4_gpu_end_commands(), "reuse benchmark end and GPU wait");
+    return 1e6 * (bench_now() - start) / calls;
+}
+
+/* Both arms use the same physical buffers. Inputs are immutable and output is
+ * overwritten, so repeating a dispatch does not change the next one's work. */
+static void m1_reuse_compare(m1_reuse_case *c, bool benchmark) {
+    const uint64_t n = c->hc ? (uint64_t)c->T * c->E :
+        (uint64_t)c->T * (c->slots + (c->shared_type != UINT32_MAX)) * (c->down ? c->E : c->F);
+    const uint64_t guard = 17u, total = n + 2u * guard;
+    const float sentinel = 127.25f;
+    ds4_gpu_tensor *storage = upload(NULL, total);
+    c->out = ds4_gpu_tensor_view(storage, guard * sizeof(float), n * sizeof(float));
+    require_ok(c->out != NULL, "reuse guarded output view");
+    float *reference = NULL;
+    char label[128];
+    snprintf(label, sizeof(label), "%s E=%u %s=%u T=%u shared=%u",
+        c->hc ? "HC F16 reuse" : c->down ? "Q2 down reuse" : "IQ2 mid reuse", c->E, c->hc ? "rank" : "F", c->F, c->T,
+        !c->hc && c->shared_type != UINT32_MAX);
+    for (uint32_t mode = 0; mode < (c->hc ? 3u : 2u); mode++) {
+        m1_reuse_select(c->hc, mode);
+        require_ok(ds4_gpu_tensor_fill_f32(storage, sentinel, total) &&
+            ds4_gpu_begin_commands() && m1_reuse_dispatch(c) && ds4_gpu_end_commands(),
+            "reuse exact dispatch and wait");
+        float *got = download(storage, total);
+        for (uint64_t i = 0; i < guard; i++)
+            require_ok(got[i] == sentinel && got[guard + n + i] == sentinel, "reuse prefix and suffix guards");
+        if (!mode) {
+            reference = got;
+            check_exact_f32(label, reference, reference, total);
+            uint64_t nonzero = 0;
+            for (uint64_t i = guard; i < guard + n; i++) nonzero += got[i] != 0.0f && got[i] != sentinel;
+            require_ok(nonzero > n / 2u, "reuse reference has nontrivial output");
+        } else {
+            check_exact_f32(label, got, reference, total);
+            free(got);
+        }
+    }
+    printf("  %s: generic vs unset default%s exact, guards intact\n", label,
+           c->hc ? " vs explicit prefetch" : "");
+    if (benchmark) {
+        /* Fixed small warmup, then alternating old/new order. Report every
+         * observation: medians alone can hide device clock drift. HC needs
+         * longer measured batches because each dispatch is much shorter. */
+        for (uint32_t mode = 0; mode < 2u; mode++) (void)m1_reuse_batch(c, mode, 20u);
+        const uint32_t calls = c->hc ? 1000u : 100u;
+        double samples[2][7];
+        for (uint32_t rep = 0; rep < 7u; rep++) for (uint32_t order = 0; order < 2u; order++) {
+            const uint32_t mode = (rep + order) & 1u;
+            samples[mode][rep] = m1_reuse_batch(c, mode, calls);
+        }
+        const double old = hc_norm_median7(samples[0]), automatic = hc_norm_median7(samples[1]);
+        printf("  %s timing calls=%u generic=%.3f us automatic=%.3f us speedup=%+.2f%%\n",
+            label, calls, old, automatic, 100.0 * (old / automatic - 1.0));
+        for (uint32_t mode = 0; mode < 2u; mode++) {
+            printf("    %s samples_us:", mode ? "automatic" : "generic");
+            for (uint32_t rep = 0; rep < 7u; rep++) printf(" %.3f", samples[mode][rep]);
+            printf("\n");
+        }
+        /* Repeated writes must still produce the oracle, including guards. */
+        float *got = download(storage, total);
+        check_exact_f32("reuse benchmark final output", got, reference, total);
+        free(got);
+    }
+    free(reference);
+    ds4_gpu_tensor_free(c->out);
+    ds4_gpu_tensor_free(storage);
+    c->out = NULL;
+}
+
+static void test_m1_reuse(arena_t *a, bool benchmark, const char *only) {
+    const char *env[] = {"DS4_QWEN4_MOE_MV_SPECIALIZE", "DS4_QWEN4_MOE_MV_NR",
+        "DS4_QWEN4_MOE_MV_NSG", "DS4_QWEN4_HC_MIX_PREFETCH", "DS4_QWEN4_HC_PAIR_NSG"};
+    char *saved[5];
+    for (uint32_t i = 0; i < 5u; i++) {
+        const char *value = getenv(env[i]);
+        saved[i] = value ? strdup(value) : NULL;
+        require_ok(!value || saved[i] != NULL, "save reuse environment");
+        require_ok(unsetenv(env[i]) == 0, "clear reuse geometry override");
+    }
+    printf("M1 reuse screen: explicit generic vs automatic (device-dependent) kernels%s\n",
+           benchmark ? "; timing includes CPU encoding and final GPU wait" : "");
+    const bool all = !only || strcmp(only, "1") == 0;
+    if (all || strcmp(only, "iq2") == 0) {
+        const uint32_t rows[] = {640u, 641u};
+        for (uint32_t shape = 0; shape < 2u; shape++) {
+            m1_reuse_case c = { .arena = a, .E = 2560u, .F = rows[shape], .NE = 12u, .slots = 10u };
+            c.gate = arena_iq2_xxs(a, (uint64_t)c.NE * c.F, c.E, NULL, 0.05f);
+            c.up = arena_iq2_xxs(a, (uint64_t)c.NE * c.F, c.E, NULL, 0.05f);
+            double *shadow;
+            c.shared_gate = arena_q8_0(a, c.F, c.E, &shadow, 0.05f); free(shadow);
+            c.shared_up = arena_q8_0(a, c.F, c.E, &shadow, 0.05f); free(shadow);
+            float *x = rand_vec(3u * c.E, 1.0f);
+            for (uint32_t i = 0; i < 3u * c.E; i++) x[i] *= i % 7u == 0u ? 8.0f : i % 7u == 1u ? 0.125f : 1.0f;
+            c.x = upload(x, 3u * c.E); free(x);
+            int32_t selected[30];
+            for (uint32_t t = 0; t < 3u; t++) for (uint32_t s = 0; s < c.slots; s++)
+                selected[t * c.slots + s] = (int32_t)((t * 7u + s * 5u) % c.NE);
+            c.selected = ds4_gpu_tensor_alloc(sizeof(selected));
+            require_ok(c.selected && ds4_gpu_tensor_write(c.selected, 0, selected, sizeof(selected)), "reuse selected IDs");
+            for (c.T = 1u; c.T <= 3u; c.T++) for (uint32_t shared = 0; shared < 2u; shared++) {
+                c.shared_type = shared ? 8u : UINT32_MAX;
+                m1_reuse_compare(&c, benchmark && shape == 0u && shared != 0u);
+            }
+            ds4_gpu_tensor_free(c.selected); ds4_gpu_tensor_free(c.x);
+        }
+    }
+    if (all || strcmp(only, "q2") == 0) {
+        const uint32_t rows[] = {2560u, 2561u};
+        for (uint32_t shape = 0; shape < 2u; shape++) {
+            m1_reuse_case c = { .arena = a, .down = true, .E = rows[shape], .F = 640u,
+                .NE = 12u, .slots = 10u };
+            double *shadow;
+            /* The physical last block has random nonzero values beyond the
+             * 640 activation columns; both row kernels must ignore them. */
+            c.down_weights = arena_q2_K(a, (uint64_t)c.NE * c.E, 768u, &shadow, 0.05f); free(shadow);
+            c.shared_down = arena_q8_0(a, c.E, c.F, &shadow, 0.05f); free(shadow);
+            const uint64_t nx = 3u * (c.slots + 1u) * c.F;
+            float *x = rand_vec(nx, 1.0f);
+            for (uint64_t i = 0; i < nx; i++) x[i] *= i % 7u == 0u ? 8.0f : i % 7u == 1u ? 0.125f : 1.0f;
+            c.x = upload(x, nx); free(x);
+            int32_t selected[30];
+            for (uint32_t t = 0; t < 3u; t++) for (uint32_t s = 0; s < c.slots; s++)
+                selected[t * c.slots + s] = (int32_t)((t * 7u + s * 5u) % c.NE);
+            c.selected = ds4_gpu_tensor_alloc(sizeof(selected));
+            require_ok(c.selected && ds4_gpu_tensor_write(c.selected, 0, selected, sizeof(selected)), "Q2 reuse selected IDs");
+            for (c.T = 1u; c.T <= 3u; c.T++) for (uint32_t shared = 0; shared < 2u; shared++) {
+                c.shared_type = shared ? 8u : UINT32_MAX;
+                m1_reuse_compare(&c, benchmark && shape == 0u && shared != 0u);
+            }
+            ds4_gpu_tensor_free(c.selected); ds4_gpu_tensor_free(c.x);
+        }
+    }
+    if (all || strcmp(only, "hc") == 0) {
+        const uint32_t widths[] = {33u, 2560u};
+        for (uint32_t shape = 0; shape < 2u; shape++) {
+            m1_reuse_case c = { .arena = a, .hc = true, .E = widths[shape], .F = 320u };
+            double *shadow;
+            c.up = arena_f16(a, (uint64_t)4u * c.E * c.F, &shadow, 0.3f); free(shadow);
+            float *x = rand_vec(3u * 4u * c.E, 1.0f), *low = rand_vec(3u * c.F, 6.0f);
+            c.x = upload(x, 3u * 4u * c.E); c.low = upload(low, 3u * c.F);
+            free(x); free(low);
+            for (c.T = 1u; c.T <= 3u; c.T++)
+                m1_reuse_compare(&c, benchmark && shape == 1u && c.T != 2u);
+            ds4_gpu_tensor_free(c.low); ds4_gpu_tensor_free(c.x);
+        }
+    }
+    for (uint32_t i = 0; i < 5u; i++) {
+        require_ok(saved[i] ? setenv(env[i], saved[i], 1) == 0 : unsetenv(env[i]) == 0, "restore reuse environment");
+        free(saved[i]);
+    }
+    printf("M1 reuse screen passed; arena used %.2f MiB\n", (double)a->used / (1024.0 * 1024.0));
 }
 
 /* Optional scheduling screen; excluded from the default correctness path.
@@ -3041,8 +3414,16 @@ static void test_dense_mm(arena_t *a, uint32_t in_dim, uint32_t rows, uint32_t T
 }
 
 int main(void) {
+    /* A focused path avoids the full suite's large arena and dispatch bench.
+     * ONLY accepts 1 (all), iq2, q2 or hc; BENCH=1 adds paired resident timings. */
+    const char *reuse_only = getenv("DS4_TEST_QWEN4_M1_REUSE_ONLY");
+    const char *reuse_bench = getenv("DS4_TEST_QWEN4_M1_REUSE_BENCH");
+    const char *mtp_only = getenv("DS4_TEST_QWEN4_MTP_OPT_ONLY");
+    const bool run_reuse = reuse_only && reuse_only[0] && strcmp(reuse_only, "0") != 0;
+    const bool bench_reuse = reuse_bench && reuse_bench[0] && strcmp(reuse_bench, "0") != 0;
+    const bool run_mtp = mtp_only && mtp_only[0] && strcmp(mtp_only, "0") != 0;
     arena_t arena;
-    arena.size = (uint64_t)1536 << 20;
+    arena.size = (uint64_t)(run_reuse || bench_reuse || run_mtp ? 96u : 1536u) << 20;
     arena.base = mmap(NULL, arena.size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     arena.used = 0;
     if (arena.base == MAP_FAILED) { perror("mmap"); return 1; }
@@ -3050,6 +3431,22 @@ int main(void) {
     require_ok(ds4_gpu_init(), "GPU initialization");
     require_ok(ds4_gpu_set_model_map(arena.base, arena.size), "model map registration");
 
+    if (run_reuse || bench_reuse) {
+        test_m1_reuse(&arena, bench_reuse, run_reuse ? reuse_only : NULL);
+        ds4_gpu_cleanup();
+        munmap(arena.base, arena.size);
+        return 0;
+    }
+    if (run_mtp) {
+        test_mtp_cache_prep(&arena);
+        test_mtp_project(&arena);
+        test_mtp(&arena, 2560u, 4u);
+        test_mtp(&arena, 64u, 4u);
+        ds4_gpu_cleanup();
+        munmap(arena.base, arena.size);
+        puts("all Qwen MTP cache/projection kernel tests passed");
+        return 0;
+    }
     if (getenv("DS4_TEST_QWEN4_DECODE_FUSIONS")) { test_decode_fusions(&arena); return 0; }
     if (getenv("DS4_TEST_QWEN4_MV_EXACT")) {
         test_moe_types(&arena, 8, 6, 2560, 640, 1, 16u, 10u);
@@ -3094,6 +3491,7 @@ int main(void) {
     test_hc_pair_groups(&arena);
     test_mv_ext_groups(&arena);
     test_hc_mix_prefetch(&arena);
+    test_m1_reuse(&arena, false, NULL);
     test_hc(&arena, 2560, 320, 3, 1u);
     test_hc(&arena, 2560, 320, 2, 1u);
     test_hc(&arena, 2560, 320, 2, 0u);
@@ -3161,6 +3559,8 @@ int main(void) {
     test_multi_gemv(&arena, 2560, 2);
     test_multi_gemv(&arena, 64, 3);
     printf("mtp\n");
+    test_mtp_cache_prep(&arena);
+    test_mtp_project(&arena);
     test_mtp(&arena, 2560, 4);
     test_mtp(&arena, 64, 4);
     test_hc_norm_reuse(&arena);

@@ -163,6 +163,7 @@ static void test_session_rewind_replay(void) {
     char err[192] = {0};
     ds4_token_score got[8], want[8];
     const bool mtp = test_env_bool("DS4_TEST_GLM_MTP");
+    char *saved_force = test_save_env("DS4_QWEN4_SPEC_FORCE_ACCEPT");
     if (mtp) setenv("DS4_QWEN4_SPEC_FORCE_ACCEPT", "1", 1);
 
     ds4_chat_begin(engine, &prompt);
@@ -174,8 +175,8 @@ static void test_session_rewind_replay(void) {
     TEST_ASSERT(ds4_session_sync(live, &prompt, err, sizeof(err)) == 0);
     for (int i = 0; i < prompt.len; i++) ds4_tokens_push(&replay, prompt.v[i]);
 
-    /* three greedy steps; under MTP the first cycle seeds a draft and the
-     * forced-accept cycles after it commit token pairs */
+    /* Three greedy steps; prepared MTP prefixes can verify immediately,
+     * and forced acceptance ensures the final cycle commits a token pair. */
     int last_n = 1;
     for (int step = 0; step < 3; step++) {
         const int first = ds4_session_argmax(live);
@@ -250,6 +251,7 @@ cleanup:
     ds4_tokens_free(&prompt);
     ds4_session_free(fresh);
     ds4_session_free(live);
+    test_restore_env("DS4_QWEN4_SPEC_FORCE_ACCEPT", saved_force);
 }
 
 /* Issue #8 regression: the server rewinds a verified block to its start and
@@ -462,7 +464,7 @@ static void test_qwen_restore_reused_session(void) {
         int accepted[2];
         int n = ds4_session_eval_speculative_argmax(live, ds4_session_argmax(live),
                                                    2, -1, accepted, 2, err, sizeof(err));
-        TEST_ASSERT(n == (step == 0 ? 1 : 2));
+        TEST_ASSERT(step == 0 ? n >= 1 && n <= 2 : n == 2);
         if (n < 1) goto cleanup;
     }
     const ds4_tokens *tokens = ds4_session_tokens(live);
