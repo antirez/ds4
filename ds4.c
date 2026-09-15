@@ -74264,6 +74264,7 @@ static DS4_MAYBE_UNUSED void ds4_session_slice_commit_timeline(ds4_session *s, c
     ds4_session_dspark_capture_note_checkpoint(s);
 }
 
+#ifndef DS4_NO_GPU
 /* Forward declaration for the multi-token slice body (defined below). */
 static int ds4_session_eval_layer_slice_span(
         ds4_session *s,
@@ -74279,6 +74280,7 @@ static int ds4_session_eval_layer_slice_span(
         bool output_all_logits,
         char *err,
         size_t errlen);
+#endif
 int ds4_session_eval_layer_slice(ds4_session *s,
                                  const int *tokens,
                                  uint32_t n_tokens,
@@ -74564,7 +74566,6 @@ int ds4_session_eval_layer_slice(ds4_session *s,
     }
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
-    const uint64_t hc_bytes = (uint64_t)n_tokens * hc_dim * sizeof(float);
     if (n_tokens == 1 && pos0 > 0) {
         if (g->raw_cap == 0) {
             if (errlen) snprintf(err, errlen, "%s layer-slice decode has no raw KV cache",
@@ -74700,6 +74701,7 @@ int ds4_session_eval_layer_slice(ds4_session *s,
 }
 
 
+#ifndef DS4_NO_GPU
 /* Shared multi-token layer-slice body (n_tokens >= 2).  output_logits emits
  * the final row only; output_all_logits runs the output head once per row
  * and emits n_tokens vocab rows, used by the distributed MTP speculative
@@ -74917,6 +74919,7 @@ static int ds4_session_eval_layer_slice_span(
     ds4_session_slice_commit_timeline(s, tokens, n_tokens);
     return 0;
 }
+#endif
 
 int ds4_session_eval_layer_slice_logits_all(ds4_session *s,
                                             const int *tokens,
