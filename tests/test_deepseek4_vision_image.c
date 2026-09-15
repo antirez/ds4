@@ -122,6 +122,223 @@ static int check_attention_bounds(void) {
     return memcmp(bounds, expected, sizeof(expected)) == 0;
 }
 
+/* ------------------------------------------------------------------------
+ * WebP decoding
+ *
+ * The vectors below were produced with cwebp from images whose pixels follow
+ * the formulas repeated here, so a lossless decode has to reproduce them
+ * exactly and a lossy decode has to land close to them.
+ * ------------------------------------------------------------------------ */
+
+static const unsigned char webp_lossless_gradient[] = {
+    0x52, 0x49, 0x46, 0x46, 0x2c, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50,
+    0x56, 0x50, 0x38, 0x4c, 0x1f, 0x00, 0x00, 0x00, 0x2f, 0x0f, 0xc0, 0x02,
+    0x00, 0xb9, 0x8c, 0xe8, 0x7f, 0xec, 0x22, 0x2a, 0xd0, 0xff, 0x80, 0x90,
+    0x80, 0x30, 0xc2, 0xff, 0xbb, 0x9a, 0x3c, 0x10, 0x83, 0x10, 0x13, 0x00,
+    0x5c, 0x75, 0x17, 0x00,
+};
+
+static const unsigned char webp_lossy_gradient[] = {
+    0x52, 0x49, 0x46, 0x46, 0x62, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50,
+    0x56, 0x50, 0x38, 0x20, 0x56, 0x00, 0x00, 0x00, 0x90, 0x02, 0x00, 0x9d,
+    0x01, 0x2a, 0x10, 0x00, 0x0c, 0x00, 0x00, 0xc0, 0x12, 0x25, 0xb0, 0x02,
+    0x74, 0xb7, 0x00, 0xa3, 0x00, 0x8c, 0x00, 0x13, 0x71, 0x0a, 0xc0, 0xed,
+    0xa0, 0x00, 0xfe, 0xff, 0xd4, 0xeb, 0x7e, 0x48, 0x24, 0xc0, 0x04, 0x85,
+    0x2d, 0x2a, 0xf8, 0xac, 0xb8, 0x32, 0x9c, 0xbd, 0x97, 0xb9, 0xb8, 0xc6,
+    0xb0, 0xfb, 0xcf, 0x78, 0x29, 0x10, 0x9f, 0x84, 0x2a, 0xba, 0x63, 0x77,
+    0xfe, 0xfb, 0x05, 0xff, 0x8d, 0x5b, 0xbe, 0x6b, 0x99, 0x0f, 0xfc, 0xdb,
+    0xfa, 0x27, 0x06, 0xbb, 0x73, 0x17, 0x13, 0x00, 0x00, 0x00,
+};
+
+static const unsigned char webp_lossless_palette[] = {
+    0x52, 0x49, 0x46, 0x46, 0x44, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50,
+    0x56, 0x50, 0x38, 0x4c, 0x37, 0x00, 0x00, 0x00, 0x2f, 0x0f, 0xc0, 0x02,
+    0x00, 0x1f, 0x20, 0x10, 0x20, 0x8e, 0xe4, 0x88, 0x54, 0x27, 0x47, 0x48,
+    0x40, 0x74, 0x03, 0x6d, 0x37, 0xc3, 0x04, 0x81, 0x6c, 0x12, 0xc4, 0xfd,
+    0x17, 0xea, 0xfc, 0xc7, 0x4b, 0x64, 0x64, 0x20, 0xc8, 0xb6, 0x41, 0x98,
+    0xda, 0x24, 0x2f, 0x79, 0x80, 0x31, 0x44, 0xf4, 0xbf, 0x04, 0xa3, 0xde,
+    0xca, 0xaa, 0xaf, 0x00,
+};
+
+static const unsigned char webp_animated[] = {
+    0x52, 0x49, 0x46, 0x46, 0x02, 0x01, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50,
+    0x56, 0x50, 0x38, 0x58, 0x0a, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+    0x0f, 0x00, 0x00, 0x0f, 0x00, 0x00, 0x41, 0x4e, 0x49, 0x4d, 0x06, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x41, 0x4e, 0x4d, 0x46,
+    0x44, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0f, 0x00,
+    0x00, 0x0f, 0x00, 0x00, 0x50, 0x00, 0x00, 0x02, 0x56, 0x50, 0x38, 0x20,
+    0x2c, 0x00, 0x00, 0x00, 0x50, 0x01, 0x00, 0x9d, 0x01, 0x2a, 0x10, 0x00,
+    0x10, 0x00, 0x01, 0x40, 0x26, 0x25, 0xa0, 0x00, 0x04, 0x61, 0x80, 0x00,
+    0xfe, 0xfb, 0x7b, 0x17, 0xff, 0xfe, 0x37, 0x8f, 0xee, 0x53, 0xfc, 0x53,
+    0xe5, 0x7f, 0xff, 0xe3, 0x7f, 0x7d, 0x5e, 0x55, 0x14, 0xc0, 0x00, 0x00,
+    0x41, 0x4e, 0x4d, 0x46, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x0f, 0x00, 0x00, 0x0f, 0x00, 0x00, 0x50, 0x00, 0x00, 0x00,
+    0x56, 0x50, 0x38, 0x20, 0x28, 0x00, 0x00, 0x00, 0x54, 0x01, 0x00, 0x9d,
+    0x01, 0x2a, 0x10, 0x00, 0x10, 0x00, 0x00, 0x00, 0x26, 0x25, 0x88, 0x00,
+    0x04, 0x61, 0x80, 0x00, 0xfe, 0xf9, 0x36, 0xcf, 0xff, 0xb5, 0x3f, 0x7b,
+    0x3f, 0x09, 0xfa, 0x0f, 0xfc, 0x8e, 0xc2, 0x1b, 0xb0, 0x40, 0x00, 0x00,
+    0x41, 0x4e, 0x4d, 0x46, 0x42, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x0f, 0x00, 0x00, 0x0f, 0x00, 0x00, 0x50, 0x00, 0x00, 0x00,
+    0x56, 0x50, 0x38, 0x20, 0x2a, 0x00, 0x00, 0x00, 0x34, 0x01, 0x00, 0x9d,
+    0x01, 0x2a, 0x10, 0x00, 0x10, 0x00, 0x00, 0x00, 0x26, 0x25, 0xa0, 0x00,
+    0x03, 0x70, 0x00, 0xfe, 0xf5, 0x27, 0x5f, 0xf7, 0x49, 0xfa, 0x9f, 0xe8,
+    0xbf, 0xff, 0xe7, 0xa6, 0x7f, 0xfe, 0x09, 0x3f, 0xff, 0x82, 0x4f, 0xc6,
+    0x40, 0x00,
+};
+
+#define WEBP_VEC_W 16u
+#define WEBP_VEC_H 12u
+
+static void webp_expect_gradient(uint32_t x, uint32_t y, uint8_t rgb[3]) {
+    rgb[0] = (uint8_t)(x * 16u + y);
+    rgb[1] = (uint8_t)(y * 20u);
+    rgb[2] = (uint8_t)((x + y) * 8u);
+}
+
+static void webp_expect_palette(uint32_t x, uint32_t y, uint8_t rgb[3]) {
+    static const uint8_t pal[4][3] = {
+        {200, 30, 40}, {30, 200, 40}, {40, 30, 200}, {240, 240, 20},
+    };
+    const uint8_t *p = pal[(x / 2u + y / 3u) % 4u];
+    rgb[0] = p[0];
+    rgb[1] = p[1];
+    rgb[2] = p[2];
+}
+
+static int check_webp_exact(const char *what, const unsigned char *data,
+                            size_t len,
+                            void (*expect)(uint32_t, uint32_t, uint8_t *)) {
+    ds4_image image = {0};
+    char error[160] = {0};
+    int ok = 1;
+    if (!ds4_image_decode_memory(&image, data, len, error, sizeof(error))) {
+        fprintf(stderr, "%s failed to decode: %s\n", what, error);
+        return 0;
+    }
+    if (image.width != WEBP_VEC_W || image.height != WEBP_VEC_H) {
+        fprintf(stderr, "%s decoded to %ux%u\n", what, image.width, image.height);
+        ok = 0;
+    }
+    for (uint32_t y = 0; ok && y < image.height; y++) {
+        for (uint32_t x = 0; ok && x < image.width; x++) {
+            const uint8_t *got = image.rgb + ((size_t)y * image.width + x) * 3u;
+            uint8_t want[3];
+            expect(x, y, want);
+            if (memcmp(got, want, 3) != 0) {
+                fprintf(stderr,
+                        "%s differs at %u,%u: got %u,%u,%u want %u,%u,%u\n",
+                        what, x, y, got[0], got[1], got[2], want[0], want[1],
+                        want[2]);
+                ok = 0;
+            }
+        }
+    }
+    ds4_image_free(&image);
+    return ok;
+}
+
+static int check_webp_rejected(const char *what, const unsigned char *data,
+                               size_t len, const char *needle) {
+    ds4_image image = {0};
+    char error[160] = {0};
+    if (ds4_image_decode_memory(&image, data, len, error, sizeof(error))) {
+        fprintf(stderr, "%s decoded but should have been refused\n", what);
+        ds4_image_free(&image);
+        return 0;
+    }
+    if (needle && !strstr(error, needle)) {
+        fprintf(stderr, "%s reported \"%s\", expected to mention \"%s\"\n",
+                what, error, needle);
+        return 0;
+    }
+    return 1;
+}
+
+static int check_webp(void) {
+    if (!check_webp_exact("lossless WebP", webp_lossless_gradient,
+                          sizeof(webp_lossless_gradient),
+                          webp_expect_gradient))
+        return 0;
+    /* A palette small enough that cwebp packs several pixels per byte. */
+    if (!check_webp_exact("lossless palette WebP", webp_lossless_palette,
+                          sizeof(webp_lossless_palette), webp_expect_palette))
+        return 0;
+
+    /* Lossy decoding cannot be exact, so only require it to stay close. */
+    {
+        ds4_image image = {0};
+        char error[160] = {0};
+        long total = 0;
+        if (!ds4_image_decode_memory(&image, webp_lossy_gradient,
+                                     sizeof(webp_lossy_gradient), error,
+                                     sizeof(error))) {
+            fprintf(stderr, "lossy WebP failed to decode: %s\n", error);
+            return 0;
+        }
+        if (image.width != WEBP_VEC_W || image.height != WEBP_VEC_H) {
+            fprintf(stderr, "lossy WebP decoded to %ux%u\n", image.width,
+                    image.height);
+            ds4_image_free(&image);
+            return 0;
+        }
+        for (uint32_t y = 0; y < image.height; y++) {
+            for (uint32_t x = 0; x < image.width; x++) {
+                const uint8_t *got = image.rgb + ((size_t)y * image.width + x) * 3u;
+                uint8_t want[3];
+                webp_expect_gradient(x, y, want);
+                for (int c = 0; c < 3; c++) total += abs((int)got[c] - (int)want[c]);
+            }
+        }
+        ds4_image_free(&image);
+        {
+            const double mean = (double)total / (WEBP_VEC_W * WEBP_VEC_H * 3);
+            if (mean > 12.0) {
+                fprintf(stderr, "lossy WebP mean error %.2f is too high\n", mean);
+                return 0;
+            }
+        }
+    }
+
+    /* Animation has no single image to show, and the caller needs to know
+     * that rather than receiving the first frame silently. */
+    if (!check_webp_rejected("animated WebP", webp_animated,
+                             sizeof(webp_animated), "animated"))
+        return 0;
+    /*
+     * Truncation at any length must either be refused with a message or, if
+     * the missing bytes happened to be padding, decode at the right size.
+     * What it must never do is succeed with a short buffer.
+     */
+    for (size_t n = 0; n < sizeof(webp_lossless_gradient); n++) {
+        ds4_image image = {0};
+        char error[160] = {0};
+        if (!ds4_image_decode_memory(&image, webp_lossless_gradient, n, error,
+                                     sizeof(error))) {
+            if (!error[0]) {
+                fprintf(stderr, "truncated WebP of %zu bytes gave no reason\n", n);
+                return 0;
+            }
+            continue;
+        }
+        if (image.width != WEBP_VEC_W || image.height != WEBP_VEC_H) {
+            fprintf(stderr, "truncated WebP of %zu bytes decoded to %ux%u\n", n,
+                    image.width, image.height);
+            ds4_image_free(&image);
+            return 0;
+        }
+        ds4_image_free(&image);
+    }
+    {
+        /* A RIFF/WEBP wrapper with no image chunk. */
+        static const unsigned char empty[] = {
+            'R', 'I', 'F', 'F', 4, 0, 0, 0, 'W', 'E', 'B', 'P',
+        };
+        if (!check_webp_rejected("chunkless WebP", empty, sizeof(empty), NULL))
+            return 0;
+    }
+    return 1;
+}
+
 int main(void) {
     static const uint8_t types_a[] = {
         1, 1, 1, 0, 2, 2, 2, 2, 2, 2, 3, 3, 4,
@@ -140,7 +357,8 @@ int main(void) {
         !check_layout(1, 1, 3, types_c, sizeof(types_c),
                       perm_c, sizeof(perm_c) / sizeof(perm_c[0])) ||
         !check_span_parser() ||
-        !check_attention_bounds()) {
+        !check_attention_bounds() ||
+        !check_webp()) {
         return 1;
     }
 
