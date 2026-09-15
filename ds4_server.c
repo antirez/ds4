@@ -10344,6 +10344,7 @@ struct server {
     bool model_stopping;
     int decode_pending;
     int active_generations;
+    int prefill_quantum;
     int mixed_prefill_quantum;
     int last_prefill_slot;
     pthread_mutex_t mu;
@@ -12517,11 +12518,15 @@ static void server_prefill_leave(server *s) {
 
 static int server_prefill_quantum_for(const server *s,
                                       bool generation_active) {
-    int quantum = generation_active ? s->mixed_prefill_quantum : 2048;
+    int idle = s->prefill_quantum > 0 ? s->prefill_quantum : 2048;
+    int quantum = generation_active ? s->mixed_prefill_quantum : idle;
     /* Distributed sessions share one worker connection and the mixed
      * prefill/decode interleave is not dist-aware yet (L0): keep prefills
-     * exclusive so a prefill never runs beside another slot's decode. */
-    if (s->engine && ds4_engine_is_distributed(s->engine)) quantum = 2048;
+     * exclusive so a prefill never runs beside another slot's decode.
+     * Still use --prefill-quantum so a pipeline window of several
+     * --dist-prefill-chunk slices can stay full (2048 is only two 1024
+     * chunks and re-drains the worker every quantum). */
+    if (s->engine && ds4_engine_is_distributed(s->engine)) quantum = idle;
     if (generation_active && quantum < 1024 && s->engine &&
         ds4_engine_is_glm53(s->engine)) {
         quantum = 1024;
@@ -15761,6 +15766,7 @@ typedef struct {
     int tool_memory_max_ids;
     bool enable_cors;
     int batched_sessions;
+    int prefill_quantum;
     int mixed_prefill_quantum;
 } server_config;
 
@@ -15905,6 +15911,7 @@ static server_config parse_options(int argc, char **argv) {
         .ctx_size = 32768,
         .default_tokens = 393216,
         .tool_memory_max_ids = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS,
+        .prefill_quantum = 2048,
         .mixed_prefill_quantum = 128,
     };
     c.kv_cache = kv_cache_default_options();
@@ -15998,6 +16005,9 @@ static server_config parse_options(int argc, char **argv) {
             c.trace_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--batched-session")) {
             c.batched_sessions = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--prefill-quantum")) {
+            c.prefill_quantum =
+                parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mixed-prefill-quantum")) {
             c.mixed_prefill_quantum =
                 parse_int_arg(need_arg(&i, argc, argv, arg), arg);
@@ -16272,6 +16282,7 @@ int main(int argc, char **argv) {
     s.ctx_size = cfg.ctx_size;
     s.slot_count = slot_count;
     s.batched_mode = cfg.batched_sessions > 0;
+    s.prefill_quantum = cfg.prefill_quantum;
     s.mixed_prefill_quantum = cfg.mixed_prefill_quantum;
     s.last_prefill_slot = slot_count - 1;
     s.default_tokens = cfg.default_tokens;
@@ -16602,6 +16613,7 @@ static void test_batched_prefill_round_robin(void) {
 static void test_mixed_prefill_quantum_option(void) {
     char *default_argv[] = {"ds4-server"};
     server_config defaults = parse_options(1, default_argv);
+    TEST_ASSERT(defaults.prefill_quantum == 2048);
     TEST_ASSERT(defaults.mixed_prefill_quantum == 128);
 
     char *custom_argv[] = {
@@ -16610,11 +16622,22 @@ static void test_mixed_prefill_quantum_option(void) {
     server_config custom = parse_options(3, custom_argv);
     TEST_ASSERT(custom.mixed_prefill_quantum == 2048);
 
-    server s = {.mixed_prefill_quantum = custom.mixed_prefill_quantum};
+    server s = {.prefill_quantum = custom.prefill_quantum,
+                .mixed_prefill_quantum = custom.mixed_prefill_quantum};
     TEST_ASSERT(server_prefill_quantum_for(&s, false) == 2048);
     TEST_ASSERT(server_prefill_quantum_for(&s, true) == 2048);
     s.mixed_prefill_quantum = defaults.mixed_prefill_quantum;
     TEST_ASSERT(server_prefill_quantum_for(&s, true) == 128);
+
+    char *idle_argv[] = {
+        "ds4-server", "--prefill-quantum", "8192"
+    };
+    server_config idle = parse_options(3, idle_argv);
+    TEST_ASSERT(idle.prefill_quantum == 8192);
+    server s2 = {.prefill_quantum = idle.prefill_quantum,
+                 .mixed_prefill_quantum = idle.mixed_prefill_quantum};
+    TEST_ASSERT(server_prefill_quantum_for(&s2, false) == 8192);
+    TEST_ASSERT(server_prefill_quantum_for(&s2, true) == 128);
 }
 
 static void test_multimodal_prefill_resume_frontier(void) {
