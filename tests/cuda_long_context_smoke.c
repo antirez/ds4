@@ -19,6 +19,90 @@ static double getenv_seconds(const char *name, double fallback) {
     return end != s && v > 0.0 ? v : fallback;
 }
 
+static float topk_adversarial_value(uint64_t i) {
+    uint32_t x = (uint32_t)i ^ (uint32_t)(i >> 32);
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    x ^= x >> 16;
+    /* Deliberate collisions exercise the value/index tie break. */
+    if ((i % 29u) == 0u) return 0.5f;
+    if ((i % 113u) == 0u) return -0.0f;
+    return (float)(int32_t)(x & 0x1ffffu) * (1.0f / 65536.0f) - 1.0f;
+}
+
+static int check_stream_topk_matches_reference(void) {
+    static const uint32_t n_comp_cases[] = {8193u, 8448u, 32768u};
+    const uint32_t n_tokens = 32u;
+    const uint32_t top_k = 512u;
+
+    for (uint32_t c = 0; c < sizeof(n_comp_cases) / sizeof(n_comp_cases[0]); c++) {
+        const uint32_t n_comp = n_comp_cases[c];
+        const uint64_t score_count = (uint64_t)n_comp * n_tokens;
+        const uint64_t selected_count = (uint64_t)n_tokens * top_k;
+        float *scores_host = malloc((size_t)score_count * sizeof(*scores_host));
+        uint32_t *stream_host = malloc((size_t)selected_count * sizeof(*stream_host));
+        uint32_t *reference_host = malloc((size_t)selected_count * sizeof(*reference_host));
+        ds4_gpu_tensor *scores = ds4_gpu_tensor_alloc(score_count * sizeof(float));
+        ds4_gpu_tensor *selected = ds4_gpu_tensor_alloc(selected_count * sizeof(uint32_t));
+        int rc = 1;
+        if (!scores_host || !stream_host || !reference_host || !scores || !selected) {
+            goto cleanup;
+        }
+        for (uint64_t i = 0; i < score_count; i++) {
+            scores_host[i] = topk_adversarial_value(i + (uint64_t)c * 0x100000001b3ull);
+        }
+        if (!ds4_gpu_tensor_write(scores, 0, scores_host,
+                                  score_count * sizeof(float))) {
+            goto cleanup;
+        }
+
+        unsetenv("DS4_CUDA_NO_TOPK_STREAM");
+        if (!ds4_gpu_indexer_topk_tensor(selected, scores, n_comp, n_tokens, top_k) ||
+            !ds4_gpu_synchronize() ||
+            !ds4_gpu_tensor_read(selected, 0, stream_host,
+                                  selected_count * sizeof(uint32_t))) {
+            goto cleanup;
+        }
+
+        setenv("DS4_CUDA_NO_TOPK_STREAM", "1", 1);
+        if (!ds4_gpu_indexer_topk_tensor(selected, scores, n_comp, n_tokens, top_k) ||
+            !ds4_gpu_synchronize() ||
+            !ds4_gpu_tensor_read(selected, 0, reference_host,
+                                  selected_count * sizeof(uint32_t))) {
+            goto cleanup;
+        }
+        unsetenv("DS4_CUDA_NO_TOPK_STREAM");
+
+        for (uint64_t i = 0; i < selected_count; i++) {
+            if (stream_host[i] != reference_host[i]) {
+                fprintf(stderr,
+                        "stream top-k mismatch n_comp=%u token=%llu rank=%llu got=%u expected=%u\n",
+                        n_comp,
+                        (unsigned long long)(i / top_k),
+                        (unsigned long long)(i % top_k),
+                        stream_host[i], reference_host[i]);
+                goto cleanup;
+            }
+        }
+        fprintf(stderr,
+                "cuda-regression: stream top-k matches reference n_comp=%u n_tokens=%u\n",
+                n_comp, n_tokens);
+        rc = 0;
+
+cleanup:
+        unsetenv("DS4_CUDA_NO_TOPK_STREAM");
+        ds4_gpu_tensor_free(selected);
+        ds4_gpu_tensor_free(scores);
+        free(reference_host);
+        free(stream_host);
+        free(scores_host);
+        if (rc != 0) return rc;
+    }
+    return 0;
+}
+
 static int check_large_topk(void) {
     const uint32_t n_comp = 32768;
     const uint32_t n_tokens = 32;
@@ -159,6 +243,7 @@ static int check_decode_attention_overflow_path(void) {
 int main(void) {
     if (!ds4_gpu_init()) return 1;
     int rc = check_large_topk();
+    if (check_stream_topk_matches_reference() != 0) rc = 1;
     if (check_decode_attention_overflow_path() != 0) rc = 1;
     ds4_gpu_cleanup();
     if (rc == 0) puts("cuda long-context regression: OK");
