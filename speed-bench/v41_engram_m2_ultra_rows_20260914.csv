@@ -1,0 +1,17 @@
+pass,variant,two_tables_ms_per_token
+0,serial,4.877297
+0,parallel,1.378023
+1,parallel,1.361867
+1,serial,4.835125
+2,serial,5.241109
+2,parallel,1.728391
+3,parallel,1.367898
+3,serial,4.830344
+4,serial,4.850586
+4,parallel,1.370258
+5,parallel,1.360914
+5,serial,4.865039
+6,serial,4.852234
+6,parallel,1.370906
+7,parallel,1.362859
+7,serial,4.811570

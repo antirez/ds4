@@ -99,3 +99,21 @@ Qwen routed MoE quantization specialization is enabled by default on M3 Ultra.
 `DS4_QWEN4_MOE_MM_SPECIALIZE=0` restores the generic kernels; `=1` opts in on
 other devices. To compare the final default against rollback, pass
 `--candidate-env DS4_QWEN4_MOE_MM_SPECIALIZE --candidate-value 0` to the harness.
+
+### DeepSeek V4.1 Flash Engram decode reads
+
+On macOS, `DS4_ENGRAM_PARALLEL_DECODE=1` divides one 24-row decode read among four
+joined readers. Each reader writes its own six rows in original order; the
+batched prefill reader is unchanged. See [the M2 Ultra results](v41_engram_m2_ultra.md).
+
+```sh
+make engram-decode-bench test-engram
+./speed-bench/engram_decode_bench MODEL OFFSET0 ROWS0 OFFSET1 ROWS1
+```
+
+Use the native Engram table payload offsets and row counts from that GGUF,
+not offsets from another quantization. The benchmark reads 128 deterministic
+24-row sets from each of two tables, alternates serial/parallel order over
+eight passes, and checks every float bit against the serial result. Its CSV
+reports milliseconds for both tables per token. It preserves the runtime's
+uncached file descriptor policy; it does not populate an in-memory table.

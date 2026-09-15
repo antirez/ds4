@@ -144,6 +144,27 @@ static float e4m3(uint8_t byte) {
     return byte & 128 ? -value : value;
 }
 
+#ifdef __APPLE__
+enum { ENGRAM_DECODE_READERS = 4 };
+
+typedef struct {
+    const ds4_engram_table *table;
+    const uint32_t *rows;
+    float *out;
+    int error[ENGRAM_DECODE_READERS];
+} engram_decode_read;
+
+static void read_decode_part(void *context, size_t part) {
+    engram_decode_read *read = context;
+    const size_t begin = DS4_ENGRAM_COLS * part / ENGRAM_DECODE_READERS;
+    const size_t end = DS4_ENGRAM_COLS * (part + 1) / ENGRAM_DECODE_READERS;
+    if (!ds4_engram_read(read->table, read->rows + begin, end - begin,
+                         read->out + begin * DS4_ENGRAM_DIM)) {
+        read->error[part] = errno ? errno : EIO;
+    }
+}
+#endif
+
 bool ds4_engram_read(const ds4_engram_table *t, const uint32_t *rows,
                      size_t count, float *out) {
     if (!t || t->fd < 0 || (count && (!rows || !out)) ||
@@ -157,6 +178,23 @@ bool ds4_engram_read(const ds4_engram_table *t, const uint32_t *rows,
             return false;
         }
     }
+#ifdef __APPLE__
+    if (count == DS4_ENGRAM_COLS && getenv("DS4_ENGRAM_PARALLEL_DECODE")) {
+        /* Decode reads 24 uncached rows. Partition the original order without
+         * sorting or allocating; each reader owns disjoint output rows and
+         * dispatch_apply joins all readers before returning to the caller. */
+        engram_decode_read read = {.table = t, .rows = rows, .out = out};
+        dispatch_apply_f(ENGRAM_DECODE_READERS,
+            dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &read, read_decode_part);
+        for (size_t i = 0; i < ENGRAM_DECODE_READERS; i++) {
+            if (read.error[i]) {
+                errno = read.error[i];
+                return false;
+            }
+        }
+        return true;
+    }
+#endif
     uint8_t raw[DS4_ENGRAM_ROW_BYTES];
     for (size_t i = 0; i < count; i++) {
         if (!read_row(t->fd, t->offset + (uint64_t)rows[i] * sizeof(raw), raw)) return false;

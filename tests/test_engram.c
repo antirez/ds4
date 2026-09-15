@@ -158,6 +158,21 @@ static void test_rows(void) {
         }
         assert(batch[count * WIDTH] == 123456.0f);
     }
+    /* A decode-sized read preserves row order, duplicates and output bounds
+     * in both the serial and opt-in parallel modes. */
+    batch[WIDTH] = 123456.0f;
+    assert(ds4_engram_read(&t, batch_ids, DS4_ENGRAM_COLS, batch));
+    for (size_t j = 0; j < DS4_ENGRAM_COLS; j++) {
+        assert(!memcmp(batch + j * DS4_ENGRAM_DIM,
+                       expected[batch_ids[j]], sizeof(expected[0])));
+    }
+    assert(batch[WIDTH] == 123456.0f);
+    const uint32_t last = batch_ids[DS4_ENGRAM_COLS - 1];
+    batch_ids[DS4_ENGRAM_COLS - 1] = 3;
+    batch[0] = 123456.0f;
+    assert(!ds4_engram_read(&t, batch_ids, DS4_ENGRAM_COLS, batch) && errno == EINVAL);
+    assert(batch[0] == 123456.0f);
+    batch_ids[DS4_ENGRAM_COLS - 1] = last;
     assert(ds4_engram_read_batch(&t, NULL, 0, 0, NULL));
     assert(!ds4_engram_read_batch(&t, batch_ids, 1, 23, batch) && errno == EINVAL);
     assert(!ds4_engram_read_batch(&t, batch_ids, 2, SIZE_MAX, batch) && errno == EINVAL);
@@ -177,6 +192,12 @@ static void test_rows(void) {
     assert(!ds4_engram_read(&t, &bad, 1, out) && errno == EDOM);
     assert(!ds4_engram_read_batch(&t, batch_ids, 1, STRIDE, batch) && errno == EDOM);
     assert(!ds4_engram_read_batch(&t, batch_ids, 31, STRIDE, batch) && errno == EDOM);
+    for (size_t part = 0; part < 4; part++) {
+        uint32_t decode_ids[DS4_ENGRAM_COLS];
+        for (size_t j = 0; j < DS4_ENGRAM_COLS; j++) decode_ids[j] = 2;
+        decode_ids[part * (DS4_ENGRAM_COLS / 4)] = 0;
+        assert(!ds4_engram_read(&t, decode_ids, DS4_ENGRAM_COLS, batch) && errno == EDOM);
+    }
     assert(pwrite(fd, raw, sizeof(raw), offset) == sizeof(raw));
     nan = 255;
     assert(pwrite(fd, &nan, 1, offset + 256) == 1);
@@ -186,6 +207,7 @@ static void test_rows(void) {
     assert(!ds4_engram_read(&t, &bad, 1, out) && errno == EIO);
     assert(!ds4_engram_read_batch(&t, batch_ids, 1, STRIDE, batch) && errno == EIO);
     assert(!ds4_engram_read_batch(&t, batch_ids, 31, STRIDE, batch) && errno == EIO);
+    assert(!ds4_engram_read(&t, batch_ids, DS4_ENGRAM_COLS, batch) && errno == EIO);
     free(batch_ids);
     free(batch);
     ds4_engram_table_close(&t);
@@ -234,7 +256,11 @@ static void test_all_scaled_values(void) {
 
 int main(void) {
     test_hash();
+    unsetenv("DS4_ENGRAM_PARALLEL_DECODE");
     test_rows();
+    setenv("DS4_ENGRAM_PARALLEL_DECODE", "1", 1);
+    test_rows();
+    unsetenv("DS4_ENGRAM_PARALLEL_DECODE");
     test_all_scaled_values();
     puts("Engram hashes, history and bounded disk rows: PASS");
     return 0;
