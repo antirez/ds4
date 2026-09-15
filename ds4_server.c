@@ -11435,11 +11435,43 @@ static int kv_cache_try_load(server *s, server_slot *slot, const request *req,
                              ds4_tokens *effective_prompt,
                              char **loaded_path_out,
                              uint8_t *loaded_ext_flags_out) {
-    return kv_cache_try_load_text(s, slot, req ? req->prompt_text : NULL,
-                                  effective_prompt,
-                                  loaded_path_out,
-                                  loaded_ext_flags_out,
-                                  req && req->api == API_RESPONSES);
+    int loaded = kv_cache_try_load_text(s, slot, req ? req->prompt_text : NULL,
+                                        effective_prompt,
+                                        loaded_path_out,
+                                        loaded_ext_flags_out,
+                                        req && req->api == API_RESPONSES);
+    if (loaded > 0 || !req || req->prompt.len <= 0 || req->api == API_RESPONSES)
+        return loaded;
+    /* A token-text store renders the session's tokens, and rendering is not
+     * the prompt text: a literal "<|system|>" in a source file tokenizes to
+     * the special token and renders back as "<｜System｜>", so the store of a
+     * 570k-token prompt never matched that prompt again. Look the request's
+     * own tokens up the way they were stored, then continue with those
+     * tokens rather than re-tokenizing rendered text. */
+    size_t rendered_len = 0;
+    char *rendered = ds4_kvstore_render_tokens_text(s->engine, &req->prompt, &rendered_len);
+    if (!rendered) return 0;
+    const bool same = req->prompt_text && strcmp(rendered, req->prompt_text) == 0;
+    if (!same)
+        loaded = kv_cache_try_load_text(s, slot, rendered, effective_prompt,
+                                        loaded_path_out, loaded_ext_flags_out, false);
+    free(rendered);
+    if (same || loaded <= 0) return loaded > 0 ? loaded : 0;
+    pthread_mutex_lock(&s->inference_mu);
+    const ds4_tokens *live = ds4_session_tokens(slot->session);
+    const bool exact = live && live->len == loaded && live->len <= req->prompt.len &&
+                       ds4_tokens_starts_with(&req->prompt, live);
+    if (exact) ds4_tokens_copy(effective_prompt, &req->prompt);
+    else ds4_session_invalidate(slot->session);
+    pthread_mutex_unlock(&s->inference_mu);
+    if (!exact) {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: kv cache text hit did not match the request's tokens; rebuilding");
+        if (loaded_path_out) { free(*loaded_path_out); *loaded_path_out = NULL; }
+        if (loaded_ext_flags_out) *loaded_ext_flags_out = 0;
+        return 0;
+    }
+    return loaded;
 }
 
 /* A text-only suffix tokenizer would turn image markers into literal text.

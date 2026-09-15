@@ -129,6 +129,9 @@ tests/test_metal_tp_cancel: tests/test_metal_tp_cancel.c ds4.h ds4_tp.h $(CORE_O
 test-metal-session-batch: tests/test_metal_session_batch
 	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" ./tests/test_metal_session_batch
 
+tests/tok_roundtrip: tests/tok_roundtrip.c $(CORE_OBJS)
+	$(CC) $(CFLAGS) -I. -o $@ tests/tok_roundtrip.c $(CORE_OBJS) $(METAL_LDLIBS)
+
 speed-bench/metal_decode_schedule_bench.o: speed-bench/metal_decode_schedule_bench.c ds4.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
