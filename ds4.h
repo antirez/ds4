@@ -506,6 +506,7 @@ int ds4_test_argmax_excluding_logits(const float *logits, uint32_t n_vocab,
                                      int excluded_id);
 uint64_t ds4_test_mixed_native_count(void);
 uint64_t ds4_test_ds41_batch_count(void);
+bool ds4_test_glm_chat_preamble(void);
 #endif
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k);
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out);
