@@ -129,6 +129,12 @@ tests/test_metal_tp_cancel: tests/test_metal_tp_cancel.c ds4.h ds4_tp.h $(CORE_O
 test-metal-session-batch: tests/test_metal_session_batch
 	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" ./tests/test_metal_session_batch
 
+tests/test_metal_topk_select: tests/test_metal_topk_select.m ds4_metal.o ds4_image.o
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_metal_topk_select.m ds4_metal.o ds4_image.o $(METAL_LDLIBS)
+
+test-metal-topk-select: tests/test_metal_topk_select
+	./tests/test_metal_topk_select
+
 speed-bench/metal_decode_schedule_bench.o: speed-bench/metal_decode_schedule_bench.c ds4.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
