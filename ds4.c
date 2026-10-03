@@ -55765,11 +55765,19 @@ static bool glm_graph_forward_indexed_tokens(
         progress_flush_interval != 0 ? glm_graph_indexed_prefill_drain_interval() : 0u;
     const bool progress_requested = display_progress && work_total > 0;
     /* Generic IQ2 GLM benefits from sequential layer reads on large continued
-     * chunks too. Keep the typed Flash path's selected-expert cache reuse. */
+     * chunks too. Keep the typed Flash path's selected-expert cache reuse;
+     * GLM 5.3 Flash Q2 (IQ2 gate, Q2_K down) has no such prefill route, so a
+     * continued chunk would otherwise fault its layers in from the mmap. */
+    const ds4_layer_weights *first_routed = &weights->layer[DS4_N_LEADING_DENSE];
+    const bool continued_full_layer_reads =
+        glm_graph_layer_uses_generic_routed_moe(first_routed) &&
+        (!g->glm53 ||
+         (first_routed->ffn_down_exps->type == DS4_TENSOR_Q2_K &&
+          glm_stream_selected_expert_cache_supported(first_routed,
+                                                     DS4_N_LEADING_DENSE)));
     const bool full_layer_prefill =
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
-        (pos0 == 0 || (!g->glm53 && glm_graph_layer_uses_generic_routed_moe(
-                                      &weights->layer[DS4_N_LEADING_DENSE]))) &&
+        (pos0 == 0 || continued_full_layer_reads) &&
         n_tokens >= 256u && use_batch_ffn && !g->quality &&
         g->tp_world < 2 &&
         g->layer_start == 0 && g->layer_count == glm_graph_normal_layer_count() &&
