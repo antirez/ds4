@@ -536,6 +536,11 @@ int ds4_gpu_stream_expert_cache_seed_experts_gpu_copy(
         const int32_t                     *expert_ids,
         const uint32_t                    *expert_priorities,
         uint32_t                           n_experts);
+/* Set cached[e] for each expert of the table's layer that the cache holds
+ * now, without counting a hit or touching recency. Returns the number set. */
+uint32_t ds4_gpu_stream_expert_cache_layer_cached(
+        const ds4_gpu_stream_expert_table *table,
+        bool                              *cached);
 #endif
 void ds4_gpu_print_memory_report(const char *label);
 

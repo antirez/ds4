@@ -21162,6 +21162,59 @@ static bool metal_graph_stream_prefill_selected_pagein_join(
     return ok;
 }
 
+static bool metal_graph_stream_pagein_job_launch(
+        metal_graph_stream_pagein_job   *job,
+        const ds4_model                 *model,
+        metal_graph_stream_pagein_range *ranges,
+        uint32_t                         n_ranges,
+        uint32_t                         n_threads) {
+    job->model = model;
+    job->ranges = ranges;
+    job->n_ranges = n_ranges;
+    job->n_threads = n_threads;
+    if (n_threads == 1) {
+        const int rc = pthread_create(&job->thread,
+                                      NULL,
+                                      metal_graph_stream_pagein_thread_main,
+                                      job);
+        if (rc != 0) {
+            fprintf(stderr,
+                    "ds4: Metal streaming prefill layer page-in thread failed: %s\n",
+                    strerror(rc));
+            free(ranges);
+            memset(job, 0, sizeof(*job));
+            return false;
+        }
+    } else {
+        job->threads = xcalloc(n_threads, sizeof(job->threads[0]));
+        job->workers = xcalloc(n_threads, sizeof(job->workers[0]));
+        for (uint32_t t = 0; t < n_threads; t++) {
+            job->workers[t].job = job;
+            job->workers[t].first = t;
+            job->workers[t].stride = n_threads;
+            const int rc = pthread_create(&job->threads[t],
+                                          NULL,
+                                          metal_graph_stream_pagein_worker_main,
+                                          &job->workers[t]);
+            if (rc != 0) {
+                fprintf(stderr,
+                        "ds4: Metal streaming prefill layer page-in worker failed: %s\n",
+                        strerror(rc));
+                for (uint32_t j = 0; j < t; j++) {
+                    (void)pthread_join(job->threads[j], NULL);
+                }
+                free(job->workers);
+                free(job->threads);
+                free(ranges);
+                memset(job, 0, sizeof(*job));
+                return false;
+            }
+        }
+    }
+    job->started = true;
+    return true;
+}
+
 static bool metal_graph_stream_prefill_layer_pagein_start(
         const ds4_gpu_graph           *g,
         const ds4_model               *model,
@@ -21268,51 +21321,82 @@ static bool metal_graph_stream_prefill_layer_pagein_start(
     job->unique = spans.len;
     free(spans.v);
 
-    job->model = model;
-    job->ranges = ranges;
-    job->n_ranges = n_ranges;
-    job->n_threads = n_threads;
-    if (n_threads == 1) {
-        const int rc = pthread_create(&job->thread,
-                                      NULL,
-                                      metal_graph_stream_pagein_thread_main,
-                                      job);
-        if (rc != 0) {
-            fprintf(stderr,
-                    "ds4: Metal streaming prefill layer page-in thread failed: %s\n",
-                    strerror(rc));
-            free(ranges);
-            memset(job, 0, sizeof(*job));
-            return false;
-        }
-    } else {
-        job->threads = xcalloc(n_threads, sizeof(job->threads[0]));
-        job->workers = xcalloc(n_threads, sizeof(job->workers[0]));
-        for (uint32_t t = 0; t < n_threads; t++) {
-            job->workers[t].job = job;
-            job->workers[t].first = t;
-            job->workers[t].stride = n_threads;
-            const int rc = pthread_create(&job->threads[t],
-                                          NULL,
-                                          metal_graph_stream_pagein_worker_main,
-                                          &job->workers[t]);
-            if (rc != 0) {
-                fprintf(stderr,
-                        "ds4: Metal streaming prefill layer page-in worker failed: %s\n",
-                        strerror(rc));
-                for (uint32_t j = 0; j < t; j++) {
-                    (void)pthread_join(job->threads[j], NULL);
-                }
-                free(job->workers);
-                free(job->threads);
-                free(ranges);
-                memset(job, 0, sizeof(*job));
-                return false;
+    return metal_graph_stream_pagein_job_launch(job, model, ranges, n_ranges, n_threads);
+}
+
+/* Read ahead only the routed experts of layer il that the expert cache does
+ * not hold. A chunk of 128 or more tokens with eight of 256 experts selects
+ * nearly every expert of a layer, so these are its cache misses, known before
+ * routing. The cached prefill route then loads them from the page cache. */
+static bool metal_graph_stream_prefill_layer_miss_pagein_start(
+        const ds4_model               *model,
+        const ds4_weights             *weights,
+        uint32_t                       il,
+        uint32_t                       n_tokens,
+        metal_graph_stream_pagein_job *job) {
+    if (!job) return false;
+    memset(job, 0, sizeof(*job));
+    job->ok = true;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (!model || !weights || il >= DS4_N_LAYER) return false;
+    if (il < DS4_N_LEADING_DENSE) return true;
+    const ds4_layer_weights *l = &weights->layer[il];
+    uint64_t gate_bytes = 0, down_bytes = 0;
+    if (!l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps ||
+        DS4_N_EXPERT > DS4_MAX_EXPERT ||
+        !streaming_layer_gate_down_expert_bytes(l, &gate_bytes, &down_bytes)) {
+        return true;
+    }
+    const ds4_gpu_stream_expert_table table =
+        graph_stream_expert_table_make(model, l, il, gate_bytes, down_bytes);
+    bool cached[DS4_MAX_EXPERT];
+    const uint32_t n_cached = ds4_gpu_stream_expert_cache_layer_cached(&table, cached);
+    if (n_cached >= DS4_N_EXPERT) return true;
+
+    /* Merge runs of missing experts per tensor and split them into pieces
+     * small enough to spread over the read threads. */
+    const uint64_t piece = 4ull << 20;
+    const uint64_t offsets[3] = { table.gate_offset, table.up_offset, table.down_offset };
+    const uint64_t sizes[3] = { gate_bytes, gate_bytes, down_bytes };
+    const uint64_t missing = DS4_N_EXPERT - n_cached;
+    const uint64_t cap = 3u * (missing + (missing * (gate_bytes > down_bytes ?
+                                                     gate_bytes : down_bytes)) / piece + 1u);
+    metal_graph_stream_pagein_range *ranges = xmalloc((size_t)cap * sizeof(ranges[0]));
+    uint32_t n_ranges = 0;
+    for (uint32_t t = 0; t < 3; t++) {
+        for (uint32_t e = 0; e < DS4_N_EXPERT;) {
+            if (cached[e]) { e++; continue; }
+            uint32_t end = e;
+            while (end < DS4_N_EXPERT && !cached[end]) end++;
+            uint64_t off = offsets[t] + (uint64_t)e * sizes[t];
+            uint64_t left = (uint64_t)(end - e) * sizes[t];
+            job->bytes += left;
+            while (left != 0) {
+                const uint64_t n = left > piece ? piece : left;
+                ranges[n_ranges++] = (metal_graph_stream_pagein_range){ off, n };
+                off += n;
+                left -= n;
             }
+            e = end;
         }
     }
-    job->started = true;
+    job->pread_only = true;
+    job->profile =
+        glm_graph_env_present("DS4_ROCM_STREAMING_PREFILL_LAYER_PREAD_PROFILE",
+                              "DS4_METAL_STREAMING_PREFILL_LAYER_PREAD_PROFILE");
+    job->layer = il;
+    job->n_tokens = n_tokens;
+    job->unique = (uint32_t)missing;
+    return metal_graph_stream_pagein_job_launch(
+            job, model, ranges, n_ranges,
+            metal_graph_stream_prefill_layer_pagein_threads());
+#else
+    (void)model;
+    (void)weights;
+    (void)il;
+    (void)n_tokens;
     return true;
+#endif
 }
 
 static bool metal_graph_stream_prefill_layer_pagein_join(
@@ -48325,7 +48409,8 @@ static bool glm_graph_stream_prefill_expert_addr_supported(
         l->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
         (l->ffn_down_exps->type == DS4_TENSOR_IQ2_XXS ||
          l->ffn_down_exps->type == DS4_TENSOR_Q2_K) &&
-        DS4_N_EXPERT_USED == 8 && n_tokens < 256 &&
+        DS4_N_EXPERT_USED == 8 &&
+        (n_tokens < 256 || l->ffn_down_exps->type == DS4_TENSOR_Q2_K) &&
         getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_ADDR_TABLE") == NULL &&
         getenv("DS4_METAL_DISABLE_TINY_PAIR_SWIGLU_FUSION") == NULL &&
         getenv("DS4_METAL_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR") == NULL &&
@@ -48421,6 +48506,10 @@ static bool glm_graph_stream_map_prefill_layer(
     }
     return metal_graph_stream_map_layer(model, weights, il);
 }
+
+/* From here on a chunk selects about 98% of a layer's 256 experts (eight per
+ * token), so reading every uncached expert ahead wastes little. */
+enum { DS4_GLM_STREAM_PREFILL_MISS_READ_MIN_TOKENS = 128 };
 
 #ifdef DS4_ROCM_BUILD
 enum { DS4_GLM_STREAM_PREFILL_FULL_LAYER_MIN_TOKENS = 1024 };
@@ -55794,8 +55883,43 @@ static bool glm_graph_forward_indexed_tokens(
          (first_routed->ffn_down_exps->type == DS4_TENSOR_Q2_K &&
           glm_stream_selected_expert_cache_supported(first_routed,
                                                      DS4_N_LEADING_DENSE)));
+    /* GLM 5.3 Flash Q2 serves larger chunks from the bounded expert cache
+     * instead: cached experts are not read again, the misses are read one
+     * layer ahead, and the chunk leaves its experts cached for decode. While
+     * the cache holds under a quarter of all routed experts, copying nearly
+     * every expert into it costs more than whole-layer reads save, so a cold
+     * chunk reads full layers and seeds the cache instead. */
+    const bool cache_prefill_layout =
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+        g->ssd_streaming && g->glm53 && use_batch_ffn && !g->quality &&
+        g->tp_world < 2 &&
+        g->layer_start == 0 && g->layer_count == glm_graph_normal_layer_count() &&
+        n_tokens >= DS4_GLM_STREAM_PREFILL_MISS_READ_MIN_TOKENS &&
+        first_routed->ffn_down_exps->type == DS4_TENSOR_Q2_K &&
+        !glm_graph_env_present("DS4_ROCM_DISABLE_GLM_STREAMING_PREFILL_CACHE",
+                               "DS4_METAL_DISABLE_GLM_STREAMING_PREFILL_CACHE") &&
+        glm_graph_stream_prefill_expert_addr_supported(g,
+                                                       weights,
+                                                       first_routed,
+                                                       DS4_N_LEADING_DENSE,
+                                                       n_tokens);
+#else
+        false;
+#endif
+    const uint64_t routed_experts =
+        (uint64_t)(g->layer_count > DS4_N_LEADING_DENSE ?
+                   g->layer_count - DS4_N_LEADING_DENSE : 0u) * DS4_N_EXPERT;
+    const bool cache_prefill =
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+        cache_prefill_layout &&
+        (uint64_t)ds4_gpu_stream_expert_cache_current_count() * 4u >= routed_experts;
+#else
+        false;
+    (void)routed_experts;
+#endif
     const bool full_layer_prefill =
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
+        !cache_prefill &&
         (pos0 == 0 || continued_full_layer_reads) &&
         n_tokens >= 256u && use_batch_ffn && !g->quality &&
         g->tp_world < 2 &&
@@ -55806,12 +55930,14 @@ static bool glm_graph_forward_indexed_tokens(
 #endif
     /* Seeding the expert cache from each full layer costs prompt speed and
      * only warms the decode that follows the final chunk. When continued
-     * chunks read full layers too, leave the seed to the last one. */
+     * chunks read full layers too, leave the seed to the last one. A cold
+     * chunk of the cache prefill layout seeds, so the next chunk can use it. */
     const bool defer_cache_seed =
-        logits_out == NULL && continued_full_layer_reads;
+        logits_out == NULL && continued_full_layer_reads && !cache_prefill_layout;
     const bool layer_prepare =
         glm_graph_stream_prefill_full_layer_prepare_enabled(g, full_layer_prefill);
     metal_graph_stream_prepare_slot layer_prepare_slot = {0};
+    metal_graph_stream_pagein_job miss_read = {0};
     ds4_gpu_set_glm_streaming_prefill_full_layer(full_layer_prefill);
     const bool streaming_prefill_sync_each_layer =
         !g->ssd_streaming ||
@@ -55956,6 +56082,11 @@ static bool glm_graph_forward_indexed_tokens(
             ok = false;
             break;
         }
+        if (miss_read.started && miss_read.layer == il &&
+            !metal_graph_stream_prefill_layer_pagein_join(&miss_read)) {
+            ok = false;
+            break;
+        }
         if (g->ssd_streaming) {
             ok = glm_graph_stream_map_prefill_layer(g,
                                                     model,
@@ -55967,6 +56098,10 @@ static bool glm_graph_forward_indexed_tokens(
                 ok = metal_graph_stream_prepare_start_if_needed(
                         NULL, model, weights, il + 1u, n_tokens,
                         false, true, false, false, &layer_prepare_slot, 1);
+            }
+            if (ok && cache_prefill && il < g->layer_end) {
+                ok = metal_graph_stream_prefill_layer_miss_pagein_start(
+                        model, weights, il + 1u, n_tokens, &miss_read);
             }
             if (ok) ok = ds4_gpu_begin_commands() != 0;
         }
@@ -57166,6 +57301,7 @@ glm53_indexed_attention_done:
     ds4_gpu_tp_set_attn_head_split(0);
 #undef DS4_GLM_PROFILE_INDEXED_STAGE
     if (!metal_graph_stream_prepare_join_all(&layer_prepare_slot, 1)) ok = false;
+    if (!metal_graph_stream_prefill_layer_pagein_join(&miss_read)) ok = false;
     if (ok && !g->ssd_streaming) {
         const double trace_end_t0 = trace ? now_sec() : 0.0;
         if (trace) {

@@ -230,6 +230,26 @@ static int check_batch(uint32_t n_tokens) {
             if (peak < 0.01f) { fprintf(stderr, "reference peak too small: %g\n", peak); ok = 0; }
             continue;
         }
+        if (run == 2) {
+            /* Both streamed runs left exactly the selected experts cached. */
+            bool used[E] = {false}, cached[E];
+            uint32_t n_used = 0;
+            for (uint64_t i = 0; i < rows; i++) {
+                if (!used[ids[i]]) n_used++;
+                used[ids[i]] = true;
+            }
+            const ds4_gpu_stream_expert_table table = {
+                .model_map = model, .model_size = size, .layer = 0, .n_total_expert = E,
+                .gate_offset = 0, .up_offset = up, .down_offset = down,
+                .gate_expert_bytes = gate_expert, .down_expert_bytes = down_expert,
+            };
+            const uint32_t n_cached = ds4_gpu_stream_expert_cache_layer_cached(&table, cached);
+            if (n_cached != n_used || memcmp(used, cached, sizeof(used)) != 0) {
+                fprintf(stderr, "cached experts tokens=%u: %u cached, %u used\n",
+                        n_tokens, n_cached, n_used);
+                ok = 0;
+            }
+        }
         for (uint64_t i = 0; i < (uint64_t)n_tokens * O && ok; i++) {
             if (!isfinite(actual[i]) ||
                 fabsf(actual[i] - reference[i]) > 2e-4f * (1 + fabsf(reference[i]))) {
@@ -255,8 +275,9 @@ cleanup:
 int main(void) {
     /* 6 is DeepSeek V4 Flash's existing selected-slot path; 8 is GLM 5.3. */
     const uint32_t counts[] = {6, 8};
-    /* Tiny pair MV, mul_mv_id and mul_mm_id batch kernels. */
-    const uint32_t batches[] = {4, 31, 64, 200};
+    /* Tiny pair MV, mul_mv_id and mul_mm_id batch kernels; 512 is a full
+     * prefill chunk, which takes the cache route when it skips full layers. */
+    const uint32_t batches[] = {4, 31, 64, 200, 512};
     int ok = 1;
     for (unsigned i = 0; i < sizeof(counts) / sizeof(counts[0]); i++) ok &= check(counts[i]);
     for (unsigned i = 0; i < sizeof(batches) / sizeof(batches[0]); i++) ok &= check_batch(batches[i]);

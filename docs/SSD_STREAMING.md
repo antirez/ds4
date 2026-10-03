@@ -75,10 +75,12 @@ When the whole file fits as a static decode map and no cache size was given,
 Metal keeps that map instead, because it is faster. Passing
 `--ssd-streaming-cache-experts`, or a machine where that map does not fit,
 selects the bounded cache, and the routed experts then stay within it.
-Prefill still maps full layers, so prompt processing is slower than with the
-whole-file map. Metal tensor parallelism does not use this path.
-`make test-metal-iq2-q2k-stream-cache` checks the decode path against zeroed
-mapped weights at six and eight experts.
+Prefill uses the same cache: cached experts are not read again, a layer's
+uncached experts are read one layer ahead, and the prompt leaves its experts
+cached for the generation that follows. `DS4_METAL_DISABLE_GLM_STREAMING_PREFILL_CACHE=1`
+returns to full-layer reads. Metal tensor parallelism does not use this path.
+`make test-metal-iq2-q2k-stream-cache` checks decode at six and eight experts,
+and prefill batches at eight, against zeroed mapped weights.
 
 Leave expert preloading enabled for normal use. `--ssd-streaming-cold` and
 `--ssd-streaming-preload-experts N` are mainly useful for controlled measurements.

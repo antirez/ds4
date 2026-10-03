@@ -16424,6 +16424,35 @@ static int ds4_gpu_stream_expert_cache_entry_matches(
            e->gate_buffer && e->up_buffer && e->down_buffer;
 }
 
+uint32_t ds4_gpu_stream_expert_cache_layer_cached(
+        const ds4_gpu_stream_expert_table *table,
+        bool                              *cached) {
+    if (!table || !cached) return 0;
+    memset(cached, 0, (size_t)table->n_total_expert * sizeof(*cached));
+    if (!g_ssd_streaming_mode ||
+        table->layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER ||
+        table->n_total_expert > DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT ||
+        table->gate_expert_bytes == 0 || table->down_expert_bytes == 0) {
+        return 0;
+    }
+    uint32_t n = 0;
+    for (uint32_t expert = 0; expert < table->n_total_expert; expert++) {
+        const uint64_t gate_rel = (uint64_t)expert * table->gate_expert_bytes;
+        const uint64_t down_rel = (uint64_t)expert * table->down_expert_bytes;
+        cached[expert] = ds4_gpu_stream_expert_cache_entry_matches(
+                &g_stream_expert_cache[table->layer][expert],
+                table->model_map,
+                table->model_size,
+                table->gate_offset + gate_rel,
+                table->up_offset + gate_rel,
+                table->down_offset + down_rel,
+                table->gate_expert_bytes,
+                table->down_expert_bytes);
+        if (cached[expert]) n++;
+    }
+    return n;
+}
+
 static ds4_gpu_stream_expert_cache_entry *ds4_gpu_stream_expert_cache_peek(
         const void *model_map,
         uint64_t    model_size,
@@ -44691,7 +44720,9 @@ int ds4_gpu_routed_moe_batch_tensor(
             g_moe_mul_mv_addr_q2_k_sum6_pipeline != nil;
         /* Small full-GLM appends reuse cached bytes with the same MV/MM
          * arithmetic. Large prefills retain sequential whole-layer reads.
-         * GLM 5.3 Flash Q2 has the same IQ2 gate/up with a Q2_K down. */
+         * GLM 5.3 Flash Q2 has the same IQ2 gate/up with a Q2_K down; its
+         * large chunks use the cache too unless the caller reads full layers
+         * (force_resident). */
         const bool use_iq2_cached_batch =
             g_ssd_streaming_mode && !force_resident && g_tp_split_world == 1 &&
             !ds4_gpu_glm_streaming_prefill_full_layer_active() &&
@@ -44700,7 +44731,7 @@ int ds4_gpu_routed_moe_batch_tensor(
              (down_type == DS4_METAL_TENSOR_Q2_K &&
               g_moe_mul_mv_addr_q2_k_pipeline != nil)) &&
             n_expert == 8 &&
-            n_tokens < 256 &&
+            (n_tokens < 256 || down_type == DS4_METAL_TENSOR_Q2_K) &&
             n_total_expert <= DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT &&
             ds4_gpu_stream_expert_cache_note_expert_size(gate_expert_bytes,
                                                          down_expert_bytes) &&
