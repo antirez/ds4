@@ -48323,7 +48323,8 @@ static bool glm_graph_stream_prefill_expert_addr_supported(
         l->ffn_gate_exps && l->ffn_up_exps && l->ffn_down_exps &&
         l->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
         l->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
-        l->ffn_down_exps->type == DS4_TENSOR_IQ2_XXS &&
+        (l->ffn_down_exps->type == DS4_TENSOR_IQ2_XXS ||
+         l->ffn_down_exps->type == DS4_TENSOR_Q2_K) &&
         DS4_N_EXPERT_USED == 8 && n_tokens < 256 &&
         getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_ADDR_TABLE") == NULL &&
         getenv("DS4_METAL_DISABLE_TINY_PAIR_SWIGLU_FUSION") == NULL &&
@@ -50751,6 +50752,16 @@ static int glm_graph_routed_moe_batch_dispatch(
             l->ffn_gate_exps->type != l->ffn_up_exps->type) {
             return 0;
         }
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+        /* A Q2_K down reads through the expert cache only on the route the
+         * engine chose for it; with the whole-file map the layer is read in
+         * place, as before. */
+        if (g->ssd_streaming &&
+            l->ffn_down_exps->type == DS4_TENSOR_Q2_K &&
+            !glm_stream_selected_expert_cache_supported(l, il)) {
+            force_resident = true;
+        }
+#endif
         return ds4_gpu_routed_moe_batch_tensor(out,
                                                g->batch_routed_gate,
                                                g->batch_routed_up,

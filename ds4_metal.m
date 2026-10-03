@@ -44690,12 +44690,16 @@ int ds4_gpu_routed_moe_batch_tensor(
             g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_pipeline != nil &&
             g_moe_mul_mv_addr_q2_k_sum6_pipeline != nil;
         /* Small full-GLM appends reuse cached bytes with the same MV/MM
-         * arithmetic. Large prefills retain sequential whole-layer reads. */
+         * arithmetic. Large prefills retain sequential whole-layer reads.
+         * GLM 5.3 Flash Q2 has the same IQ2 gate/up with a Q2_K down. */
         const bool use_iq2_cached_batch =
             g_ssd_streaming_mode && !force_resident && g_tp_split_world == 1 &&
             !ds4_gpu_glm_streaming_prefill_full_layer_active() &&
             gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
-            down_type == DS4_METAL_TENSOR_IQ2_XXS && n_expert == 8 &&
+            (down_type == DS4_METAL_TENSOR_IQ2_XXS ||
+             (down_type == DS4_METAL_TENSOR_Q2_K &&
+              g_moe_mul_mv_addr_q2_k_pipeline != nil)) &&
+            n_expert == 8 &&
             n_tokens < 256 &&
             n_total_expert <= DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT &&
             ds4_gpu_stream_expert_cache_note_expert_size(gate_expert_bytes,
@@ -45124,9 +45128,13 @@ int ds4_gpu_routed_moe_batch_tensor(
                 mpp ? "kernel_mul_mm_id_iq2_xxs_cached_f32_mpp" :
                       "kernel_mul_mm_id_iq2_xxs_cached_f32", false);
             down_mm_pipeline = ds4_gpu_get_mul_mm_id_pipeline(
-                request_mid_f16 ? (mpp ? "kernel_mul_mm_id_iq2_xxs_cached_f16_mpp" :
-                                        "kernel_mul_mm_id_iq2_xxs_cached_f16") :
-                                  "kernel_mul_mm_id_iq2_xxs_cached_f32", false);
+                down_type == DS4_METAL_TENSOR_Q2_K ?
+                    (request_mid_f16 ? (mpp ? "kernel_mul_mm_id_q2_K_cached_f16_mpp" :
+                                             "kernel_mul_mm_id_q2_K_cached_f16") :
+                                       "kernel_mul_mm_id_q2_K_cached_f32") :
+                    (request_mid_f16 ? (mpp ? "kernel_mul_mm_id_iq2_xxs_cached_f16_mpp" :
+                                             "kernel_mul_mm_id_iq2_xxs_cached_f16") :
+                                       "kernel_mul_mm_id_iq2_xxs_cached_f32"), false);
             if (!gate_mm_pipeline || !down_mm_pipeline) return 0;
         }
         if (use_cached_batch) {
@@ -45850,7 +45858,9 @@ int ds4_gpu_routed_moe_batch_tensor(
                                                        packed_m32n128 ? 32u : 64u);
             } else if (use_iq2_cached_batch) {
                 ok = ds4_gpu_encode_mul_mv_addr_iq2(cb,
-                    g_moe_mul_mv_addr_iq2_xxs_pipeline, &down_args,
+                    down_type == DS4_METAL_TENSOR_Q2_K ?
+                        g_moe_mul_mv_addr_q2_k_pipeline :
+                        g_moe_mul_mv_addr_iq2_xxs_pipeline, &down_args,
                     stream_resources, stream_resource_count, stream_down_addr_buf,
                     midbuf, ds4_gpu_tensor_offset(mid), down_dst, down_dst_off,
                     selectedbuf, ds4_gpu_tensor_offset(selected), down_smem, down_nsg,
