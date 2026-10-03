@@ -52282,8 +52282,10 @@ static bool glm_graph_seed_streaming_expert_cache_from_full_layer(
         uint32_t                 n_tokens,
         uint64_t                 gate_expert_bytes,
         uint64_t                 down_expert_bytes,
-        bool                     full_layer_prefill) {
+        bool                     full_layer_prefill,
+        bool                     defer_cache_seed) {
 #ifdef DS4_ROCM_BUILD
+    (void)defer_cache_seed;
     uint32_t seed_tokens = glm_graph_streaming_prefill_cache_seed_k(g);
     if (seed_tokens == 0) return true;
     if (!full_layer_prefill ||
@@ -52330,7 +52332,8 @@ static bool glm_graph_seed_streaming_expert_cache_from_full_layer(
     }
     return true;
 #elif defined(__APPLE__) && !defined(DS4_NO_GPU)
-    if (!full_layer_prefill || !g || !model || !weights || !layer ||
+    if (!full_layer_prefill || defer_cache_seed ||
+        !g || !model || !weights || !layer ||
         !g->batch_router_selected || n_tokens == 0 || g->layer_count == 0 ||
         g->tp_world >= 2 || g->layer_start != 0 ||
         g->layer_count != glm_graph_normal_layer_count() ||
@@ -52403,6 +52406,7 @@ static bool glm_graph_seed_streaming_expert_cache_from_full_layer(
     (void)gate_expert_bytes;
     (void)down_expert_bytes;
     (void)full_layer_prefill;
+    (void)defer_cache_seed;
     return true;
 #endif
 }
@@ -52806,6 +52810,7 @@ static bool glm_graph_encode_ffn_batch(
         ds4_gpu_tensor          *next,
         uint32_t                 n_tokens,
         bool                     full_layer_prefill,
+        bool                     defer_cache_seed,
         bool                     stage_profile,
         bool                     stage_sync,
         double                  *stage_t0) {
@@ -53054,7 +53059,8 @@ static bool glm_graph_encode_ffn_batch(
             n_tokens,
             gate_out * gate_row_bytes,
             down_out * down_row_bytes,
-            full_layer_prefill);
+            full_layer_prefill,
+            defer_cache_seed);
     bool shared_done = false;
 #define DS4_GLM_ENCODE_FFN_BATCH_SHARED() do { \
         if (ok) { \
@@ -54118,6 +54124,7 @@ static bool glm_graph_verify_rows(
                                                 g->batch_after_attn,
                                                 nxt,
                                                 n,
+                                                false,
                                                 false,
                                                 false,
                                                 false,
@@ -55218,6 +55225,7 @@ glm53_batch_attention_done:
                                             next,
                                             n_tokens,
                                             full_layer_prefill,
+                                            false,
                                             layer_stage_profile,
                                             stage_sync,
                                             layer_stage_profile ? &layer_stage_t0 : NULL);
@@ -55785,6 +55793,11 @@ static bool glm_graph_forward_indexed_tokens(
 #else
         false;
 #endif
+    /* Seeding the expert cache from each full layer costs prompt speed and
+     * only warms the decode that follows the final chunk. When continued
+     * chunks read full layers too, leave the seed to the last one. */
+    const bool defer_cache_seed =
+        logits_out == NULL && continued_full_layer_reads;
     const bool layer_prepare =
         glm_graph_stream_prefill_full_layer_prepare_enabled(g, full_layer_prefill);
     metal_graph_stream_prepare_slot layer_prepare_slot = {0};
@@ -56898,6 +56911,7 @@ glm53_indexed_attention_done:
                                             next,
                                             n_tokens,
                                             full_layer_prefill,
+                                            defer_cache_seed,
                                             layer_stage_profile,
                                             stage_sync,
                                             layer_stage_profile ? &layer_stage_t0 : NULL);
@@ -81084,6 +81098,7 @@ static bool glm53_graph_encode_native_session_batch(
                                                 after_attn,
                                                 next,
                                                 rows,
+                                                false,
                                                 false,
                                                 false,
                                                 false,
