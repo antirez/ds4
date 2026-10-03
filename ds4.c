@@ -8345,6 +8345,14 @@ static DS4_MAYBE_UNUSED bool glm_stream_expert_cache_addr_supported(
 #endif
 }
 
+/* Metal streams GLM IQ2/Q2_K experts whose selected count is not six through
+ * the IQ2 address table and the bounded expert cache. That shrinks the static
+ * decode map to the non-routed weights, but when the whole-file map fits it is
+ * faster, so ds4_engine_fit_glm_streaming_budget enables this only when that
+ * map does not fit or a cache size was requested. -1 until decided, which
+ * reads as off: such layers map in full, as before. */
+static int g_glm_metal_iq2_q2k_addr_stream DS4_MAYBE_UNUSED = -1;
+
 static bool glm_stream_selected_expert_cache_supported(
         const ds4_layer_weights *l,
         uint32_t                 il) {
@@ -8373,9 +8381,14 @@ static bool glm_stream_selected_expert_cache_supported(
 
     if (l->ffn_down_exps->type == DS4_TENSOR_Q2_K) {
 #ifdef __APPLE__
-        /* Metal's IQ2/Q2 selected-slot down kernel sums six experts. The
-         * separate IQ2/IQ2 address-table path below supports up to eight. */
-        if (DS4_N_EXPERT_USED != 6) return false;
+        /* Metal's IQ2/Q2 selected-slot down kernel sums six experts; other
+         * counts (GLM 5.3 selects eight) go through the IQ2 address table
+         * once the streaming budget fit has chosen it. */
+        if (DS4_N_EXPERT_USED != 6) {
+            return g_glm_metal_iq2_q2k_addr_stream == 1 &&
+                   !glm_graph_env_present("DS4_ROCM_DISABLE_IQ2_STREAM_ADDR_TABLE",
+                                          "DS4_METAL_DISABLE_IQ2_STREAM_ADDR_TABLE");
+        }
 #endif
         return !glm_graph_env_present("DS4_ROCM_DISABLE_IQ2_SELECTED_EXPERT_VIEWS",
                                       "DS4_METAL_DISABLE_IQ2_SELECTED_EXPERT_VIEWS");
@@ -22680,7 +22693,8 @@ static bool metal_graph_streaming_expert_cache_seed_layer_expected(
         !g->quality &&
         layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
         layer->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
-        layer->ffn_down_exps->type == DS4_TENSOR_IQ2_XXS &&
+        (layer->ffn_down_exps->type == DS4_TENSOR_IQ2_XXS ||
+         layer->ffn_down_exps->type == DS4_TENSOR_Q2_K) &&
         DS4_N_EXPERT_USED != 0 &&
         DS4_N_EXPERT_USED <= 8 &&
         DS4_N_EXPERT >= 128 &&
@@ -44393,6 +44407,7 @@ struct ds4_engine {
     uint32_t prefill_chunk;
     uint32_t ssd_streaming_cache_experts;
     uint64_t ssd_streaming_cache_bytes;
+    bool ssd_streaming_cache_requested;
     uint64_t ssd_streaming_prefill_headroom_bytes;
     uint64_t ssd_streaming_full_layer_bytes;
     uint64_t ssd_streaming_decode_map_bytes;
@@ -71048,32 +71063,48 @@ static void ds4_engine_fit_glm_streaming_budget(
     const uint64_t minimum_cache_bytes =
         has_routed_experts && cache_can_serve_decode ?
         (uint64_t)DS4_N_EXPERT_USED * per_expert_bytes : 0;
-    if (metal_graph_stream_decode_static_map_enabled() &&
-        cache_can_serve_decode) {
-        uint32_t candidate_layers = old_full_layers;
-        for (;;) {
-            g_glm_streaming_full_resident_layers = candidate_layers;
-            uint64_t candidate_map_bytes = 0;
-            if (ds4_glm_streaming_runtime_decode_map_bytes(
-                        &e->weights, &candidate_map_bytes)) {
-                const uint64_t candidate_extra =
-                    candidate_map_bytes > model_bytes ?
-                    candidate_map_bytes - model_bytes : 0;
-                uint64_t required = glm_graph_saturating_add_u64(
-                        candidate_extra, old_prefill_headroom);
-                required = glm_graph_saturating_add_u64(
-                        required, minimum_cache_bytes);
-                if (required <= available) {
-                    static_decode_map = true;
-                    full_layers = candidate_layers;
-                    decode_map_bytes = candidate_map_bytes;
-                    decode_map_extra_bytes = candidate_extra;
-                    break;
+    /* Decided once per engine, at the first fit, so the weights are never
+     * mapped for one choice and planned for the other. */
+    const bool decide_iq2_q2k_addr = g_glm_metal_iq2_q2k_addr_stream < 0;
+    if (decide_iq2_q2k_addr) {
+        g_glm_metal_iq2_q2k_addr_stream =
+            e->ssd_streaming_cache_requested ? 1 : 0;
+    }
+    for (int pass = 0; pass < 2; pass++) {
+        if (metal_graph_stream_decode_static_map_enabled() &&
+            cache_can_serve_decode) {
+            uint32_t candidate_layers = old_full_layers;
+            for (;;) {
+                g_glm_streaming_full_resident_layers = candidate_layers;
+                uint64_t candidate_map_bytes = 0;
+                if (ds4_glm_streaming_runtime_decode_map_bytes(
+                            &e->weights, &candidate_map_bytes)) {
+                    const uint64_t candidate_extra =
+                        candidate_map_bytes > model_bytes ?
+                        candidate_map_bytes - model_bytes : 0;
+                    uint64_t required = glm_graph_saturating_add_u64(
+                            candidate_extra, old_prefill_headroom);
+                    required = glm_graph_saturating_add_u64(
+                            required, minimum_cache_bytes);
+                    if (required <= available) {
+                        static_decode_map = true;
+                        full_layers = candidate_layers;
+                        decode_map_bytes = candidate_map_bytes;
+                        decode_map_extra_bytes = candidate_extra;
+                        break;
+                    }
                 }
+                if (candidate_layers == 0) break;
+                candidate_layers--;
             }
-            if (candidate_layers == 0) break;
-            candidate_layers--;
         }
+        if (static_decode_map || !decide_iq2_q2k_addr ||
+            g_glm_metal_iq2_q2k_addr_stream == 1) {
+            break;
+        }
+        /* The whole-file map does not fit: serve streamable experts from
+         * the bounded cache and retry with the smaller map. */
+        g_glm_metal_iq2_q2k_addr_stream = 1;
     }
 
     if (!static_decode_map) {
@@ -73034,6 +73065,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
                                     opt->prefill_chunk);
     e->ssd_streaming_cache_experts = opt->ssd_streaming_cache_experts;
     e->ssd_streaming_cache_bytes = opt->ssd_streaming_cache_bytes;
+    e->ssd_streaming_cache_requested =
+        opt->ssd_streaming_cache_experts != 0 ||
+        opt->ssd_streaming_cache_bytes != 0;
+    g_glm_metal_iq2_q2k_addr_stream = -1;
     e->ssd_streaming_full_layers = opt->ssd_streaming_full_layers;
     e->ssd_streaming_preload_experts = opt->ssd_streaming_preload_experts;
     if (e->power_percent > 100) e->power_percent = 100;
@@ -75137,6 +75172,14 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
     }
     if (e->tp.ctx) {
         snprintf(err, errlen, "tensor parallelism already bound");
+        return 0;
+    }
+    if (e->backend == DS4_BACKEND_METAL && g_glm_metal_iq2_q2k_addr_stream == 1) {
+        /* The IQ2/Q2_K address-table decode sums experts on one device; the
+         * TP split sums them in the down kernel instead. */
+        snprintf(err, errlen,
+                 "tensor parallelism does not support GLM IQ2/Q2_K expert-cache "
+                 "streaming; run without --ssd-streaming-cache-experts");
         return 0;
     }
     uint32_t execution_mode = e->cuda_tp_expert_split ?

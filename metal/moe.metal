@@ -4257,6 +4257,63 @@ kernel void kernel_mul_mv_addr_iq2_xxs_f32(
         sgitg);
 }
 
+/* Per-expert Q2_K down projection through the streaming address table.
+ * kernel_mul_mv_addr_q2_K_sum6_f32 fuses the weighted sum but is fixed at six
+ * experts; this one writes each expert's row separately so any selected count
+ * up to DS4_METAL_MAX_ROUTED_EXPERT_USED is summed by the generic expert sum. */
+kernel void kernel_mul_mv_addr_q2_K_f32(
+        constant ds4_metal_args_mul_mv_id & args,
+        device const uint64_t * addrs,
+        device const char * src1,
+        device       char * dst,
+        device const char * ids,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    (void)tiitg;
+
+    const int iid1 = tgpig.z / args.nei0;
+    const int idx  = tgpig.z % args.nei0;
+
+    tgpig.z = 0;
+
+    const int32_t i02 = ((device const int32_t *)(ids + iid1 * args.nbi1))[idx];
+    if (i02 < 0 || i02 >= args.ne02 || i02 >= 384) {
+        return;
+    }
+    const uint64_t addr = addrs[(uint)i02];
+    if (addr == 0) {
+        return;
+    }
+
+    const int64_t i11 = idx % args.ne11;
+    const int64_t i12 = iid1;
+
+    device const char *src0_cur = reinterpret_cast<device const char *>(addr);
+    device const char *src1_cur = src1 + i11 * args.nb11 + i12 * args.nb12;
+    device char *dst_cur = dst + (idx * args.ne0 + i12 * args.ne1 * args.ne0) * sizeof(float);
+
+    ds4_metal_args_mul_mv args0 = {
+        args.ne00, args.ne01, 1,
+        args.nb00, args.nb01, args.nb02, args.nb02,
+        args.ne10, 1, 1,
+        args.nb10, args.nb11, args.nb12, args.nb12,
+        args.ne0, 1, args.nr0, 1, 1,
+    };
+
+    kernel_mul_mv_q2_K_f32_impl<N_R0_Q2_K>(
+        args0,
+        src0_cur,
+        src1_cur,
+        dst_cur,
+        shmem,
+        tgpig,
+        tiisg,
+        sgitg);
+}
+
 kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_masked_f32(
         constant ds4_metal_args_mul_mv_id & args,
         constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
