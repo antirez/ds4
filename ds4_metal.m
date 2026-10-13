@@ -20061,7 +20061,7 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
         const bool bc_out =
             (out_dim % 64u) != 0 || (generic_rows % 32u) != 0;
         /* Amortize dequantization across token tiles with identical half
-         * operands. Default is scoped by the Qwen entry point to M3 Ultra. */
+         * operands. Default is scoped by the Qwen entry point to M3 Ultra and M4. */
         const int unpack_override = ds4_gpu_env_bool("DS4_QWEN4_Q8_PREFILL_UNPACK");
         /* The unpacked weights share one scratch buffer: a concurrent section
          * could overlap the unpack and its GEMM, so it keeps the tiled kernel. */
@@ -20268,7 +20268,7 @@ int ds4_gpu_qwen4_matmul_q8_0_tensor(
         uint64_t                n_tok) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     return ds4_gpu_matmul_q8_0_tensor_impl(out, model_map, model_size, weight_offset, in_dim, out_dim, x, n_tok,
-        ds4_gpu_device_name_contains("M3 Ultra"), 0, NULL);
+        ds4_gpu_device_name_contains("M3 Ultra") || ds4_gpu_device_is_m4_apple_silicon(), 0, NULL);
 }
 
 /* Two to eight rows share one pass over the weights (the rows kernels);
@@ -50704,10 +50704,12 @@ typedef struct {
 static bool qwen4_moe_mv_specialize(uint32_t type) {
     /* Constant quantization and logical width remove the generic decode
      * branches. Keep the original per-lane reduction order and padded stride.
-     * M3 Ultra uses low-bit and MXFP4 down rows; M5 and M4 use MXFP4 down rows. */
+     * M3 Ultra uses low-bit and MXFP4 down rows; M4 also uses low-bit rows,
+     * and M5 and M4 use MXFP4 down rows. */
     const int override = ds4_gpu_env_bool("DS4_QWEN4_MOE_MV_SPECIALIZE");
     return override >= 0 ? override != 0 :
         ((type == 16u || type == 10u || type == 39u) && ds4_gpu_device_name_contains("M3 Ultra")) ||
+        ((type == 16u || type == 10u) && ds4_gpu_device_is_m4_apple_silicon()) ||
         (type == 39u && (ds4_gpu_device_is_m4_apple_silicon() || ds4_gpu_device_is_m5_apple_silicon()));
 }
 
@@ -50966,10 +50968,11 @@ int ds4_gpu_qwen4_hc_gate_mix_tensor(
     }
     const bool pair = n_tokens == 2u && getenv("DS4_QWEN4_NO_HC_PAIR") == NULL;
     /* Register-prefetched F16 rows (same lane order and rounding, pinned
-     * against the plain kernel by tests/test_qwen4_kernels.c); M5 default. */
+     * against the plain kernel by tests/test_qwen4_kernels.c); M5 and M4 default. */
     const int prefetch_override = ds4_gpu_env_bool("DS4_QWEN4_HC_MIX_PREFETCH");
     const bool prefetch = weight_type == 1u &&
-        (prefetch_override >= 0 ? prefetch_override > 0 : ds4_gpu_device_is_m5_apple_silicon());
+        (prefetch_override >= 0 ? prefetch_override > 0 :
+         (ds4_gpu_device_is_m4_apple_silicon() || ds4_gpu_device_is_m5_apple_silicon()));
     const int kernel = pair ? (prefetch ? QWEN4_K_HC_GATE_MIX_PAIR_F16_PF
                                         : qwen4_hc_kernel(weight_type, QWEN4_K_HC_GATE_MIX_PAIR_F16,
                                               QWEN4_K_HC_GATE_MIX_PAIR_F32, QWEN4_K_HC_GATE_MIX_PAIR_Q8))
@@ -50979,7 +50982,7 @@ int ds4_gpu_qwen4_hc_gate_mix_tensor(
     /* More independent output rows share the activated inputs in MTP.
      * Keep the per-row lane mapping and reduction order unchanged. */
     const uint32_t default_nsg = n_embd == 2560u && n_rank == 320u &&
-        ds4_gpu_device_name_contains("M3 Ultra") ? 16u : 4u;
+        (ds4_gpu_device_name_contains("M3 Ultra") || ds4_gpu_device_is_m4_apple_silicon()) ? 16u : 4u;
     const uint32_t nsg = pair ?
         (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_HC_PAIR_NSG", default_nsg, 1u, 16u) : 4u;
     return qwen4_dispatch(kernel, &args, sizeof(args), b, 4,
@@ -51524,11 +51527,12 @@ int ds4_gpu_qwen4_idx_score_tensor(
                               MTLSizeMake((n_blocks + 63) / 64, (n_tokens + 15) / 16, 1), MTLSizeMake(128, 1, 1), 0);
     }
     /* staged queries and vector key loads, plus the tile maxima the
-     * prefiltered selector needs; measured on M5, other devices keep the
-     * scalar scorer */
+     * prefiltered selector needs; measured on M5 and M4, other devices keep
+     * the scalar scorer */
     const int vec_override = ds4_gpu_env_bool("DS4_QWEN4_IDX_SCORE_VEC");
     const bool vec = tile_max && n_idx_head * idx_dim <= 512u && (idx_dim & 3u) == 0u &&
-        (vec_override >= 0 ? vec_override != 0 : ds4_gpu_device_is_m5_apple_silicon());
+        (vec_override >= 0 ? vec_override != 0 :
+         (ds4_gpu_device_is_m4_apple_silicon() || ds4_gpu_device_is_m5_apple_silicon()));
     if (vec) {
         if (!qwen4_bind_tensor(&b[3], tile_max, (uint64_t)n_tokens * ((n_blocks + 7u) / 8u) * sizeof(uint32_t),
                                "indexer tile maxima")) return 0;
@@ -51556,7 +51560,8 @@ int ds4_gpu_qwen4_idx_select_tensor(
     /* Scalar/MM scorers do not populate tile maxima. An independent
      * scorer override must also disable their consumer. */
     const int vec_override = ds4_gpu_env_bool("DS4_QWEN4_IDX_SCORE_VEC");
-    const bool vec = vec_override >= 0 ? vec_override != 0 : ds4_gpu_device_is_m5_apple_silicon();
+    const bool vec = vec_override >= 0 ? vec_override != 0 :
+        (ds4_gpu_device_is_m4_apple_silicon() || ds4_gpu_device_is_m5_apple_silicon());
     const bool pre = tile_max && vec && n_tokens <= 2u && n_blocks > 8u * top_k &&
         (pre_override >= 0 ? pre_override != 0 : ds4_gpu_device_is_m5_apple_silicon());
     if (pre) {
@@ -51663,10 +51668,11 @@ int ds4_gpu_qwen4_attn_decode_tensor(
     if (n_splits == 1) return 1;
     qwen4_bind mb[3] = { b[7], b[1], b[6] };
     /* One thread per dim merges the same split chain with eight times the
-     * threads; measured on M5, other devices keep the simdgroup merge. */
+     * threads; measured on M5 and M4, other devices keep the simdgroup merge. */
     const int wide_override = ds4_gpu_env_bool("DS4_QWEN4_ATTN_MERGE_WIDE");
     const bool wide = head_dim >= 128u &&
-        (wide_override >= 0 ? wide_override != 0 : ds4_gpu_device_is_m5_apple_silicon());
+        (wide_override >= 0 ? wide_override != 0 :
+         (ds4_gpu_device_is_m4_apple_silicon() || ds4_gpu_device_is_m5_apple_silicon()));
     if (wide) {
         return qwen4_dispatch(head_dim == 256u ? QWEN4_K_ATTN_MERGE_WIDE_NPT8 : QWEN4_K_ATTN_MERGE_WIDE_NPT4,
                               &args, sizeof(args), mb, 3,
@@ -52239,11 +52245,12 @@ static ds4_gpu_tensor *qwen4_nax_half_operand(ds4_gpu_tensor **slot, uint64_t *s
 }
 
 static bool qwen4_moe_mm_tails(uint32_t type, uint32_t nt) {
-    /* Remainder tiles measured on M3 Ultra for the low-bit experts and on M5
-     * and M4 for Q4_K gate/up with MXFP4 down. */
+    /* Remainder tiles measured on M3 Ultra and M4 for the low-bit experts and
+     * on M5 and M4 for Q4_K gate/up with MXFP4 down. */
     const int override = ds4_gpu_env_bool("DS4_QWEN4_MOE_TAILS");
     return nt > 1u && (override >= 0 ? override != 0 :
-        ((type == 16u || type == 10u) && ds4_gpu_device_name_contains("M3 Ultra")) ||
+        ((type == 16u || type == 10u) &&
+         (ds4_gpu_device_name_contains("M3 Ultra") || ds4_gpu_device_is_m4_apple_silicon())) ||
         ((type == 12u || type == 39u) &&
          (ds4_gpu_device_is_m4_apple_silicon() || ds4_gpu_device_is_m5_apple_silicon())));
 }
