@@ -306,6 +306,31 @@ static bool json_int(const char **p, int *out) {
     return true;
 }
 
+/* A seed is a 64-bit integer, so read plain integers from their digits: a
+ * double rounds above 2^53, and casting one at or past 2^64 is undefined (x86
+ * turns 18446744073709551615 into 0, which means "no seed"). Other numbers
+ * keep the old reading, where zero, negatives and NaN mean no seed. */
+static bool json_seed(const char **p, uint64_t *out) {
+    json_ws(p);
+    const char *s = *p;
+    if (*s >= '0' && *s <= '9') {
+        const char *end = s;
+        while (*end >= '0' && *end <= '9') end++;
+        if (*end != '.' && *end != 'e' && *end != 'E') {
+            /* strtoull() saturates an overflowing value at ULLONG_MAX. */
+            *out = (uint64_t)strtoull(s, NULL, 10);
+            *p = end;
+            return true;
+        }
+    }
+    double v = 0.0;
+    if (!json_number(p, &v)) return false;
+    if (!(v > 0.0)) *out = 0;
+    else if (v >= 18446744073709551616.0) *out = UINT64_MAX;
+    else *out = (uint64_t)v;
+    return true;
+}
+
 static bool json_bool(const char **p, bool *out) {
     json_ws(p);
     if (json_lit(p, "true")) {
@@ -4192,12 +4217,10 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
             }
             r->top_k_set = true;
         } else if (!strcmp(key, "seed")) {
-            double v = 0.0;
-            if (!json_number(&p, &v)) {
+            if (!json_seed(&p, &r->seed)) {
                 free(key);
                 goto bad;
             }
-            r->seed = v > 0.0 ? (uint64_t)v : 0;
         } else if (!strcmp(key, "stream")) {
             if (!json_bool(&p, &r->stream)) {
                 free(key);
@@ -5662,12 +5685,10 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
             }
             r->top_k_set = true;
         } else if (!strcmp(key, "seed")) {
-            double v = 0.0;
-            if (!json_number(&p, &v)) {
+            if (!json_seed(&p, &r->seed)) {
                 free(key);
                 goto bad;
             }
-            r->seed = v > 0.0 ? (uint64_t)v : 0;
         } else if (!strcmp(key, "stream")) {
             if (!json_bool(&p, &r->stream)) {
                 free(key);
@@ -18267,6 +18288,38 @@ static void test_api_thinking_controls_parse(void) {
     }
 }
 
+static void test_api_seed_parse(void) {
+    const struct {
+        const char *json;
+        uint64_t seed;
+    } cases[] = {
+        {"42", 42},
+        {" 7,", 7},
+        {"9007199254740993", UINT64_C(9007199254740993)},
+        {"18446744073709551615", UINT64_MAX},
+        {"18446744073709551616", UINT64_MAX},
+        {"1e20", UINT64_MAX},
+        {"42.0", 42},
+        {"4.2e1", 42},
+        {"0", 0},
+        {"0.5", 0},
+        {"-1", 0},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const char *p = cases[i].json;
+        uint64_t seed = 1;
+        TEST_ASSERT(json_seed(&p, &seed));
+        TEST_ASSERT(seed == cases[i].seed);
+        TEST_ASSERT(*p == '\0' || *p == ',');
+    }
+    const char *invalid[] = {"\"42\"", "true", ""};
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+        const char *p = invalid[i];
+        uint64_t seed = 1;
+        TEST_ASSERT(!json_seed(&p, &seed));
+    }
+}
+
 static void test_render_think_max_prompt_prefix(void) {
     chat_msgs msgs = {0};
     chat_msg sys = {0};
@@ -22952,6 +23005,7 @@ static void ds4_server_unit_tests_run(void) {
     test_reasoning_effort_mapping();
     test_model_alias_thinking_controls();
     test_api_thinking_controls_parse();
+    test_api_seed_parse();
     test_render_think_max_prompt_prefix();
     test_render_non_thinking_prompt_closes_think();
     test_render_drops_old_reasoning_without_tools();
