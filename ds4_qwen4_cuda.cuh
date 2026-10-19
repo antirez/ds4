@@ -1938,13 +1938,19 @@ extern "C" void ds4_gpu_qwen4_set_rope(const float *freq, uint32_t n, float scal
     if (freq) memcpy(qwen4_cuda::rope_freq, freq, std::min(n, 32u) * sizeof(float));
 }
 
+/* The CUDA TQ kernels land with the CUDA mirror task; until then the knob
+ * refuses CUDA builds (ds4.c gates on this). */
+extern "C" int ds4_gpu_qwen4_tq_supported(void) { return 0; }
+
 extern "C" int ds4_gpu_qwen4_attn_prep_tensor(ds4_gpu_tensor *q, ds4_gpu_tensor *gate,
         ds4_gpu_tensor *kc, ds4_gpu_tensor *vc, ds4_gpu_tensor *iqout, ds4_gpu_tensor *ikc,
         const ds4_gpu_tensor *qg, const ds4_gpu_tensor *kp, const ds4_gpu_tensor *vp,
         const ds4_gpu_tensor *iq, const ds4_gpu_tensor *ik, const ds4_gpu_tensor *pos3,
         const void *map, uint64_t size, uint64_t qo, uint64_t ko, uint64_t io,
         uint32_t T, uint32_t H, uint32_t Hkv, uint32_t D, uint32_t nrot,
-        uint32_t Hi, uint32_t Di, uint32_t pos0, uint32_t cap, float base, float eps) {
+        uint32_t Hi, uint32_t Di, uint32_t pos0, uint32_t cap, float base, float eps,
+        uint32_t tq_bits, uint32_t tq_norm_words) {
+    (void)tq_bits; (void)tq_norm_words;
     using namespace qwen4_cuda;
     const uint64_t qb = (uint64_t)T * H * D * 4, kb = (uint64_t)T * Hkv * D * 4, ib = (uint64_t)T * Hi * Di * 4;
     if (!T || !H || !Hkv || H % Hkv || !Hi || D < 32 || D > 256 || D % 32 ||
@@ -2310,7 +2316,9 @@ extern "C" int ds4_gpu_qwen4_vision_encode(float *out, const float *patches, con
 extern "C" int ds4_gpu_qwen4_attn_decode_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *gate, const ds4_gpu_tensor *kc, const ds4_gpu_tensor *vc,
         const ds4_gpu_tensor *sel, const ds4_gpu_tensor *count, ds4_gpu_tensor *partial,
-        uint32_t T, uint32_t H, uint32_t Hkv, uint32_t D, uint32_t pos0, bool sparse, uint32_t stride, float scale) {
+        uint32_t T, uint32_t H, uint32_t Hkv, uint32_t D, uint32_t pos0, bool sparse, uint32_t stride, float scale,
+        uint32_t tq_bits, uint32_t tq_norm_words) {
+    (void)tq_bits; (void)tq_norm_words;
     using namespace qwen4_cuda;
     const uint64_t n = (uint64_t)T * H * D * 4, cb = ((uint64_t)pos0 + T) * Hkv * D * 2;
     if (!T || !H || !Hkv || H % Hkv || (D != 32 && D != 128 && D != 256) ||

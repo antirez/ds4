@@ -2193,6 +2193,19 @@ paired comparisons, also with decode graphs disabled. Separately run the
   Repeat those sanitizer tools with `DS4_TEST_QWEN4_DENSE_ONLY=1` and
   `DS4_TEST_QWEN4_EXPERT_TILES=1`. Check residual-corrected dense projections,
   odd strides, large outputs, partial expert tiles and untouched output guards.
+- With Qwen3.8-Flash-Next TurboQuant KV enabled (`DS4_QWEN4_KV_BITS` any of
+  2..8; Metal only), repeat: kernel tests, prefill checkpoints/restore-reuse,
+  session snapshot/rewind/rewind-resample, checkpoint replay, MTP limits,
+  logit dump, steering, server story, and the vision CLI. Run the codec and
+  kernel suites across every width (`make test-qwen4-tq test-qwen4-kernels`
+  loop the 2..8 arms themselves), and at least the model-backed battery at the
+  production depths 4, 6 and 8 plus the lowest supported one (2). Same-schedule
+  replay must stay exact; different-schedule serial differences run larger
+  than f16 (top-1 unchanged) and are reported, not asserted. Session files
+  must refuse cross-width restores; disk KV entries of another width must
+  miss cold-prefill, never load. Record the `QWEN4_BENCH_TQ=1` encode/read
+  tables per width (no model needed) and diff the read deltas against the
+  recorded M5 Max numbers before shipping a kernel change.
 - Build `tests/test_qwen4_prefill` and run it with a real prompt through at
   least 8K context on both Metal and CUDA. Same-schedule replay must agree;
   record different-schedule probability differences separately. Nearly tied

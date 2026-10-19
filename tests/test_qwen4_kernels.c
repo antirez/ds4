@@ -13,6 +13,7 @@
 
 #include "ds4.h"
 #include "ds4_gpu.h"
+#include "ds4_qwen4_tq.h"
 
 bool ds4_log_is_tty(FILE *fp) {
     (void)fp;
@@ -914,9 +915,9 @@ static void test_attn_mm_keys(uint32_t T, uint32_t pos0, bool sparse, uint32_t k
     require_ok(gk && gv && gsel && gcnt && ds4_gpu_tensor_write(gk, 0, kc, kvn * 2) && ds4_gpu_tensor_write(gv, 0, vc, kvn * 2) &&
                ds4_gpu_tensor_write(gsel, 0, sel, (uint64_t)T * sel_stride * 4) && ds4_gpu_tensor_write(gcnt, 0, cnt, T * 4), "attn mm setup");
     setenv("DS4_QWEN4_NO_ATTN_MM", "1", 1);
-    require_ok(ds4_gpu_qwen4_attn_decode_tensor(go_ref, gq, ggate, gk, gv, gsel, gcnt, NULL, T, H, Hkv, D, pos0, sparse, sel_stride, 0.0625f), "attn reference");
+    require_ok(ds4_gpu_qwen4_attn_decode_tensor(go_ref, gq, ggate, gk, gv, gsel, gcnt, NULL, T, H, Hkv, D, pos0, sparse, sel_stride, 0.0625f, 0, 0), "attn reference");
     unsetenv("DS4_QWEN4_NO_ATTN_MM");
-    require_ok(ds4_gpu_qwen4_attn_decode_tensor(go_new, gq, ggate, gk, gv, gsel, gcnt, partial, T, H, Hkv, D, pos0, sparse, sel_stride, 0.0625f), "attn mm");
+    require_ok(ds4_gpu_qwen4_attn_decode_tensor(go_new, gq, ggate, gk, gv, gsel, gcnt, partial, T, H, Hkv, D, pos0, sparse, sel_stride, 0.0625f, 0, 0), "attn mm");
     float *ref = download(go_ref, qn), *got = download(go_new, qn);
     double worst = 0.0, scale = 0.0;
     for (uint64_t i = 0; i < qn; i++) {
@@ -1308,7 +1309,7 @@ static void test_attention(arena_t *a, uint32_t H, uint32_t Hkv, uint32_t D, uin
         ds4_gpu_tensor *vout = ds4_gpu_tensor_view(gout, (uint64_t)pos * H * D * 4, (uint64_t)H * D * 4);
         require_ok(ds4_gpu_qwen4_attn_prep_tensor(gq, ggate, gkc, gvc, giqo, gikc, vqg, vk, vv, viq, vik, gpos3,
                                                   a->base, a->size, gq_off, gk_off, giq_off,
-                                                  1, H, Hkv, D, n_rot, Hi, Di, pos, cap, (float)base, (float)eps), "attn prep");
+                                                  1, H, Hkv, D, n_rot, Hi, Di, pos, cap, (float)base, (float)eps, 0, 0), "attn prep");
         const uint32_t n_blocks = (pos + 1) / ratio;
         if ((pos + 1) % ratio == 0) {
             require_ok(ds4_gpu_qwen4_idx_block_key_tensor(gbk, gikc, gpos3, a->base, a->size, gik_off, n_blocks - 1, 1,
@@ -1335,7 +1336,7 @@ static void test_attention(arena_t *a, uint32_t H, uint32_t Hkv, uint32_t D, uin
         }
         /* even positions exercise the key-split partials (main sets DS4_QWEN4_ATTN_SPLIT_KEYS=8) */
         require_ok(ds4_gpu_qwen4_attn_decode_tensor(vout, gq, ggate, gkc, gvc, gselt, gnsel, (pos % 2) ? NULL : gpart,
-                                                    1, H, Hkv, D, pos, sparse, sel_stride, scale), "attn decode");
+                                                    1, H, Hkv, D, pos, sparse, sel_stride, scale, 0, 0), "attn decode");
         ds4_gpu_tensor_free(vout); ds4_gpu_tensor_free(vik); ds4_gpu_tensor_free(viq);
         ds4_gpu_tensor_free(vv); ds4_gpu_tensor_free(vk); ds4_gpu_tensor_free(vqg);
     }
@@ -1449,7 +1450,7 @@ static void test_attention_rows(arena_t *a) {
         for (int i = 0; i < 14; i++) require_ok(v[i] != NULL, "rows views");
         require_ok(ds4_gpu_qwen4_attn_prep_tensor(v[5], v[6], kc[0][r], vc[0][r], v[7], ikc[0][r], v[0], v[1], v[2], v[3], v[4],
                                                   pos3[r], a->base, a->size, gq_off, gk_off, giq_off, 1, H, Hkv, D, n_rot, Hi, Di,
-                                                  pos, pos + 4, (float)base, (float)eps), "rows: prep");
+                                                  pos, pos + 4, (float)base, (float)eps, 0, 0), "rows: prep");
         if ((pos + 1) % ratio == 0) {
             require_ok(ds4_gpu_qwen4_idx_block_key_tensor(bk[0][r], ikc[0][r], pos3[r], a->base, a->size, gik_off, n_blocks - 1, 1,
                                                           ratio, Di, n_rot, (float)base, (float)eps), "rows: block key");
@@ -1460,7 +1461,7 @@ static void test_attention_rows(arena_t *a) {
             require_ok(ds4_gpu_qwen4_idx_expand_tensor(v[12], v[13], v[11], 1, k_blocks, ratio, pos, sel_stride), "rows: expand");
         }
         require_ok(ds4_gpu_qwen4_attn_decode_tensor(v[8], v[5], v[6], kc[0][r], vc[0][r], v[12], v[13], part1,
-                                                    1, H, Hkv, D, pos, sparse, sel_stride, scale), "rows: decode");
+                                                    1, H, Hkv, D, pos, sparse, sel_stride, scale, 0, 0), "rows: decode");
         for (int i = 0; i < 14; i++) ds4_gpu_tensor_free(v[i]);
     }
 
@@ -1475,7 +1476,7 @@ static void test_attention_rows(arena_t *a) {
     require_ok(table && ds4_gpu_qwen4_attn_rows_stage(table, 0, rows, R, ratio), "rows: stage");
     require_ok(ds4_gpu_qwen4_attn_prep_rows_tensor(q[1], gate[1], iqn[1], gqg, gkp, gvp, giq, gik, table, 0, rows, R,
                                                    a->base, a->size, gq_off, gk_off, giq_off, H, Hkv, D, n_rot, Hi, Di,
-                                                   (float)base, (float)eps), "rows: prep rows");
+                                                   (float)base, (float)eps, 0, 0), "rows: prep rows");
     require_ok(ds4_gpu_qwen4_idx_block_key_rows_tensor(table, 0, rows, R, a->base, a->size, gik_off, ratio, Di, n_rot,
                                                        (float)base, (float)eps), "rows: block key rows");
     require_ok(ds4_gpu_qwen4_idx_score_rows_tensor(score[1], tile_max[1], iqn[1], table, 0, rows, R, n_block_stride, Hi, Di, ratio),
@@ -1485,7 +1486,7 @@ static void test_attention_rows(arena_t *a) {
     require_ok(ds4_gpu_qwen4_idx_expand_rows_tensor(selt[1], nsel[1], selb[1], table, 0, R, k_blocks, ratio, sel_stride),
                "rows: expand rows");
     require_ok(ds4_gpu_qwen4_attn_decode_rows_tensor(out[1], q[1], gate[1], selt[1], nsel[1], partR, table, 0, rows, R,
-                                                     H, Hkv, D, sel_stride, scale), "rows: decode rows");
+                                                     H, Hkv, D, sel_stride, scale, 0, 0), "rows: decode rows");
 
     same_bytes("q", R, q[0], 0, q[1], 0, R * q_dim * 4);
     same_bytes("gate", R, gate[0], 0, gate[1], 0, R * q_dim * 4);
@@ -1509,6 +1510,191 @@ static void test_attention_rows(arena_t *a) {
                    (uint64_t)n_sel_a * 4);
     }
     printf("  attention rows: dense, block-completing and sparse rows byte-exact against the per-row kernels\n");
+
+    ds4_gpu_tensor_free(partR); ds4_gpu_tensor_free(table); ds4_gpu_tensor_free(part1);
+    for (uint32_t r = 0; r < R; r++) {
+        ds4_gpu_tensor_free(pos3[r]);
+        for (int p = 0; p < 2; p++) {
+            ds4_gpu_tensor_free(kc[p][r]); ds4_gpu_tensor_free(vc[p][r]);
+            ds4_gpu_tensor_free(ikc[p][r]); ds4_gpu_tensor_free(bk[p][r]);
+        }
+    }
+    for (int p = 0; p < 2; p++) {
+        ds4_gpu_tensor_free(q[p]); ds4_gpu_tensor_free(gate[p]); ds4_gpu_tensor_free(iqn[p]); ds4_gpu_tensor_free(out[p]);
+        ds4_gpu_tensor_free(score[p]); ds4_gpu_tensor_free(tile_max[p]); ds4_gpu_tensor_free(selb[p]);
+        ds4_gpu_tensor_free(selt[p]); ds4_gpu_tensor_free(nsel[p]);
+    }
+    ds4_gpu_tensor_free(gik); ds4_gpu_tensor_free(giq); ds4_gpu_tensor_free(gvp); ds4_gpu_tensor_free(gkp); ds4_gpu_tensor_free(gqg);
+    free(ik); free(iq); free(vp); free(kp); free(qg);
+    free(gq_w); free(gk_w); free(giq_w); free(gik_w);
+}
+
+/* The rows kernels under TurboQuant: same bit-identity contract as
+ * test_attention_rows, over packed blobs with pre-quantized histories.
+ * All row blobs share ONE capacity — the rows dispatch carries a single
+ * tq_norm_words, exactly like the engine's uniform-ctx batch invariant
+ * (qwen4_batch_rows_tq_uniform). */
+static void test_attention_rows_tq(arena_t *a, uint32_t bits) {
+    const uint32_t H = 8, Hkv = 2, D = 256, n_rot = 64, Hi = 4, Di = 128, k_blocks = 4, ratio = 4, R = 4;
+    const uint32_t sparse_pos = (k_blocks + 1) * ratio - 1;
+    const uint32_t pos_of[4] = { 5, 11, sparse_pos, 140 };
+    const uint32_t cap = 160, n_bk = cap / ratio + 1;
+    const double base = 1.0e7, eps = 1e-6;
+    const float scale = 1.0f / sqrtf((float)D);
+    const uint32_t sel_stride = k_blocks * ratio + ratio;
+    const uint64_t q_dim = (uint64_t)H * D, kv_dim = (uint64_t)Hkv * D, iq_dim = (uint64_t)Hi * Di;
+    const uint32_t pw = ds4_qwen4_tq_packed_width(bits);
+    const uint64_t blob = ds4_qwen4_tq_blob_bytes(cap, bits);
+    const uint64_t norms_off = ds4_qwen4_tq_norms_offset(cap, bits);
+    const uint32_t norm_words = (uint32_t)(norms_off / 4u);
+    double *gq_w, *gk_w, *giq_w, *gik_w;
+    const uint64_t gq_off = arena_f32(a, D, &gq_w, 0.5f, 1.5f);
+    const uint64_t gk_off = arena_f32(a, D, &gk_w, 0.5f, 1.5f);
+    const uint64_t giq_off = arena_f32(a, Di, &giq_w, 0.5f, 1.5f);
+    const uint64_t gik_off = arena_f32(a, Di, &gik_w, 0.5f, 1.5f);
+    (void)giq_w; (void)gik_w;
+    const uint32_t n_block_stride = (pos_of[R - 1] + 1) / ratio;
+    const uint32_t n_tiles = (n_block_stride + 7) / 8;
+
+    float *qg = rand_vec(R * 2 * q_dim, 1.0f), *kp = rand_vec(R * kv_dim, 1.0f), *vp = rand_vec(R * kv_dim, 1.0f);
+    float *iq = rand_vec(R * iq_dim, 1.0f), *ik = rand_vec(R * Di, 1.0f);
+    ds4_gpu_tensor *gqg = upload(qg, R * 2 * q_dim), *gkp = upload(kp, R * kv_dim), *gvp = upload(vp, R * kv_dim);
+    ds4_gpu_tensor *giq = upload(iq, R * iq_dim), *gik = upload(ik, R * Di);
+    ds4_gpu_tensor *q[2], *gate[2], *iqn[2], *out[2], *score[2], *tile_max[2], *selb[2], *selt[2], *nsel[2];
+    ds4_gpu_tensor *kc[2][4], *vc[2][4], *ikc[2][4], *bk[2][4], *pos3[4];
+    for (int p = 0; p < 2; p++) {
+        q[p] = upload(NULL, R * q_dim); gate[p] = upload(NULL, R * q_dim); iqn[p] = upload(NULL, R * iq_dim);
+        out[p] = upload(NULL, R * q_dim); score[p] = upload(NULL, (uint64_t)R * n_block_stride);
+        tile_max[p] = ds4_gpu_tensor_alloc((uint64_t)R * n_tiles * 4);
+        selb[p] = ds4_gpu_tensor_alloc((uint64_t)R * k_blocks * 4);
+        selt[p] = ds4_gpu_tensor_alloc((uint64_t)R * sel_stride * 4);
+        nsel[p] = ds4_gpu_tensor_alloc((uint64_t)R * 4);
+        require_ok(tile_max[p] && selb[p] && selt[p] && nsel[p], "tq rows allocs");
+    }
+    /* identical pre-quantized histories for both paths */
+    uint8_t *kblob = calloc(1, blob), *vblob = calloc(1, blob);
+    float *ikh = malloc((uint64_t)cap * Di * sizeof(float));
+    uint16_t *bkh = malloc((uint64_t)n_bk * Di * 2);
+    uint32_t *p3 = calloc((size_t)cap * 4, sizeof(uint32_t));
+    for (uint32_t p = 0; p < cap; p++) p3[p * 4] = p3[p * 4 + 1] = p3[p * 4 + 2] = p;
+    float row_in[256];
+    uint32_t codes[64];
+    uint16_t nh;
+    for (uint32_t r = 0; r < R; r++) {
+        memset(kblob, 0, blob);
+        memset(vblob, 0, blob);
+        for (uint32_t row = 0; row < pos_of[r]; row++) {
+            for (uint32_t h = 0; h < Hkv; h++) {
+                const uint64_t slot = (uint64_t)row * Hkv + h;
+                for (uint32_t i = 0; i < D; i++) row_in[i] = frand();
+                ds4_qwen4_tq_quantize_row(row_in, bits, codes, &nh);
+                memcpy(kblob + slot * pw * 4u, codes, (size_t)pw * 4u);
+                memcpy(kblob + norms_off + slot * 2u, &nh, 2u);
+                for (uint32_t i = 0; i < D; i++) row_in[i] = frand();
+                ds4_qwen4_tq_quantize_row(row_in, bits, codes, &nh);
+                memcpy(vblob + slot * pw * 4u, codes, (size_t)pw * 4u);
+                memcpy(vblob + norms_off + slot * 2u, &nh, 2u);
+            }
+        }
+        for (uint64_t i = 0; i < (uint64_t)cap * Di; i++) ikh[i] = frand();
+        for (uint64_t i = 0; i < (uint64_t)n_bk * Di; i++) bkh[i] = f32_to_f16(frand());
+        pos3[r] = ds4_gpu_tensor_alloc((uint64_t)cap * 16);
+        require_ok(pos3[r] && ds4_gpu_tensor_write(pos3[r], 0, p3, (uint64_t)cap * 16), "tq rows pos3");
+        for (int p = 0; p < 2; p++) {
+            kc[p][r] = ds4_gpu_tensor_alloc(blob); vc[p][r] = ds4_gpu_tensor_alloc(blob);
+            ikc[p][r] = ds4_gpu_tensor_alloc((uint64_t)cap * Di * 4);
+            bk[p][r] = ds4_gpu_tensor_alloc((uint64_t)n_bk * Di * 2);
+            require_ok(kc[p][r] && vc[p][r] && ikc[p][r] && bk[p][r] &&
+                       ds4_gpu_tensor_write(kc[p][r], 0, kblob, blob) &&
+                       ds4_gpu_tensor_write(vc[p][r], 0, vblob, blob) &&
+                       ds4_gpu_tensor_write(ikc[p][r], 0, ikh, (uint64_t)cap * Di * 4) &&
+                       ds4_gpu_tensor_write(bk[p][r], 0, bkh, (uint64_t)n_bk * Di * 2), "tq rows caches");
+        }
+    }
+    free(kblob); free(vblob); free(ikh); free(bkh); free(p3);
+
+    /* path A: the per-row dispatches on row views */
+    ds4_gpu_tensor *part1 = upload(NULL, ds4_gpu_qwen4_attn_part_floats(1, H, D));
+    for (uint32_t r = 0; r < R; r++) {
+        const uint32_t pos = pos_of[r], n_blocks = (pos + 1) / ratio;
+        const bool sparse = pos >= sparse_pos;
+        ds4_gpu_tensor *v[16] = {
+            ds4_gpu_tensor_view(gqg, r * 2 * q_dim * 4, 2 * q_dim * 4), ds4_gpu_tensor_view(gkp, r * kv_dim * 4, kv_dim * 4),
+            ds4_gpu_tensor_view(gvp, r * kv_dim * 4, kv_dim * 4), ds4_gpu_tensor_view(giq, r * iq_dim * 4, iq_dim * 4),
+            ds4_gpu_tensor_view(gik, (uint64_t)r * Di * 4, Di * 4), ds4_gpu_tensor_view(q[0], r * q_dim * 4, q_dim * 4),
+            ds4_gpu_tensor_view(gate[0], r * q_dim * 4, q_dim * 4), ds4_gpu_tensor_view(iqn[0], r * iq_dim * 4, iq_dim * 4),
+            ds4_gpu_tensor_view(out[0], r * q_dim * 4, q_dim * 4),
+            ds4_gpu_tensor_view(score[0], (uint64_t)r * n_block_stride * 4, (uint64_t)n_block_stride * 4),
+            ds4_gpu_tensor_view(tile_max[0], (uint64_t)r * n_tiles * 4, (uint64_t)n_tiles * 4),
+            ds4_gpu_tensor_view(selb[0], (uint64_t)r * k_blocks * 4, k_blocks * 4),
+            ds4_gpu_tensor_view(selt[0], (uint64_t)r * sel_stride * 4, sel_stride * 4),
+            ds4_gpu_tensor_view(nsel[0], (uint64_t)r * 4, 4), NULL, NULL };
+        for (int i = 0; i < 14; i++) require_ok(v[i] != NULL, "tq rows views");
+        require_ok(ds4_gpu_qwen4_attn_prep_tensor(v[5], v[6], kc[0][r], vc[0][r], v[7], ikc[0][r], v[0], v[1], v[2], v[3], v[4],
+                                                  pos3[r], a->base, a->size, gq_off, gk_off, giq_off, 1, H, Hkv, D, n_rot, Hi, Di,
+                                                  pos, cap, (float)base, (float)eps, bits, norm_words), "tq rows: prep");
+        if ((pos + 1) % ratio == 0) {
+            require_ok(ds4_gpu_qwen4_idx_block_key_tensor(bk[0][r], ikc[0][r], pos3[r], a->base, a->size, gik_off, n_blocks - 1, 1,
+                                                          ratio, Di, n_rot, (float)base, (float)eps), "tq rows: block key");
+        }
+        if (sparse) {
+            require_ok(ds4_gpu_qwen4_idx_score_tensor(v[9], v[10], v[7], bk[0][r], 1, n_blocks, Hi, Di, pos, ratio), "tq rows: score");
+            require_ok(ds4_gpu_qwen4_idx_select_tensor(v[11], v[9], v[10], n_blocks, 1, k_blocks), "tq rows: select");
+            require_ok(ds4_gpu_qwen4_idx_expand_tensor(v[12], v[13], v[11], 1, k_blocks, ratio, pos, sel_stride), "tq rows: expand");
+        }
+        require_ok(ds4_gpu_qwen4_attn_decode_tensor(v[8], v[5], v[6], kc[0][r], vc[0][r], v[12], v[13], part1,
+                                                    1, H, Hkv, D, pos, sparse, sel_stride, scale, bits, norm_words),
+                   "tq rows: decode");
+        for (int i = 0; i < 14; i++) ds4_gpu_tensor_free(v[i]);
+    }
+
+    /* path B: the rows kernels */
+    ds4_gpu_tensor *table = ds4_gpu_tensor_alloc((uint64_t)R * DS4_GPU_QWEN4_ATTN_ROW_BYTES);
+    ds4_gpu_tensor *partR = upload(NULL, ds4_gpu_qwen4_attn_part_floats(R, H, D));
+    ds4_gpu_qwen4_attn_row rows[4];
+    for (uint32_t r = 0; r < R; r++) {
+        rows[r].k_cache = kc[1][r]; rows[r].v_cache = vc[1][r]; rows[r].ik_cache = ikc[1][r]; rows[r].block_key = bk[1][r];
+        rows[r].pos3 = pos3[r]; rows[r].pos = pos_of[r]; rows[r].use_sel = pos_of[r] >= sparse_pos;
+    }
+    require_ok(table && ds4_gpu_qwen4_attn_rows_stage(table, 0, rows, R, ratio), "tq rows: stage");
+    require_ok(ds4_gpu_qwen4_attn_prep_rows_tensor(q[1], gate[1], iqn[1], gqg, gkp, gvp, giq, gik, table, 0, rows, R,
+                                                   a->base, a->size, gq_off, gk_off, giq_off, H, Hkv, D, n_rot, Hi, Di,
+                                                   (float)base, (float)eps, bits, norm_words), "tq rows: prep rows");
+    require_ok(ds4_gpu_qwen4_idx_block_key_rows_tensor(table, 0, rows, R, a->base, a->size, gik_off, ratio, Di, n_rot,
+                                                       (float)base, (float)eps), "tq rows: block key rows");
+    require_ok(ds4_gpu_qwen4_idx_score_rows_tensor(score[1], tile_max[1], iqn[1], table, 0, rows, R, n_block_stride, Hi, Di, ratio),
+               "tq rows: score rows");
+    require_ok(ds4_gpu_qwen4_idx_select_rows_tensor(selb[1], score[1], tile_max[1], table, 0, rows, R, n_block_stride, k_blocks),
+               "tq rows: select rows");
+    require_ok(ds4_gpu_qwen4_idx_expand_rows_tensor(selt[1], nsel[1], selb[1], table, 0, R, k_blocks, ratio, sel_stride),
+               "tq rows: expand rows");
+    require_ok(ds4_gpu_qwen4_attn_decode_rows_tensor(out[1], q[1], gate[1], selt[1], nsel[1], partR, table, 0, rows, R,
+                                                     H, Hkv, D, sel_stride, scale, bits, norm_words), "tq rows: decode rows");
+
+    same_bytes("tq q", R, q[0], 0, q[1], 0, R * q_dim * 4);
+    same_bytes("tq gate", R, gate[0], 0, gate[1], 0, R * q_dim * 4);
+    same_bytes("tq indexer q", R, iqn[0], 0, iqn[1], 0, R * iq_dim * 4);
+    same_bytes("tq output", R, out[0], 0, out[1], 0, R * q_dim * 4);
+    for (uint32_t r = 0; r < R; r++) {
+        const uint32_t pos = pos_of[r], n_blocks = (pos + 1) / ratio;
+        same_bytes("tq k blob", r, kc[0][r], 0, kc[1][r], 0, blob);
+        same_bytes("tq v blob", r, vc[0][r], 0, vc[1][r], 0, blob);
+        same_bytes("tq indexer k cache", r, ikc[0][r], 0, ikc[1][r], 0, (uint64_t)cap * Di * 4);
+        same_bytes("tq block keys", r, bk[0][r], 0, bk[1][r], 0, (uint64_t)n_bk * Di * 2);
+        if (pos < sparse_pos) continue;
+        uint32_t n_sel_a = 0;
+        require_ok(ds4_gpu_tensor_read(nsel[0], (uint64_t)r * 4, &n_sel_a, 4), "tq rows: n_sel read");
+        same_bytes("tq scores", r, score[0], (uint64_t)r * n_block_stride * 4, score[1], (uint64_t)r * n_block_stride * 4,
+                   (uint64_t)n_blocks * 4);
+        same_bytes("tq selected blocks", r, selb[0], (uint64_t)r * k_blocks * 4, selb[1], (uint64_t)r * k_blocks * 4,
+                   (uint64_t)k_blocks * 4);
+        same_bytes("tq selected count", r, nsel[0], (uint64_t)r * 4, nsel[1], (uint64_t)r * 4, 4);
+        same_bytes("tq selected tokens", r, selt[0], (uint64_t)r * sel_stride * 4, selt[1], (uint64_t)r * sel_stride * 4,
+                   (uint64_t)n_sel_a * 4);
+    }
+    char what[96];
+    snprintf(what, sizeof(what), "tq%u attention rows byte-exact vs per-row kernels", bits);
+    printf("  %-56s ok\n", what);
 
     ds4_gpu_tensor_free(partR); ds4_gpu_tensor_free(table); ds4_gpu_tensor_free(part1);
     for (uint32_t r = 0; r < R; r++) {
@@ -3003,7 +3189,7 @@ static int bench_hc_mix2(void *ud) { bench_ctx *c = ud; return ds4_gpu_qwen4_hc_
 static int bench_attn(void *ud) {
     bench_ctx *c = ud;
     return ds4_gpu_qwen4_attn_decode_tensor(c->t[6], c->t[7], c->t[7], c->t[8], c->t[9], NULL, NULL, c->n[1] ? c->t[10] : NULL,
-                                            1, 24, 2, 256, c->n[0], false, 0, 0.0625f);
+                                            1, 24, 2, 256, c->n[0], false, 0, 0.0625f, 0, 0);
 }
 static int bench_gdn_front(void *ud) {
     bench_ctx *c = ud;
@@ -3067,7 +3253,7 @@ static int bench_p_idx_select_1k(void *ud) { bench_ctx *c = ud; return ds4_gpu_q
 static int bench_p_attn_sparse(void *ud) {
     bench_ctx *c = ud;
     return ds4_gpu_qwen4_attn_decode_tensor(c->t[37], c->t[33], c->t[34], c->t[31], c->t[32], c->n[2] ? c->t[36] : c->t[35], c->t[38], NULL,
-                                            1024, 24, 2, 256, 262144 - 1024, true, 2052, 0.0625f);
+                                            1024, 24, 2, 256, 262144 - 1024, true, 2052, 0.0625f, 0, 0);
 }
 static int bench_p_gdn_r4(void *ud) { bench_ctx *c = ud; return ds4_gpu_qwen4_gdn_scan_tensor(c->t[15], c->t[1], c->t[11], c->t[13], c->t[14], 1024, 16, 48, 128, NULL, 0u, NULL, 0u); }
 static int bench_p_moe_mm(void *ud) {
@@ -3528,6 +3714,688 @@ static void test_dense_mm_large(arena_t *a, uint32_t wtype) {
 }
 #endif
 
+/* ---- TurboQuant KV prep parity (Metal-only; production geometry) --------
+ * With tq_bits, prep must write q_out pre-rotated by the codec RHT and pack
+ * the K rows (RMSNorm+rope'd f32) and V rows (raw f32) into the blob like
+ * the CPU codec does — modulo the GPU's simd-tree norm reduction, so the
+ * f16 norm may sit 1 ulp off and indices may flip only at midpoint ties.
+ * Verification: dequantize the GPU blob with the CPU codec and bound the
+ * row cosine; compare q_out against the CPU RHT of the reference q rows;
+ * require byte-identical blobs across two runs (determinism). */
+
+/* Layout/packing bugs collapse the row cosine (<0.5), so these floors only
+ * have to stay under the codec's own worst-row distortion at each width.
+ * Measured worst rows over the prep arm's packed K and V caches: 0.9312
+ * (2-bit), 0.9758 (3), 0.9930 (4), 0.9972 (5), 0.9995 (6), 0.9990 (7),
+ * 0.9999 (8); the pinned golden rows sit slightly above them. */
+static double tq_cos_floor(uint32_t bits) {
+    switch (bits) {
+        case 8u: return 0.9995;
+        case 7u: return 0.9985;
+        case 6u: return 0.9980;
+        case 5u: return 0.9950;
+        case 4u: return 0.9900;
+        case 3u: return 0.9700;
+        default: return 0.9250;   /* 2-bit */
+    }
+}
+
+static void test_qwen4_tq_prep(arena_t *a, uint32_t bits) {
+    const uint32_t H = 24, Hkv = 2, D = 256, n_rot = 64, Hi = 4, Di = 128;
+    const uint32_t n_pos = 5, cap = n_pos + 4;
+    const double base = 1.0e7, eps = 1e-6;
+    double *gq_w, *gk_w, *giq_w, *gik_w;
+    const uint64_t gq_off = arena_f32(a, D, &gq_w, 0.5f, 1.5f);
+    const uint64_t gk_off = arena_f32(a, D, &gk_w, 0.5f, 1.5f);
+    const uint64_t giq_off = arena_f32(a, Di, &giq_w, 0.5f, 1.5f);
+    const uint64_t gik_off = arena_f32(a, Di, &gik_w, 0.5f, 1.5f);
+    (void)giq_w; (void)gik_w; (void)gik_off;
+    float *qg = rand_vec((uint64_t)n_pos * H * 2 * D, 1.0f);
+    float *kp = rand_vec((uint64_t)n_pos * Hkv * D, 1.0f);
+    float *vp = rand_vec((uint64_t)n_pos * Hkv * D, 1.0f);
+    float *iq = rand_vec((uint64_t)n_pos * Hi * Di, 1.0f);
+    float *ik = rand_vec((uint64_t)n_pos * Di, 1.0f);
+
+    const uint32_t pw = ds4_qwen4_tq_packed_width(bits);
+    const uint64_t blob = ds4_qwen4_tq_blob_bytes(cap, bits);
+    const uint64_t norms_off = ds4_qwen4_tq_norms_offset(cap, bits);
+    const uint32_t norm_words = (uint32_t)(norms_off / 4u);
+
+    ds4_gpu_tensor *gqg = upload(qg, (uint64_t)n_pos * H * 2 * D);
+    ds4_gpu_tensor *gkp = upload(kp, (uint64_t)n_pos * Hkv * D);
+    ds4_gpu_tensor *gvp = upload(vp, (uint64_t)n_pos * Hkv * D);
+    ds4_gpu_tensor *giq = upload(iq, (uint64_t)n_pos * Hi * Di);
+    ds4_gpu_tensor *gik = upload(ik, (uint64_t)n_pos * Di);
+    ds4_gpu_tensor *gq = upload(NULL, (uint64_t)H * D);
+    ds4_gpu_tensor *ggate = upload(NULL, (uint64_t)H * D);
+    ds4_gpu_tensor *giqo = upload(NULL, (uint64_t)Hi * Di);
+    ds4_gpu_tensor *gikc = upload(NULL, (uint64_t)cap * Di);
+    ds4_gpu_tensor *gpos3 = ds4_gpu_tensor_alloc((uint64_t)cap * 16);
+    ds4_gpu_tensor *gkb = ds4_gpu_tensor_alloc(blob);
+    ds4_gpu_tensor *gvb = ds4_gpu_tensor_alloc(blob);
+    ds4_gpu_tensor *gkb2 = ds4_gpu_tensor_alloc(blob);
+    ds4_gpu_tensor *gvb2 = ds4_gpu_tensor_alloc(blob);
+    require_ok(gqg && gkp && gvp && giq && gik && gq && ggate && giqo && gikc && gpos3 &&
+               gkb && gvb && gkb2 && gvb2, "tq prep allocs");
+    {   /* zero every blob so the determinism memcmp covers unwritten rows too */
+        uint8_t *zeros = calloc(1, blob);
+        require_ok(zeros && ds4_gpu_tensor_write(gkb, 0, zeros, blob) &&
+                   ds4_gpu_tensor_write(gvb, 0, zeros, blob) &&
+                   ds4_gpu_tensor_write(gkb2, 0, zeros, blob) &&
+                   ds4_gpu_tensor_write(gvb2, 0, zeros, blob), "tq blob zeroing");
+        free(zeros);
+        uint32_t *p3 = calloc((size_t)cap * 4, sizeof(uint32_t));
+        for (uint32_t p = 0; p < cap; p++) p3[p * 4] = p3[p * 4 + 1] = p3[p * 4 + 2] = p;
+        require_ok(ds4_gpu_tensor_write(gpos3, 0, p3, (uint64_t)cap * 16), "tq pos3 write");
+        free(p3);
+    }
+
+    uint8_t *kb_host = malloc(blob), *vb_host = malloc(blob);
+    uint8_t *kb2 = malloc(blob), *vb2 = malloc(blob);
+    float *q_host = malloc((size_t)H * D * sizeof(float));
+    float *qgot_all = malloc((size_t)n_pos * H * D * sizeof(float));
+    double *qwant_all = malloc((size_t)n_pos * H * D * sizeof(double));
+    double worst_cos_k = 2.0, worst_cos_v = 2.0;
+    int norm_ulps = 0, checked = 0;
+    char what[128];
+    for (uint32_t pos = 0; pos < n_pos; pos++) {
+        ds4_gpu_tensor *vqg = ds4_gpu_tensor_view(gqg, (uint64_t)pos * H * 2 * D * 4, (uint64_t)H * 2 * D * 4);
+        ds4_gpu_tensor *vk = ds4_gpu_tensor_view(gkp, (uint64_t)pos * Hkv * D * 4, (uint64_t)Hkv * D * 4);
+        ds4_gpu_tensor *vv = ds4_gpu_tensor_view(gvp, (uint64_t)pos * Hkv * D * 4, (uint64_t)Hkv * D * 4);
+        ds4_gpu_tensor *viq = ds4_gpu_tensor_view(giq, (uint64_t)pos * Hi * Di * 4, (uint64_t)Hi * Di * 4);
+        ds4_gpu_tensor *vik = ds4_gpu_tensor_view(gik, (uint64_t)pos * Di * 4, (uint64_t)Di * 4);
+        for (int run = 0; run < 2; run++) {
+            require_ok(ds4_gpu_qwen4_attn_prep_tensor(gq, ggate, run ? gkb2 : gkb, run ? gvb2 : gvb,
+                                                      giqo, gikc, vqg, vk, vv, viq, vik, gpos3,
+                                                      a->base, a->size, gq_off, gk_off, giq_off,
+                                                      1, H, Hkv, D, n_rot, Hi, Di, pos, cap,
+                                                      (float)base, (float)eps, bits, norm_words), "tq prep");
+        }
+        require_ok(ds4_gpu_tensor_read(gkb, 0, kb_host, blob) && ds4_gpu_tensor_read(gvb, 0, vb_host, blob) &&
+                   ds4_gpu_tensor_read(gkb2, 0, kb2, blob) && ds4_gpu_tensor_read(gvb2, 0, vb2, blob) &&
+                   ds4_gpu_tensor_read(gq, 0, q_host, (uint64_t)H * D * 4), "tq readback");
+        snprintf(what, sizeof(what), "tq%u blob determinism pos=%u", bits, pos);
+        require_ok(memcmp(kb_host, kb2, blob) == 0 && memcmp(vb_host, vb2, blob) == 0, what);
+
+        for (uint32_t h = 0; h < Hkv; h++) {
+            const uint64_t slot = (uint64_t)pos * Hkv + h;
+            /* K reference: rope(rmsnorm(kp) * gk) in double, cast to f32 */
+            const float *src = kp + slot * D;
+            double ss = 0.0;
+            for (uint32_t i = 0; i < D; i++) ss += (double)src[i] * src[i];
+            const double r = 1.0 / sqrt(ss / D + eps);
+            double tmp[256];
+            float kref[256], deq[256];
+            for (uint32_t i = 0; i < D; i++) tmp[i] = src[i] * r * gk_w[i];
+            rope_ref(tmp, n_rot, pos, base);
+            for (uint32_t i = 0; i < D; i++) kref[i] = (float)tmp[i];
+            const uint16_t *knorms = (const uint16_t *)(kb_host + norms_off);
+            ds4_qwen4_tq_dequantize_row((const uint32_t *)(kb_host + slot * pw * 4u),
+                                        knorms[slot], bits, deq);
+            double dot = 0, n1 = 0, n2 = 0;
+            for (uint32_t i = 0; i < D; i++) {
+                dot += (double)deq[i] * kref[i];
+                n1 += (double)deq[i] * deq[i];
+                n2 += (double)kref[i] * kref[i];
+            }
+            const double cosk = dot / (sqrt(n1) * sqrt(n2));
+            if (cosk < worst_cos_k) worst_cos_k = cosk;
+            uint32_t exp_codes[64];
+            uint16_t exp_norm;
+            ds4_qwen4_tq_quantize_row(kref, bits, exp_codes, &exp_norm);
+            const int du = (int)knorms[slot] - (int)exp_norm;
+            if ((du < 0 ? -du : du) > 1) norm_ulps++;
+            checked++;
+            /* V reference: the raw projection row */
+            const float *vref = vp + slot * D;
+            const uint16_t *vnorms = (const uint16_t *)(vb_host + norms_off);
+            ds4_qwen4_tq_dequantize_row((const uint32_t *)(vb_host + slot * pw * 4u),
+                                        vnorms[slot], bits, deq);
+            dot = 0; n1 = 0; n2 = 0;
+            for (uint32_t i = 0; i < D; i++) {
+                dot += (double)deq[i] * vref[i];
+                n1 += (double)deq[i] * deq[i];
+                n2 += (double)vref[i] * vref[i];
+            }
+            const double cosv = dot / (sqrt(n1) * sqrt(n2));
+            if (cosv < worst_cos_v) worst_cos_v = cosv;
+        }
+        /* q_out must be the codec RHT of the reference q row, per head.
+         * Rotated elements cancel, so judge like the rest of this file:
+         * absolute error scaled by the reference magnitude (check_close). */
+        for (uint32_t h = 0; h < H; h++) {
+            const float *src = qg + ((uint64_t)pos * H + h) * 2 * D;
+            double ss = 0.0;
+            for (uint32_t i = 0; i < D; i++) ss += (double)src[i] * src[i];
+            const double r = 1.0 / sqrt(ss / D + eps);
+            double tmp[256];
+            float qref[256], qrot[256];
+            for (uint32_t i = 0; i < D; i++) tmp[i] = src[i] * r * gq_w[i];
+            rope_ref(tmp, n_rot, pos, base);
+            for (uint32_t i = 0; i < D; i++) qref[i] = (float)tmp[i];
+            ds4_qwen4_tq_rht(qref, qrot);
+            const uint64_t off = (uint64_t)pos * H * D + (uint64_t)h * D;
+            for (uint32_t i = 0; i < D; i++) {
+                qgot_all[off + i] = q_host[h * D + i];
+                qwant_all[off + i] = qrot[i];
+            }
+        }
+        ds4_gpu_tensor_free(vqg); ds4_gpu_tensor_free(vk); ds4_gpu_tensor_free(vv);
+        ds4_gpu_tensor_free(viq); ds4_gpu_tensor_free(vik);
+    }
+    /* Layout/packing bugs collapse the cosine (<0.5); see tq_cos_floor(). */
+    const double cos_floor = tq_cos_floor(bits);
+    snprintf(what, sizeof(what), "tq%u k-row cosine worst %.6f >= %.4f", bits, worst_cos_k, cos_floor);
+    require_ok(worst_cos_k >= cos_floor, what);
+    printf("  %-56s ok\n", what);
+    snprintf(what, sizeof(what), "tq%u v-row cosine worst %.6f >= %.4f", bits, worst_cos_v, cos_floor);
+    require_ok(worst_cos_v >= cos_floor, what);
+    printf("  %-56s ok\n", what);
+    snprintf(what, sizeof(what), "tq%u norms within 1 f16 ulp (%d rows, %d over)", bits, checked, norm_ulps);
+    require_ok(norm_ulps == 0, what);
+    printf("  %-56s ok\n", what);
+    snprintf(what, sizeof(what), "tq%u q_out == RHT(q_ref)", bits);
+    check_close(what, qgot_all, qwant_all, (uint64_t)n_pos * H * D, 5e-4);
+
+    free(kb_host); free(vb_host); free(kb2); free(vb2); free(q_host);
+    free(qgot_all); free(qwant_all);
+    ds4_gpu_tensor_free(gkb2); ds4_gpu_tensor_free(gvb2);
+    ds4_gpu_tensor_free(gkb); ds4_gpu_tensor_free(gvb);
+    ds4_gpu_tensor_free(gpos3); ds4_gpu_tensor_free(gikc); ds4_gpu_tensor_free(giqo);
+    ds4_gpu_tensor_free(ggate); ds4_gpu_tensor_free(gq);
+    ds4_gpu_tensor_free(gik); ds4_gpu_tensor_free(giq); ds4_gpu_tensor_free(gvp);
+    ds4_gpu_tensor_free(gkp); ds4_gpu_tensor_free(gqg);
+    free(qg); free(kp); free(vp); free(iq); free(ik);
+    free(gq_w); free(gk_w); free(giq_w); free(gik_w);
+}
+
+/* ---- TurboQuant decode parity (Metal-only; production geometry) ---------
+ * The decode/merge kernels must consume packed blobs through the rotated
+ * domain: q arrives pre-rotated, scores run against codebook-decoded unit
+ * keys scaled by the f16 norms, values accumulate rotated and take one
+ * inverse RHT before the gate.  The reference dequantizes with the CPU
+ * codec and runs the softmax in double — orthogonality makes that equal
+ * the rotated-domain math.  Covers the dense and selected arms, single
+ * split (in-tile inverse RHT) and split+merge, and pins the simd/wide
+ * merge bit-identity under TQ. */
+static void test_qwen4_tq_attn(uint32_t bits) {
+    const uint32_t H = 24, Hkv = 2, D = 256, N = 96;
+    const float scale = 0.0625f;
+    const uint32_t pw = ds4_qwen4_tq_packed_width(bits);
+    const uint64_t blob = ds4_qwen4_tq_blob_bytes(N, bits);
+    const uint64_t norms_off = ds4_qwen4_tq_norms_offset(N, bits);
+    const uint32_t norm_words = (uint32_t)(norms_off / 4u);
+
+    uint8_t *kb = calloc(1, blob), *vb = calloc(1, blob);
+    double *kd = malloc((uint64_t)N * Hkv * D * sizeof(double));
+    double *vd = malloc((uint64_t)N * Hkv * D * sizeof(double));
+    float row_in[256], deq[256];
+    uint32_t codes[64];
+    uint16_t nh;
+    for (uint32_t r = 0; r < N; r++) {
+        for (uint32_t h = 0; h < Hkv; h++) {
+            const uint64_t slot = (uint64_t)r * Hkv + h;
+            for (uint32_t i = 0; i < D; i++) row_in[i] = frand();
+            ds4_qwen4_tq_quantize_row(row_in, bits, codes, &nh);
+            memcpy(kb + slot * pw * 4u, codes, pw * 4u);
+            memcpy(kb + norms_off + slot * 2u, &nh, 2u);
+            ds4_qwen4_tq_dequantize_row(codes, nh, bits, deq);
+            for (uint32_t i = 0; i < D; i++) kd[slot * D + i] = deq[i];
+            for (uint32_t i = 0; i < D; i++) row_in[i] = frand();
+            ds4_qwen4_tq_quantize_row(row_in, bits, codes, &nh);
+            memcpy(vb + slot * pw * 4u, codes, pw * 4u);
+            memcpy(vb + norms_off + slot * 2u, &nh, 2u);
+            ds4_qwen4_tq_dequantize_row(codes, nh, bits, deq);
+            for (uint32_t i = 0; i < D; i++) vd[slot * D + i] = deq[i];
+        }
+    }
+
+    /* q in both bases (the kernel takes the rotated one; the reference the
+     * original) and a random gate */
+    float *qo = malloc((size_t)H * D * sizeof(float));
+    float *qr = malloc((size_t)H * D * sizeof(float));
+    float *gate = malloc((size_t)H * D * sizeof(float));
+    for (uint32_t h = 0; h < H; h++) {
+        for (uint32_t i = 0; i < D; i++) qo[(size_t)h * D + i] = frand();
+        ds4_qwen4_tq_rht(qo + (size_t)h * D, qr + (size_t)h * D);
+        for (uint32_t i = 0; i < D; i++) gate[(size_t)h * D + i] = frand();
+    }
+    ds4_gpu_tensor *gq = upload(qr, (uint64_t)H * D);
+    ds4_gpu_tensor *gg = upload(gate, (uint64_t)H * D);
+    ds4_gpu_tensor *gk = ds4_gpu_tensor_alloc(blob);
+    ds4_gpu_tensor *gv = ds4_gpu_tensor_alloc(blob);
+    ds4_gpu_tensor *gout = upload(NULL, (uint64_t)H * D);
+    ds4_gpu_tensor *gpart = upload(NULL, ds4_gpu_qwen4_attn_part_floats(1, H, D));
+    require_ok(gk && gv && ds4_gpu_tensor_write(gk, 0, kb, blob) &&
+               ds4_gpu_tensor_write(gv, 0, vb, blob), "tq attn blob upload");
+
+    const uint32_t S = 40, sel_stride = S + 4;
+    int32_t *sel = calloc(sel_stride, 4);
+    for (uint32_t i = 0; i < S; i++) sel[i] = (int32_t)((i * 37u + 11u) % N);
+    uint32_t nsel_v = S;
+    ds4_gpu_tensor *gsel = ds4_gpu_tensor_alloc((uint64_t)sel_stride * 4u);
+    ds4_gpu_tensor *gnsel = ds4_gpu_tensor_alloc(4);
+    require_ok(gsel && gnsel && ds4_gpu_tensor_write(gsel, 0, sel, (uint64_t)sel_stride * 4u) &&
+               ds4_gpu_tensor_write(gnsel, 0, &nsel_v, 4u), "tq attn sel upload");
+
+    double *ref = malloc((size_t)H * D * sizeof(double));
+    double *p = malloc(N * sizeof(double));
+    float *simd_out = NULL;
+    char what[128];
+    for (int arm = 0; arm < 3; arm++) {
+        const bool use_sel = arm == 2;
+        const uint32_t n_keys = use_sel ? S : N;
+        for (uint32_t h = 0; h < H; h++) {
+            const uint32_t kvh = h / (H / Hkv);
+            double mx = -1e300, sum = 0;
+            for (uint32_t i = 0; i < n_keys; i++) {
+                const uint32_t r = use_sel ? (uint32_t)sel[i] : i;
+                double dot = 0;
+                for (uint32_t d = 0; d < D; d++)
+                    dot += (double)qo[(size_t)h * D + d] * kd[((uint64_t)r * Hkv + kvh) * D + d];
+                p[i] = dot * scale;
+                if (p[i] > mx) mx = p[i];
+            }
+            for (uint32_t i = 0; i < n_keys; i++) { p[i] = exp(p[i] - mx); sum += p[i]; }
+            for (uint32_t d = 0; d < D; d++) {
+                double acc = 0;
+                for (uint32_t i = 0; i < n_keys; i++) {
+                    const uint32_t r = use_sel ? (uint32_t)sel[i] : i;
+                    acc += p[i] * vd[((uint64_t)r * Hkv + kvh) * D + d];
+                }
+                ref[(size_t)h * D + d] = acc / sum * (1.0 / (1.0 + exp(-(double)gate[(size_t)h * D + d])));
+            }
+        }
+        for (int wide = 0; wide < 2; wide++) {
+            if (wide) setenv("DS4_QWEN4_ATTN_MERGE_WIDE", "1", 1);
+            else setenv("DS4_QWEN4_ATTN_MERGE_WIDE", "0", 1);
+            require_ok(ds4_gpu_qwen4_attn_decode_tensor(gout, gq, gg, gk, gv,
+                           use_sel ? gsel : NULL, use_sel ? gnsel : NULL,
+                           arm == 0 ? NULL : gpart, 1, H, Hkv, D,
+                           use_sel ? 0u : N - 1u, use_sel, sel_stride, scale,
+                           bits, norm_words), "tq attn decode");
+            snprintf(what, sizeof(what), "tq%u attn arm=%d wide=%d", bits, arm, wide);
+            check_tensor(what, gout, ref, (uint64_t)H * D, 5e-4);
+            if (arm == 1) {   /* split+merge: simd and wide merge must be bit-identical */
+                float *got = download(gout, (uint64_t)H * D);
+                if (!wide) {
+                    simd_out = got;   /* ownership moves here; freed after the compare */
+                } else {
+                    snprintf(what, sizeof(what), "tq%u merge simd==wide bit-identical", bits);
+                    require_ok(simd_out && memcmp(simd_out, got, (size_t)H * D * sizeof(float)) == 0, what);
+                    printf("  %-56s ok\n", what);
+                    free(simd_out);
+                    simd_out = NULL;
+                    free(got);
+                }
+            }
+        }
+    }
+    unsetenv("DS4_QWEN4_ATTN_MERGE_WIDE");
+    free(simd_out);
+    free(ref); free(p); free(sel);
+    ds4_gpu_tensor_free(gsel); ds4_gpu_tensor_free(gnsel);
+    ds4_gpu_tensor_free(gpart); ds4_gpu_tensor_free(gout);
+    ds4_gpu_tensor_free(gv); ds4_gpu_tensor_free(gk);
+    ds4_gpu_tensor_free(gg); ds4_gpu_tensor_free(gq);
+    free(qo); free(qr); free(gate); free(kb); free(vb); free(kd); free(vd);
+}
+
+/* The fused mm arm over packed blobs: multi-token prefill-style dispatches
+ * (T > 8, no partials) must match the double-precision reference of the
+ * dequantized cache within the half-tile staging tolerance the f16 mm arm
+ * uses on Metal.  Token 5 selects nothing, which exercises the zero path
+ * through staging, softmax and the epilogue inverse RHT. */
+static void test_qwen4_tq_attn_mm(uint32_t bits) {
+    const uint32_t H = 24, Hkv = 2, D = 256, T = 12, pos0 = 20;
+    const uint32_t N = pos0 + T;
+    const float scale = 0.0625f;
+    const uint32_t pw = ds4_qwen4_tq_packed_width(bits);
+    const uint64_t blob = ds4_qwen4_tq_blob_bytes(N, bits);
+    const uint64_t norms_off = ds4_qwen4_tq_norms_offset(N, bits);
+    const uint32_t norm_words = (uint32_t)(norms_off / 4u);
+
+    uint8_t *kb = calloc(1, blob), *vb = calloc(1, blob);
+    double *kd = malloc((uint64_t)N * Hkv * D * sizeof(double));
+    double *vd = malloc((uint64_t)N * Hkv * D * sizeof(double));
+    float row_in[256], deq[256];
+    uint32_t codes[64];
+    uint16_t nh;
+    for (uint32_t r = 0; r < N; r++) {
+        for (uint32_t h = 0; h < Hkv; h++) {
+            const uint64_t slot = (uint64_t)r * Hkv + h;
+            for (uint32_t i = 0; i < D; i++) row_in[i] = frand();
+            ds4_qwen4_tq_quantize_row(row_in, bits, codes, &nh);
+            memcpy(kb + slot * pw * 4u, codes, pw * 4u);
+            memcpy(kb + norms_off + slot * 2u, &nh, 2u);
+            ds4_qwen4_tq_dequantize_row(codes, nh, bits, deq);
+            for (uint32_t i = 0; i < D; i++) kd[slot * D + i] = deq[i];
+            for (uint32_t i = 0; i < D; i++) row_in[i] = frand();
+            ds4_qwen4_tq_quantize_row(row_in, bits, codes, &nh);
+            memcpy(vb + slot * pw * 4u, codes, pw * 4u);
+            memcpy(vb + norms_off + slot * 2u, &nh, 2u);
+            ds4_qwen4_tq_dequantize_row(codes, nh, bits, deq);
+            for (uint32_t i = 0; i < D; i++) vd[slot * D + i] = deq[i];
+        }
+    }
+
+    float *qo = malloc((uint64_t)T * H * D * sizeof(float));
+    float *qr = malloc((uint64_t)T * H * D * sizeof(float));
+    float *gate = malloc((uint64_t)T * H * D * sizeof(float));
+    for (uint64_t i = 0; i < (uint64_t)T * H * D; i++) qo[i] = frand();
+    for (uint64_t i = 0; i < (uint64_t)T * H * D; i++) gate[i] = frand();
+    for (uint64_t r = 0; r < (uint64_t)T * H; r++)
+        ds4_qwen4_tq_rht(qo + r * D, qr + r * D);
+
+    const uint32_t S = 16, sel_stride = S + 4;
+    int32_t *sel = calloc((uint64_t)T * sel_stride, 4);
+    uint32_t *cnt = malloc(T * sizeof(*cnt));
+    for (uint32_t t = 0; t < T; t++) {
+        if (t == 5) { cnt[t] = 0; continue; }
+        const uint32_t horizon = pos0 + t + 1;   /* every pick stays causal */
+        uint32_t n = 0;
+        while (n < S) {
+            const int32_t k = (int32_t)(((frand() + 1.0f) * 0.5f) * horizon) % (int32_t)horizon;
+            bool dup = false;
+            for (uint32_t j = 0; j < n && !dup; j++) dup = sel[(uint64_t)t * sel_stride + j] == k;
+            if (!dup) sel[(uint64_t)t * sel_stride + n++] = k;
+        }
+        cnt[t] = S;
+    }
+
+    ds4_gpu_tensor *gq = upload(qr, (uint64_t)T * H * D);
+    ds4_gpu_tensor *gg = upload(gate, (uint64_t)T * H * D);
+    ds4_gpu_tensor *gk = ds4_gpu_tensor_alloc(blob);
+    ds4_gpu_tensor *gv = ds4_gpu_tensor_alloc(blob);
+    ds4_gpu_tensor *gout = upload(NULL, (uint64_t)T * H * D);
+    ds4_gpu_tensor *gsel = ds4_gpu_tensor_alloc((uint64_t)T * sel_stride * 4u);
+    ds4_gpu_tensor *gcnt = ds4_gpu_tensor_alloc(T * 4u);
+    require_ok(gk && gv && gsel && gcnt &&
+               ds4_gpu_tensor_write(gk, 0, kb, blob) && ds4_gpu_tensor_write(gv, 0, vb, blob) &&
+               ds4_gpu_tensor_write(gsel, 0, sel, (uint64_t)T * sel_stride * 4u) &&
+               ds4_gpu_tensor_write(gcnt, 0, cnt, T * 4u), "tq mm setup");
+
+    double *ref = malloc((uint64_t)T * H * D * sizeof(double));
+    double *p = malloc(N * sizeof(double));
+    char what[128];
+    for (int mode = 0; mode < 2; mode++) {
+        const bool use_sel = mode == 1;
+        for (uint32_t t = 0; t < T; t++) {
+            const uint32_t n_keys = use_sel ? cnt[t] : pos0 + t + 1;
+            for (uint32_t h = 0; h < H; h++) {
+                const uint32_t kvh = h / (H / Hkv);
+                double *rr = ref + ((uint64_t)t * H + h) * D;
+                if (n_keys == 0) { for (uint32_t d = 0; d < D; d++) rr[d] = 0; continue; }
+                double mx = -1e300, sum = 0;
+                for (uint32_t i = 0; i < n_keys; i++) {
+                    const uint32_t r = use_sel ? (uint32_t)sel[(uint64_t)t * sel_stride + i] : i;
+                    double dot = 0;
+                    for (uint32_t d = 0; d < D; d++)
+                        dot += (double)qo[((uint64_t)t * H + h) * D + d] * kd[((uint64_t)r * Hkv + kvh) * D + d];
+                    p[i] = dot * scale;
+                    if (p[i] > mx) mx = p[i];
+                }
+                for (uint32_t i = 0; i < n_keys; i++) { p[i] = exp(p[i] - mx); sum += p[i]; }
+                for (uint32_t d = 0; d < D; d++) {
+                    double acc = 0;
+                    for (uint32_t i = 0; i < n_keys; i++) {
+                        const uint32_t r = use_sel ? (uint32_t)sel[(uint64_t)t * sel_stride + i] : i;
+                        acc += p[i] * vd[((uint64_t)r * Hkv + kvh) * D + d];
+                    }
+                    rr[d] = acc / sum * (1.0 / (1.0 + exp(-(double)gate[((uint64_t)t * H + h) * D + d])));
+                }
+            }
+        }
+        /* No partials: n_splits == 1 with T > 8 routes to the mm arm. */
+        require_ok(ds4_gpu_qwen4_attn_decode_tensor(gout, gq, gg, gk, gv,
+                       use_sel ? gsel : NULL, use_sel ? gcnt : NULL, NULL,
+                       T, H, Hkv, D, pos0, use_sel, sel_stride, scale,
+                       bits, norm_words), "tq mm dispatch");
+        snprintf(what, sizeof(what), "tq%u attn mm %s", bits, use_sel ? "sparse" : "dense");
+        check_tensor(what, gout, ref, (uint64_t)T * H * D, 4e-3);
+    }
+    free(ref); free(p); free(sel); free(cnt);
+    ds4_gpu_tensor_free(gsel); ds4_gpu_tensor_free(gcnt);
+    ds4_gpu_tensor_free(gout); ds4_gpu_tensor_free(gv); ds4_gpu_tensor_free(gk);
+    ds4_gpu_tensor_free(gg); ds4_gpu_tensor_free(gq);
+    free(qo); free(qr); free(gate); free(kb); free(vb); free(kd); free(vd);
+}
+
+/* ---- TurboQuant encode/read throughput (QWEN4_BENCH_TQ=1) ---------------
+ * The fused kernels measured here with no model, no prefill and no weights
+ * beyond the two RMSNorm gammas parked in the arena: every buffer is
+ * synthetic and nothing checks values (that is the parity arms' job).
+ *
+ * These are not codec-only kernels: attn_prep also runs RMSNorm+rope for the
+ * q/k/iq slots and writes ik_cache, and the attention arms also run QK^T,
+ * softmax and PV.  So each case is reported against the SAME dispatch on f16
+ * caches (tq_bits == 0), which differs only in how a row is stored or loaded,
+ * plus rows/s and bytes/s columns to keep traffic separable from arithmetic.
+ * What that shows here: the write side is a wash (a few hundredths of a
+ * microsecond per row either way), while the read side is compute-bound --
+ * packed widths are slower than f16 despite reading a fraction of the bytes,
+ * and in attn_mm the generic unpack (2..5, 7) costs a near-constant amount
+ * whatever `bits` is, whereas 6 and 8 use constant-folded extraction and land
+ * below it.  Same column, so the gap between the two groups is the generic
+ * path's own cost. */
+typedef struct {
+    arena_t *a;
+    uint64_t gq_off, gk_off, giq_off;         /* norm gammas in the map */
+    ds4_gpu_tensor *qg, *kp, *vp, *iq, *ik;   /* prep inputs */
+    ds4_gpu_tensor *q_out, *gate_out, *iq_out, *ik_cache, *pos3;
+    ds4_gpu_tensor *kb, *vb;                  /* K/V caches (blob or f16) */
+    ds4_gpu_tensor *q, *gate, *out;           /* attention inputs */
+    uint32_t p_tokens, p_cap;                 /* prep shape */
+    uint32_t r_tokens, r_keys, r_cap;         /* read shape */
+    uint32_t bits, norm_words;
+} tqbench;
+
+#define TQB_H 24u
+#define TQB_HKV 2u
+#define TQB_D 256u
+#define TQB_ROT 64u
+#define TQB_HI 4u
+#define TQB_DI 128u
+
+static int tqbench_prep(void *ud) {
+    tqbench *b = ud;
+    return ds4_gpu_qwen4_attn_prep_tensor(b->q_out, b->gate_out, b->kb, b->vb, b->iq_out,
+                                          b->ik_cache, b->qg, b->kp, b->vp, b->iq, b->ik, b->pos3,
+                                          b->a->base, b->a->size, b->gq_off, b->gk_off, b->giq_off,
+                                          b->p_tokens, TQB_H, TQB_HKV, TQB_D, TQB_ROT, TQB_HI, TQB_DI,
+                                          0u, b->p_cap, 1.0e7f, 1e-6f, b->bits, b->norm_words);
+}
+
+static int tqbench_read(void *ud) {
+    tqbench *b = ud;
+    return ds4_gpu_qwen4_attn_decode_tensor(b->out, b->q, b->gate, b->kb, b->vb, NULL, NULL, NULL,
+                                            b->r_tokens, TQB_H, TQB_HKV, TQB_D,
+                                            b->r_keys - b->r_tokens, false, 0u, 0.0625f,
+                                            b->bits, b->norm_words);
+}
+
+/* One timed batch like bench_run(), but returning the microseconds without
+ * printing: every case here is reported relative to its f16 baseline. */
+static double tqbench_us(tqbench *b, int (*fn)(void *), uint32_t reps) {
+    for (uint32_t i = 0; i < 3u; i++) require_ok(fn(b), "tq bench warmup");
+    require_ok(ds4_gpu_begin_commands(), "tq bench begin");
+    for (uint32_t r = 0; r < reps; r++) require_ok(fn(b), "tq bench dispatch");
+    require_ok(ds4_gpu_end_commands(), "tq bench end");
+    require_ok(ds4_gpu_synchronize(), "tq bench sync");
+    const double t0 = bench_now();
+    require_ok(ds4_gpu_begin_commands(), "tq bench begin");
+    for (uint32_t r = 0; r < reps; r++) require_ok(fn(b), "tq bench dispatch");
+    require_ok(ds4_gpu_end_commands(), "tq bench end");
+    require_ok(ds4_gpu_synchronize(), "tq bench sync");
+    return 1e6 * (bench_now() - t0) / reps;
+}
+
+/* Cache contents: the f16 baseline gets plain random halves; a packed blob
+ * gets random code words plus f16 norms of exactly 1.0, because a NaN or inf
+ * norm would change the floating-point work, not just the values. */
+static void tqbench_fill(tqbench *b, uint32_t bits) {
+    const uint64_t bytes = (uint64_t)b->r_cap * TQB_HKV * TQB_D * 2u;   /* f16: the widest layout */
+    uint8_t *h = malloc(bytes);
+    require_ok(h != NULL, "tq bench fill alloc");
+    uint64_t s = 0x2545F4914F6CDD1Dull;
+    for (uint64_t i = 0; i < bytes / 2u; i++) {
+        s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+        if (bits == 0u) {
+            ((_Float16 *)h)[i] = (_Float16)(((s >> 40) / 67108864.0) - 0.5);
+        } else if ((i & 1u) == 0u && i * 2u + 4u <= bytes) {
+            *(uint32_t *)(h + i * 2u) = (uint32_t)(s >> 32);
+        }
+    }
+    if (bits != 0u) {
+        _Float16 *n = (_Float16 *)(h + ds4_qwen4_tq_norms_offset(b->r_cap, bits));
+        for (uint64_t i = 0; i < (uint64_t)b->r_cap * TQB_HKV; i++) n[i] = (_Float16)1.0f;
+    }
+    require_ok(ds4_gpu_tensor_write(b->kb, 0, h, bytes) &&
+               ds4_gpu_tensor_write(b->vb, 0, h, bytes), "tq bench blob write");
+    free(h);
+}
+
+static void bench_tq(arena_t *a) {
+    tqbench b;
+    memset(&b, 0, sizeof(b));
+    b.a = a;
+    b.p_tokens = 256u; b.p_cap = 256u;             /* the encode series sweeps tokens */
+    b.r_cap = 32768u;
+    double *w;
+    b.gq_off = arena_f32(a, TQB_D, &w, 0.5f, 1.5f); free(w);
+    b.gk_off = arena_f32(a, TQB_D, &w, 0.5f, 1.5f); free(w);
+    b.giq_off = arena_f32(a, TQB_DI, &w, 0.5f, 1.5f); free(w);
+    float *qg = rand_vec((uint64_t)b.p_tokens * TQB_H * 2 * TQB_D, 1.0f);
+    float *kp = rand_vec((uint64_t)b.p_tokens * TQB_HKV * TQB_D, 1.0f);
+    float *vp = rand_vec((uint64_t)b.p_tokens * TQB_HKV * TQB_D, 1.0f);
+    float *iq = rand_vec((uint64_t)b.p_tokens * TQB_HI * TQB_DI, 1.0f);
+    float *ik = rand_vec((uint64_t)b.p_tokens * TQB_DI, 1.0f);
+    float *qr = rand_vec((uint64_t)16 * TQB_H * TQB_D, 1.0f);
+    const uint64_t cache_bytes = (uint64_t)b.r_cap * TQB_HKV * TQB_D * 2u;
+    b.qg = upload(qg, (uint64_t)b.p_tokens * TQB_H * 2 * TQB_D);
+    b.kp = upload(kp, (uint64_t)b.p_tokens * TQB_HKV * TQB_D);
+    b.vp = upload(vp, (uint64_t)b.p_tokens * TQB_HKV * TQB_D);
+    b.iq = upload(iq, (uint64_t)b.p_tokens * TQB_HI * TQB_DI);
+    b.ik = upload(ik, (uint64_t)b.p_tokens * TQB_DI);
+    b.q_out = upload(NULL, (uint64_t)b.p_tokens * TQB_H * TQB_D);
+    b.gate_out = upload(NULL, (uint64_t)b.p_tokens * TQB_H * TQB_D);
+    b.iq_out = upload(NULL, (uint64_t)b.p_tokens * TQB_HI * TQB_DI);
+    b.ik_cache = upload(NULL, (uint64_t)b.p_cap * TQB_DI);
+    b.pos3 = ds4_gpu_tensor_alloc((uint64_t)b.p_cap * 16u);
+    b.kb = ds4_gpu_tensor_alloc(cache_bytes);
+    b.vb = ds4_gpu_tensor_alloc(cache_bytes);
+    b.q = upload(qr, (uint64_t)16 * TQB_H * TQB_D);
+    b.gate = upload(qr, (uint64_t)16 * TQB_H * TQB_D);
+    b.out = upload(NULL, (uint64_t)16 * TQB_H * TQB_D);
+    require_ok(b.qg && b.kp && b.vp && b.iq && b.ik && b.q_out && b.gate_out && b.iq_out &&
+               b.ik_cache && b.pos3 && b.kb && b.vb && b.q && b.gate && b.out, "tq bench allocs");
+    {   /* one rope position per cached token, same in all three multimodal lanes */
+        uint32_t *p3 = calloc((size_t)b.p_cap * 4u, sizeof(uint32_t));
+        for (uint32_t p = 0; p < b.p_cap; p++) p3[p * 4u] = p3[p * 4u + 1] = p3[p * 4u + 2] = p;
+        require_ok(ds4_gpu_tensor_write(b.pos3, 0, p3, (uint64_t)b.p_cap * 16u), "tq bench pos3");
+        free(p3);
+    }
+    free(qg); free(kp); free(vp); free(iq); free(ik); free(qr);
+
+    /* ---- encode: attn_prep packing Hkv x (K,V) rows per token ----------
+     * Two token counts and a marginal cost: (t(n1) - t(n0)) / (n1 - n0) drops
+     * the fixed dispatch overhead, leaving the per-token cache write.  The f16
+     * baseline is not "no work" -- it stores 256 halves per row as 8 scattered
+     * 2-byte stores per lane -- so this column reads as pack-vs-store, not as
+     * the codec in isolation.  On M5 Max the packed widths land +0.011..+0.014
+     * us/row above f16 with no trend across widths; a bigger jump or a width
+     * trend means the pack path got slower. */
+    const uint32_t enc_n0 = 32u, enc_n1 = 256u;
+    const uint32_t enc_rows_per_tok = TQB_HKV * 2u;
+    double enc[DS4_QWEN4_TQ_MAX_BITS + 1u][2];
+    for (uint32_t pass = 0u; pass < 6u; pass++) {
+        for (uint32_t bits = 0u; bits <= DS4_QWEN4_TQ_MAX_BITS; bits++) {
+            if (bits != 0u && bits < DS4_QWEN4_TQ_MIN_BITS) continue;
+            b.bits = bits;
+            b.norm_words = bits ? (uint32_t)(ds4_qwen4_tq_norms_offset(b.p_cap, bits) / 4u) : 0u;
+            b.p_tokens = enc_n0;
+            const double us0 = tqbench_us(&b, tqbench_prep, 32u);
+            b.p_tokens = enc_n1;
+            const double us1 = tqbench_us(&b, tqbench_prep, 12u);
+            if (pass == 0u || us0 < enc[bits][0]) enc[bits][0] = us0;
+            if (pass == 0u || us1 < enc[bits][1]) enc[bits][1] = us1;
+        }
+    }
+    printf("tq encode  attn_prep, marginal per token (%u..%u tokens, %u packed rows/token)\n",
+           enc_n0, enc_n1, enc_rows_per_tok);
+    printf("  %-6s %12s %12s %16s %10s\n",
+           "bits", "us/token", "us/row", "delta/row vs f16", "B/token");
+    const double enc_f16_row = (enc[0][1] - enc[0][0]) / (enc_n1 - enc_n0) / enc_rows_per_tok;
+    for (uint32_t bits = 0u; bits <= DS4_QWEN4_TQ_MAX_BITS; bits++) {
+        if (bits != 0u && bits < DS4_QWEN4_TQ_MIN_BITS) continue;
+        const double us_row = (enc[bits][1] - enc[bits][0]) / (enc_n1 - enc_n0) / enc_rows_per_tok;
+        /* codes + f16 norms; norms live once per (token, kv head) per cache */
+        const double tok_bytes = bits ? enc_rows_per_tok * ds4_qwen4_tq_packed_width(bits) * 4.0 +
+                                        (double)TQB_HKV * 2.0 * 2.0
+                                      : enc_rows_per_tok * TQB_D * 2.0;
+        if (bits == 0u)
+            printf("  %-6s %12.3f %12.3f %16s %10.0f\n", "f16", us_row * enc_rows_per_tok,
+                   us_row, "baseline", tok_bytes);
+        else
+            printf("  %-6u %12.3f %12.3f %+16.3f %10.0f\n", bits,
+                   us_row * enc_rows_per_tok, us_row, us_row - enc_f16_row, tok_bytes);
+    }
+
+    /* ---- read: the fused unpack inside attention (mm = prefill arm) ----
+     * Blob contents depend only on the width (r_cap is fixed), so each width
+     * is filled once and every key count measured before the table prints.
+     * GiB/s counts only the bytes the layout actually reads, so a packed
+     * width that is slower in us is visibly cheaper in traffic: the mm arm is
+     * compute-bound on QK^T + staging, so its unpack cost shows up as a
+     * positive delta, while 6/8 (constant-folded) sit below 2..5/7 (generic). */
+    const uint32_t key_counts[3] = { 2048u, 8192u, 32768u };
+    double res[DS4_QWEN4_TQ_MAX_BITS + 1u][3];
+    for (int arm = 0; arm < 2; arm++) {
+        const uint32_t ntok = arm ? 1u : 16u;      /* 16 -> attn_mm, 1 -> attn_decode */
+        const uint32_t n_sets = arm ? 2u : 3u;     /* single-split decode: 2 threadgroups */
+        for (uint32_t pass = 0u; pass < 2u; pass++) {
+            for (uint32_t bits = 0u; bits <= DS4_QWEN4_TQ_MAX_BITS; bits++) {
+                if (bits != 0u && bits < DS4_QWEN4_TQ_MIN_BITS) continue;
+                tqbench_fill(&b, bits);
+                b.bits = bits;
+                b.norm_words = bits ? (uint32_t)(ds4_qwen4_tq_norms_offset(b.r_cap, bits) / 4u) : 0u;
+                b.r_tokens = ntok;
+                for (uint32_t kc = 0u; kc < n_sets; kc++) {
+                    b.r_keys = key_counts[kc];
+                    const double us = tqbench_us(&b, tqbench_read, key_counts[kc] >= 32768u ? 3u : 8u);
+                    if (pass == 0u || us < res[bits][kc]) res[bits][kc] = us;
+                }
+            }
+        }
+        printf("tq read  %s  %u query token(s)%s\n", arm ? "attn_decode" : "attn_mm", ntok,
+               arm ? "  (one split: latency-bound, compare widths only)" : "");
+        printf("  %-8s %-8s %12s %14s %12s %10s\n",
+               "keys", "bits", "dispatch us", "delta vs f16", "read Mrow/s", "GiB/s");
+        for (uint32_t kc = 0u; kc < n_sets; kc++) {
+            const double rows = (double)ntok * TQB_HKV * key_counts[kc] * 2.0;
+            for (uint32_t bits = 0u; bits <= DS4_QWEN4_TQ_MAX_BITS; bits++) {
+                if (bits != 0u && bits < DS4_QWEN4_TQ_MIN_BITS) continue;
+                const double row_bytes = bits ? ds4_qwen4_tq_packed_width(bits) * 4.0 + 2.0
+                                              : TQB_D * 2.0;
+                const double gib = rows * row_bytes / res[bits][kc] / 1073.741824;  /* B/us -> GiB/s */
+                if (bits == 0u)
+                    printf("  %-8u %-8s %12.1f %14s %12.2f %10.1f\n",
+                           key_counts[kc], "f16", res[0][kc], "baseline", rows / res[0][kc], gib);
+                else
+                    printf("  %-8u %-8u %12.1f %+14.1f %12.2f %10.1f\n", key_counts[kc], bits,
+                           res[bits][kc], res[bits][kc] - res[0][kc], rows / res[bits][kc], gib);
+            }
+        }
+    }
+
+    ds4_gpu_tensor_free(b.qg); ds4_gpu_tensor_free(b.kp); ds4_gpu_tensor_free(b.vp);
+    ds4_gpu_tensor_free(b.iq); ds4_gpu_tensor_free(b.ik); ds4_gpu_tensor_free(b.q_out);
+    ds4_gpu_tensor_free(b.gate_out); ds4_gpu_tensor_free(b.iq_out); ds4_gpu_tensor_free(b.ik_cache);
+    ds4_gpu_tensor_free(b.pos3); ds4_gpu_tensor_free(b.kb); ds4_gpu_tensor_free(b.vb);
+    ds4_gpu_tensor_free(b.q); ds4_gpu_tensor_free(b.gate); ds4_gpu_tensor_free(b.out);
+    printf("tq bench done: read deltas are net of the bytes the packed layout does not read\n");
+}
+
 int main(void) {
     arena_t arena;
     arena.size = (uint64_t)1536 << 20;
@@ -3591,6 +4459,7 @@ int main(void) {
         bench_hc_norm_reuse(&arena);
         return 0;
     }
+    if (getenv("QWEN4_BENCH_TQ")) { bench_tq(&arena); return 0; }
     if (getenv("QWEN4_BENCH")) {
         bench_dispatch(&arena);
         return 0;
@@ -3646,6 +4515,17 @@ int main(void) {
     test_attention(&arena, 4, 2, 32, 8, 4, 32, 2, 30);
 #ifdef __APPLE__
     test_attention_rows(&arena);
+    /* Every supported TurboQuant width, through all four TQ arms. */
+    for (uint32_t tqb = DS4_QWEN4_TQ_MIN_BITS; tqb <= DS4_QWEN4_TQ_MAX_BITS; tqb++) {
+        printf("tq prep %u\n", tqb);
+        test_qwen4_tq_prep(&arena, tqb);
+        printf("tq attn %u\n", tqb);
+        test_qwen4_tq_attn(tqb);
+        printf("tq attn mm %u\n", tqb);
+        test_qwen4_tq_attn_mm(tqb);
+        printf("tq rows %u\n", tqb);
+        test_attention_rows_tq(&arena, tqb);
+    }
 #endif
     printf("routed experts\n");
     test_moe(&arena, 16, 10, 2560, 640, 2, 8u);

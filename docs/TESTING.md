@@ -49,6 +49,33 @@ continuations help distinguish sampling changes from graph errors. Server
 traces include cache and tool-parser decisions. Keep traces private when they
 contain real conversations.
 
+## Template parity without a model
+
+`tests/template_parity_ab.py` renders synthetic Qwen scenarios through ds4's C
+renderer (`./ds4_test --qwen-render EFFORT PRESERVE MESSAGES.json [TOOLS.json]`)
+and through one or more Jinja templates given locally, then reports framing
+differences. No model, no transcript, no corpus: scenarios live in the script
+and reference templates are arguments.
+
+```sh
+python3 tests/template_parity_ab.py --template shipped=/tmp/shipped.jinja \
+    --template fixed=/tmp/fixed.jinja --verbose
+```
+
+`--strict` exits non-zero when a scenario diverges from the shipped framing
+differently than recorded in its `expect` field. The gating regression stays in
+`./ds4_test --server`, whose Qwen parity blocks assert the shipped template's
+defect patterns are absent; run them against a deliberately reverted build to
+see them fail first.
+
+Every scenario also reports a `\u` escape-sequence count for ds4 and for each
+reference, and `--strict` fails when they disagree. The templates render tool
+schemas through `tojson`, which decodes whatever spelling the client used and
+writes non-ASCII raw, so these counts must match even in scenarios where framing
+legitimately differs. The `tool-schema-escapes` scenario sends a schema whose
+nested descriptions spell an em dash, a surrogate-pair emoji and a bell on the
+wire, which is the case that used to survive verbatim into the prompt.
+
 ## Tools and source references
 
 - [GGUF conversion and quantization](../gguf-tools/README.md)

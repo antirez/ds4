@@ -48,6 +48,23 @@ For DeepSeek, thinking is on by default. `reasoning_effort=max` selects Think
 Max only with sufficient context; otherwise it falls back to normal thinking.
 `xhigh` maps to normal thinking, not Think Max. Use `think:false`, a disabled
 thinking object, or a non-thinking model alias for direct answers.
+Client aliases `extreme` and `ultracode` map to `xhigh`, `minimal` maps to
+`low`, and `none` or `off` disable thinking.
+
+For Qwen, `preserve_thinking` (or the llama.cpp alias `preserve_reasoning`,
+which wins) controls whether the prompt replays every historical reasoning
+block. It is accepted at the top level and inside `chat_template_kwargs`, and
+defaults to true, which is the shipped template's rendering. With false, the
+template's own window applies: reasoning is rendered only for turns after the
+last real user query, so a running tool loop keeps the chain that produced it
+while earlier loops lose it. Tool outputs never close the window.
+
+Switching the flag changes the prompt, so the first request under the new setting
+starts cold by design. Reuse in general requires the new prompt to extend the one
+already in the session: resending an equal or shorter history reports
+`reason=token-mismatch` even when every token matches, because rewinding the live
+session is implemented for GLM and not for Qwen. Agent loops that only append are
+unaffected.
 
 ## Multiple sessions
 
@@ -142,6 +159,12 @@ part of the prefix.
 `--disable-exact-dsml-tool-replay` disables it for diagnostic comparisons.
 Use `--trace /tmp/ds4-trace.txt` to record prompt rendering, cache decisions,
 generated text, and tool-parser events. Traces can contain sensitive content.
+With tracing on, a request whose client text carries model control tokens gets
+a `--- client control tokens ---` section naming each token and where it first
+appeared: those spellings become real control tokens when the rendered prompt is
+tokenized, so a client replaying its own transcript can hand the model structure
+it never sampled. ds4 records this instead of rewriting it — escaping client text
+would break parity with every reference template and invalidate KV checkpoints.
 
 Cache formats are implementation details. The current header and extension
 definitions are in [ds4_kvstore.h](../ds4_kvstore.h) and

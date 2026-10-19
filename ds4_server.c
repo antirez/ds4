@@ -808,6 +808,8 @@ typedef struct {
     stop_list stops;
     char *raw_body;
     char *prompt_text;
+    /* --trace only: control tokens found inside client-supplied text. */
+    char *client_marker_note;
     tool_schema_orders tool_orders;
     int max_tokens;
     int top_k;
@@ -828,6 +830,13 @@ typedef struct {
     int cache_write_tokens;
     ds4_think_mode think_mode;
     bool has_tools;
+    /* Qwen's chat template keeps every historical reasoning block only while the
+     * client asks for it (preserve_thinking, or its preserve_reasoning alias).
+     * With it false the template renders reasoning only for turns after the last
+     * user query, so reasoning from earlier tool loops drops out.  Default true
+     * keeps the shipped template's bytes.  Other model families have their own
+     * reasoning-retention rule and ignore this. */
+    bool preserve_thinking;
     bool prompt_preserves_reasoning;
     /* For /v1/responses: emit reasoning_summary_* events / fields only when the
      * client opted in via reasoning.summary. Other APIs leave this false; the
@@ -993,6 +1002,7 @@ static void request_init(request *r, req_kind kind, int max_tokens) {
     r->top_p = DS4_DEFAULT_TOP_P;
     r->min_p = DS4_DEFAULT_MIN_P;
     r->think_mode = DS4_THINK_HIGH;
+    r->preserve_thinking = true;
 }
 
 static bool parse_ignore_eos_value(const char **p, request *r) {
@@ -1019,6 +1029,7 @@ static void request_free(request *r) {
     free(r->stops.v);
     free(r->raw_body);
     free(r->prompt_text);
+    free(r->client_marker_note);
     stop_list_clear(&r->responses_live_call_ids);
     free(r->responses_live_call_ids.v);
     free(r->responses_live_suffix_text);
@@ -1040,7 +1051,10 @@ static bool parse_reasoning_effort_name(const char *s, ds4_think_mode *out) {
         *out = DS4_THINK_MAX;
         return true;
     }
-    if (!strcmp(s, "xhigh") || !strcmp(s, "high")) {
+    if (!strcmp(s, "xhigh") || !strcmp(s, "high") ||
+        !strcmp(s, "extreme") || !strcmp(s, "ultracode")) {
+        /* "extreme"/"ultracode" are client aliases for the xhigh instruction;
+         * the official template only names xhigh, so map them onto it. */
         *out = DS4_THINK_HIGH;
         return true;
     }
@@ -1054,7 +1068,7 @@ static bool parse_reasoning_effort_name(const char *s, ds4_think_mode *out) {
         *out = DS4_THINK_LOW;
         return true;
     }
-    if (!strcmp(s, "none")) {
+    if (!strcmp(s, "none") || !strcmp(s, "off")) {
         *out = DS4_THINK_NONE;
         return true;
     }
@@ -1111,10 +1125,15 @@ static bool parse_thinking_control_value(const char **p, bool *thinking_enabled)
     return true;
 }
 
-/* chat_template_kwargs as the Qwen3.8 model card documents them: enable_thinking
- * and reasoning_effort are applied, other keys are ignored */
-static bool parse_chat_template_kwargs(const char **p, bool *thinking_enabled, bool *got_thinking,
-                                       ds4_think_mode *effort) {
+/* chat_template_kwargs as the Qwen3.8 model card documents them: enable_thinking,
+ * reasoning_effort and the reasoning-retention switch are applied, other keys are
+ * ignored.  preserve_reasoning is the llama.cpp --reasoning-preserve alias; it
+ * wins over preserve_thinking whichever order the client sends them in, matching
+ * the template's own precedence. */
+static bool parse_chat_template_kwargs(const char **p, bool *thinking_enabled,
+                                       bool *got_thinking, ds4_think_mode *effort,
+                                       bool *preserve) {
+    bool got_alias = false;
     json_ws(p);
     if (json_lit(p, "null")) return true;
     if (**p != '{') return json_skip_value(p);
@@ -1136,6 +1155,17 @@ static bool parse_chat_template_kwargs(const char **p, bool *thinking_enabled, b
             if (ok) *got_thinking = true;
         } else if (!strcmp(key, "reasoning_effort")) {
             ok = parse_reasoning_effort_value(p, effort);
+        } else if (!strcmp(key, "preserve_reasoning")) {
+            bool v = true;
+            ok = json_bool(p, &v);
+            if (ok) {
+                got_alias = true;
+                if (preserve) *preserve = v;
+            }
+        } else if (!strcmp(key, "preserve_thinking")) {
+            bool v = true;
+            ok = json_bool(p, &v);
+            if (ok && preserve && !got_alias) *preserve = v;
         } else {
             ok = json_skip_value(p);
         }
@@ -1521,6 +1551,7 @@ static void append_raw_json_line(buf *b, const char *json) {
 }
 
 static void json_escape(buf *b, const char *s);
+static void json_recode_value(buf *b, const char *s, size_t n);
 
 static char *openai_function_schema_from_tool(const char *raw) {
     const char *p = raw;
@@ -2709,7 +2740,7 @@ static bool append_glm_tool_schema_json(buf *b, const char *json,
         json_escape(b, arg->key);
         buf_puts(b, ": ");
         if (arg->is_string) json_escape(b, arg->value);
-        else buf_puts(b, arg->value);
+        else json_recode_value(b, arg->value, strlen(arg->value));
         wrote = true;
     }
     buf_putc(b, '}');
@@ -2734,7 +2765,7 @@ static void append_glm_tools_prompt_text(buf *b, const char *tool_schemas) {
         if (!json_raw_value(&p, &raw)) break;
         bool emitted = false;
         if (!append_glm_tool_schema_json(b, raw, &emitted)) {
-            buf_puts(b, raw);
+            json_recode_value(b, raw, strlen(raw));
             emitted = true;
         }
         free(raw);
@@ -3451,7 +3482,7 @@ static void append_qwen_tools_prompt_text(buf *b, const char *tool_schemas) {
         buf inner = {0};
         bool emitted = false;
         if (!append_glm_tool_schema_json(&inner, raw, &emitted)) {
-            buf_puts(&inner, raw);
+            json_recode_value(&inner, raw, strlen(raw));
             emitted = true;
         }
         if (emitted) {
@@ -3506,10 +3537,54 @@ static void append_qwen_tool_result_message(buf *b, const chat_msg *m) {
     append_qwen_tool_response(b, content, strlen(content));
 }
 
+/* A client that replays its own transcript can leave the reasoning block inside
+ * assistant content instead of the reasoning_content field.  The template
+ * extracts it and renders exactly one reasoning pair, so do the same: only a
+ * leading block is reinterpreted, never text in the middle of an answer, which
+ * keeps a client-authored marker from becoming a control token the model never
+ * sampled while leaving the answer bytes untouched. */
+typedef struct {
+    char *content;    /* answer text with any client-side reasoning block removed */
+    char *reasoning;  /* reasoning to render; empty when the turn has none */
+} qwen_assistant_text;
+
+static void split_reasoning_content(const char *text, size_t n,
+                                    char **content_out, char **reasoning_out);
+
+static void qwen_assistant_text_load(const chat_msg *m, qwen_assistant_text *t) {
+    t->content = xstrdup(m && m->content ? m->content : "");
+    t->reasoning = xstrdup(m && m->reasoning ? m->reasoning : "");
+    if (!text_starts_with_think_tag(t->content)) return;
+
+    char *answer = NULL;
+    char *chain = NULL;
+    split_reasoning_content(t->content, strlen(t->content), &answer, &chain);
+    if (!answer) return;
+    free(t->content);
+    t->content = answer;
+    /* An explicit reasoning field wins; the in-content block is dropped either
+     * way so the turn never carries two reasoning bodies. */
+    if (chain && !t->reasoning[0]) {
+        free(t->reasoning);
+        t->reasoning = chain;
+        chain = NULL;
+    }
+    free(chain);
+}
+
+static void qwen_assistant_text_free(qwen_assistant_text *t) {
+    free(t->content);
+    free(t->reasoning);
+    memset(t, 0, sizeof(*t));
+}
+
 static void append_qwen_assistant_message(buf *out, const chat_msg *m,
-                                          const tool_schema_orders *tool_orders) {
-    const char *content = m && m->content ? m->content : "";
-    const char *reasoning = m && m->reasoning ? m->reasoning : "";
+                                          const tool_schema_orders *tool_orders,
+                                          bool keep_reasoning) {
+    qwen_assistant_text text = {0};
+    qwen_assistant_text_load(m, &text);
+    const char *content = text.content;
+    const char *reasoning = text.reasoning;
     const bool has_calls = m && m->calls.len > 0;
     buf body = {0};
     append_trimmed_text(&body, content);
@@ -3522,7 +3597,7 @@ static void append_qwen_assistant_message(buf *out, const chat_msg *m,
         buf_append(&body, end, strlen(end));
     }
     buf_puts(out, "<|im_start|>assistant\n");
-    if (!text_starts_with_think_tag(content)) {
+    if (keep_reasoning && !text_starts_with_think_tag(content)) {
         /* an empty reasoning block is exactly the no-thinking generation prompt */
         buf_puts(out, "<think>\n");
         append_trimmed_text(out, reasoning);
@@ -3535,6 +3610,7 @@ static void append_qwen_assistant_message(buf *out, const chat_msg *m,
     buf_puts(out, body.ptr ? body.ptr : "");
     buf_free(&body);
     append_qwen_tool_calls_text(out, m ? &m->calls : NULL, has_content, tool_orders);
+    qwen_assistant_text_free(&text);
     buf_puts(out, "<|im_end|>\n");
 }
 
@@ -3543,8 +3619,27 @@ static void append_qwen_generation_prompt(buf *out, bool think) {
                         : "<|im_start|>assistant\n<think>\n\n</think>\n\n");
 }
 
+/* The template's reasoning-retention window: reasoning stays rendered for
+ * every turn after the last real user query, so a tool loop keeps the chain
+ * that produced it while earlier loops lose it.  Tool outputs are not queries,
+ * whether they arrive as tool-role messages or as user messages carrying call
+ * ids.  The template's fallback for a history with no real query keeps the
+ * window shut except for the newest turn once the history is long. */
+static int qwen_last_query_index(const chat_msgs *msgs) {
+    int last = msgs ? msgs->len - 1 : -1;
+    for (int i = last; msgs && i >= 0; i--) {
+        const chat_msg *m = &msgs->v[i];
+        if (strcmp(m->role, "user")) continue;
+        if (chat_msg_is_glm_tool_result(m)) continue;
+        return i;
+    }
+    return last > 50 ? last : 0;
+}
+
 static void append_qwen_conversation(buf *out, const chat_msgs *msgs, int start,
-                                     const tool_schema_orders *tool_orders, bool think) {
+                                     const tool_schema_orders *tool_orders, bool think,
+                                     bool preserve_thinking) {
+    const int last_query = qwen_last_query_index(msgs);
     bool pending_assistant = false;
     bool tool_open = false;
     for (int i = start; msgs && i < msgs->len; i++) {
@@ -3567,7 +3662,8 @@ static void append_qwen_conversation(buf *out, const chat_msgs *msgs, int start,
             buf_puts(out, "<|im_end|>\n");
             pending_assistant = true;
         } else if (!strcmp(m->role, "assistant")) {
-            append_qwen_assistant_message(out, m, tool_orders);
+            append_qwen_assistant_message(out, m, tool_orders,
+                                          preserve_thinking || i > last_query);
             pending_assistant = false;
         }
     }
@@ -3578,7 +3674,8 @@ static void append_qwen_conversation(buf *out, const chat_msgs *msgs, int start,
 static char *render_qwen_chat_prompt_text(const chat_msgs *msgs,
                                           const char *tool_schemas,
                                           const tool_schema_orders *tool_orders,
-                                          ds4_think_mode think_mode) {
+                                          ds4_think_mode think_mode,
+                                          bool preserve_thinking) {
     const bool think = ds4_think_mode_enabled(think_mode);
     const char *effort = think ? ds4_qwen4_reasoning_effort_text(think_mode) : NULL;
     const bool have_tools = tool_schemas && tool_schemas[0];
@@ -3609,15 +3706,18 @@ static char *render_qwen_chat_prompt_text(const chat_msgs *msgs,
         buf_puts(&out, "<|im_end|>\n");
     }
     buf_free(&system);
-    append_qwen_conversation(&out, msgs, 0, tool_orders, think);
+    append_qwen_conversation(&out, msgs, 0, tool_orders, think, preserve_thinking);
     return buf_take(&out);
 }
 
-static char *render_chat_prompt_text_for_syntax(server_model_syntax syntax,
+/* preserve_thinking is a Qwen template switch; the other families decide
+ * reasoning retention from tool context inside their own renderers. */
+static char *render_chat_prompt_text_preserving(server_model_syntax syntax,
                                                 const chat_msgs *msgs,
                                                 const char *tool_schemas,
                                                 const tool_schema_orders *tool_orders,
-                                                ds4_think_mode think_mode) {
+                                                ds4_think_mode think_mode,
+                                                bool preserve_thinking) {
     if (syntax == SERVER_MODEL_SYNTAX_GLM) {
         return render_glm_chat_prompt_text(msgs, tool_schemas,
                                            tool_orders, think_mode);
@@ -3625,10 +3725,21 @@ static char *render_chat_prompt_text_for_syntax(server_model_syntax syntax,
     if (syntax == SERVER_MODEL_SYNTAX_DEEPSEEK41)
         return render_deepseek41_chat(msgs, 0, tool_schemas, think_mode, false);
     if (syntax == SERVER_MODEL_SYNTAX_QWEN) {
-        return render_qwen_chat_prompt_text(msgs, tool_schemas, tool_orders, think_mode);
+        return render_qwen_chat_prompt_text(msgs, tool_schemas, tool_orders,
+                                            think_mode, preserve_thinking);
     }
     return render_deepseek_chat_prompt_text(msgs, tool_schemas,
                                             tool_orders, think_mode);
+}
+
+/* The shipped template's retention default: every reasoning block is kept. */
+static char *render_chat_prompt_text_for_syntax(server_model_syntax syntax,
+                                                const chat_msgs *msgs,
+                                                const char *tool_schemas,
+                                                const tool_schema_orders *tool_orders,
+                                                ds4_think_mode think_mode) {
+    return render_chat_prompt_text_preserving(syntax, msgs, tool_schemas,
+                                              tool_orders, think_mode, true);
 }
 
 static DS4_SERVER_MAYBE_UNUSED char *render_chat_prompt_text(
@@ -3836,7 +3947,10 @@ static char *render_qwen_live_tool_tail(const chat_msgs *msgs, int start,
                                         ds4_think_mode think_mode) {
     buf out = {0};
     buf_puts(&out, "<|im_end|>\n");
-    append_qwen_conversation(&out, msgs, start, tool_orders, ds4_think_mode_enabled(think_mode));
+    /* A live tail only ever renders the turns after the checkpoint frontier,
+     * which are inside the current tool loop, so their reasoning is kept. */
+    append_qwen_conversation(&out, msgs, start, tool_orders,
+                             ds4_think_mode_enabled(think_mode), true);
     return buf_take(&out);
 }
 
@@ -4096,6 +4210,87 @@ static void anthropic_prepare_live_continuation(server *s, request *r,
  * fields that affect model semantics, rendering, streaming, or cache keys, and
  * skip extension fields.  The output is always a rendered DS4 chat/completion
  * prompt plus the small amount of protocol state needed to translate the reply. */
+static bool server_tracing(server *s);
+
+/* --trace only: report model control tokens that arrive inside client text.
+ *
+ * No engine in the Qwen lineage escapes these, and ds4's rendered-chat
+ * tokenizer promotes any marker spelling in the rendered text into a real
+ * control token, so a client that replays a transcript can hand the model
+ * structure it never sampled.  Rewriting those bytes would break parity with
+ * every reference template and invalidate KV checkpoints, so the renderer
+ * leaves them alone and the trace records what happened instead. */
+static void note_client_control_tokens(request *r, const chat_msgs *msgs) {
+    static const struct {
+        const char *name;
+        const char *text;
+    } tokens[] = {
+        { "im-start", "<|im_start|>" },
+        { "im-end", "<|im_end|>" },
+        { "doc-end", "<|endoftext|>" },
+        { "think-open", "<think>" },
+        { "think-close", "</think>" },
+        { "tool-call-open", "<tool_call>" },
+        { "tool-call-close", "</tool_call>" },
+        { "tool-response-open", "<tool_response>" },
+        { "tool-response-close", "<&lt;/tool_response>" },
+        { "tool-result-open", "<tool_result>" },
+        { "tool-result-close", "</tool_result>" },
+        { "dsml", "｜DSML｜" },
+        { "user-role", "<｜User｜>" },
+        { "assistant-role", "<｜Assistant｜>" },
+        { "system-role", "<｜System｜>" },
+        { "glm-user", "<|user|>" },
+        { "glm-assistant", "<|assistant|>" },
+        { "glm-system", "<|system|>" },
+        { "glm-observation", "<|observation|>" },
+        { "gmask", "<gMASK>" },
+
+    };
+    size_t counts[sizeof(tokens) / sizeof(tokens[0])];
+    for (size_t i = 0; i < sizeof(counts) / sizeof(counts[0]); i++) counts[i] = 0;
+    const char *first_role = NULL;
+
+    for (int i = 0; msgs && i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        const char *fields[2] = { m->content, m->reasoning };
+        for (size_t f = 0; f < 2; f++) {
+            const char *text = fields[f] ? fields[f] : "";
+            for (size_t k = 0; k < sizeof(tokens) / sizeof(tokens[0]); k++) {
+                size_t hits = 0;
+                for (const char *p = text; (p = strstr(p, tokens[k].text)) != NULL;
+                     p += strlen(tokens[k].text)) hits++;
+                if (!hits) continue;
+                counts[k] += hits;
+                if (!first_role) first_role = m->role ? m->role : "?";
+            }
+        }
+    }
+
+    buf out = {0};
+    for (size_t k = 0; k < sizeof(tokens) / sizeof(tokens[0]); k++) {
+        if (!counts[k]) continue;
+        if (out.len) buf_puts(&out, ", ");
+        buf_puts(&out, tokens[k].name);
+        char tail[64];
+        snprintf(tail, sizeof(tail), " x%zu", counts[k]);
+        buf_puts(&out, tail);
+    }
+    if (!out.len) {
+        buf_free(&out);
+        return;
+    }
+    char *found = buf_take(&out);
+    buf note = {0};
+    buf_puts(&note, "promoted to control tokens at tokenize time: ");
+    buf_puts(&note, found);
+    char tail[96];
+    snprintf(tail, sizeof(tail), " (first seen in role %s)", first_role ? first_role : "?");
+    buf_puts(&note, tail);
+    free(found);
+    r->client_marker_note = buf_take(&note);
+}
+
 static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int def_tokens,
                                int ctx_size, request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
@@ -4105,6 +4300,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     bool tool_choice_none = false;
     bool got_thinking = false;
     bool thinking_enabled = true;
+    bool got_preserve_alias = false;
     ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
     chat_msgs msgs = {0};
     char *tool_schemas = NULL;
@@ -4224,8 +4420,24 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                 free(key);
                 goto bad;
             }
+        } else if (!strcmp(key, "preserve_thinking") ||
+                   !strcmp(key, "preserve_reasoning")) {
+            /* Top-level retention switch.  preserve_reasoning is the llama.cpp
+             * alias and wins inside this channel; chat_template_kwargs remains
+             * the template-authoritative channel and overrides both. */
+            bool v = true;
+            const bool alias = !strcmp(key, "preserve_reasoning");
+            if (!json_bool(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            if (alias || !got_preserve_alias) {
+                r->preserve_thinking = v;
+                if (alias) got_preserve_alias = true;
+            }
         } else if (!strcmp(key, "chat_template_kwargs")) {
-            if (!parse_chat_template_kwargs(&p, &thinking_enabled, &got_thinking, &reasoning_effort)) {
+            if (!parse_chat_template_kwargs(&p, &thinking_enabled, &got_thinking,
+                                            &reasoning_effort, &r->preserve_thinking)) {
                 free(key);
                 goto bad;
             }
@@ -4273,9 +4485,10 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
-    r->prompt_text = render_chat_prompt_text_for_syntax(
+    r->prompt_text = render_chat_prompt_text_preserving(
         r->model_syntax, &msgs, active_tool_schemas,
-        &r->tool_orders, r->think_mode);
+        &r->tool_orders, r->think_mode, r->preserve_thinking);
+    if (server_tracing(s)) note_client_control_tokens(r, &msgs);
     if (!request_tokenize_multimodal_prompt(e, s, r, &msgs, err, errlen)) {
         chat_msgs_free(&msgs);
         free(tool_schemas);
@@ -5801,6 +6014,126 @@ static void json_escape_n(buf *b, const char *s, size_t n) {
     char *tmp = xstrndup(s ? s : "", n);
     json_escape(b, tmp);
     free(tmp);
+}
+
+/* JSON text that arrives on the wire reaches a prompt two ways: parsed strings
+ * go through json_escape, which writes UTF-8 bytes as-is, and nested values are
+ * copied verbatim, which keeps whatever escape spelling the client happened to
+ * choose.  The reference templates render the whole schema through tojson, so
+ * every string is decoded and re-encoded with ensure_ascii=False.  Recode
+ * verbatim values the same way: decoded non-ASCII stays raw, control characters
+ * keep the json_escape spelling, and structure, key order and spacing are
+ * untouched. */
+static int json_hex4(const char *s, unsigned *out) {
+    unsigned v = 0;
+    for (int i = 0; i < 4; i++) {
+        char c = s[i];
+        unsigned d;
+        if (c >= '0' && c <= '9') d = (unsigned)(c - '0');
+        else if (c >= 'a' && c <= 'f') d = (unsigned)(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') d = (unsigned)(c - 'A' + 10);
+        else return 0;
+        v = (v << 4) | d;
+    }
+    *out = v;
+    return 1;
+}
+
+static void json_put_utf8(buf *b, unsigned cp) {
+    if (cp < 0x80) {
+        buf_putc(b, (char)cp);
+    } else if (cp < 0x800) {
+        buf_putc(b, (char)(0xC0 | (cp >> 6)));
+        buf_putc(b, (char)(0x80 | (cp & 0x3F)));
+    } else if (cp < 0x10000) {
+        buf_putc(b, (char)(0xE0 | (cp >> 12)));
+        buf_putc(b, (char)(0x80 | ((cp >> 6) & 0x3F)));
+        buf_putc(b, (char)(0x80 | (cp & 0x3F)));
+    } else {
+        buf_putc(b, (char)(0xF0 | (cp >> 18)));
+        buf_putc(b, (char)(0x80 | ((cp >> 12) & 0x3F)));
+        buf_putc(b, (char)(0x80 | ((cp >> 6) & 0x3F)));
+        buf_putc(b, (char)(0x80 | (cp & 0x3F)));
+    }
+}
+
+static void json_escape_codepoint(buf *b, unsigned cp) {
+    if (cp == '"' || cp == '\\') {
+        buf_putc(b, '\\');
+        buf_putc(b, (char)cp);
+    } else if (cp == '\n') {
+        buf_puts(b, "\\n");
+    } else if (cp == '\r') {
+        buf_puts(b, "\\r");
+    } else if (cp == '\t') {
+        buf_puts(b, "\\t");
+    } else if (cp < 0x20) {
+        buf_printf(b, "\\u%04x", cp);
+    } else if (cp >= 0x7F && cp <= 0x10FFFF &&
+               !(cp >= 0xD800 && cp <= 0xDFFF)) {
+        json_put_utf8(b, cp);
+    } else {
+        buf_printf(b, "\\u%04x", cp);
+    }
+}
+
+static void json_recode_value(buf *b, const char *s, size_t n) {
+    bool in_string = false;
+    if (!s) return;
+    for (size_t i = 0; i < n; i++) {
+        char c = s[i];
+        if (!in_string) {
+            if (c == '"') in_string = true;
+            buf_putc(b, c);
+            continue;
+        }
+        if (c == '"') {
+            in_string = false;
+            buf_putc(b, c);
+            continue;
+        }
+        if (c != '\\') {
+            buf_putc(b, c);
+            continue;
+        }
+        if (i + 1 >= n) {
+            buf_puts(b, "\\\\");
+            break;
+        }
+        char e = s[++i];
+        if (e == 'u') {
+            unsigned cp = 0;
+            if (i + 4 < n && json_hex4(s + i + 1, &cp)) {
+                i += 4;
+                if (cp >= 0xD800 && cp <= 0xDBFF && i + 6 < n &&
+                    s[i + 1] == '\\' && s[i + 2] == 'u') {
+                    unsigned low = 0;
+                    if (json_hex4(s + i + 3, &low) && low >= 0xDC00 && low <= 0xDFFF) {
+                        cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
+                        i += 6;
+                    }
+                }
+                json_escape_codepoint(b, cp);
+            } else {
+                buf_puts(b, "\\u");
+            }
+            continue;
+        }
+        switch (e) {
+            case 'b': json_escape_codepoint(b, 0x08); break;
+            case 'f': json_escape_codepoint(b, 0x0C); break;
+            case 'n': json_escape_codepoint(b, '\n'); break;
+            case 'r': json_escape_codepoint(b, '\r'); break;
+            case 't': json_escape_codepoint(b, '\t'); break;
+            case '"': json_escape_codepoint(b, '"'); break;
+            case '\\': json_escape_codepoint(b, '\\'); break;
+            case '/': json_escape_codepoint(b, '/'); break;
+            default:
+                buf_putc(b, '\\');
+                buf_putc(b, e);
+                break;
+        }
+    }
 }
 
 static void json_escape_fragment_n(buf *b, const char *s, size_t n) {
@@ -11841,6 +12174,10 @@ static const char *trace_cache_miss_reason(const trace_cache_diag *d) {
     return "live-prefix-match";
 }
 
+static bool server_tracing(server *s) {
+    return s && s->trace != NULL;
+}
+
 static bool trace_cache_memory_reusable(const trace_cache_diag *d) {
     return d && d->valid &&
            (d->rewind_to >= 0 ||
@@ -12013,6 +12350,11 @@ static uint64_t trace_begin(
         if (!j->req.prompt_text[0] || j->req.prompt_text[strlen(j->req.prompt_text) - 1] != '\n') {
             fputc('\n', s->trace);
         }
+    }
+    if (j->req.client_marker_note) {
+        fputs("\n--- client control tokens ---\n", s->trace);
+        fputs(j->req.client_marker_note, s->trace);
+        fputc('\n', s->trace);
     }
     fputs("\n--- generated text ---\n", s->trace);
     fflush(s->trace);
@@ -18393,6 +18735,211 @@ static void test_render_chat_prompt_text_renders_tools_before_system(void) {
     chat_msgs_free(&msgs);
 }
 
+
+
+/* Synthetic scenarios only: both template generations copy message bytes
+ * verbatim, so the difference is framing, and framing is testable without model
+ * weights or private transcripts.  Each block asserts the shipped template's
+ * defect pattern is absent, not merely that the fixed bytes are present. */
+static void chat_msg_push_text(chat_msgs *msgs, const char *role, const char *content,
+                               const char *reasoning) {
+    chat_msg m = {0};
+    m.role = xstrdup(role);
+    m.content = xstrdup(content ? content : "");
+    m.reasoning = reasoning ? xstrdup(reasoning) : NULL;
+    chat_msgs_push(msgs, m);
+}
+
+static int qwen_marker_count(const char *text, const char *marker) {
+    int n = 0;
+    size_t len = strlen(marker);
+    for (const char *p = text; (p = strstr(p, marker)) != NULL; p += len) n++;
+    return n;
+}
+
+static void test_render_qwen_reasoning_parity(void) {
+    char buf[512];
+
+    /* 1. A client replaying its transcript leaves the reasoning block inside
+     * content in its own spacing.  Defect: those bytes pass through and become
+     * control tokens the model never sampled.  Fixed: the template's canonical
+     * framing, written once by the renderer. */
+    chat_msgs inlined = {0};
+    chat_msg_push_text(&inlined, "user", "Explain", NULL);
+    const char *client_block = "<think>" "hidden chain" "</think>" " Visible answer";
+    chat_msg_push_text(&inlined, "assistant", client_block, NULL);
+    char *fixed = render_chat_prompt_text_for_syntax(SERVER_MODEL_SYNTAX_QWEN, &inlined,
+                                                     NULL, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(fixed != NULL);
+    TEST_ASSERT(!strstr(fixed, client_block));
+    TEST_ASSERT(strstr(fixed, "hidden chain") && strstr(fixed, "Visible answer"));
+    TEST_ASSERT(strstr(fixed, "<think>" "\nhidden chain\n" "</think>" "\n\nVisible answer") != NULL);
+    TEST_ASSERT(qwen_marker_count(fixed, "<think>") == 1);
+    TEST_ASSERT(qwen_marker_count(fixed, "</think>") == 1);
+    free(fixed);
+    chat_msgs_free(&inlined);
+
+    /* 2. A non-thinking echo arrives as content opening with the closing
+     * marker.  Defect: that lone closer is written with nothing opening it.
+     * Fixed: the empty pair the template uses for a non-thinking turn. */
+    chat_msgs echo = {0};
+    chat_msg_push_text(&echo, "user", "Next", NULL);
+    snprintf(buf, sizeof(buf), "%s\n\nAnswer only", "</think>");
+    chat_msg_push_text(&echo, "assistant", buf, NULL);
+    char *echoed = render_chat_prompt_text_for_syntax(SERVER_MODEL_SYNTAX_QWEN, &echo,
+                                                      NULL, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(echoed != NULL);
+    TEST_ASSERT(qwen_marker_count(echoed, "<think>") == 1 && qwen_marker_count(echoed, "</think>") == 1);
+    TEST_ASSERT(strstr(echoed, "<|im_start|>assistant\n<think>\n\n</think>\n\nAnswer only") != NULL);
+    free(echoed);
+    chat_msgs_free(&echo);
+
+    /* 3. Both channels populated.  Defect: the turn carries two reasoning
+     * bodies.  Fixed: the explicit field wins and the block is dropped. */
+    chat_msgs dup = {0};
+    chat_msg_push_text(&dup, "user", "Again", NULL);
+    snprintf(buf, sizeof(buf), "%s\nduplicate chain\n%s\n\nVisible", "<think>", "</think>");
+    chat_msg_push_text(&dup, "assistant", buf, "real chain");
+    char *deduped = render_chat_prompt_text_for_syntax(SERVER_MODEL_SYNTAX_QWEN, &dup,
+                                                       NULL, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(deduped != NULL);
+    TEST_ASSERT(strstr(deduped, "real chain"));
+    TEST_ASSERT(!strstr(deduped, "duplicate chain"));
+    free(deduped);
+    chat_msgs_free(&dup);
+
+    /* 4. A quoted block inside an answer is ordinary text and must survive. */
+    chat_msgs quoted = {0};
+    chat_msg_push_text(&quoted, "user", "Quote it", NULL);
+    snprintf(buf, sizeof(buf), "Before %sinner%s after", "<think>", "</think>");
+    chat_msg_push_text(&quoted, "assistant", buf, "quoted chain");
+    char *kept = render_chat_prompt_text_for_syntax(SERVER_MODEL_SYNTAX_QWEN, &quoted,
+                                                    NULL, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(kept != NULL);
+    TEST_ASSERT(strstr(kept, "quoted chain"));
+    TEST_ASSERT(strstr(kept, buf));
+    free(kept);
+    chat_msgs_free(&quoted);
+
+    /* 5. Retention.  The shipped bytes stay the default; opting out keeps only
+     * the turns after the last real query. */
+    chat_msgs history = {0};
+    chat_msg_push_text(&history, "user", "Hello", NULL);
+    chat_msg_push_text(&history, "assistant", "Hi.", "stale chain");
+    chat_msg_push_text(&history, "user", "Do the task", NULL);
+    chat_msg_push_text(&history, "assistant", "Working.", "live chain");
+    char *archive = render_chat_prompt_text_for_syntax(SERVER_MODEL_SYNTAX_QWEN,
+                                                       &history, NULL, NULL,
+                                                       DS4_THINK_HIGH);
+    char *windowed = render_chat_prompt_text_preserving(
+        SERVER_MODEL_SYNTAX_QWEN, &history, NULL, NULL, DS4_THINK_HIGH, false);
+    TEST_ASSERT(archive && windowed);
+    TEST_ASSERT(strstr(archive, "stale chain") && strstr(archive, "live chain"));
+    TEST_ASSERT(!strstr(windowed, "stale chain"));
+    TEST_ASSERT(strstr(windowed, "live chain"));
+    /* the dropped turn keeps its answer bytes; only the block goes */
+    TEST_ASSERT(strstr(windowed, "<|im_start|>assistant\nHi.") != NULL);
+    free(archive);
+    free(windowed);
+    chat_msgs_free(&history);
+
+    /* 6. Tool outputs never close the window: the loop keeps the chain that
+     * produced the call even with retention off. */
+    chat_msgs loop = {0};
+    chat_msg_push_text(&loop, "user", "Start", NULL);
+    chat_msg_push_text(&loop, "assistant", "", "loop chain");
+    chat_msg_push_text(&loop, "tool", "tool output", NULL);
+    char *looped = render_chat_prompt_text_preserving(
+        SERVER_MODEL_SYNTAX_QWEN, &loop, NULL, NULL, DS4_THINK_HIGH, false);
+    TEST_ASSERT(looped != NULL);
+    TEST_ASSERT(strstr(looped, "loop chain"));
+    free(looped);
+    chat_msgs_free(&loop);
+
+    /* 7. Non-thinking turns never leak a stale block: with thinking off the
+     * generation prompt carries the template's empty pair. */
+    chat_msgs off = {0};
+    chat_msg_push_text(&off, "user", "Be brief", NULL);
+    char *suppressed = render_chat_prompt_text_for_syntax(SERVER_MODEL_SYNTAX_QWEN,
+                                                          &off, NULL, NULL,
+                                                          DS4_THINK_NONE);
+    TEST_ASSERT(suppressed != NULL);
+    TEST_ASSERT(strstr(suppressed, "<|im_start|>assistant\n<think>\n\n</think>\n\n") != NULL);
+    TEST_ASSERT(qwen_marker_count(suppressed, "<think>") == 1);
+    free(suppressed);
+    chat_msgs_free(&off);
+}
+
+/* Tool schemas reach the prompt as JSON text, and the client may spell a
+ * character either way.  The templates render the schema through tojson, which
+ * decodes every string and writes non-ASCII raw, so the wire's escape spelling
+ * must not survive.  Defect: nested values were copied verbatim, so a client
+ * sending \u2014 in a property description produced six characters where the
+ * model was trained to see one.  Control characters still take the json_escape
+ * spelling, and structure, key order and spacing are untouched. */
+static void test_render_qwen_tool_schema_escapes(void) {
+    const char *tools = "[{\"type\":\"function\",\"function\":{\"name\":\"search\","
+        "\"description\":\"directory to search \\u2014 one path\","
+        "\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":"
+        "{\"type\":\"string\",\"description\":\"glob \\u2014 or a list \\ud83d\\ude00 and \\u0007 a bell\"}},"
+        "\"required\":[\"path\"]}}}]";
+    const char *p = tools;
+    char *schemas = NULL;
+    tool_schema_orders orders = {0};
+    TEST_ASSERT(parse_tools_value(&p, &schemas, &orders));
+
+    chat_msgs msgs = {0};
+    chat_msg_push_text(&msgs, "user", "Find it", NULL);
+    char *text = render_chat_prompt_text_for_syntax(SERVER_MODEL_SYNTAX_QWEN, &msgs,
+                                                    schemas, &orders, DS4_THINK_HIGH);
+    TEST_ASSERT(text != NULL);
+    const char em[] = { (char)0xE2, (char)0x80, (char)0x94, 0 };
+    const char emoji[] = { (char)0xF0, (char)0x9F, (char)0x98, (char)0x80, 0 };
+    TEST_ASSERT(strstr(text, "\\u2014") == NULL);
+    TEST_ASSERT(strstr(text, "\\ud83d") == NULL);
+    TEST_ASSERT(strstr(text, em) != NULL);
+    TEST_ASSERT(strstr(text, emoji) != NULL);
+    TEST_ASSERT(strstr(text, "\\u0007") != NULL);
+    TEST_ASSERT(strstr(text, "\"type\":\"string\"") != NULL ||
+                strstr(text, "\"type\": \"string\"") != NULL);
+    free(text);
+    free(schemas);
+    chat_msgs_free(&msgs);
+    tool_schema_orders_free(&orders);
+}
+
+static void test_note_client_control_tokens(void) {
+    /* Detection is observational: it reports the hazard and never edits the
+     * prompt bytes, so KV keys and template parity both stay intact. */
+    request r = {0};
+    request_init(&r, REQ_CHAT, 128);
+    chat_msgs msgs = {0};
+    chat_msg_push_text(&msgs, "user", "<think>\nquoted chain</think> plain text", NULL);
+    char *before = render_chat_prompt_text_for_syntax(SERVER_MODEL_SYNTAX_QWEN, &msgs,
+                                                      NULL, NULL, DS4_THINK_HIGH);
+    note_client_control_tokens(&r, &msgs);
+    char *after = render_chat_prompt_text_for_syntax(SERVER_MODEL_SYNTAX_QWEN, &msgs,
+                                                     NULL, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(r.client_marker_note != NULL);
+    TEST_ASSERT(strstr(r.client_marker_note, "think-open") != NULL);
+    TEST_ASSERT(strstr(r.client_marker_note, "think-close") != NULL);
+    TEST_ASSERT(strstr(r.client_marker_note, "role user") != NULL);
+    TEST_ASSERT(before && after && !strcmp(before, after));
+    free(r.client_marker_note);
+    r.client_marker_note = NULL;
+
+    chat_msgs clean = {0};
+    chat_msg_push_text(&clean, "user", "plain question, no markup", NULL);
+    note_client_control_tokens(&r, &clean);
+    TEST_ASSERT(r.client_marker_note == NULL);
+
+    free(before);
+    free(after);
+    chat_msgs_free(&msgs);
+    chat_msgs_free(&clean);
+    request_free(&r);
+}
+
 static void test_render_qwen_chat_prompt_text(void) {
     chat_msgs msgs = {0};
     chat_msg sys = {0};
@@ -18436,14 +18983,33 @@ static void test_render_qwen_chat_prompt_text(void) {
 }
 
 static void test_qwen_reasoning_effort_levels(void) {
-    bool enabled = true, got = false;
+    bool enabled = true, got = false, preserve = true;
     ds4_think_mode mode = DS4_THINK_HIGH;
     const char *kwargs = "{\"enable_thinking\": false, \"reasoning_effort\": \"low\", \"preserve_thinking\": true}";
-    TEST_ASSERT(parse_chat_template_kwargs(&kwargs, &enabled, &got, &mode));
-    TEST_ASSERT(!enabled && got && mode == DS4_THINK_LOW);
+    TEST_ASSERT(parse_chat_template_kwargs(&kwargs, &enabled, &got, &mode, &preserve));
+    TEST_ASSERT(!enabled && got && mode == DS4_THINK_LOW && preserve);
     kwargs = "null";
-    TEST_ASSERT(parse_chat_template_kwargs(&kwargs, &enabled, &got, &mode));
-    TEST_ASSERT(!enabled && mode == DS4_THINK_LOW);
+    TEST_ASSERT(parse_chat_template_kwargs(&kwargs, &enabled, &got, &mode, &preserve));
+    TEST_ASSERT(!enabled && mode == DS4_THINK_LOW && preserve);
+
+    /* Retention is opt-out, and the llama.cpp alias wins in either order. */
+    kwargs = "{\"preserve_thinking\": false}";
+    TEST_ASSERT(parse_chat_template_kwargs(&kwargs, &enabled, &got, &mode, &preserve));
+    TEST_ASSERT(!preserve);
+    kwargs = "{\"preserve_thinking\": false, \"preserve_reasoning\": true}";
+    TEST_ASSERT(parse_chat_template_kwargs(&kwargs, &enabled, &got, &mode, &preserve));
+    TEST_ASSERT(preserve);
+    kwargs = "{\"preserve_reasoning\": false, \"preserve_thinking\": true}";
+    TEST_ASSERT(parse_chat_template_kwargs(&kwargs, &enabled, &got, &mode, &preserve));
+    TEST_ASSERT(!preserve);
+
+    /* Client effort aliases land on the levels the template actually names. */
+    const char *alias = "\"ultracode\"";
+    TEST_ASSERT(parse_reasoning_effort_value(&alias, &mode) && mode == DS4_THINK_HIGH);
+    alias = "\"extreme\"";
+    TEST_ASSERT(parse_reasoning_effort_value(&alias, &mode) && mode == DS4_THINK_HIGH);
+    alias = "\"off\"";
+    TEST_ASSERT(parse_reasoning_effort_value(&alias, &mode) && mode == DS4_THINK_NONE);
 
     chat_msgs msgs = {0};
     chat_msg user = {0};
@@ -18476,7 +19042,7 @@ static void test_qwen_tool_visible_checkpoint_boundary(void) {
             r.kind = REQ_CHAT;
             r.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
             r.think_mode = thinking ? DS4_THINK_HIGH : DS4_THINK_NONE;
-            r.prompt_text = render_qwen_chat_prompt_text(&msgs, NULL, NULL, r.think_mode);
+            r.prompt_text = render_qwen_chat_prompt_text(&msgs, NULL, NULL, r.think_mode, true);
             chat_msg assistant = {0};
             assistant.role = xstrdup("assistant");
             assistant.content = xstrdup(with_content ? "Running." : "");
@@ -18505,7 +19071,7 @@ static void test_qwen_tool_visible_checkpoint_boundary(void) {
             tool.role = xstrdup("tool");
             tool.content = xstrdup("ok");
             chat_msgs_push(&msgs, tool);
-            char *next = render_qwen_chat_prompt_text(&msgs, NULL, NULL, r.think_mode);
+            char *next = render_qwen_chat_prompt_text(&msgs, NULL, NULL, r.think_mode, true);
             TEST_ASSERT(visible && !strncmp(next, visible, strlen(visible)));
             if (visible && !strncmp(next, visible, strlen(visible))) {
                 /* The live frontier ends at the sampled tool block. The new
@@ -18516,7 +19082,7 @@ static void test_qwen_tool_visible_checkpoint_boundary(void) {
             }
             if (thinking) {
                 msgs.v[1].reasoning = xstrdup("hidden reasoning");
-                char *with_reasoning = render_qwen_chat_prompt_text(&msgs, NULL, NULL, r.think_mode);
+                char *with_reasoning = render_qwen_chat_prompt_text(&msgs, NULL, NULL, r.think_mode, true);
                 TEST_ASSERT(visible && strncmp(with_reasoning, visible, strlen(visible)) != 0);
                 free(with_reasoning);
             }
@@ -18770,19 +19336,19 @@ static void test_qwen_thinking_visible_text_matches_render(void) {
         free(future);
         /* Echoed or edited history must not match the reasoning-free alias. */
         history.v[1].reasoning = xstrdup("2 plus 2 is 4.");
-        future = render_qwen_chat_prompt_text(&history, schemas[i], NULL, DS4_THINK_HIGH);
+        future = render_qwen_chat_prompt_text(&history, schemas[i], NULL, DS4_THINK_HIGH, true);
         TEST_ASSERT(strncmp(future, visible, strlen(visible)) != 0);
         free(future);
         free(history.v[1].reasoning);
         history.v[1].reasoning = NULL;
         free(history.v[1].content);
         history.v[1].content = xstrdup("An edited answer.");
-        future = render_qwen_chat_prompt_text(&history, schemas[i], NULL, DS4_THINK_HIGH);
+        future = render_qwen_chat_prompt_text(&history, schemas[i], NULL, DS4_THINK_HIGH, true);
         TEST_ASSERT(strncmp(future, visible, strlen(visible)) != 0);
         free(future);
         free(history.v[1].content);
         history.v[1].content = xstrdup("The answer is 4.");
-        future = render_qwen_chat_prompt_text(&history, "{\"name\":\"different_tool\"}", NULL, DS4_THINK_HIGH);
+        future = render_qwen_chat_prompt_text(&history, "{\"name\":\"different_tool\"}", NULL, DS4_THINK_HIGH, true);
         TEST_ASSERT(strncmp(future, visible, strlen(visible)) != 0);
         free(future);
         free(visible);
@@ -18886,7 +19452,7 @@ static void test_qwen_sampled_tool_text_after_think_renders_exactly(void) {
     buf_puts(&expected, block);
     buf_puts(&expected, "<|im_end|>\n");
     buf out = {0};
-    append_qwen_assistant_message(&out, &asst, NULL);
+    append_qwen_assistant_message(&out, &asst, NULL, true);
     TEST_ASSERT(out.ptr && !strcmp(out.ptr, expected.ptr));
     buf_free(&out);
     buf_free(&expected);
@@ -18901,7 +19467,7 @@ static void test_qwen_sampled_tool_text_after_think_renders_exactly(void) {
     buf_puts(&expected, "<|im_start|>assistant\n<think>\n\n</think>\n\n");
     buf_puts(&expected, block);
     buf_puts(&expected, "<|im_end|>\n");
-    append_qwen_assistant_message(&out, &plain, NULL);
+    append_qwen_assistant_message(&out, &plain, NULL, true);
     TEST_ASSERT(out.ptr && !strcmp(out.ptr, expected.ptr));
     buf_free(&out);
     buf_free(&expected);
@@ -18937,7 +19503,7 @@ static void test_qwen_plain_answer_keeps_trailing_whitespace(void) {
     plain.role = xstrdup("assistant");
     plain.content = xstrdup("Done.\n");
     buf out = {0};
-    append_qwen_assistant_message(&out, &plain, NULL);
+    append_qwen_assistant_message(&out, &plain, NULL, true);
     TEST_ASSERT(out.ptr && !strcmp(out.ptr, "<|im_start|>assistant\n<think>\n\n</think>\n\nDone.\n<|im_end|>\n"));
     buf_free(&out);
     chat_msg_free(&plain);
@@ -18949,7 +19515,7 @@ static void test_qwen_plain_answer_keeps_trailing_whitespace(void) {
     tc.name = xstrdup("bash");
     tc.arguments = xstrdup("{\"command\": \"ls\"}");
     tool_calls_push(&with_call.calls, tc);
-    append_qwen_assistant_message(&out, &with_call, NULL);
+    append_qwen_assistant_message(&out, &with_call, NULL, true);
     TEST_ASSERT(out.ptr && !strcmp(out.ptr,
         "<|im_start|>assistant\n<think>\n\n</think>\n\nLook:\n\n<tool_call>\n<function=bash>\n"
         "<parameter=command>\nls\n</parameter>\n</function>\n</tool_call><|im_end|>\n"));
@@ -22959,6 +23525,9 @@ static void ds4_server_unit_tests_run(void) {
     test_render_chat_prompt_text_renders_tools_before_system();
     test_render_glm_chat_prompt_text();
     test_render_qwen_chat_prompt_text();
+    test_render_qwen_reasoning_parity();
+    test_render_qwen_tool_schema_escapes();
+    test_note_client_control_tokens();
     test_render_qwen_tool_round_trip();
     test_qwen_tool_visible_checkpoint_boundary();
     test_qwen_decode_tracker_markers();

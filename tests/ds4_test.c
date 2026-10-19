@@ -7408,6 +7408,46 @@ static void test_run_entry(const ds4_test_entry *entry) {
 }
 
 int main(int argc, char **argv) {
+    if (argc >= 5 && !strcmp(argv[1], "--qwen-render")) {
+        /* Model-free prompt dump for the template A/B harness:
+         *   ./ds4_test --qwen-render EFFORT PRESERVE MESSAGES.json [TOOLS.json]
+         * Prints the rendered prompt so a driver can diff it against a Jinja
+         * reference renderer over the same synthetic body. */
+        ds4_think_mode mode = DS4_THINK_HIGH;
+        if (!parse_reasoning_effort_name(argv[2], &mode)) return 2;
+        const bool preserve = !strcmp(argv[3], "true");
+        char *body = test_read_file(argv[4]);
+        if (!body) return 2;
+        char *tools = argc > 5 && strcmp(argv[5], "-") ? test_read_file(argv[5]) : NULL;
+        char *tool_schemas = NULL;
+        tool_schema_orders orders = {0};
+        if (tools) {
+            const char *tjson = tools;
+            if (!parse_tools_value(&tjson, &tool_schemas, &orders)) {
+                free(tools);
+                return 2;
+            }
+        }
+        const char *json = body;
+        chat_msgs msgs = {0};
+        if (!parse_messages(&json, &msgs)) {
+            free(body);
+            free(tools);
+            free(tool_schemas);
+            tool_schema_orders_free(&orders);
+            return 2;
+        }
+        char *text = render_chat_prompt_text_preserving(
+            SERVER_MODEL_SYNTAX_QWEN, &msgs, tool_schemas, &orders, mode, preserve);
+        fputs(text ? text : "", stdout);
+        free(text);
+        chat_msgs_free(&msgs);
+        free(body);
+        free(tools);
+        free(tool_schemas);
+        tool_schema_orders_free(&orders);
+        return 0;
+    }
     if (argc == 4 && (!strcmp(argv[1], "--ds41-render") ||
                       !strcmp(argv[1], "--ds41-render-anthropic"))) {
         ds4_think_mode mode;

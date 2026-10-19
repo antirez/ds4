@@ -24,6 +24,7 @@
 /tests/test_cuda_session_batch
 /tests/cuda_long_context_smoke
 /tests/test_layer_pack
+/tests/test_prompt_prefix
 /tests/test_metal_session_batch
 /tests/test_metal_tp_spec
 /tests/test_metal_tp_cancel
@@ -83,8 +84,10 @@
 /tests/test_linux_memory
 /tests/test_rocm_memory
 /tests/test_qwen4_kernels
+/tests/test_qwen4_prefill
 /tests/test_qwen4_moe_mm_specialize
 /tests/test_qwen4_vision
+/tests/test_qwen4_tq
 /tests/test_deepseek4_vision_image
 /tests/test_image_decode
 /tests/test_deepseek41_metal
