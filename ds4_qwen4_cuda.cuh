@@ -1979,6 +1979,9 @@ extern "C" int ds4_gpu_qwen4_idx_block_key_tensor(ds4_gpu_tensor *out,
     return launched();
 }
 
+/* The CUDA scorer fills tile maxima whenever it is given a buffer. */
+extern "C" int ds4_gpu_qwen4_idx_score_emits_tile_max(uint32_t, uint32_t, uint32_t) { return 1; }
+
 extern "C" int ds4_gpu_qwen4_idx_score_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *tiles,
         const ds4_gpu_tensor *q, const ds4_gpu_tensor *key, uint32_t T, uint32_t N,
         uint32_t H, uint32_t D, uint32_t pos0, uint32_t ratio) {

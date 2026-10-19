@@ -28080,7 +28080,9 @@ static bool ds4_gpu_fill_visual_mixed_batch_mask(
         uint32_t       pos0,
         uint32_t       window,
         uint32_t       ratio) {
-    if (!mask || !tokens || vocab_size == 0 || n_tokens == 0 || n_raw == 0) {
+    /* first_raw_pos below wraps if more raw keys than positions exist */
+    if (!mask || !tokens || vocab_size == 0 || n_tokens == 0 || n_raw == 0 ||
+        (uint64_t)n_raw > (uint64_t)pos0 + n_tokens) {
         return false;
     }
     const uint16_t neg_inf_half = 0xfc00u;
@@ -30598,7 +30600,10 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
     if (!heads || !model_map || !q || !raw_kv || !comp_kv || !topk ||
         n_tokens == 0 || n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap ||
         n_comp == 0 || top_k == 0 || top_k > n_comp || (top_k & (top_k - 1u)) != 0 ||
-        ratio == 0 || n_head == 0 || head_dim != 512) {
+        ratio == 0 || n_head == 0 || (n_head % 8u) != 0 || head_dim != 512) {
+        /* The pipelines below run 8 heads per threadgroup.  Simdgroups past
+         * n_head return early and never reach the threadgroup barriers the
+         * rest of the group waits on, so a partial group is undefined. */
         return 0;
     }
 
@@ -46501,7 +46506,10 @@ int ds4_gpu_glm53_matmul_bf16(
             model_map, model_size, weight_offset, weights * sizeof(uint16_t),
             &inner, "BF16 matrix");
         if (!weightbuf) return 0;
-        const bool use_mv = n_rows <= 8u;
+        /* mul_mm dequantizes whole 16-value weight blocks, and bc_inp only
+         * zeroes the activation tail, so a partial block would read the next
+         * row (or past the tensor) and NaN * 0 still poisons the sum. */
+        const bool use_mv = n_rows <= 8u || (in_dim % 16u) != 0u;
         const bool bc_inp = (in_dim % 32u) != 0u;
         const bool bc_out = (out_dim % 64u) != 0u || (n_rows % 32u) != 0u;
         id<MTLComputePipelineState> pipeline = use_mv
@@ -49122,7 +49130,9 @@ int ds4_gpu_qwen4_idx_block_key_tensor(
     qwen4_rope_fill(args.rope_freq, &args.rope_mscale, n_rot, rope_base);
     const uint64_t n_keys = ((uint64_t)block0 + n_blocks) * ratio;
     qwen4_bind b[4];
+    /* the kernel ropes into float tmp[64] with rope_freq[32] */
     if (n_blocks == 0 || ratio == 0 || idx_dim < 32 || idx_dim > 128 || (idx_dim % 32) != 0 || n_rot > idx_dim ||
+        n_rot > 64 || (n_rot % 2) != 0 ||
         !qwen4_bind_tensor(&b[0], ik_cache, n_keys * idx_dim * sizeof(float), "indexer k cache") ||
         !qwen4_bind_weight(&b[1], model_map, model_size, g_ik_offset, (uint64_t)idx_dim * sizeof(float),
                            "indexer k_norm") ||
@@ -49132,6 +49142,17 @@ int ds4_gpu_qwen4_idx_block_key_tensor(
     }
     return qwen4_dispatch(QWEN4_K_IDX_BLOCK_KEY, &args, sizeof(args), b, 4,
                           MTLSizeMake(n_blocks, 1, 1), MTLSizeMake(32, 1, 1), 0);
+}
+
+/* staged queries and vector key loads, plus the tile maxima the prefiltered
+ * selector needs; measured on M5, other devices keep the scalar scorer.
+ * Callers must not hand the selector tile maxima when this is false: the
+ * other scorers leave them stale. */
+int ds4_gpu_qwen4_idx_score_emits_tile_max(uint32_t n_tokens, uint32_t n_idx_head, uint32_t idx_dim) {
+    if (n_tokens > 2u && n_idx_head == 4u && idx_dim == 128u) return 0;
+    if (n_idx_head * idx_dim > 512u || (idx_dim & 3u) != 0u) return 0;
+    const int vec_override = ds4_gpu_env_bool("DS4_QWEN4_IDX_SCORE_VEC");
+    return vec_override >= 0 ? vec_override != 0 : ds4_gpu_device_is_m5_apple_silicon();
 }
 
 int ds4_gpu_qwen4_idx_score_tensor(
@@ -49151,12 +49172,7 @@ int ds4_gpu_qwen4_idx_score_tensor(
         return qwen4_dispatch(QWEN4_K_IDX_SCORE_MM, &args, sizeof(args), b, 3,
                               MTLSizeMake((n_blocks + 63) / 64, (n_tokens + 15) / 16, 1), MTLSizeMake(128, 1, 1), 0);
     }
-    /* staged queries and vector key loads, plus the tile maxima the
-     * prefiltered selector needs; measured on M5, other devices keep the
-     * scalar scorer */
-    const int vec_override = ds4_gpu_env_bool("DS4_QWEN4_IDX_SCORE_VEC");
-    const bool vec = tile_max && n_idx_head * idx_dim <= 512u && (idx_dim & 3u) == 0u &&
-        (vec_override >= 0 ? vec_override != 0 : ds4_gpu_device_is_m5_apple_silicon());
+    const bool vec = tile_max && ds4_gpu_qwen4_idx_score_emits_tile_max(n_tokens, n_idx_head, idx_dim);
     if (vec) {
         if (!qwen4_bind_tensor(&b[3], tile_max, (uint64_t)n_tokens * ((n_blocks + 7u) / 8u) * sizeof(uint32_t),
                                "indexer tile maxima")) return 0;
@@ -49420,7 +49436,7 @@ int ds4_gpu_qwen4_idx_block_key_rows_tensor(
     qwen4_rope_fill(args.rope_freq, &args.rope_mscale, n_rot, rope_base);
     qwen4_bind b[2], res[QWEN4_ATTN_ROWS_MAX * 5u];
     if (n_rows == 0 || n_rows > QWEN4_ATTN_ROWS_MAX || ratio == 0 || idx_dim < 32 || idx_dim > 128 ||
-        (idx_dim % 32) != 0 || n_rot > idx_dim ||
+        (idx_dim % 32) != 0 || n_rot > idx_dim || n_rot > 64 || (n_rot % 2) != 0 ||
         !qwen4_bind_weight(&b[0], model_map, model_size, g_ik_offset, (uint64_t)idx_dim * sizeof(float), "indexer k_norm") ||
         !qwen4_bind_rows(&b[1], table, entry0, n_rows)) {
         return 0;
