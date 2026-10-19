@@ -417,6 +417,26 @@ static void test_text_observations(void) {
     vocab_free(v);
 }
 
+/* Block layouts from ggml: block_q8_1 is d + s + qs[QK8_1] over 32 weights,
+ * block_iq1_s is d + qs[QK_K/8] + qh[QK_K/32] uint16s, block_iq4_nl is
+ * d + qs[QK4_NL/2] over 32 weights. */
+static void test_gguf_block_sizes(void) {
+    enum { GGUF_Q8_1 = 9, GGUF_IQ1_S = 19, GGUF_IQ4_NL = 20 };
+    const gguf_type_info *q8_1 = tensor_type(GGUF_Q8_1);
+    const gguf_type_info *iq1_s = tensor_type(GGUF_IQ1_S);
+    const gguf_type_info *iq4_nl = tensor_type(GGUF_IQ4_NL);
+    assert(q8_1 && strcmp(q8_1->name, "q8_1") == 0);
+    assert(iq1_s && strcmp(iq1_s->name, "iq1_s") == 0);
+    assert(iq4_nl && strcmp(iq4_nl->name, "iq4_nl") == 0);
+    assert(q8_1->block_elems == 32 && q8_1->block_bytes == 36);
+    assert(iq1_s->block_elems == 256 && iq1_s->block_bytes == 50);
+    assert(iq4_nl->block_elems == 32 && iq4_nl->block_bytes == 18);
+    uint64_t bytes = 0;
+    assert(tensor_nbytes(GGUF_Q8_1, 4096, &bytes) && bytes == 4608);
+    assert(tensor_nbytes(GGUF_IQ1_S, 4096, &bytes) && bytes == 800);
+    assert(tensor_nbytes(GGUF_IQ4_NL, 4096, &bytes) && bytes == 2304);
+}
+
 #ifndef DS4_NO_GPU
 static void test_glm_attention_budget(void) {
     const ds4_shape saved_shape = g_ds4_shape;
@@ -766,6 +786,7 @@ int main(void) {
     test_payload_tokens();
     test_snapshot_bytes();
     test_text_observations();
+    test_gguf_block_sizes();
 #ifndef DS4_NO_GPU
     test_glm_attention_budget();
     test_glm_spec_rollback();
