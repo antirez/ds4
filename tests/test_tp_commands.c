@@ -17,6 +17,25 @@ static void *exchange_bulk(void *arg) {
     return NULL;
 }
 
+static uint64_t rcvtimeo_ms(int fd) {
+    struct timeval timeout;
+    socklen_t len = sizeof(timeout);
+    assert(getsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, &len) == 0);
+    return (uint64_t)timeout.tv_sec * 1000u + timeout.tv_usec / 1000u;
+}
+
+/* Linux stores socket timeouts in jiffies, so with HZ=250 a 50 ms timeout
+ * reads back as 52. Ask a scratch socket what the kernel keeps for ms. */
+static uint64_t kernel_timeout_ms(uint64_t ms) {
+    int fd[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fd) == 0);
+    struct timeval tv = {(time_t)(ms / 1000u), (suseconds_t)(ms % 1000u * 1000u)};
+    assert(setsockopt(fd[0], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == 0);
+    const uint64_t kept = rcvtimeo_ms(fd[0]);
+    close(fd[0]); close(fd[1]);
+    return kept;
+}
+
 static void check_bulk_exchange(void) {
     const uint64_t sizes[] = {20480, 2 * 1024 * 1024 - 4,
         2 * 1024 * 1024, 2 * 1024 * 1024 + 4, 7 * 1024 * 1024 + 4};
@@ -48,11 +67,8 @@ static void check_bulk_exchange(void) {
         assert(!memcmp(peer[0].in, peer[1].out, sizes[n]));
         assert(!memcmp(peer[1].in, peer[0].out, sizes[n]));
         for (unsigned rank = 0; rank < 2; rank++) {
-            struct timeval timeout;
-            socklen_t len = sizeof(timeout);
-            assert(getsockopt(fd[rank], SOL_SOCKET, SO_RCVTIMEO, &timeout, &len) == 0);
-            assert((uint64_t)timeout.tv_sec * 1000u + timeout.tv_usec / 1000u ==
-                   peer[rank].tp.gate_timeout_ms);
+            assert(rcvtimeo_ms(fd[rank]) ==
+                   kernel_timeout_ms(peer[rank].tp.gate_timeout_ms));
             free(peer[rank].in); free(peer[rank].out); close(fd[rank]);
         }
     }
