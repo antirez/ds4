@@ -909,6 +909,7 @@ static void test_attn_mm_keys(uint32_t T, uint32_t pos0, bool sparse, uint32_t k
     ds4_gpu_tensor *gk = ds4_gpu_tensor_alloc(kvn * 2), *gv = ds4_gpu_tensor_alloc(kvn * 2);
     ds4_gpu_tensor *gsel = ds4_gpu_tensor_alloc((uint64_t)T * sel_stride * 4), *gcnt = ds4_gpu_tensor_alloc(T * 4);
     ds4_gpu_tensor *go_ref = upload(NULL, qn), *go_new = upload(NULL, qn);
+    ds4_gpu_tensor *go_cls = upload(NULL, qn);
     ds4_gpu_tensor *partial = split ? ds4_gpu_tensor_alloc((uint64_t)T*H*64*(D+2)*4) : NULL;
     require_ok(!split || partial, "attention partial allocation");
     require_ok(gk && gv && gsel && gcnt && ds4_gpu_tensor_write(gk, 0, kc, kvn * 2) && ds4_gpu_tensor_write(gv, 0, vc, kvn * 2) &&
@@ -917,7 +918,10 @@ static void test_attn_mm_keys(uint32_t T, uint32_t pos0, bool sparse, uint32_t k
     require_ok(ds4_gpu_qwen4_attn_decode_tensor(go_ref, gq, ggate, gk, gv, gsel, gcnt, NULL, T, H, Hkv, D, pos0, sparse, sel_stride, 0.0625f), "attn reference");
     unsetenv("DS4_QWEN4_NO_ATTN_MM");
     require_ok(ds4_gpu_qwen4_attn_decode_tensor(go_new, gq, ggate, gk, gv, gsel, gcnt, partial, T, H, Hkv, D, pos0, sparse, sel_stride, 0.0625f), "attn mm");
-    float *ref = download(go_ref, qn), *got = download(go_new, qn);
+    setenv("DS4_QWEN4_NO_ATTN_MM_NAX", "1", 1);
+    require_ok(ds4_gpu_qwen4_attn_decode_tensor(go_cls, gq, ggate, gk, gv, gsel, gcnt, partial, T, H, Hkv, D, pos0, sparse, sel_stride, 0.0625f), "attn classic mm");
+    unsetenv("DS4_QWEN4_NO_ATTN_MM_NAX");
+    float *ref = download(go_ref, qn), *got = download(go_new, qn), *cls = download(go_cls, qn);
     double worst = 0.0, scale = 0.0;
     for (uint64_t i = 0; i < qn; i++) {
         require_ok(isfinite(got[i]) && isfinite(ref[i]), "finite attention output");
@@ -925,10 +929,23 @@ static void test_attn_mm_keys(uint32_t T, uint32_t pos0, bool sparse, uint32_t k
         if (d > worst) worst = d;
         if (fabs(ref[i]) > scale) scale = fabs(ref[i]);
     }
+    double worst_cls = 0.0, scale_cls = 0.0;
+    for (uint64_t i = 0; i < qn; i++) {
+        require_ok(isfinite(cls[i]), "finite classic attention output");
+        const double d = fabs((double)got[i] - cls[i]);
+        if (d > worst_cls) worst_cls = d;
+        if (fabs(cls[i]) > scale_cls) scale_cls = fabs(cls[i]);
+    }
     char name[96];
     snprintf(name, sizeof(name), "attn mm T=%u H=%u pos0=%u %s%s", T, H, pos0, sparse ? "sparse" : "dense", split ? " split" : "");
 #ifdef __APPLE__
     require_ok(worst <= 4e-3 * scale, name);
+    /* The default path may run the tensor-unit (NAX) tiles, which drift from
+     * the classic simdgroup kernel by about an ulp (tensor accumulation
+     * order).  The kill switch must select the classic kernel bit-exactly
+     * wherever the mm gate is closed (short tails, key splits). */
+    require_ok(worst_cls <= 2e-3 * fmax(scale_cls, 1e-8), "attn nax vs classic mm");
+    if (split || T <= 8u) require_ok(worst_cls == 0.0, "non-mm paths are kill-switch invariant");
 #else
     require_ok(worst <= 3e-5 * scale, name);
     /* Check selected rows against the definition, independently of both GPU
@@ -970,10 +987,11 @@ static void test_attn_mm_keys(uint32_t T, uint32_t pos0, bool sparse, uint32_t k
     printf("  %-44s CPU max|d|=%.2e scalar=%.2e (scale %.2e)\n", name, cpu_error, scalar_error, cpu_scale);
 #endif
     if (T <= 8u && !split) require_ok(worst == 0.0, "short attention tails keep decode arithmetic");
-    printf("  %-44s ok  max|d|=%.2e (scale %.2e)\n", name, worst, scale);
-    free(ref); free(got); free(q); free(gate); free(kc); free(vc); free(sel); free(cnt);
+    printf("  %-44s ok  max|d|=%.2e (scale %.2e)  mm-vs-classic %.2e\n", name, worst, scale, worst_cls);
+    free(ref); free(got); free(cls); free(q); free(gate); free(kc); free(vc); free(sel); free(cnt);
     ds4_gpu_tensor_free(gq); ds4_gpu_tensor_free(ggate); ds4_gpu_tensor_free(gk); ds4_gpu_tensor_free(gv);
     ds4_gpu_tensor_free(gsel); ds4_gpu_tensor_free(gcnt); ds4_gpu_tensor_free(go_ref); ds4_gpu_tensor_free(go_new);
+    ds4_gpu_tensor_free(go_cls);
     ds4_gpu_tensor_free(partial);
 }
 

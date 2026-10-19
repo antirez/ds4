@@ -2560,6 +2560,340 @@ kernel void kernel_qwen4_attn_mm(
     }
 }
 
+/* Prefill attention on the Metal 4 tensor ops (M5 neural accelerators):
+ * one (kv head, token) per threadgroup of 2 simdgroups (64 threads), the
+ * group's query heads as ONE 16-row tensor tile (rows >= group idle) and
+ * the 256 head dims split 128/128 between the simdgroups, which exchange
+ * the partial scores through threadgroup memory.  The key loop walks the
+ * query's own selection list (dense mode: every causal position) 32 keys
+ * per step, so every step is exactly the query's own keys: no per-row
+ * masks, only slots past the list and positions past the query are masked.
+ * Ops are 16x32x32 matmul2d: Q K^T over 32 head dims per run, P@V with the
+ * step's two 16-key P fragments packed along K (P is stored half, so no
+ * hi/lo pieces).  O lives in persistent cooperative tensors across the key
+ * loop (no per-tile store/load), Q is re-read from device each step, and O
+ * is rescaled only when a row max changed.  The scalar softmax (m/l per
+ * row, P rounded to half) and the normalize + sigmoid-gate epilogue match
+ * kernel_qwen4_attn_mm; only the accumulation order changes (tensor trees
+ * vs the classic sequential chains), so outputs drift by about an ulp on a
+ * fraction of elements (measured max |delta| < 1e-4 on random data).
+ *
+ * Cooperative tensor slot layout (execution_simdgroup, 32 lanes): slot
+ * 8c + 4r + j of a 16x16 fragment c holds row (fm + 8r) x col (fn + j).
+ * Left operands are (M rows x K cols), right operands mirror the stored
+ * [key][dim] matrix (transpose_right says which stored axis is K),
+ * destinations are (M rows x N cols).  Head dims are permuted per lane
+ * (cols fn..fn+3 <-> dims 2fn..2fn+3 within each 16-wide fragment pair),
+ * so one 16-byte load feeds both fragments; Q and K share the permutation,
+ * V and the O store undo it. */
+#ifdef DS4_METAL_HAS_TENSOR
+kernel void kernel_qwen4_attn_mm_nax(
+        constant ds4_metal_args_qwen4_attn_decode & args,
+        device const float   *q,          /* [T][H*D] */
+        device const float   *gate,       /* [T][H*D] */
+        device const half    *k_cache,    /* [cap][Hkv*D] */
+        device const half    *v_cache,    /* [cap][Hkv*D] */
+        device const int32_t *sel_tokens, /* [T][sel_stride] */
+        device const uint32_t *n_sel,     /* [T] */
+        device float         *out,        /* [T][H*D] */
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const uint kvh = tgpig.x, tok = tgpig.y;
+    if (kvh >= args.n_head_kv || tok >= args.n_tokens) return;
+    constexpr uint D = 256;
+    constexpr uint SK = 32;                 /* keys per step */
+    const uint H = args.n_head, Hkv = args.n_head_kv, group = H / Hkv;
+    const uint qpos = args.pos0 + tok;
+    const uint n = args.use_sel ? n_sel[tok] : qpos + 1;
+    device const int32_t *sel = sel_tokens + (uint64_t)tok * args.sel_stride;
+
+    const ushort dh = sgitg;                /* 0/1: which 128-dim half of D */
+    const ushort lane = tiisg;
+    const short qid = lane >> 2;
+    const short fm = (qid & 4) | ((lane >> 1) & 3);   /* row of the 16-row tile */
+    const short fn = ((qid & 2) | (lane & 1)) * 4;    /* first of four columns */
+    const short fcol = 2 * fn;
+    const bool row_ok[2] = { (uint)fm < group, (uint)(fm + 8) < group };
+    const uint head[2] = { kvh * group + (uint)fm, kvh * group + (uint)(fm + 8) };
+    const uint64_t qrow[2] = {
+        (uint64_t)tok * H * D + (uint64_t)head[0] * D,
+        (uint64_t)tok * H * D + (uint64_t)head[1] * D };
+    const uint64_t kvr = (uint64_t)Hkv * D;           /* cache row stride */
+    const uint64_t kvh_off = (uint64_t)kvh * D;
+
+    threadgroup float xchg[2][8 * 32];      /* partial scores, one simdgroup each */
+
+    /* The position of a key slot, or -1 when masked (past the list or past
+     * the query).  Masked rows read cache row 0: P = 0 never meets an
+     * unwritten cache row (0 * NaN = NaN). */
+    auto key_pos = [&](uint idx) -> int {
+        if (idx >= n) return -1;
+        const int p = args.use_sel ? sel[idx] : (int)idx;
+        return (p < 0 || p > (int)qpos) ? -1 : p;
+    };
+    int krow[4];                            /* this lane's four K/V key rows */
+    bool kcol[2][4];                        /* this lane's eight S columns */
+    auto fetch = [&](uint t0) {
+#pragma unroll
+        for (short r = 0; r < 4; ++r) {
+            /* step keys fm, 8 + fm, 16 + fm, 24 + fm */
+            const int p = key_pos(t0 + 16 * (r >> 1) + (uint)fm + 8 * (r & 1));
+            krow[r] = p >= 0 ? p : 0;
+        }
+#pragma unroll
+        for (short f = 0; f < 2; ++f) {
+#pragma unroll
+            for (short j = 0; j < 4; ++j) {
+                kcol[f][j] = key_pos(t0 + 16 * f + (uint)fn + j) >= 0;
+            }
+        }
+    };
+    fetch(0);
+
+    constexpr auto qk_desc = matmul2d_descriptor(
+        16, 32, 32, false, true, false,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<qk_desc, execution_simdgroup> qk_op;
+    constexpr auto pv_desc = matmul2d_descriptor(
+        16, 32, 32, false, false, false,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<pv_desc, execution_simdgroup> pv_op;
+    auto qa_ct = qk_op.template get_left_input_cooperative_tensor<half, half, float>();
+    auto kb_ct = qk_op.template get_right_input_cooperative_tensor<half, half, float>();
+    using qa_t = metal::remove_addrspace_t<decltype(qa_ct)>;
+    using kb_t = metal::remove_addrspace_t<decltype(kb_ct)>;
+    auto pa_ct = pv_op.template get_left_input_cooperative_tensor<half, half, float>();
+    auto vb_ct = pv_op.template get_right_input_cooperative_tensor<half, half, float>();
+    using pa_t = metal::remove_addrspace_t<decltype(pa_ct)>;
+    using vb_t = metal::remove_addrspace_t<decltype(vb_ct)>;
+    /* O over this half of D: o<j> holds dim fragments (2j, 2j + 1), i.e.
+     * dims 32 j .. 32 j + 31 of the half */
+    auto o0 = pv_op.template get_destination_cooperative_tensor<pa_t, vb_t, float>();
+    auto o1 = pv_op.template get_destination_cooperative_tensor<pa_t, vb_t, float>();
+    auto o2 = pv_op.template get_destination_cooperative_tensor<pa_t, vb_t, float>();
+    auto o3 = pv_op.template get_destination_cooperative_tensor<pa_t, vb_t, float>();
+#pragma unroll
+    for (short i = 0; i < 16; ++i) {
+        o0[i] = 0.0f;
+        o1[i] = 0.0f;
+        o2[i] = 0.0f;
+        o3[i] = 0.0f;
+    }
+    float max_s[2] = { -3.0e38f, -3.0e38f };   /* m per row (rows fm, fm + 8) */
+    float sum_s[2] = { 0.0f, 0.0f };           /* l per row */
+
+    const uint nsteps = (n + SK - 1) / SK;
+    for (uint step = 0; step < nsteps; ++step) {
+        const uint t0 = step * SK;
+
+        /* S = Q K^T over this half of D: one 16x32x32 op per 32 head dims */
+        auto s_ct = qk_op.template get_destination_cooperative_tensor<qa_t, kb_t, float>();
+#pragma unroll
+        for (short i = 0; i < 16; ++i) s_ct[i] = 0.0f;
+#pragma unroll
+        for (short jj = 0; jj < 4; ++jj) {
+            const uint d0 = (uint)dh * 128 + 32 * (uint)jj + (uint)fcol;
+            half4 q0l = half4(0.0h), q0h = half4(0.0h), q1l = half4(0.0h), q1h = half4(0.0h);
+            if (row_ok[0]) {
+                q0l = half4(*(device const float4 *)(q + qrow[0] + d0) * args.scale);
+                q0h = half4(*(device const float4 *)(q + qrow[0] + d0 + 4) * args.scale);
+            }
+            if (row_ok[1]) {
+                q1l = half4(*(device const float4 *)(q + qrow[1] + d0) * args.scale);
+                q1h = half4(*(device const float4 *)(q + qrow[1] + d0 + 4) * args.scale);
+            }
+            const uint64_t r0 = (uint64_t)krow[0] * kvr + kvh_off;
+            const uint64_t r1 = (uint64_t)krow[1] * kvr + kvh_off;
+            const uint64_t r2 = (uint64_t)krow[2] * kvr + kvh_off;
+            const uint64_t r3 = (uint64_t)krow[3] * kvr + kvh_off;
+            const half4 k0l = *(device const half4 *)(k_cache + r0 + d0);
+            const half4 k0h = *(device const half4 *)(k_cache + r0 + d0 + 4);
+            const half4 k1l = *(device const half4 *)(k_cache + r1 + d0);
+            const half4 k1h = *(device const half4 *)(k_cache + r1 + d0 + 4);
+            const half4 k2l = *(device const half4 *)(k_cache + r2 + d0);
+            const half4 k2h = *(device const half4 *)(k_cache + r2 + d0 + 4);
+            const half4 k3l = *(device const half4 *)(k_cache + r3 + d0);
+            const half4 k3h = *(device const half4 *)(k_cache + r3 + d0 + 4);
+#pragma unroll
+            for (short j = 0; j < 4; ++j) {
+                qa_ct[j]      = q0l[j];
+                qa_ct[4 + j]  = q1l[j];
+                qa_ct[8 + j]  = q0h[j];
+                qa_ct[12 + j] = q1h[j];
+                kb_ct[j]      = k0l[j];
+                kb_ct[4 + j]  = k1l[j];
+                kb_ct[8 + j]  = k2l[j];
+                kb_ct[12 + j] = k3l[j];
+                kb_ct[16 + j] = k0h[j];
+                kb_ct[20 + j] = k1h[j];
+                kb_ct[24 + j] = k2h[j];
+                kb_ct[28 + j] = k3h[j];
+            }
+            qk_op.run(qa_ct, kb_ct, s_ct);
+        }
+        vec<float, 8> s[2];
+#pragma unroll
+        for (short i = 0; i < 8; ++i) {
+            s[0][i] = s_ct[i];
+            s[1][i] = s_ct[8 + i];
+        }
+
+        /* add the other half's partial scores, one 16-key fragment at a time */
+#pragma unroll
+        for (short f = 0; f < 2; ++f) {
+            threadgroup float *mine = xchg[dh];
+            const threadgroup float *peer = xchg[1 - dh];
+#pragma unroll
+            for (short i = 0; i < 8; ++i) mine[lane * 8 + i] = s[f][i];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+#pragma unroll
+            for (short i = 0; i < 8; ++i) s[f][i] += peer[lane * 8 + i];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        /* mask: this lane's columns fn..fn+3 of fragment f are the step's
+         * keys 16 f + fn + j; the query is pre-scaled, so no scale here */
+#pragma unroll
+        for (short f = 0; f < 2; ++f) {
+#pragma unroll
+            for (short j = 0; j < 4; ++j) {
+                s[f][j] = kcol[f][j] ? s[f][j] : -3.0e38f;
+                s[f][4 + j] = kcol[f][j] ? s[f][4 + j] : -3.0e38f;
+            }
+        }
+
+        /* online softmax per row (rows fm and fm + 8); lanes sharing a row
+         * differ in lane bits 0 and 3 (the fn bits) */
+        float factor[2];
+#pragma unroll
+        for (short r = 0; r < 2; ++r) {
+            float m = -3.0e38f;
+#pragma unroll
+            for (short f = 0; f < 2; ++f) {
+#pragma unroll
+                for (short j = 0; j < 4; ++j) m = max(m, s[f][4 * r + j]);
+            }
+            m = max(m, simd_shuffle_xor(m, 1));
+            m = max(m, simd_shuffle_xor(m, 8));
+            const float m_new = max(max_s[r], m);
+            const float corr = exp(max_s[r] - m_new);
+            float rs = 0.0f;
+#pragma unroll
+            for (short f = 0; f < 2; ++f) {
+#pragma unroll
+                for (short j = 0; j < 4; ++j) {
+                    const float pv = kcol[f][j] ? exp(s[f][4 * r + j] - m_new) : 0.0f;
+                    s[f][4 * r + j] = pv;   /* fp32 P; rounded to half for P@V */
+                    rs += pv;
+                }
+            }
+            rs += simd_shuffle_xor(rs, 1);
+            rs += simd_shuffle_xor(rs, 8);
+            sum_s[r] = sum_s[r] * corr + rs;
+            max_s[r] = m_new;
+            factor[r] = corr;
+        }
+
+        /* O *= factor (exact no-op when every factor of the simdgroup is 1) */
+        if (simd_any(factor[0] != 1.0f || factor[1] != 1.0f)) {
+#pragma unroll
+            for (short h = 0; h < 2; ++h) {
+#pragma unroll
+                for (short j = 0; j < 4; ++j) {
+                    o0[8 * h + j] *= factor[0];
+                    o0[8 * h + 4 + j] *= factor[1];
+                    o1[8 * h + j] *= factor[0];
+                    o1[8 * h + 4 + j] *= factor[1];
+                    o2[8 * h + j] *= factor[0];
+                    o2[8 * h + 4 + j] *= factor[1];
+                    o3[8 * h + j] *= factor[0];
+                    o3[8 * h + 4 + j] *= factor[1];
+                }
+            }
+        }
+
+        /* O += P V over this half of D: the step's two 16-key P fragments
+         * packed along K into one 16x32x32 op per 32 output dims */
+#pragma unroll
+        for (short cc = 0; cc < 4; ++cc) {
+            const uint d0 = (uint)dh * 128 + 32 * (uint)cc + (uint)fcol;
+            const uint64_t r0 = (uint64_t)krow[0] * kvr + kvh_off;
+            const uint64_t r1 = (uint64_t)krow[1] * kvr + kvh_off;
+            const uint64_t r2 = (uint64_t)krow[2] * kvr + kvh_off;
+            const uint64_t r3 = (uint64_t)krow[3] * kvr + kvh_off;
+            const half4 v0l = *(device const half4 *)(v_cache + r0 + d0);
+            const half4 v0h = *(device const half4 *)(v_cache + r0 + d0 + 4);
+            const half4 v1l = *(device const half4 *)(v_cache + r1 + d0);
+            const half4 v1h = *(device const half4 *)(v_cache + r1 + d0 + 4);
+            const half4 v2l = *(device const half4 *)(v_cache + r2 + d0);
+            const half4 v2h = *(device const half4 *)(v_cache + r2 + d0 + 4);
+            const half4 v3l = *(device const half4 *)(v_cache + r3 + d0);
+            const half4 v3h = *(device const half4 *)(v_cache + r3 + d0 + 4);
+#pragma unroll
+            for (short i = 0; i < 8; ++i) {
+                pa_ct[i] = (half)s[0][i];
+                pa_ct[8 + i] = (half)s[1][i];
+            }
+#pragma unroll
+            for (short j = 0; j < 4; ++j) {
+                vb_ct[j]      = v0l[j];
+                vb_ct[4 + j]  = v1l[j];
+                vb_ct[8 + j]  = v0h[j];
+                vb_ct[12 + j] = v1h[j];
+                vb_ct[16 + j] = v2l[j];
+                vb_ct[20 + j] = v3l[j];
+                vb_ct[24 + j] = v2h[j];
+                vb_ct[28 + j] = v3h[j];
+            }
+            if (cc == 0) pv_op.run(pa_ct, vb_ct, o0);
+            else if (cc == 1) pv_op.run(pa_ct, vb_ct, o1);
+            else if (cc == 2) pv_op.run(pa_ct, vb_ct, o2);
+            else pv_op.run(pa_ct, vb_ct, o3);
+        }
+
+        if (step + 1 < nsteps) fetch(t0 + SK);
+    }
+
+    /* normalize and apply the sigmoid gate: out = O / l * sigmoid(gate) */
+#pragma unroll
+    for (short r = 0; r < 2; ++r) {
+        if (!row_ok[r]) continue;
+        const float rr = sum_s[r] > 0.0f ? 1.0f / sum_s[r] : 0.0f;
+        const uint64_t ob = (uint64_t)tok * H * D + (uint64_t)head[r] * D;
+#pragma unroll
+        for (short cc = 0; cc < 4; ++cc) {
+            const uint d0 = (uint)dh * 128 + 32 * (uint)cc + (uint)fcol;
+            float4 e0, e1;
+            if (cc == 0) {
+#pragma unroll
+                for (short j = 0; j < 4; ++j) { e0[j] = o0[4 * r + j]; e1[j] = o0[8 + 4 * r + j]; }
+            } else if (cc == 1) {
+#pragma unroll
+                for (short j = 0; j < 4; ++j) { e0[j] = o1[4 * r + j]; e1[j] = o1[8 + 4 * r + j]; }
+            } else if (cc == 2) {
+#pragma unroll
+                for (short j = 0; j < 4; ++j) { e0[j] = o2[4 * r + j]; e1[j] = o2[8 + 4 * r + j]; }
+            } else {
+#pragma unroll
+                for (short j = 0; j < 4; ++j) { e0[j] = o3[4 * r + j]; e1[j] = o3[8 + 4 * r + j]; }
+            }
+            const float4 g0 = *(device const float4 *)(gate + ob + d0);
+            const float4 g1 = *(device const float4 *)(gate + ob + d0 + 4);
+            float4 w0, w1;
+#pragma unroll
+            for (short j = 0; j < 4; ++j) {
+                w0[j] = (e0[j] * rr) * qwen4_sigmoid(g0[j]);
+                w1[j] = (e1[j] * rr) * qwen4_sigmoid(g1[j]);
+            }
+            *(device float4 *)(out + ob + d0) = w0;
+            *(device float4 *)(out + ob + d0 + 4) = w1;
+        }
+    }
+}
+#endif /* DS4_METAL_HAS_TENSOR */
+
 /* --- routed experts ----------------------------------------------------- */
 
 #define QWEN4_MOE_NSG 4

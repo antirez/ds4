@@ -48134,6 +48134,7 @@ enum {
     QWEN4_K_ATTN_MERGE_WIDE_NPT8,
     QWEN4_K_ATTN_MERGE_WIDE_NPT4,
     QWEN4_K_ATTN_MM,
+    QWEN4_K_ATTN_MM_NAX,
     QWEN4_K_MOE_MID,
     QWEN4_K_MOE_MID_Q4K,
     QWEN4_K_MOE_MID_Q4K_NR1,
@@ -48239,6 +48240,7 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_attn_merge_wide_npt8",
     "kernel_qwen4_attn_merge_wide_npt4",
     "kernel_qwen4_attn_mm",
+    "kernel_qwen4_attn_mm_nax",
     "kernel_qwen4_moe_mid",
     "kernel_qwen4_moe_mid_q4k",
     "kernel_qwen4_moe_mid_q4k_nr1",
@@ -49277,6 +49279,17 @@ int ds4_gpu_qwen4_attn_decode_tensor(
      * relative to one-token continuation; large prefills retain matrix tiles. */
     if (n_splits == 1 && n_tokens > 8u && head_dim == 256u && n_head / n_head_kv <= 16u &&
         getenv("DS4_QWEN4_NO_ATTN_MM") == NULL) {
+        /* Tensor-unit (NAX) tiles first where the Metal 4 tensor API is
+         * live: same selection walk, scalar softmax and gate epilogue,
+         * 16x32x32 matmul2d ops, 2 simdgroups per (kv head, token).  Drifts
+         * ~1 ulp from the classic kernel (tensor accumulation order).
+         * DS4_QWEN4_NO_ATTN_MM_NAX keeps the classic kernel on this path;
+         * devices or compiles without the tensor kernels fall back too. */
+        if (ds4_gpu_mpp_available() && getenv("DS4_QWEN4_NO_ATTN_MM_NAX") == NULL &&
+            ds4_gpu_get_pipeline(qwen4_kernel_names[QWEN4_K_ATTN_MM_NAX]) != nil) {
+            return qwen4_dispatch(QWEN4_K_ATTN_MM_NAX, &args, sizeof(args), b, 7,
+                                  MTLSizeMake(n_head_kv, n_tokens, 1), MTLSizeMake(64, 1, 1), 0);
+        }
         return qwen4_dispatch(QWEN4_K_ATTN_MM, &args, sizeof(args), b, 7,
                               MTLSizeMake(n_head_kv, n_tokens, 1), MTLSizeMake(128, 1, 1), 0);
     }
