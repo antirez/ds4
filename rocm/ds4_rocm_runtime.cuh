@@ -569,6 +569,7 @@ __global__ static void dequant_q8_0_to_f32_kernel(
         uint64_t in_dim,
         uint64_t out_dim,
         uint64_t blocks);
+#define DS4_Q8_F16_T_TILE 64u
 __global__ static void dequant_q8_0_to_f16_transpose_kernel(
         __half *out,
         const unsigned char *w,
@@ -5103,6 +5104,59 @@ static const __half *cuda_q8_f16_ptr(
     return dev;
 }
 
+/* Dequantize an out_dim x in_dim Q8_0 matrix (rows of in_dim values) into an
+ * in_dim x out_dim F16 matrix: out[i * out_dim + row] = w[row][i]. */
+static cudaError_t cuda_q8_0_f16_transpose_launch(
+        __half *out,
+        const unsigned char *q8,
+        uint64_t in_dim,
+        uint64_t out_dim) {
+    const uint64_t blocks = (in_dim + 31u) / 32u;
+    const uint64_t row_tiles = (out_dim + DS4_Q8_F16_T_TILE - 1u) / DS4_Q8_F16_T_TILE;
+    const uint64_t col_tiles = (in_dim + DS4_Q8_F16_T_TILE - 1u) / DS4_Q8_F16_T_TILE;
+    if (row_tiles > 0x7fffffffu || col_tiles > 65535u) return cudaErrorInvalidValue;
+    const dim3 grid((unsigned int)row_tiles, (unsigned int)col_tiles);
+    dequant_q8_0_to_f16_transpose_kernel<<<grid, 256>>>(out, q8, in_dim, out_dim, blocks);
+    return cudaGetLastError();
+}
+
+extern "C" int ds4_gpu_test_q8_0_f16_transpose(
+        const void *q8,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint16_t *out_bits,
+        double *kernel_ms) {
+    if (!q8 || !out_bits || in_dim == 0u || out_dim == 0u) return 0;
+    const uint64_t q8_bytes = out_dim * ((in_dim + 31u) / 32u) * 34u;
+    const uint64_t out_bytes = in_dim * out_dim * sizeof(__half);
+    unsigned char *dq8 = NULL;
+    __half *dout = NULL;
+    cudaEvent_t ev[2] = {NULL, NULL};
+    int ok = cuda_ok(cudaMalloc((void **)&dq8, (size_t)q8_bytes), "q8 transpose test input alloc") &&
+             cuda_ok(cudaMalloc((void **)&dout, (size_t)out_bytes), "q8 transpose test output alloc") &&
+             cuda_ok(cudaMemcpy(dq8, q8, (size_t)q8_bytes, cudaMemcpyHostToDevice), "q8 transpose test upload") &&
+             cuda_ok(cudaMemset(dout, 0xff, (size_t)out_bytes), "q8 transpose test output fill") &&
+             cuda_ok(cudaEventCreate(&ev[0]), "q8 transpose test event") &&
+             cuda_ok(cudaEventCreate(&ev[1]), "q8 transpose test event") &&
+             cuda_ok(cudaDeviceSynchronize(), "q8 transpose test sync") &&
+             cuda_ok(cudaEventRecord(ev[0], 0), "q8 transpose test event record") &&
+             cuda_ok(cuda_q8_0_f16_transpose_launch(dout, dq8, in_dim, out_dim), "q8 transpose test launch") &&
+             cuda_ok(cudaEventRecord(ev[1], 0), "q8 transpose test event record") &&
+             cuda_ok(cudaEventSynchronize(ev[1]), "q8 transpose test kernel") &&
+             cuda_ok(cudaMemcpy(out_bits, dout, (size_t)out_bytes, cudaMemcpyDeviceToHost), "q8 transpose test download");
+    if (ok && kernel_ms) {
+        float ms = 0.0f;
+        ok = cuda_ok(cudaEventElapsedTime(&ms, ev[0], ev[1]), "q8 transpose test timing");
+        *kernel_ms = ms;
+    }
+    for (cudaEvent_t e : ev) {
+        if (e) (void)cudaEventDestroy(e);
+    }
+    if (dout) (void)cudaFree(dout);
+    if (dq8) (void)cudaFree(dq8);
+    return ok;
+}
+
 static const __half *cuda_q8_f16_transpose_ptr(
         const void *model_map,
         uint64_t offset,
@@ -5140,14 +5194,8 @@ static const __half *cuda_q8_f16_transpose_ptr(
         cuda_q8_f16_cache_disable_after_failure("transpose allocation failure", out_bytes);
         return NULL;
     }
-    const uint64_t blocks = (in_dim + 31u) / 32u;
-    const uint64_t n = in_dim * out_dim;
-    dequant_q8_0_to_f16_transpose_kernel<<<(n + 255u) / 256u, 256>>>(dev,
-                                                                     (const unsigned char *)q8,
-                                                                     in_dim,
-                                                                     out_dim,
-                                                                     blocks);
-    if (!cuda_ok(cudaGetLastError(), "q8 fp16 transpose dequant launch")) {
+    if (!cuda_ok(cuda_q8_0_f16_transpose_launch(dev, (const unsigned char *)q8, in_dim, out_dim),
+                 "q8 fp16 transpose dequant launch")) {
         (void)cudaFree(dev);
         cuda_q8_f16_cache_disable_after_failure("transpose launch failure", out_bytes);
         return NULL;

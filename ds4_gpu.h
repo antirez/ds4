@@ -252,6 +252,14 @@ int ds4_gpu_q8_cache_suppressed(void);
 void ds4_gpu_set_q8_cache_suppressed(int suppressed);
 #ifdef DS4_ROCM_BUILD
 void ds4_gpu_release_q8_f16_cache(void);
+/* Test oracle for the kernel that builds the transposed F16 cache of Q8_0
+ * weights: q8 holds out_dim rows of in_dim values, out_bits receives the
+ * in_dim x out_dim F16 transpose, kernel_ms (optional) the kernel time. */
+int ds4_gpu_test_q8_0_f16_transpose(const void *q8,
+                                    uint64_t in_dim,
+                                    uint64_t out_dim,
+                                    uint16_t *out_bits,
+                                    double *kernel_ms);
 #endif
 
 /* Model-file ranges assigned to CUDA devices by the multi-GPU placement
