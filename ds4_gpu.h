@@ -252,6 +252,17 @@ int ds4_gpu_q8_cache_suppressed(void);
 void ds4_gpu_set_q8_cache_suppressed(int suppressed);
 #ifdef DS4_ROCM_BUILD
 void ds4_gpu_release_q8_f16_cache(void);
+/* Test hook for the IQ2_XXS sign expansion (tests/test_iq2_signs_rocm.c).
+ * For every grid index g (256) and sign index s (128), with i = g * 128 + s:
+ * grid_out[g] is the device grid table entry, words_out[2i], words_out[2i+1]
+ * the signed weight words of the ROCm expansion, dots_out[i] the
+ * dev_iq2_dp4a_8 sum against q8[8s .. 8s+7] (q8 holds 128 * 8 values) and
+ * mmq_words_out[2i..2i+1] the words of the MMQ expansion. */
+int ds4_gpu_test_iq2_xxs_signs(const int8_t *q8,
+                               uint64_t *grid_out,
+                               int32_t *words_out,
+                               int32_t *dots_out,
+                               int32_t *mmq_words_out);
 #endif
 
 /* Model-file ranges assigned to CUDA devices by the multi-GPU placement

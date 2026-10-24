@@ -103,6 +103,25 @@ static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
     return s * 0x01010101;
 }
 
+// ds4: signed IQ2_XXS grid word.  sel = signs & selector (0x08040201 or
+// 0x80402010), so every byte of sel is 0 or a single bit.  Returns the grid
+// bytes negated where sel is nonzero, i.e. __vsub4(grid ^ m, m) with
+// m = __vcmpne4(sel, 0).  On HIP both intrinsics are per-byte loops
+// (vendors/hip.h); adding 0x7f sets bit 7 exactly in the nonzero bytes of sel
+// without carries, and since the IQ2_XXS grid bytes are 0x08, 0x19 or 0x2b the
+// negated byte ~g + 1 stays below 0x100, so (grid ^ m) + (m & 0x01010101)
+// gives the same bytes.  CUDA keeps the original intrinsics.
+static __device__ __forceinline__ int iq2_grid_signed4(const uint32_t grid, const uint32_t sel) {
+#if defined(GGML_USE_HIP)
+    const uint32_t y = (sel + 0x7f7f7f7fu) & 0x80808080u;
+    const uint32_t m = (y << 1) - (y >> 7);
+    return (int) ((grid ^ m) + (m & 0x01010101u));
+#else
+    const int m = __vcmpne4(sel, 0);
+    return __vsub4(grid ^ m, m);
+#endif // defined(GGML_USE_HIP)
+}
+
 // VDR = vec dot ratio, how many contiguous integers each thread processes when the vec dot kernel is called
 // MMVQ = mul_mat_vec_q, MMQ = mul_mat_q
 
@@ -997,13 +1016,11 @@ static __device__ __forceinline__ float vec_dot_iq2_xxs_q8_1(
         const uint2 grid_pos = ((const uint2*)iq2xxs_grid)[aux8[k0/2]];
         const uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
 
-        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-        const int grid0 = __vsub4(grid_pos.x ^ signs0, signs0);
+        const int grid0 = iq2_grid_signed4(grid_pos.x, signs & 0x08040201);
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, k0 + 0);
         sumi = ggml_cuda_dp4a(grid0, u0, sumi);
 
-        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-        const int grid1 = __vsub4(grid_pos.y ^ signs1, signs1);
+        const int grid1 = iq2_grid_signed4(grid_pos.y, signs & 0x80402010);
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, k0 + 1);
         sumi = ggml_cuda_dp4a(grid1, u1, sumi);
     }

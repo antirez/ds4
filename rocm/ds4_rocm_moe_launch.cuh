@@ -2829,3 +2829,70 @@ extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tens
                              selected, weights, n_total_expert, n_expert, clamp, x, layer_index, n_tokens,
                              force_resident);
 }
+
+/*
+ * Test hook for the IQ2_XXS sign expansion (ds4_gpu_test_iq2_xxs_signs in
+ * ds4_gpu.h).  One block per grid index, one thread per sign index: the
+ * signed weight words of dev_iq2_i8x8_lut (through the shared negative-mask
+ * table the gate/up kernels build), the dp4a sum of dev_iq2_dp4a_8 against
+ * q8[8 * sign_idx ...], and the same words from the MMQ helper
+ * iq2_grid_signed4 (ds4_mmq_test_iq2_grid_signed4).
+ */
+__global__ static void iq2_xxs_signs_test_kernel(
+        const int8_t *q8,
+        uint64_t *grid_out,
+        int32_t *words,
+        int32_t *dots) {
+    const uint32_t gi = blockIdx.x;
+    const uint32_t si = threadIdx.x;
+    __shared__ uint64_t s_grid[256];
+    __shared__ uint64_t s_negmask[128];
+    s_grid[si] = cuda_iq2xxs_grid[si];
+    s_grid[si + 128u] = cuda_iq2xxs_grid[si + 128u];
+    s_negmask[si] = dev_iq2_negmask(cuda_ksigns_iq2xs[si]);
+    __syncthreads();
+    if (si == 0u) grid_out[gi] = s_grid[gi];
+    int32_t w0, w1;
+    dev_iq2_i8x8_lut(s_grid, s_negmask, (uint8_t)gi, si, &w0, &w1);
+    const uint64_t idx = (uint64_t)gi * 128u + si;
+    words[2u * idx + 0u] = w0;
+    words[2u * idx + 1u] = w1;
+    dots[idx] = dev_iq2_dp4a_8(cuda_iq2xxs_grid[gi], cuda_ksigns_iq2xs[si], q8 + 8u * si, 0);
+}
+
+extern "C" int ds4_mmq_test_iq2_grid_signed4(int32_t *words);
+
+extern "C" int ds4_gpu_test_iq2_xxs_signs(
+        const int8_t *q8,
+        uint64_t *grid_out,
+        int32_t *words_out,
+        int32_t *dots_out,
+        int32_t *mmq_words_out) {
+    if (!q8 || !grid_out || !words_out || !dots_out || !mmq_words_out) return 0;
+    const size_t n = 256u * 128u;
+    int8_t *dq8 = NULL;
+    uint64_t *dgrid = NULL;
+    int32_t *dwords = NULL, *ddots = NULL, *dmmq = NULL;
+    int ok = cuda_ok(cudaMalloc((void **)&dq8, 128u * 8u), "iq2 signs test q8 alloc") &&
+             cuda_ok(cudaMalloc((void **)&dgrid, 256u * sizeof(uint64_t)), "iq2 signs test grid alloc") &&
+             cuda_ok(cudaMalloc((void **)&dwords, 2u * n * sizeof(int32_t)), "iq2 signs test words alloc") &&
+             cuda_ok(cudaMalloc((void **)&ddots, n * sizeof(int32_t)), "iq2 signs test dots alloc") &&
+             cuda_ok(cudaMalloc((void **)&dmmq, 2u * n * sizeof(int32_t)), "iq2 signs test mmq alloc") &&
+             cuda_ok(cudaMemcpy(dq8, q8, 128u * 8u, cudaMemcpyHostToDevice), "iq2 signs test upload");
+    if (ok) {
+        iq2_xxs_signs_test_kernel<<<256, 128>>>(dq8, dgrid, dwords, ddots);
+        ok = cuda_ok(cudaGetLastError(), "iq2 signs test launch") &&
+             ds4_mmq_test_iq2_grid_signed4(dmmq) == 0 &&
+             cuda_ok(cudaDeviceSynchronize(), "iq2 signs test sync") &&
+             cuda_ok(cudaMemcpy(grid_out, dgrid, 256u * sizeof(uint64_t), cudaMemcpyDeviceToHost), "iq2 signs test grid") &&
+             cuda_ok(cudaMemcpy(words_out, dwords, 2u * n * sizeof(int32_t), cudaMemcpyDeviceToHost), "iq2 signs test words") &&
+             cuda_ok(cudaMemcpy(dots_out, ddots, n * sizeof(int32_t), cudaMemcpyDeviceToHost), "iq2 signs test dots") &&
+             cuda_ok(cudaMemcpy(mmq_words_out, dmmq, 2u * n * sizeof(int32_t), cudaMemcpyDeviceToHost), "iq2 signs test mmq");
+    }
+    if (dmmq) (void)cudaFree(dmmq);
+    if (ddots) (void)cudaFree(ddots);
+    if (dwords) (void)cudaFree(dwords);
+    if (dgrid) (void)cudaFree(dgrid);
+    if (dq8) (void)cudaFree(dq8);
+    return ok;
+}
