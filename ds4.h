@@ -480,6 +480,9 @@ bool ds4_session_checkpoint_valid(const ds4_session *s);
  * checkpoint tokens, for server-side routing/probe unit tests.  Not usable
  * for inference; free with ds4_session_free_test_checkpoint(). */
 ds4_session *ds4_session_new_test_checkpoint(const int *tokens, int n);
+/* Test hook: server logic runs as if a V4.1 model were loaded (on=1) until
+ * restored (on=0). */
+void ds4_test_use_deepseek41_shape(int on);
 void ds4_session_free_test_checkpoint(ds4_session *s);
 /* Attach synthetic image identities to a test checkpoint (copies
  * token_start/row-count/fingerprint per span).  Not usable for inference. */

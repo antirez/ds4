@@ -11525,8 +11525,8 @@ static bool build_live_prompt_suffix(server *s, server_slot *slot,
  * (generate_job) materializes:
  *
  *   responses-visible -> responses-tool-output -> anthropic-tool-output ->
- *   memory-rewind (GLM only) -> memory-token -> thinking-visible ->
- *   memory-text
+ *   memory-rewind (GLM, V4.1) -> memory-token -> thinking-visible ->
+ *   memory-text -> memory-rewind below a diverged prompt (V4.1)
  *
  * Both slot routing (job_slot_score, under dispatch) and the execution
  * ladder consume this probe, so routing decisions and execution-time reuse
@@ -11551,9 +11551,10 @@ static bool build_live_prompt_suffix(server *s, server_slot *slot,
  * - anthropic-tool-output: /v1/messages has no server-side response object,
  *   but tool_use_id is a precise continuation handle inside a live local
  *   agent loop.
- * - memory-rewind (GLM only): the prompt is a strict truncation of the
+ * - memory-rewind (GLM, V4.1): the prompt is a strict truncation of the
  *   checkpoint; the live KV is rewound and the final prompt token
- *   reevaluated.
+ *   reevaluated.  V4.1 rewinds to pair boundaries (its compressed caches hold
+ *   token pairs) and only text-only checkpoints.
  * - memory-token: the checkpoint is an exact token prefix of the prompt.
  * - thinking-visible: after a tool-less thinking answer the next prompt
  *   omits the hidden reasoning by design; the remembered visible transcript
@@ -11564,12 +11565,17 @@ static bool build_live_prompt_suffix(server *s, server_slot *slot,
  *   is authoritative, so the checkpoint tokens are kept verbatim and only
  *   the suffix text is tokenized (full-prompt BPE may have merged across
  *   the byte boundary).
+ * - memory-rewind below a diverged prompt (V4.1, last): the prompt shares
+ *   a token prefix with the checkpoint and then differs (an agent turn whose
+ *   history re-renders the sampled tail differently, an edited message).
+ *   Tried only after every tier that needs no recompute; the live KV is
+ *   rewound to the shared prefix and only the tail is re-read.
  *
  * Locking: slot_probe_reuse_locked() requires tool_mu held (dispatch holds
  * it while scoring); slot_probe_reuse() is the worker-path wrapper.
  * ========================================================================= */
 
-static int live_prefix_rewind_target(bool backend_can_rewind,
+static int live_prefix_rewind_target(bool backend_can_rewind, int align,
                                      int old_pos, int prompt_len, int common);
 
 typedef enum {
@@ -11674,8 +11680,13 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
     const int common = ds4_session_common_prefix(slot->session, &req->prompt);
     const bool token_image_prefix = ds4_session_vision_prefix_matches(
         slot->session, req->images, req->image_count);
+    /* V4.1 rewinds exactly but only text-only checkpoints (ds4.c); a
+     * (NULL, 0) vision match is false while the checkpoint holds images. */
+    const bool ds41_rewind = ds4_engine_is_deepseek41(s->engine) &&
+        ds4_session_vision_prefix_matches(slot->session, NULL, 0);
     const int rewind_to = live_prefix_rewind_target(
-        ds4_engine_is_glm_dsa(s->engine), live_pos, req->prompt.len, common);
+        ds41_rewind || ds4_engine_is_glm_dsa(s->engine), ds41_rewind ? 2 : 1,
+        live_pos, req->prompt.len, common == req->prompt.len ? common : 0);
     if (rewind_to >= 0 && token_image_prefix) {
         pr.kind = REUSE_MEMORY_REWIND;
         pr.reuse_tokens = rewind_to;
@@ -11721,6 +11732,17 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
         pr.reuse_tokens = live_pos;
         pr.suffix_off = slot->live_text_len;
         return pr;
+    }
+
+    if (ds41_rewind && token_image_prefix && common < live_pos &&
+        common < req->prompt.len) {
+        const int diverged_to = live_prefix_rewind_target(true, 2, live_pos,
+                                                          req->prompt.len, common);
+        if (diverged_to >= 0) {
+            pr.kind = REUSE_MEMORY_REWIND;
+            pr.reuse_tokens = diverged_to;
+            return pr;
+        }
     }
 
     return pr;
@@ -11948,11 +11970,25 @@ static void trace_write_cache_diag(
     }
 }
 
-static int live_prefix_rewind_target(bool backend_can_rewind,
+/* Where a live session can drop back to instead of being rebuilt. GLM DSA
+ * rewinds to any position but only for a prompt that is a strict prefix of
+ * the live tokens (the last prompt token is re-evaluated for its logits).
+ * V4.1 (align 2: its compressed caches hold token pairs) also rewinds below a
+ * prompt that diverged from the live tokens, so re-asking with the last
+ * message edited costs the edited tail, not the whole 1M-token prefix. */
+static int live_prefix_rewind_target(bool backend_can_rewind, int align,
                                      int old_pos, int prompt_len, int common) {
-    if (!backend_can_rewind || prompt_len <= 1 || prompt_len >= old_pos) return -1;
-    if (common != prompt_len) return -1;
-    return prompt_len - 1;
+    if (!backend_can_rewind || prompt_len <= 1 || common <= 0) return -1;
+    int target;
+    if (common == prompt_len) {
+        if (prompt_len >= old_pos) return -1;
+        target = prompt_len - 1;
+    } else {
+        if (align < 2 || common >= old_pos) return -1;
+        target = common;
+    }
+    if (align > 1) target -= target % align;
+    return target >= align ? target : -1;
 }
 
 static void trace_time(FILE *fp) {
@@ -12442,6 +12478,19 @@ static int server_session_sync(server *s, server_slot *slot,
     pthread_mutex_lock(&s->inference_mu);
     int live = ds4_session_pos(slot->session);
     int common = ds4_session_common_prefix(slot->session, prompt);
+    if (common > 0 && common < live && ds4_engine_is_deepseek41(s->engine) &&
+        ds4_session_vision_prefix_matches(slot->session, NULL, 0)) {
+        /* The live checkpoint has a tail this prompt does not share.  V4.1
+         * rewinds exactly, so drop back to the shared prefix and resume
+         * there: starting at zero made the first slice truncate a reusable
+         * checkpoint to one quantum and refill the rest (the multimodal path
+         * below documents the same trap).  Stop one short of a full match so
+         * the last prompt token is re-evaluated for fresh logits. */
+        const int target = common < prompt->len ? common : prompt->len - 1;
+        ds4_session_rewind(slot->session, target);
+        live = ds4_session_pos(slot->session);
+        common = ds4_session_common_prefix(slot->session, prompt);
+    }
     pthread_mutex_unlock(&s->inference_mu);
     int done = common == live && prompt->len >= live ? live : 0;
     bool called = false;
@@ -12598,8 +12647,15 @@ static int server_generation_rewind(server *s, server_slot *slot,
     ds4_session_rewind(slot->session, pos);
     ds4_tokens prefix = {0};
     ds4_tokens_copy(&prefix, ds4_session_tokens(slot->session));
-    bool rebuild = ds4_session_common_prefix(slot->session, &prefix) != prefix.len;
+    const int common = ds4_session_common_prefix(slot->session, &prefix);
+    const bool rebuild = common != prefix.len;
     pthread_mutex_unlock(&s->inference_mu);
+    /* V4.1 rewinds in place (odd targets included); a rebuild of a long
+     * prefix here looks exactly like a hang, so say so if one happens. */
+    if (rebuild && prefix.len - common > 8 && ds4_engine_is_deepseek41(s->engine))
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: generation rewind to %d lost the live state; re-prefilling %d tokens",
+                   pos, prefix.len - common);
     int rc = rebuild ? server_session_sync_multimodal(s, slot, &prefix,
         r->images, r->image_count, err, errlen) : 0;
     ds4_tokens_free(&prefix);
@@ -13531,12 +13587,12 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             cache_source = "memory-rewind";
             cache_diag.rewind_to = reuse.reuse_tokens;
             server_log(DS4_LOG_KVCACHE,
-                       "ds4-server: rewound GLM live prefix from %d to %d; final prompt token will be reevaluated",
-                       old_pos, reuse.reuse_tokens);
+                       "ds4-server: rewound live prefix from %d to %d; %d prompt tokens will be reevaluated",
+                       old_pos, reuse.reuse_tokens, j->req.prompt.len - reuse.reuse_tokens);
         } else {
             cached = 0;
             server_log(DS4_LOG_KVCACHE,
-                       "ds4-server: GLM live prefix rewind from %d to %d requires rebuild",
+                       "ds4-server: live prefix rewind from %d to %d requires rebuild",
                        old_pos, reuse.reuse_tokens);
         }
         break;
@@ -16377,6 +16433,57 @@ static void test_slot_routing_staleness_tiers(void) {
     ds4_session_free_test_checkpoint(slots[3].session);
     ds4_tokens_free(&sub.req.prompt);
     ds4_tokens_free(&cont.req.prompt);
+}
+
+/* V4.1 rewind tiers of the reuse probe (V4.1 builds only): a strict
+ * truncation rewinds to a pair boundary; a prompt that diverged from the
+ * live tokens rewinds to the shared prefix, but only after every tier that
+ * needs no recompute -- a matching rendered-text prefix still wins. */
+static void test_slot_probe_v41_rewind_tiers(void) {
+    ds4_test_use_deepseek41_shape(1);
+    TEST_ASSERT(ds4_engine_is_deepseek41(NULL));
+    server s = {0};
+    int ckpt_tok[10];
+    for (int i = 0; i < 10; i++) ckpt_tok[i] = i + 1;
+    struct { int shared; int extra; slot_reuse_kind kind; int reuse; } cases[] = {
+        {8, 0, REUSE_MEMORY_REWIND, 6},   /* strict truncation: 8-1, paired */
+        {6, 6, REUSE_MEMORY_REWIND, 6},   /* diverged after 6 */
+        {7, 6, REUSE_MEMORY_REWIND, 6},   /* diverged after 7: paired down */
+        {10, 1, REUSE_MEMORY_TOKEN, 10},  /* exact extension */
+        {1, 6, REUSE_NONE, 0},            /* nothing worth a pair */
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        server_slot slot = {0};
+        slot.session = ds4_session_new_test_checkpoint(ckpt_tok, 10);
+        job j = {0};
+        for (int i = 0; i < cases[c].shared; i++) ds4_tokens_push(&j.req.prompt, i + 1);
+        for (int i = 0; i < cases[c].extra; i++) ds4_tokens_push(&j.req.prompt, 900 + i);
+        slot_reuse pr = slot_probe_reuse_locked(&s, &slot, &j.req);
+        TEST_ASSERT(pr.kind == cases[c].kind);
+        TEST_ASSERT(pr.reuse_tokens == cases[c].reuse);
+        ds4_session_free_test_checkpoint(slot.session);
+        request_free(&j.req);
+    }
+    /* Diverged tokens, but the live rendered text is a byte prefix of the
+     * request: memory-text keeps the whole checkpoint, no recompute. */
+    {
+        server_slot slot = {0};
+        slot.session = ds4_session_new_test_checkpoint(ckpt_tok, 10);
+        slot.live_text = xstrdup("<sys>turn1 ");
+        slot.live_text_len = strlen(slot.live_text);
+        slot.live_text_pos = 10;
+        job j = {0};
+        j.req.prompt_text = xstrdup("<sys>turn1 turn2");
+        for (int i = 0; i < 6; i++) ds4_tokens_push(&j.req.prompt, i + 1);
+        for (int i = 0; i < 6; i++) ds4_tokens_push(&j.req.prompt, 900 + i);
+        slot_reuse pr = slot_probe_reuse_locked(&s, &slot, &j.req);
+        TEST_ASSERT(pr.kind == REUSE_MEMORY_TEXT);
+        TEST_ASSERT(pr.reuse_tokens == 10);
+        free(slot.live_text);
+        ds4_session_free_test_checkpoint(slot.session);
+        request_free(&j.req);
+    }
+    ds4_test_use_deepseek41_shape(0);
 }
 
 static void test_slot_probe_live_state_tiers(void) {
@@ -21126,12 +21233,19 @@ static void test_model_metadata_clamps_completion_to_context(void) {
 }
 
 static void test_live_prefix_rewind_target(void) {
-    TEST_ASSERT(live_prefix_rewind_target(true, 17, 8, 8) == 7);
-    TEST_ASSERT(live_prefix_rewind_target(true, 49826, 48379, 48379) == 48378);
-    TEST_ASSERT(live_prefix_rewind_target(false, 17, 8, 8) == -1);
-    TEST_ASSERT(live_prefix_rewind_target(true, 17, 8, 7) == -1);
-    TEST_ASSERT(live_prefix_rewind_target(true, 8, 8, 8) == -1);
-    TEST_ASSERT(live_prefix_rewind_target(true, 17, 1, 1) == -1);
+    TEST_ASSERT(live_prefix_rewind_target(true, 1, 17, 8, 8) == 7);
+    TEST_ASSERT(live_prefix_rewind_target(true, 1, 49826, 48379, 48379) == 48378);
+    TEST_ASSERT(live_prefix_rewind_target(false, 1, 17, 8, 8) == -1);
+    TEST_ASSERT(live_prefix_rewind_target(true, 1, 17, 8, 7) == -1);
+    TEST_ASSERT(live_prefix_rewind_target(true, 1, 8, 8, 8) == -1);
+    TEST_ASSERT(live_prefix_rewind_target(true, 1, 17, 1, 1) == -1);
+    /* V4.1: pair-aligned, and below a diverging prompt too. */
+    TEST_ASSERT(live_prefix_rewind_target(true, 2, 17, 8, 8) == 6);
+    TEST_ASSERT(live_prefix_rewind_target(true, 2, 869024, 868904, 868904) == 868902);
+    TEST_ASSERT(live_prefix_rewind_target(true, 2, 17, 20, 9) == 8);
+    TEST_ASSERT(live_prefix_rewind_target(true, 2, 17, 8, 7) == 6);
+    TEST_ASSERT(live_prefix_rewind_target(true, 2, 17, 20, 17) == -1);
+    TEST_ASSERT(live_prefix_rewind_target(true, 2, 17, 3, 1) == -1);
 }
 
 static void test_client_socket_nonblocking_flag(void) {
@@ -22944,6 +23058,7 @@ static void ds4_server_unit_tests_run(void) {
     test_live_continuation_contract();
     test_slot_probe_and_routing_scores();
     test_slot_probe_live_state_tiers();
+    test_slot_probe_v41_rewind_tiers();
     test_slot_probe_vision_tiers();
     test_slot_routing_staleness_tiers();
     test_dispatch_routes_alien_request_to_empty_slot();
