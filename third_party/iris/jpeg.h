@@ -1395,6 +1395,9 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
             dec.se = file_data[sos_offset + 1];
             dec.ah = file_data[sos_offset + 2] >> 4;
             dec.al = file_data[sos_offset + 2] & 0x0F;
+            /* DS4: a progressive scan ends its spectral band at Se <= 63 (T.81
+             * Table B.3). The coefficient decoders walk jpeg_zigzag[64] up to Se. */
+            if (dec.is_progressive && dec.se > 63) goto fail;
 
             /* Setup bitstream for scan data */
             size_t scan_data_start = pos + seg_len;
