@@ -12968,6 +12968,38 @@ static bool remember_qwen_tool_turn_visible_checkpoint(server *s, server_slot *s
     return true;
 }
 
+/* GLM counterpart of the Qwen tool-turn key.  A chat client that carries tool
+ * schemas (Hermes, OpenAI-style agents) does not send the generated tool-call
+ * text back as reasoning, so the exact sampled live KV can never be continued
+ * token-for-token: the next request is strictly shorter than the live frontier.
+ * For GLM the compressed DSA KV cannot be rolled back by truncation
+ * (ds4_session_glm_mtp_rewind only handles the 2-token MTP cycle, so
+ * ds4_session_rewind() clears checkpoint_valid and the caller rebuilds the whole
+ * prefix - measured 30k tokens / ~100 s per follow-up turn).
+ *
+ * Remember the visible key instead (prompt + closed think block + the tool-call
+ * text), exactly like the Qwen path: the next request renders that same visible
+ * surface, thinking_live_visible_prefix_prompt() matches it, and the live KV is
+ * reused.  Eligibility mirrors build_thinking_visible_text(), which only
+ * succeeds when the prompt still ends with the open "<think>" marker. */
+static bool glm_tool_turn_checkpoint_eligible(const request *r, const char *finish,
+                                              bool inside_thinking,
+                                              const char *content) {
+    if (!r || r->model_syntax != SERVER_MODEL_SYNTAX_GLM) return false;
+    if (r->kind != REQ_CHAT || r->image_count != 0) return false;
+    if (r->api == API_RESPONSES || r->api == API_ANTHROPIC) return false;
+    if (!r->prompt_text || !r->prompt_text[0]) return false;
+    /* Use the decode finish, not the parser's promoted status: repaired,
+     * truncated or unclosed output is not this frontier. */
+    if (!finish || strcmp(finish, "tool_calls") || inside_thinking) return false;
+    if (!content || !content[0]) return false;
+    const char *think_tag = "<think>";
+    const size_t tag_len = strlen(think_tag);
+    const size_t prompt_len = strlen(r->prompt_text);
+    return prompt_len >= tag_len &&
+           memcmp(r->prompt_text + prompt_len - tag_len, think_tag, tag_len) == 0;
+}
+
 /* After a successful tool-call finish, make the live checkpoint match what the
  * next request will render.  Usually that is just the exact DSML remembered by
  * tool id.  If a client sends a tool call without an id we know, the fallback
@@ -14596,11 +14628,30 @@ decode_again:
                                      parsed_reasoning, &parsed_calls);
         thinking_live_clear(s, slot);
     } else if (parsed_calls.len) {
-        if (!remember_qwen_tool_turn_visible_checkpoint(
+        /* GLM consumes the DSML tool call out of the generated content, so
+         * parsed_content is empty on a tool turn; the exact sampled text lives
+         * in raw_tool_text and is what the client will send back. */
+        const char *tool_turn_content = parsed_content && parsed_content[0] ?
+                                        parsed_content :
+                                        (parsed_calls.raw_tool_text ?
+                                         parsed_calls.raw_tool_text : "");
+        bool checkpoint_remembered = remember_qwen_tool_turn_visible_checkpoint(
                 s, slot, j, ctx_span, finish, thinking.inside,
-                parsed_content ? parsed_content : "",
-                &parsed_calls))
+                tool_turn_content,
+                &parsed_calls);
+        if (!checkpoint_remembered &&
+            glm_tool_turn_checkpoint_eligible(&j->req, finish, thinking.inside,
+                                              tool_turn_content))
         {
+            /* GLM has no raw-DSML replay path (should_canonicalize_tool_checkpoint
+             * returns false once raw_tool_text is known) and no truncating rewind,
+             * so without this the live checkpoint is cleared and every follow-up
+             * turn rebuilds its prefix. */
+            remember_thinking_checkpoint(s, slot, j, ctx_span, trace_id,
+                                         tool_turn_content, false);
+            checkpoint_remembered = true;
+        }
+        if (!checkpoint_remembered) {
             thinking_live_clear(s, slot);
         }
     } else if (!parsed_calls.len &&
@@ -21125,6 +21176,32 @@ static void test_model_metadata_clamps_completion_to_context(void) {
     buf_free(&b);
 }
 
+static void test_glm_tool_turn_checkpoint_eligible(void) {
+    request r;
+    memset(&r, 0, sizeof r);
+    r.kind = REQ_CHAT;
+    r.api = API_OPENAI;
+    r.model_syntax = SERVER_MODEL_SYNTAX_GLM;
+    r.prompt_text = "<|system|>\nhi<|user|>\nrun<|assistant|>\n<think>";
+    /* eligible: GLM chat tool turn, open think block, tool text present */
+    TEST_ASSERT(glm_tool_turn_checkpoint_eligible(&r, "tool_calls", false, "<tool_call>x</tool_call>"));
+    /* not eligible: finished turn, still inside thinking, empty tool text, no finish */
+    TEST_ASSERT(!glm_tool_turn_checkpoint_eligible(&r, "stop", false, "<tool_call>x</tool_call>"));
+    TEST_ASSERT(!glm_tool_turn_checkpoint_eligible(&r, "tool_calls", true, "<tool_call>x</tool_call>"));
+    TEST_ASSERT(!glm_tool_turn_checkpoint_eligible(&r, "tool_calls", false, ""));
+    TEST_ASSERT(!glm_tool_turn_checkpoint_eligible(&r, NULL, false, "<tool_call>x</tool_call>"));
+    /* not eligible: other syntax, other protocol, or a prompt without the open marker */
+    r.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
+    TEST_ASSERT(!glm_tool_turn_checkpoint_eligible(&r, "tool_calls", false, "<tool_call>x</tool_call>"));
+    r.model_syntax = SERVER_MODEL_SYNTAX_GLM;
+    r.api = API_RESPONSES;
+    TEST_ASSERT(!glm_tool_turn_checkpoint_eligible(&r, "tool_calls", false, "<tool_call>x</tool_call>"));
+    r.api = API_OPENAI;
+    r.prompt_text = "<|assistant|>\nclosed";
+    TEST_ASSERT(!glm_tool_turn_checkpoint_eligible(&r, "tool_calls", false, "<tool_call>x</tool_call>"));
+    TEST_ASSERT(!glm_tool_turn_checkpoint_eligible(NULL, "tool_calls", false, "<tool_call>x</tool_call>"));
+}
+
 static void test_live_prefix_rewind_target(void) {
     TEST_ASSERT(live_prefix_rewind_target(true, 17, 8, 8) == 7);
     TEST_ASSERT(live_prefix_rewind_target(true, 49826, 48379, 48379) == 48378);
@@ -23067,6 +23144,7 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_history_validation_handles_large_replays();
     test_model_metadata_clamps_completion_to_context();
     test_live_prefix_rewind_target();
+    test_glm_tool_turn_checkpoint_eligible();
     test_client_socket_nonblocking_flag();
     test_client_disconnect_probe();
     test_cancelled_progress_callback_is_inert();
