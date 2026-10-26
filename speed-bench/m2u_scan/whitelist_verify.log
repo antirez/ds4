@@ -1,0 +1,18 @@
+==== V1: rope-fuse whitelist (decode) | 06:34:05
+metal-decode-schedule-bench: model=ds4flash.gguf prompt=speed-bench/promessi_sposi.txt prefix=2048 ctx=3072 warmup=16 measured=512 control=2/32 candidate=2/32 candidate_env=DS4_METAL_DISABLE_AFFINE_ROPE_PAIR include_selection=yes
+variant=control first_split=2 second_split=32 tokens=512 seconds=17.578268 tokens_per_second=29.1269
+variant=candidate first_split=2 second_split=32 tokens=512 seconds=18.193965 tokens_per_second=28.1412
+exact_rows=529 exact_floats=68389120 exact_selected_ids=528 vocab=129280
+### V1 done 06:35:04
+==== V2: prefill mask-cache whitelist (bit-exact via decode rows) | 06:35:04
+metal-decode-schedule-bench: model=ds4flash.gguf prompt=speed-bench/promessi_sposi.txt prefix=8192 ctx=9216 warmup=16 measured=256 control=2/32 candidate=2/32 candidate_env=DS4_METAL_DISABLE_ZERO_PREFIX_PREFILL_MASK_CACHE include_selection=yes
+variant=control first_split=2 second_split=32 tokens=256 seconds=9.093094 tokens_per_second=28.1532
+variant=candidate first_split=2 second_split=32 tokens=256 seconds=9.094555 tokens_per_second=28.1487
+exact_rows=273 exact_floats=35293440 exact_selected_ids=272 vocab=129280
+### V2 done 06:36:19
+==== V3: mask-cache PREFILL perf (pure prefill, ctx 16384) | 06:36:19
+### V3a cache ON (no env)
+ds4-bench: context buffers 624.17 MiB (ctx=16385, backend=metal, prefill_chunk=4096, raw_kv_rows=4352, compressed_kv_rows=4098)
+### V3b cache OFF (env set)
+ds4-bench: context buffers 624.17 MiB (ctx=16385, backend=metal, prefill_chunk=4096, raw_kv_rows=4352, compressed_kv_rows=4098)
+==== VERIFY COMPLETE Sun Aug 30 06:38:00 CST 2026 ====
