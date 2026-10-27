@@ -224,6 +224,7 @@ tests/test_metal_command_memory: tests/test_metal_command_memory.c ds4_gpu.h $(C
 .PHONY: test-metal-command-memory
 test-metal-command-memory: tests/test_metal_command_memory
 	MTL_DEBUG_LAYER=1 ./tests/test_metal_command_memory
+	MTL_DEBUG_LAYER=1 ./tests/test_metal_command_memory buffers
 	MTL_DEBUG_LAYER=1 ./tests/test_metal_command_memory row
 	MTL_DEBUG_LAYER=1 ./tests/test_metal_command_memory session
 	MTL_DEBUG_LAYER=1 ./tests/test_metal_command_memory batch
@@ -238,6 +239,12 @@ tests/test_deepseek41_metal: tests/test_deepseek41_metal.o $(CORE_OBJS)
 .PHONY: test-deepseek41-metal
 test-deepseek41-metal: tests/test_deepseek41_metal
 	./tests/test_deepseek41_metal
+
+tests/test_deepseek41_native_graph.o: tests/test_deepseek41_native_graph.c ds4.c ds4_gpu.h ds4_engram.h ds4_deepseek41_gpu.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
+
+tests/test_deepseek41_native_graph: tests/test_deepseek41_native_graph.o $(filter-out ds4.o,$(CORE_OBJS))
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -o $@ $^ $(METAL_LDLIBS)
 
 tests/test_deepseek41_graph.o: tests/test_deepseek41_graph.c ds4.c ds4_gpu.h ds4_engram.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
@@ -1387,7 +1394,7 @@ clean:
 	rm -f tests/test_cuda_v41_fusion
 	rm -f tests/test_cuda_ssd_repack
 	rm -f tests/test_deepseek41_gguf
-	rm -f tests/test_deepseek41_graph tests/test_deepseek41_cli
+	rm -f tests/test_deepseek41_graph tests/test_deepseek41_native_graph tests/test_deepseek41_cli
 	rm -f tests/test_deepseek41_dspark
 	rm -f tests/test_deepseek41_rocm gguf-tools/quality-testing/score_official_verify gguf-tools/quality-testing/score_official_verify.o
 	rm -f tests/test_deepseek41_prefill

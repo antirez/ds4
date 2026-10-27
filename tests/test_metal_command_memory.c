@@ -1,5 +1,6 @@
 /* Exercise the C entry points without an Objective-C caller's autorelease pool. */
 #include "ds4_gpu.h"
+#include <mach/mach.h>
 #include <malloc/malloc.h>
 #include <stdio.h>
 #include <string.h>
@@ -77,14 +78,57 @@ done:
     return rc;
 }
 
+/* Fresh streamed buffers must be released after their completed commands.
+ * The fixed-buffer heap checks cannot see retained IOAccelerator allocations. */
+static int check_buffer_memory(void) {
+    ds4_gpu_tensor *a = NULL, *b = NULL;
+    const uint64_t bytes = 8u * 1024u * 1024u;
+    uint64_t baseline = 0;
+    int rc = 1;
+    CHECK(ds4_gpu_init());
+    a = ds4_gpu_tensor_alloc(bytes);
+    CHECK(a && ds4_gpu_tensor_fill_f32(a, 1, bytes / sizeof(float)));
+    for (int i = 0; i < 256; i++) {
+        float value = 0;
+        b = ds4_gpu_tensor_alloc(bytes);
+        CHECK(b && ds4_gpu_tensor_contents(b));
+        CHECK(ds4_gpu_tensor_write(b, 0, &value, sizeof(value)));
+        CHECK(ds4_gpu_begin_commands());
+        CHECK(ds4_gpu_tensor_copy(b, 0, a, 0, bytes));
+        CHECK(ds4_gpu_end_commands());
+        CHECK(ds4_gpu_tensor_read(b, bytes - sizeof(float), &value, sizeof(value)));
+        CHECK(value == 1);
+        ds4_gpu_tensor_free(b);
+        b = NULL;
+        if (i % 32 == 31) {
+            task_vm_info_data_t info;
+            mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+            CHECK(task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&info, &count) == KERN_SUCCESS);
+            if (!baseline) baseline = info.phys_footprint;
+            fprintf(stderr, "Metal streamed buffers: %d batches, footprint %.3f MiB\n",
+                    i + 1, info.phys_footprint / 1048576.0);
+            CHECK(info.phys_footprint <= baseline + 128u * 1024u * 1024u);
+        }
+    }
+    puts("Metal streamed buffer contents and bounded allocation lifetime: PASS");
+    rc = 0;
+done:
+    if (ds4_gpu_commands_active()) ds4_gpu_end_commands();
+    ds4_gpu_tensor_free(b);
+    ds4_gpu_tensor_free(a);
+    ds4_gpu_cleanup();
+    return rc;
+}
+
 int main(int argc, char **argv) {
     if (argc == 2) {
+        if (!strcmp(argv[1], "buffers")) return check_buffer_memory();
         const char *modes[] = {"row", "session", "batch", "big"};
         for (int i = 0; i < 4; i++)
             if (!strcmp(argv[1], modes[i])) return check_tp_memory(i);
     }
     if (argc != 1) {
-        fprintf(stderr, "usage: %s [row|session|batch|big]\n", argv[0]);
+        fprintf(stderr, "usage: %s [row|session|batch|big|buffers]\n", argv[0]);
         return 2;
     }
     ds4_gpu_tensor *a = NULL, *b = NULL;

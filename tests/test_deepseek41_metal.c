@@ -158,7 +158,7 @@ static int check_router(void) {
     return 1;
 }
 
-static int check_quantization(void) {
+static int check_quantization(bool native) {
     enum { WIDTH = 512, ROWS = 33, N = WIDTH * ROWS };
     float *source = malloc(N * sizeof(float)), *actual = malloc(N * sizeof(float));
     CHECK(source && actual);
@@ -168,6 +168,22 @@ static int check_quantization(void) {
         const int block = mode == DS4_V41_FP4_E4M3 ? 16 : 32;
         for (int i = 0; i < N; i++) source[i] = random_value() * (1u << ((i / block) % 4));
         for (int i = 0; i < WIDTH; i++) source[i] = copysignf(0.0f, i & 1 ? -1.0f : 1.0f);
+        if (native && mode == DS4_V41_FP4_E4M3) {
+            /* Every finite nonzero FP8 scale and both signs of all E2M1
+             * midpoints. Approximate division used to choose an odd code. */
+            const float midpoint[] = {.25f,.75f,1.25f,1.75f,2.5f,3.5f,5.f};
+            for (int start = WIDTH; start < N; start += 16) {
+                const unsigned code = 1u + (unsigned)(start / 16) % 126u;
+                const unsigned e = code >> 3, m = code & 7;
+                const float scale = e ? ldexpf(1.f + m / 8.f, (int)e - 7) : m / 512.f;
+                source[start] = 6.f * scale;
+                source[start + 15] = 0.f;
+                for (unsigned j = 0; j < 7; j++) {
+                    source[start + 1 + 2*j] = midpoint[j] * scale;
+                    source[start + 2 + 2*j] = -midpoint[j] * scale;
+                }
+            }
+        }
         CHECK(ds4_gpu_tensor_write(t, 0, source, N * sizeof(float)));
         CHECK(ds4_gpu_dsv41_quantize(t, WIDTH, ROWS, (ds4_v41_activation_format)mode));
         CHECK(ds4_gpu_tensor_read(t, 0, actual, N * sizeof(float)));
@@ -1256,7 +1272,285 @@ static int check_tp_attention(void) {
     return 1;
 }
 
+#ifdef __APPLE__
+static int check_native_source_arithmetic(void) {
+    enum { WIDTH = 96, HIDDEN = 32, BANK = HIDDEN * (WIDTH / 32) * 17 };
+    const size_t bytes = (size_t)getpagesize();
+    unsigned char *map = NULL;
+    CHECK(bytes >= 3u * BANK + 2u * WIDTH * sizeof(float));
+    CHECK(posix_memalign((void **)&map, bytes, bytes) == 0);
+    memset(map, 0, bytes);
+    /* One expert. The gate's three scaled blocks contribute 1, 2^25,
+     * -2^25. Source FP32 block accumulation gives zero before SwiGLU;
+     * the old lane-wise long dot canceled the large terms first. */
+    for (unsigned bank = 0; bank < 3; bank++)
+        for (unsigned block = 0; block < BANK / 17; block++) map[bank * BANK + block * 17] = 127;
+    map[1] = 2; map[17] = 152; map[19] = 2; map[34] = 152; map[36] = 10;
+    map[BANK + 1] = 2;
+    for (unsigned row = 0; row < WIDTH; row++) map[2 * BANK + row * 17 + 1] = 2;
+    float *dense = (float *)(map + 3 * BANK);
+    dense[0] = 1; dense[33] = 0x1p25f; dense[65] = -0x1p25f;
+    uint16_t *packed = (uint16_t *)(dense + WIDTH);
+    for (unsigned i = 0; i < WIDTH; i++) {
+        uint32_t bits; memcpy(&bits, dense + i, sizeof(bits)); packed[i] = (uint16_t)(bits >> 16);
+    }
+    CHECK(ds4_gpu_set_model_map(map, bytes));
+    float input[WIDTH], one = 1; int32_t id = 0;
+    for (unsigned i = 0; i < WIDTH; i++) input[i] = 1;
+    ds4_gpu_tensor *x = upload(input, sizeof(input)), *selected = upload(&id, sizeof(id));
+    ds4_gpu_tensor *weight = upload(&one, sizeof(one)), *out = upload(NULL, sizeof(input));
+    ds4_gpu_tensor *gate = upload(NULL, HIDDEN * 4), *up = upload(NULL, HIDDEN * 4);
+    ds4_gpu_tensor *mid = upload(NULL, HIDDEN * 4), *experts = upload(NULL, sizeof(input));
+    CHECK(x && selected && weight && out && gate && up && mid && experts);
+    ds4_gpu_tensor *wide[3], *raw[3];
+    uint32_t errors = 0;
+    ds4_gpu_tensor *err = upload(&errors, sizeof(errors));
+    CHECK(err);
+    for (unsigned part = 0; part < 3; part++) {
+        raw[part] = upload(map + part * BANK, BANK);
+        wide[part] = upload(NULL, WIDTH * HIDDEN * sizeof(uint16_t));
+        CHECK(raw[part] && wide[part] &&
+            ds4_gpu_dsv41_native_expand_mxfp4_bf16(wide[part], raw[part], err, WIDTH * HIDDEN));
+    }
+    CHECK(ds4_gpu_synchronize() && ds4_gpu_tensor_read(err, 0, &errors, sizeof(errors)) && !errors);
+    const float *actual;
+    for (unsigned expanded = 0; expanded < 2; expanded++) {
+        CHECK(ds4_gpu_begin_commands());
+        CHECK(ds4_gpu_dsv41_native_moe(out, gate, up, mid, experts, map, bytes, 0, BANK, 2 * BANK,
+            WIDTH, HIDDEN, 1, 1, selected, weight, 10.f, x,
+            expanded ? wide[0] : NULL, expanded ? wide[1] : NULL, expanded ? wide[2] : NULL,
+            expanded != 0, expanded != 0, NULL, 1u));
+        CHECK(ds4_gpu_end_commands());
+        CHECK(ds4_gpu_synchronize());
+        actual = ds4_gpu_tensor_contents(out);
+        for (unsigned i = 0; i < WIDTH; i++) CHECK(actual[i] == 0.f);
+    }
+    for (unsigned part = 0; part < 3; part++) {
+        ds4_gpu_tensor_free(raw[part]); ds4_gpu_tensor_free(wide[part]);
+    }
+    ds4_gpu_tensor_free(err);
+    for (unsigned bf = 0; bf < 2; bf++) {
+        CHECK(ds4_gpu_dsv41_native_matmul_fp8(out, map, bytes,
+            (unsigned char *)(bf ? (void *)packed : (void *)dense) - map, WIDTH, 1, x, bf != 0));
+        CHECK(ds4_gpu_synchronize());
+        CHECK(*(const float *)ds4_gpu_tensor_contents(out) == 0.f);
+    }
+    /* Token tails and expert regrouping must preserve original output slots.
+     * Saturated gate 16 rounds to an exact power of two after SwiGLU; all
+     * remaining products and FP8 casts are exact for these inputs. */
+    enum { TOKENS = 17, USED = 2, EXPERTS = 3 };
+    float inputs[TOKENS * WIDTH], routing[TOKENS * USED];
+    int32_t selection[TOKENS * USED];
+    float guarded[(TOKENS + 1) * WIDTH];
+    memset(inputs, 0, sizeof(inputs));
+    for (unsigned t = 0; t < TOKENS; t++) {
+        inputs[t * WIDTH] = (float)(1u << (t % 7u));
+        for (unsigned j = 0; j < USED; j++) {
+            selection[t * USED + j] = (int32_t)((t + 2u * j) % EXPERTS);
+            routing[t * USED + j] = j ? 0.5f : 0.25f;
+        }
+    }
+    for (unsigned i = 0; i < (TOKENS + 1u) * WIDTH; i++) guarded[i] = 12345.f;
+    ds4_gpu_tensor *bx = upload(inputs, sizeof(inputs)), *bs = upload(selection, sizeof(selection));
+    ds4_gpu_tensor *bw = upload(routing, sizeof(routing)), *bo = upload(guarded, sizeof(guarded));
+    ds4_gpu_tensor *bg = upload(NULL, TOKENS * USED * HIDDEN * 4u);
+    ds4_gpu_tensor *bu = upload(NULL, TOKENS * USED * HIDDEN * 4u);
+    ds4_gpu_tensor *bm = upload(NULL, TOKENS * USED * HIDDEN * 4u);
+    ds4_gpu_tensor *be = upload(NULL, TOKENS * USED * WIDTH * 4u);
+    CHECK(bx && bs && bw && bo && bg && bu && bm && be);
+    for (unsigned part = 0; part < 3u; part++) {
+        uint16_t bank[EXPERTS * WIDTH * HIDDEN];
+        memset(bank, 0, sizeof(bank));
+        for (unsigned expert = 0; expert < EXPERTS; expert++) {
+            const float value = part == 0 ? 16.f : part == 1 ? (float)(expert + 1u) / 64.f : (float)(1u << expert);
+            uint32_t bits; memcpy(&bits, &value, sizeof(bits));
+            for (unsigned row = 0; row < (part == 2 ? WIDTH : 1u); row++)
+                bank[expert * WIDTH * HIDDEN + row * (part == 2 ? HIDDEN : WIDTH)] = (uint16_t)(bits >> 16);
+        }
+        wide[part] = upload(bank, sizeof(bank));
+        CHECK(wide[part]);
+    }
+    CHECK(ds4_gpu_dsv41_native_moe(bo, bg, bu, bm, be, map, bytes, 0, 0, 0,
+        WIDTH, HIDDEN, EXPERTS, USED, bs, bw, 16.f, bx,
+        wide[0], wide[1], wide[2], true, true, NULL, TOKENS));
+    CHECK(ds4_gpu_end_commands() && ds4_gpu_tensor_read(bo, 0, guarded, sizeof(guarded)));
+    for (unsigned t = 0; t < TOKENS; t++) {
+        float expected = 0.f;
+        for (unsigned j = 0; j < USED; j++) {
+            const unsigned expert = (unsigned)selection[t * USED + j];
+            expected += inputs[t * WIDTH] * (float)((expert + 1u) * (1u << expert)) * routing[t * USED + j] / 4.f;
+        }
+        for (unsigned i = 0; i < WIDTH; i++) CHECK(guarded[t * WIDTH + i] == expected);
+    }
+    for (unsigned i = TOKENS * WIDTH; i < (TOKENS + 1u) * WIDTH; i++) CHECK(guarded[i] == 12345.f);
+    for (unsigned t = 0; t < TOKENS; t++) inputs[t * WIDTH + 33u] = inputs[t * WIDTH + 65u] = 1.f;
+    CHECK(ds4_gpu_tensor_write(bx, 0, inputs, sizeof(inputs)));
+    for (unsigned bf = 0; bf < 2u; bf++) {
+        CHECK(ds4_gpu_dsv41_native_matmul_fp8_rows(bo, map, bytes,
+            (unsigned char *)(bf ? (void *)packed : (void *)dense) - map,
+            WIDTH, 1u, bx, bf != 0, TOKENS));
+        CHECK(ds4_gpu_synchronize());
+        actual = ds4_gpu_tensor_contents(bo);
+        for (unsigned t = 0; t < TOKENS; t++)
+            CHECK(actual[t] == (t % 7u < 2u ? 0.f : (float)(1u << (t % 7u))));
+    }
+    for (unsigned part = 0; part < 3u; part++) ds4_gpu_tensor_free(wide[part]);
+    ds4_gpu_tensor_free(bx); ds4_gpu_tensor_free(bs); ds4_gpu_tensor_free(bw); ds4_gpu_tensor_free(bo);
+    ds4_gpu_tensor_free(bg); ds4_gpu_tensor_free(bu); ds4_gpu_tensor_free(bm); ds4_gpu_tensor_free(be);
+    ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(selected); ds4_gpu_tensor_free(weight);
+    ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(gate); ds4_gpu_tensor_free(up);
+    ds4_gpu_tensor_free(mid); ds4_gpu_tensor_free(experts);
+    /* Independent token rows share the HC matrix, but retain their own
+     * RMS scale. Powers of two make the expected signed row values exact. */
+    float hc_inputs[TOKENS * 32u], hc_outputs[(TOKENS + 1u) * 24u];
+    memset(map, 0, bytes);
+    for (unsigned row = 0; row < 24u; row++) ((float *)map)[row * 32u] = (float)(row + 1u);
+    for (unsigned t = 0; t < TOKENS; t++)
+        for (unsigned col = 0; col < 32u; col++)
+            hc_inputs[t * 32u + col] = (t & 1u ? -1.f : 1.f) * (float)(1u << (t % 4u));
+    for (unsigned i = 0; i < (TOKENS + 1u) * 24u; i++) hc_outputs[i] = 12345.f;
+    bx = upload(hc_inputs, sizeof(hc_inputs)); bo = upload(hc_outputs, sizeof(hc_outputs));
+    CHECK(bx && bo && ds4_gpu_dsv41_native_hc_rows(bo, bx, map, bytes, 0, 32u, 24u, 0.f, TOKENS));
+    CHECK(ds4_gpu_synchronize() && ds4_gpu_tensor_read(bo, 0, hc_outputs, sizeof(hc_outputs)));
+    for (unsigned t = 0; t < TOKENS; t++)
+        for (unsigned row = 0; row < 24u; row++)
+            CHECK(hc_outputs[t * 24u + row] == (t & 1u ? -1.f : 1.f) * (float)(row + 1u));
+    for (unsigned row = 0; row < 24u; row++) CHECK(hc_outputs[TOKENS * 24u + row] == 12345.f);
+    ds4_gpu_tensor_free(bx); ds4_gpu_tensor_free(bo);
+    /* HC must compute the residual cancellation first, then add the block.
+     * Including 1 in the residual sum loses it against 2^25. */
+    const float residual[] = {0x1p25f, -0x1p25f, 0.f, 0.f};
+    float split[24] = {0};
+    for (unsigned j = 0; j < 4; j++) { split[4+j] = 1; split[8+j] = 1; split[12+j] = 1; }
+    ds4_gpu_tensor *r = upload(residual, sizeof(residual)), *sp = upload(split, sizeof(split));
+    x = upload(&one, sizeof(one)); out = upload(NULL, sizeof(residual));
+    CHECK(r && sp && x && out && ds4_gpu_hc_expand_split_tensor(out, x, r, sp, 1, 4) &&
+          ds4_gpu_dsv41_quantize(out, 4, 1, DS4_V41_BF16));
+    CHECK(ds4_gpu_synchronize()); actual = ds4_gpu_tensor_contents(out);
+    for (unsigned j = 0; j < 4; j++) CHECK(actual[j] == 1.f);
+    /* Each source product is rounded before addition. These products round
+     * to 0x1.020002p-1, then cancel; FMA retains a spurious 2^-31. Cover
+     * both a residual product and the separately added block product. */
+    for (unsigned final_product = 0; final_product < 2; final_product++) {
+        float values[] = {-1.f, final_product ? 0.f : 0x1.02p0f, 0.f, 0.f};
+        float block = final_product ? 0x1.02p0f : 0.f;
+        memset(split, 0, sizeof(split));
+        for (unsigned j = 0; j < 4; j++) {
+            split[8+j] = 0x1.020002p-1f;
+            split[(final_product ? 4 : 12)+j] = 0x1.000002p-1f;
+        }
+        CHECK(ds4_gpu_tensor_write(r, 0, values, sizeof(values)) &&
+            ds4_gpu_tensor_write(sp, 0, split, sizeof(split)) &&
+            ds4_gpu_tensor_write(x, 0, &block, sizeof(block)) &&
+            ds4_gpu_hc_expand_split_tensor(out, x, r, sp, 1, 4) &&
+            ds4_gpu_dsv41_quantize(out, 4, 1, DS4_V41_BF16));
+        CHECK(ds4_gpu_synchronize()); actual = ds4_gpu_tensor_contents(out);
+        for (unsigned j = 0; j < 4; j++) CHECK(actual[j] == 0.f);
+    }
+    ds4_gpu_tensor_free(r); ds4_gpu_tensor_free(sp); ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(out);
+    /* hc_pre has the same separate product boundary, both at the final
+     * head and in the fused block-input operation. */
+    float channels[16] = {0}, pre[] = {0x1.020002p-1f, 0x1.000002p-1f, 0.f, 0.f};
+    float mixes[24] = {0};
+    for (unsigned j = 0; j < 4; j++) { channels[j] = -1.f; channels[4+j] = 0x1.02p0f; }
+    memset(map, 0, bytes);
+    for (unsigned j = 0; j < 4; j++) ((float *)(map + 128))[j] = 1.f;
+    r = upload(channels, sizeof(channels)); sp = upload(NULL, sizeof(mixes));
+    x = upload(NULL, 4 * sizeof(float)); out = upload(NULL, 4 * sizeof(float));
+    ds4_gpu_tensor *pre_w = upload(pre, sizeof(pre)), *mix = upload(mixes, sizeof(mixes));
+    CHECK(r && sp && x && out && pre_w && mix);
+    CHECK(ds4_gpu_hc_weighted_sum_tensor(x, r, pre_w, 4, 4));
+    CHECK(ds4_gpu_synchronize()); actual = ds4_gpu_tensor_contents(x);
+    for (unsigned j = 0; j < 4; j++) CHECK(actual[j] == 0.f);
+    CHECK(ds4_gpu_dsv41_native_hc_input(x, out, sp, mix, r, pre_w, map, bytes, 0, 16, 128,
+        4, 4, 20, 1e-6f, 1e-6f));
+    CHECK(ds4_gpu_synchronize()); actual = ds4_gpu_tensor_contents(x);
+    for (unsigned j = 0; j < 4; j++) CHECK(actual[j] == 0.f);
+    ds4_gpu_tensor_free(r); ds4_gpu_tensor_free(sp); ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(pre_w); ds4_gpu_tensor_free(mix);
+    /* Exhaust every FP4 code and E8M0 scale, including signed zeros and
+     * the native decoder's canonical NaN for invalid/overflowing values. */
+    unsigned char encoded[256 * 17];
+    for (unsigned scale = 0; scale < 256; scale++) {
+        encoded[scale * 17] = (unsigned char)scale;
+        for (unsigned i = 0; i < 16; i++) encoded[scale * 17 + 1 + i] = i | ((15 - i) << 4);
+    }
+    x = upload(encoded, sizeof(encoded)); out = upload(NULL, 256 * 32 * sizeof(uint16_t));
+    err = upload(&errors, sizeof(errors));
+    CHECK(x && out && err && ds4_gpu_dsv41_native_expand_mxfp4_bf16(out, x, err, 256 * 32));
+    CHECK(ds4_gpu_synchronize() && ds4_gpu_tensor_read(err, 0, &errors, sizeof(errors)) && !errors);
+    const uint16_t *expanded_bits = ds4_gpu_tensor_contents(out);
+    const float magnitudes[] = {0.f, .5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+    for (unsigned scale = 0; scale < 256; scale++) for (unsigned i = 0; i < 32; i++) {
+        const unsigned code = i < 16 ? i : 31 - i;
+        const float value = copysignf(ldexpf(magnitudes[code & 7], (int)scale - 127),
+                                      code & 8 ? -1.f : 1.f);
+        uint32_t bits; memcpy(&bits, &value, sizeof(bits));
+        if (scale == 255 || !isfinite(value)) bits = 0x7fc00000u;
+        CHECK((uint32_t)expanded_bits[scale * 32 + i] << 16 == bits);
+    }
+    ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(err);
+    /* Equal winning scores are spread across all eight SIMD groups. */
+    float router_logits[384] = {0};
+    memset(map, 0, bytes);
+    for (unsigned i = 0; i < 384; i++) ((float *)map)[i] = (float)(i % 64);
+    x = upload(router_logits, sizeof(router_logits)); out = upload(NULL, sizeof(router_logits));
+    selected = upload(NULL, 6 * sizeof(int32_t)); weight = upload(NULL, 6 * sizeof(float));
+    CHECK(x && out && selected && weight && ds4_gpu_dsv41_native_router(selected, weight,
+        out, x, map, bytes, 0, 384, 6, 2.5f));
+    CHECK(ds4_gpu_synchronize());
+    const int32_t *chosen = ds4_gpu_tensor_contents(selected);
+    actual = ds4_gpu_tensor_contents(weight);
+    for (unsigned i = 0; i < 6; i++) {
+        CHECK(chosen[i] == (int32_t)(63 + 64 * i));
+        CHECK(fabsf(actual[i] - 2.5f / 6.f) < 1e-7f);
+    }
+    ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(selected); ds4_gpu_tensor_free(weight);
+    ds4_gpu_cleanup(); free(map);
+    fprintf(stderr, "native FP8/FP4 block accumulation and HC source order: PASS\n");
+    return 1;
+}
+/* A real key at position 248 crosses a BF16 midpoint if the rotation's
+ * two products are contracted in the opposite order. */
+static int check_native_key_rotation(void) {
+    const float rotary[] = {
+        .1484375f, .9609375f, .314453125f, .953125f, 1.3515625f, -.44140625f,
+        -.216796875f, .72265625f, -1.0703125f, -.2021484375f, .134765625f, .392578125f,
+        -.83203125f, .7890625f, .296875f, 1.234375f, -.64453125f, -.1015625f,
+        .83984375f, -.95703125f, -1.078125f, -2.21875f, .263671875f, -.85546875f,
+        .177734375f, .1953125f, -1.3828125f, -.1953125f, -.455078125f, -.2392578125f,
+        .09619140625f, .466796875f,
+    };
+    const float expected[] = {
+        -.3125f, -.9375f, -.5625f, .875f, -1.125f, -.9375f, .5f, .5625f,
+        -.6875f, .875f, -.04296875f, .40625f, -1.125f, -.375f, 1.125f, .625f,
+        -.625f, .00634765625f, .21875f, 1.25f, -1.875f, -1.625f, -.8125f, .34375f,
+        -.234375f, -.1171875f, .625f, -1.25f, .1171875f, -.5f, -.3125f, .375f,
+    };
+    float input[512] = {0}, actual[512];
+    memcpy(input + 448, rotary, sizeof(rotary));
+    ds4_gpu_tensor *x = upload(input, sizeof(input));
+    ds4_gpu_tensor *out = upload(NULL, sizeof(actual));
+    CHECK(x && out && ds4_gpu_dsv41_native_rope_quantize(x, out, 0,
+        512, 248, true, DS4_V41_FP8_E8M0));
+    CHECK(ds4_gpu_synchronize() && ds4_gpu_tensor_read(out, 0, actual, sizeof(actual)));
+    for (unsigned i = 0; i < 32; i++) CHECK(actual[448 + i] == expected[i]);
+    ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(out);
+    fprintf(stderr, "native key rotation midpoint: PASS\n");
+    return 1;
+}
+#endif
+
 int main(int argc, char **argv) {
+#ifdef __APPLE__
+    if (argc == 2 && !strcmp(argv[1], "--native-source")) {
+        const int ok = ds4_gpu_dsv41_require_native_math() && ds4_gpu_init() &&
+            check_quantization(true) && check_native_key_rotation() && check_native_source_arithmetic();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
+#endif
     if (argc == 2 && !strcmp(argv[1], "--embedding")) {
         const int ok = ds4_gpu_init() && check_embedding();
         ds4_gpu_cleanup();
@@ -1317,7 +1611,7 @@ int main(int argc, char **argv) {
         return ok ? 0 : 1;
     }
     if (argc != 1) return 2;
-    int ok = ds4_gpu_init() && check_router() && check_quantization() && check_engram() && check_rope_stride() && check_pool() &&
+    int ok = ds4_gpu_init() && check_router() && check_quantization(false) && check_engram() && check_rope_stride() && check_pool() &&
              check_candidates() && check_sparse_gather() && check_indexer_batch() &&
              check_embedding() && check_index_projection() && check_general_topk() && check_causal_topk() && check_compact_carry() && check_attention_output(false) &&
              check_tp_attention();

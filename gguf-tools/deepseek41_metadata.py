@@ -85,7 +85,7 @@ def engram_layout(config, tokenizer):
                 primes=primes, multipliers=multipliers)
 
 
-def metadata(hf_dir, revision):
+def metadata(hf_dir, revision, source_repo="deepseek-ai/DeepSeek-V4.1-Flash"):
     from tokenizers import Tokenizer
 
     with open(os.path.join(hf_dir, "config.json"), "rb") as fp:
@@ -108,8 +108,8 @@ def metadata(hf_dir, revision):
     merges = [" ".join(pair) if isinstance(pair, list) else pair for pair in tok["model"]["merges"]]
     records = [
         kv_string("general.architecture", "deepseek41"),
-        kv_string("general.name", "DeepSeek V4.1 Flash"),
-        kv_string("general.source.url", "https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash"),
+        kv_string("general.name", "DeepSeek V4.1 Flash" if source_repo == "deepseek-ai/DeepSeek-V4.1-Flash" else source_repo.split("/")[-1]),
+        kv_string("general.source.url", "https://huggingface.co/" + source_repo),
         kv_string("general.source.revision", revision),
         kv_u32("general.alignment", GGUF_ALIGNMENT),
         kv_string("deepseek41.config", json.dumps(config, sort_keys=True, separators=(",", ":"))),
