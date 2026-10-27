@@ -109,12 +109,28 @@ extern "C" int ds4_gpu_shared_mid_swiglu_q8_0_tensor(
         const ds4_gpu_tensor *x,
         float                   clamp) {
     if (!mid || out_dim == 0u || out_dim > UINT32_MAX) return 0;
-    uint64_t tmp_bytes = 0;
-    if (!cuda_u64_mul3_checked(2u, out_dim, sizeof(float), &tmp_bytes)) return 0;
+    const uint64_t blocks = (in_dim + 31u) / 32u;
+    uint64_t xq_bytes = 0;
+    uint64_t scale_bytes = 0;
+    uint64_t outputs_bytes = 0;
+    if (!cuda_u64_mul_checked(blocks, 32u, &xq_bytes) ||
+        !cuda_u64_mul_checked(blocks, sizeof(float), &scale_bytes) ||
+        !cuda_u64_mul3_checked(2u, out_dim, sizeof(float), &outputs_bytes)) {
+        return 0;
+    }
+    if (xq_bytes > UINT64_MAX - 15u) return 0;
+    const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
+    if (scale_offset > UINT64_MAX - scale_bytes) return 0;
+    const uint64_t nested_scratch_bytes =
+        (scale_offset + scale_bytes + 15u) & ~15ull;
+    if (nested_scratch_bytes > UINT64_MAX - outputs_bytes) return 0;
+    const uint64_t tmp_bytes = nested_scratch_bytes + outputs_bytes;
     void *tmp = cuda_tmp_alloc(tmp_bytes, "shared gate/up mid wrapper");
     if (!tmp) return 0;
-    ds4_gpu_tensor gate_tmp = { tmp, out_dim * sizeof(float), 0 };
-    ds4_gpu_tensor up_tmp = { (char *)tmp + out_dim * sizeof(float),
+    ds4_gpu_tensor gate_tmp = {
+        (char *)tmp + nested_scratch_bytes, out_dim * sizeof(float), 0
+    };
+    ds4_gpu_tensor up_tmp = { (char *)gate_tmp.ptr + out_dim * sizeof(float),
                               out_dim * sizeof(float),
                               0 };
     return ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(&gate_tmp,

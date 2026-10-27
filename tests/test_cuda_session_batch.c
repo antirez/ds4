@@ -6,18 +6,28 @@
  * prompt is replayed
  * through one isolated control session. Batch order is reversed on alternate
  * steps to expose accidental row/slot coupling. This is intentionally not part
- * of `make test`: it requires the large DeepSeek model and eight CUDA devices
- * used by the TP/EP setup.
+ * of `make test`: it requires model weights and either one sufficiently large
+ * CUDA device or the eight-device TP/EP setup.
  *
  * Run with:
  *   DS4_TEST_MODEL=/path/to/model.gguf make test-cuda-session-batch
+ * Set DS4_TEST_CUDA_SINGLE_GPU=1 for the ordinary one-GPU CUDA path used by
+ * models such as GLM on DGX Spark.
+ * Set DS4_TEST_SSD_CACHE_GIB=64 (or auto) for SSD streaming on that one GPU.
+ * DS4_CUDA_SESSION_BATCH_MOE=0 checks the serial fallback for comparison.
+ * Set DS4_TEST_PROMPT_OFFSET=N to rotate which built-in prompt runs first.
+ * Set DS4_TEST_QUALITY=1 to run the engine's reference-quality CUDA paths.
  * Set DS4_TEST_SERVER_PREFILL=1 to exercise the progress-split prefill path
  * used by ds4-server.
+ * For two-host RoCE, set DS4_TEST_TP_LISTEN_HOST to the local direct-link
+ * address and optionally DS4_TEST_TP_PORT (default 19841). Start a ds4 worker
+ * on the other host with the same model/context and RDMA transport.
  */
 
 #include "ds4.h"
 #include "ds4_gpu_args.h"
 #include "ds4_gpu_mgpu.h"
+#include "ds4_tp.h"
 
 #include <math.h>
 #include <stdbool.h>
@@ -91,7 +101,7 @@ static void compare_frontier(ds4_session *control, const float *expected,
     *nonexact += different;
 
     int actual_argmax = ds4_session_argmax(control);
-    if (different != 0 || actual_argmax != expected_argmax) {
+    if (!isfinite(max_abs) || different != 0 || actual_argmax != expected_argmax) {
         fprintf(stderr,
                 "FAIL: logits mismatch session=%d step=%d control=%d batch=%d "
                 "max_abs=%g differing=%d\n",
@@ -107,17 +117,35 @@ int main(void) {
         fprintf(stderr, "FAIL: DS4_TEST_MODEL is not set\n");
         return 1;
     }
+    /* A normal ds4 worker runs on the other host with the same context. */
+    const char *tp_host = getenv("DS4_TEST_TP_LISTEN_HOST");
+    const bool network_tp = tp_host && *tp_host;
+    const bool single_gpu = network_tp || getenv("DS4_TEST_CUDA_SINGLE_GPU") != NULL;
     const bool server_prefill = getenv("DS4_TEST_SERVER_PREFILL") != NULL;
+    const bool quality = getenv("DS4_TEST_QUALITY") != NULL;
+    const char *ssd_budget = getenv("DS4_TEST_SSD_CACHE_GIB");
+    const bool ssd = ssd_budget != NULL;
+    if (network_tp && ssd) fail("network TP needs resident shards", -1, -1);
+    int ssd_gib = 0;
+    if (ssd && !single_gpu) fail("SSD test requires a single GPU", -1, -1);
+    if (ssd && strcmp(ssd_budget, "auto")) {
+        char *end;
+        const long value = strtol(ssd_budget, &end, 10);
+        if (end == ssd_budget || *end || value < 1 || value > 90)
+            fail("SSD budget requires auto or 1..90 GiB", -1, -1);
+        ssd_gib = (int)value;
+    }
 
     int session_count = DEFAULT_SESSION_COUNT;
     const char *session_count_env = getenv("DS4_TEST_SESSION_COUNT");
     if (session_count_env && session_count_env[0]) {
         session_count = atoi(session_count_env);
     }
-    if (session_count < 2 || session_count > MAX_SESSION_COUNT) {
+    const int min_sessions = single_gpu ? 1 : 2;
+    if (session_count < min_sessions || session_count > MAX_SESSION_COUNT) {
         fprintf(stderr,
-                "FAIL: DS4_TEST_SESSION_COUNT must be between 2 and %d\n",
-                MAX_SESSION_COUNT);
+                "FAIL: DS4_TEST_SESSION_COUNT must be between %d and %d\n",
+                min_sessions, MAX_SESSION_COUNT);
         return 1;
     }
 
@@ -153,12 +181,14 @@ int main(void) {
         *dst = '\0';
     }
 
-    setenv("DS4_CUDA_SESSION_BATCH_MOE", "1", 1);
+    setenv("DS4_CUDA_SESSION_BATCH_MOE", "1", 0);
+    const bool native_enabled = strcmp(getenv("DS4_CUDA_SESSION_BATCH_MOE"), "0") != 0;
 
     ds4_gpu_config gpu_cfg = {0};
     bool skip_cuda = false;
     char err[256] = {0};
-    if (parse_gpu_vram_arg("auto", "0,2,4,6,1,3,5,7",
+    if (parse_gpu_vram_arg("auto",
+                           single_gpu ? "0" : "0,2,4,6,1,3,5,7",
                            &gpu_cfg, &skip_cuda, err, sizeof(err)) != 0 ||
         skip_cuda) {
         fprintf(stderr, "FAIL: GPU configuration: %s\n", err);
@@ -168,23 +198,74 @@ int main(void) {
     ds4_engine_options opt = {
         .model_path = model,
         .backend = DS4_BACKEND_CUDA,
+        .context_size = test_ctx,
         .n_threads = 1,
-        .cuda_tensor_parallel = true,
+        .quality = quality,
+        .ssd_streaming = ssd,
+        .ssd_streaming_cache_bytes = (uint64_t)ssd_gib << 30,
+        .cuda_tensor_parallel = !single_gpu,
         .share_session_prefill_workspace = true,
         .placement_ctx_hint = (uint32_t)test_ctx,
+        .placement_session_count_hint = ssd ? session_count : 0,
     };
     ds4_engine *engine = NULL;
-    if (ds4_engine_create_with_gpu_config(&engine, &opt, &gpu_cfg) != 0) {
+    if (network_tp) {
+        const char *port = getenv("DS4_TEST_TP_PORT");
+        char *end = NULL;
+        const long number = port ? strtol(port, &end, 10) : 19841;
+        if ((port && (end == port || *end)) || number < 1 || number > 65535)
+            fail("invalid TP port", -1, -1);
+        opt.tp.role = DS4_TP_LEADER;
+        opt.tp.listen_host = tp_host;
+        opt.tp.listen_port = (int)number;
+        opt.tp.transport = DS4_TP_TRANSPORT_RDMA;
+        opt.placement_session_count_hint = session_count;
+        if (session_count > 8) fail("network TP test is limited to eight sessions", -1, -1);
+    }
+    if (ds4_engine_create_with_gpu_config(&engine, &opt, (ssd || network_tp) ? NULL : &gpu_cfg) != 0) {
         fprintf(stderr, "FAIL: engine open\n");
         return 1;
+    }
+
+    ds4_tp *tp = NULL;
+    if (network_tp) {
+        ds4_tp_identity identity = {
+            .gguf_bytes = ds4_engine_model_bytes(engine),
+            .model_id = (uint32_t)ds4_engine_model_id(engine),
+            .n_layer = (uint32_t)ds4_engine_layer_count(engine),
+            .n_embd = (uint32_t)ds4_engine_embd_dim(engine),
+            .n_vocab = (uint32_t)ds4_engine_vocab_size(engine),
+            .quant_bits = (uint32_t)ds4_engine_routed_quant_bits(engine),
+            .ctx_size = (uint32_t)test_ctx,
+        };
+        ds4_engine_tp_gate_schedule(engine, &identity.gate_slot_start,
+            &identity.gate_slot_step, &identity.gates_per_token, identity.gate_slot_mask);
+        if (!ds4_tp_create(&tp, &opt.tp, &identity, err, sizeof(err)) ||
+            !ds4_engine_tp_bind(engine, tp, err, sizeof(err))) {
+            fprintf(stderr, "FAIL: network TP setup: %s\n", err);
+            ds4_engine_close(engine);
+            ds4_tp_free(tp);
+            return 1;
+        }
     }
 
     ds4_session *batched[MAX_SESSION_COUNT] = {0};
     ds4_tokens prompt[MAX_SESSION_COUNT] = {0};
     const int prompt_count = (int)(sizeof(prompts) / sizeof(prompts[0]));
+    int prompt_offset = 0;
+    const char *prompt_offset_env = getenv("DS4_TEST_PROMPT_OFFSET");
+    if (prompt_offset_env && prompt_offset_env[0]) {
+        prompt_offset = atoi(prompt_offset_env);
+    }
+    if (prompt_offset < 0 || prompt_offset >= prompt_count) {
+        fprintf(stderr,
+                "FAIL: DS4_TEST_PROMPT_OFFSET must be between 0 and %d\n",
+                prompt_count - 1);
+        return 1;
+    }
     for (int i = 0; i < session_count; i++) {
         const char *prompt_text = long_prompt && (i & 1) == 0
-            ? long_prompt : prompts[i % prompt_count];
+            ? long_prompt : prompts[(i + prompt_offset) % prompt_count];
         ds4_encode_chat_prompt(engine, NULL, prompt_text, DS4_THINK_NONE,
                                &prompt[i]);
         if (long_prompt && (i & 1) == 0) {
@@ -223,6 +304,16 @@ int main(void) {
     double evaluated_ms = 0.0;
     const bool power_of_two = (session_count & (session_count - 1)) == 0;
     for (int step = 0; step <= DECODE_STEPS; step++) {
+        if (ds4_engine_is_deepseek41(engine) && step == 8) {
+            for (int i = 0; i < session_count; i++) {
+                ds4_session_snapshot saved = {0};
+                if (ds4_session_save_snapshot(batched[i], &saved, err, sizeof(err)) ||
+                    ds4_session_eval(batched[i], ds4_session_argmax(batched[i]), err, sizeof(err)) ||
+                    ds4_session_load_snapshot(batched[i], &saved, err, sizeof(err)))
+                    fail("snapshot after native batch", i, step);
+                ds4_session_snapshot_free(&saved);
+            }
+        }
         int tokens[MAX_SESSION_COUNT];
         for (int i = 0; i < session_count; i++) {
             const size_t frontier =
@@ -237,7 +328,28 @@ int main(void) {
         }
         if (step == DECODE_STEPS) break;
 
-        const int group = !power_of_two ? session_count :
+        if (step == 0 && session_count >= 2 && ds4_engine_is_deepseek41(engine)) {
+            ds4_decode_item bad[] = {{batched[0], tokens[0]}, {batched[1], vocab}};
+            const int before[] = {ds4_session_pos(batched[0]), ds4_session_pos(batched[1])};
+            if (ds4_sessions_eval_batch(bad, 2, err, sizeof(err)) == 0)
+                fail("accepted invalid batch token", 1, step);
+            bad[1] = bad[0];
+            if (ds4_sessions_eval_batch(bad, 2, err, sizeof(err)) == 0)
+                fail("accepted duplicate session", 1, step);
+            bad[1] = (ds4_decode_item){NULL, tokens[1]};
+            if (ds4_sessions_eval_batch(bad, 2, err, sizeof(err)) == 0)
+                fail("accepted null batch session", 1, step);
+            for (int i = 0; i < 2; i++) {
+                if (ds4_session_pos(batched[i]) != before[i] ||
+                    ds4_session_copy_logits(batched[i], actual, vocab) != vocab ||
+                    memcmp(actual, expected + (size_t)i * vocab, (size_t)vocab * sizeof(float)))
+                    fail("invalid request changed a session", i, step);
+            }
+            err[0] = '\0';
+        }
+
+        const int group = session_count == 1 ? 1 :
+                          !power_of_two ? session_count :
                           step % 3 == 0 ? session_count :
                           step % 3 == 1 ? session_count / 2 :
                                           session_count / 4 > 1
@@ -251,6 +363,7 @@ int main(void) {
                 items[row].session = batched[i];
                 items[row].token = tokens[i];
             }
+            const uint64_t native_before = ds4_test_ds41_batch_count();
             const double started = now_ms();
             const int eval_rc = ds4_sessions_eval_batch(items, rows,
                                                         err, sizeof(err));
@@ -260,6 +373,11 @@ int main(void) {
                         "FAIL: batch eval size=%d base=%d step=%d: %s\n",
                         rows, base, step, err);
                 return 1;
+            }
+            if (ds4_engine_is_deepseek41(engine) && !quality && rows >= 2 && rows <= 8) {
+                const bool native = native_enabled && (!network_tp || rows >= 5);
+                if (ds4_test_ds41_batch_count() != native_before + (native ? 1u : 0u))
+                    fail("V4.1 batch did not follow its native/serial dispatch", base, step);
             }
             batch_ms[rows] += elapsed;
             batch_calls[rows]++;
@@ -306,7 +424,9 @@ int main(void) {
             ds4_tokens_free(&prompt[i]);
         }
         free(long_prompt);
+        if (tp && !ds4_tp_send_stop(tp)) fail("TP stop", -1, -1);
         ds4_engine_close(engine);
+        ds4_tp_free(tp);
         return 0;
     }
 
@@ -346,9 +466,10 @@ int main(void) {
     }
 
     fprintf(stderr,
-            "test_cuda_session_batch PASS sessions=%d steps=%d "
+            "test_cuda_session_batch PASS mode=%s sessions=%d steps=%d "
             "worst_logit_abs=%g nonexact_logits=%d\n",
-            session_count, DECODE_STEPS, worst_abs, nonexact);
+            network_tp ? "network-tp" : single_gpu ? "single-gpu" : "tp", session_count, DECODE_STEPS,
+            worst_abs, nonexact);
 
     free(actual);
     free(expected_argmax);
@@ -357,6 +478,8 @@ int main(void) {
         ds4_tokens_free(&prompt[i]);
     }
     free(long_prompt);
+    if (tp && !ds4_tp_send_stop(tp)) fail("TP stop", -1, -1);
     ds4_engine_close(engine);
+    ds4_tp_free(tp);
     return 0;
 }

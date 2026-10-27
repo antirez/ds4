@@ -1,0 +1,1 @@
+Write a Python function to count balanced pairs of parentheses and reject malformed input.

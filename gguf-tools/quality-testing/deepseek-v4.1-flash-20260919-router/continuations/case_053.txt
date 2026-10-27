@@ -1,0 +1,5 @@
+Here's the simple version: **a moving bike keeps correcting itself, while a stopped bike can't.**
+
+**The key idea: steering + momentum**
+
+When you're riding and you start to tip to the left, the bike's front wheel naturally steers a little to the left. That small steering motion makes the bike

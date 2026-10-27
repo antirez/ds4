@@ -1,0 +1,1 @@
+Write a C function to check whether a size_t addition would overflow, without performing the overflowing addition.

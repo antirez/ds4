@@ -1,0 +1,9 @@
+# Audit Result
+
+## The unsafe function
+
+```c
+int checked_get(const int *a, int n, int i) { if (i <= n) return a[i]; return 0; }
+```
+
+All of the `limit_*` functions are pure integer arithmetic on a value parameter — they cannot cause

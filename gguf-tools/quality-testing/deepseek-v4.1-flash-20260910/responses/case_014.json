@@ -1,0 +1,252 @@
+{
+  "id": "167c0514-2e5a-49fc-847d-5b8f774c27e3",
+  "object": "chat.completion",
+  "created": 1789046370,
+  "model": "deepseek-flash",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "074"
+      },
+      "logprobs": {
+        "content": [
+          {
+            "token": "074",
+            "logprob": -1.2636105e-05,
+            "bytes": [
+              48,
+              55,
+              52
+            ],
+            "top_logprobs": [
+              {
+                "token": "074",
+                "logprob": -1.2636105e-05,
+                "bytes": [
+                  48,
+                  55,
+                  52
+                ]
+              },
+              {
+                "token": "74",
+                "logprob": -11.482373,
+                "bytes": [
+                  55,
+                  52
+                ]
+              },
+              {
+                "token": "000",
+                "logprob": -14.361466,
+                "bytes": [
+                  48,
+                  48,
+                  48
+                ]
+              },
+              {
+                "token": "002",
+                "logprob": -14.5973215,
+                "bytes": [
+                  48,
+                  48,
+                  50
+                ]
+              },
+              {
+                "token": "2",
+                "logprob": -14.768697,
+                "bytes": [
+                  50
+                ]
+              },
+              {
+                "token": "Based",
+                "logprob": -15.803241,
+                "bytes": [
+                  66,
+                  97,
+                  115,
+                  101,
+                  100
+                ]
+              },
+              {
+                "token": "072",
+                "logprob": -16.19668,
+                "bytes": [
+                  48,
+                  55,
+                  50
+                ]
+              },
+              {
+                "token": "The",
+                "logprob": -16.293175,
+                "bytes": [
+                  84,
+                  104,
+                  101
+                ]
+              },
+              {
+                "token": "Ware",
+                "logprob": -16.567677,
+                "bytes": [
+                  87,
+                  97,
+                  114,
+                  101
+                ]
+              },
+              {
+                "token": "0",
+                "logprob": -16.635187,
+                "bytes": [
+                  48
+                ]
+              },
+              {
+                "token": "<｜｜end▁of▁sentence｜｜>",
+                "logprob": -16.770422,
+                "bytes": [
+                  60,
+                  239,
+                  189,
+                  156,
+                  239,
+                  189,
+                  156,
+                  101,
+                  110,
+                  100,
+                  226,
+                  150,
+                  129,
+                  111,
+                  102,
+                  226,
+                  150,
+                  129,
+                  115,
+                  101,
+                  110,
+                  116,
+                  101,
+                  110,
+                  99,
+                  101,
+                  239,
+                  189,
+                  156,
+                  239,
+                  189,
+                  156,
+                  62
+                ]
+              },
+              {
+                "token": "076",
+                "logprob": -17.29207,
+                "bytes": [
+                  48,
+                  55,
+                  54
+                ]
+              },
+              {
+                "token": "073",
+                "logprob": -17.384907,
+                "bytes": [
+                  48,
+                  55,
+                  51
+                ]
+              },
+              {
+                "token": " ",
+                "logprob": -17.590904,
+                "bytes": [
+                  32
+                ]
+              },
+              {
+                "token": "740",
+                "logprob": -17.632378,
+                "bytes": [
+                  55,
+                  52,
+                  48
+                ]
+              },
+              {
+                "token": "Record",
+                "logprob": -18.097769,
+                "bytes": [
+                  82,
+                  101,
+                  99,
+                  111,
+                  114,
+                  100
+                ]
+              },
+              {
+                "token": "075",
+                "logprob": -18.251814,
+                "bytes": [
+                  48,
+                  55,
+                  53
+                ]
+              },
+              {
+                "token": "007",
+                "logprob": -18.256634,
+                "bytes": [
+                  48,
+                  48,
+                  55
+                ]
+              },
+              {
+                "token": "974",
+                "logprob": -18.43823,
+                "bytes": [
+                  57,
+                  55,
+                  52
+                ]
+              },
+              {
+                "token": "ware",
+                "logprob": -18.701612,
+                "bytes": [
+                  119,
+                  97,
+                  114,
+                  101
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 16383,
+    "completion_tokens": 1,
+    "total_tokens": 16384,
+    "prompt_tokens_details": {
+      "cached_tokens": 896
+    },
+    "prompt_cache_hit_tokens": 896,
+    "prompt_cache_miss_tokens": 15487
+  },
+  "system_fingerprint": "aeb56401ca74e127821c4f9126dcb669"
+}

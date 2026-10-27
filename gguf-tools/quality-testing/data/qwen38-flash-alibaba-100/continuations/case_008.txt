@@ -1,0 +1,3 @@
+The premise of your question contains a fundamental misunderstanding: **A GPU prefill path is not faster than single-token decode in terms of latency per token.** In fact, the opposite is true.
+
+However, I believe you are asking about **throughput** or **computational efficiency**, where the prefill phase *is

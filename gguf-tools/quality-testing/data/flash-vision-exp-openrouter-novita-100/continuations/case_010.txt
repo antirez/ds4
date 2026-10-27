@@ -1,0 +1,7 @@
+Ti spiego il funzionamento dell'inserimento in un **B-tree** (albero B), concentrandomi sui casi di split e sulla gestione della radice. 
+
+---
+
+## **1. Concetti base**
+Un B-tree è un albero bilanciato in cui:
+- Ogni nod

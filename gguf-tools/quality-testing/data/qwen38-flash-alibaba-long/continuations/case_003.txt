@@ -1,0 +1,3 @@
+Record 0017 is owned by **team_17** and has a revision of **294**.
+
+I found this by locating the line labeled "Record 0017" in the provided archive text, which explicitly states: `owner=team_17; revision=29

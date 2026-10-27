@@ -1,0 +1,5 @@
+When investigating performance degradation during generation with long contexts, the goal is to isolate whether the bottleneck is in the **prefill** (processing the input), the **decode** (generating tokens), or system-level resource constraints.
+
+Here are the first five critical measurements to take, ordered by diagnostic priority:
+
+### 

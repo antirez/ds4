@@ -52,6 +52,11 @@ static bool ds4_mmq_nvtx_requested() {
     return enabled != 0;
 }
 
+static bool ds4_mmq_gfx1151_flag(const char *name, int cc) {
+    const char *env = getenv(name);
+    return env ? env[0] != '0' : cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151;
+}
+
 static uint64_t ds4_mmq_nvtx_payload(uint32_t first, uint32_t second) {
     return ((uint64_t)first << 32) | second;
 }
@@ -116,10 +121,37 @@ static size_t g_q81_scratch_bytes = 0;
 static bool   g_q81_scratch_enabled = false;
 static void  *g_aligned_q81_scratch_ptr = nullptr;
 static size_t g_aligned_q81_scratch_bytes = 0;
+static int    g_aligned_q81_scratch_device = -1;
+
+// The gfx1151 IQ2 pair path is fed in tiles of at most 2048 tokens with six
+// routed experts per token. Keep its small routing maps out of the ROCm async
+// pool: repeated shape churn can recycle/remap those allocations while the
+// following quantize kernel still consumes them. One plain allocation per
+// device gives the maps a stable lifetime for the full MMQ session.
+static constexpr size_t MMQ_GFX1151_PAIR_MAP_ROWS = 2048u * 6u;
+static constexpr size_t MMQ_GFX1151_PAIR_MAP_EXPERTS = 256u;
+
+struct mmq_pair_map_scratch {
+    int32_t *base = nullptr;
+    int32_t *ids_src1 = nullptr;
+    int32_t *ids_dst = nullptr;
+    int32_t *expert_bounds = nullptr;
+};
+
+static mmq_pair_map_scratch g_mmq_pair_maps[GGML_CUDA_MAX_DEVICES] = {};
 
 extern "C" void ds4_mmq_set_aligned_q81_scratch(void *ptr, size_t bytes) {
     g_aligned_q81_scratch_ptr = ptr;
     g_aligned_q81_scratch_bytes = ptr ? bytes : 0;
+    g_aligned_q81_scratch_device = -1;
+    if (ptr) (void)cudaGetDevice(&g_aligned_q81_scratch_device);
+}
+
+static void *ds4_mmq_aligned_q81_scratch(int device, size_t bytes) {
+    return g_aligned_q81_scratch_ptr &&
+           g_aligned_q81_scratch_device == device &&
+           g_aligned_q81_scratch_bytes >= bytes
+        ? g_aligned_q81_scratch_ptr : nullptr;
 }
 
 // Read by ds4_mmq_moe_vec_impl; non-zero means use the persistent buffer.
@@ -298,6 +330,25 @@ extern "C" int ds4_mmq_init(int device) {
         return -1;
     }
 
+    if (info.devices[device].cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151 &&
+        !g_mmq_pair_maps[device].base) {
+        constexpr size_t map_ints =
+            2u * MMQ_GFX1151_PAIR_MAP_ROWS + MMQ_GFX1151_PAIR_MAP_EXPERTS + 1u;
+        int32_t *base = nullptr;
+        const cudaError_t err = cudaMalloc((void **)&base, map_ints * sizeof(int32_t));
+        if (err != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4_mmq_init: cudaMalloc(gfx1151 pair maps %zu B) failed: %s\n",
+                    map_ints * sizeof(int32_t), cudaGetErrorString(err));
+            return -1;
+        }
+        auto & maps = g_mmq_pair_maps[device];
+        maps.base = base;
+        maps.ids_src1 = base;
+        maps.ids_dst = base + MMQ_GFX1151_PAIR_MAP_ROWS;
+        maps.expert_bounds = base + 2u * MMQ_GFX1151_PAIR_MAP_ROWS;
+    }
+
     // Step 7 task #29: pre-allocate persistent Q8_1 scratch if enabled.
     // Must happen here (before any layer-graph capture) so the cudaMalloc
     // is not forbidden by capture-mode restrictions, and so the kernel
@@ -448,10 +499,499 @@ ggml_backend_cuda_context * get_ctx_for_device(int device) {
     }
     return cached[device];
 }
+#ifndef GGML_USE_HIP
+
+/* Exact dense Q8_0 GEMV for Spark verify batches: the TP rank's attention
+ * q_b (K = 1024, 16384 rows) with 2..8 columns.
+ *
+ * mul_mat_q fixes the float result of every element through its stream-k
+ * schedule (mmq_x 8, mmq_y 128, G CTAs, 8-block iterations): each Q8_0 block
+ * contributes an exact int32 dot C; a CTA accumulates its blocks of a tile
+ * in ascending order as sum += C*dA*dB; the CTA reaching the tile's end
+ * stores its sum, the fixup adds the earlier CTAs' sums (accumulated from 0,
+ * descending, skipping empty CTAs), and the sanitize pass zeroes non-finite
+ * results.  This kernel streams each raw row once through registers (on
+ * GB10 ld.global.v4 reads near bandwidth where cp.async staging does not),
+ * computes the same int32 block sums with dp4a and replays exactly those
+ * float chains, so its output equals quantize + mul_mat_q + fixup + sanitize
+ * bit for bit, without the fixup scratch and the extra launches. */
+constexpr int DS4_Q8_GEMV_K = 1024;
+constexpr int DS4_Q8_GEMV_BLOCKS = DS4_Q8_GEMV_K / QK8_0;               /* one block per lane */
+constexpr int DS4_Q8_GEMV_ROW_U4 = DS4_Q8_GEMV_BLOCKS * (int)sizeof(block_q8_0) / 16;
+constexpr int DS4_Q8_GEMV_WARPS = 8;
+constexpr int DS4_Q8_GEMV_MMQ_Y = 128;
+constexpr int DS4_Q8_GEMV_ITER_BLOCKS = MMQ_ITER_K / QK8_0;
+static_assert(DS4_Q8_GEMV_BLOCKS == WARP_SIZE, "one Q8_0 block per lane");
+static_assert(DS4_Q8_GEMV_ROW_U4 * 16 == DS4_Q8_GEMV_BLOCKS * (int)sizeof(block_q8_0),
+              "rows are whole 16-byte units");
+static_assert(DS4_Q8_GEMV_ROW_U4 <= 3 * WARP_SIZE, "a row is at most three uint4 per lane");
+
+/* First k-block unit of stream-k CTA b, as mul_mat_q and its fixup compute it. */
+__device__ __forceinline__ static int ds4_q8_gemv_sk_unit(int b, int units, int G) {
+    const int k = (int)((int64_t)b * units / G);
+    return k - (k % DS4_Q8_GEMV_BLOCKS) % DS4_Q8_GEMV_ITER_BLOCKS;
+}
+
+/* One CTA's chain over blocks [b0, b1) of a tile: sum += C*dA*dB. */
+__device__ __forceinline__ static float ds4_q8_gemv_chain(const float *c, const float *da, const float *db,
+                                                          int b0, int b1) {
+    float sum = 0.0f;
+    for (int b = b0; b < b1; b++) sum = __fmaf_rn(__fmul_rn(c[b], da[b]), db[b], sum);
+    return sum;
+}
+
+template <int ncols>
+__global__ static void __launch_bounds__(DS4_Q8_GEMV_WARPS * WARP_SIZE)
+ds4_mmq_q8_0_exact_gemv_kernel(const block_q8_0 * __restrict__ W, const block_q8_1_mmq * __restrict__ Y,
+                               float * __restrict__ out, const int M, const int G) {
+    /* The row stage keeps one spare uint4: the last lane's funnel shift reads
+     * one word past the row.  Per-column rows are padded to 33 floats so the
+     * chain lanes (one per column) read the same block in different banks. */
+    __shared__ uint4 stage[DS4_Q8_GEMV_WARPS][DS4_Q8_GEMV_ROW_U4 + 1];
+    __shared__ float s_c[DS4_Q8_GEMV_WARPS][ncols][DS4_Q8_GEMV_BLOCKS + 1];
+    __shared__ float s_da[DS4_Q8_GEMV_WARPS][DS4_Q8_GEMV_BLOCKS];
+    __shared__ float s_db[ncols][DS4_Q8_GEMV_BLOCKS + 1];
+    const int lane = threadIdx.x % WARP_SIZE, warp = threadIdx.x / WARP_SIZE;
+    const int units = M / DS4_Q8_GEMV_MMQ_Y * DS4_Q8_GEMV_BLOCKS;
+    if (lane == 0) stage[warp][DS4_Q8_GEMV_ROW_U4] = make_uint4(0, 0, 0, 0);
+
+    /* This lane's activation block for every column stays in registers. */
+    int yq[ncols][QI8_0];
+    {
+        const int kc = lane / 4, sub = lane % 4;
+#pragma unroll
+        for (int c = 0; c < ncols; c++) {
+            const block_q8_1_mmq *yb = Y + kc * ncols + c;
+            const int4 a = ((const int4 *)yb->qs)[2 * sub], b = ((const int4 *)yb->qs)[2 * sub + 1];
+            yq[c][0] = a.x; yq[c][1] = a.y; yq[c][2] = a.z; yq[c][3] = a.w;
+            yq[c][4] = b.x; yq[c][5] = b.y; yq[c][6] = b.z; yq[c][7] = b.w;
+            if (warp == 0) s_db[c][lane] = yb->d4[sub];
+        }
+    }
+    __syncthreads();
+
+    const int nwarps = gridDim.x * DS4_Q8_GEMV_WARPS;
+    int row = blockIdx.x * DS4_Q8_GEMV_WARPS + warp;
+    /* Rows stream through registers one row ahead. */
+    auto load = [&](int r, uint4 (&v)[3]) {
+        const uint4 *src = (const uint4 *)(W + (size_t)r * DS4_Q8_GEMV_BLOCKS);
+#pragma unroll
+        for (int j = 0; j < 3; j++) {
+            const int k = lane + WARP_SIZE * j;
+            v[j] = (r < M && k < DS4_Q8_GEMV_ROW_U4) ? __ldcs(src + k) : make_uint4(0, 0, 0, 0);
+        }
+    };
+    uint4 cur[3], next[3];
+    load(row, cur);
+    for (; row < M; row += nwarps) {
+        load(row + nwarps, next);
+#pragma unroll
+        for (int j = 0; j < 3; j++) {
+            const int k = lane + WARP_SIZE * j;
+            if (k < DS4_Q8_GEMV_ROW_U4) stage[warp][k] = cur[j];
+        }
+        __syncwarp();
+
+        /* Block `lane` of the row: half d, then 32 int8, 34 bytes in all. */
+        const uint32_t *w32 = (const uint32_t *)stage[warp];
+        const int byte = (int)sizeof(block_q8_0) * lane;
+        const uint16_t dbits = (uint16_t)(w32[byte / 4] >> (byte % 4 * 8));
+        const int qbyte = byte + (int)sizeof(ggml_half), qw = qbyte / 4, sh = qbyte % 4 * 8;
+        int q[QI8_0];
+#pragma unroll
+        for (int i = 0; i < QI8_0; i++) q[i] = (int)__funnelshift_r(w32[qw + i], w32[qw + i + 1], sh);
+#pragma unroll
+        for (int c = 0; c < ncols; c++) {
+            int sumi = 0;
+#pragma unroll
+            for (int i = 0; i < QI8_0; i++) sumi = ggml_cuda_dp4a(q[i], yq[c][i], sumi);
+            s_c[warp][c][lane] = (float)sumi;
+        }
+        s_da[warp][lane] = __half2float(__ushort_as_half(dbits));
+        __syncwarp();
+
+        if (lane < ncols) {
+            const int c = lane;
+            const int ts = row / DS4_Q8_GEMV_MMQ_Y * DS4_Q8_GEMV_BLOCKS, te = ts + DS4_Q8_GEMV_BLOCKS;
+            /* The CTA holding the tile's last unit, then the fixup walk. */
+            int bend = (int)((int64_t)(te - 1) * G / units);
+            while (bend + 1 < G && ds4_q8_gemv_sk_unit(bend + 1, units, G) <= te - 1) bend++;
+            while (bend > 0 && ds4_q8_gemv_sk_unit(bend, units, G) > te - 1) bend--;
+            const float *cc = s_c[warp][c], *da = s_da[warp], *db = s_db[c];
+            const int kend = ds4_q8_gemv_sk_unit(bend, units, G);
+            const int e0 = max(kend, ts) - ts;
+            float v = ds4_q8_gemv_chain(cc, da, db, e0, DS4_Q8_GEMV_BLOCKS);
+            if (e0 > 0) {
+                float fix = 0.0f;
+                bool any = false;
+                int stop = kend;
+                for (int b = bend - 1; b >= 0; b--) {
+                    const int kbc = ds4_q8_gemv_sk_unit(b, units, G);
+                    if (kbc == stop) continue;                     /* had no data */
+                    fix += ds4_q8_gemv_chain(cc, da, db, max(kbc, ts) - ts, min(stop, te) - ts);
+                    any = true;
+                    if (kbc <= ts) break;
+                    stop = kbc;
+                }
+                if (any) v += fix;
+            }
+            out[(size_t)c * M + row] = isfinite(v) ? v : 0.0f;
+        }
+        __syncwarp();
+#pragma unroll
+        for (int j = 0; j < 3; j++) cur[j] = next[j];
+    }
+}
+
+/* One wave of the ncols kernel on this device; 0 when it cannot run. */
+template <int ncols>
+static int ds4_mmq_q8_0_exact_gemv_blocks(int dev) {
+    static int per_sm[GGML_CUDA_MAX_DEVICES] = {};             /* 0 unknown, -1 unavailable */
+    if (per_sm[dev] == 0) {
+        int n = 0;
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, ds4_mmq_q8_0_exact_gemv_kernel<ncols>,
+                                                          DS4_Q8_GEMV_WARPS * WARP_SIZE, 0) != cudaSuccess ||
+            n <= 0) {
+            (void)cudaGetLastError();
+            n = -1;
+        }
+        per_sm[dev] = n;
+    }
+    return per_sm[dev] > 0 ? per_sm[dev] * ggml_cuda_info().devices[dev].nsm : 0;
+}
+
+static int ds4_mmq_q8_0_exact_gemv_blocks(int dev, int N) {
+    switch (N) {
+    case 2: return ds4_mmq_q8_0_exact_gemv_blocks<2>(dev);
+    case 3: return ds4_mmq_q8_0_exact_gemv_blocks<3>(dev);
+    case 4: return ds4_mmq_q8_0_exact_gemv_blocks<4>(dev);
+    case 5: return ds4_mmq_q8_0_exact_gemv_blocks<5>(dev);
+    case 6: return ds4_mmq_q8_0_exact_gemv_blocks<6>(dev);
+    case 7: return ds4_mmq_q8_0_exact_gemv_blocks<7>(dev);
+    case 8: return ds4_mmq_q8_0_exact_gemv_blocks<8>(dev);
+    default: return 0;
+    }
+}
+
+/* The same exact GEMV for K = 4096 (the TP rank's attention q_a and kv, 1024
+ * and 512 rows), where rows are few: each row is spread over four warps, one
+ * 1024-wide chunk each, and the stream-k chains of its tile run in parallel
+ * lanes, one (column, CTA segment) each, from a per-tile segment table the
+ * host derives with mul_mat_q's formula.  The end segment plus the earlier
+ * ones accumulated from 0 in descending order is the fixup's combine. */
+constexpr int DS4_Q8_GEMV4_BLOCKS = 4096 / QK8_0;
+constexpr int DS4_Q8_GEMV4_ROWS = DS4_Q8_GEMV_WARPS / (DS4_Q8_GEMV4_BLOCKS / WARP_SIZE);   /* rows per CTA step */
+constexpr int DS4_Q8_GEMV4_MAX_TILES = 8;                                                  /* M <= 1024 */
+constexpr int DS4_Q8_GEMV4_MAX_SEGS = DS4_Q8_GEMV4_BLOCKS / DS4_Q8_GEMV_ITER_BLOCKS;
+static_assert(DS4_Q8_GEMV4_ROWS * DS4_Q8_GEMV4_BLOCKS == DS4_Q8_GEMV_WARPS * WARP_SIZE,
+              "one block per lane of a CTA step");
+static_assert(8 * DS4_Q8_GEMV4_MAX_SEGS <= DS4_Q8_GEMV4_BLOCKS, "a row's lanes cover every (column, segment)");
+
+/* The CTA segments of each tile: block bounds within the tile, ascending.
+ * Passed by value and copied to shared memory word by word with constant
+ * indices, so no SM needs dynamic parameter indexing. */
+union ds4_q8_gemv4_segs {
+    struct {
+        uint8_t nseg[DS4_Q8_GEMV4_MAX_TILES];
+        uint8_t bound[DS4_Q8_GEMV4_MAX_TILES][DS4_Q8_GEMV4_MAX_SEGS + 1];
+    } t;
+    uint32_t w[(DS4_Q8_GEMV4_MAX_TILES * (DS4_Q8_GEMV4_MAX_SEGS + 2) + 3) / 4];
+};
+static_assert(sizeof(((ds4_q8_gemv4_segs *)nullptr)->t) <= sizeof(((ds4_q8_gemv4_segs *)nullptr)->w),
+              "the word view covers the table");
+
+template <int ncols, bool full_row = false>
+__global__ static void __launch_bounds__(DS4_Q8_GEMV_WARPS * WARP_SIZE)
+ds4_mmq_q8_0_exact_gemv4_kernel(const block_q8_0 * __restrict__ W, const block_q8_1_mmq * __restrict__ Y,
+                                float * __restrict__ out, const int M, const ds4_q8_gemv4_segs segs_param) {
+    constexpr int blocks = DS4_Q8_GEMV4_BLOCKS, chunks = blocks / WARP_SIZE;
+    constexpr int seg_words = sizeof(segs_param.w) / sizeof(uint32_t);
+    __shared__ uint4 stage[DS4_Q8_GEMV_WARPS][DS4_Q8_GEMV_ROW_U4 + 1];
+    __shared__ float s_c[DS4_Q8_GEMV4_ROWS][ncols][blocks + 1];
+    __shared__ float s_da[DS4_Q8_GEMV4_ROWS][blocks];
+    __shared__ float s_db[ncols][blocks + 1];
+    __shared__ float s_part[DS4_Q8_GEMV4_ROWS][ncols][DS4_Q8_GEMV4_MAX_SEGS + 1];
+    __shared__ ds4_q8_gemv4_segs segs;
+    const int lane = threadIdx.x % WARP_SIZE, warp = threadIdx.x / WARP_SIZE;
+    const int slot = warp / chunks, chunk = warp % chunks;
+    if (lane == 0) stage[warp][DS4_Q8_GEMV_ROW_U4] = make_uint4(0, 0, 0, 0);
+    if (!full_row && threadIdx.x == 0) {
+#pragma unroll
+        for (int i = 0; i < seg_words; i++) segs.w[i] = segs_param.w[i];
+    }
+    if (warp == 0) {
+        for (int b = lane; b < blocks; b += WARP_SIZE) {
+#pragma unroll
+            for (int c = 0; c < ncols; c++) s_db[c][b] = Y[b / 4 * ncols + c].d4[b % 4];
+        }
+    }
+    __syncthreads();
+
+    /* This warp's chunk of its row streams through registers one step ahead. */
+    auto load = [&](int r, uint4 (&v)[3]) {
+        const uint4 *src = (const uint4 *)(W + (size_t)r * blocks + chunk * WARP_SIZE);
+#pragma unroll
+        for (int j = 0; j < 3; j++) {
+            const int k = lane + WARP_SIZE * j;
+            v[j] = (r < M && k < DS4_Q8_GEMV_ROW_U4) ? __ldcs(src + k) : make_uint4(0, 0, 0, 0);
+        }
+    };
+    uint4 cur[3], next[3];
+    load(blockIdx.x * DS4_Q8_GEMV4_ROWS + slot, cur);
+    for (int step = blockIdx.x; step * DS4_Q8_GEMV4_ROWS < M; step += gridDim.x) {
+        const int row = step * DS4_Q8_GEMV4_ROWS + slot;
+        load(row + gridDim.x * DS4_Q8_GEMV4_ROWS, next);
+#pragma unroll
+        for (int j = 0; j < 3; j++) {
+            const int k = lane + WARP_SIZE * j;
+            if (k < DS4_Q8_GEMV_ROW_U4) stage[warp][k] = cur[j];
+        }
+        __syncwarp();
+
+        /* Block chunk*32 + lane: half d, then 32 int8, 34 bytes in all. */
+        const uint32_t *w32 = (const uint32_t *)stage[warp];
+        const int byte = (int)sizeof(block_q8_0) * lane;
+        const uint16_t dbits = (uint16_t)(w32[byte / 4] >> (byte % 4 * 8));
+        const int qbyte = byte + (int)sizeof(ggml_half), qw = qbyte / 4, sh = qbyte % 4 * 8;
+        int q[QI8_0];
+#pragma unroll
+        for (int i = 0; i < QI8_0; i++) q[i] = (int)__funnelshift_r(w32[qw + i], w32[qw + i + 1], sh);
+        const int b = chunk * WARP_SIZE + lane;
+#pragma unroll
+        for (int c = 0; c < ncols; c++) {
+            const int4 *ys = (const int4 *)Y[b / 4 * ncols + c].qs + 2 * (b % 4);
+            const int4 y0 = __ldg(ys), y1 = __ldg(ys + 1);
+            const int y[QI8_0] = {y0.x, y0.y, y0.z, y0.w, y1.x, y1.y, y1.z, y1.w};
+            int sumi = 0;
+#pragma unroll
+            for (int i = 0; i < QI8_0; i++) sumi = ggml_cuda_dp4a(q[i], y[i], sumi);
+            s_c[slot][c][b] = (float)sumi;
+        }
+        s_da[slot][b] = __half2float(__ushort_as_half(dbits));
+        __syncthreads();
+
+        if constexpr (full_row) {
+            /* With one MMQ CTA per row tile there is no stream-K fixup:
+             * each output accumulates all 128 block products in order. */
+            if (chunk == 0 && lane < ncols && row < M) {
+                float sum = 0.0f;
+                for (int bb = 0; bb < blocks; bb++) {
+                    sum = __fmaf_rn(__fmul_rn(s_c[slot][lane][bb], s_da[slot][bb]),
+                                   s_db[lane][bb], sum);
+                }
+                out[(size_t)lane * M + row] = isfinite(sum) ? sum : 0.0f;
+            }
+            __syncthreads();
+        } else {
+            /* The row's 128 lanes: one (column, segment) chain each, ascending. */
+            const int tile = row / DS4_Q8_GEMV_MMQ_Y, nseg = segs.t.nseg[tile];
+            {
+                const int k = chunk * WARP_SIZE + lane, c = k % ncols, s = k / ncols;
+                if (c < ncols && s < nseg && row < M) {
+                    float sum = 0.0f;
+                    for (int bb = segs.t.bound[tile][s]; bb < segs.t.bound[tile][s + 1]; bb++)
+                        sum = __fmaf_rn(__fmul_rn(s_c[slot][c][bb], s_da[slot][bb]), s_db[c][bb], sum);
+                    s_part[slot][c][s] = sum;
+                }
+            }
+            __syncthreads();
+
+            /* The end CTA's sum plus the earlier ones from 0, descending (the
+             * fixup), then the sanitize. */
+            if (chunk == 0 && lane < ncols && row < M) {
+                float v = s_part[slot][lane][nseg - 1];
+                if (nseg > 1) {
+                    float fix = 0.0f;
+                    for (int s = nseg - 2; s >= 0; s--) fix += s_part[slot][lane][s];
+                    v += fix;
+                }
+                out[(size_t)lane * M + row] = isfinite(v) ? v : 0.0f;
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < 3; j++) cur[j] = next[j];
+    }
+}
+
+/* mul_mat_q's stream-k segments of every tile for the q_a (1024) or kv (512)
+ * rows: G as mul_mat_q_case picks it, each CTA's first block as mul_mat_q
+ * computes it.  Built once per device and shape; null when the shape does
+ * not fit the table. */
+static const ds4_q8_gemv4_segs *ds4_q8_gemv4_segments(int dev, int M) {
+    static ds4_q8_gemv4_segs table[GGML_CUDA_MAX_DEVICES][2];
+    static int8_t state[GGML_CUDA_MAX_DEVICES][2] = {};          /* 0 unknown, 1 ready, -1 unavailable */
+    const int which = M == 1024 ? 0 : M == 512 ? 1 : -1;
+    if (which < 0 || dev < 0 || dev >= GGML_CUDA_MAX_DEVICES) return nullptr;
+    if (state[dev][which] == 0) {
+        ds4_q8_gemv4_segs s = {};
+        const int B = DS4_Q8_GEMV4_BLOCKS, ntiles = M / DS4_Q8_GEMV_MMQ_Y, nsm = ggml_cuda_info().devices[dev].nsm;
+        bool ok = ntiles <= DS4_Q8_GEMV4_MAX_TILES && nsm > 0;
+        if (ok) {
+            const int nwaves = (ntiles + nsm - 1) / nsm;
+            const int G = 100 * ntiles / (nsm * nwaves) >= 90 ? ntiles : nsm;
+            const int units = ntiles * B;
+            auto first = [&](int b) {
+                if (b >= G) return units;
+                const int k = (int)((int64_t)b * units / G);
+                return k - (k % B) % DS4_Q8_GEMV_ITER_BLOCKS;
+            };
+            for (int t = 0; t < ntiles && ok; t++) {
+                const int ts = t * B, te = ts + B;
+                int m = 0;
+                for (int b = 0; b < G && ok; b++) {
+                    const int s0 = std::max(first(b), ts), s1 = std::min(first(b + 1), te);
+                    if (s1 <= s0) continue;                            /* no data in this tile */
+                    if (m == DS4_Q8_GEMV4_MAX_SEGS || (m > 0 && s.t.bound[t][m] != s0 - ts)) { ok = false; break; }
+                    s.t.bound[t][m] = (uint8_t)(s0 - ts);
+                    s.t.bound[t][m + 1] = (uint8_t)(s1 - ts);
+                    m++;
+                }
+                ok = ok && m >= 1 && s.t.bound[t][0] == 0 && s.t.bound[t][m] == B;
+                s.t.nseg[t] = (uint8_t)m;
+            }
+        }
+        table[dev][which] = s;
+        state[dev][which] = ok ? 1 : -1;
+    }
+    return state[dev][which] > 0 ? &table[dev][which] : nullptr;
+}
+
+/* One wave of the K = 4096 kernel on this device; 0 when it cannot run. */
+template <int ncols>
+static int ds4_mmq_q8_0_exact_gemv4_blocks(int dev) {
+    static int per_sm[GGML_CUDA_MAX_DEVICES] = {};             /* 0 unknown, -1 unavailable */
+    if (per_sm[dev] == 0) {
+        int n = 0;
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, ds4_mmq_q8_0_exact_gemv4_kernel<ncols>,
+                                                          DS4_Q8_GEMV_WARPS * WARP_SIZE, 0) != cudaSuccess ||
+            n <= 0) {
+            (void)cudaGetLastError();
+            n = -1;
+        }
+        /* Limit the six-row grid to leave scheduling room for the
+         * concurrent compressor/indexer work. */
+        if (ncols == 6 && n > 2) n = 2;
+        per_sm[dev] = n;
+    }
+    return per_sm[dev] > 0 ? per_sm[dev] * ggml_cuda_info().devices[dev].nsm : 0;
+}
+
+static int ds4_mmq_q8_0_exact_gemv4_blocks(int dev, int N) {
+    switch (N) {
+    case 2: return ds4_mmq_q8_0_exact_gemv4_blocks<2>(dev);
+    case 3: return ds4_mmq_q8_0_exact_gemv4_blocks<3>(dev);
+    case 4: return ds4_mmq_q8_0_exact_gemv4_blocks<4>(dev);
+    case 5: return ds4_mmq_q8_0_exact_gemv4_blocks<5>(dev);
+    case 6: return ds4_mmq_q8_0_exact_gemv4_blocks<6>(dev);
+    case 7: return ds4_mmq_q8_0_exact_gemv4_blocks<7>(dev);
+    case 8: return ds4_mmq_q8_0_exact_gemv4_blocks<8>(dev);
+    default: return 0;
+    }
+}
+
+template <int ncols>
+static void ds4_mmq_q8_0_exact_gemv4_launch(const void *W, const void *Y, float *out, int M, int dev,
+                                            cudaStream_t stream) {
+    ds4_mmq_q8_0_exact_gemv4_kernel<ncols><<<ds4_mmq_q8_0_exact_gemv4_blocks<ncols>(dev),
+                                             DS4_Q8_GEMV_WARPS * WARP_SIZE, 0, stream>>>(
+            (const block_q8_0 *)W, (const block_q8_1_mmq *)Y, out, M, *ds4_q8_gemv4_segments(dev, M));
+}
+
+static void ds4_mmq_q8_0_exact_gemv4(const void *W, const void *Y, float *out, int M, int N, int dev,
+                                     cudaStream_t stream) {
+    switch (N) {
+    case 2: ds4_mmq_q8_0_exact_gemv4_launch<2>(W, Y, out, M, dev, stream); break;
+    case 3: ds4_mmq_q8_0_exact_gemv4_launch<3>(W, Y, out, M, dev, stream); break;
+    case 4: ds4_mmq_q8_0_exact_gemv4_launch<4>(W, Y, out, M, dev, stream); break;
+    case 5: ds4_mmq_q8_0_exact_gemv4_launch<5>(W, Y, out, M, dev, stream); break;
+    case 6: ds4_mmq_q8_0_exact_gemv4_launch<6>(W, Y, out, M, dev, stream); break;
+    case 7: ds4_mmq_q8_0_exact_gemv4_launch<7>(W, Y, out, M, dev, stream); break;
+    case 8: ds4_mmq_q8_0_exact_gemv4_launch<8>(W, Y, out, M, dev, stream); break;
+    }
+}
+
+template <int ncols>
+static int ds4_mmq_q8_0_head_blocks(int dev) {
+    static int per_sm[GGML_CUDA_MAX_DEVICES] = {};
+    if (per_sm[dev] == 0) {
+        int n = 0;
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n,
+                ds4_mmq_q8_0_exact_gemv4_kernel<ncols, true>,
+                DS4_Q8_GEMV_WARPS * WARP_SIZE, 0) != cudaSuccess || n <= 0) {
+            (void)cudaGetLastError();
+            n = -1;
+        }
+        per_sm[dev] = n;
+    }
+    return per_sm[dev] > 0 ? per_sm[dev] * ggml_cuda_info().devices[dev].nsm : 0;
+}
+
+static bool ds4_mmq_q8_0_head_ok(int dev, int M, int N) {
+    if (M != 64640 || (N != 5 && N != 6 && N != 8) || M % DS4_Q8_GEMV_MMQ_Y != 0) return false;
+    const int nsm = ggml_cuda_info().devices[dev].nsm;
+    if (nsm <= 0) return false;
+    const int tiles = M / DS4_Q8_GEMV_MMQ_Y;
+    const int waves = (tiles + nsm - 1) / nsm;
+    if (100 * tiles / (nsm * waves) < 90) return false;
+    return (N == 5 ? ds4_mmq_q8_0_head_blocks<5>(dev) :
+            N == 6 ? ds4_mmq_q8_0_head_blocks<6>(dev) : ds4_mmq_q8_0_head_blocks<8>(dev)) > 0;
+}
+
+template <int ncols>
+static void ds4_mmq_q8_0_head_launch(const void *W, const void *Y, float *out, int M, int dev,
+                                    cudaStream_t stream) {
+    ds4_q8_gemv4_segs unused = {};
+    ds4_mmq_q8_0_exact_gemv4_kernel<ncols, true><<<ds4_mmq_q8_0_head_blocks<ncols>(dev),
+            DS4_Q8_GEMV_WARPS * WARP_SIZE, 0, stream>>>(
+            (const block_q8_0 *)W, (const block_q8_1_mmq *)Y, out, M, unused);
+}
+
+/* The measured Spark TP shapes only: attention projections and vocabulary
+ * head. Everything else stays on mul_mat_q. */
+static bool ds4_mmq_q8_0_exact_gemv_ok(int dev, const void *W, int M, int N, int K) {
+    if (ggml_cuda_info().devices[dev].cc != GGML_CUDA_CC_DGX_SPARK ||
+        get_mmq_y_host(GGML_CUDA_CC_DGX_SPARK) != DS4_Q8_GEMV_MMQ_Y ||
+        N < 2 || N > 8 || ((uintptr_t)W & 15u) != 0) {
+        return false;
+    }
+    if (K == DS4_Q8_GEMV_K && M == 16384) return ds4_mmq_q8_0_exact_gemv_blocks(dev, N) > 0;
+    if (K == 4096 && ds4_mmq_q8_0_head_ok(dev, M, N)) return true;
+    if (K == 4096 && (M == 1024 || M == 512)) {
+        return ds4_q8_gemv4_segments(dev, M) != nullptr && ds4_mmq_q8_0_exact_gemv4_blocks(dev, N) > 0;
+    }
+    return false;
+}
+
+template <int ncols>
+static void ds4_mmq_q8_0_exact_gemv_launch(const void *W, const void *Y, float *out, int M, int dev,
+                                           cudaStream_t stream) {
+    /* The stream-k grid mul_mat_q_case uses for this shape (one column tile). */
+    const int nsm = ggml_cuda_info().devices[dev].nsm;
+    const int ntiles = M / DS4_Q8_GEMV_MMQ_Y;
+    const int nwaves = (ntiles + nsm - 1) / nsm;
+    const int G = 100 * ntiles / (nsm * nwaves) >= 90 ? ntiles : nsm;
+    ds4_mmq_q8_0_exact_gemv_kernel<ncols><<<ds4_mmq_q8_0_exact_gemv_blocks<ncols>(dev),
+                                            DS4_Q8_GEMV_WARPS * WARP_SIZE, 0, stream>>>(
+            (const block_q8_0 *)W, (const block_q8_1_mmq *)Y, out, M, G);
+}
+
+static void ds4_mmq_q8_0_exact_gemv(const void *W, const void *Y, float *out, int M, int N, int dev,
+                                    cudaStream_t stream) {
+    switch (N) {
+    case 2: ds4_mmq_q8_0_exact_gemv_launch<2>(W, Y, out, M, dev, stream); break;
+    case 3: ds4_mmq_q8_0_exact_gemv_launch<3>(W, Y, out, M, dev, stream); break;
+    case 4: ds4_mmq_q8_0_exact_gemv_launch<4>(W, Y, out, M, dev, stream); break;
+    case 5: ds4_mmq_q8_0_exact_gemv_launch<5>(W, Y, out, M, dev, stream); break;
+    case 6: ds4_mmq_q8_0_exact_gemv_launch<6>(W, Y, out, M, dev, stream); break;
+    case 7: ds4_mmq_q8_0_exact_gemv_launch<7>(W, Y, out, M, dev, stream); break;
+    case 8: ds4_mmq_q8_0_exact_gemv_launch<8>(W, Y, out, M, dev, stream); break;
+    }
+}
+#endif
 
 template <ggml_type type>
 bool ds4_mmq_k_tile_supported(const char *tag, int K, int cc) {
-    if constexpr (type == GGML_TYPE_MXFP4 || type == GGML_TYPE_NVFP4) {
+    if constexpr (type == GGML_TYPE_NVFP4) {
         if (blackwell_mma_available(cc) && K % MMQ_ITER_K_FP4 != 0) {
             fprintf(stderr,
                     "%s: Blackwell FP4 K=%d must be a multiple of %d\n",
@@ -508,7 +1048,7 @@ int ds4_mmq_dense_impl(
     ds4_pool_set_stream(stream);
 
     // 1. Quantize F32 activations into the format consumed by MMQ. Blackwell
-    //    MXFP4 uses native FP4 tensor cores; other paths use MMQ Q8_1.
+    //    MXFP4 retains Q8 activations, including on native FP4 hardware.
     const int64_t ne00         = K;
     const int64_t ne10_padded  = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
     const int64_t ne11         = N;
@@ -516,7 +1056,7 @@ int ds4_mmq_dense_impl(
     const int64_t ne13         = 1;
 
     const bool use_native_fp4 =
-        type == GGML_TYPE_MXFP4 && blackwell_mma_available(cc);
+        type == GGML_TYPE_NVFP4 && blackwell_mma_available(cc);
     const size_t y_block_size = use_native_fp4
         ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
     const size_t y_values_per_block = use_native_fp4
@@ -526,7 +1066,15 @@ int ds4_mmq_dense_impl(
             y_values_per_block +
         get_mmq_x_max_host(cc) * sizeof(block_q8_1_mmq);
 
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx->pool(), nbytes_src1_q8_1);
+    ggml_cuda_pool_alloc<char> src1_q8_1_pool;
+    char *src1_q8_1 = nullptr;
+    if (void *scratch = ds4_mmq_aligned_q81_scratch(
+            dev, nbytes_src1_q8_1)) {
+        src1_q8_1 = (char *)scratch;
+    } else {
+        src1_q8_1_pool.alloc(ctx->pool(), nbytes_src1_q8_1);
+        src1_q8_1 = src1_q8_1_pool.get();
+    }
 
     // S1.1a fix: the mmq Y (activation) buffer is over-allocated for the kernel's
     // tail-tile reads (the +mmq_x_max blocks above), and ne11 columns may not fill
@@ -540,17 +1088,23 @@ int ds4_mmq_dense_impl(
     // The tail's dot-products are masked out by write_back, so only their
     // non-determinism matters; zero the buffer so the tail is a deterministic zero
     // (a zero q8_1 block contributes 0 to the dot product).
-    ybuf_memset(src1_q8_1.get(), nbytes_src1_q8_1, stream);
+#ifndef GGML_USE_HIP
+    // The exact Q8_0 GEMV reads only the valid columns: no memset there.
+    bool exact_gemv = false;
+    if constexpr (type == GGML_TYPE_Q8_0) exact_gemv = ds4_mmq_q8_0_exact_gemv_ok(dev, W, M, N, K);
+    if (!exact_gemv)
+#endif
+    ybuf_memset(src1_q8_1, nbytes_src1_q8_1, stream);
 
     if (use_native_fp4) {
         quantize_mmq_fp4_cuda(
-            X_f32, /*ids=*/nullptr, (void *)src1_q8_1.get(),
+            X_f32, /*ids=*/nullptr, (void *)src1_q8_1,
             type, /*ne00=*/K, /*s11=*/(int64_t)K, /*s12=*/0, /*s13=*/0,
             /*ne0=*/ne10_padded, /*ne1=*/ne11, /*ne2=*/ne12, /*ne3=*/ne13,
             stream);
     } else {
         quantize_mmq_q8_1_cuda(
-            X_f32, /*ids=*/nullptr, (void *)src1_q8_1.get(),
+            X_f32, /*ids=*/nullptr, (void *)src1_q8_1,
             type, /*ne00=*/K, /*s11=*/(int64_t)K, /*s12=*/0, /*s13=*/0,
             /*ne0=*/ne10_padded, /*ne1=*/ne11, /*ne2=*/ne12, /*ne3=*/ne13,
             stream);
@@ -561,6 +1115,26 @@ int ds4_mmq_dense_impl(
         fprintf(stderr, "%s: quantize failed: %s\n", tag, cudaGetErrorString(err));
         return -2;
     }
+#ifndef GGML_USE_HIP
+
+    if (exact_gemv) {
+        if (out_memset_enabled()) {
+            (void)cudaMemsetAsync(out_f32, 0, (size_t)M * (size_t)N * sizeof(float), stream);
+        }
+        if (K == 4096 && M == 64640) {
+            if (N == 5) ds4_mmq_q8_0_head_launch<5>(W, src1_q8_1, out_f32, M, dev, stream);
+            else if (N == 6) ds4_mmq_q8_0_head_launch<6>(W, src1_q8_1, out_f32, M, dev, stream);
+            else ds4_mmq_q8_0_head_launch<8>(W, src1_q8_1, out_f32, M, dev, stream);
+        } else if (K == 4096) ds4_mmq_q8_0_exact_gemv4(W, src1_q8_1, out_f32, M, N, dev, stream);
+        else ds4_mmq_q8_0_exact_gemv(W, src1_q8_1, out_f32, M, N, dev, stream);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr, "%s: exact q8_0 gemv launch failed: %s\n", tag, cudaGetErrorString(err));
+            return -3;
+        }
+        return 0;
+    }
+#endif
 
     // 2. Build mmq_args. stride_row_x is in WEIGHT BLOCKS per row, which
     //    is K / blck_size(type). Q8_0 has block size 32; Q2_K and IQ2_XXS
@@ -577,13 +1151,13 @@ int ds4_mmq_dense_impl(
         GGML_CUDA_CC_IS_CDNA(cc);
 
     if (out_memset_enabled()) {
-        cudaMemsetAsync(out_f32, 0, (size_t)M * (size_t)N * sizeof(float), stream);
+        (void)cudaMemsetAsync(out_f32, 0, (size_t)M * (size_t)N * sizeof(float), stream);
     }
 
     const mmq_args args = {
         /*x=*/(const char *)W,
         /*type_x=*/type,
-        /*y=*/(const int *)src1_q8_1.get(),
+        /*y=*/(const int *)src1_q8_1,
         /*ids_dst=*/nullptr,
         /*expert_bounds=*/nullptr,
         /*dst=*/out_f32,
@@ -630,7 +1204,7 @@ extern "C" int ds4_mmq_q8_0_quantize_ref(
     ds4_pool_set_stream(stream);
     const size_t need = (size_t)N * ne10_padded * sizeof(block_q8_1) / QK8_1;
     if (y_bytes < need) return -1;
-    cudaMemsetAsync(y, 0, y_bytes, stream);
+    (void)cudaMemsetAsync(y, 0, y_bytes, stream);
     quantize_mmq_q8_1_cuda(
         X, /*ids=*/nullptr, y, GGML_TYPE_Q8_0,
         /*ne00=*/K, /*s11=*/(int64_t)K, /*s12=*/0, /*s13=*/0,
@@ -683,7 +1257,7 @@ extern "C" int ds4_mmq_q8_0_dense_preq(
     }
     /* Tail-tile slack: deterministic zeros (S1.1a).  ~18 KiB, stream-ordered
      * after the producer's emit on the same stream. */
-    cudaMemsetAsync((char *)Y_q8_mmq + data_bytes, 0, slack_bytes, stream);
+    (void)cudaMemsetAsync((char *)Y_q8_mmq + data_bytes, 0, slack_bytes, stream);
 
     const int64_t s01 = (int64_t)K / QK8_0;
     const int64_t s12 = (int64_t)N * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
@@ -693,7 +1267,7 @@ extern "C" int ds4_mmq_q8_0_dense_preq(
         GGML_CUDA_CC_IS_CDNA(cc);
 
     if (out_memset_enabled()) {
-        cudaMemsetAsync(out, 0, (size_t)M * (size_t)N * sizeof(float), stream);
+        (void)cudaMemsetAsync(out, 0, (size_t)M * (size_t)N * sizeof(float), stream);
     }
 
     const mmq_args args = {
@@ -759,11 +1333,19 @@ extern "C" int ds4_mmq_q8_0_dense_d2r(
         (int64_t)N * ne10_padded * sizeof(block_q8_1) / QK8_1 +
         slack_blocks * sizeof(block_q8_1_mmq);
 
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx->pool(), nbytes_src1_q8_1);
-    ybuf_memset(src1_q8_1.get(), nbytes_src1_q8_1, stream);
+    ggml_cuda_pool_alloc<char> src1_q8_1_pool;
+    char *src1_q8_1 = nullptr;
+    if (void *scratch = ds4_mmq_aligned_q81_scratch(
+            dev, nbytes_src1_q8_1)) {
+        src1_q8_1 = (char *)scratch;
+    } else {
+        src1_q8_1_pool.alloc(ctx->pool(), nbytes_src1_q8_1);
+        src1_q8_1 = src1_q8_1_pool.get();
+    }
+    ybuf_memset(src1_q8_1, nbytes_src1_q8_1, stream);
 
     quantize_mmq_q8_1_cuda(
-        X_f32, /*ids=*/nullptr, (void *)src1_q8_1.get(),
+        X_f32, /*ids=*/nullptr, (void *)src1_q8_1,
         GGML_TYPE_Q8_0, /*ne00=*/K, /*s11=*/(int64_t)K, /*s12=*/0, /*s13=*/0,
         /*ne0=*/ne10_padded, /*ne1=*/(int64_t)N, /*ne2=*/1, /*ne3=*/1,
         stream);
@@ -772,7 +1354,7 @@ extern "C" int ds4_mmq_q8_0_dense_d2r(
         fprintf(stderr, "%s: quantize failed: %s\n", tag, cudaGetErrorString(err));
         return -2;
     }
-    return ds4_mmq_q8_0_dense_d2r_launch(W_aligned, src1_q8_1.get(), out_f32,
+    return ds4_mmq_q8_0_dense_d2r_launch(W_aligned, src1_q8_1, out_f32,
                                          M, N, K, stream);
 }
 
@@ -805,7 +1387,7 @@ extern "C" int ds4_mmq_q8_0_dense_d2r_preq(
     if (y_bytes < data_bytes + slack_bytes) {
         return -1;
     }
-    cudaMemsetAsync((char *)Y_q8_mmq + data_bytes, 0, slack_bytes, stream);
+    (void)cudaMemsetAsync((char *)Y_q8_mmq + data_bytes, 0, slack_bytes, stream);
     return ds4_mmq_q8_0_dense_d2r_launch(W_aligned, Y_q8_mmq, out_f32,
                                          M, N, K, stream);
 }
@@ -928,8 +1510,8 @@ int ds4_mmq_moe_impl(
     // Zero both id maps so unwritten tail slots gather/scatter row 0 instead:
     // those lanes' output is never consumed (the mmq write-back loop is
     // expert_bounds-bounded), the cost is a few KB of memset on-stream.
-    cudaMemsetAsync(ids_src1.get(), 0, ne_get_rows * sizeof(int32_t), stream);
-    cudaMemsetAsync(ids_dst.get(),  0, ne_get_rows * sizeof(int32_t), stream);
+    (void)cudaMemsetAsync(ids_src1.get(), 0, ne_get_rows * sizeof(int32_t), stream);
+    (void)cudaMemsetAsync(ids_dst.get(),  0, ne_get_rows * sizeof(int32_t), stream);
 
     // si1 = stride between tokens in the ids tensor, in elements. Our ids is
     // contiguous [n_tokens, n_expert_used] so si1 = n_expert_used.
@@ -962,10 +1544,9 @@ int ds4_mmq_moe_impl(
         return -2;
     }
 
-    // 2. Gather + quantize activations. Native Blackwell MXFP4 consumes FP4;
-    //    all other MMQ kernels consume Q8_1.
+    // 2. Gather + quantize activations, retaining Q8 precision for MXFP4.
     const bool use_native_fp4 =
-        type == GGML_TYPE_MXFP4 && blackwell_mma_available(cc);
+        type == GGML_TYPE_NVFP4 && blackwell_mma_available(cc);
     const size_t y_block_size = use_native_fp4
         ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
     const size_t y_values_per_block = use_native_fp4
@@ -1033,7 +1614,7 @@ int ds4_mmq_moe_impl(
         GGML_CUDA_CC_IS_CDNA(cc);
 
     if (out_memset_enabled()) {
-        cudaMemsetAsync(out_f32, 0, (size_t)M * (size_t)ne_get_rows * sizeof(float), stream);
+        (void)cudaMemsetAsync(out_f32, 0, (size_t)M * (size_t)ne_get_rows * sizeof(float), stream);
     }
 
     if (type == GGML_TYPE_Q2_K && x_soa != nullptr && d2r_enabled() &&
@@ -1202,7 +1783,8 @@ int ds4_mmq_moe_pair_impl(
         int64_t         soa_blocks = 0,
         /* ds4 (P3): see ds4_mmq_moe_impl. */
         bool            sanitize_out = true,
-        const ds4_mmq_fused_down *fused_down = nullptr) {
+        const ds4_mmq_fused_down *fused_down = nullptr,
+        bool allow_d2r = true) {
 
     const bool direct_gateup_q8 =
         fused_down != nullptr && fused_down->direct_gateup_q8;
@@ -1279,7 +1861,7 @@ int ds4_mmq_moe_pair_impl(
     size_t direct_work_bytes = 0;
 
     const bool use_native_fp4 =
-        type == GGML_TYPE_MXFP4 && blackwell_mma_available(cc);
+        type == GGML_TYPE_NVFP4 && blackwell_mma_available(cc);
     const size_t y_block_size = use_native_fp4
         ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
     const size_t y_values_per_block = use_native_fp4
@@ -1288,6 +1870,12 @@ int ds4_mmq_moe_pair_impl(
         ne_get_rows * ne10_padded * y_block_size / y_values_per_block +
         get_mmq_x_max_host(cc) * sizeof(block_q8_1_mmq);
     size_t direct_down_q8_bytes = 0;
+    const bool persistent_pair_maps =
+        !direct_gateup_q8 && type == GGML_TYPE_IQ2_XXS &&
+        cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151 && stream == nullptr &&
+        n_expert_used == 6 && n_experts == (int)MMQ_GFX1151_PAIR_MAP_EXPERTS &&
+        ne_get_rows <= (int64_t)MMQ_GFX1151_PAIR_MAP_ROWS &&
+        g_mmq_pair_maps[dev].base != nullptr;
     if (direct_gateup_q8) {
         const int64_t down_ne10_padded = GGML_PAD((int64_t)M, MATRIX_ROW_PADDING);
         direct_down_q8_bytes =
@@ -1302,7 +1890,7 @@ int ds4_mmq_moe_pair_impl(
         if (fused_down->input_q8_scratch_bytes < nbytes_src1_q8_1) return -91;
         if (fused_down->q8_scratch_bytes < direct_down_q8_bytes) return -92;
         if (gateup_work_bytes == 0 || down_work_bytes == 0) return -93;
-        if (!d2r_enabled() || !d2r_iq2_enabled()) return -94;
+        if (!allow_d2r || !d2r_enabled() || !d2r_iq2_enabled()) return -94;
         if (ne_get_rows < d2r_min_cols()) return -95;
         if (!ds4_mmq_iq2_xxs_moe_d2r_available(cc) ||
             !ds4_mmq_q2_K_moe_d2r_available(cc)) {
@@ -1335,6 +1923,11 @@ int ds4_mmq_moe_pair_impl(
         ids_src1 = (int32_t *)ids_src1_raw;
         ids_dst = (int32_t *)ids_dst_raw;
         expert_bounds = (int32_t *)expert_bounds_raw;
+    } else if (persistent_pair_maps) {
+        const auto & maps = g_mmq_pair_maps[dev];
+        ids_src1 = maps.ids_src1;
+        ids_dst = maps.ids_dst;
+        expert_bounds = maps.expert_bounds;
     } else {
         ids_src1 = ids_src1_alloc.alloc(ctx->pool(), ne_get_rows);
         ids_dst = ids_dst_alloc.alloc(ctx->pool(), ne_get_rows);
@@ -1361,8 +1954,8 @@ int ds4_mmq_moe_pair_impl(
                 nvtx_prefill);
         // Task #22 root-cause fix (same as ds4_mmq_moe_impl): zero the id maps
         // so entries dropped by mm_ids_helper never expose stale pool memory.
-        cudaMemsetAsync(ids_src1, 0, ne_get_rows * sizeof(int32_t), stream);
-        cudaMemsetAsync(ids_dst,  0, ne_get_rows * sizeof(int32_t), stream);
+        (void)cudaMemsetAsync(ids_src1, 0, ne_get_rows * sizeof(int32_t), stream);
+        (void)cudaMemsetAsync(ids_dst,  0, ne_get_rows * sizeof(int32_t), stream);
         ggml_cuda_launch_mm_ids_helper(
             ids, ids_src1, ids_dst, expert_bounds,
             n_experts, n_tokens, n_expert_used, /*nchannels_y=*/(int)ne11,
@@ -1382,7 +1975,14 @@ int ds4_mmq_moe_pair_impl(
      * token cannot select the same expert twice, so no expert bucket can
      * exceed n_tokens rows. Keep the conservative gathered-row bound for all
      * generic MMQ callers, including DSpark/MTP. */
-    const int64_t routed_ncols_max = fused_down
+    /* The IQ2 gate/up route is a true top-k selection: one token contributes
+     * at most one row to any expert. The default gathered-row upper bound
+     * overlaunches empty expert tiles by top_k; keep this opt-in until the
+     * compact expert-tile launch replaces the rectangular grid entirely. */
+    const bool tight_iq2_ncols =
+        type == GGML_TYPE_IQ2_XXS &&
+        ds4_mmq_gfx1151_flag("DS4_ROCM_MMQ_TIGHT_NCOLS", cc);
+    const int64_t routed_ncols_max = (fused_down || tight_iq2_ncols)
         ? (int64_t)n_tokens
         : ne_get_rows;
 
@@ -1483,11 +2083,11 @@ int ds4_mmq_moe_pair_impl(
                 char *h_cmp = (char *)malloc(cmp_payload);
                 int32_t *h_ids = (int32_t *)malloc((size_t)ne_get_rows * sizeof(int32_t));
                 if (h_ref && h_cmp && h_ids) {
-                    cudaMemcpyAsync(h_ref, ref, ref_payload, cudaMemcpyDeviceToHost, stream);
-                    cudaMemcpyAsync(h_cmp, src1_q8_1, cmp_payload, cudaMemcpyDeviceToHost, stream);
-                    cudaMemcpyAsync(h_ids, ids_src1, (size_t)ne_get_rows * sizeof(int32_t),
-                                    cudaMemcpyDeviceToHost, stream);
-                    cudaStreamSynchronize(stream);
+                    (void)cudaMemcpyAsync(h_ref, ref, ref_payload, cudaMemcpyDeviceToHost, stream);
+                    (void)cudaMemcpyAsync(h_cmp, src1_q8_1, cmp_payload, cudaMemcpyDeviceToHost, stream);
+                    (void)cudaMemcpyAsync(h_ids, ids_src1, (size_t)ne_get_rows * sizeof(int32_t),
+                                          cudaMemcpyDeviceToHost, stream);
+                    (void)cudaStreamSynchronize(stream);
                     long long bad = 0;
                     long long first_slot = -1, first_kseg = -1;
                     for (int ks = 0; ks < nkseg; ++ks) {
@@ -1507,7 +2107,7 @@ int ds4_mmq_moe_pair_impl(
                             first_slot, first_kseg);
                 }
                 free(h_ref); free(h_cmp); free(h_ids);
-                cudaFree(ref);
+                (void)cudaFree(ref);
             }
         }
         ybuf_memset(fused_down->q8_scratch, direct_down_q8_bytes, stream);
@@ -1537,9 +2137,9 @@ int ds4_mmq_moe_pair_impl(
         }
 
         if (out_memset_enabled()) {
-            cudaMemsetAsync(fused_down->out, 0,
-                    (size_t)fused_down->out_dim * (size_t)ne_get_rows * sizeof(float),
-                    stream);
+            (void)cudaMemsetAsync(fused_down->out, 0,
+                                  (size_t)fused_down->out_dim * (size_t)ne_get_rows * sizeof(float),
+                                  stream);
         }
         const size_t down_work_bytes =
             ds4_mmq_q2_K_moe_d2r_scratch_bytes(ne_get_rows, n_experts);
@@ -1573,13 +2173,13 @@ int ds4_mmq_moe_pair_impl(
     const int64_t s13_mmq = ne12 * s12_mmq;
 
     if (out_memset_enabled()) {
-        cudaMemsetAsync(out_a, 0, (size_t)M * (size_t)ne_get_rows * sizeof(float), stream);
-        cudaMemsetAsync(out_b, 0, (size_t)M * (size_t)ne_get_rows * sizeof(float), stream);
+        (void)cudaMemsetAsync(out_a, 0, (size_t)M * (size_t)ne_get_rows * sizeof(float), stream);
+        (void)cudaMemsetAsync(out_b, 0, (size_t)M * (size_t)ne_get_rows * sizeof(float), stream);
     }
 
     bool gate_up_done = false;
     if (type == GGML_TYPE_IQ2_XXS && xa_soa != nullptr && xb_soa != nullptr &&
-        d2r_enabled() && d2r_iq2_enabled() && K % 256 == 0 &&
+        allow_d2r && d2r_enabled() && d2r_iq2_enabled() && K % 256 == 0 &&
         ne_get_rows >= d2r_min_cols()) {
         static int d2r_iq2_avail_cc = -1;
         static int d2r_iq2_avail = 0;
@@ -1711,9 +2311,9 @@ int ds4_mmq_moe_pair_impl(
         }
 
         if (out_memset_enabled()) {
-            cudaMemsetAsync(fused_down->out, 0,
-                    (size_t)fused_down->out_dim * (size_t)ne_get_rows * sizeof(float),
-                    stream);
+            (void)cudaMemsetAsync(fused_down->out, 0,
+                                  (size_t)fused_down->out_dim * (size_t)ne_get_rows * sizeof(float),
+                                  stream);
         }
         const int64_t down_s01 = (int64_t)M / ggml_blck_size(GGML_TYPE_Q2_K);
         const int64_t down_s02 = (int64_t)fused_down->out_dim * down_s01;
@@ -1748,7 +2348,7 @@ int ds4_mmq_moe_pair_impl(
             /*soa_blocks=*/fused_down->soa_blocks,
         };
         bool down_done = false;
-        if (fused_down->W_soa != nullptr && d2r_enabled() &&
+        if (fused_down->W_soa != nullptr && allow_d2r && d2r_enabled() &&
             ne_get_rows >= d2r_min_cols() &&
             ds4_mmq_q2_K_moe_d2r_available(cc)) {
             const size_t work_bytes =
@@ -1905,7 +2505,7 @@ extern "C" int ds4_mmq_iq2_xxs_q2_K_moe_fused_soa(
         float * gate, float * up, float * mid_f32, float * down,
         int expert_mid_dim, int expert_in_dim, int out_dim,
         int n_tokens, int n_experts, int n_expert_used,
-        float clamp, cudaStream_t stream) {
+        float clamp, int preserve_reduction, cudaStream_t stream) {
     if (expert_mid_dim <= 0 || expert_in_dim <= 0 || out_dim <= 0 ||
         n_tokens <= 0 || n_experts <= 0 || n_expert_used <= 0 ||
         n_expert_used > n_experts || expert_in_dim % 256 != 0 ||
@@ -1941,7 +2541,88 @@ extern "C" int ds4_mmq_iq2_xxs_q2_K_moe_fused_soa(
         expert_mid_dim, expert_in_dim, n_tokens, n_experts, n_expert_used,
         stream,
         (const char *)W_gate, (const char *)W_up, iq2_blocks,
-        /*sanitize_out=*/false, &fused_down);
+        /*sanitize_out=*/false, &fused_down, !preserve_reduction);
+}
+
+extern "C" int ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_scratch_sizes(
+        int expert_mid_dim,
+        int expert_in_dim,
+        int n_tokens,
+        int n_experts,
+        int n_expert_used,
+        size_t *input_q8_bytes,
+        size_t *down_q8_bytes,
+        size_t *work_bytes) {
+    if (expert_mid_dim <= 0 || expert_in_dim <= 0 || n_tokens <= 0 ||
+        n_experts <= 0 || n_expert_used <= 0 ||
+        n_expert_used > n_experts || !input_q8_bytes || !down_q8_bytes ||
+        !work_bytes) {
+        return -1;
+    }
+    auto mul_u64 = [](uint64_t a, uint64_t b, uint64_t *out) -> bool {
+        if (a != 0u && b > UINT64_MAX / a) return false;
+        *out = a * b;
+        return true;
+    };
+    uint64_t rows = 0;
+    if (!mul_u64((uint64_t)n_tokens, (uint64_t)n_expert_used, &rows) ||
+        rows > INT_MAX) {
+        return -1;
+    }
+    const int dev = ggml_cuda_get_device();
+    const int cc = ggml_cuda_info().devices[dev].cc;
+    const uint64_t x_max = (uint64_t)get_mmq_x_max_host(cc);
+    const uint64_t input_padded =
+        (uint64_t)GGML_PAD((int64_t)expert_in_dim, MATRIX_ROW_PADDING);
+    const uint64_t mid_padded =
+        (uint64_t)GGML_PAD((int64_t)expert_mid_dim, MATRIX_ROW_PADDING);
+    uint64_t input_values = 0, input_storage = 0, input_slack = 0;
+    uint64_t down_values = 0, down_storage = 0, down_slack = 0;
+    if (!mul_u64(rows, input_padded, &input_values) ||
+        !mul_u64(input_values, sizeof(block_q8_1_mmq), &input_storage) ||
+        !mul_u64(x_max, sizeof(block_q8_1_mmq), &input_slack) ||
+        !mul_u64(rows, mid_padded, &down_values) ||
+        !mul_u64(down_values, sizeof(block_q8_1), &down_storage) ||
+        !mul_u64(x_max, sizeof(block_q8_1_mmq), &down_slack)) {
+        return -1;
+    }
+    input_storage /= 4u * QK8_1;
+    down_storage /= QK8_1;
+    if (input_storage > UINT64_MAX - input_slack ||
+        down_storage > UINT64_MAX - down_slack) {
+        return -1;
+    }
+    const uint64_t input_bytes = input_storage + input_slack;
+    const uint64_t down_bytes = down_storage + down_slack;
+    const size_t gateup_work =
+        ds4_mmq_iq2_xxs_moe_d2r_fused_scratch_bytes(
+            (int64_t)rows, n_experts);
+    const size_t down_work = ds4_mmq_q2_K_moe_d2r_scratch_bytes(
+        (int64_t)rows, n_experts);
+    if (input_bytes > SIZE_MAX || down_bytes > SIZE_MAX ||
+        gateup_work == 0 || down_work == 0) {
+        return -1;
+    }
+
+    size_t offset = 0;
+    auto reserve_aligned = [&offset](size_t bytes) -> bool {
+        if (offset > SIZE_MAX - 255u) return false;
+        offset = (offset + 255u) & ~(size_t)255u;
+        if (bytes > SIZE_MAX - offset) return false;
+        offset += bytes;
+        return true;
+    };
+    if (!reserve_aligned((size_t)rows * sizeof(int32_t)) ||
+        !reserve_aligned((size_t)rows * sizeof(int32_t)) ||
+        !reserve_aligned(((size_t)n_experts + 1u) * sizeof(int32_t)) ||
+        !reserve_aligned(gateup_work > down_work ? gateup_work : down_work) ||
+        offset > SIZE_MAX - 255u) {
+        return -1;
+    }
+    *input_q8_bytes = (size_t)input_bytes;
+    *down_q8_bytes = (size_t)down_bytes;
+    *work_bytes = offset + 255u;
+    return 0;
 }
 
 /* Aligned-artifact production fast path: gate/up accumulators stay in
@@ -2196,7 +2877,7 @@ int ds4_mmq_moe_vec_impl(
 
     ggml_cuda_mm_fusion_args_device fusion = {};
 
-    cudaMemsetAsync(out_f32, 0, (size_t)M * (size_t)n_tokens * (size_t)n_expert_used * sizeof(float), stream);
+    (void)cudaMemsetAsync(out_f32, 0, (size_t)M * (size_t)n_tokens * (size_t)n_expert_used * sizeof(float), stream);
 
     // FD Inc2a: one mmvq launch serves at most col_cap columns -- the moe
     // kernel runs one warp per column (block.y = ncols_dst) under
@@ -2704,8 +3385,8 @@ int ds4_mmq_moe_pair_raw_vec_impl(
     ggml_cuda_mm_fusion_args_device fusion = {};
 
     const size_t out_bytes = (size_t)M * (size_t)n_tokens * (size_t)n_expert_used * sizeof(float);
-    cudaMemsetAsync(out_a, 0, out_bytes, stream);
-    cudaMemsetAsync(out_b, 0, out_bytes, stream);
+    (void)cudaMemsetAsync(out_a, 0, out_bytes, stream);
+    (void)cudaMemsetAsync(out_b, 0, out_bytes, stream);
 
     for (int c0 = 0; c0 < n_tokens; c0 += col_cap) {
         const int ncols = (n_tokens - c0 < col_cap) ? (n_tokens - c0) : col_cap;
@@ -2850,7 +3531,7 @@ int ds4_mmq_moe_pair_vec_impl(
     fusion.gate   = W_b;
     fusion.glu_op = GGML_GLU_OP_SWIGLU;
 
-    cudaMemsetAsync(out_silu, 0, (size_t)M * (size_t)n_expert_used * sizeof(float), stream);
+    (void)cudaMemsetAsync(out_silu, 0, (size_t)M * (size_t)n_expert_used * sizeof(float), stream);
 
     mul_mat_vec_q_switch_type(
         /*vx=*/W_a, /*type_x=*/type,
@@ -2956,7 +3637,7 @@ int ds4_mmq_dense_vec_impl(
 
     ggml_cuda_mm_fusion_args_device fusion = {};
 
-    cudaMemsetAsync(out_f32, 0, (size_t)M * (size_t)N * sizeof(float), stream);
+    (void)cudaMemsetAsync(out_f32, 0, (size_t)M * (size_t)N * sizeof(float), stream);
 
     mul_mat_vec_q_switch_type(
         /*vx=*/W, /*type_x=*/type,
@@ -3011,6 +3692,16 @@ static __device__ __forceinline__ float ds4_mmq_vec_dot_q8_1(
     }
 }
 
+/* MXFP4 short routed batches: give the token/assignment index the fastest
+ * grid dimension, so every row that uses one 64-row weight block runs together
+ * and repeated experts are served from L2. Only the block-to-work mapping
+ * moves; each block's per-thread arithmetic and output location are unchanged.
+ * Other formats keep their established row-block-major launch. */
+template <ggml_type type>
+struct ds4_mmq_vec_assignment_major {
+    static constexpr bool value = type == GGML_TYPE_MXFP4;
+};
+
 static __device__ __forceinline__ float ds4_mmq_half_warp_sum_f32(float v) {
     const uint32_t mask = 0xffffu << (threadIdx.x & 16u);
     for (int offset = 8; offset > 0; offset >>= 1) {
@@ -3019,7 +3710,7 @@ static __device__ __forceinline__ float ds4_mmq_half_warp_sum_f32(float v) {
     return v;
 }
 
-template <ggml_type type>
+template <ggml_type type, int ROWS = 8>
 static __global__ void ds4_mmq_moe_down_sum6_q8_1_qwarp32_kernel(
         const void       * __restrict__ W,
         const block_q8_1 * __restrict__ X_q8,
@@ -3042,7 +3733,9 @@ static __global__ void ds4_mmq_moe_down_sum6_q8_1_qwarp32_kernel(
     constexpr int blocks_per_iter = vdr * 16 / qi;
     const uint32_t lane = threadIdx.x & 15u;
     const uint32_t row_lane = threadIdx.x >> 4u;
-    const uint32_t tok  = blockIdx.y;
+    constexpr bool assignment_major = ds4_mmq_vec_assignment_major<type>::value;
+    const uint32_t tok       = assignment_major ? blockIdx.x : blockIdx.y;
+    const uint32_t row_block = assignment_major ? blockIdx.y : blockIdx.x;
     if (tok >= n_tokens) return;
 
     const uint32_t blocks_per_row_x = ncols_x / qk;
@@ -3050,8 +3743,8 @@ static __global__ void ds4_mmq_moe_down_sum6_q8_1_qwarp32_kernel(
     const int kqs = vdr * (lane % lanes_per_k);
 
 #pragma unroll
-    for (uint32_t rr = 0; rr < 4u; ++rr) {
-        const uint32_t row = blockIdx.x * 64u + row_lane + rr * 16u;
+    for (uint32_t rr = 0; rr < (uint32_t)ROWS; ++rr) {
+        const uint32_t row = row_block * (8u * ROWS) + row_lane + rr * 8u;
         if (row >= nrows_x) continue;
         float total = 0.0f;
 #pragma unroll
@@ -3105,7 +3798,9 @@ static __global__ void ds4_mmq_moe_gate_up_mid_q8_1_qwarp32_kernel(
     constexpr int blocks_per_iter = vdr * 16 / qi;
     const uint32_t lane = threadIdx.x & 15u;
     const uint32_t row_lane = threadIdx.x >> 4u;
-    const uint32_t assignment = blockIdx.y;
+    constexpr bool assignment_major = ds4_mmq_vec_assignment_major<type>::value;
+    const uint32_t assignment = assignment_major ? blockIdx.x : blockIdx.y;
+    const uint32_t row_block  = assignment_major ? blockIdx.y : blockIdx.x;
     const uint32_t tok = assignment / top_k;
     const uint32_t slot = assignment - tok * top_k;
     if (tok >= n_tokens) return;
@@ -3120,7 +3815,7 @@ static __global__ void ds4_mmq_moe_gate_up_mid_q8_1_qwarp32_kernel(
 
 #pragma unroll
     for (uint32_t rr = 0; rr < 4u; ++rr) {
-        const uint32_t row = blockIdx.x * 64u + row_lane + rr * 16u;
+        const uint32_t row = row_block * 64u + row_lane + rr * 16u;
         if (row >= nrows_x) continue;
         const int kbx_base = (int)(expert * stride_channel_x + row * stride_row_x);
         float gate = 0.0f;
@@ -3146,6 +3841,169 @@ static __global__ void ds4_mmq_moe_gate_up_mid_q8_1_qwarp32_kernel(
         }
     }
 }
+
+#ifndef GGML_USE_HIP
+/* Staged-row MXFP4 gate/up: bit-identical to
+ * ds4_mmq_moe_gate_up_mid_q8_1_qwarp32_kernel (same lane mapping, integer
+ * dots, float operation order, reduction and epilogue).  Each half-warp
+ * copies its gate and up rows into shared memory with 16-byte cp.async
+ * copies, then reads each lane's packed ints with aligned 32-bit loads.
+ * Needs 16-byte aligned rows (K/32 a multiple of 16). */
+__device__ __forceinline__ static void ds4_stage_cp16(void *dst, const void *src) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    const unsigned smem = static_cast<unsigned>(__cvta_generic_to_shared(dst));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(smem), "l"(src) : "memory");
+#else
+    *reinterpret_cast<int4 *>(dst) = *reinterpret_cast<const int4 *>(src);
+#endif
+}
+
+__device__ __forceinline__ static void ds4_stage_wait_all(void) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.wait_all;" ::: "memory");
+#endif
+}
+
+/* Half-warp copies one row of n16 16-byte units into stage. */
+__device__ __forceinline__ static void ds4_stage_row(uint4 *stage, const uint4 *src,
+                                                     uint32_t n16, uint32_t lane) {
+    for (uint32_t j = lane; j < n16; j += 16u) ds4_stage_cp16(stage + j, src + j);
+}
+
+/* The 32-bit word holding bytes [byte, byte + 4) of a 4-byte aligned stage. */
+__device__ __forceinline__ static int ds4_stage_int(const uint32_t *stage32, uint32_t byte) {
+    const uint32_t w = byte >> 2;
+    const uint32_t sh = (byte & 3u) * 8u;
+    const uint32_t lo = stage32[w];
+    const uint32_t hi = sh ? stage32[w + 1u] : lo;
+    return (int)__funnelshift_r(lo, hi, sh);
+}
+
+/* vec_dot_mxfp4_q8_1 for a block held in shared memory: identical ints,
+ * identical dp4a chain and scale arithmetic. */
+__device__ __forceinline__ static float ds4_mxfp4_dot_q8_1_stage(
+        const uint32_t *stage32, uint32_t block_byte, const block_q8_1 * __restrict__ bq8_1,
+        int iqs) {
+    const int * q8 = (const int *) bq8_1->qs + iqs;
+    int sumi = 0;
+#pragma unroll
+    for (int l = 0; l < VDR_MXFP4_Q8_1_MMVQ; ++l) {
+        const int aux_q4 = ds4_stage_int(stage32, block_byte + 1u + 4u * (uint32_t)(iqs + l));
+        const int2 v = get_int_from_table_16(aux_q4, kvalues_mxfp4);
+        sumi = ggml_cuda_dp4a(v.x, q8[l + 0], sumi);
+        sumi = ggml_cuda_dp4a(v.y, q8[l + 4], sumi);
+    }
+    const uint8_t e = ((const uint8_t *)stage32)[block_byte];
+    const float d = ggml_cuda_e8m0_to_fp32(e) * 0.5f * __low2float(bq8_1->ds);
+    return d * sumi;
+}
+
+/* 64 bytes between half-warp stages shift them by 16 shared-memory banks. */
+#define DS4_STAGE_PAD_U4 4u
+
+template <ggml_type type>
+static __global__ void ds4_mmq_moe_gate_up_mid_mxfp4_staged_kernel(
+        const void       * __restrict__ W_gate,
+        const void       * __restrict__ W_up,
+        const block_q8_1 * __restrict__ X_q8,
+        const int32_t    * __restrict__ ids,
+        const float      * __restrict__ weights,
+        float            * __restrict__ mid,
+        const uint32_t ncols_x,
+        const uint32_t nrows_x,
+        const uint32_t n_tokens,
+        const uint32_t n_experts,
+        const uint32_t stride_row_x,
+        const uint32_t stride_col_y,
+        const uint32_t stride_channel_x,
+        const float clamp) {
+    static_assert(type == GGML_TYPE_MXFP4, "staged rows are MXFP4 only");
+    extern __shared__ uint4 ds4_mxfp4_row_stage[];
+    constexpr int top_k = 6;
+    constexpr int qk = ggml_cuda_type_traits<type>::qk;
+    constexpr int q8_per_k = qk / QK8_1;
+    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr = ds4_mmq_vdr_mmvq_value<type>::value;
+    constexpr int lanes_per_k = qi / vdr;
+    constexpr int blocks_per_iter = vdr * 16 / qi;
+    const uint32_t lane = threadIdx.x & 15u;
+    const uint32_t row_lane = threadIdx.x >> 4u;
+    const uint32_t row_lanes = blockDim.x >> 4u;
+    const uint32_t assignment = blockIdx.x;
+    const uint32_t row_block = blockIdx.y;
+    const uint32_t tok = assignment / top_k;
+    const uint32_t slot = assignment - tok * top_k;
+    if (tok >= n_tokens) return;
+
+    const int32_t id_raw = ids[(uint64_t)tok * top_k + slot];
+    const bool invalid_id = id_raw < 0 || (uint32_t)id_raw >= n_experts;
+    const uint32_t expert = invalid_id ? 0u : (uint32_t)id_raw;
+    const block_q8_1 * xq = X_q8 + (uint64_t)tok * stride_col_y;
+    const uint32_t blocks_per_row_x = ncols_x / qk;
+    const uint32_t row_u4 = blocks_per_row_x * (uint32_t)sizeof(block_mxfp4) / 16u;
+    uint4 *gate_stage = ds4_mxfp4_row_stage +
+        (uint64_t)row_lane * (2u * row_u4 + DS4_STAGE_PAD_U4);
+    uint4 *up_stage = gate_stage + row_u4;
+    const uint32_t *gate32 = (const uint32_t *)gate_stage;
+    const uint32_t *up32 = (const uint32_t *)up_stage;
+    const unsigned half_mask = 0xffffu << (threadIdx.x & 16u);
+    const uint32_t kbx0 = lane / lanes_per_k;
+    const int kqs = vdr * (lane % lanes_per_k);
+    const uint32_t rows_per_block = row_lanes * 4u;
+
+#pragma unroll
+    for (uint32_t rr = 0; rr < 4u; ++rr) {
+        const uint32_t row = row_block * rows_per_block + row_lane + rr * row_lanes;
+        if (row >= nrows_x) continue;
+        float gate = 0.0f;
+        float up = 0.0f;
+        if (!invalid_id) {
+            const uint64_t kbx_base = (uint64_t)expert * stride_channel_x + (uint64_t)row * stride_row_x;
+            ds4_stage_row(gate_stage, (const uint4 *)((const block_mxfp4 *)W_gate + kbx_base), row_u4, lane);
+            ds4_stage_row(up_stage, (const uint4 *)((const block_mxfp4 *)W_up + kbx_base), row_u4, lane);
+            ds4_stage_wait_all();
+            __syncwarp(half_mask);
+            for (uint32_t b = kbx0; b < blocks_per_row_x; b += blocks_per_iter) {
+                const block_q8_1 * xb = xq + (uint64_t)b * q8_per_k;
+                const uint32_t bb = b * (uint32_t)sizeof(block_mxfp4);
+                gate += ds4_mxfp4_dot_q8_1_stage(gate32, bb, xb, kqs);
+                up   += ds4_mxfp4_dot_q8_1_stage(up32,   bb, xb, kqs);
+            }
+            __syncwarp(half_mask);   /* the stage is reused by the next row */
+        }
+        gate = ds4_mmq_half_warp_sum_f32(gate);
+        up   = ds4_mmq_half_warp_sum_f32(up);
+        if (lane == 0) {
+            if (!isfinite(gate)) gate = 0.0f;
+            if (!isfinite(up)) up = 0.0f;
+            if (clamp > 1.0e-6f) {
+                if (gate > clamp) gate = clamp;
+                if (up > clamp) up = clamp;
+                if (up < -clamp) up = -clamp;
+            }
+            const float silu = gate / (1.0f + expf(-gate));
+            mid[(uint64_t)assignment * nrows_x + row] = silu * up * weights[(uint64_t)tok * top_k + slot];
+        }
+    }
+}
+
+/* Enabled on DGX Spark (sm_121).  At 64 threads the stage is
+ * 4 * (2 * row + 64) bytes, within the default 48 KiB of dynamic shared
+ * memory for K up to 8192. */
+static constexpr int DS4_MXFP4_STAGED_THREADS = 64;
+
+static bool ds4_mmq_mxfp4_staged_ok(int dev, const void *w0, const void *w1, int K,
+                                    uint32_t stride_row_x, uint32_t stride_channel_x) {
+    const uint32_t blocks_per_row = (uint32_t)K / 32u;
+    const size_t smem = (size_t)(DS4_MXFP4_STAGED_THREADS / 16) *
+        (2u * blocks_per_row * sizeof(block_mxfp4) + DS4_STAGE_PAD_U4 * 16u);
+    return ggml_cuda_info().devices[dev].cc == GGML_CUDA_CC_DGX_SPARK &&
+           (((uintptr_t)w0 | (uintptr_t)w1) & 15u) == 0 &&
+           blocks_per_row % 16u == 0 && stride_row_x % 16u == 0 &&
+           stride_channel_x % 16u == 0 && stride_row_x >= blocks_per_row &&
+           smem <= 48u * 1024u;
+}
+#endif
 
 template <ggml_type type, int c_rows_per_block>
 static __global__ void ds4_mmq_moe_down_sum6_vec_kernel(
@@ -3294,13 +4152,37 @@ int ds4_mmq_moe_down_sum6_vec_impl(
     const uint32_t stride_col_y     = (uint32_t)(ne10_padded / QK8_1);
     const uint32_t stride_channel_x = (uint32_t)((int64_t)M * stride_row_x);
 
-    const dim3 block_nums((M + 63) / 64, n_tokens);
-    const dim3 block_dims(256);
+    /* Short Flash blocks need more CTAs to fill Spark, especially at one
+     * token. The dot products and ordered six-expert sum stay unchanged. */
+    bool small_tiles = false;
+#ifndef GGML_USE_HIP
+    small_tiles = type == GGML_TYPE_MXFP4 &&
+        ggml_cuda_info().devices[dev].cc == GGML_CUDA_CC_DGX_SPARK &&
+        M == 4096 && (K == 1024 || K == 2048) && n_tokens <= 8;
+#endif
+    const uint32_t tile_rows = small_tiles ? 8u : 64u;
+    const uint32_t row_blocks = ((uint32_t)M + tile_rows - 1u) / tile_rows;
+    if (ds4_mmq_vec_assignment_major<type>::value && row_blocks > 65535u) {
+        fprintf(stderr, "%s: M=%d exceeds the assignment-major grid\n", tag, M);
+        return -1;
+    }
+    const dim3 block_nums = ds4_mmq_vec_assignment_major<type>::value ?
+        dim3((unsigned)n_tokens, row_blocks) : dim3(row_blocks, (unsigned)n_tokens);
+    const dim3 block_dims(128);
 
-    ds4_mmq_moe_down_sum6_q8_1_qwarp32_kernel<type><<<block_nums, block_dims, 0, stream>>>(
-        W, (const block_q8_1 *)src1_q8_1_ptr, ids, out_f32,
-        (uint32_t)K, (uint32_t)M, (uint32_t)n_tokens, (uint32_t)n_experts,
-        stride_row_x, stride_col_y, stride_channel_x);
+#define DS4_LAUNCH_DOWN_ROWS(R) \
+    ds4_mmq_moe_down_sum6_q8_1_qwarp32_kernel<type, R><<<block_nums, block_dims, 0, stream>>>( \
+        W, (const block_q8_1 *)src1_q8_1_ptr, ids, out_f32, \
+        (uint32_t)K, (uint32_t)M, (uint32_t)n_tokens, (uint32_t)n_experts, \
+        stride_row_x, stride_col_y, stride_channel_x)
+#ifndef GGML_USE_HIP
+    if constexpr (type == GGML_TYPE_MXFP4) {
+        if (small_tiles) { DS4_LAUNCH_DOWN_ROWS(1); }
+        else { DS4_LAUNCH_DOWN_ROWS(8); }
+    } else
+#endif
+    { DS4_LAUNCH_DOWN_ROWS(8); }
+#undef DS4_LAUNCH_DOWN_ROWS
 
     err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -3543,7 +4425,42 @@ int ds4_mmq_moe_gate_up_mid_vec_impl(
     const uint32_t stride_col_y     = (uint32_t)(ne10_padded / QK8_1);
     const uint32_t stride_channel_x = (uint32_t)((int64_t)M * stride_row_x);
 
-    const dim3 block_nums((M + 63) / 64, n_tokens * n_expert_used);
+    const uint32_t row_blocks = (uint32_t)((M + 63) / 64);
+    const uint32_t assignments = (uint32_t)n_tokens * (uint32_t)n_expert_used;
+    if (ds4_mmq_vec_assignment_major<type>::value && row_blocks > 65535u) {
+        fprintf(stderr, "%s: M=%d exceeds the assignment-major grid\n", tag, M);
+        return -1;
+    }
+#ifndef GGML_USE_HIP
+    if constexpr (type == GGML_TYPE_MXFP4) {
+        /* Staged rows need 16-byte aligned rows: aligned bases and strides
+         * that are multiples of 16 blocks (17 * 16 = 272 bytes). */
+        if (ds4_mmq_mxfp4_staged_ok(dev, W_gate, W_up, K, stride_row_x, stride_channel_x)) {
+            const uint32_t staged = (uint32_t)DS4_MXFP4_STAGED_THREADS;
+            const uint32_t blocks_per_row = (uint32_t)K / 32u;
+            const uint32_t rows_per_block = staged / 16u * 4u;
+            const uint32_t staged_row_blocks = (uint32_t)((M + rows_per_block - 1) / rows_per_block);
+            const size_t smem = (size_t)(staged / 16u) *
+                (2u * blocks_per_row * sizeof(block_mxfp4) + DS4_STAGE_PAD_U4 * 16u);
+            if (staged_row_blocks <= 65535u) {
+                ds4_mmq_moe_gate_up_mid_mxfp4_staged_kernel<type>
+                    <<<dim3(assignments, staged_row_blocks), dim3(staged), smem, stream>>>(
+                    W_gate, W_up, (const block_q8_1 *)src1_q8_1_ptr, ids, weights, mid_f32,
+                    (uint32_t)K, (uint32_t)M, (uint32_t)n_tokens, (uint32_t)n_experts,
+                    stride_row_x, stride_col_y, stride_channel_x, clamp);
+                err = cudaGetLastError();
+                if (err != cudaSuccess) {
+                    fprintf(stderr, "%s: staged MXFP4 gate+up launch failed: %s\n",
+                            tag, cudaGetErrorString(err));
+                    return -3;
+                }
+                return 0;
+            }
+        }
+    }
+#endif
+    const dim3 block_nums = ds4_mmq_vec_assignment_major<type>::value ?
+        dim3(assignments, row_blocks) : dim3(row_blocks, assignments);
     const dim3 block_dims(256);
     ds4_mmq_moe_gate_up_mid_q8_1_qwarp32_kernel<type><<<block_nums, block_dims, 0, stream>>>(
         W_gate, W_up, (const block_q8_1 *)src1_q8_1_ptr, ids, weights, mid_f32,
@@ -3557,6 +4474,114 @@ int ds4_mmq_moe_gate_up_mid_vec_impl(
         return -3;
     }
 
+    return 0;
+}
+
+__global__ static void ds4_mmq_q4_K_dense_pair_vec_kernel(
+        const void       * __restrict__ W0,
+        const void       * __restrict__ W1,
+        const block_q8_1 * __restrict__ X_q8,
+        float            * __restrict__ out0,
+        float            * __restrict__ out1,
+        uint32_t                         M,
+        uint32_t                         K) {
+    constexpr ggml_type type = GGML_TYPE_Q4_K;
+    constexpr int qk = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr = ds4_mmq_vdr_mmvq_value<type>::value;
+    constexpr int lanes_per_k = qi / vdr;
+    constexpr int blocks_per_iter = vdr * 16 / qi;
+    constexpr int q8_per_k = qk / QK8_1;
+
+    const uint32_t lane = threadIdx.x & 15u;
+    const uint32_t row_lane = threadIdx.x >> 4u;
+    const uint32_t row0 = blockIdx.x * 64u + row_lane;
+    const uint32_t blocks_per_row = K / qk;
+    const uint32_t kbx0 = lane / lanes_per_k;
+    const int kqs = vdr * (lane % lanes_per_k);
+
+    float acc0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float acc1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (uint32_t b = kbx0; b < blocks_per_row; b += blocks_per_iter) {
+        const block_q8_1 *xb = X_q8 + (uint64_t)b * q8_per_k;
+#pragma unroll
+        for (uint32_t rr = 0; rr < 4u; rr++) {
+            const uint32_t row = row0 + rr * 16u;
+            if (row < M) {
+                const int kbx = (int)(row * blocks_per_row + b);
+                acc0[rr] += ds4_mmq_vec_dot_q8_1<type>(W0, xb, kbx, kqs);
+                acc1[rr] += ds4_mmq_vec_dot_q8_1<type>(W1, xb, kbx, kqs);
+            }
+        }
+    }
+#pragma unroll
+    for (uint32_t rr = 0; rr < 4u; rr++) {
+        acc0[rr] = ds4_mmq_half_warp_sum_f32(acc0[rr]);
+        acc1[rr] = ds4_mmq_half_warp_sum_f32(acc1[rr]);
+    }
+    if (lane == 0u) {
+#pragma unroll
+        for (uint32_t rr = 0; rr < 4u; rr++) {
+            const uint32_t row = row0 + rr * 16u;
+            if (row < M) {
+                const float a = acc0[rr];
+                const float b = acc1[rr];
+                out0[row] = isfinite(a) ? a : 0.0f;
+                out1[row] = isfinite(b) ? b : 0.0f;
+            }
+        }
+    }
+}
+
+static int ds4_mmq_q4_K_dense_pair_vec_impl(
+        const void *W0, const void *W1, const float *X,
+        float *out0, float *out1, int M, int K, cudaStream_t stream) {
+    const char *tag = "ds4_mmq_q4_K_dense_pair_vec";
+    if (!W0 || !W1 || !X || !out0 || !out1 || M <= 0 || K <= 0 ||
+        K % QK_K != 0) {
+        return -1;
+    }
+    const int dev = ggml_cuda_get_device();
+    ggml_backend_cuda_context *ctx = get_ctx_for_device(dev);
+    if (!ctx) return -1;
+    ds4_pool_set_stream(stream);
+
+    const int64_t padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
+    const size_t qbytes =
+        (size_t)padded * sizeof(block_q8_1) / QK8_1;
+    ggml_cuda_pool_alloc<char> q8_pool;
+    char *x8 = ds4_mmq_folded_q81(X, K, 1, padded);
+    if (!x8) {
+        if (void *scratch = ds4_mmq_aligned_q81_scratch(dev, qbytes)) {
+            x8 = (char *)scratch;
+        } else if (g_q81_scratch_enabled && g_q81_scratch_ptr &&
+                   g_q81_scratch_bytes >= qbytes) {
+            x8 = (char *)g_q81_scratch_ptr;
+        } else {
+            q8_pool.alloc(ctx->pool(), qbytes);
+            x8 = q8_pool.get();
+        }
+        quantize_row_q8_1_cuda(
+            X, nullptr, x8, GGML_TYPE_Q4_K,
+            K, K, K, K, padded, 1, 1, 1, stream);
+        const cudaError_t quant_err = cudaGetLastError();
+        if (quant_err != cudaSuccess) {
+            fprintf(stderr, "%s: activation quantize failed: %s\n",
+                    tag, cudaGetErrorString(quant_err));
+            return -2;
+        }
+    }
+
+    ds4_mmq_q4_K_dense_pair_vec_kernel
+        <<<((unsigned)M + 63u) / 64u, 256, 0, stream>>>(
+            W0, W1, (const block_q8_1 *)x8,
+            out0, out1, (uint32_t)M, (uint32_t)K);
+    const cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "%s: kernel launch failed: %s\n",
+                tag, cudaGetErrorString(err));
+        return -3;
+    }
     return 0;
 }
 
@@ -3672,6 +4697,7 @@ extern "C" int ds4_mmq_iq2_xxs_aligned_derepack(
 // parity): attn_q_b 217->235, mid 2048x4096 172->218, out_a 8192x4096
 // 199->230, head 224->243 GB/s; the warp-per-row accumulation is also ~1000x
 // closer to the double reference than the mmvq tile order at K>=4096.
+template <int WARPS_PER_BLOCK>
 __global__ void q8_0_aligned_dense_vec_kernel(
         float             *out,        // [M]
         const int4        *qs,         // aligned codes, 2 int4 per block
@@ -3680,8 +4706,10 @@ __global__ void q8_0_aligned_dense_vec_kernel(
         int                M,
         int                nb)         // blocks per row = K/32
 {
-    const int row  = blockIdx.x;
-    const int lane = threadIdx.x;
+    const int warp = threadIdx.x >> 5;
+    const int row  = blockIdx.x * WARPS_PER_BLOCK + warp;
+    const int lane = threadIdx.x & 31;
+    if (row >= M) return;
     const long long rbase = (long long)row * nb;
 
     float acc = 0.0f;
@@ -3768,6 +4796,139 @@ extern "C" uint64_t ds4_mmq_q8_0_aligned_bytes(int M, int K) {
     return dq_bytes + nblk * 32u;
 }
 
+static int ds4_q8_aligned_warps_per_block(int cc) {
+    const char *value = getenv("DS4_CUDA_Q8_ALIGNED_WARPS");
+    if (value) {
+        const int requested = atoi(value);
+        if (requested == 1 || requested == 2 || requested == 4 ||
+            requested == 8 || requested == 16) {
+            return requested;
+        }
+    }
+    return cc == 1210 ? 16 : 1;
+}
+
+template <int WARPS_PER_BLOCK>
+__global__ void q8_0_aligned_dense_vec_pair_kernel(
+        float             *out0,
+        float             *out1,
+        const int4        *qs0,
+        const int4        *qs1,
+        const __half      *dq0,
+        const __half      *dq1,
+        const block_q8_1  *x8,
+        int                M0,
+        int                M1,
+        int                nb) {
+    const int warp = threadIdx.x >> 5;
+    const int global_row = blockIdx.x * WARPS_PER_BLOCK + warp;
+    const int lane = threadIdx.x & 31;
+    if (global_row >= M0 + M1) return;
+    const bool second = global_row >= M0;
+    const int row = second ? global_row - M0 : global_row;
+    const int4 *qs = second ? qs1 : qs0;
+    const __half *dq = second ? dq1 : dq0;
+    const long long rbase = (long long)row * nb;
+
+    float acc = 0.0f;
+    for (int b0 = 0; b0 < nb; b0 += 32) {
+        const int b = b0 + lane;
+        const int4 w0 = qs[(rbase + b) * 2 + 0];
+        const int4 w1 = qs[(rbase + b) * 2 + 1];
+        const int *u = (const int *)x8[b].qs;
+        int sumi = 0;
+        sumi = ggml_cuda_dp4a(w0.x, u[0], sumi);
+        sumi = ggml_cuda_dp4a(w0.y, u[1], sumi);
+        sumi = ggml_cuda_dp4a(w0.z, u[2], sumi);
+        sumi = ggml_cuda_dp4a(w0.w, u[3], sumi);
+        sumi = ggml_cuda_dp4a(w1.x, u[4], sumi);
+        sumi = ggml_cuda_dp4a(w1.y, u[5], sumi);
+        sumi = ggml_cuda_dp4a(w1.z, u[6], sumi);
+        sumi = ggml_cuda_dp4a(w1.w, u[7], sumi);
+        acc += __half2float(dq[rbase + b]) *
+               __low2float(x8[b].ds) * (float)sumi;
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_down_sync(0xffffffffu, acc, off);
+    }
+    if (lane == 0) (second ? out1 : out0)[row] = acc;
+}
+
+extern "C" int ds4_mmq_q8_0_aligned_dense_vec_pair(
+        const void *W0_aligned, const void *W1_aligned,
+        const float *X_f32, float *out0_f32, float *out1_f32,
+        int M0, int M1, int K, cudaStream_t stream) {
+    const char *tag = "ds4_mmq_q8_0_aligned_dense_vec_pair";
+    if (!W0_aligned || !W1_aligned || !X_f32 || !out0_f32 || !out1_f32 ||
+        M0 <= 0 || M1 <= 0 || K <= 0 || K % 1024 != 0) {
+        return -1;
+    }
+    const int dev = ggml_cuda_get_device();
+    ggml_backend_cuda_context *ctx = get_ctx_for_device(dev);
+    if (!ctx) return -1;
+    ds4_pool_set_stream(stream);
+
+    const int64_t padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
+    const size_t qbytes =
+        (size_t)padded * sizeof(block_q8_1) / QK8_1;
+    ggml_cuda_pool_alloc<char> q8_pool;
+    char *x8 = ds4_mmq_folded_q81(X_f32, K, 1, padded);
+    if (!x8) {
+        if (void *scratch = ds4_mmq_aligned_q81_scratch(dev, qbytes)) {
+            x8 = (char *)scratch;
+        } else if (g_q81_scratch_enabled && g_q81_scratch_ptr &&
+            g_q81_scratch_bytes >= qbytes) {
+            x8 = (char *)g_q81_scratch_ptr;
+        } else {
+            q8_pool.alloc(ctx->pool(), qbytes);
+            x8 = q8_pool.get();
+        }
+        quantize_row_q8_1_cuda(
+            X_f32, nullptr, (void *)x8, GGML_TYPE_Q8_0,
+            K, K, K, K, padded, 1, 1, 1, stream);
+        const cudaError_t quant_err = cudaGetLastError();
+        if (quant_err != cudaSuccess) {
+            fprintf(stderr, "%s: activation quantize failed: %s\n",
+                    tag, cudaGetErrorString(quant_err));
+            return -2;
+        }
+    }
+
+    const uint64_t nblk0 = (uint64_t)M0 * (uint64_t)(K / 32);
+    const uint64_t nblk1 = (uint64_t)M1 * (uint64_t)(K / 32);
+    const uint64_t dq0_bytes = (nblk0 * 2u + 63u) & ~63ull;
+    const uint64_t dq1_bytes = (nblk1 * 2u + 63u) & ~63ull;
+    const int4 *qs0 =
+        (const int4 *)((const char *)W0_aligned + dq0_bytes);
+    const int4 *qs1 =
+        (const int4 *)((const char *)W1_aligned + dq1_bytes);
+    const int rows = M0 + M1;
+    const int warps = ds4_q8_aligned_warps_per_block(
+        ggml_cuda_info().devices[dev].cc);
+#define DS4_LAUNCH_Q8_PAIR(W) \
+    q8_0_aligned_dense_vec_pair_kernel<W> \
+        <<<(unsigned)(rows + W - 1) / W, W * 32, 0, stream>>>( \
+            out0_f32, out1_f32, qs0, qs1, \
+            (const __half *)W0_aligned, (const __half *)W1_aligned, \
+            (const block_q8_1 *)x8, M0, M1, K / 32)
+    switch (warps) {
+    case 16: DS4_LAUNCH_Q8_PAIR(16); break;
+    case 8: DS4_LAUNCH_Q8_PAIR(8); break;
+    case 4: DS4_LAUNCH_Q8_PAIR(4); break;
+    case 2: DS4_LAUNCH_Q8_PAIR(2); break;
+    default: DS4_LAUNCH_Q8_PAIR(1); break;
+    }
+#undef DS4_LAUNCH_Q8_PAIR
+    const cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "%s: kernel launch failed: %s\n",
+                tag, cudaGetErrorString(err));
+        return -3;
+    }
+    return 0;
+}
+
 extern "C" int ds4_mmq_q8_0_aligned_dense_vec(
         const void * W_aligned, const float * X_f32, float * out_f32,
         int M, int N, int K, cudaStream_t stream) {
@@ -3797,7 +4958,9 @@ extern "C" int ds4_mmq_q8_0_aligned_dense_vec(
     char *x8 = N == 1 ? ds4_mmq_folded_q81(X_f32, K, 1, ne10_padded) : NULL;
     cudaError_t err;
     if (!x8) {
-    if (g_q81_scratch_enabled && g_q81_scratch_ptr && g_q81_scratch_bytes >= nbytes_q8_1) {
+    if (void *scratch = ds4_mmq_aligned_q81_scratch(dev, nbytes_q8_1)) {
+        x8 = (char *)scratch;
+    } else if (g_q81_scratch_enabled && g_q81_scratch_ptr && g_q81_scratch_bytes >= nbytes_q8_1) {
         x8 = (char *)g_q81_scratch_ptr;
     } else {
         q8_pool.alloc(ctx->pool(), nbytes_q8_1);
@@ -3823,8 +4986,34 @@ extern "C" int ds4_mmq_q8_0_aligned_dense_vec(
     const block_q8_1 *x8p = (const block_q8_1 *)x8;
     switch (N) {
     case 1:
-        q8_0_aligned_dense_vec_kernel<<<(unsigned)M, 32, 0, stream>>>(
-            out_f32, qsp, dqp, x8p, M, K / 32);
+        switch (ds4_q8_aligned_warps_per_block(
+                    ggml_cuda_info().devices[dev].cc)) {
+        case 16:
+            q8_0_aligned_dense_vec_kernel<16>
+                <<<((unsigned)M + 15u) / 16u, 512, 0, stream>>>(
+                    out_f32, qsp, dqp, x8p, M, K / 32);
+            break;
+        case 8:
+            q8_0_aligned_dense_vec_kernel<8>
+                <<<((unsigned)M + 7u) / 8u, 256, 0, stream>>>(
+                    out_f32, qsp, dqp, x8p, M, K / 32);
+            break;
+        case 4:
+            q8_0_aligned_dense_vec_kernel<4>
+                <<<((unsigned)M + 3u) / 4u, 128, 0, stream>>>(
+                    out_f32, qsp, dqp, x8p, M, K / 32);
+            break;
+        case 2:
+            q8_0_aligned_dense_vec_kernel<2>
+                <<<((unsigned)M + 1u) / 2u, 64, 0, stream>>>(
+                    out_f32, qsp, dqp, x8p, M, K / 32);
+            break;
+        default:
+            q8_0_aligned_dense_vec_kernel<1>
+                <<<(unsigned)M, 32, 0, stream>>>(
+                    out_f32, qsp, dqp, x8p, M, K / 32);
+            break;
+        }
         break;
     case 2: q8_0_aligned_dense_vec_nc_kernel<2><<<(unsigned)M, 32, 0, stream>>>(out_f32, qsp, dqp, x8p, M, K / 32); break;
     case 3: q8_0_aligned_dense_vec_nc_kernel<3><<<(unsigned)M, 32, 0, stream>>>(out_f32, qsp, dqp, x8p, M, K / 32); break;
@@ -4047,9 +5236,8 @@ extern "C" int ds4_mmq_q2_K_aligned_moe_vec(
     const size_t  nbytes_q8_1 = (size_t)n_tokens * ne10_padded * sizeof(block_q8_1) / QK8_1;
     ggml_cuda_pool_alloc<char> src1_q8_1_pool;
     char *src1_q8_1_ptr = nullptr;
-    if (g_aligned_q81_scratch_ptr &&
-        g_aligned_q81_scratch_bytes >= nbytes_q8_1) {
-        src1_q8_1_ptr = (char *)g_aligned_q81_scratch_ptr;
+    if (void *scratch = ds4_mmq_aligned_q81_scratch(dev, nbytes_q8_1)) {
+        src1_q8_1_ptr = (char *)scratch;
     } else if (g_q81_scratch_enabled && g_q81_scratch_ptr &&
                g_q81_scratch_bytes >= nbytes_q8_1) {
         src1_q8_1_ptr = (char *)g_q81_scratch_ptr;
@@ -4072,7 +5260,7 @@ extern "C" int ds4_mmq_q2_K_aligned_moe_vec(
     const int64_t s12_y  = ne10_padded / QK8_1;
     const int64_t s2_dst = (int64_t)M;   /* n_expert_used == 1 */
 
-    cudaMemsetAsync(out_f32, 0, (size_t)M * (size_t)n_tokens * sizeof(float), stream);
+    (void)cudaMemsetAsync(out_f32, 0, (size_t)M * (size_t)n_tokens * sizeof(float), stream);
 
     const uint64_t npair = (uint64_t)n_experts * (uint64_t)(M/2) * (uint64_t)(K / 256);
     const uint64_t dm_bytes = (npair * 8u + 63u) & ~63ull;
@@ -4198,9 +5386,8 @@ static char *iq2_aligned_quantize_xn(
         return folded;
     }
     char *ptr = nullptr;
-    if (g_aligned_q81_scratch_ptr &&
-        g_aligned_q81_scratch_bytes >= nbytes_q8_1) {
-        ptr = (char *)g_aligned_q81_scratch_ptr;
+    if (void *scratch = ds4_mmq_aligned_q81_scratch(dev, nbytes_q8_1)) {
+        ptr = (char *)scratch;
     } else if (g_q81_scratch_enabled && g_q81_scratch_ptr &&
                g_q81_scratch_bytes >= nbytes_q8_1) {
         ptr = (char *)g_q81_scratch_ptr;
@@ -4494,6 +5681,13 @@ extern "C" int ds4_mmq_q8_0_dense_vec(
         int M, int N, int K, cudaStream_t stream) {
     return ds4_mmq_dense_vec_impl<GGML_TYPE_Q8_0>(
         "ds4_mmq_q8_0_dense_vec", W, X, out, M, N, K, stream);
+}
+
+extern "C" int ds4_mmq_q4_K_dense_pair_vec(
+        const void *W0, const void *W1, const float *X,
+        float *out0, float *out1, int M, int K, cudaStream_t stream) {
+    return ds4_mmq_q4_K_dense_pair_vec_impl(
+        W0, W1, X, out0, out1, M, K, stream);
 }
 
 // Explicit instantiations. One per quant type the public API exposes.

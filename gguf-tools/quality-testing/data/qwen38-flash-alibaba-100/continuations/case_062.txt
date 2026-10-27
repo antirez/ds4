@@ -1,0 +1,6 @@
+**Eventual consistency** is a consistency model used in distributed computing and databases that guarantees that, given enough time without new updates, all replicas of the data will eventually converge to the same state.
+
+### Key Concepts
+
+1.  **No Immediate Guarantee**:
+    - When a write operation occurs, it does not

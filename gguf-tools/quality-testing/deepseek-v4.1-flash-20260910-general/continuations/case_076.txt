@@ -1,0 +1,3 @@
+# Testare un Parser da Riga di Comando con Casi Limite
+
+Testare un CLI parser significa verificare che gestisca corrett

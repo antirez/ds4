@@ -1,0 +1,3 @@
+To understand why one large Metal buffer can be worse than multiple overlapping views, you have to look at how the **GPU memory hierarchy**, **CPU-GPU synchronization**, and **driver optimizations** interact. 
+
+In Metal, a `MTLBuffer` is a single, contiguous allocation of memory. While it is the

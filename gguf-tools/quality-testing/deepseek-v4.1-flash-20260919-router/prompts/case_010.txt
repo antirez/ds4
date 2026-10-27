@@ -1,0 +1,1 @@
+Write C pseudocode that retries read after EINTR but handles EOF and real errors separately.

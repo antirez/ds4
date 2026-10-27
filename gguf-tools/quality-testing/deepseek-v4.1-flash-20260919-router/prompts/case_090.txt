@@ -1,0 +1,1 @@
+Explain why a cache entry needs both a key and validation of the state that produced it.

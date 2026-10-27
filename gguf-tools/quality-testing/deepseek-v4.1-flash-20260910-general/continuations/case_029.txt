@@ -1,0 +1,3 @@
+# Comparing Two Model Quantizations Without a Single Ground Truth
+
+When you don't have a gold-standard "correct" answer (or don't want to privilege one

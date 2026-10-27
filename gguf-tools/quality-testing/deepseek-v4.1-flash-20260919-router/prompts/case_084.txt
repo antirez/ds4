@@ -1,0 +1,1 @@
+Write a Python function computing the longest common prefix of a list of strings, including an empty input list.

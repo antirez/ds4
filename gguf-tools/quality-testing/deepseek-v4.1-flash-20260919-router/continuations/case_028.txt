@@ -1,0 +1,8 @@
+# Deleting from a List While Iterating
+
+## The Bug
+
+When you remove an item from a list while iterating with an index, the list shifts left — but the index keeps moving right. The element that slides into the current position gets skipped.
+
+```python
+items = [1, 2, 

@@ -1,0 +1,5 @@
+Ecco cinque misure iniziali per diagnosticare e mitigare un **decode lento a contesto lungo** (tipico di modelli LLM con finestre di contesto estese, come 32k, 128k o più token):
+
+---
+
+### 1. **Analizzare il collo

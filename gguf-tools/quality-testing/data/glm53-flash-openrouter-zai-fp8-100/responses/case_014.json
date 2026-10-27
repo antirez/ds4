@@ -1,0 +1,46 @@
+{
+  "id": "gen-1787762109-xaaMpAjZjZ2DRWcw18Uj",
+  "object": "chat.completion",
+  "created": 1787762109,
+  "model": "z-ai/glm-5.3-flash",
+  "provider": "Z.AI",
+  "system_fingerprint": null,
+  "service_tier": null,
+  "choices": [
+    {
+      "index": 0,
+      "logprobs": null,
+      "finish_reason": "length",
+      "native_finish_reason": "length",
+      "message": {
+        "role": "assistant",
+        "content": "# Cache KV su disco nelle sessioni agentiche\n\n## Il problema\n\nNei sistemi transformer, ogni token generato produce una **cache KV** (Key-Value cache): le rappresentazioni interne di tutti i token precedenti, necessarie per generare i successivi. Nelle sessioni agentiche questo diventa critico perché:\n\n1. **Contesti molto lunghi**: un agente accumula cronologia di conversazione, risultati di tool, output di codice, documenti letti — spesso decine o centinaia di migliaia di token.\n2. **Chiamate iterative**:",
+        "refusal": null,
+        "reasoning": null
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 30,
+    "completion_tokens": 128,
+    "total_tokens": 158,
+    "cost": 3.425e-05,
+    "is_byok": false,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "cache_write_tokens": 0,
+      "audio_tokens": 0,
+      "video_tokens": 0
+    },
+    "cost_details": {
+      "upstream_inference_cost": 3.425e-05,
+      "upstream_inference_prompt_cost": 2.25e-06,
+      "upstream_inference_completions_cost": 3.2e-05
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 0,
+      "image_tokens": 0,
+      "audio_tokens": 0
+    }
+  }
+}

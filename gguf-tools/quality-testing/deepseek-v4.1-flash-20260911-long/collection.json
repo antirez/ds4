@@ -1,0 +1,24 @@
+{
+  "model": "deepseek-flash",
+  "endpoint": "https://api.deepseek.com/chat/completions",
+  "fingerprint": "aeb56401ca74e127821c4f9126dcb669",
+  "source_revision": "df42c109f1defefcbfcedbe7d905718a12266e40",
+  "created_utc_first": "2026-09-10T23:11:05+00:00",
+  "created_utc_last": "2026-09-10T23:11:17+00:00",
+  "thinking": "disabled",
+  "temperature": 1,
+  "max_tokens": 64,
+  "top_logprobs": 20,
+  "prompt_tokens": [
+    8197,
+    8197,
+    8196,
+    16389,
+    16389,
+    16388,
+    32772,
+    32773,
+    32773
+  ],
+  "purpose": "held-out long prefill and exact decoder dependency validation"
+}

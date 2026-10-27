@@ -1,0 +1,8 @@
+# Perché valutare 50 prompt è più utile di un singolo prompt "preferito"
+
+## 1. Riduce i bias personali
+Un prompt preferito può funzionare bene per **te**, in un contesto specifico. Valutandone 50, ottieni una visione oggettiva di cosa funziona davvero, non solo cosa ti piace.
+
+## 2. Rivela pattern, non coincidenze
+- Con **1 prompt**: non sai se il risultato è fortuna o qualità
+- Con **50 prompt**: emergono schemi ricorrenti (struttura, tono

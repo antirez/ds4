@@ -1,0 +1,12 @@
+# Queue Using Two Stacks
+
+## Implementation
+
+```python
+class QueueUsingStacks:
+    def __init__(self):
+        self.inbox = []   # stack for enqueue operations
+        self.outbox = []  # stack for dequeue operations
+
+    def enqueue(self, item):
+        """

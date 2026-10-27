@@ -1,0 +1,11 @@
+# Finding the First Non-Repeated Character in a String
+
+Here's an efficient Python solution using a dictionary to count character frequencies:
+
+```python
+def first_non_repeated_char(s: str):
+    """
+    Find the first non-repeated character in a string.
+    
+    Args:
+        s: Input string to search

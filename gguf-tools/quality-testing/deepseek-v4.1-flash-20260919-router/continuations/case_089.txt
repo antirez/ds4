@@ -1,0 +1,15 @@
+# Second Largest Distinct Number
+
+```python
+def second_largest(numbers):
+    """
+    Return the second largest distinct number from an iterable.
+    
+    Args:
+        numbers: An iterable of numeric values.
+    
+    Returns:
+        The second largest distinct number.
+    
+    Raises:
+        TypeError: If input

@@ -1,0 +1,5 @@
+```python
+def median_of_three(a: float, b: float, c: float) -> float:
+    """Restituisce la mediana di tre numeri."""
+    return sorted([a, b, c])[1]
+```

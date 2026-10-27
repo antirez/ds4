@@ -1,0 +1,3 @@
+# Il ruolo del router in un layer Mixture-of-Experts (MoE)
+
+In un layer MoE, il **router** (chiamato anche

@@ -1,0 +1,12 @@
+# Chunk Function
+
+```python
+def chunk(sequence, n):
+    """
+    Split a sequence into consecutive chunks of size n.
+    
+    Args:
+        sequence: Any iterable (list, tuple, string, generator, etc.)
+        n: Chunk size. Must be a positive integer.
+    
+   

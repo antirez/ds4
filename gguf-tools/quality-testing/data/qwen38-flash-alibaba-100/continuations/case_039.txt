@@ -1,0 +1,1 @@
+Confrontare due quantizzazioni (ad esempio, un modello a 8-bit vs. uno a 4-bit, o INT8 vs. FP16) senza fidarsi di una singola metrica o risposta richiede un approccio **multidimensionale e robusto**. L'obiettivo è valutare non solo la "

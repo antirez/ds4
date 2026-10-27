@@ -1,0 +1,1 @@
+Questa è una domanda fondamentale nel campo dell'**ingegneria dei prompt** e dell'**allineamento dei modelli**. La risposta breve è: **perché un singolo prompt "preferito" è un campione di un singolo punto, mentre 50 prompt rappresentano una

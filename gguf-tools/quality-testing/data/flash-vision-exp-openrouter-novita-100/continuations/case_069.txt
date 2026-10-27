@@ -1,0 +1,8 @@
+Here is a short, focused checklist for reviewing a PR that touches memory lifetimes (Rust, C++, or similar systems languages).
+
+---
+
+### 🔍 Memory Lifetime PR Review Checklist
+
+**1. Ownership & Transfer**
+- [ ] Is ownership clearly transferred (moved) or explicitly borrowed (`&`/`&mut

@@ -1,0 +1,5 @@
+# Latenza vs Throughput
+
+Sono due metriche fondamentali delle prestazioni di un sistema, ma misurano cose diverse:
+
+## Laten

@@ -1,0 +1,1 @@
+Per spiegare la differenza tra **mutex** e **contatore atomico**, dobbiamo prima chiarire che sono due strumenti di sincronizzazione che risolvono problemi diversi, anche se entrambi servono a gestire l'accesso concorrente a risorse condivise

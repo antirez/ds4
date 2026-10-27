@@ -1,0 +1,1 @@
+La differenza tra la **dimensione virtuale** (Virtual Size) e la **residenza** (Resident Set Size, RSS) delle pagine mappate in memoria (`mmap`) è un concetto fondamentale nella gestione della memoria dei sistemi operativi moderni. Ecco una spiegazione dettagliata del perché queste due grandez

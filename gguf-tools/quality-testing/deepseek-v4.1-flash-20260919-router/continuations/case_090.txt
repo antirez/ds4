@@ -1,0 +1,6 @@
+# Why a Cache Entry Needs Both a Key and State Validation
+
+A cache entry is a **claim** that "this result is what you'd get if you ran the computation." For that claim to be trustworthy, you need to answer two separate questions:
+
+1. **Which computation?** → the *key*
+2

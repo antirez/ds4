@@ -1,0 +1,6 @@
+Here is a concise checklist for reviewing pull requests that involve memory lifetimes (e.g., in Rust, C++, or other systems languages):
+
+### 🧠 Memory Lifetime Review Checklist
+
+#### 1. **Ownership & Borrowing Clarity**
+- [ ] Is ownership clearly transferred or borrowed? Avoid ambiguous `

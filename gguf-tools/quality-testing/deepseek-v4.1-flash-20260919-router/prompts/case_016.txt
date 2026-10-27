@@ -1,0 +1,1 @@
+Explain why checking access permissions before opening a path can introduce a race.

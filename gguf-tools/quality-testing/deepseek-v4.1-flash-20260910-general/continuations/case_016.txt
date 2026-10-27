@@ -1,0 +1,4 @@
+# Top-p vs Temperatura zero: pro e contro
+
+## Cosa fanno (brevemente)
+- **Temperatura = 0**: sampling

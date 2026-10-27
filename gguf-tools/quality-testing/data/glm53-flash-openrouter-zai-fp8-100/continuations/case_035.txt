@@ -1,0 +1,12 @@
+# Ring Buffer (Buffer Circolare)
+
+## Cos'è
+
+Un ring buffer è una struttura dati a dimensione fissa che utilizza la memoria in modo circolare: quando si raggiunge la fine dell'array, si riparte dall'inizio. È molto usato per streaming di dati, code producer/consumer, log e buffer I/O.
+
+## Componenti principali
+
+- **buffer[]**: array di dimensione fissa `N`
+- **head** (testa): indice dove si scrive
+- **tail** (coda): indice da cui si legge
+- **count**: numero di elementi

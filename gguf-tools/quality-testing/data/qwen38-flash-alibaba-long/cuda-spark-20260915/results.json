@@ -1,0 +1,572 @@
+{
+  "date": "2026-09-15",
+  "backend": "CUDA",
+  "gpu": "DGX Spark GB10",
+  "arch": "sm_121",
+  "source_commit": "3cae02295f003defca8bdf9db8043dde8f846c57",
+  "ctx": 32768,
+  "prefill_chunk": "default",
+  "effective_prefill_cap": 8192,
+  "models": {
+    "q2": {
+      "file": "Qwen3.8-Flash-Next-Q2.gguf",
+      "bytes": 147207127040,
+      "sha256": "b1b93fa69aca5f187b0fb813aca8f3ec1beb5cf8cf0bd38cf041b93e0b6ccac9"
+    },
+    "q4": {
+      "file": "Qwen3.8-Flash-Next-Q4.gguf",
+      "bytes": 177280286720,
+      "sha256": "680944460a8cbe93ba8b6d7b6107213ffb7e22320bd913000e563ca0a0f25a8a"
+    }
+  },
+  "mtp": false,
+  "validation": "All expected cases completed with finite logits; every prompt and target token ID matches the official HF tokenizer. API token bytes are checked separately.",
+  "bootstrap": "10000 paired case resamples, seed 20260915. Descriptive intervals for this suite, not population guarantees: some prompts are translations and long cases share two task families.",
+  "source_sha256": {
+    "ds4.c": "fce23d4c851d16b29e68aac11abea81ee7406f58e41692a1ef5f74a38fe4d5f3",
+    "ds4_cuda.cu": "c2184bb477b8589e329f33e4a7be301c1a287e4c1ba382d941377bef52b97230",
+    "ds4_qwen4_cuda.cuh": "4161b3c6d8c5df7bd70be62108f2857ecd3ffa8731ef41c97d62d0d72616df6d",
+    "gguf-tools/quality-testing/score_official.c": "091b8b874669ac2f709cf5d874068071d927d17b2dd6495395ec604953738c60"
+  },
+  "results": {
+    "suite": "long",
+    "runs": {
+      "q2-fast": {
+        "cases": 12,
+        "tokens": 766,
+        "avg_nll": 0.15419895703002612,
+        "first_matches": 7,
+        "mean_greedy_prefix": 7.25,
+        "api_top1": 0.9399477806788512,
+        "api_top1_matches": 720,
+        "api_top1_count": 766,
+        "api_target_mae": 0.06999725387597912,
+        "confident_reference": {
+          "api_above_90pct": 609,
+          "mismatches": [
+            {
+              "id": "case_003",
+              "position": 53,
+              "match": false,
+              "local_logprob": -0.787,
+              "api_logprob": -0.082
+            }
+          ]
+        }
+      },
+      "q2-quality": {
+        "cases": 12,
+        "tokens": 766,
+        "avg_nll": 0.15410606898302873,
+        "first_matches": 8,
+        "mean_greedy_prefix": 9.416666666666666,
+        "api_top1": 0.9399477806788512,
+        "api_top1_matches": 720,
+        "api_top1_count": 766,
+        "api_target_mae": 0.07045810085117493,
+        "confident_reference": {
+          "api_above_90pct": 609,
+          "mismatches": [
+            {
+              "id": "case_003",
+              "position": 53,
+              "match": false,
+              "local_logprob": -0.713,
+              "api_logprob": -0.082
+            }
+          ]
+        }
+      },
+      "q2-continued-1": {
+        "cases": 12,
+        "tokens": 766,
+        "avg_nll": 0.154734533924282,
+        "first_matches": 7,
+        "mean_greedy_prefix": 7.25,
+        "api_top1": 0.9399477806788512,
+        "api_top1_matches": 720,
+        "api_top1_count": 766,
+        "api_target_mae": 0.07016112564229765,
+        "confident_reference": {
+          "api_above_90pct": 609,
+          "mismatches": [
+            {
+              "id": "case_003",
+              "position": 53,
+              "match": false,
+              "local_logprob": -0.763,
+              "api_logprob": -0.082
+            }
+          ]
+        }
+      },
+      "q2-continued-256": {
+        "cases": 12,
+        "tokens": 766,
+        "avg_nll": 0.1534129302754569,
+        "first_matches": 8,
+        "mean_greedy_prefix": 9.666666666666666,
+        "api_top1": 0.9425587467362925,
+        "api_top1_matches": 722,
+        "api_top1_count": 766,
+        "api_target_mae": 0.06936548992689295,
+        "confident_reference": {
+          "api_above_90pct": 609,
+          "mismatches": [
+            {
+              "id": "case_003",
+              "position": 53,
+              "match": false,
+              "local_logprob": -0.801,
+              "api_logprob": -0.082
+            }
+          ]
+        }
+      },
+      "q4-fast": {
+        "cases": 12,
+        "tokens": 766,
+        "avg_nll": 0.12461129389556136,
+        "first_matches": 11,
+        "mean_greedy_prefix": 21.5,
+        "api_top1": 0.9725848563968669,
+        "api_top1_matches": 745,
+        "api_top1_count": 766,
+        "api_target_mae": 0.03694663707832899,
+        "confident_reference": {
+          "api_above_90pct": 609,
+          "mismatches": []
+        }
+      },
+      "q4-quality": {
+        "cases": 12,
+        "tokens": 766,
+        "avg_nll": 0.1255455810221932,
+        "first_matches": 11,
+        "mean_greedy_prefix": 24.166666666666668,
+        "api_top1": 0.9712793733681462,
+        "api_top1_matches": 744,
+        "api_top1_count": 766,
+        "api_target_mae": 0.037404645451697124,
+        "confident_reference": {
+          "api_above_90pct": 609,
+          "mismatches": []
+        }
+      },
+      "q4-continued-1": {
+        "cases": 12,
+        "tokens": 766,
+        "avg_nll": 0.12424239107049607,
+        "first_matches": 11,
+        "mean_greedy_prefix": 21.5,
+        "api_top1": 0.9712793733681462,
+        "api_top1_matches": 744,
+        "api_top1_count": 766,
+        "api_target_mae": 0.03698696390078329,
+        "confident_reference": {
+          "api_above_90pct": 609,
+          "mismatches": []
+        }
+      },
+      "q4-continued-256": {
+        "cases": 12,
+        "tokens": 766,
+        "avg_nll": 0.12493869878328982,
+        "first_matches": 11,
+        "mean_greedy_prefix": 24.416666666666668,
+        "api_top1": 0.9738903394255874,
+        "api_top1_matches": 746,
+        "api_top1_count": 766,
+        "api_target_mae": 0.03738547843342037,
+        "confident_reference": {
+          "api_above_90pct": 609,
+          "mismatches": []
+        }
+      }
+    },
+    "comparisons": {
+      "q2-quality-to-fast": {
+        "delta_nll": 9.28880469973906e-05,
+        "paired_bootstrap_95_ci": [
+          -0.0016531228509803911,
+          0.00184053820887729
+        ],
+        "case_wins_losses_ties": [
+          6,
+          6,
+          0
+        ],
+        "worst_deltas": [
+          {
+            "id": "case_000",
+            "delta": 0.006025221999999997,
+            "old": 0.186299182,
+            "new": 0.192324404
+          },
+          {
+            "id": "case_002",
+            "delta": 0.0036775410000000064,
+            "old": 0.217209209,
+            "new": 0.22088675
+          },
+          {
+            "id": "case_001",
+            "delta": 0.0035379470000000135,
+            "old": 0.186892547,
+            "new": 0.190430494
+          },
+          {
+            "id": "case_011",
+            "delta": 0.0010024319999999975,
+            "old": 0.098584869,
+            "new": 0.099587301
+          },
+          {
+            "id": "case_009",
+            "delta": 0.00041650199999999915,
+            "old": 0.093826524,
+            "new": 0.094243026
+          }
+        ]
+      },
+      "q2-continued-1-vs-fresh": {
+        "delta_nll": 0.0005355768942558731,
+        "paired_bootstrap_95_ci": [
+          -6.003791395046265e-05,
+          0.0012388982954248406
+        ],
+        "case_wins_losses_ties": [
+          6,
+          6,
+          0
+        ],
+        "worst_deltas": [
+          {
+            "id": "case_002",
+            "delta": 0.0032537009999999977,
+            "old": 0.22088675,
+            "new": 0.224140451
+          },
+          {
+            "id": "case_011",
+            "delta": 0.0023041229999999913,
+            "old": 0.099587301,
+            "new": 0.101891424
+          },
+          {
+            "id": "case_003",
+            "delta": 0.0016377250000000065,
+            "old": 0.172970561,
+            "new": 0.174608286
+          },
+          {
+            "id": "case_001",
+            "delta": 1.5238000000000751e-05,
+            "old": 0.190430494,
+            "new": 0.190445732
+          },
+          {
+            "id": "case_006",
+            "delta": 4.346999999987888e-06,
+            "old": 0.092390752,
+            "new": 0.092395099
+          }
+        ]
+      },
+      "q2-continued-256-vs-fresh": {
+        "delta_nll": -0.0007860267545691923,
+        "paired_bootstrap_95_ci": [
+          -0.0018657147924281976,
+          0.00022571079319371807
+        ],
+        "case_wins_losses_ties": [
+          6,
+          6,
+          0
+        ],
+        "worst_deltas": [
+          {
+            "id": "case_004",
+            "delta": 0.001398643000000005,
+            "old": 0.22504493,
+            "new": 0.226443573
+          },
+          {
+            "id": "case_008",
+            "delta": 0.0011875239999999954,
+            "old": 0.128141745,
+            "new": 0.129329269
+          },
+          {
+            "id": "case_007",
+            "delta": 0.0011752460000000048,
+            "old": 0.09471481,
+            "new": 0.095890056
+          },
+          {
+            "id": "case_006",
+            "delta": 0.0005274289999999959,
+            "old": 0.092390752,
+            "new": 0.092918181
+          },
+          {
+            "id": "case_003",
+            "delta": 0.00025822799999999924,
+            "old": 0.172970561,
+            "new": 0.173228789
+          }
+        ]
+      },
+      "q4-quality-to-fast": {
+        "delta_nll": -0.0009342871266318533,
+        "paired_bootstrap_95_ci": [
+          -0.0020174270639686663,
+          4.313290612777261e-05
+        ],
+        "case_wins_losses_ties": [
+          8,
+          4,
+          0
+        ],
+        "worst_deltas": [
+          {
+            "id": "case_008",
+            "delta": 0.0012122969999999872,
+            "old": 0.117433007,
+            "new": 0.118645304
+          },
+          {
+            "id": "case_003",
+            "delta": 0.0008875139999999782,
+            "old": 0.137547455,
+            "new": 0.138434969
+          },
+          {
+            "id": "case_002",
+            "delta": 0.0007437180000000043,
+            "old": 0.154179227,
+            "new": 0.154922945
+          },
+          {
+            "id": "case_007",
+            "delta": 0.000497334000000002,
+            "old": 0.076119068,
+            "new": 0.076616402
+          },
+          {
+            "id": "case_010",
+            "delta": -1.73579999999951e-05,
+            "old": 0.093907614,
+            "new": 0.093890256
+          }
+        ]
+      },
+      "q4-continued-1-vs-fresh": {
+        "delta_nll": -0.0003689028250652715,
+        "paired_bootstrap_95_ci": [
+          -0.0007128624080834457,
+          -7.61537415143575e-05
+        ],
+        "case_wins_losses_ties": [
+          8,
+          4,
+          0
+        ],
+        "worst_deltas": [
+          {
+            "id": "case_006",
+            "delta": 1.7757999999992724e-05,
+            "old": 0.076252015,
+            "new": 0.076269773
+          },
+          {
+            "id": "case_001",
+            "delta": 8.041000000014176e-06,
+            "old": 0.142537588,
+            "new": 0.142545629
+          },
+          {
+            "id": "case_007",
+            "delta": 4.008999999999263e-06,
+            "old": 0.076616402,
+            "new": 0.076620411
+          },
+          {
+            "id": "case_009",
+            "delta": 1.4600000000086766e-06,
+            "old": 0.092245627,
+            "new": 0.092247087
+          },
+          {
+            "id": "case_011",
+            "delta": -3.229999999965205e-07,
+            "old": 0.094469492,
+            "new": 0.094469169
+          }
+        ]
+      },
+      "q4-continued-256-vs-fresh": {
+        "delta_nll": 0.00032740488772846306,
+        "paired_bootstrap_95_ci": [
+          -0.000604323993481093,
+          0.001386384475880052
+        ],
+        "case_wins_losses_ties": [
+          5,
+          7,
+          0
+        ],
+        "worst_deltas": [
+          {
+            "id": "case_001",
+            "delta": 0.004808067999999999,
+            "old": 0.142537588,
+            "new": 0.147345656
+          },
+          {
+            "id": "case_010",
+            "delta": 0.0012670189999999942,
+            "old": 0.093890256,
+            "new": 0.095157275
+          },
+          {
+            "id": "case_004",
+            "delta": 0.0010447340000000194,
+            "old": 0.177306582,
+            "new": 0.178351316
+          },
+          {
+            "id": "case_000",
+            "delta": 0.0010375469999999998,
+            "old": 0.144351565,
+            "new": 0.145389112
+          },
+          {
+            "id": "case_006",
+            "delta": 0.0008433179999999957,
+            "old": 0.076252015,
+            "new": 0.077095333
+          }
+        ]
+      },
+      "q2-to-q4-fast": {
+        "delta_nll": -0.029587663134464752,
+        "paired_bootstrap_95_ci": [
+          -0.04127604115796345,
+          -0.018590081628422427
+        ],
+        "case_wins_losses_ties": [
+          12,
+          0,
+          0
+        ],
+        "worst_deltas": [
+          {
+            "id": "case_009",
+            "delta": -0.001997398999999997,
+            "old": 0.094243026,
+            "new": 0.092245627
+          },
+          {
+            "id": "case_011",
+            "delta": -0.005117809000000001,
+            "old": 0.099587301,
+            "new": 0.094469492
+          },
+          {
+            "id": "case_008",
+            "delta": -0.009496441000000008,
+            "old": 0.128141745,
+            "new": 0.118645304
+          },
+          {
+            "id": "case_010",
+            "delta": -0.012330392999999995,
+            "old": 0.106220649,
+            "new": 0.093890256
+          },
+          {
+            "id": "case_006",
+            "delta": -0.016138737,
+            "old": 0.092390752,
+            "new": 0.076252015
+          }
+        ]
+      }
+    }
+  },
+  "runs": {
+    "q2": {
+      "ok": true,
+      "started": 1789474789.9409928,
+      "runs": [
+        {
+          "mode": "fast",
+          "seconds": 224.94290566444397
+        },
+        {
+          "mode": "quality",
+          "seconds": 358.3313994407654
+        },
+        {
+          "mode": "continued-1",
+          "seconds": 224.86317539215088
+        },
+        {
+          "mode": "continued-256",
+          "seconds": 230.04361128807068
+        }
+      ],
+      "finished": 1789475828.734042
+    },
+    "q4": {
+      "ok": true,
+      "started": 1789474828.3263762,
+      "runs": [
+        {
+          "mode": "fast",
+          "seconds": 230.5291645526886
+        },
+        {
+          "mode": "quality",
+          "seconds": 374.2060568332672
+        },
+        {
+          "mode": "continued-1",
+          "seconds": 230.49750065803528
+        },
+        {
+          "mode": "continued-256",
+          "seconds": 234.7781286239624
+        }
+      ],
+      "finished": 1789475898.9895182
+    }
+  },
+  "fresh_answers": {
+    "q2": {
+      "case_000": "Team **team_17** owns record 0017, and its revision is **294**.\n\nI found this by directly locating the line labeled \"Record 0017\" in the provided archive list, which explicitly states `owner=team_17` and `revision=294`.\n",
+      "case_005": "Based on the archive provided:\n\n*   **Owner:** team_17\n*   **Revision:** 294\n\n**Explanation:**\nI located the specific line labeled `Record 0017` in the text. The line reads: `Record 0017: owner=team_17; revision=294; checksum=239352; retention=30 days.` I extracted the values directly associated with the `owner` and `revision` keys from that specific record.\n",
+      "case_006": "For `clamp_0017(int x)`, the logic is:\n- If `x < 17`, return `17`.\n- If `x > 117`, return `117`.\n- Otherwise, return `x`.\n\n**Outputs for the given inputs:**\n1. **Input: -5**\n   - Since `-5 < 17`, the first condition is true.\n   - **Output: 17**\n\n2. **Input: 50**\n   - `50` is not less than `17` and not greater than `117`.\n   - The function returns `x` directly.\n   - **Output: 50**\n\n3. **Input: 999**\n   - Since `999 > 117`, the second condition is true.\n   - **Output: 117**\n\n**Boundary Test:**\nA boundary test checks values immediately around the limits (17 and 117) to ensure the clamping logic works correctly at the edges.\n- **Test Input: 16** (Just below lower bound)\n  - `16 < 17` is true.\n  - **Expected Output: 17**\n- **Test Input: 17** (At lower bound)\n  - `17 < 17` is false. `17 > 117` is false.\n  - **Expected Output: 17**\n- **Test Input: 117** (At upper bound)\n  - `117 < 17` is false. `117 > 117` is false.\n  - **Expected Output: 117**\n- **Test Input: 118** (Just above upper bound)\n  - `118 > 117` is true.\n  - **Expected Output: 117**\n",
+      "case_011": "For `clamp_0017(int x)`, the logic is:\n- If `x < 17`, return `17`.\n- If `x > 117`, return `117`.\n- Otherwise, return `x`.\n\n**Outputs for the specified inputs:**\n1.  **Input: -5**\n    -   Since `-5 < 17`, the first condition is true.\n    -   **Output: 17**\n2.  **Input: 50**\n    -   `50` is not less than `17` and not greater than `117`.\n    -   The function returns `x`.\n    -   **Output: 50**\n3.  **Input: 999**\n    -   Since `999 > 117`, the second condition is true.\n    -   **Output: 117**\n\n**Boundary Test:**\nTo verify the boundaries, we should test values immediately around the limits (17 and 117):\n-   **Input: 16** -> Output should be **17** (clamped up).\n-   **Input: 17** -> Output should be **17** (returned as is).\n-   **Input: 117** -> Output should be **117** (returned as is).\n-   **Input: 118** -> Output should be **117** (clamped down).\n"
+    },
+    "q4": {
+      "case_000": "Team **team_17** owns record 0017, and its revision is **294**.\n\nI found this by locating the line labeled `Record 0017` in the provided archive list, which explicitly states: `owner=team_17; revision=294`.\n",
+      "case_005": "Team **team_17** owns record 0017, and its revision is **294**.\n\n**How I found it:**\nI located the line starting with `Record 0017` in the provided archive. The line reads:\n`Record 0017: owner=team_17; revision=294; checksum=239352; retention=30 days.`\nFrom this line, I extracted the value for `owner` (team_17) and the value for `revision` (294).\n",
+      "case_006": "For `clamp_0017(int x)`:\n- **Input -5**: Since `-5 < 17`, the function returns **17**.\n- **Input 50**: Since `17 <= 50 <= 117`, the function returns **50**.\n- **Input 999**: Since `999 > 117`, the function returns **117**.\n\n**Boundary tests:**\n- Input **16**: Returns **17** (just below lower bound).\n- Input **17**: Returns **17** (at lower bound).\n- Input **117**: Returns **117** (at upper bound).\n- Input **118**: Returns **117** (just above upper bound).\n",
+      "case_011": "For `clamp_0017`, the function definition is:\n`int clamp_0017(int x) { if (x < 17) return 17; if (x > 117) return 117; return x; }`\n\nThis function clamps the input `x` to the range `[17, 117]`.\n\n**Outputs for the given inputs:**\n\n1.  **Input: -5**\n    *   Check `if (x < 17)`: `-5 < 17` is true.\n    *   The function returns `17`.\n    *   **Output: 17**\n\n2.  **Input: 50**\n    *   Check `if (x < 17)`: `50 < 17` is false.\n    *   Check `if (x > 117)`: `50 > 117` is false.\n    *   The function returns `x` (which is 50).\n    *   **Output: 50**\n\n3.  **Input: 999**\n    *   Check `if (x < 17)`: `999 < 17` is false.\n    *   Check `if (x > 117)`: `999 > 117` is true.\n    *   The function returns `117`.\n    *   **Output: 117**\n\n**Boundary Test:**\n\nA boundary test checks the values immediately around the thresholds (17 and 117) to ensure the logic handles the edges correctly.\n\n*   **Lower Boundary:**\n    *   Input `16`: `16 < 17` is true \u2192 Returns `17`.\n    *   Input `17`: `17 < 17` is false, `17 > 117` is false \u2192 Returns `17`.\n*   **Upper Boundary:**\n    *   Input `117`: `117 < 17` is false, `117 > 117` is false \u2192 Returns `117`.\n    *   Input `118`: `118 < 17` is false, `118 > 117` is true \u2192 Returns `117`.\n"
+    }
+  },
+  "fresh_answer_token_limits": {
+    "archive": 192,
+    "code": 512,
+    "q4-case_011": 1024
+  },
+  "fresh_answer_options": {
+    "system": "You are a helpful assistant",
+    "temperature": 0,
+    "nothink": true,
+    "ctx": 32768,
+    "note": "Independent CLI answers, not byte-matched API scoring; all eight reviewed for the requested facts, clamp outputs and boundary tests."
+  }
+}

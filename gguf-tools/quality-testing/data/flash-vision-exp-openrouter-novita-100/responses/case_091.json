@@ -1,0 +1,46 @@
+{
+  "id": "gen-1788193403-eFVdc8fmRpSs9eyznJB1",
+  "object": "chat.completion",
+  "created": 1788193403,
+  "model": "deepseek/deepseek-v4-flash-vision-exp",
+  "provider": "Novita",
+  "system_fingerprint": "aa8d6caccae4a22492bb51091cfc8eab",
+  "service_tier": null,
+  "choices": [
+    {
+      "index": 0,
+      "logprobs": null,
+      "finish_reason": "length",
+      "native_finish_reason": "length",
+      "message": {
+        "role": "assistant",
+        "content": "Here is a plain-language explanation:\n\n**A confidence interval is a \"best guess range\" with a built-in guarantee.**\n\nImagine you want to know the average height of all students in a school of 5,000 people. You can't measure everyone, so you measure a random sample of 50 students. \n\n-",
+        "refusal": null,
+        "reasoning": null
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 14,
+    "completion_tokens": 64,
+    "total_tokens": 78,
+    "cost": 9.064e-05,
+    "is_byok": false,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "cache_write_tokens": 0,
+      "audio_tokens": 0,
+      "video_tokens": 0
+    },
+    "cost_details": {
+      "upstream_inference_cost": 9.064e-05,
+      "upstream_inference_prompt_cost": 6.16e-06,
+      "upstream_inference_completions_cost": 8.448e-05
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 0,
+      "image_tokens": 0,
+      "audio_tokens": 0
+    }
+  }
+}

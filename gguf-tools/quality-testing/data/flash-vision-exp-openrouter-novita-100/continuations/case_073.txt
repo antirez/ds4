@@ -1,0 +1,12 @@
+Ecco un esempio classico di race condition in C con thread:
+
+```c
+#include <stdio.h>
+#include <pthread.h>
+
+// Variabile condivisa
+int counter = 0;
+
+// Funzione eseguita dai thread
+void* increment(void* arg) {
+    for (int i =

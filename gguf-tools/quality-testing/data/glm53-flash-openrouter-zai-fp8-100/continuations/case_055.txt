@@ -1,0 +1,7 @@
+# Perché un grande buffer Metal può essere peggiore di viste sovrapposte
+
+In Metal (e nelle API grafiche in generale), usare un unico grande buffer invece di buffer più piccoli con viste (`MTLBufferView` / range offsets) sovrapposte o affiancate può essere controproducente per diversi motivi:
+
+## 1. Sincronizzazione e hazard tracking a grana grossa
+
+- Il driver/GPU traccia gli **hazard** (rischi di lettura/scrittura concorrente) spesso **a livello di intero buffer**, non

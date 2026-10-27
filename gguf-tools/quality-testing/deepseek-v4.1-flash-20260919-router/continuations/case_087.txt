@@ -1,0 +1,10 @@
+```c
+#include <stdio.h>
+#include <string.h>
+
+int main(void)
+{
+    char buf[] = "abcdefghij";
+
+    /* Shift the bytes at buf[0..4] ("abcde") up by two positions,
+       so that buf becomes "ababcdehij".  Source and

@@ -1,0 +1,61 @@
+{
+  "schema": "ds4-openrouter-continuation-v1",
+  "source": "openrouter",
+  "model": "deepseek/deepseek-v4-flash-vision-exp",
+  "endpoint": "https://openrouter.ai/api/v1/chat/completions",
+  "created_at": "2026-08-31T16:15:48Z",
+  "id": "short_reasoning_plain",
+  "kind": "short",
+  "prompt": "Answer with only the number: 2048 divided by 128 is",
+  "request": {
+    "model": "deepseek/deepseek-v4-flash-vision-exp",
+    "temperature": 0,
+    "token_limit_field": "max_tokens",
+    "max_tokens": 32,
+    "logprobs": true,
+    "top_logprobs": 20,
+    "messages": [
+      {
+        "role": "user",
+        "content": "Answer with only the number: 2048 divided by 128 is"
+      }
+    ],
+    "reasoning": {
+      "effort": "none"
+    }
+  },
+  "provider": "Novita",
+  "usage": {
+    "prompt_tokens": 18,
+    "completion_tokens": 1,
+    "total_tokens": 19,
+    "cost": 9.24e-06,
+    "is_byok": false,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "cache_write_tokens": 0,
+      "audio_tokens": 0,
+      "video_tokens": 0
+    },
+    "cost_details": {
+      "upstream_inference_cost": 9.24e-06,
+      "upstream_inference_prompt_cost": 7.92e-06,
+      "upstream_inference_completions_cost": 1.32e-06
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 0,
+      "image_tokens": 0,
+      "audio_tokens": 0
+    }
+  },
+  "finish_reason": "stop",
+  "message": {
+    "role": "assistant",
+    "content": "16",
+    "refusal": null,
+    "reasoning": null
+  },
+  "logits_available": false,
+  "logprobs_available": false,
+  "steps": []
+}

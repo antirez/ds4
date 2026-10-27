@@ -1,0 +1,12 @@
+Let’s convert step by step.
+
+---
+
+**1. Convert hours to seconds**  
+We know:  
+1 hour = 60 minutes  
+1 minute = 60 seconds  
+So, 1 hour = 60 × 60 = 3600 seconds.
+
+For 2 hours:  
+\( 2 \times

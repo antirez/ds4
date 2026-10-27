@@ -1,0 +1,1 @@
+A compiler utilizes an Abstract Syntax Tree (AST) as a hierarchical, language-agnostic representation of the source code's logical structure, serving as the central data structure for semantic analysis and intermediate code generation. After the parser constructs the AST from tokens, the compiler traverses this tree to perform critical tasks such as type checking,

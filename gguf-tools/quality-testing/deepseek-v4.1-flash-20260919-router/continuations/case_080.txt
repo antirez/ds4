@@ -1,0 +1,7 @@
+# Why First-Token-Only Tests Are Insufficient for Text Generation
+
+A test that only validates the first output token verifies an extremely narrow slice of a text-generation pipeline. Here's why it fails to establish correctness of the whole implementation.
+
+## 1. It bypasses the autoregressive loop entirely
+
+Text generation

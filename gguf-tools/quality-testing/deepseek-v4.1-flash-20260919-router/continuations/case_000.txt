@@ -1,0 +1,8 @@
+```python
+def adjacent_pairs(iterable):
+    """
+    Yield (previous, current) pairs from an iterable lazily.
+
+    Works on any iterable (lists, generators, files, etc.) without
+    loading the whole thing into memory. If the iterable has fewer
+    than two elements

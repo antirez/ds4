@@ -1,0 +1,16 @@
+# Shallow Copy vs Deep Copy
+
+The difference comes down to **how nested (mutable) objects are handled**.
+
+## Setup
+
+```python
+import copy
+
+original = [[1, 2, 3], [4, 5, 6]]
+```
+
+This is a list containing two inner lists.
+
+---
+

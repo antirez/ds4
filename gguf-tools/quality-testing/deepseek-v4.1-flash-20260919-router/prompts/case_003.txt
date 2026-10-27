@@ -1,0 +1,1 @@
+Find the bug in this Python function and show a correction: def append_item(x, items=[]): items.append(x); return items.

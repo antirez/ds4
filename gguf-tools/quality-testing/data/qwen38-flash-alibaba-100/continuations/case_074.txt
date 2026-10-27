@@ -1,0 +1,7 @@
+La differenza tra **latenza** e **throughput** è fondamentale in informatica, networking e ingegneria dei sistemi. Sebbene siano spesso correlate, misurano aspetti diversi delle prestazioni di un sistema.
+
+Ecco una spiegazione chiara con analogie e definizioni tecniche:
+
+---
+
+### 1

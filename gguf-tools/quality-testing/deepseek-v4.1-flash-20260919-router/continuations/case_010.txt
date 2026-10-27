@@ -1,0 +1,8 @@
+# Retry `read()` on EINTR, Distinguishing EOF from Real Errors
+
+```c
+/*
+ * read_full() - Read up to `len` bytes into `buf`, retrying on EINTR.
+ *
+ * Returns:
+ *   > 0  : number of bytes read (may be

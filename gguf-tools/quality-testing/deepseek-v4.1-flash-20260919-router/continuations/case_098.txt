@@ -1,0 +1,6 @@
+# Test for Context Isolation Between Interleaved Conversations
+
+## Purpose
+Verify that when two independent conversations (A and B) are interleaved through the same model, information from one does not leak into the other's context, and cross-conversation state is not shared.
+
+## Design: Canary-injection protocol

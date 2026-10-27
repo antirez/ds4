@@ -1,0 +1,1 @@
+Explain why a page cache can make a second file read faster.

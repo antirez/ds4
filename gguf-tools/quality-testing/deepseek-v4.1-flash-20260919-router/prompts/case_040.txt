@@ -1,0 +1,1 @@
+A fair coin is tossed four times. What is the probability of exactly three heads? Show the calculation.

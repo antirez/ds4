@@ -1,0 +1,6 @@
+Spiegare l'**Online Softmax** (o Softmax Incrementale) è fondamentale per capire come funzionano modelli moderni come FlashAttention, che permettono di gestire sequenze molto lunghe senza saturare la memoria.
+
+Ecco una spiegazione passo-passo usando variabili semplici e logica intuitiva.
+
+---
+

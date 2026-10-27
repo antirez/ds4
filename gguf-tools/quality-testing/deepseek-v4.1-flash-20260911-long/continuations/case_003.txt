@@ -1,0 +1,5 @@
+Looking at the archive entries, I notice they follow a pattern where packages and desks cycle through values modulo 257 (packages 0000-1007, desks 000-256). But the final task is a separate C code review question, so let me focus on that.
+
+## The Bug
+
+```c

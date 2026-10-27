@@ -1,0 +1,1 @@
+Three boxes contain only apples, only oranges, or a mix. Every label is wrong. Explain how one fruit draw can identify all boxes.

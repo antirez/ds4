@@ -1,0 +1,9 @@
+# Consistenza Eventuale (Eventual Consistency)
+
+La **consistenza eventuale** è un modello di consistenza utilizzato nei database distribuiti in cui, dopo un aggiornamento, le copie dei dati sui diversi nodi **potrebbero temporaneamente essere diverse**, ma garantendo che, se non ci sono nuove scritture, **prima o poi tutte le repliche convergeranno verso lo stesso valore**.
+
+## Concetto chiave
+
+A differenza della **consistenza forte** (dove ogni lettura vede subito l'ultimo valore scritto), nella consistenza eventuale:
+
+- Una

@@ -1,0 +1,10 @@
+Ecco uno schema JSON minimo per una tool call:
+
+```json
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": ["name", "arguments"],
+  "properties": {
+    "name": {
+      "

@@ -1,0 +1,8 @@
+# First Value Greater Than Threshold in Sorted List
+
+Here's a Python function using binary search, which is the most efficient approach for a sorted list:
+
+```python
+def first_greater_than(sorted_list, threshold):
+    """
+    Return the index of the first value greater than threshold in a sorted list.

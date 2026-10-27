@@ -1,0 +1,7 @@
+Ecco lo pseudocodice per inserire un elemento in un heap binario (min-heap):
+
+## Pseudocodice per l'inserimento in un Heap Binario
+
+```
+ALGORITMO InserisciElemento(heap, n, elemento)
+    // heap: array che rappresent

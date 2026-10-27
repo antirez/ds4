@@ -1,0 +1,6 @@
+# Session State (agent_worker)
+
+The worker struct is the single-process home for everything persistent:
+
+- **Engine/session wiring**: `engine`, `session`, plus `cfg` pointing back to the config (note `agent_worker_effective_ctx_size` falls back from session ctx to `cfg->gen.ctx_size` — session may not exist yet).
+- **Transcript**: a `ds4_tokens transcript`, plus an `images` array (`ds4_vision_span` with `image_count`/`image_cap`) for vision embeddings attached to the conversation. A turn's end token is appended only when the engine's tool syntax

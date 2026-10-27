@@ -1,0 +1,1 @@
+Un prezzo passa da 80 a 92 euro. Calcola l'aumento percentuale e mostra il calcolo.

@@ -1,0 +1,10 @@
+Ecco i dati richiesti:
+
+**Giorno 19:**
+- Deposito: 6
+- Pacchi registrati da Marta: 15
+- Pacchi ritirati da Luca: 9
+
+**Giorno 510:**
+- Deposito: 3
+- Pacchi

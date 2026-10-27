@@ -1,0 +1,3 @@
+To understand the **importance matrix** in low-bit quantization, it helps to first understand the core problem: **when you compress a neural network to 4-bit or 8-bit, you are throwing away information.** 
+
+The goal of quantization is to throw away the *least* important information. The importance matrix is the

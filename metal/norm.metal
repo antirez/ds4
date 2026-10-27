@@ -175,6 +175,7 @@ struct ds4_metal_args_qkv_rms_norm {
     uint64_t q_row_stride;
     uint64_t kv_row_stride;
     float    eps;
+    uint32_t tasks;   /* bit 0: q task, bit 1: kv task (0 = both) */
 };
 
 // Normalizes DS4's q-lora row and KV row in one dispatch.  The two reductions
@@ -274,6 +275,9 @@ kernel void kernel_dsv4_qkv_rms_norm_kv_rope_fp8_store_f32(
 
     const uint row = tgpig.x;
     const bool kv_task = tgpig.y != 0;
+    if (args.tasks != 0u && (args.tasks & (kv_task ? 2u : 1u)) == 0u) {
+        return;
+    }
     const int n = kv_task ? args.kv_n : args.q_n;
     const int n4 = kv_task ? args.kv_n4 : args.q_n4;
     const uint64_t row_stride4 = (kv_task ? args.kv_row_stride : args.q_row_stride) / sizeof(float4);

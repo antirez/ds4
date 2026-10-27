@@ -1,0 +1,1 @@
+Un **trie** (chiamato anche *albero dei prefissi* o *digital tree*) rappresenta un insieme di stringhe in modo **compatto ed efficiente**, sfruttando i **prefissi comuni** tra le parole. Ecco come funziona in

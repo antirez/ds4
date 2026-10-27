@@ -1,0 +1,46 @@
+{
+  "id": "gen-1787762078-zISGS6pSm7eBz4XvckTu",
+  "object": "chat.completion",
+  "created": 1787762078,
+  "model": "z-ai/glm-5.3-flash",
+  "provider": "Z.AI",
+  "system_fingerprint": null,
+  "service_tier": null,
+  "choices": [
+    {
+      "index": 0,
+      "logprobs": null,
+      "finish_reason": "length",
+      "native_finish_reason": "length",
+      "message": {
+        "role": "assistant",
+        "content": "# Binary Heap Push (Insert) — Pseudocode\n\n```\nfunction PUSH(heap, value):\n    // 1. Add the new element at the end\n    APPEND(heap.array, value)\n    index = LENGTH(heap.array) - 1\n\n    // 2. Sift up: restore heap property by swapping with parent\n    while index > 0:\n        parent = FLOOR((index - 1) / 2)\n        if heap.array[index] <= heap.array[parent]:   // min-heap\n            break\n        SWAP(heap.array[index], heap.array[parent])\n        index = parent\n",
+        "refusal": null,
+        "reasoning": null
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 22,
+    "completion_tokens": 128,
+    "total_tokens": 150,
+    "cost": 3.365e-05,
+    "is_byok": false,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "cache_write_tokens": 0,
+      "audio_tokens": 0,
+      "video_tokens": 0
+    },
+    "cost_details": {
+      "upstream_inference_cost": 3.365e-05,
+      "upstream_inference_prompt_cost": 1.65e-06,
+      "upstream_inference_completions_cost": 3.2e-05
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 0,
+      "image_tokens": 0,
+      "audio_tokens": 0
+    }
+  }
+}

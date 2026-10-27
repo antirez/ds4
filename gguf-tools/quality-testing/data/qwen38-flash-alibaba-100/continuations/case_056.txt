@@ -1,0 +1,3 @@
+In un'architettura **Mixture-of-Experts (MoE)**, il **router** (o gate) svolge un ruolo fondamentale e critico: è il componente responsabile della **selezione dinamica degli esperti** più adatti per elaborare ogni singolo token o input.
+
+### Ruolo dettagliato del Router

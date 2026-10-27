@@ -1,0 +1,5 @@
+# Derivazione di RMSNorm: perché somma dei quadrati e riscalamento
+
+## 1. Il punto di partenza: la normalizzazione
+
+L'obiettivo di una tecnica di normalizzazione è portare le attivazioni di un vettore $x \in \mathbb{R}^d$ su una scala comparabile, indipendentemente dalla loro magnitudine. Questo stabilizza l'addestramento perché evita che i gradienti esplodano o sv

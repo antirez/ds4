@@ -1,0 +1,5 @@
+# Ricerca binaria del punto di inserimento
+
+## Il problema
+
+Data una **lista ordinata** `A` di `n` elementi e un

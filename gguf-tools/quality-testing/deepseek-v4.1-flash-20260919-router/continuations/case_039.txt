@@ -1,0 +1,8 @@
+When you average two percentages, you are implicitly treating them as if they were measured on the same base. If their denominators differ, that assumption breaks down, and the simple average can misrepresent the overall rate.
+
+## The core issue
+
+A percentage is a ratio:
+
+\[
+\text{percentage} = \frac{\text

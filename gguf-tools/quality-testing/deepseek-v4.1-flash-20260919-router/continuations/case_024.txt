@@ -1,0 +1,9 @@
+```regex
+^-?\d+$
+```
+
+Explanation:
+
+- `^` — start of string (anchor)
+- `-?` — an optional single minus sign (`?` makes the preceding `-` optional). There's no `+` alternative, so a leading plus is disallowed.
+- `\d

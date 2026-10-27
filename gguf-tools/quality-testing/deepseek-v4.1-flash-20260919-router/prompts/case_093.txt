@@ -1,0 +1,1 @@
+Write a small Python function validating a rectangular matrix before transposing it.

@@ -80,3 +80,67 @@ ABBA and BAAB blocks, poisons host logit buffers before copying, and aborts
 unless every final full-vocabulary logit row is bit-identical. Defaults are an
 8192-token prefix, an automatically sized 8193-token context, and two repeats;
 use `--help` to override them.
+
+Numeric runtime tuning controls can use `--candidate-value TEXT` (default `1`), and
+`--prefill-chunk N` selects the same chunk size for both variants (default
+4096). The control unsets the named variable. Use only controls read at
+dispatch time: this harness keeps one engine alive and cannot compare settings
+cached during initialization.
+
+`DS4_QWEN4_TIMING=2` reports each prefill chunk's position, token count, and
+stage times, including the attention mixer separately from GDN/attention.
+These measurements include synchronization overhead and are for attribution;
+use uninstrumented alternating runs for throughput claims.
+`DS4_QWEN4_MOE_PROFILE=1` further splits tiled MoE into routing, expert-list
+construction, routed/shared gate-up, routed/shared down, and reduction,
+reporting one line per layer. Its synchronization also makes it diagnostic only.
+
+Qwen routed MoE quantization specialization is enabled by default on M3 Ultra.
+`DS4_QWEN4_MOE_MM_SPECIALIZE=0` restores the generic kernels; `=1` opts in on
+other devices. To compare the final default against rollback, pass
+`--candidate-env DS4_QWEN4_MOE_MM_SPECIALIZE --candidate-value 0` to the harness.
+
+### Concurrency: many requests at once
+
+`session_concurrency_bench` measures the engine without HTTP overhead.
+
+```sh
+make session-concurrency-bench
+./speed-bench/session_concurrency_bench -m ds4flash.gguf \
+  --concurrency 1,2,4,8 --ctx 4096 --gen 128 --budget-gib 28 \
+  --csv /tmp/concurrency.csv
+```
+
+Streams use different corpus offsets to avoid identical expert routing.
+The report includes aggregate and per-stream throughput, step latency and
+prefill time. Set `--budget-gib` to bound session allocations; monitor actual
+memory and swap too. `--mixed` adds a concurrent continued prefill, `--spec`
+enables Qwen MTP, and `--verify` fails on a greedy-token mismatch against
+serial decoding. Use the official-continuation scorer to assess quality when
+different reduction orders change a close token choice.
+
+For an interleaved comparison against a diagnostic rollback:
+
+```sh
+./speed-bench/session_concurrency_bench --ctx 4096 --concurrency 8 \
+  --candidate-env DS4_QWEN4_SESSION_BATCH --candidate-value 0 --repeat 3
+```
+
+The control unsets the variable; the candidate sets it in alternating ABBA
+blocks. Use only controls read at dispatch time. Keep prompts, context, memory
+pressure and thermal conditions comparable, and retain generated text when
+measuring speculation. `concurrency_sweep.sh` runs each cell in a fresh process.
+
+`serve_concurrency_bench.py` measures the HTTP server, including queueing,
+prompt rendering, prefix reuse and streaming:
+
+```sh
+python3 speed-bench/serve_concurrency_bench.py \
+  --concurrency 8 --prompt-tokens 4096 --max-tokens 128 --requests 32 \
+  --ignore-eos --json /tmp/serve-8.json
+```
+
+Start the server separately with an appropriate model, context and
+`--batched-session 8`. The report includes first-token and inter-token
+latency, request latency and throughput. Prompts use fresh nonces;
+`--shared-prefix` tests cache reuse instead.

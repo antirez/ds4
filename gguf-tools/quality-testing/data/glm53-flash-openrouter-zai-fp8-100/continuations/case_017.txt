@@ -1,0 +1,8 @@
+# Decodifica Speculativa: Perché Mantiene l'Output Esatto
+
+La decodifica speculativa (speculative decoding) è una tecnica che accelera l'inferenza dei modelli linguistici **senza alterare la distribuzione di probabilità dell'output**. Ecco perché garantisce risultati identici:
+
+## Meccanismo base
+
+1. **Modello draft (piccolo e veloce)**: propone rapidamente k token candidati
+2. **Modello target (grande, quello vero)**: verifica tutti i token proposti in un solo

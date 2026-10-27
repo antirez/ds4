@@ -1,0 +1,3 @@
+To understand why **Grouped MoE (Mixture of Experts) expert execution** improves prefill, we first need to clarify what "prefill" is and what the bottleneck is in standard MoE models.
+
+**Prefill** is the phase where the model processes the entire input prompt (e.g., a 

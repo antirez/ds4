@@ -1,0 +1,7 @@
+# Why a Map's Scale Matters When Estimating Distance
+
+A map's scale is the ratio between a distance on the map and the actual distance on the ground. It matters because **the same physical measurement on paper can represent wildly different real-world distances depending on the scale**.
+
+## The Core Idea
+
+If you measure 2

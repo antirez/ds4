@@ -1,0 +1,1 @@
+Per rispondere in modo preciso, dobbiamo prima chiarire il termine. Nel contesto della **quantizzazione low-bit** (es. 4-bit, 8-bit) di modelli di deep learning, non esiste un termine standard chiamato "matrice di importanza" come oggetto mat

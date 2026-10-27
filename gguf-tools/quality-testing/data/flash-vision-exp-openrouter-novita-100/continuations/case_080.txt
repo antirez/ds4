@@ -1,0 +1,6 @@
+A good benchmark should measure **the specific, meaningful outcome it is designed to improve, under realistic conditions, with enough precision to distinguish between meaningful differences in performance.** 
+
+To be truly effective, it should also be:
+
+- **Relevant** (aligned with the actual goal or user need)
+- **Reliable**

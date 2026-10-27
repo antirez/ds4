@@ -1,0 +1,8 @@
+# Floating-Point Addition is Not Associative
+
+Floating-point addition is **not associative**: `(a + b) + c` can differ from `a + (b + c)` due to rounding at each step.
+
+## Example (using a typical format with ~7 significant digits)
+
+Take:
+- `

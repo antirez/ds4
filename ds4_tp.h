@@ -30,8 +30,9 @@ enum {
     DS4_TP_GATE_ATTN = 0,
     DS4_TP_GATE_FFN = 1,
     DS4_TP_GATES_PER_LAYER = 2,
-    /* Max rows in a verify-block batch gate (speculative blocks are <=5). */
+    /* Includes the seed row as well as drafted tokens. */
     DS4_TP_BATCH_MAX_ROWS = 8,
+    DS4_TP_BATCH_GATES_PER_LAYER = 2,
 };
 
 /* Engine identity exchanged in the hello so a mismatched pair aborts before
@@ -45,14 +46,17 @@ typedef struct {
     uint32_t quant_bits;
     uint32_t ctx_size;
     /* Decode gate schedule, used to place RDMA recvs into the right slab
-     * slot: slot(seq) = start + ((seq-1) % per_token) * step.
+     * slot. A nonempty mask lists the exact slots in firing order; otherwise
+     * slot(seq) = start + ((seq-1) % per_token) * step.
      * per_token 0 falls back to the identity mapping over all slots
      * (DS4: every layer fires ATTN then FFN). GLM fires one FFN gate per
-     * sparse layer only, so its schedule skips the dense prefix and the
-     * ATTN slots. Exchanged in the hello; both sides must agree. */
+     * sparse layer in streaming mode. Hybrid GLM-5.3 uses the mask because
+     * DSA layers also fire ATTN while KDA layers do not. Exchanged in the
+     * hello; both sides must agree. */
     uint32_t gate_slot_start;
     uint32_t gate_slot_step;
     uint32_t gates_per_token;
+    uint64_t gate_slot_mask[DS4_TP_GATE_MASK_WORDS];
 } ds4_tp_identity;
 
 bool ds4_tp_enabled(const ds4_tp_options *opt);
@@ -100,7 +104,19 @@ void ds4_tp_free(ds4_tp *tp);
 
 int ds4_tp_rank(const ds4_tp *tp);
 bool ds4_tp_is_rdma(const ds4_tp *tp);
+/* True once both peers agreed on the RDMA command mailbox (RC queue pairs,
+ * not disabled with DS4_TP_DISABLE_RDMA_MAILBOX on either rank). */
+bool ds4_tp_command_mailbox_active(const ds4_tp *tp);
 uint32_t ds4_tp_peer_ctx(const ds4_tp *tp);
+enum {
+    DS4_TP_MODE_EXPERT_INTERMEDIATE_SPLIT = 1u,
+    DS4_TP_MODE_V41_SHARED_OWNER = 2u,
+    DS4_TP_MODE_V41_SHARED_BALANCE = 4u,
+    DS4_TP_MODE_V41_DSPARK = 8u,
+};
+/* Call on both engines before binding the GPU slab. Resident layouts and
+ * shared-expert ownership must match before either rank can reduce results. */
+int ds4_tp_agree_execution_mode(ds4_tp *tp, uint32_t flags, char *err, size_t errlen);
 bool ds4_tp_failed(const ds4_tp *tp);
 void ds4_tp_mark_failed(ds4_tp *tp);
 
@@ -112,7 +128,8 @@ void ds4_tp_mark_failed(ds4_tp *tp);
  *   in  vectors   S * vec_bytes   RDMA/TCP-written with the peer partials
  *   in  seq flags S * 8           written strictly after each in vector
  *   token slot    16              {seq u64, token i32, pad} leader->worker
- *   (gpu flags, then batch out/in: n_layer * BATCH_MAX_ROWS * vec_bytes
+ *   (gpu flags, then batch out/in:
+ *    n_layer * BATCH_GATES_PER_LAYER * BATCH_MAX_ROWS * vec_bytes
  *    each, row partials for the speculative verify-block gates)
  *
  * vec_bytes = n_embd * 4 (f32 partials, never quantized on the wire). */
@@ -123,6 +140,9 @@ uint64_t ds4_tp_slab_batch_out_offset(const ds4_tp *tp, uint32_t layer);
 uint64_t ds4_tp_slab_batch_in_offset(const ds4_tp *tp, uint32_t layer);
 uint64_t ds4_tp_slab_gpu_flags_offset(const ds4_tp *tp);
 int ds4_tp_attach_slab(ds4_tp *tp, void *base, char *err, size_t errlen);
+/* Stop the data plane before freeing its registered buffers. No more gates
+ * may be issued; free the transport after the engine has been unbound. */
+void ds4_tp_detach_slab(ds4_tp *tp);
 
 /* Exchange one gate: send out[layer][gate] to the peer's in[layer][gate]
  * and wait until the peer's partial for `seq` has fully landed locally.
@@ -134,6 +154,15 @@ int ds4_tp_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq
  * the GPU gate service thread. */
 int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
                                uint64_t seq);
+/* Verify-block RDMA window (speculative decoding): call on both ranks right
+ * before/after a verify block with one batch gate per layer. */
+int ds4_tp_batch_block_begin(ds4_tp *tp, uint32_t rows, uint32_t n_layers);
+/* Negotiate one or two batch gates per layer before encoding the block.
+ * Both ranks receive the smaller offered count. Slots are then consecutive
+ * gate indices, not layer indices. Works with RDMA and TCP. */
+int ds4_tp_batch_block_begin_gates(ds4_tp *tp, uint32_t rows, uint32_t n_layers,
+                                  uint32_t *gates_per_layer);
+int ds4_tp_batch_block_end(ds4_tp *tp);
 
 /* Prefill batch gate: arbitrary-size symmetric payload exchange over bulk
  * RDMA, with interleaved 2MB TCP rounds as fallback (see ds4_tp.c). */
@@ -151,9 +180,19 @@ int ds4_tp_send_session_create(ds4_tp *tp, uint64_t session_id, int ctx_size);
 int ds4_tp_send_session_destroy(ds4_tp *tp, uint64_t session_id);
 int ds4_tp_send_sync(ds4_tp *tp, uint64_t session_id,
                      const int *tokens, uint32_t n_tokens);
+int ds4_tp_send_sync_multimodal(ds4_tp *tp, uint64_t session_id,
+                                const int *tokens, uint32_t n_tokens,
+                                const ds4_vision_span *images,
+                                uint32_t image_count);
 int ds4_tp_send_eval(ds4_tp *tp, uint64_t session_id,
                      uint64_t seq, int token);
+int ds4_tp_send_glm_mtp(ds4_tp *tp, uint64_t session_id,
+                       uint64_t seq, int token, int limit);
 int ds4_tp_send_rewind(ds4_tp *tp, uint64_t session_id, int pos);
+/* State-only restore: ACK status 0 restored, 1 unavailable, -1 failed (closes).
+ * No TP collectives or logits reply. Await ds4_tp_wait_command_status() before
+ * mirroring replay EVALs; status 1 requires invalidation and full sync. */
+int ds4_tp_send_spec_restore(ds4_tp *tp, uint64_t session_id, int pos);
 int ds4_tp_send_invalidate(ds4_tp *tp, uint64_t session_id);
 int ds4_tp_send_eval_batch(ds4_tp *tp, const ds4_tp_batch_item *items,
                            uint32_t count);
@@ -164,6 +203,12 @@ int ds4_tp_send_mixed_batch(ds4_tp *tp, uint64_t prefill_session_id,
 int ds4_tp_send_command_ack(ds4_tp *tp, uint64_t session_id, int status);
 int ds4_tp_wait_command_ack(ds4_tp *tp, uint64_t session_id,
                             const char *operation, char *err, size_t errlen);
+int ds4_tp_wait_command_status(ds4_tp *tp, uint64_t session_id, int *status,
+                               const char *operation, char *err, size_t errlen);
+/* Both ranks call at matching prefill boundaries. Cancellation is agreed
+ * here, never sampled independently while either rank is inside a GPU gate. */
+int ds4_tp_sync_checkpoint(ds4_tp *tp, uint32_t point, int current, int total,
+                            bool requested, bool *cancelled);
 int ds4_tp_send_stop(ds4_tp *tp);
 
 /* Worker: blocks for the next mirrored command.  Frame types below; for
@@ -188,6 +233,13 @@ typedef enum {
     DS4_TP_FRAME_EVAL_BATCH = 15,
     DS4_TP_FRAME_MIXED_BATCH = 16,
     DS4_TP_FRAME_COMMAND_ACK = 17,
+    DS4_TP_FRAME_SYNC_MULTIMODAL = 18,
+    DS4_TP_FRAME_RDMA_WARM = 19,
+    DS4_TP_FRAME_RDMA_POSTED = 20,
+    DS4_TP_FRAME_GLM_MTP = 21,
+    DS4_TP_FRAME_SYNC_CHECKPOINT = 22,
+    DS4_TP_FRAME_DSPARK_DRAFT = 23,
+    DS4_TP_FRAME_SPEC_RESTORE = 24,
 } ds4_tp_frame_type;
 
 typedef struct {
@@ -195,10 +247,13 @@ typedef struct {
     uint64_t session_id;
     uint64_t seq;
     int value;
+    int limit;
     int *tokens;
     uint32_t n_tokens;
     ds4_tp_batch_item *items;
     uint32_t n_items;
+    ds4_vision_span *images;
+    uint32_t n_images;
 } ds4_tp_command;
 
 int ds4_tp_recv_command(
@@ -219,13 +274,73 @@ int ds4_tp_recv_logits_half(ds4_tp *tp, float *half, uint32_t count);
 
 /* Speculative verify mirroring.  The leader announces a draft block right
  * before both ranks run the expert-split batch verify; the worker then blocks
- * on the commit frame, which carries the leader's decision: full_accept keeps
- * the pushed rows, otherwise both sides roll back and replay replay_n tokens
- * through the gated single-token decode in lockstep. */
+ * on the commit frame. A full commit keeps the entire verified block, a prefix
+ * commit restores the matching verifier prefix on both ranks, and rollback
+ * restores the original frontier before replaying token_count tokens. */
+typedef enum {
+    DS4_TP_VERIFY_ROLLBACK_REPLAY = 0,
+    DS4_TP_VERIFY_COMMIT_FULL = 1,
+    DS4_TP_VERIFY_COMMIT_PREFIX = 2,
+} ds4_tp_verify_commit_mode;
+
 int ds4_tp_send_verify(ds4_tp *tp, uint64_t session_id,
                        const int *drafts, uint32_t n);
-int ds4_tp_send_verify_commit(ds4_tp *tp, int32_t full_accept, int32_t replay_n);
-int ds4_tp_recv_verify_commit(ds4_tp *tp, int32_t *full_accept, int32_t *replay_n);
+/* VERIFY flags.  DS4_TP_VERIFY_HEAD_SPLIT: greedy block, each rank computes
+ * the verify head on its vocabulary half and the ranks combine row top-1s
+ * (ds4_tp_small_exchange); the worker then sends its half of the one row
+ * the leader commits (ds4_tp_head_row_send/recv). */
+#define DS4_TP_VERIFY_HEAD_SPLIT 1u
+/* DS4_TP_VERIFY_DSPARK_TP: the block holds at least one row of the last
+ * lockstep DRAFT's proposal, which the worker also holds and checks (a block
+ * trimmed to its seed is unmarked); DS4_TP_VERIFY_DSPARK_SEED: the block
+ * starts with the seed, so the proposal rows are drafts[1..]. */
+#define DS4_TP_VERIFY_DSPARK_TP 2u
+#define DS4_TP_VERIFY_DSPARK_SEED 4u
+#define DS4_TP_VERIFY_FLAGS \
+    (DS4_TP_VERIFY_HEAD_SPLIT | DS4_TP_VERIFY_DSPARK_TP | DS4_TP_VERIFY_DSPARK_SEED)
+int ds4_tp_send_verify_flags(ds4_tp *tp, uint64_t session_id,
+                             const int *drafts, uint32_t n, uint32_t flags);
+
+/* Lockstep TP drafter.  The leader sends DSPARK_DRAFT where it would prepare
+ * a DSpark proposal.  DRAFT: both ranks run the proposal for (token, pos) on
+ * their halves of the drafter.  MAINTAIN: both only bring the drafter history
+ * up to pos; the leader may still draft on its own with the full drafter.
+ * The worker receives the token in value, pos in limit and the mode in seq. */
+enum {
+    DS4_TP_DSPARK_MAINTAIN = 1,
+    DS4_TP_DSPARK_DRAFT = 2,
+};
+int ds4_tp_send_dspark_draft(ds4_tp *tp, uint64_t session_id, int token,
+                             int pos, uint32_t mode);
+/* Startup agreement, after the execution mode: enabled only when both ranks
+ * opted in with byte-identical metadata.  When only one opted in, both keep
+ * the leader-local drafter (*agreed false, *peer_on reports the peer);
+ * different metadata fails. */
+#define DS4_TP_DSPARK_META_BYTES 64u
+int ds4_tp_agree_dspark_split(ds4_tp *tp, bool mine_on, const void *meta,
+                              bool *agreed, bool *peer_on,
+                              char *err, size_t errlen);
+
+/* Lockstep symmetric exchange of up to DS4_TP_SMALL_EXCHANGE_MAX bytes over
+ * polled slab records (RDMA command mailbox only; 0 without it).  Both
+ * ranks must pass the same byte count, which the record carries and the
+ * receiver checks.  Failure marks the context failed. */
+#define DS4_TP_SMALL_EXCHANGE_MAX 192u
+int ds4_tp_small_exchange(ds4_tp *tp, const void *mine, void *peer, uint32_t bytes);
+
+/* Worker -> leader float row of up to DS4_TP_HEAD_ROW_MAX floats (mailbox
+ * only), sent after the current verify block's begin.  The worker writes the
+ * row into ds4_tp_head_row_out() (host memory inside the registered slab),
+ * then sends; the leader receives it into dst.  The record carries the
+ * verify block, row and float count and the leader requires all three, so
+ * a row sent for a block the leader then rolled back without reading is
+ * never mistaken for a later one. */
+#define DS4_TP_HEAD_ROW_MAX 131072u
+float *ds4_tp_head_row_out(ds4_tp *tp);
+int ds4_tp_head_row_send(ds4_tp *tp, uint32_t row, uint32_t floats);
+int ds4_tp_head_row_recv(ds4_tp *tp, uint32_t row, float *dst, uint32_t floats);
+int ds4_tp_send_verify_commit(ds4_tp *tp, int32_t mode, int32_t token_count);
+int ds4_tp_recv_verify_commit(ds4_tp *tp, int32_t *mode, int32_t *token_count);
 
 /* Standalone worker mode entry. Loads nothing itself: the engine is already
  * open. */

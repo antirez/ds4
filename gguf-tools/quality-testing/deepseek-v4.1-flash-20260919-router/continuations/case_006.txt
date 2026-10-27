@@ -1,0 +1,8 @@
+# Group Array of Objects by Category
+
+Here's a concise, reusable function that groups an array of objects by a given property (defaulting to `category`):
+
+```javascript
+function groupBy(arr, key = 'category') {
+  return arr.reduce((groups, item) => {
+    const group = item[key

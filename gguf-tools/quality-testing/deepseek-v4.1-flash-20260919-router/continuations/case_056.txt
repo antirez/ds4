@@ -1,0 +1,5 @@
+Here are three practical differences between an observation and an interpretation in scientific note-taking:
+
+1. **Observations record sensory data; interpretations assign meaning to it.**
+   - *Observation:* "The solution turned from clear to yellow after 30 seconds."
+   - *Interpretation:* "The color change indicates a chemical reaction

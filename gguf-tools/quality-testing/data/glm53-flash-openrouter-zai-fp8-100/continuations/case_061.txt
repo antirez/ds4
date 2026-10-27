@@ -1,0 +1,14 @@
+# Why Sorted Arrays Speed Up Membership Tests
+
+## The Core Idea: Eliminating Half the Search Space at Each Step
+
+When an array is **sorted**, you gain a crucial piece of information: the position of any element tells you where all smaller and larger elements are. Binary search exploits this to avoid checking most elements.
+
+## How Binary Search Works
+
+To check if `x` exists in a sorted array:
+
+1. Look at the **middle** element.
+2. Compare it with `x`:
+   - If equal → found it.
+   - If the middle is **greater** than `x` → `x` can

@@ -1,0 +1,3 @@
+In the context of a network server, **backpressure** is a mechanism used to prevent a fast producer from overwhelming a slow consumer. 
+
+Think of it like a water pipe: if you pump water into a pipe faster than the drain can handle, the pipe will burst. Backpressure is the valve that automatically restricts the

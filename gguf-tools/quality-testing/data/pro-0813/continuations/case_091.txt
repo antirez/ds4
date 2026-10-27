@@ -1,0 +1,1 @@
+In plain language, a **confidence interval** is a range of values that gives you a "best guess with a margin

@@ -1,0 +1,1 @@
+Explain why blindly retrying a payment request after a timeout can charge a customer twice.

@@ -1,0 +1,10 @@
+This is a classic logic puzzle. Here's the step-by-step solution:
+
+## The Setup
+
+You have **three boxes** with labels:
+1. **"Apples"** 
+2. **"Oranges"**
+3. **"Apples and Oranges"**
+
+You're told **every label is wrong

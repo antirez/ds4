@@ -1,0 +1,5 @@
+A good benchmark should measure **performance against a defined standard or baseline in a consistent, reproducible, and relevant manner.**
+
+### Explanation:
+To be effective, a benchmark must possess the following characteristics:
+1.  **Relevance:** It measures what matters to the specific context (e.g., speed for software

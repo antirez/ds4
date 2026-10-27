@@ -1,0 +1,4 @@
+For `clamp_0017`, the function definition is:
+`int clamp_0017(int x) { if (x < 17) return 17; if (x > 117) return 117; return x; }`
+
+This function cl

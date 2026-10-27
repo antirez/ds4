@@ -1,0 +1,1 @@
+In the context of quantizing a neural network (converting weights and activations from high-precision floating-point, e.g., FP32, to lower precision, e.g., INT8), **calibration data** plays a critical role in determining how accurately the low-precision model represents the original high-precision model

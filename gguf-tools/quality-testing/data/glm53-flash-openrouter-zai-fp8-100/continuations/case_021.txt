@@ -1,0 +1,18 @@
+```c
+int clamp(int value, int min, int max) {
+    if (value < min) return min;
+    if (value > max) return max;
+    return value;
+}
+```
+
+**Usage example:**
+
+```c
+#include <stdio.h>
+
+int main(void) {
+    printf("%d\n", clamp(15, 0, 10));   // 10
+    printf("%d\n", clamp(-5, 0, 10));   // 0
+    printf("%d\n", clamp(7, 0, 10));    // 7
+    return 0

@@ -1,0 +1,1 @@
+Write a SQL query selecting the newest event per account, including a deterministic tie-break on event id.

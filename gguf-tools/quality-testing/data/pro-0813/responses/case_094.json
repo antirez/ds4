@@ -1,0 +1,269 @@
+{
+  "id": "c71f63ca-2a66-4ab5-b26c-689ab65a5549",
+  "object": "chat.completion",
+  "created": 1786576166,
+  "model": "deepseek-v4-pro",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Tokyo"
+      },
+      "logprobs": {
+        "content": [
+          {
+            "token": "Tokyo",
+            "logprob": 0.0,
+            "bytes": [
+              84,
+              111,
+              107,
+              121,
+              111
+            ],
+            "top_logprobs": [
+              {
+                "token": "Tokyo",
+                "logprob": 0.0,
+                "bytes": [
+                  84,
+                  111,
+                  107,
+                  121,
+                  111
+                ]
+              },
+              {
+                "token": "The",
+                "logprob": -9999.0,
+                "bytes": [
+                  84,
+                  104,
+                  101
+                ]
+              },
+              {
+                "token": "Ky",
+                "logprob": -9999.0,
+                "bytes": [
+                  75,
+                  121
+                ]
+              },
+              {
+                "token": "Japan",
+                "logprob": -9999.0,
+                "bytes": [
+                  74,
+                  97,
+                  112,
+                  97,
+                  110
+                ]
+              },
+              {
+                "token": "**",
+                "logprob": -9999.0,
+                "bytes": [
+                  42,
+                  42
+                ]
+              },
+              {
+                "token": "京都",
+                "logprob": -9999.0,
+                "bytes": [
+                  228,
+                  186,
+                  172,
+                  233,
+                  131,
+                  189
+                ]
+              },
+              {
+                "token": " Tokyo",
+                "logprob": -9999.0,
+                "bytes": [
+                  32,
+                  84,
+                  111,
+                  107,
+                  121,
+                  111
+                ]
+              },
+              {
+                "token": "東京",
+                "logprob": -9999.0,
+                "bytes": [
+                  230,
+                  157,
+                  177,
+                  228,
+                  186,
+                  172
+                ]
+              },
+              {
+                "token": "Capital",
+                "logprob": -9999.0,
+                "bytes": [
+                  67,
+                  97,
+                  112,
+                  105,
+                  116,
+                  97,
+                  108
+                ]
+              },
+              {
+                "token": "-",
+                "logprob": -9999.0,
+                "bytes": [
+                  45
+                ]
+              },
+              {
+                "token": "Answer",
+                "logprob": -9999.0,
+                "bytes": [
+                  65,
+                  110,
+                  115,
+                  119,
+                  101,
+                  114
+                ]
+              },
+              {
+                "token": "<｜｜end▁of▁sentence｜｜>",
+                "logprob": -9999.0,
+                "bytes": [
+                  60,
+                  239,
+                  189,
+                  156,
+                  239,
+                  189,
+                  156,
+                  101,
+                  110,
+                  100,
+                  226,
+                  150,
+                  129,
+                  111,
+                  102,
+                  226,
+                  150,
+                  129,
+                  115,
+                  101,
+                  110,
+                  116,
+                  101,
+                  110,
+                  99,
+                  101,
+                  239,
+                  189,
+                  156,
+                  239,
+                  189,
+                  156,
+                  62
+                ]
+              },
+              {
+                "token": "It",
+                "logprob": -9999.0,
+                "bytes": [
+                  73,
+                  116
+                ]
+              },
+              {
+                "token": "T",
+                "logprob": -9999.0,
+                "bytes": [
+                  84
+                ]
+              },
+              {
+                "token": " Kyoto",
+                "logprob": -9999.0,
+                "bytes": [
+                  32,
+                  75,
+                  121,
+                  111,
+                  116,
+                  111
+                ]
+              },
+              {
+                "token": "东京",
+                "logprob": -9999.0,
+                "bytes": [
+                  228,
+                  184,
+                  156,
+                  228,
+                  186,
+                  172
+                ]
+              },
+              {
+                "token": "K",
+                "logprob": -9999.0,
+                "bytes": [
+                  75
+                ]
+              },
+              {
+                "token": "Т",
+                "logprob": -9999.0,
+                "bytes": [
+                  208,
+                  162
+                ]
+              },
+              {
+                "token": "Its",
+                "logprob": -9999.0,
+                "bytes": [
+                  73,
+                  116,
+                  115
+                ]
+              },
+              {
+                "token": "ky",
+                "logprob": -9999.0,
+                "bytes": [
+                  107,
+                  121
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 16,
+    "completion_tokens": 1,
+    "total_tokens": 17,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    },
+    "prompt_cache_hit_tokens": 0,
+    "prompt_cache_miss_tokens": 16
+  },
+  "system_fingerprint": "fp_v4pro_20260812_prod0820_fp8_kvcache_20260402"
+}

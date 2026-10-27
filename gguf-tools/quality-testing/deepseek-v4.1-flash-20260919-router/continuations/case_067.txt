@@ -1,0 +1,3 @@
+# Perché un programma non deve ignorare il valore restituito da una scrittura su file
+
+Quando si scrive su un file (con `write()`, `fwrite()`, `fputs()`, `outputstream.write()`, ecc.), l'operazione **può fallire o essere

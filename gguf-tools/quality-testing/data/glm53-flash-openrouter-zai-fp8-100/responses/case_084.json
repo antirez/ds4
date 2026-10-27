@@ -1,0 +1,54 @@
+{
+  "id": "gen-1787762363-KVO6V3IYjftA5MtxkfXx",
+  "object": "chat.completion",
+  "created": 1787762363,
+  "model": "z-ai/glm-5.3-flash",
+  "provider": "Z.AI",
+  "system_fingerprint": null,
+  "service_tier": null,
+  "choices": [
+    {
+      "index": 0,
+      "logprobs": null,
+      "finish_reason": "stop",
+      "native_finish_reason": "stop",
+      "message": {
+        "role": "assistant",
+        "content": "**Translation:** \"Quantization reduces memory but can alter the logits.\"\n\nA slightly more natural phrasing might be: \"Quantization saves memory but may distort the logits.\"",
+        "refusal": null,
+        "reasoning": "Simple translation.",
+        "reasoning_details": [
+          {
+            "type": "reasoning.text",
+            "text": "Simple translation.",
+            "format": "unknown",
+            "index": 0
+          }
+        ]
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 31,
+    "completion_tokens": 39,
+    "total_tokens": 70,
+    "cost": 1.2075e-05,
+    "is_byok": false,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "cache_write_tokens": 0,
+      "audio_tokens": 0,
+      "video_tokens": 0
+    },
+    "cost_details": {
+      "upstream_inference_cost": 1.2075e-05,
+      "upstream_inference_prompt_cost": 2.325e-06,
+      "upstream_inference_completions_cost": 9.75e-06
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 3,
+      "image_tokens": 0,
+      "audio_tokens": 0
+    }
+  }
+}

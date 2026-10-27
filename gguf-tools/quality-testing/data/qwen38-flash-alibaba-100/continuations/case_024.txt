@@ -1,0 +1,1 @@
+Storing a model checkpoint header safely is critical because the header often contains metadata (e.g., architecture, hyperparameters, versioning) that may be parsed or executed during loading. If not handled properly, it can lead to security vulnerabilities such as **arbitrary code execution**, **denial of service**, or **data

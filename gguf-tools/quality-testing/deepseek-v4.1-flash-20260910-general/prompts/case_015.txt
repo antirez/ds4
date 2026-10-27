@@ -1,0 +1,1 @@
+Scrivi pseudocodice per inserire un elemento in un heap binario.

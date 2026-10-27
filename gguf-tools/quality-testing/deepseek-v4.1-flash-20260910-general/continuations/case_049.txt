@@ -1,0 +1,1 @@
+Evaluating 50 prompts is more informative than evaluating one favorite prompt for the same basic reason that testing 50 people is more informative than testing one person: you

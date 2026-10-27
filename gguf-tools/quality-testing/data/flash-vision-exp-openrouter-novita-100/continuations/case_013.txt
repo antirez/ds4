@@ -1,0 +1,3 @@
+Per capire **perché** RMSNorm (Root Mean Square Normalization) richiede la somma dei quadrati e il riscalamento, dobbiamo partire dalla sua definizione matematica e dal suo scopo.
+
+RMSNorm normalizza un vettore di attivazioni **dividendo per la sua

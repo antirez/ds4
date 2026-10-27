@@ -1,0 +1,5 @@
+Here is a concise design for a TCP echo server optimized for handling slow clients (the "C10K" or "Slowloris" problem).
+
+### Core Principle
+**Non-blocking I/O + Event-Driven Architecture.**  
+Never block the main thread waiting for data from a slow client. Instead, register

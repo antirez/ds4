@@ -1,0 +1,3 @@
+# Testing That a File-Backed mmap Isn't Repeatedly Remapped
+
+The concern is that code might call `mmap()` over and over (e.g., per-access or per-read) instead of mapping once. Here are several ways

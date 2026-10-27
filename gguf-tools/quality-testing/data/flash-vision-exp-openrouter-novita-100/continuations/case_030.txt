@@ -1,0 +1,5 @@
+Ti spiego la **ricerca binaria del punto di inserimento** (in inglese *binary search for insertion point*), che è una variante della classica ricerca binaria.
+
+## Obiettivo
+
+Dato un array **ordinato** e un valore `target`, vogliamo trovare l'ind

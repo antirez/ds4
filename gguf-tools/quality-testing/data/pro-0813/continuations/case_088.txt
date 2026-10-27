@@ -1,0 +1,4 @@
+A tokenizer should treat special tags carefully for several important reasons:
+
+## 1. **Preserving Semantic Meaning**
+Special

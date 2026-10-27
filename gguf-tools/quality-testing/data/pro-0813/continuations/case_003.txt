@@ -1,0 +1,1 @@
+To derive why **RMSNorm** (Root Mean Square Layer Normalization) needs a **sum of squares** and a

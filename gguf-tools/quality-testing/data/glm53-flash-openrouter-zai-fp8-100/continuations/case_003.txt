@@ -1,0 +1,7 @@
+# Deriving RMSNorm
+
+## Starting point: LayerNorm
+
+LayerNorm normalizes a vector $x \in \mathbb{R}^d$ to zero mean and unit variance:
+
+$$\hat{x}_i = \frac{x_i - \mu}{\sqrt{\sigma^2 + \epsilon}}, \qquad \mu = \frac{1}{d}\sum_j x_j, \quad \sigma^2 = \frac{1}{d}\sum_j (x_j - \

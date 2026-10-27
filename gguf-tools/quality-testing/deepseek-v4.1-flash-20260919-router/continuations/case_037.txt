@@ -1,0 +1,12 @@
+Let’s go through it step-by-step.
+
+---
+
+**Step 1 – Convert time to hours**  
+90 minutes = \( \frac{90}{60} = 1.5 \) hours.
+
+---
+
+**Step 2 – Find the distance each train travels**
+
+- Train 1 speed = 45 km/h

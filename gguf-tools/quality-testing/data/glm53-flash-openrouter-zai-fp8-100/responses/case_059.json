@@ -1,0 +1,46 @@
+{
+  "id": "gen-1787762274-pz0o0kkKzPKjZnaHEoij",
+  "object": "chat.completion",
+  "created": 1787762274,
+  "model": "z-ai/glm-5.3-flash",
+  "provider": "Z.AI",
+  "system_fingerprint": null,
+  "service_tier": null,
+  "choices": [
+    {
+      "index": 0,
+      "logprobs": null,
+      "finish_reason": "length",
+      "native_finish_reason": "length",
+      "message": {
+        "role": "assistant",
+        "content": "# Perché valutare 50 prompt è più utile di un singolo prompt \"preferito\"\n\n## 1. Riduce i bias personali\nUn prompt preferito può funzionare bene per **te**, in un contesto specifico. Valutandone 50, ottieni una visione oggettiva di cosa funziona davvero, non solo cosa ti piace.\n\n## 2. Rivela pattern, non coincidenze\n- Con **1 prompt**: non sai se il risultato è fortuna o qualità\n- Con **50 prompt**: emergono schemi ricorrenti (struttura, tono",
+        "refusal": null,
+        "reasoning": null
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 31,
+    "completion_tokens": 128,
+    "total_tokens": 159,
+    "cost": 3.4325e-05,
+    "is_byok": false,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "cache_write_tokens": 0,
+      "audio_tokens": 0,
+      "video_tokens": 0
+    },
+    "cost_details": {
+      "upstream_inference_cost": 3.4325e-05,
+      "upstream_inference_prompt_cost": 2.325e-06,
+      "upstream_inference_completions_cost": 3.2e-05
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 0,
+      "image_tokens": 0,
+      "audio_tokens": 0
+    }
+  }
+}

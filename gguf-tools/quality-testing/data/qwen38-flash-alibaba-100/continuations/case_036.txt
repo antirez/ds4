@@ -1,0 +1,4 @@
+Ecco un piano conciso per testare l'efficacia del chunking (frammentazione) su prompt lunghi:
+
+### 1. Definizione degli Obiettivi
+*   **Metriche chiave:** Accuratezza della risposta, coerenza logica tra i chunk, latenza totale e costo token.

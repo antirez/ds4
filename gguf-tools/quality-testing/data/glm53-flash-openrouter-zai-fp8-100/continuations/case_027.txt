@@ -1,0 +1,9 @@
+# Importance Matrix in Low-Bit Quantization
+
+An **importance matrix** (often called an "imatrix") is a technique used in post-training quantization—popularized by tools like **llama.cpp**—to improve the accuracy of aggressively quantized models (e.g., 2-bit, 3-bit, or mixed-precision formats like Q2_K, IQ4_XS).
+
+## The Problem It Solves
+
+Naive quantization treats all weights as equally important. But in reality:
+- Some weights have a much larger impact on the model's output than others
+- Quantization error on "important"

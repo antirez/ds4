@@ -1,0 +1,3 @@
+Confrontare `mmap` (memory-mapped file) con la copia completa dei pesi in memoria su macOS è una questione cruciale per l'ottimizzazione delle prestazioni, specialmente nel contesto di modelli di machine learning di grandi dimensioni.
+
+Ecco un'analisi dettagliata dei due approcci, con

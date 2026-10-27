@@ -1,0 +1,8 @@
+# Verifica di anagrammi in Python
+
+Ecco una funzione compatta che verifica se due parole sono anagrammi, ignorando spazi e differenze tra maiuscole/minuscole:
+
+```python
+def sono_anagrammi(parola1, parola2):
+    """
+    Ver

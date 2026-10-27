@@ -1,0 +1,14 @@
+# Perché il prefill GPU è più veloce del decode token-per-token
+
+## La differenza fondamentale
+
+**Prefill** e **decode** sono le due fasi dell'inferenza di un LLM, ma hanno caratteristiche computazionali molto diverse:
+
+- **Prefill**: elabora l'intero prompt in un'unica passata
+- **Decode**: genera un token alla volta, in modo autoregressivo
+
+## Il motivo principale: parallelismo
+
+### Prefill = calcolo parallelo massivo
+
+Durante il prefill, tutti i token del prompt vengono processati **simultane

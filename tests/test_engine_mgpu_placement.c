@@ -82,6 +82,12 @@ size_t ds4_test_compute_glm_entry_bytes_sum_with_sessions(
                                          int n_tensors,
                                          int placement_ctx_hint,
                                          int placement_session_count_hint);
+uint64_t ds4_test_glm_memory_guard_default_budget(uint64_t host_bytes,
+                                                   uint64_t model_bytes,
+                                                   bool glm53);
+int ds4_test_glm_memory_guard_disabled(void);
+int ds4_test_qwen4_placement(uint64_t budget, int sessions,
+                              size_t *weights, size_t *runtime);
 
 /* DS4_N_LAYER constant is private to ds4.c; for the test we use
  * the same value. (The packer header doesn't expose it.) */
@@ -545,6 +551,39 @@ static void restore_env_value(const char *name, char *saved) {
     }
 }
 
+static void test_glm_memory_guard_budget(void) {
+    fprintf(stderr, "RUN: test_glm_memory_guard_budget\n");
+    const uint64_t gib = 1024ull * 1024ull * 1024ull;
+
+    CHECK(ds4_test_glm_memory_guard_default_budget(
+                  128ull * gib, 90ull * gib, true) == 110ull * gib,
+          "GLM-5.3 keeps 18 GiB free on a 128 GiB resident-Q2 host");
+    CHECK(ds4_test_glm_memory_guard_default_budget(
+                  112ull * gib, 90ull * gib, true) == 94ull * gib,
+          "GLM-5.3 recognizes a 128 GB ROCm host by available GiB");
+    CHECK(ds4_test_glm_memory_guard_default_budget(
+                  256ull * gib, 178ull * gib, true) == 224ull * gib,
+          "GLM-5.3 uses the host-sized budget on a 256 GiB host");
+    CHECK(ds4_test_glm_memory_guard_default_budget(
+                  256ull * gib, 178ull * gib, false) == 224ull * gib,
+          "larger-host budget is model-variant independent");
+
+    char *old_guard = save_env_value("DS4_GLM_MEMORY_GUARD");
+    unsetenv("DS4_GLM_MEMORY_GUARD");
+    CHECK(ds4_test_glm_memory_guard_disabled() == 0,
+          "memory guard defaults to enabled");
+    setenv("DS4_GLM_MEMORY_GUARD", "0", 1);
+    CHECK(ds4_test_glm_memory_guard_disabled() == 1,
+          "DS4_GLM_MEMORY_GUARD=0 disables the guard for every GLM variant");
+    setenv("DS4_GLM_MEMORY_GUARD", "false", 1);
+    CHECK(ds4_test_glm_memory_guard_disabled() == 1,
+          "false spelling disables the memory guard");
+    setenv("DS4_GLM_MEMORY_GUARD", "1", 1);
+    CHECK(ds4_test_glm_memory_guard_disabled() == 0,
+          "DS4_GLM_MEMORY_GUARD=1 keeps the guard enabled");
+    restore_env_value("DS4_GLM_MEMORY_GUARD", old_guard);
+}
+
 static void test_cuda_tp_prefill_default_accounting(void) {
     fprintf(stderr, "RUN: test_cuda_tp_prefill_default_accounting\n");
 
@@ -666,6 +705,22 @@ static void test_cuda_tp_output_head_moves_to_lower_half(void) {
     restore_env_value("DS4_METAL_PREFILL_CHUNK", old_chunk);
 }
 
+static void test_qwen4_disk_ngram_accounting(void) {
+    fprintf(stderr, "RUN: test_qwen4_disk_ngram_accounting\n");
+    const uint64_t gib = UINT64_C(1073741824);
+    size_t weights = 0, one = 0, four = 0;
+    CHECK(ds4_test_qwen4_placement(80u * gib, 1, &weights, &one) == 1,
+          "Qwen fits without charging disk-only n-grams to VRAM");
+    CHECK(weights == 42u * gib + gib / 2u,
+          "Qwen entries contain resident text and vision weights, not DeepSeek KV");
+    CHECK(ds4_test_qwen4_placement(80u * gib, 4, &weights, &four) == 1,
+          "Qwen four-session configuration fits");
+    CHECK(one > 0 && four == 4u * one,
+          "Qwen reserves independent runtime memory for every session");
+    CHECK(ds4_test_qwen4_placement(40u * gib, 1, &weights, &one) == 0,
+          "Qwen still refuses a budget smaller than its resident weights");
+}
+
 int main(void) {
     test_tensor_to_entry();
     test_null_config();
@@ -677,8 +732,10 @@ int main(void) {
     test_no_per_layer_scratch_double_count();
     test_glm_per_layer_cache_accounting();
     test_glm_session_count_accounting();
+    test_glm_memory_guard_budget();
     test_cuda_tp_prefill_default_accounting();
     test_cuda_tp_output_head_moves_to_lower_half();
+    test_qwen4_disk_ngram_accounting();
 
     fprintf(stderr, "\ntest_engine_mgpu_placement: %d/%d checks passed (%d failed)\n",
             g_checks - g_failures, g_checks, g_failures);

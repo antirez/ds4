@@ -1,0 +1,1 @@
+Un treno parte alle 18:47 e il viaggio dura 2 ore e 38 minuti. Calcola l'orario di arrivo e spiega il passaggio.

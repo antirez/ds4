@@ -1,0 +1,12 @@
+# Binary Search for Insertion Point
+
+## The Idea
+Given a sorted array and a target value, binary search finds the index where the target **is or should be inserted** to keep the array sorted.
+
+## Algorithm (Lower Bound)
+
+Maintain two pointers, `lo` and `hi`, bounding the search range:
+
+1. Initialize `lo = 0`, `hi = n` (note: `n`, not `n - 1`, so the insertion point can be past the last element).
+2. While `lo < hi`:
+   - Compute `mid = lo + (hi - lo) / 

@@ -1,0 +1,5 @@
+# Why KV Cache Checkpointing Helps Agentic Sessions
+
+## The core problem: long context, repeated prefix work
+
+An agentic session (ReAct loops

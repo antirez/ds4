@@ -1,0 +1,3 @@
+Weather refers to short-term atmospheric conditions—temperature, precipitation, wind, humidity—in a specific place over hours to days. Climate refers to the long-term patterns and averages of those conditions in a region, typically measured over decades.
+
+In short: weather is what you get day to day; climate is the statistical character of

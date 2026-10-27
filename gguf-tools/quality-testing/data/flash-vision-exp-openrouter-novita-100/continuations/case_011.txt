@@ -1,0 +1,8 @@
+Ecco un progetto conciso per un server TCP echo che gestisce client lenti:
+
+## **Server TCP Echo con Gestione Client Lenti**
+
+### **Architettura**
+- **Thread Pool** per gestire connessioni multiple
+- **Timeout** per client inattivi
+- **Buffer dinam

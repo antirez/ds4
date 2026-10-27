@@ -1,0 +1,5 @@
+# Perché la media dei tempi di risposta può nascondere richieste molto lente
+
+## Il problema in sintesi
+
+La media aritmetica è un **punto unico che riassume una distribuzione**, ma non dice nulla su *come* i valori sono distribuiti

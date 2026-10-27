@@ -1,0 +1,61 @@
+{
+  "schema": "ds4-openrouter-continuation-v1",
+  "source": "openrouter",
+  "model": "deepseek/deepseek-v4-flash-vision-exp",
+  "endpoint": "https://openrouter.ai/api/v1/chat/completions",
+  "created_at": "2026-08-31T16:15:47Z",
+  "id": "short_code_completion",
+  "kind": "short",
+  "prompt": "Complete the C statement with the next exact token only:\nreturn snprintf(buf, sizeof(buf), \"%d\", value",
+  "request": {
+    "model": "deepseek/deepseek-v4-flash-vision-exp",
+    "temperature": 0,
+    "token_limit_field": "max_tokens",
+    "max_tokens": 32,
+    "logprobs": true,
+    "top_logprobs": 20,
+    "messages": [
+      {
+        "role": "user",
+        "content": "Complete the C statement with the next exact token only:\nreturn snprintf(buf, sizeof(buf), \"%d\", value"
+      }
+    ],
+    "reasoning": {
+      "effort": "none"
+    }
+  },
+  "provider": "Novita",
+  "usage": {
+    "prompt_tokens": 27,
+    "completion_tokens": 1,
+    "total_tokens": 28,
+    "cost": 1.32e-05,
+    "is_byok": false,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "cache_write_tokens": 0,
+      "audio_tokens": 0,
+      "video_tokens": 0
+    },
+    "cost_details": {
+      "upstream_inference_cost": 1.32e-05,
+      "upstream_inference_prompt_cost": 1.188e-05,
+      "upstream_inference_completions_cost": 1.32e-06
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 0,
+      "image_tokens": 0,
+      "audio_tokens": 0
+    }
+  },
+  "finish_reason": "stop",
+  "message": {
+    "role": "assistant",
+    "content": ");",
+    "refusal": null,
+    "reasoning": null
+  },
+  "logits_available": false,
+  "logprobs_available": false,
+  "steps": []
+}

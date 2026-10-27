@@ -1,0 +1,3 @@
+# Why mmap Page Residency Can Differ from Virtual Address Space Size
+
+When you `mmap()` a region, the kernel reserves that many bytes in your

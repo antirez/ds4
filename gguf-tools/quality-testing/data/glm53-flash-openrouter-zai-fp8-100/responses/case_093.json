@@ -1,0 +1,46 @@
+{
+  "id": "gen-1787762394-Tsnw38Orw6A7P3PlEBrB",
+  "object": "chat.completion",
+  "created": 1787762394,
+  "model": "z-ai/glm-5.3-flash",
+  "provider": "Z.AI",
+  "system_fingerprint": null,
+  "service_tier": null,
+  "choices": [
+    {
+      "index": 0,
+      "logprobs": null,
+      "finish_reason": "length",
+      "native_finish_reason": "length",
+      "message": {
+        "role": "assistant",
+        "content": "# Why the Page Cache Speeds Up Second Reads\n\n## The Basic Idea\n\nThe **page cache** is an in-memory cache maintained by the operating system that stores recently accessed file data in RAM. When a file is read, its contents are copied from disk into memory pages; subsequent reads of the same data can be served directly from RAM.\n\n## First Read (Slow)\n\n1. Application calls `read()`.\n2. The OS checks the page cache — miss.\n3. Data must be fetched from disk:\n   - Disk seek/rotation latency (HDDs: milliseconds)\n   - Or flash access latency (SSDs:",
+        "refusal": null,
+        "reasoning": null
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 26,
+    "completion_tokens": 128,
+    "total_tokens": 154,
+    "cost": 3.395e-05,
+    "is_byok": false,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "cache_write_tokens": 0,
+      "audio_tokens": 0,
+      "video_tokens": 0
+    },
+    "cost_details": {
+      "upstream_inference_cost": 3.395e-05,
+      "upstream_inference_prompt_cost": 1.95e-06,
+      "upstream_inference_completions_cost": 3.2e-05
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 0,
+      "image_tokens": 0,
+      "audio_tokens": 0
+    }
+  }
+}

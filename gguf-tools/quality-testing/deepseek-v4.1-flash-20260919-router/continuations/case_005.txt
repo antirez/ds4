@@ -1,0 +1,3 @@
+# Atomic File Replacement with Rollback Safety
+
+The classic pattern is **write to a temp file, fsync, then `rename()` over the original**. `rename()` is atomic on POSIX systems — the old file is either fully replaced or untouched, never half-written. For rollback safety on *write* failure

@@ -1,0 +1,3 @@
+In realtà, c'è un malinteso fondamentale nella premessa della tua domanda: **il prefill non è più veloce del decode per singolo token**. Anzi, il contrario è vero.
+
+Tuttavia, la confusione nasce spesso dal confronto tra **throughput totale** (token al secondo) e

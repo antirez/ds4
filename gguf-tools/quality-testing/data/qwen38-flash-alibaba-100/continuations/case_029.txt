@@ -1,0 +1,1 @@
+Comparing two model quantizations (e.g., INT8 vs. FP16, or different calibration methods for the same bit-width) requires a multi-dimensional evaluation framework. Relying on a single metric (like top-1 accuracy) is insufficient because quantization can introduce subtle biases, latency trade-offs, and

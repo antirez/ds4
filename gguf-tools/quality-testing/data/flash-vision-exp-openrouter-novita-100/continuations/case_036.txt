@@ -1,0 +1,8 @@
+Ecco un piano breve e strutturato per testare il chunking di prompt lunghi:
+
+---
+
+## Piano di Test per Chunking di Prompt Lunghi
+
+### 1. **Obiettivo**
+Verificare che il sistema gestisca correttamente prompt oltre il limite di token, suddividend

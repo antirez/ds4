@@ -1,0 +1,1 @@
+Speculative decoding preserves exact greedy output by using a **draft model to propose candidate tokens quickly**, while a **target

@@ -6,6 +6,7 @@
 #include <hipcub/hipcub.hpp>
 #include <rocwmma/rocwmma-version.hpp>
 #include <rocwmma/rocwmma.hpp>
+#include "ds4_rocm_memory.h"
 
 #define cudaError_t hipError_t
 #define cudaStream_t hipStream_t
@@ -30,9 +31,9 @@
 #define cudaFuncSetAttribute(func, attr, value) hipFuncSetAttribute((const void *)(func), (attr), (value))
 #define cudaMemLocationTypeDevice hipMemLocationTypeDevice
 
-#define cudaMalloc hipMalloc
-#define cudaMallocHost hipHostMalloc
-#define cudaMallocManaged hipMallocManaged
+#define cudaMalloc ds4_rocm_malloc
+#define cudaMallocHost ds4_rocm_malloc_host
+#define cudaMallocManaged ds4_rocm_malloc_managed
 #define cudaFree hipFree
 #define cudaFreeHost hipFreeHost
 #define cudaMemset hipMemset
@@ -41,7 +42,7 @@
 #define cudaMemcpyHostToDevice hipMemcpyHostToDevice
 #define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
 #define cudaMemcpyDeviceToDevice hipMemcpyDeviceToDevice
-#define cudaMemGetInfo hipMemGetInfo
+#define cudaMemGetInfo ds4_rocm_mem_get_info
 #define cudaMemsetAsync hipMemsetAsync
 
 #define cudaHostRegister hipHostRegister
@@ -138,5 +139,10 @@ extern "C" __device__ __attribute__((pure))  float __ocml_log1p_f32(float);
 extern "C" __device__ __attribute__((const)) float __ocml_sqrt_f32(float);
 
 static __device__ __forceinline__ float ds4_precise_expf(float x)   { return __ocml_exp_f32(x); }
-static __device__ __forceinline__ float ds4_precise_log1pf(float x) { return __ocml_log1p_f32(x); }
+static __device__ __forceinline__ float ds4_precise_log1pf(float x) {
+    /* OCML's unsafe-math mode can reduce log1p(x) to log(1+x), losing
+     * small router probabilities. The cubic's relative error here is < 2^-31. */
+    if (fabsf(x) < 0x1p-10f) return x * (1.0f - x * (0.5f - x / 3.0f));
+    return __ocml_log1p_f32(x);
+}
 static __device__ __forceinline__ float ds4_precise_sqrtf(float x)  { return __ocml_sqrt_f32(x); }

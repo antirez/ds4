@@ -1,0 +1,1 @@
+An integer leaves remainder 2 when divided by 5 and remainder 1 when divided by 3. Find the smallest positive example and verify it.

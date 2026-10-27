@@ -1,0 +1,15 @@
+# Latency vs. Throughput
+
+These are two fundamental performance metrics that are often confused but measure very different things.
+
+## Latency
+**The time it takes to complete a single operation** — how long you wait for a response.
+
+- Measured in units of time (milliseconds, seconds)
+- Answers: *"How fast is one request?"*
+- Example: If a website takes 200ms to load after you click, the latency is 200ms.
+
+## Throughput
+**The amount of work completed per unit of time** — total capacity.
+
+- Measured in operations/second, requests/second, GB/s

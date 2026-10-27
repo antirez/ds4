@@ -1,0 +1,46 @@
+{
+  "id": "gen-1788193390-hs8QxST5TLiRpUaj8m5Y",
+  "object": "chat.completion",
+  "created": 1788193390,
+  "model": "deepseek/deepseek-v4-flash-vision-exp",
+  "provider": "Novita",
+  "system_fingerprint": "aa8d6caccae4a22492bb51091cfc8eab",
+  "service_tier": null,
+  "choices": [
+    {
+      "index": 0,
+      "logprobs": null,
+      "finish_reason": "stop",
+      "native_finish_reason": "stop",
+      "message": {
+        "role": "assistant",
+        "content": "Il vantaggio principale della cache è **la velocità**: riduce i tempi di accesso ai dati, evitando di doverli recuperare ogni volta dalla memoria principale o dal disco.",
+        "refusal": null,
+        "reasoning": null
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 16,
+    "completion_tokens": 40,
+    "total_tokens": 56,
+    "cost": 5.984e-05,
+    "is_byok": false,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "cache_write_tokens": 0,
+      "audio_tokens": 0,
+      "video_tokens": 0
+    },
+    "cost_details": {
+      "upstream_inference_cost": 5.984e-05,
+      "upstream_inference_prompt_cost": 7.04e-06,
+      "upstream_inference_completions_cost": 5.28e-05
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 0,
+      "image_tokens": 0,
+      "audio_tokens": 0
+    }
+  }
+}

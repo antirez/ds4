@@ -1,0 +1,1 @@
+At a high level, both mutexes and atomic counters are used to prevent data races in concurrent programming, but they

@@ -1,0 +1,1 @@
+La premessa della tua domanda contiene un'assunzione tecnica che va corretta: **un grande buffer Metal non è intrinsecamente "peggiore" delle viste sovrapposte (overlapping views)**. In realtà, in molti casi, l'uso di un singolo buffer Metal ben gestito è *super

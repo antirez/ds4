@@ -1,0 +1,1 @@
+Checksums catch accidental corruption because they rely on the mathematical principle that any change to a data set—even a single flipped bit—will almost certainly alter the resulting calculated value. When a file is created or transmitted, a checksum algorithm (like CRC or MD5) processes the data to produce a fixed-size "

@@ -1,0 +1,4 @@
+Here's a brief plan for testing long-context prompt chunking.
+
+## Objective
+Verify that chunking a long input preserves answer quality, stays within context limits

@@ -1,0 +1,1 @@
+Show a minimal example where deleting items from a list while iterating skips an item, then fix it.

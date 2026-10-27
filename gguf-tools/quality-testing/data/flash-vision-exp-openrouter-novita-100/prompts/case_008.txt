@@ -1,0 +1,1 @@
+Explain why a GPU prefill path can be faster than single-token decode.

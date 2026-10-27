@@ -1,0 +1,3 @@
+**Translation:** "Quantization reduces memory but can alter the logits."
+
+A slightly more natural phrasing might be: "Quantization saves memory but may distort the logits."

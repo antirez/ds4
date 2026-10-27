@@ -1,0 +1,6 @@
+Per calcolare l'orario di arrivo, bisogna sommare la durata del viaggio all'orario di partenza.
+
+**Passaggio 1: sommare le ore**
+- Partenza: 18:47
+- Durata: 2 ore e 38 minuti
+- Aggiung

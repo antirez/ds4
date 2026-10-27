@@ -1,0 +1,1 @@
+La decodifica speculativa mantiene l'output esatto perché **non decide mai al posto del modello principale**: usa un modello draft solo per *

@@ -1,0 +1,9 @@
+# Checking if Two Fractions Are Equal (Without Decimals)
+
+The key idea is **cross-multiplication**.
+
+## The Rule
+
+For two fractions $\frac{a}{b}$ and $\frac{c}{d}$ (with $b \neq 0$ and $d \neq 0$):
+
+$$\frac{a}{b

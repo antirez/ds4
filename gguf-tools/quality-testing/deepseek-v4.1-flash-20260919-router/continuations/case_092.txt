@@ -1,0 +1,3 @@
+# Distinguishing a Performance Regression from Thermal Throttling
+
+The core problem: both manifest as "the same workload now runs slower." The difference is *why* — code/config changed (regression) vs. the hardware couldn't sustain its clock (throttling). You can usually separate them with a few

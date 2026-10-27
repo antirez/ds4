@@ -1,0 +1,1 @@
+Certamente! Ti spiego la **softmax** nel contesto dell'attenzione (come nei Transformer) in

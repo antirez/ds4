@@ -1,0 +1,7 @@
+Ti spiego la **softmax nell'attenzione** usando un esempio concreto e variabili semplici. 
+
+Immagina di dover leggere una frase e decidere **quanto è importante ogni parola** per capire il significato della parola corrente.
+
+---
+
+### 1. Le vari

@@ -1,0 +1,1 @@
+A rectangle has perimeter 34 and width 5. Find its area and show the steps.

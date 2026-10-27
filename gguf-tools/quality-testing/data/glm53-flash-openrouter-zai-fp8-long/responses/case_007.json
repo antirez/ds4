@@ -1,0 +1,54 @@
+{
+  "id": "gen-1788630710-k3uTxjloRgHCmvPNsYoo",
+  "object": "chat.completion",
+  "created": 1788630710,
+  "model": "z-ai/glm-5.3-flash",
+  "provider": "Z.AI",
+  "system_fingerprint": null,
+  "service_tier": null,
+  "choices": [
+    {
+      "index": 0,
+      "logprobs": null,
+      "finish_reason": "length",
+      "native_finish_reason": "length",
+      "message": {
+        "role": "assistant",
+        "content": "## Short answer\n\nThe excerpt **doesn't actually contain the code paths that run when a connection drops** — it's mostly constants, wire-format structs, state",
+        "refusal": null,
+        "reasoning": "The excerpt doesn't show connection-close handling logic in detail — mostly just declarations. We must answer based only on the excerpt: we can point to what's visible: recv error codes DS4_DIST_RECV_TRANSPORT_ERROR/REMOTE_ERROR, forwarder \"closing\" flag, job queue \"closed\"/\"canceled\"/rc, dist_sleep_reconnect, write_full returning errors, etc. But actual handling bodies aren't shown. So explain what can be inferred and acknowledge limits.",
+        "reasoning_details": [
+          {
+            "type": "reasoning.text",
+            "text": "The excerpt doesn't show connection-close handling logic in detail — mostly just declarations. We must answer based only on the excerpt: we can point to what's visible: recv error codes DS4_DIST_RECV_TRANSPORT_ERROR/REMOTE_ERROR, forwarder \"closing\" flag, job queue \"closed\"/\"canceled\"/rc, dist_sleep_reconnect, write_full returning errors, etc. But actual handling bodies aren't shown. So explain what can be inferred and acknowledge limits.",
+            "format": "unknown",
+            "index": 0
+          }
+        ]
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 6402,
+    "completion_tokens": 128,
+    "total_tokens": 6530,
+    "cost": 0.00032783,
+    "is_byok": false,
+    "prompt_tokens_details": {
+      "cached_tokens": 3072,
+      "cache_write_tokens": 0,
+      "audio_tokens": 0,
+      "video_tokens": 0
+    },
+    "cost_details": {
+      "upstream_inference_cost": 0.00032783,
+      "upstream_inference_prompt_cost": 0.00029583,
+      "upstream_inference_completions_cost": 3.2e-05
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 95,
+      "image_tokens": 0,
+      "audio_tokens": 0
+    }
+  }
+}

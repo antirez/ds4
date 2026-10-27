@@ -1,0 +1,6 @@
+# Why `i <= length` Is Usually a Bug
+
+Array indices in most programming languages (C, C++, Java, JavaScript, Python, Go, Rust, etc.) start at **0**, not 1. So a valid index range for an array of length `N` is:
+
+```
+0, 1

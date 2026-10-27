@@ -1,0 +1,10 @@
+# The Bug: Integer Underflow
+
+This is a classic **unsigned integer underflow** bug.
+
+## What happens
+
+`n` is declared as `unsigned` and initialized to `0`. In the expression `n - 1`:
+
+1. `n` is `0` (unsigned)
+2. `

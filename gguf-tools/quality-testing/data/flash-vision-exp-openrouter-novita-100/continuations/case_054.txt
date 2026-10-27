@@ -1,0 +1,7 @@
+Per testare che un `mmap` su file non venga rimappato ripetutamente, puoi utilizzare diverse tecniche. Ecco le principali strategie:
+
+## 1. **Monitoraggio con `/proc/self/maps`**
+
+```c
+#include <stdio.h>
+#include

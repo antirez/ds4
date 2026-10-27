@@ -1,0 +1,4 @@
+Here's a short C function that clamps an integer to a range:
+
+```c
+int clamp(int value, int

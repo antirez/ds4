@@ -1,0 +1,6 @@
+KV cache checkpointing helps agentic sessions primarily by **reducing latency, saving computational resources, and enabling efficient state management** in long-running, multi-step AI workflows.
+
+Here’s a detailed breakdown of why it is critical for agents:
+
+### 1. What is the KV Cache?
+In transformer-based

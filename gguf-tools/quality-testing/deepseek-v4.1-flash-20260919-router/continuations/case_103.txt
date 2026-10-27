@@ -1,0 +1,7 @@
+Based only on the archive records:
+
+- Record 17: owner R323, bin 629
+- Record 128: owner R438, bin 772
+- Record 253: owner R819, bin 442
+
+I located each by matching the record number directly to the corresponding line in the archive, then

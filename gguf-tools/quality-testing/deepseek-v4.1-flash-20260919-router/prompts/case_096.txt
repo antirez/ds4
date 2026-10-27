@@ -1,0 +1,1 @@
+Write a Python function rotating a sequence to the right by k positions, handling negative k and empty input.

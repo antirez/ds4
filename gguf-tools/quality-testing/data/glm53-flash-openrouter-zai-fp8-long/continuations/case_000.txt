@@ -1,0 +1,10 @@
+# Storage and Retrieval in ds4_kvstore.c
+
+## What the excerpt shows
+
+The file implements a **shared-disk KV checkpoint store**: a directory containing files named `<40-hex-sha>.kv`, each wrapping a serialized session payload ("graph payload") in a versioned "KVC" envelope.
+
+### Writing (storing) entries
+
+- An in-memory **entry array** (`kc->entry`, with `len`/`cap`) tracks known checkpoint files. `kv_cache_push()` appends an entry, doubling capacity as needed (a classic dynamic array, start cap 16).
+- Paths are built

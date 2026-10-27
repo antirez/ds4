@@ -1,0 +1,5 @@
+Ecco una checklist concisa per la revisione della gestione della memoria (lifetime) in una Pull Request, focalizzata principalmente su linguaggi con ownership esplicita come **Rust**, ma applicabile anche a C++ o altri contesti:
+
+### ✅ Checklist di Revisione Lifetime & Ownership
+
+1. **

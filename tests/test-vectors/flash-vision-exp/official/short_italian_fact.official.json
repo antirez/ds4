@@ -1,0 +1,61 @@
+{
+  "schema": "ds4-openrouter-continuation-v1",
+  "source": "openrouter",
+  "model": "deepseek/deepseek-v4-flash-vision-exp",
+  "endpoint": "https://openrouter.ai/api/v1/chat/completions",
+  "created_at": "2026-08-31T16:15:46Z",
+  "id": "short_italian_fact",
+  "kind": "short",
+  "prompt": "Rispondi in italiano con una frase: chi era Ada Lovelace?",
+  "request": {
+    "model": "deepseek/deepseek-v4-flash-vision-exp",
+    "temperature": 0,
+    "token_limit_field": "max_tokens",
+    "max_tokens": 32,
+    "logprobs": true,
+    "top_logprobs": 20,
+    "messages": [
+      {
+        "role": "user",
+        "content": "Rispondi in italiano con una frase: chi era Ada Lovelace?"
+      }
+    ],
+    "reasoning": {
+      "effort": "none"
+    }
+  },
+  "provider": "Novita",
+  "usage": {
+    "prompt_tokens": 21,
+    "completion_tokens": 32,
+    "total_tokens": 53,
+    "cost": 5.148e-05,
+    "is_byok": false,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "cache_write_tokens": 0,
+      "audio_tokens": 0,
+      "video_tokens": 0
+    },
+    "cost_details": {
+      "upstream_inference_cost": 5.148e-05,
+      "upstream_inference_prompt_cost": 9.24e-06,
+      "upstream_inference_completions_cost": 4.224e-05
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 0,
+      "image_tokens": 0,
+      "audio_tokens": 0
+    }
+  },
+  "finish_reason": "length",
+  "message": {
+    "role": "assistant",
+    "content": "Ada Lovelace è stata una matematica e scrittrice inglese dell'Ottocento, considerata la prima programmatrice della storia per aver",
+    "refusal": null,
+    "reasoning": null
+  },
+  "logits_available": false,
+  "logprobs_available": false,
+  "steps": []
+}

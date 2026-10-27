@@ -1,0 +1,10 @@
+# Checklist: Validating Instruction-Following in Quantized Models
+
+## 1. Setup & Baseline
+- [ ] Run the original (unquantized) model on the same test set to establish a baseline
+- [ ] Use identical prompts, sampling parameters (temperature, top-p, max tokens), and system prompts for both models
+- [ ] Fix random seeds where possible for reproducibility
+- [ ] Record model versions, quantization method (e.g., GPTQ, AWQ, GGUF Q4/Q8), and hardware
+
+## 2. Core Instruction Compliance
+- [ ] **Format

@@ -1,0 +1,1 @@
+Explain how a database transaction can prevent a lost update when two clients increment the same counter.

@@ -1,0 +1,7 @@
+# Perché raggruppare gli esperti MoE può accelerare il prefill
+
+## Contesto: il problema del prefill nei modelli MoE
+
+Durante il **prefill** (l'elaborazione dell'intero prompt in parallelo), un modello Mixture-of-Experts deve processare migliaia di token contemporaneamente. Ogni token viene instradato a pochi esperti (top-k), ma con batch grandi **tutti o quasi tutti gli esperti vengono attivati** per ogni layer. Questo crea due problemi:
+
+1. **Comunicazione massiva**: nell'

@@ -1,0 +1,1 @@
+Write Python code to compute the running mean of numbers without retaining the entire input.

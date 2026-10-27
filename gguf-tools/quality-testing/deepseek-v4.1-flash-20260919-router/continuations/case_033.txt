@@ -1,0 +1,9 @@
+# Bounded Work Queue vs. Thread-Per-Request
+
+These are two different concurrency strategies for handling incoming work, and they trade off differently across throughput, latency, resource usage, and failure modes.
+
+## Thread-per-request
+
+Each incoming request spawns a new thread that runs to completion, then dies.
+
+```

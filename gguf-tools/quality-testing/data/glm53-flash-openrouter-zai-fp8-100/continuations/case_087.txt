@@ -1,0 +1,9 @@
+# Three Useful Server Metrics
+
+1. **CPU Utilization** – Measures how much of the processor's capacity is being used. Sustained high CPU usage can indicate insufficient resources, inefficient code, or unexpected traffic spikes.
+
+2. **Memory Usage** – Tracks how much RAM is consumed versus available. Running low on memory can cause slowdowns or crashes, and may signal memory leaks in applications.
+
+3. **Disk I/O / Disk Space** – Monitors read/write activity and remaining storage. Full disks can cause service failures, while heavy I/O can reveal performance bottlenecks.
+
+Other valuable metrics include network latency, request rates

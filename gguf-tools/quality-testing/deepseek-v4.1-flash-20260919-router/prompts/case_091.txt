@@ -1,0 +1,1 @@
+Describe a simple way to test whether cancellation releases a worker and its memory.

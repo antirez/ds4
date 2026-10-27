@@ -1,0 +1,12 @@
+Let’s examine the sequence:
+
+**2, 6, 12, 20, 30**
+
+---
+
+### Step 1 – Differences
+First, look at the differences between terms:
+
+- 6 − 2 = 4  
+- 12 − 6 = 6  
+- 20 − 

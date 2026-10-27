@@ -1,0 +1,11 @@
+# Latenza vs Throughput
+
+Sono due metriche fondamentali per misurare le prestazioni di sistemi (reti, database, CPU, ecc.), ma misurano cose molto diverse.
+
+## Latenza
+
+È il **tempo** necessario per completare una singola operazione, dal momento in cui la richiesta parte a quando arriva la risposta.
+
+- **Unità di misura**: millisecondi (ms), microsecondi (µs)
+- **Esempio**: un ping verso un server che impiega 30 ms ha una latenza di 30 ms
+- Risponde alla domanda: *"

@@ -3,6 +3,25 @@
 // Included from ds4_cuda.cu before more specialized modules; these helpers are
 // intentionally kept static in the single translation unit.
 
+static int ds4_rocm_is_gfx1151(void) {
+    static int cached = -1;
+    if (cached >= 0) return cached;
+    int dev = 0;
+    cudaDeviceProp prop;
+    cached = cudaGetDevice(&dev) == cudaSuccess &&
+             cudaGetDeviceProperties(&prop, dev) == cudaSuccess &&
+             strncmp(prop.gcnArchName, "gfx1151", 7) == 0 &&
+             (prop.gcnArchName[7] == '\0' || prop.gcnArchName[7] == ':');
+    return cached;
+}
+
+/* The tuned paths are the production default on gfx1151. Setting an
+ * individual selector to 0 keeps a simple fallback/debug escape hatch. */
+static int ds4_rocm_gfx1151_flag(const char *name) {
+    const char *env = getenv(name);
+    return env ? env[0] != '0' : ds4_rocm_is_gfx1151();
+}
+
 __global__ static void fill_f32_kernel(float *x, uint64_t n, float v) {
     uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] = v;

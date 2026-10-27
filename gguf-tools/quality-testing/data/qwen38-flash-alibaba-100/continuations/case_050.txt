@@ -1,0 +1,4 @@
+Ecco cinque misure iniziali da adottare per diagnosticare e mitigare la lentezza del decode in contesti lunghi:
+
+1. **Verificare l’uso della KV Cache (Key-Value Cache)**  
+   Assicurarsi che la cache delle chiavi e dei valori sia abilitata e correttamente configurata

@@ -1,0 +1,5 @@
+An absent result in a small experiment does not prove an effect is impossible because **“not detected” is not the same as “not there.”** A small study mainly limits your ability to detect an effect; it does not establish that the effect is truly zero.
+
+Here are the main reasons:
+
+1. **Low statistical

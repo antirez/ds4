@@ -14,8 +14,12 @@
 #include "common.cuh"
 #include "mmq.cuh"
 
+#if defined(GGML_USE_HIP)
+#include "vendors/hip.h"
+#else
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#endif
 
 #include <climits>
 #include <cstddef>

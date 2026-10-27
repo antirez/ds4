@@ -1,0 +1,5 @@
+La decodifica speculativa (Speculative Decoding) mantiene l'output esatto grazie a un meccanismo di **verifica rigorosa** che garantisce la distribuzione di probabilità identica a quella del modello target originale.
+
+Ecco il riassunto dei principi chiave:
+
+### 1. Il Principio Fond

@@ -1,0 +1,3 @@
+Validating that a quantized model (e.g., INT8, FP16, or mixed-precision) still follows instructions is critical because quantization can introduce subtle numerical errors that degrade reasoning capabilities, instruction adherence, and output quality.
+
+Here’s a comprehensive checklist for validating instruction-following in quantized models:

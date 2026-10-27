@@ -1,0 +1,10 @@
+Ecco un esempio classico e conciso di **race condition** in C, utilizzando due thread che incrementano una variabile condivisa senza protezione.
+
+### Esempio di Race Condition
+
+```c
+#include <stdio.h>
+#include <pthread.h>
+#include <unistd.h>
+
+int shared_counter =

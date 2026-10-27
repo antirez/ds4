@@ -1,0 +1,12 @@
+# Eventual Consistency in Distributed Databases
+
+**Eventual consistency** is a consistency model where, after an update is made, the system guarantees that all replicas will *eventually* converge to the same value — but there's no guarantee they'll be consistent immediately.
+
+## How It Works
+
+In distributed databases, data is often replicated across multiple nodes for availability and fault tolerance. With eventual consistency:
+
+1. A write goes to one node (or a subset of nodes)
+2. The update propagates to other replicas asynchronously
+3. During propagation, different nodes may return **different values** for the same key
+4.

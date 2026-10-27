@@ -1,0 +1,16 @@
+# Testing a Command-Line Parser with Edge Cases
+
+## 1. Identify What to Test
+
+A CLI parser typically handles: flags, options with values, positional arguments, delimiters, and error reporting. Test each dimension systematically.
+
+## 2. Core Edge Case Categories
+
+### Empty & Missing Input
+- No arguments at all
+- Flag without its required value: `--verbose` when it expects `--verbose <level>`
+- Only whitespace or empty strings: `""`, `"   "`
+
+### Value Handling
+- Values containing spaces: `--name "John Doe"`
+- Empty string values: `--name ""`

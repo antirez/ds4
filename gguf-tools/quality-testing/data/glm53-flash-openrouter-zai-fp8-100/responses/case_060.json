@@ -1,0 +1,46 @@
+{
+  "id": "gen-1787762277-Zs2KhMmVD1IvoGuaMz3Q",
+  "object": "chat.completion",
+  "created": 1787762277,
+  "model": "z-ai/glm-5.3-flash",
+  "provider": "Z.AI",
+  "system_fingerprint": null,
+  "service_tier": null,
+  "choices": [
+    {
+      "index": 0,
+      "logprobs": null,
+      "finish_reason": "length",
+      "native_finish_reason": "length",
+      "message": {
+        "role": "assistant",
+        "content": "```python\ndef median3(a, b, c):\n    return sorted((a, b, c))[1]\n```\n\nExample:\n\n```python\nprint(median3(5, 1, 9))  # 5\n```\n\nIf you'd like a version without sorting (slightly faster, using comparisons only):\n\n```python\ndef median3(a, b, c):\n    if (a <= b <= c) or (c <= b <= a):\n        return b\n    elif (b <= a <= c) or (c <= a <= b):\n        return a\n    return c\n```",
+        "refusal": null,
+        "reasoning": null
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 25,
+    "completion_tokens": 128,
+    "total_tokens": 153,
+    "cost": 3.3875e-05,
+    "is_byok": false,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "cache_write_tokens": 0,
+      "audio_tokens": 0,
+      "video_tokens": 0
+    },
+    "cost_details": {
+      "upstream_inference_cost": 3.3875e-05,
+      "upstream_inference_prompt_cost": 1.875e-06,
+      "upstream_inference_completions_cost": 3.2e-05
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 0,
+      "image_tokens": 0,
+      "audio_tokens": 0
+    }
+  }
+}

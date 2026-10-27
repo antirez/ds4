@@ -1,0 +1,1 @@
+A TCP server must preserve a partially written reply when a client reads slowly because TCP provides a reliable, ordered byte stream with flow control, and the server’s write operation may only accept part of the data if the client’s receive window is full. If the server discards or overwrites the unsent portion instead

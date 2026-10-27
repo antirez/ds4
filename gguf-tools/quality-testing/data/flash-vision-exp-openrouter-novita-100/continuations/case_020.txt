@@ -1,0 +1,9 @@
+Here's how binary search finds the insertion point in a sorted array:
+
+## The Core Idea
+
+Binary search for insertion point finds the **leftmost position** where a target value can be inserted while maintaining sorted order. This is essentially finding the **lower bound** of the target value.
+
+## The Algorithm
+
+Given a sorted

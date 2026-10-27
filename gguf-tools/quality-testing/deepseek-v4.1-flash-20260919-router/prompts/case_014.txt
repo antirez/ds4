@@ -1,0 +1,1 @@
+Explain how a condition variable should be used with a predicate and a mutex.

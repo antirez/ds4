@@ -1,0 +1,5 @@
+Online Softmax is a technique used in attention mechanisms (like FlashAttention) to compute the softmax function **without needing to see all the values at once**. This allows for memory-efficient and faster computation, especially when dealing with long sequences.
+
+Here’s an explanation using simple variables:
+
+### The Problem with Standard Softmax

@@ -1,0 +1,5 @@
+# Perché `O_APPEND` non rende atomiche le operazioni composte
+
+## Cosa garantisce realmente `O_APPEND`
+
+Quando apri un file con `O_APPEND` (o `"a"` in Python/C), il kernel garantisce **una sola cosa**:

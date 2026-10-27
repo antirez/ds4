@@ -1,0 +1,1 @@
+At a high level, **latency** is about *time*, while **throughput** is about *volume*.

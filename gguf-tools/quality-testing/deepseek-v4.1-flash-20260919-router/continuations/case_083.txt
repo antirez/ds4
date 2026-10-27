@@ -1,0 +1,5 @@
+# Why LRU Performs Poorly on Large Sequential Scans
+
+## The Core Problem
+
+An LRU cache evicts the **least recently used** item when it needs space. This policy assumes that items not accessed recently are unlikely to be accessed soon. Large sequential scans violate this assumption in a way that po

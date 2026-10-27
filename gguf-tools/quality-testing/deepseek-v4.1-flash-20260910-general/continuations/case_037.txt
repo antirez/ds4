@@ -1,0 +1,3 @@
+# Matrice di importanza nella quantizzazione low-bit
+
+Nella **quantizzazione low-bit** (riduzione dei pesi/attivazioni di una

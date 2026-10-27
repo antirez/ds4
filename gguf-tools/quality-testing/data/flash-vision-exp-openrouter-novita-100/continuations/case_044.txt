@@ -1,0 +1,7 @@
+To test that a file-backed mmap is not repeatedly remapped, you need to verify that the kernel is reusing the same virtual address mapping rather than creating new mappings each time. Here are several approaches:
+
+## 1. **Address Stability Test**
+
+```c
+#include <stdio.h>
+#include <stdlib.h>

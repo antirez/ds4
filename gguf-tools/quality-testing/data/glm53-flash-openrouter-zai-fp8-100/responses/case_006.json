@@ -1,0 +1,46 @@
+{
+  "id": "gen-1787762081-42mHpEtVxge8qBUSjS90",
+  "object": "chat.completion",
+  "created": 1787762081,
+  "model": "z-ai/glm-5.3-flash",
+  "provider": "Z.AI",
+  "system_fingerprint": null,
+  "service_tier": null,
+  "choices": [
+    {
+      "index": 0,
+      "logprobs": null,
+      "finish_reason": "length",
+      "native_finish_reason": "length",
+      "message": {
+        "role": "assistant",
+        "content": "# Top-p (Nucleus) Sampling vs. Temperature Zero (Greedy) Decoding\n\n## Temperature Zero (Greedy Decoding)\n\n**How it works:** Always selects the highest-probability token at each step.\n\n**Pros:**\n- **Deterministic and reproducible** — same input always yields the same output, which is valuable for debugging, testing, and production consistency\n- **Maximizes per-token likelihood** — each step picks the locally most probable continuation\n- **Fast to reason about** — no hyperparameter tuning needed\n\n**Cons:**\n- **Repetition loops** — greedy decoding notoriously gets",
+        "refusal": null,
+        "reasoning": null
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 26,
+    "completion_tokens": 128,
+    "total_tokens": 154,
+    "cost": 3.395e-05,
+    "is_byok": false,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "cache_write_tokens": 0,
+      "audio_tokens": 0,
+      "video_tokens": 0
+    },
+    "cost_details": {
+      "upstream_inference_cost": 3.395e-05,
+      "upstream_inference_prompt_cost": 1.95e-06,
+      "upstream_inference_completions_cost": 3.2e-05
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 0,
+      "image_tokens": 0,
+      "audio_tokens": 0
+    }
+  }
+}

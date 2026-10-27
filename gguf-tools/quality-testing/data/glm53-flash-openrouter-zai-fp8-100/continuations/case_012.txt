@@ -1,0 +1,12 @@
+# mmap dei pesi vs copia completa su macOS
+
+## Come funziona `mmap`
+
+Con memory-mapped file, i pesi del modello non vengono caricati subito in RAM: il file viene mappato nello spazio di indirizzi virtuale e le pagine vengono caricate **lazy** dal disco solo quando effettivamente lette (page fault).
+
+```python
+import mmap
+
+with open("model.safetensors", "rb") as f:
+    mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+    # nessun caricamento finché non si

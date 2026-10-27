@@ -1,0 +1,18 @@
+# Tries: Representing Sets of Strings
+
+A **trie** (prefix tree) is a tree data structure where each path from the root to a node represents a prefix of stored strings. Each edge is labeled with a character.
+
+## Structure
+
+- The **root** represents the empty string
+- Each node has children, one per possible next character
+- Strings are typically marked with a special flag (e.g., `is_end_of_word`) at their final node
+
+## Example
+
+Storing the set `{cat, car, card, dog}`:
+
+```
+        (root)
+        /    \
+       c      d

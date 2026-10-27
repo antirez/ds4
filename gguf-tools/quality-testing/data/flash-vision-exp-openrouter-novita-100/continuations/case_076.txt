@@ -1,0 +1,9 @@
+Ecco una guida completa per testare un parser da riga di comando con casi limite:
+
+## 1. **Test di Base (Happy Path)**
+
+### Input Validi Standard
+```python
+# Test con input normali
+parser.parse_args(["--input", "file.txt", "--verbose"])
+parser

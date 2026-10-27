@@ -1,0 +1,19 @@
+Let's go step-by-step.
+
+We have:
+
+- 3 red balls
+- 2 blue balls
+
+Total balls = 5.
+
+We draw two balls **without replacement**.
+
+---
+
+**Step 1: Probability that the first ball is red.**
+
+There are 3 red out of 5 total:
+
+\[
+P

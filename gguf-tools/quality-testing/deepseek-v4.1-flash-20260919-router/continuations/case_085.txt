@@ -1,0 +1,9 @@
+# Rounding Intermediate vs. Final Results
+
+## The Core Distinction
+
+**Round only at the end:** You keep full precision through every calculation step, then round once when you report the answer.
+
+**Round intermediates:** You round after each operation along the way, then use those rounded values in subsequent calculations.
+
+## A

@@ -1,0 +1,1 @@
+Small differences in logits can change a greedy continuation because **greedy decoding only looks at the argmax**, not at the margin. If two tokens have

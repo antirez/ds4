@@ -1,0 +1,5 @@
+# Why One Large Metal Buffer Can Be Worse Than Multiple Overlapping Views
+
+## The Core Issue: Memory Coherency and Cache Behavior
+
+At first glance, a single large buffer seems simpler — one allocation, one binding point. But in practice, **multiple overlapping views** (or separate buffers) often outperform a

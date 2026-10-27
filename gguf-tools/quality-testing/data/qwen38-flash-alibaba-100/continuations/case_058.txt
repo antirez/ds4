@@ -1,0 +1,3 @@
+Ecco una checklist strutturata per validare che un modello quantizzato (es. INT8, INT4, FP16) mantenga la capacità di seguire le istruzioni (Instruction Following), confrontandolo con il modello originale non quantizzato o con un benchmark standard.
+
+### 📋 Checklist di Validazione:

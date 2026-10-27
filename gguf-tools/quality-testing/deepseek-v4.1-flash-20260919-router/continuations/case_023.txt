@@ -1,0 +1,6 @@
+# Terminating a Process vs. Reaping a Child Process
+
+These are two distinct operations in Unix/Linux process management, often confused because they both deal with process lifecycle. The key difference: **termination ends a running process; reaping cleans up a process that has already ended.**
+
+## Terminating a Process
+

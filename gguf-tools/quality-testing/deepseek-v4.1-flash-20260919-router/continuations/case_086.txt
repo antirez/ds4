@@ -1,0 +1,5 @@
+# Testing Parsers Against Truncated Messages Deterministically
+
+Random truncation tests are flaky: they fail inconsistently, hide the actual bug behind a stack trace, and don't tell you *which* prefixes matter. Here's how to make truncation testing deterministic and useful.
+
+## 1. Enumerate Every

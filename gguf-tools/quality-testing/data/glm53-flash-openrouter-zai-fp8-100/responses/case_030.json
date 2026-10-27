@@ -1,0 +1,46 @@
+{
+  "id": "gen-1787762168-ToBL3SLOgvV5dK06l6XP",
+  "object": "chat.completion",
+  "created": 1787762168,
+  "model": "z-ai/glm-5.3-flash",
+  "provider": "Z.AI",
+  "system_fingerprint": null,
+  "service_tier": null,
+  "choices": [
+    {
+      "index": 0,
+      "logprobs": null,
+      "finish_reason": "length",
+      "native_finish_reason": "length",
+      "message": {
+        "role": "assistant",
+        "content": "# Ricerca Binaria del Punto di Inserimento\n\n## Concetto\n\nLa **ricerca binaria del punto di inserimento** (binary search for insertion point) serve a trovare la posizione in cui un elemento dovrebbe essere inserito in una lista ordinata, mantenendo l'ordinamento. È alla base di algoritmi come l'**insertion sort ottimizzato** e di funzioni come `bisect` in Python.\n\n## Idea\n\nCome nella ricerca binaria classica, si sfrutta l'ordinamento:\n- Si confronta il valore cercato con l'elemento centrale.\n",
+        "refusal": null,
+        "reasoning": null
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 30,
+    "completion_tokens": 128,
+    "total_tokens": 158,
+    "cost": 3.425e-05,
+    "is_byok": false,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "cache_write_tokens": 0,
+      "audio_tokens": 0,
+      "video_tokens": 0
+    },
+    "cost_details": {
+      "upstream_inference_cost": 3.425e-05,
+      "upstream_inference_prompt_cost": 2.25e-06,
+      "upstream_inference_completions_cost": 3.2e-05
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 0,
+      "image_tokens": 0,
+      "audio_tokens": 0
+    }
+  }
+}

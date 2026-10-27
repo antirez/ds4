@@ -1,0 +1,7 @@
+# Distinguishing Content-Length vs. Connection-Close Framing
+
+An HTTP client determines message boundaries using rules defined in RFC 7230 (and now RFC 9112). These rules are applied in a strict precedence order.
+
+## The Framing Decision Order
+
+When reading a response body, the client checks these

@@ -1,0 +1,21 @@
+```python
+def median3(a, b, c):
+    return sorted((a, b, c))[1]
+```
+
+Example:
+
+```python
+print(median3(5, 1, 9))  # 5
+```
+
+If you'd like a version without sorting (slightly faster, using comparisons only):
+
+```python
+def median3(a, b, c):
+    if (a <= b <= c) or (c <= b <= a):
+        return b
+    elif (b <= a <= c) or (c <= a <= b):
+        return a
+    return c
+```

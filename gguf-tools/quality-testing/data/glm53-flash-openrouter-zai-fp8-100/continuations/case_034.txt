@@ -1,0 +1,12 @@
+# Formato sicuro per l'header di un checkpoint modello
+
+## Struttura consigliata
+
+Un approccio robusto è un **header binario con magic number, versione e metadati firmati**, seguito dal payload dei pesi.
+
+```
+┌─────────────────────────────┐
+│ Magic number (4-8 byte)     │  es. "MCKP" — identifica il formato
+│ Versione formato (uint32)   │  per compatibilità futura
+│ Lunghezza header (uint64)   │
+│ Hash del payload (SHA-256)  │

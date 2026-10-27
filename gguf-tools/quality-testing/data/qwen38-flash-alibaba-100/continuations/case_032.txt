@@ -1,0 +1,5 @@
+La differenza fondamentale tra un **mutex** e un **contatore atomico** risiede nel loro scopo, nella granularità dell'operazione che proteggono e nel meccanismo con cui garantiscono la sicurezza in ambienti multi-thread.
+
+Ecco una spiegazione dettagliata:
+
+### 1. Contatore Atomico

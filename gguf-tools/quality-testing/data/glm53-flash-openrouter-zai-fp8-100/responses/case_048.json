@@ -1,0 +1,46 @@
+{
+  "id": "gen-1787762235-G7DyK7tgGleOC5aHwgTq",
+  "object": "chat.completion",
+  "created": 1787762235,
+  "model": "z-ai/glm-5.3-flash",
+  "provider": "Z.AI",
+  "system_fingerprint": null,
+  "service_tier": null,
+  "choices": [
+    {
+      "index": 0,
+      "logprobs": null,
+      "finish_reason": "length",
+      "native_finish_reason": "length",
+      "message": {
+        "role": "assistant",
+        "content": "# Checklist: Validating Instruction-Following in Quantized Models\n\n## 1. Setup & Baseline\n- [ ] Run the original (unquantized) model on the same test set to establish a baseline\n- [ ] Use identical prompts, sampling parameters (temperature, top-p, max tokens), and system prompts for both models\n- [ ] Fix random seeds where possible for reproducibility\n- [ ] Record model versions, quantization method (e.g., GPTQ, AWQ, GGUF Q4/Q8), and hardware\n\n## 2. Core Instruction Compliance\n- [ ] **Format",
+        "refusal": null,
+        "reasoning": null
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 26,
+    "completion_tokens": 128,
+    "total_tokens": 154,
+    "cost": 3.395e-05,
+    "is_byok": false,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "cache_write_tokens": 0,
+      "audio_tokens": 0,
+      "video_tokens": 0
+    },
+    "cost_details": {
+      "upstream_inference_cost": 3.395e-05,
+      "upstream_inference_prompt_cost": 1.95e-06,
+      "upstream_inference_completions_cost": 3.2e-05
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 0,
+      "image_tokens": 0,
+      "audio_tokens": 0
+    }
+  }
+}

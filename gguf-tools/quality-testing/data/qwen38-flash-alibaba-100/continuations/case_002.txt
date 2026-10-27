@@ -1,0 +1,5 @@
+Comparing **memory-mapped (mmaped) model weights** versus **copying all weights into private buffers** on macOS involves trade-offs between memory efficiency, startup latency, runtime performance, and system resource management. Below is a detailed comparison across key dimensions:
+
+---
+
+### 1. **Memory Usage**

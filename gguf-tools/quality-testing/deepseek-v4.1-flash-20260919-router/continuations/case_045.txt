@@ -1,0 +1,6 @@
+Here’s a clear way to see the difference using divisibility by 4.
+
+## Key idea
+
+- A **necessary condition** is something that *must* be true for the statement to hold, but it may not be enough by itself.
+- A **sufficient condition** is something that *guarante

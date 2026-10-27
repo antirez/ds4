@@ -1,0 +1,5 @@
+# Why Blindly Retrying a Timed-Out Payment Can Double-Charge a Customer
+
+The core problem is that **a timeout tells you nothing about what actually happened on the other side.** It only tells you that *you* stopped waiting. The payment may have:
+
+1. **Failed** — never processed (

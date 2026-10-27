@@ -1,0 +1,7 @@
+# P(E|H) vs. P(H|E) — The Inverse Probability Distinction
+
+This is one of the most consequential distinctions in probability and statistics, often summarized as "the prosecutor's fallacy" when confused.
+
+## The Two Quantities
+
+- **P(E | H)** — the *likelihood*

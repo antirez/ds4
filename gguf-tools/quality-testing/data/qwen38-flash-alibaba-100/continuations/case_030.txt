@@ -1,0 +1,1 @@
+La **ricerca binaria del punto di inserimento** (spesso implementata come `bisect_left` o `bisect_right` in Python, o `lower_bound`/`upper_bound` in C++) è un algoritmo che determina l'indice corretto per inserire un nuovo elemento in una lista ordin

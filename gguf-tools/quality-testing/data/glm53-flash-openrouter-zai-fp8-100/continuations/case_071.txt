@@ -1,0 +1,11 @@
+# Perché gli array ordinati rendono più veloce la ricerca
+
+## Il problema: ricerca in un array non ordinato
+
+In un array **non ordinato**, per sapere se un elemento esiste devi controllare ogni elemento uno per uno, perché potrebbe trovarsi ovunque:
+
+```
+[7, 2, 9, 4, 1] → cerco il 9 → devo guardare 1°, 2°, 3° elemento
+```
+
+Nel caso peggiore (elemento assente o all'ultimo posto) devi scorrere **tutti

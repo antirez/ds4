@@ -1,0 +1,3 @@
+To test that a file-backed `mmap` is not repeatedly remapped (i.e., to ensure the mapping persists and isn't being torn down/recreated, which would cause performance issues or data loss), you can use several approaches depending on your specific concern.
+
+## Key Concerns with Repeated Remapping

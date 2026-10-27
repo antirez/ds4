@@ -1,0 +1,8 @@
+Ecco uno schema JSON minimo per una tool call, basato sul formato standard (come quello utilizzato da OpenAI e altri LLM):
+
+```json
+{
+  "name": "nome_della_tool",
+  "arguments": {
+    "parametro1": "valore1",
+    "

@@ -3,7 +3,11 @@
 
 #pragma once
 
+#if defined(GGML_USE_HIP)
+#include "vendors/hip.h"
+#else
 #include <cuda_runtime.h>
+#endif
 
 #include <stddef.h>
 #include <stdint.h>

@@ -1,0 +1,1 @@
+Spiega la differenza tra mutex e contatore atomico.

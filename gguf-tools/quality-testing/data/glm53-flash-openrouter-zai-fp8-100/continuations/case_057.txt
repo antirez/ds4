@@ -1,0 +1,11 @@
+# Differenza tra righe KV raw e righe KV compresse
+
+## Righe KV raw (grezze)
+
+Le righe KV **raw** sono coppie chiave-valore memorizzate nel loro formato originale, senza alcuna trasformazione:
+
+- **Chiave**: la chiave così com'è stata definita
+- **Valore**: il valore completo e non elaborato
+- **Dimensione**: corrisponde alla dimensione effettiva dei dati originali
+- **Accesso**: lettura/scrittura diretta senza overhead di elaborazione
+- **Uso tipico

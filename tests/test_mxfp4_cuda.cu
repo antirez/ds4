@@ -71,21 +71,27 @@ bool close_enough(const std::vector<float> &got,
                   const std::vector<float> &expected,
                   float abs_tol,
                   float rel_tol,
-                  const char *label) {
+                  const char *label,
+                  double rms_tol = 0.0) {
     float worst = 0.0f;
     size_t worst_i = 0;
     int failures = 0;
+    double error2 = 0, reference2 = 0;
     for (size_t i = 0; i < got.size(); i++) {
         const float diff = std::fabs(got[i] - expected[i]);
         const float limit = abs_tol + rel_tol * std::fabs(expected[i]);
+        error2 += (double)diff * diff;
+        reference2 += (double)expected[i] * expected[i];
         if (diff > worst) {
             worst = diff;
             worst_i = i;
         }
         if (!std::isfinite(got[i]) || diff > limit) failures++;
     }
-    std::fprintf(stderr, "%s: max_abs=%g at=%zu failures=%d/%zu: %s\n",
-                 label, worst, worst_i, failures, got.size(),
+    const double relative_rms = std::sqrt(error2 / std::max(reference2, 1e-30));
+    if (rms_tol > 0 && (!std::isfinite(relative_rms) || relative_rms > rms_tol)) failures++;
+    std::fprintf(stderr, "%s: max_abs=%g at=%zu relative_rms=%g failures=%d/%zu: %s\n",
+                 label, worst, worst_i, relative_rms, failures, got.size(),
                  failures == 0 ? "PASS" : "FAIL");
     if (failures != 0) {
         const size_t shown = std::min<size_t>(got.size(), 8);
@@ -97,23 +103,14 @@ bool close_enough(const std::vector<float> &got,
     return failures == 0;
 }
 
-bool test_dense_and_moe() {
-    constexpr int M = 64;
-    constexpr int N = 4;
-    constexpr int K = 512;
-    constexpr int n_tokens = 4;
+bool test_dense_and_moe(int M, int N, int K) {
+    const int n_tokens = N;
     constexpr int n_experts = 8;
     constexpr int n_used = 6;
     std::mt19937 rng(0x4d584650u);
     std::uniform_real_distribution<float> activation(-1.0f, 1.0f);
-    cudaDeviceProp device = {};
-    if (!cuda_ok(cudaGetDeviceProperties(&device, 0),
-                 "read CUDA device properties")) {
-        return false;
-    }
-    const bool native_fp4 = device.major >= 12;
-    const float mmq_abs_tol = native_fp4 ? 8.0f : 1.0f;
-    const float mmq_rel_tol = native_fp4 ? 0.08f : 0.02f;
+    const float mmq_abs_tol = 1.0f, mmq_rel_tol = 0.02f;
+    std::fprintf(stderr, "MXFP4 shape M=%d N=%d K=%d\n", M, N, K);
 
     std::vector<block_mxfp4_test> dense_blocks((size_t)M * K / QK);
     fill_blocks(dense_blocks, rng);
@@ -160,19 +157,11 @@ bool test_dense_and_moe() {
     cudaMemcpyAsync(dense_got.data(), d_out,
                     dense_got.size() * sizeof(float),
                     cudaMemcpyDeviceToHost, stream);
-    cudaStreamSynchronize(stream);
+    if (!cuda_ok(cudaStreamSynchronize(stream), "dense MMQ")) return false;
     const bool dense_ok = rc == 0 &&
         close_enough(dense_got, dense_ref, mmq_abs_tol, mmq_rel_tol,
-                     "MXFP4 dense MMQ");
+                     "MXFP4 dense MMQ", 0.01);
     bool ok = dense_ok;
-    if (native_fp4) {
-        const int guard_rc = ds4_mmq_mxfp4_dense(
-            d_weights, d_x, d_out, M, N, K / 2, stream);
-        const bool guard_ok = guard_rc != 0;
-        std::fprintf(stderr, "MXFP4 Blackwell K-tile guard: %s\n",
-                     guard_ok ? "PASS" : "FAIL");
-        ok = ok && guard_ok;
-    }
     cudaFree(d_weights);
     cudaFree(d_x);
     cudaFree(d_out);
@@ -195,7 +184,7 @@ bool test_dense_and_moe() {
     std::vector<int32_t> ids((size_t)n_tokens * n_used);
     for (int token = 0; token < n_tokens; token++) {
         for (int slot = 0; slot < n_used; slot++) {
-            ids[(size_t)token * n_used + slot] = (token + slot) % n_experts;
+            ids[(size_t)token * n_used + slot] = (token + slot + 2) % n_experts;
         }
     }
     std::vector<float> moe_ref((size_t)n_tokens * n_used * M, 0.0f);
@@ -230,10 +219,10 @@ bool test_dense_and_moe() {
     std::vector<float> moe_got(moe_ref.size());
     cudaMemcpyAsync(moe_got.data(), d_out, moe_got.size() * sizeof(float),
                     cudaMemcpyDeviceToHost, stream);
-    cudaStreamSynchronize(stream);
+    if (!cuda_ok(cudaStreamSynchronize(stream), "routed MMQ")) return false;
     const bool moe_mmq_ok = rc == 0 &&
         close_enough(moe_got, moe_ref, mmq_abs_tol, mmq_rel_tol,
-                     "MXFP4 routed MMQ");
+                     "MXFP4 routed MMQ", 0.01);
     ok = ok && moe_mmq_ok;
 
     rc = ds4_mmq_mxfp4_moe_vec(d_weights, d_x, d_ids, d_out,
@@ -242,7 +231,7 @@ bool test_dense_and_moe() {
     cudaMemcpyAsync(moe_vec_got.data(), d_out,
                     moe_vec_got.size() * sizeof(float),
                     cudaMemcpyDeviceToHost, stream);
-    cudaStreamSynchronize(stream);
+    if (!cuda_ok(cudaStreamSynchronize(stream), "routed MMVQ")) return false;
     const bool moe_vec_ok = rc == 0 &&
         close_enough(moe_vec_got, moe_ref, 1.0f, 0.02f,
                      "MXFP4 routed MMVQ");
@@ -325,7 +314,7 @@ bool test_fused_decode() {
                     up_out.size() * sizeof(float), cudaMemcpyDeviceToHost, stream);
     cudaMemcpyAsync(mid.data(), d_mid,
                     mid.size() * sizeof(float), cudaMemcpyDeviceToHost, stream);
-    cudaStreamSynchronize(stream);
+    if (!cuda_ok(cudaStreamSynchronize(stream), "fused gate/up")) return false;
     std::vector<float> mid_ref(mid.size());
     for (int slot = 0; slot < n_used; slot++) {
         for (int row = 0; row < mid_dim; row++) {
@@ -350,7 +339,7 @@ bool test_fused_decode() {
                     cudaMemcpyDeviceToHost, stream);
     cudaMemcpyAsync(out.data(), d_out, out.size() * sizeof(float),
                     cudaMemcpyDeviceToHost, stream);
-    cudaStreamSynchronize(stream);
+    if (!cuda_ok(cudaStreamSynchronize(stream), "fused down")) return false;
     std::vector<float> out_ref(out_dim, 0.0f);
     for (int slot = 0; slot < n_used; slot++) {
         for (int row = 0; row < out_dim; row++) {
@@ -383,7 +372,13 @@ int main() {
         std::fprintf(stderr, "ds4_mmq_init failed\n");
         return 1;
     }
-    const bool matrix_ok = test_dense_and_moe();
+    bool matrix_ok = true;
+    const int shapes[][3] = {{64, 4, 512}, {63, 1, 256}, {65, 6, 768},
+                             {17, 129, 512}, {64, 6, 4096}, {17, 2048, 256},
+                             {192, 9, 768}, {4160, 1, 256}};
+    for (const auto &shape : shapes) {
+        matrix_ok = test_dense_and_moe(shape[0], shape[1], shape[2]) && matrix_ok;
+    }
     const bool decode_ok = test_fused_decode();
     const bool ok = matrix_ok && decode_ok;
     std::fprintf(stderr, "MXFP4 CUDA parity: %s\n", ok ? "PASS" : "FAIL");

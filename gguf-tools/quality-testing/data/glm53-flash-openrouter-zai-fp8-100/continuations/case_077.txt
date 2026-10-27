@@ -1,0 +1,7 @@
+# Residenza delle pagine mmap vs dimensione virtuale
+
+La **dimensione virtuale** di una mappatura mmap e la memoria effettivamente **residente** (in RAM) possono differire notevolmente per diversi motivi:
+
+## 1. Allocazione pigra (lazy allocation)
+
+Quando chiami `mmap()`, il kernel **non alloca fisicamente la memoria subito**. Crea solo le strutture dati del VMA (Virtual Memory Area) e aggiorna la tabella delle pagine virtuali del processo. Le pagine fisiche vengono allocate solo al momento

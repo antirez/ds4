@@ -1,0 +1,3 @@
+Questa è una domanda fondamentale nel campo dell'ingegneria dei prompt (prompt engineering) e dello sviluppo di applicazioni basate su Large Language Models (LLM).
+
+**Top-p (Nucleus Sampling)** e **Temperatura 0 (Greedy Decoding)** sono due strategie diverse per selezionare il token

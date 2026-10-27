@@ -1,0 +1,5 @@
+Sorted arrays make membership tests faster with binary search because they allow the algorithm to **eliminate half of the remaining search space** at each step, reducing the time complexity from linear $O(n)$ to logarithmic $O(\log n)$.
+
+Here is a detailed explanation of why this works:
+
+### 1

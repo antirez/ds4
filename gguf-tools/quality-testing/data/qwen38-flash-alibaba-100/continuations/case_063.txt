@@ -1,0 +1,7 @@
+Here is a short, classic example of a race condition in C using two threads incrementing a shared counter.
+
+### The Problem
+The operation `counter++` is **not atomic**. It consists of three steps:
+1. Read the value from memory.
+2. Increment the value.
+3. Write

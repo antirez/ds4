@@ -1,0 +1,11 @@
+# Confidence Interval, Plain and Simple
+
+A confidence interval is a **range of values that likely contains the true answer** you're trying to estimate.
+
+## An Example
+
+Imagine you want to know the average height of all adults in your country. You can't measure everyone, so you measure a sample of 1,000 people. Your sample average might be 5'7" (170 cm).
+
+But you know your sample isn't perfect—it's just one group out of millions. So instead of saying "the average is exactly 170 cm," you say:
+
+> "The average is probably somewhere between 168 cm and 

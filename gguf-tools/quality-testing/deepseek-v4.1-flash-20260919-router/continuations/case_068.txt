@@ -1,0 +1,4 @@
+# Organizzare una coda con priorità alle richieste più vecchie
+
+Per dare precedenza alle richieste più vecchie si usa una politica **FIFO** (First In, First Out), eventualmente combinata con meccanismi di priorità. Ecco come strutturarla.
+

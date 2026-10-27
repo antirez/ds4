@@ -1,0 +1,3 @@
+Un **ring buffer** (o buffer circolare) è una struttura dati fondamentale in informatica, particolarmente utile nei sistemi embedded, nell'elaborazione di segnali audio/video e nella comunicazione tra processi.
+
+Ecco una spiegazione dettagliata del suo funzionamento e delle strategie per gestire le sovrascritture.

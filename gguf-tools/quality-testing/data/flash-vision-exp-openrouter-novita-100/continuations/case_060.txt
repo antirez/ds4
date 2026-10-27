@@ -1,0 +1,8 @@
+Here's a tiny Python function that returns the median of three numbers:
+
+```python
+def median_of_three(a, b, c):
+    return a + b + c - min(a, b, c) - max(a, b, c)
+```
+
+This works because the median is the middle value, and by

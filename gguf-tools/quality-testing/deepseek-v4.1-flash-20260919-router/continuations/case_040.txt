@@ -1,0 +1,11 @@
+Alright, let's go step-by-step.
+
+---
+
+**Step 1: Understand the problem**  
+We toss a fair coin 4 times. We want the probability of getting exactly 3 heads.
+
+A fair coin means:
+
+\[
+P(H) = \frac{1}{2}, \quad P(T) =

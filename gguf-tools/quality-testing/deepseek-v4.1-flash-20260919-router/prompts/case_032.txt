@@ -1,0 +1,1 @@
+Write a small C loop that frees every element of a linked list without reading freed memory.

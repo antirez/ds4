@@ -1,0 +1,3 @@
+La cache KV (Key-Value) su disco è una tecnica di ottimizzazione fondamentale per le **sessioni agentiche** (agent-based sessions), dove un modello linguistico (LLM) deve mantenere uno stato coerente attraverso molti passaggi, chiamate a strumenti e interazioni con l'ambiente esterno.
+
+E
