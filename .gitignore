@@ -31,6 +31,7 @@
 /tests/test_metal_ssd_experts
 /tests/test_metal_command_memory
 /tests/test_metal_dense_mpp
+/tests/test_kv_frontier_state
 /tests/test_mxfp4_cuda
 /tests/test_mmvq_cuda
 /tests/test_mmvq_rocm

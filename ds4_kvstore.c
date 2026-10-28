@@ -28,8 +28,11 @@
 #define KV_CACHE_VERSION 1u
 /* Header byte 20 carries the graph-payload ABI.  It is separate from the outer
  * file version because the KVC envelope can remain stable while the serialized
- * ds4_session internals become unsafe to restore across runtime changes. */
-#define KV_CACHE_PAYLOAD_ABI 2u
+ * ds4_session internals become unsafe to restore across runtime changes.
+ * Bumped to 3 for compressor frontier-state occupancy serialization: single-lane
+ * layers (ratio != 0 && != 4) now write a u32 partial count + only the occupied
+ * rows of the in-progress compressor block instead of the full-capacity buffer. */
+#define KV_CACHE_PAYLOAD_ABI 3u
 #define KV_CACHE_DEFAULT_MIN_TOKENS 512
 #define KV_CACHE_DEFAULT_COLD_MAX_TOKENS 30000
 /* Tokenizers may merge text across the prompt boundary. Trimming a small tail

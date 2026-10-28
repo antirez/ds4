@@ -4639,13 +4639,13 @@ static bool dist_kv_layer_tensor_bytes(
             !dist_u64_mul(tmp, sizeof(float), &tmp) ||
             !dist_u64_add(&bytes, tmp))
             return false;
-        bool ok = true;
-        const uint64_t attn_state = dist_kv_state_bytes(ratio, layout->head_dim, &ok);
-        if (!ok ||
-            !dist_u64_add(&bytes, attn_state) ||
-            !dist_u64_add(&bytes, attn_state))
-            return false;
         if (ratio == 4u) {
+            bool ok = true;
+            const uint64_t attn_state = dist_kv_state_bytes(ratio, layout->head_dim, &ok);
+            if (!ok ||
+                !dist_u64_add(&bytes, attn_state) ||
+                !dist_u64_add(&bytes, attn_state))
+                return false;
             if (!dist_u64_mul(n_index_comp, layout->indexer_head_dim, &tmp) ||
                 !dist_u64_mul(tmp, sizeof(float), &tmp) ||
                 !dist_u64_add(&bytes, tmp))
@@ -4655,6 +4655,18 @@ static bool dist_kv_layer_tensor_bytes(
             if (!ok ||
                 !dist_u64_add(&bytes, index_state) ||
                 !dist_u64_add(&bytes, index_state))
+                return false;
+        } else {
+            /* Single-lane compressor layers serialize only the occupied
+             * partial = token_count % ratio rows of the in-progress block,
+             * prefixed by one u32 count covering both kv and score.  Mirrors
+             * the per-layer layout math in ds4_session_save/load_layer_payload. */
+            const uint32_t partial = layout->token_count % ratio;
+            if (!dist_u64_mul(partial, layout->head_dim, &tmp) ||
+                !dist_u64_mul(tmp, sizeof(float), &tmp) ||
+                !dist_u64_add(&bytes, tmp) ||
+                !dist_u64_add(&bytes, tmp) ||
+                !dist_u64_add(&bytes, sizeof(uint32_t)))
                 return false;
         }
     }
