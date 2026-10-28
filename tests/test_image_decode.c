@@ -45,5 +45,17 @@ int main(void) {
                     64u, 48u,
                     "d3be4d7078c41b6589942c82bd622ca8a3ed40adddee11cccf1de9ca1a096ba4"))
         return 1;
+    /* 40x24 JPEGs sampled 1x1,2x2,1x1: luma below Cb, so the Y plane is
+     * 24x16 while the image is 40x24. Unpatched conversion reads Y past the
+     * end of its plane; patched decode upsamples it and matches libjpeg-turbo
+     * djpeg bit-exactly, baseline and progressive alike. */
+    if (!check_jpeg("tests/vision-fixtures/jpeg/base_luma_subsampled.jpg",
+                    40u, 24u,
+                    "bca52b9d8e46d760e9d66c852030e5635a6c5c6b8ce63562638c44fde9a1da37"))
+        return 1;
+    if (!check_jpeg("tests/vision-fixtures/jpeg/prog_luma_subsampled.jpg",
+                    40u, 24u,
+                    "bca52b9d8e46d760e9d66c852030e5635a6c5c6b8ce63562638c44fde9a1da37"))
+        return 1;
     return 0;
 }

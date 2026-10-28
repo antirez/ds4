@@ -651,7 +651,10 @@ static void jpeg_ycbcr_to_rgb(uint8_t y, uint8_t cb, uint8_t cr, uint8_t *rgb) {
 
 /* DS4: interpolate common subsampled chroma at pixel centers, matching the
  * triangle filter used by libjpeg/Pillow. Clamp to the real component extent,
- * not its padded MCU storage. Unusual sampling ratios retain replication. */
+ * not its padded MCU storage. Unusual sampling ratios retain replication.
+ * Luma goes through here too when a frame gives Y lower sampling factors than
+ * Cb or Cr: then its plane is smaller than the image. Full-resolution luma,
+ * the usual layout, keeps the direct read in the callers. */
 static uint8_t jpeg_sample_chroma(const jpeg_decoder *dec, int component,
                                   const uint8_t *plane, int stride, int x, int y) {
     const int hs = dec->comp[component].h_samp;
@@ -1477,9 +1480,12 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
                         }
                     }
                 } else {
+                    const int y_full = dec.comp[0].h_samp == dec.max_h_samp &&
+                                       dec.comp[0].v_samp == dec.max_v_samp;
                     for (int y = 0; y < dec.height; y++) {
                         for (int x = 0; x < dec.width; x++) {
-                            uint8_t yy = y_data[y * y_stride + x];
+                            uint8_t yy = y_full ? y_data[y * y_stride + x]
+                                                : jpeg_sample_chroma(&dec, 0, y_data, y_stride, x, y);
                             uint8_t cb = jpeg_sample_chroma(&dec, 1, cb_data, cb_stride, x, y);
                             uint8_t cr = jpeg_sample_chroma(&dec, 2, cr_data, cr_stride, x, y);
 
@@ -1532,9 +1538,12 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
                 }
             }
         } else {
+            const int y_full = dec.comp[0].h_samp == dec.max_h_samp &&
+                               dec.comp[0].v_samp == dec.max_v_samp;
             for (int y = 0; y < dec.height; y++) {
                 for (int x = 0; x < dec.width; x++) {
-                    uint8_t yy = planes[0][y * strides[0] + x];
+                    uint8_t yy = y_full ? planes[0][y * strides[0] + x]
+                                        : jpeg_sample_chroma(&dec, 0, planes[0], strides[0], x, y);
                     uint8_t cb = jpeg_sample_chroma(&dec, 1, planes[1], strides[1], x, y);
                     uint8_t cr = jpeg_sample_chroma(&dec, 2, planes[2], strides[2], x, y);
 
