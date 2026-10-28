@@ -2065,6 +2065,18 @@ static bool parse_openai_content(const char **p, chat_msg *msg) {
     return true;
 }
 
+/* A must-echo client replays an assistant turn that produced no reasoning as a
+ * single space, because the hosted API rejects an empty string.  A
+ * whitespace-only body is not reasoning: rendering it emits a token between the
+ * think markers that the model never sampled, so the replayed prompt no longer
+ * re-tokenises to the cached prefix and the whole conversation is re-prefilled. */
+static bool text_is_blank(const char *s) {
+    if (!s) return true;
+    for (; *s; s++)
+        if (!isspace((unsigned char)*s)) return false;
+    return true;
+}
+
 static bool parse_messages(const char **p, chat_msgs *msgs) {
     json_ws(p);
     if (**p != '[') return false;
@@ -2102,6 +2114,10 @@ static bool parse_messages(const char **p, chat_msgs *msgs) {
                 if (!json_content_replace(p, &msg.reasoning)) {
                     free(key);
                     goto fail;
+                }
+                if (text_is_blank(msg.reasoning)) {
+                    free(msg.reasoning);
+                    msg.reasoning = NULL;
                 }
             } else if (!strcmp(key, "tool_call_id")) {
                 char *id = NULL;
@@ -18289,6 +18305,44 @@ static void test_render_think_max_prompt_prefix(void) {
     chat_msgs_free(&msgs);
 }
 
+/* A must-echo client replays an assistant turn that produced no reasoning as a
+ * single space, because the hosted API rejects an empty string.  A
+ * whitespace-only body is not reasoning: rendering it puts a token between
+ * <think> and </think> that the model never sampled, so the replayed prompt no
+ * longer tokenises to the cached prefix and the whole conversation is
+ * re-prefilled.  Render a blank body exactly like an absent one.
+ */
+static void test_render_blank_reasoning_is_absent(void) {
+    const char *pad_json =
+        "[{\"role\":\"user\",\"content\":\"Hello\"},"
+        "{\"role\":\"assistant\",\"content\":\"\",\"reasoning_content\":\" \","
+        "\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\","
+        "\"function\":{\"name\":\"run\",\"arguments\":\"{}\"}}]}]";
+    const char *none_json =
+        "[{\"role\":\"user\",\"content\":\"Hello\"},"
+        "{\"role\":\"assistant\",\"content\":\"\","
+        "\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\","
+        "\"function\":{\"name\":\"run\",\"arguments\":\"{}\"}}]}]";
+
+    chat_msgs pad = {0}, none = {0};
+    const char *p1 = pad_json, *p2 = none_json;
+    TEST_ASSERT(parse_messages(&p1, &pad));
+    TEST_ASSERT(parse_messages(&p2, &none));
+
+    char *a = render_chat_prompt_text_for_syntax(SERVER_MODEL_SYNTAX_DEEPSEEK41,
+                                                &pad, NULL, NULL, DS4_THINK_MEDIUM);
+    char *b = render_chat_prompt_text_for_syntax(SERVER_MODEL_SYNTAX_DEEPSEEK41,
+                                                &none, NULL, NULL, DS4_THINK_MEDIUM);
+    TEST_ASSERT(a != NULL);
+    TEST_ASSERT(b != NULL);
+    TEST_ASSERT(strcmp(a, b) == 0);
+
+    free(a);
+    free(b);
+    chat_msgs_free(&pad);
+    chat_msgs_free(&none);
+}
+
 static void test_render_non_thinking_prompt_closes_think(void) {
     chat_msgs msgs = {0};
     chat_msg user = {0};
@@ -22954,6 +23008,7 @@ static void ds4_server_unit_tests_run(void) {
     test_api_thinking_controls_parse();
     test_render_think_max_prompt_prefix();
     test_render_non_thinking_prompt_closes_think();
+    test_render_blank_reasoning_is_absent();
     test_render_drops_old_reasoning_without_tools();
     test_render_preserves_reasoning_with_tools();
     test_render_chat_prompt_text_renders_tools_before_system();
