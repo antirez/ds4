@@ -1028,8 +1028,9 @@ static int jpeg_decode_progressive_scan(jpeg_decoder *dec, int *scan_comps, int 
     }
     dec->eobrun = 0;
 
-    /* DC scans process all components interleaved, AC scans process one component */
-    if (dec->ss == 0) {
+    /* Interleaved scans (more than one component) can only be DC scans. A
+     * scan with one component is non-interleaved, DC or AC alike. */
+    if (dec->ss == 0 && num_scan_comps > 1) {
         /* DC scan - interleaved MCUs */
         for (int mcu_y = 0; mcu_y < dec->mcus_y; mcu_y++) {
             for (int mcu_x = 0; mcu_x < dec->mcus_x; mcu_x++) {
@@ -1073,7 +1074,8 @@ static int jpeg_decode_progressive_scan(jpeg_decoder *dec, int *scan_comps, int 
             }
         }
     } else {
-        /* AC scan - non-interleaved, single component.
+        /* Non-interleaved scan, single component: every AC scan, and a DC scan
+         * that carries one component (e.g. one DC scan per component).
          * Per JPEG spec section A.2.3, non-interleaved scans process data units
          * in raster order. For components with sampling factors > 1, the number
          * of data units is based on the COMPONENT dimensions (scaled from image
@@ -1115,7 +1117,13 @@ static int jpeg_decode_progressive_scan(jpeg_decoder *dec, int *scan_comps, int 
                 /* Map image-based block position to MCU-aligned storage index */
                 int16_t *coef = dec->comp[comp_idx].coefs + (by * store_blocks_x + bx) * 64;
 
-                if (dec->ah == 0) {
+                if (dec->ss == 0) {
+                    if (dec->ah == 0) {
+                        if (jpeg_prog_decode_dc_first(dec, comp_idx, coef) < 0) return -1;
+                    } else {
+                        if (jpeg_prog_decode_dc_refine(dec, coef) < 0) return -1;
+                    }
+                } else if (dec->ah == 0) {
                     if (jpeg_prog_decode_ac_first(dec, comp_idx, coef) < 0) return -1;
                 } else {
                     if (jpeg_prog_decode_ac_refine(dec, comp_idx, coef) < 0) return -1;
@@ -1245,6 +1253,13 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
                 if (dec.comp[i].h_samp == 0 || dec.comp[i].h_samp > 4) goto fail;
                 if (dec.comp[i].v_samp == 0 || dec.comp[i].v_samp > 4) goto fail;
                 if (dec.comp[i].qt_idx > 3) goto fail;
+
+                /* DS4: a single-component frame has only non-interleaved
+                 * scans, whose data units are single blocks in raster order
+                 * (T.81 A.2.2), so sampling factors other than 1x1 must not
+                 * group its blocks into MCUs. */
+                if (dec.num_components == 1)
+                    dec.comp[i].h_samp = dec.comp[i].v_samp = 1;
 
                 if (dec.comp[i].h_samp > dec.max_h_samp) dec.max_h_samp = dec.comp[i].h_samp;
                 if (dec.comp[i].v_samp > dec.max_v_samp) dec.max_v_samp = dec.comp[i].v_samp;

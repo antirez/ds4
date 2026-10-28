@@ -45,5 +45,21 @@ int main(void) {
                     64u, 48u,
                     "d3be4d7078c41b6589942c82bd622ca8a3ed40adddee11cccf1de9ca1a096ba4"))
         return 1;
+    /* 48x32 4:2:0 progressive JPEG with one DC scan per component, first
+     * and refinement. A one-component DC scan is non-interleaved: the 2x2
+     * luma blocks come in raster order, not grouped by MCU. Matches
+     * libjpeg-turbo djpeg bit-exactly. */
+    if (!check_jpeg("tests/vision-fixtures/jpeg/prog_dc_per_component_420.jpg",
+                    48u, 32u,
+                    "555e6729c69706675c9458c642627e0562533eb028b89dafdc233c97db8ea020"))
+        return 1;
+    /* 40x24 baseline grayscale JPEG whose only component declares 2x2
+     * sampling. Its scan is non-interleaved, so the blocks are in raster
+     * order. Unpatched jpeg_load returns NULL; patched decode matches
+     * libjpeg-turbo djpeg bit-exactly. */
+    if (!check_jpeg("tests/vision-fixtures/jpeg/base_gray_2x2.jpg",
+                    40u, 24u,
+                    "978d9ef28446264cf02e0b023ee4b921447d8b7d61e7cfc11a3f1fdf27a1eb0c"))
+        return 1;
     return 0;
 }
