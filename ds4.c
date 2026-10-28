@@ -61168,6 +61168,41 @@ typedef struct {
     uint8_t fingerprint[32];
 } ds4_vision_identity;
 
+/* Presence penalty state.
+ *
+ * OpenAI semantics: every token id that already appeared in the output this
+ * session is generating loses a flat amount from its logit before the
+ * temperature/top-k/top-p/min-p pipeline.  The set counts an id once however
+ * often it was emitted, which is what makes it a presence penalty rather than
+ * a frequency penalty.
+ *
+ * The history deliberately excludes the prompt: `from` is the checkpoint
+ * length when the request started, so the same request behaves the same
+ * whether its prefix came from a cache hit or a cold prefill, and a long
+ * system prompt cannot suppress its own vocabulary.  The checkpoint is the
+ * authoritative record of what was emitted, so the set is folded forward from
+ * it (`synced`) instead of being pushed to from every sampling site: rejected
+ * speculative drafts never reach the checkpoint and therefore never penalise
+ * anything.
+ *
+ * Applying edits the logit row in place and restores the saved values right
+ * after the pick, which costs O(seen) where a penalised copy of the row would
+ * cost O(vocab) per token.  No later reader (logprobs, MTP conditioning, KV
+ * payloads) ever observes a penalised logit. */
+typedef struct {
+    float penalty;    /* 0 disables every presence code path */
+    int from;         /* checkpoint index where this request's output starts */
+    int synced;       /* checkpoint prefix already folded into the set */
+    int n;            /* ids in the set */
+    int n_temp;       /* trailing ids added by the live apply, popped on restore */
+    uint32_t cap;     /* vocabulary the arrays below are sized for */
+    bool detached;    /* the checkpoint lost this request's prefix: stop folding */
+    uint8_t *flags;   /* membership by id, allocated when first enabled */
+    int *ids;         /* the seen ids, so applying is O(seen) */
+    float *saved;     /* logits saved by the live apply, parallel to ids */
+    float *applied;   /* row the live apply edited, NULL when none */
+} ds4_presence;
+
 struct ds4_session {
     ds4_engine *engine;
     ds4_dist_session *distributed;
@@ -61223,6 +61258,7 @@ struct ds4_session {
     ds4_kv_cache cpu_cache;
     ds4_cpu_decode_scratch cpu_scratch;
     token_vec checkpoint;
+    ds4_presence presence;
     ds4_vision_identity *checkpoint_images;
     size_t checkpoint_image_count;
     const ds4_vision_span *sync_images;
@@ -61282,6 +61318,134 @@ struct ds4_session {
 };
 
 static bool ds4_session_tp_leader(const ds4_session *s);
+
+/* Size the per-vocabulary tables.  Only a session that actually enables the
+ * penalty pays for them, so ordinary requests keep their old footprint. */
+static void presence_reserve(ds4_presence *p, uint32_t n_vocab) {
+    if (p->cap == n_vocab) return;
+    free(p->flags);
+    free(p->ids);
+    free(p->saved);
+    p->flags = xmalloc((size_t)n_vocab * sizeof(p->flags[0]));
+    p->ids = xmalloc((size_t)n_vocab * sizeof(p->ids[0]));
+    p->saved = xmalloc((size_t)n_vocab * sizeof(p->saved[0]));
+    p->cap = n_vocab;
+    memset(p->flags, 0, (size_t)n_vocab);
+    p->n = 0;
+}
+
+static void presence_free(ds4_presence *p) {
+    free(p->flags);
+    free(p->ids);
+    free(p->saved);
+    memset(p, 0, sizeof(*p));
+}
+
+static void presence_clear(ds4_presence *p, int from) {
+    if (p->flags) memset(p->flags, 0, p->cap);
+    p->n = 0;
+    p->n_temp = 0;
+    p->applied = NULL;
+    p->detached = false;
+    p->from = from;
+    p->synced = from;
+}
+
+static void presence_mark(ds4_presence *p, int id) {
+    if (id < 0 || (uint32_t)id >= p->cap || p->flags[id]) return;
+    p->flags[id] = 1;
+    p->ids[p->n++] = id;
+}
+
+static void presence_restore(ds4_presence *p) {
+    float *logits = p->applied;
+    if (!logits) return;
+    for (int i = 0; i < p->n; i++) logits[p->ids[i]] = p->saved[i];
+    while (p->n_temp > 0) {
+        p->flags[p->ids[--p->n]] = 0;
+        p->n_temp--;
+    }
+    p->applied = NULL;
+}
+
+/* Penalise a logit row in place.  `extra` carries ids a speculative cycle has
+ * already accepted but not yet committed to the checkpoint, because the row
+ * being verified is conditioned on them. */
+static bool presence_apply(ds4_presence *p, float *logits,
+                           const int *extra, int n_extra) {
+    if (!logits || !p->flags) return false;
+    presence_restore(p);
+    for (int i = 0; i < n_extra; i++) {
+        const int id = extra[i];
+        if (id < 0 || (uint32_t)id >= p->cap || p->flags[id]) continue;
+        presence_mark(p, id);
+        p->n_temp++;
+    }
+    for (int i = 0; i < p->n; i++) {
+        const int id = p->ids[i];
+        p->saved[i] = logits[id];
+        logits[id] -= p->penalty;
+    }
+    p->applied = logits;
+    return true;
+}
+
+/* True while this session must not accept a draft on the word of a verifier
+ * that cannot see the penalty. */
+static DS4_MAYBE_UNUSED bool presence_active(const ds4_session *s) {
+    return s && s->presence.penalty != 0.0f;
+}
+
+/* Fold everything generated since the request started into the set.  Normally
+ * this is the one token committed since the previous sampling site. */
+static void presence_sync(ds4_session *s) {
+    ds4_presence *p = &s->presence;
+    const int len = s->checkpoint.len;
+    if (p->detached) return;
+    if (len < p->from) {
+        /* The session dropped this request's prompt prefix (an invalidate, or
+         * a rewind into the prompt).  Ids already emitted still count, but the
+         * checkpoint can no longer tell prompt from output, so stop folding
+         * until the next request re-anchors the history. */
+        p->detached = true;
+        return;
+    }
+    if (len < p->synced) {
+        /* A rewind dropped committed output: rebuild the set from the
+         * boundary rather than keep ids the request no longer owns. */
+        presence_clear(p, p->from);
+    }
+    for (int i = p->synced; i < len; i++) presence_mark(p, s->checkpoint.v[i]);
+    p->synced = len;
+}
+
+/* Apply the request's presence penalty to `logits` and return true when the
+ * row was edited; the caller must pair it with ds4_session_presence_restore()
+ * before anything else reads the row. */
+static bool ds4_session_presence_apply(ds4_session *s, float *logits,
+                                       const int *extra, int n_extra) {
+    if (!s || s->presence.penalty == 0.0f) return false;
+    /* Restore before syncing: a rewind rebuilds the set, and the row of an
+     * unrestored apply could then never be put back. */
+    presence_restore(&s->presence);
+    presence_sync(s);
+    return presence_apply(&s->presence, logits, extra, n_extra);
+}
+
+static void ds4_session_presence_restore(ds4_session *s) {
+    if (s && s->presence.applied) presence_restore(&s->presence);
+}
+
+/* Penalised argmax: the greedy pick must come from the same row the sampled
+ * pick would see, or temperature 0 and temperature > 0 disagree about which
+ * tokens the penalty suppressed. */
+static int ds4_session_presence_argmax(ds4_session *s, float *logits,
+                                       const int *extra, int n_extra) {
+    const bool penalised = ds4_session_presence_apply(s, logits, extra, n_extra);
+    const int token = sample_argmax(logits, DS4_N_VOCAB);
+    if (penalised) ds4_session_presence_restore(s);
+    return token;
+}
 
 #ifndef DS4_NO_GPU
 static bool ds4_dspark_stats_enabled(void);
@@ -74769,6 +74933,7 @@ void ds4_session_free(ds4_session *s) {
 #endif
     token_vec_free(&s->checkpoint);
     token_vec_free(&s->greedy_splitkv_segment);
+    presence_free(&s->presence);
     free(s->checkpoint_images);
     free(s->logits);
     free(s->sample_probs);
@@ -75048,6 +75213,16 @@ static int glm_session_logits_argmax(const float *logits) {
     return best;
 }
 
+/* The GLM pick under the request's presence penalty.  `extra` carries the
+ * tokens this cycle has accepted but not yet pushed to the checkpoint. */
+static int glm_session_presence_argmax(ds4_session *s, float *logits,
+                                       const int *extra, int n_extra) {
+    const bool penalised = ds4_session_presence_apply(s, logits, extra, n_extra);
+    const int best = glm_session_logits_argmax(logits);
+    if (penalised) ds4_session_presence_restore(s);
+    return best;
+}
+
 static bool speculative_point_accept(float target_p, float draft_p,
                                      uint64_t *rng);
 static int speculative_point_replacement(ds4_session *s,
@@ -75103,7 +75278,7 @@ static int ds4_session_glm_spec_cycle_impl(
         const int rc = ds4_session_eval_internal(s, first_token, false, err, errlen);
         s->glm_spec_inside = 0;
         if (rc != 0) return -1;
-        const int n1 = glm_session_logits_argmax(s->logits);
+        const int n1 = glm_session_presence_argmax(s, s->logits, NULL, 0);
         if (s->glm_mtp_min_pos == 0 || s->glm_mtp_min_pos > pos) {
             s->glm_mtp_min_pos = pos;
         }
@@ -75236,18 +75411,25 @@ static int ds4_session_glm_spec_cycle_impl(
         s->checkpoint_valid = false;
         return -1;
     }
-    const int n1 = glm_session_logits_argmax(s->glm_mtp_logits0);
+    /* Row 0 predicts the token after first_token, which is committed only
+     * below, so the penalty for this row includes it explicitly. */
+    const int n1 = glm_session_presence_argmax(s, s->glm_mtp_logits0,
+                                               &first_token, 1);
     int replacement = -1;
     int accept = n1 == d;
     if (exact_sampling) {
-        if (!rng ||
-            !sample_build_probabilities(s->glm_mtp_logits0,
-                                        DS4_N_VOCAB,
-                                        temperature,
-                                        top_k,
-                                        top_p,
-                                        min_p,
-                                        s->sample_probs)) {
+        const bool penalised = ds4_session_presence_apply(
+                s, s->glm_mtp_logits0, &first_token, 1);
+        const bool built = rng &&
+            sample_build_probabilities(s->glm_mtp_logits0,
+                                       DS4_N_VOCAB,
+                                       temperature,
+                                       top_k,
+                                       top_p,
+                                       min_p,
+                                       s->sample_probs);
+        if (penalised) ds4_session_presence_restore(s);
+        if (!built) {
             if (g->glm53 && state_saved) {
                 (void)glm53_graph_copy_spec_state(g, false);
             }
@@ -75276,7 +75458,7 @@ static int ds4_session_glm_spec_cycle_impl(
         ds4_session_glm_note_dense_cache(s, pos, 2);
         n_committed = 2;
         /* s->logits already holds row1 (position pos+1) logits. */
-        const int n2 = glm_session_logits_argmax(s->logits);
+        const int n2 = glm_session_presence_argmax(s, s->logits, NULL, 0);
         int dummy = -1, nd = -1;
         ds4_gpu_tensor *target_hidden = g->glm53 ? g->hc_cur : g->cur;
         const bool cu =
@@ -75339,7 +75521,7 @@ static int ds4_session_glm_spec_cycle_impl(
             accepted[0] = first_token;
             accepted[1] = replacement;
 
-            const int next = glm_session_logits_argmax(s->logits);
+            const int next = glm_session_presence_argmax(s, s->logits, NULL, 0);
             int nd = -1;
             s->glm_mtp_have = 0;
             if (replacement != eos_token &&
@@ -75555,7 +75737,9 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
         const int rc = ds4_session_eval_internal(s, first_token, false, err, errlen);
         s->glm_spec_inside = 0;
         if (rc != 0) return -1;
-        const int parent = sample_argmax(s->logits, V);
+        /* The predictor is conditioned on the token the caller will sample
+         * next, so it has to see the same penalised row that sample will. */
+        const int parent = ds4_session_presence_argmax(s, s->logits, NULL, 0);
         int draft = -1;
         s->glm_mtp_have2 = false;
         if (qwen4_graph_mtp_step(&s->qwen4_graph, m, w, 0, parent, pos, true, NULL, &draft)) {
@@ -75619,15 +75803,26 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
     token_vec_push(&s->checkpoint, first_token);
     s->checkpoint_valid = true;
     s->mtp_draft_valid = false;
-    bool accept = sample_argmax(rows, V) == d || qwen4_spec_force_accept();
+    /* The verifier rows decide which drafts become output, so they carry the
+     * same penalty the caller's sampler applies: an unpenalised argmax would
+     * accept tokens the penalty was meant to push away.  Row 1 is conditioned
+     * on d, which this cycle has accepted but not yet committed. */
+    bool accept = ds4_session_presence_argmax(s, rows, NULL, 0) == d ||
+        qwen4_spec_force_accept();
     bool accept2 = false;
     if (deep) {
-        accept2 = accept && (sample_argmax(rows + V, V) == d2 || qwen4_spec_force_accept());
+        accept2 = accept &&
+            (ds4_session_presence_argmax(s, rows + V, &d, 1) == d2 ||
+             qwen4_spec_force_accept());
     }
     int replacement = -1;
     if (exact_sampling && temperature > 0.0f) {
         if (!s->sample_probs) s->sample_probs = xmalloc((size_t)V * sizeof(s->sample_probs[0]));
-        if (!rng || !sample_build_probabilities(rows, V, temperature, top_k, top_p, min_p, s->sample_probs)) {
+        const bool penalised = ds4_session_presence_apply(s, rows, NULL, 0);
+        const bool built = rng && sample_build_probabilities(rows, V, temperature, top_k,
+                                                             top_p, min_p, s->sample_probs);
+        if (penalised) ds4_session_presence_restore(s);
+        if (!built) {
             if (errlen) snprintf(err, errlen, "Qwen3.8 mtp: target distribution failed");
             s->checkpoint_valid = false;
             return -1;
@@ -75655,7 +75850,7 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
         token_vec_push(&s->checkpoint, d);
         if (deep) token_vec_push(&s->checkpoint, d2);
         memcpy(s->logits, rows + (T - 1u) * V, (size_t)V * sizeof(float));
-        const int parent = sample_argmax(s->logits, V);
+        const int parent = ds4_session_presence_argmax(s, s->logits, NULL, 0);
         bool have_next = false;
         int draft = -1;
         if (deep) {
@@ -75699,7 +75894,7 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
         s->checkpoint.len = pos + 1;
         token_vec_push(&s->checkpoint, d);
         memcpy(s->logits, rows + V, (size_t)V * sizeof(float));
-        const int parent = sample_argmax(s->logits, V);
+        const int parent = ds4_session_presence_argmax(s, s->logits, NULL, 0);
         const int next_tokens[2] = {d, parent};
         int draft = -1;
         if (qwen4_graph_mtp_steps(g, m, w, 0, next_tokens, 2u, pos, true, NULL, &draft)) {
@@ -75732,14 +75927,14 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
             return -1;
         }
         token_vec_push(&s->checkpoint, replacement);
-        qwen4_session_draft(s, 0, sample_argmax(s->logits, V), pos + 1u);
+        qwen4_session_draft(s, 0, ds4_session_presence_argmax(s, s->logits, NULL, 0), pos + 1u);
         accepted[0] = first_token;
         accepted[1] = replacement;
         return 2;
     }
     memcpy(s->logits, rows, (size_t)V * sizeof(float));
     {
-        const int parent = sample_argmax(s->logits, V);
+        const int parent = ds4_session_presence_argmax(s, s->logits, NULL, 0);
         int draft = -1;
         if (qwen4_graph_mtp_step(g, m, w, 0, parent, pos, true, NULL, &draft)) {
             s->glm_mtp_draft = draft;
@@ -77901,16 +78096,59 @@ int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
     return i;
 }
 
+/* Arm the OpenAI-style presence penalty and restart its history: every token
+ * this session generates from here on subtracts `penalty` from the logit of
+ * every id it has already generated.  One call per request keeps the state
+ * out of the sampling signatures and out of the speculative call chain. */
+void ds4_session_set_presence_penalty(ds4_session *s, float penalty) {
+    if (!s) return;
+    if (!isfinite(penalty)) penalty = 0.0f;
+    s->presence.penalty = penalty;
+    if (penalty != 0.0f) presence_reserve(&s->presence, DS4_N_VOCAB);
+    presence_clear(&s->presence, s->checkpoint.len);
+}
+
+#ifdef DS4_TEST_HOOKS
+int ds4_test_sample_logits_presence(const float *logits, uint32_t n_vocab,
+                                    float temperature, int top_k,
+                                    float top_p, float min_p,
+                                    float penalty,
+                                    const int *seen, int n_seen,
+                                    uint64_t *rng, float *prob_scratch) {
+    if (!logits || !rng || n_vocab == 0) return -1;
+    /* The sessions edit their own logit row; tests keep theirs untouched. */
+    float *row = xmalloc((size_t)n_vocab * sizeof(row[0]));
+    memcpy(row, logits, (size_t)n_vocab * sizeof(row[0]));
+    ds4_presence p = {0};
+    p.penalty = penalty;
+    if (penalty != 0.0f) {
+        presence_reserve(&p, n_vocab);
+        for (int i = 0; i < n_seen; i++) presence_mark(&p, seen[i]);
+        (void)presence_apply(&p, row, NULL, 0);
+    }
+    const int token = sample_top_p_min_p(row, n_vocab, temperature, top_k,
+                                         top_p, min_p, rng, prob_scratch);
+    presence_restore(&p);
+    presence_free(&p);
+    free(row);
+    return token;
+}
+#endif
+
 int ds4_session_argmax(ds4_session *s) {
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
-    return sample_argmax(s->logits, DS4_N_VOCAB);
+    return ds4_session_presence_argmax(s, s->logits, NULL, 0);
 }
 
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
+    const bool penalised = ds4_session_presence_apply(s, s->logits, NULL, 0);
+    int result;
     if (getenv("DS4_CPU_DISABLE_UNROLLED_ARGMAX") == NULL) {
-        return argmax_f32_excluding_unrolled8(
+        result = argmax_f32_excluding_unrolled8(
                 s->logits, DS4_N_VOCAB, excluded_id);
+        if (penalised) ds4_session_presence_restore(s);
+        return result;
     }
     int best = -1;
     float best_logit = DS4_NEG_INF;
@@ -77922,12 +78160,14 @@ int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
             best_logit = v;
         }
     }
+    if (penalised) ds4_session_presence_restore(s);
     return best;
 }
 
 int ds4_session_argmax_ignoring_eos(ds4_session *s,
                                     ds4_think_mode think_mode) {
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
+    const bool penalised = ds4_session_presence_apply(s, s->logits, NULL, 0);
     int best = -1;
     float best_logit = DS4_NEG_INF;
     for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
@@ -77941,6 +78181,7 @@ int ds4_session_argmax_ignoring_eos(ds4_session *s,
             best_logit = v;
         }
     }
+    if (penalised) ds4_session_presence_restore(s);
     return best;
 }
 
@@ -77957,8 +78198,15 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
 
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
-    return sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k,
-                              top_p, min_p, rng, s->sample_probs);
+    /* Greedy decoding goes through the same penalised row: sample_top_p_min_p
+     * falls back to argmax at temperature 0, and the two must not disagree
+     * about which ids the penalty suppressed. */
+    const bool penalised = ds4_session_presence_apply(s, s->logits, NULL, 0);
+    const int token = sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature,
+                                         top_k, top_p, min_p, rng,
+                                         s->sample_probs);
+    if (penalised) ds4_session_presence_restore(s);
+    return token;
 }
 
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
@@ -81620,7 +81868,11 @@ int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count
             committed[i] = 1u;
             if (mem[i].n == 2u) {
                 s->qwen4_spec_cycles++;
-                const bool accept = sample_argmax(rows, V) == mem[i].tokens[1] || qwen4_spec_force_accept();
+                /* Same rule as the single-session cycle: the row that decides
+                 * whether this draft becomes output is penalised first. */
+                const bool accept =
+                    ds4_session_presence_argmax(s, rows, NULL, 0) == mem[i].tokens[1] ||
+                    qwen4_spec_force_accept();
                 qwen4_spec_note_first_draft(s, accept);
                 n_draft++;
                 n_acc += accept;
@@ -81649,7 +81901,7 @@ int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count
             s->checkpoint_valid = true;
             s->mtp_draft_valid = false;
             s->qwen4_rewound = false;
-            parents[i] = sample_argmax(s->logits, V);
+            parents[i] = ds4_session_presence_argmax(s, s->logits, NULL, 0);
             n_accepted[i] = (int)committed[i];
             accepted[i][0] = mem[i].tokens[0];
             accepted[i][1] = committed[i] == 2u ? mem[i].tokens[1] : -1;
@@ -86305,6 +86557,16 @@ static int ds4_session_eval_speculative_argmax_impl(
                                           err, errlen);
     }
 
+    /* The DeepSeek MTP and DSpark verifiers below take their top-1 from the
+     * device, where the request's presence penalty is not visible, so a
+     * penalised request decodes one token per cycle here.  Speculation is
+     * only allowed to change speed, never the emitted tokens. */
+    if (presence_active(s)) {
+        if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+        accepted[0] = first_token;
+        return 1;
+    }
+
     /*
      * MTP in DeepSeek V4 is a speculative drafter, not a replacement sampler.
      * The target model still defines the exact output stream.  A cycle starts
@@ -87163,6 +87425,14 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
         }
 #endif
         return rc;
+    }
+    /* Same reason as the argmax path: DSpark drafts are proposed and verified
+     * against device-side tops that cannot see the presence penalty, so a
+     * penalised request decodes one token per cycle from here. */
+    if (presence_active(s)) {
+        if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+        accepted[0] = first_token;
+        return 1;
     }
     const bool opportunistic_dspark =
         e && e->support_kind == DS4_SUPPORT_DSPARK && e->dspark &&

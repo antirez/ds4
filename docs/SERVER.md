@@ -44,6 +44,9 @@ sampling and output-budget fields are supported; explicit request parameters
 take precedence over defaults.
 
 The default sampling settings are temperature 1, top-p 1, and min-p 0.05.
+`presence_penalty` (-2 to 2, default 0, accepted by all four routes) subtracts
+its value from the logit of every token id the request has already generated,
+prompt tokens excluded. Qwen3.8 Flash Next recommends 1.5 in no-think mode.
 For DeepSeek, thinking is on by default. `reasoning_effort=max` selects Think
 Max only with sufficient context; otherwise it falls back to normal thinking.
 `xhigh` maps to normal thinking, not Think Max. Use `think:false`, a disabled

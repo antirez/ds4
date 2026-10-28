@@ -354,6 +354,111 @@ static void check_speculative_distribution(void) {
            (double)counts[2] / trials);
 }
 
+/* Build the row the presence penalty is supposed to produce: a flat
+ * subtraction at every id in the seen set, counted once per id however often
+ * the caller listed it. */
+static float *presence_reference_logits(const float *logits, uint32_t n,
+                                        float penalty, const int *seen,
+                                        int n_seen) {
+    float *out = malloc((size_t)n * sizeof(*out));
+    unsigned char *hit = calloc(n, 1);
+    CHECK(out && hit, "presence reference allocation");
+    if (!out || !hit) {
+        free(out);
+        free(hit);
+        return NULL;
+    }
+    memcpy(out, logits, (size_t)n * sizeof(*out));
+    for (int i = 0; i < n_seen; i++) {
+        const int id = seen[i];
+        if (id < 0 || (uint32_t)id >= n || hit[id]) continue;
+        hit[id] = 1;
+        out[id] -= penalty;
+    }
+    free(hit);
+    return out;
+}
+
+static void compare_presence_case(const float *logits, float *scratch,
+                                  uint32_t n, float temperature, int top_k,
+                                  float top_p, float min_p, float penalty,
+                                  const int *seen, int n_seen,
+                                  const char *label) {
+    float *expected = presence_reference_logits(logits, n, penalty, seen,
+                                                n_seen);
+    if (!expected) return;
+    for (uint64_t seed = 0; seed < 64; seed++) {
+        uint64_t ref_rng = seed;
+        uint64_t opt_rng = seed;
+        const int ref = ds4_test_sample_logits(expected, n, temperature,
+                                               top_k, top_p, min_p,
+                                               &ref_rng, scratch);
+        const int opt = ds4_test_sample_logits_presence(
+                logits, n, temperature, top_k, top_p, min_p, penalty,
+                seen, n_seen, &opt_rng, scratch);
+        CHECK(ref == opt,
+              "%s seed=%llu token reference=%d presence=%d",
+              label, (unsigned long long)seed, ref, opt);
+        CHECK(ref_rng == opt_rng,
+              "%s seed=%llu RNG reference=%llu presence=%llu",
+              label, (unsigned long long)seed,
+              (unsigned long long)ref_rng, (unsigned long long)opt_rng);
+    }
+    free(expected);
+}
+
+static void check_presence_penalty(const float *logits, float *scratch,
+                                   uint32_t n) {
+    uint64_t rng = 99;
+    const int top = ds4_test_sample_logits(logits, n, 0.0f, 0, 1.0f, 0.0f,
+                                           &rng, scratch);
+    const int seen[] = {top, 5, 9, 5, 2048, top};
+    const int n_seen = (int)(sizeof(seen) / sizeof(seen[0]));
+
+    /* Off means off: the seen list must not perturb anything. */
+    compare_presence_case(logits, scratch, n, 1.0f, 0, 1.0f, 0.05f, 0.0f,
+                          seen, n_seen, "presence-off");
+    compare_presence_case(logits, scratch, n, 0.0f, 0, 1.0f, 0.0f, 0.0f,
+                          seen, n_seen, "presence-off-greedy");
+
+    /* Qwen3.8's recommended setting, and a duplicate id that must be
+     * subtracted once. */
+    compare_presence_case(logits, scratch, n, 1.0f, 0, 1.0f, 0.05f, 1.5f,
+                          seen, n_seen, "presence-sampled");
+    compare_presence_case(logits, scratch, n, 0.8f, 64, 0.9f, 0.05f, 1.5f,
+                          seen, n_seen, "presence-top-k");
+    compare_presence_case(logits, scratch, n, 1.3f, 0, 0.9f, 0.05f, -1.5f,
+                          seen, n_seen, "presence-negative");
+    compare_presence_case(logits, scratch, n, 0.0f, 0, 1.0f, 0.0f, 1.5f,
+                          seen, n_seen, "presence-greedy");
+
+    /* Guard the comparisons above against a no-op implementation: crushing
+     * the top token has to change what the sampler returns. */
+    int moved = 0;
+    for (uint64_t seed = 0; seed < 64; seed++) {
+        uint64_t plain_rng = seed;
+        uint64_t penalised_rng = seed;
+        const int plain = ds4_test_sample_logits(logits, n, 1.0f, 0, 1.0f,
+                                                 0.05f, &plain_rng, scratch);
+        const int penalised = ds4_test_sample_logits_presence(
+                logits, n, 1.0f, 0, 1.0f, 0.05f, 100.0f, seen, n_seen,
+                &penalised_rng, scratch);
+        if (plain != penalised) moved++;
+    }
+    CHECK(moved > 0, "presence penalty never changed the sampled token");
+
+    /* Greedy must follow the penalised row, not the raw one. */
+    uint64_t greedy_rng = 7;
+    const int penalised_top = ds4_test_sample_logits_presence(
+            logits, n, 0.0f, 0, 1.0f, 0.0f, 100.0f, &top, 1,
+            &greedy_rng, scratch);
+    CHECK(penalised_top != top,
+          "presence-greedy-moves-argmax top=%d penalised=%d",
+          top, penalised_top);
+    CHECK(greedy_rng == 7,
+          "presence greedy consumed RNG state");
+}
+
 int main(void) {
     check_speculative_distribution();
     const uint32_t semantic_n = 4096;
@@ -383,6 +488,8 @@ int main(void) {
                  "greedy-scalar-control");
     CHECK(unsetenv("DS4_CPU_DISABLE_UNROLLED_ARGMAX") == 0,
           "restore unrolled argmax default");
+
+    check_presence_penalty(logits, scratch, semantic_n);
 
     const float cross_lane_tie[] = {
         -4.0f, 9.0f, -2.0f, 3.0f, 1.0f, 5.0f, 0.0f, 7.0f,

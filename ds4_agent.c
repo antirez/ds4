@@ -76,6 +76,7 @@ typedef struct {
     float temperature;
     float top_p;
     float min_p;
+    float presence_penalty;
     bool temperature_set;
     bool top_p_set;
     bool min_p_set;
@@ -860,6 +861,9 @@ static agent_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--min-p")) {
             c.gen.min_p = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
             c.gen.min_p_set = true;
+        } else if (!strcmp(arg, "--presence-penalty")) {
+            c.gen.presence_penalty =
+                parse_float_range(need_arg(&i, argc, argv, arg), arg, -2.0f, 2.0f);
         } else if (!strcmp(arg, "--seed")) {
             c.gen.seed = parse_u64(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--think-level")) {
@@ -9916,6 +9920,9 @@ static bool agent_worker_compact_transcript(agent_worker *w, const char *reason,
     char eval_err[160] = {0};
     int dsml_id = agent_special_token_id(w->engine, "｜DSML｜");
     double t0 = now_sec();
+    /* The compaction summary is maintenance, not the user's reply: it never
+     * carries the request's presence penalty. */
+    ds4_session_set_presence_penalty(w->session, 0.0f);
     for (int i = 0; i < summary_max; i++) {
         if (worker_should_interrupt(w)) {
             snprintf(err, err_len, "interrupted");
@@ -10475,6 +10482,9 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         pthread_mutex_unlock(&w->mu);
 
         bool status_greedy_sampling = false;
+        /* One tool round is one generation: the prompt just synced, including
+         * earlier rounds' output, is the boundary of the penalised history. */
+        ds4_session_set_presence_penalty(w->session, cfg->gen.presence_penalty);
         while (generated < max_tokens && !worker_should_interrupt(w)) {
             worker_apply_pending_power(w);
             bool greedy_sampling = agent_stream_wants_greedy_sampling(&stream);
@@ -10872,6 +10882,7 @@ static int worker_run_raw_prompt(agent_worker *w, const char *user_text) {
 
     uint64_t rng = cfg->gen.seed ? cfg->gen.seed :
         ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
+    ds4_session_set_presence_penalty(w->session, cfg->gen.presence_penalty);
     int generated = 0;
     double t0 = now_sec();
 

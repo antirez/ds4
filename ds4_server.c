@@ -293,6 +293,18 @@ static bool json_number(const char **p, double *out) {
     return true;
 }
 
+/* strtod() accepts "NaN" and "Infinity", neither of which is valid JSON, and
+ * this file is compiled with -ffast-math, where a later isfinite() or NaN
+ * comparison may be optimized away.  Reject those spellings from the text so
+ * the caller only ever sees a real number. */
+static bool json_finite_number(const char **p, double *out) {
+    json_ws(p);
+    const char *q = *p;
+    if (*q == '+' || *q == '-') q++;
+    if (*q != '.' && !(*q >= '0' && *q <= '9')) return false;
+    return json_number(p, out);
+}
+
 static bool json_int(const char **p, int *out) {
     double v = 0.0;
     if (!json_number(p, &v)) return false;
@@ -814,12 +826,16 @@ typedef struct {
     float temperature;
     float top_p;
     float min_p;
+    /* Flat subtraction from the logit of every token id this request has
+     * already generated.  0 is off, which is also the OpenAI default. */
+    float presence_penalty;
     /* Explicit client sampling wins even in thinking mode; the fixed
      * DeepSeek-style thinking defaults apply only to omitted knobs. */
     bool temperature_set;
     bool top_p_set;
     bool min_p_set;
     bool top_k_set;
+    bool presence_penalty_set;
     uint64_t seed;
     bool stream;
     bool stream_include_usage;
@@ -992,11 +1008,25 @@ static void request_init(request *r, req_kind kind, int max_tokens) {
     r->temperature = DS4_DEFAULT_TEMPERATURE;
     r->top_p = DS4_DEFAULT_TOP_P;
     r->min_p = DS4_DEFAULT_MIN_P;
+    r->presence_penalty = 0.0f;
     r->think_mode = DS4_THINK_HIGH;
 }
 
 static bool parse_ignore_eos_value(const char **p, request *r) {
     return p && r && json_bool(p, &r->ignore_eos);
+}
+
+/* OpenAI's presence_penalty range.  Out-of-range and non-finite values are
+ * rejected rather than clamped: a client asking for 20 is asking for a
+ * sampler this server does not implement. */
+#define REQUEST_PRESENCE_PENALTY_ERR \
+    "presence_penalty must be a number between -2 and 2"
+
+static bool request_set_presence_penalty(request *r, double v) {
+    if (v < -2.0 || v > 2.0) return false;
+    r->presence_penalty = (float)v;
+    r->presence_penalty_set = true;
+    return true;
 }
 
 static bool request_validate_ignore_eos(const request *r,
@@ -4101,6 +4131,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     request_init(r, REQ_CHAT, def_tokens);
     r->model_syntax = server_model_syntax_for_engine(e);
     const char *p = body;
+    const char *bad_reason = "invalid JSON request";
     bool got_messages = false;
     bool tool_choice_none = false;
     bool got_thinking = false;
@@ -4177,6 +4208,17 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
             }
             r->top_p = (float)v;
             r->top_p_set = true;
+        } else if (!strcmp(key, "presence_penalty")) {
+            double v = 0.0;
+            if (!json_finite_number(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            if (!request_set_presence_penalty(r, v)) {
+                free(key);
+                bad_reason = REQUEST_PRESENCE_PENALTY_ERR;
+                goto bad;
+            }
         } else if (!strcmp(key, "min_p")) {
             double v = 0.0;
             if (!json_number(&p, &v)) {
@@ -4288,7 +4330,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
 bad:
     chat_msgs_free(&msgs);
     free(tool_schemas);
-    snprintf(err, errlen, "invalid JSON request");
+    snprintf(err, errlen, "%s", bad_reason);
     request_free(r);
     return false;
 }
@@ -4299,6 +4341,7 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     r->api = API_ANTHROPIC;
     r->model_syntax = server_model_syntax_for_engine(e);
     const char *p = body;
+    const char *bad_reason = "invalid JSON request";
     bool got_messages = false;
     bool tool_choice_none = false;
     bool got_thinking = false;
@@ -4416,6 +4459,17 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
             }
             r->top_p = (float)v;
             r->top_p_set = true;
+        } else if (!strcmp(key, "presence_penalty")) {
+            double v = 0.0;
+            if (!json_finite_number(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            if (!request_set_presence_penalty(r, v)) {
+                free(key);
+                bad_reason = REQUEST_PRESENCE_PENALTY_ERR;
+                goto bad;
+            }
         } else if (!strcmp(key, "top_k")) {
             if (!json_int(&p, &r->top_k)) {
                 free(key);
@@ -4518,7 +4572,7 @@ bad:
     chat_msgs_free(&msgs);
     free(system);
     free(tool_schemas);
-    snprintf(err, errlen, "invalid JSON request");
+    snprintf(err, errlen, "%s", bad_reason);
     request_free(r);
     return false;
 }
@@ -5288,6 +5342,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     r->api = API_RESPONSES;
     r->model_syntax = server_model_syntax_for_engine(e);
     const char *p = body;
+    const char *bad_reason = "invalid JSON request";
     bool got_input = false;
     bool tool_choice_none = false;
     bool got_thinking = false;
@@ -5415,6 +5470,17 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
             }
             r->top_p = (float)v;
             r->top_p_set = true;
+        } else if (!strcmp(key, "presence_penalty")) {
+            double v = 0.0;
+            if (!json_finite_number(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            if (!request_set_presence_penalty(r, v)) {
+                free(key);
+                bad_reason = REQUEST_PRESENCE_PENALTY_ERR;
+                goto bad;
+            }
         } else if (!strcmp(key, "stream")) {
             if (!json_bool(&p, &r->stream)) {
                 free(key);
@@ -5553,7 +5619,7 @@ bad:
     buf_free(&loaded_tool_schemas);
     free(instructions);
     free(tool_schemas);
-    snprintf(err, errlen, "invalid JSON request");
+    snprintf(err, errlen, "%s", bad_reason);
     request_free(r);
     return false;
 }
@@ -5593,6 +5659,7 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
     request_init(r, REQ_COMPLETION, def_tokens);
     r->model_syntax = server_model_syntax_for_engine(e);
     const char *p = body;
+    const char *bad_reason = "invalid JSON request";
     char *prompt = NULL;
     bool got_thinking = false;
     bool thinking_enabled = true;
@@ -5647,6 +5714,17 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
             }
             r->top_p = (float)v;
             r->top_p_set = true;
+        } else if (!strcmp(key, "presence_penalty")) {
+            double v = 0.0;
+            if (!json_finite_number(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            if (!request_set_presence_penalty(r, v)) {
+                free(key);
+                bad_reason = REQUEST_PRESENCE_PENALTY_ERR;
+                goto bad;
+            }
         } else if (!strcmp(key, "min_p")) {
             double v = 0.0;
             if (!json_number(&p, &v)) {
@@ -5737,7 +5815,7 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
     return true;
 bad:
     free(prompt);
-    snprintf(err, errlen, "invalid JSON request");
+    snprintf(err, errlen, "%s", bad_reason);
     request_free(r);
     return false;
 }
@@ -11980,7 +12058,7 @@ static uint64_t trace_begin(
     fprintf(s->trace, "\n===== request %llu ", (unsigned long long)id);
     trace_time(s->trace);
     fprintf(s->trace,
-            " =====\nkind: %s\nmodel: %s\nstream: %d\ntools: %d\nthink_mode: %s\nprompt_tokens: %d\neffective_prompt_tokens: %d\ncached_tokens: %d\nmax_tokens: %d\ntemperature: %.3f\ntop_k: %d\ntop_p: %.3f\nmin_p: %.3f\nignore_eos: %d\nseed: %llu\n",
+            " =====\nkind: %s\nmodel: %s\nstream: %d\ntools: %d\nthink_mode: %s\nprompt_tokens: %d\neffective_prompt_tokens: %d\ncached_tokens: %d\nmax_tokens: %d\ntemperature: %.3f\ntop_k: %d\ntop_p: %.3f\nmin_p: %.3f\npresence_penalty: %.3f\nignore_eos: %d\nseed: %llu\n",
             j->req.kind == REQ_CHAT ? "chat" : "completion",
             j->req.model ? j->req.model : "",
             j->req.stream ? 1 : 0,
@@ -11994,6 +12072,7 @@ static uint64_t trace_begin(
             j->req.top_k,
             j->req.top_p,
             j->req.min_p,
+            (double)j->req.presence_penalty,
             j->req.ignore_eos ? 1 : 0,
             (unsigned long long)j->req.seed);
     fprintf(s->trace, "stream_include_usage: %d\n",
@@ -13934,6 +14013,12 @@ decode_again:
     dsml_decode_tracker_init(&dsml_tracker);
     dsml_tracker.model_syntax = j->req.model_syntax;
 
+    /* Arm the presence penalty for this attempt.  The call anchors the
+     * history at the current checkpoint, so only what the request generates
+     * from here is penalised, never the prompt, and a recovery restart begins
+     * from the rewound boundary. */
+    ds4_session_set_presence_penalty(slot->session, j->req.presence_penalty);
+
     server_generation_enter(s);
     while (!g_stop_requested && !job_cancelled(j) && completion < max_tokens &&
            ds4_session_pos(slot->session) < ds4_session_ctx(slot->session)) {
@@ -15116,6 +15201,7 @@ static void append_model_json_values(buf *b, const char *id, const char *name,
             "\"top_p\","
             "\"top_k\","
             "\"min_p\","
+            "\"presence_penalty\","
             "\"ignore_eos\","
             "\"stop\","
             "\"seed\","
@@ -18147,6 +18233,94 @@ static void test_request_defaults_use_min_p_filtering(void) {
     TEST_ASSERT(r.min_p == DS4_DEFAULT_MIN_P);
     TEST_ASSERT(!r.ignore_eos);
     request_free(&r);
+}
+
+static void test_presence_penalty_request_parsing(void) {
+    request r;
+    char err[160];
+
+    /* Absent means off. */
+    request_init(&r, REQ_CHAT, 128);
+    TEST_ASSERT(r.presence_penalty == 0.0f);
+    TEST_ASSERT(!r.presence_penalty_set);
+
+    TEST_ASSERT(request_set_presence_penalty(&r, 1.5));
+    TEST_ASSERT(r.presence_penalty == 1.5f && r.presence_penalty_set);
+    TEST_ASSERT(request_set_presence_penalty(&r, -2.0));
+    TEST_ASSERT(r.presence_penalty == -2.0f);
+    TEST_ASSERT(request_set_presence_penalty(&r, 2.0));
+    TEST_ASSERT(!request_set_presence_penalty(&r, 2.5));
+    TEST_ASSERT(!request_set_presence_penalty(&r, -2.5));
+    TEST_ASSERT(r.presence_penalty == 2.0f);
+    request_free(&r);
+
+    /* "NaN"/"Infinity" are not JSON and strtod() would otherwise accept them. */
+    const char *non_finite[] = {
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],"
+        "\"presence_penalty\":NaN}",
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],"
+        "\"presence_penalty\":Infinity}",
+    };
+    for (size_t i = 0; i < sizeof(non_finite) / sizeof(non_finite[0]); i++) {
+        err[0] = '\0';
+        TEST_ASSERT(!parse_chat_request(NULL, NULL, non_finite[i], 128, 32768,
+                                        &r, err, sizeof(err)));
+        TEST_ASSERT(!strcmp(err, "invalid JSON request"));
+    }
+
+    /* An in-range value is accepted by every API style: parsing then fails on
+     * the missing required field, not on the penalty. */
+    const struct {
+        const char *label;
+        const char *accepted;
+        const char *rejected;
+        const char *missing;
+        bool anthropic;
+        bool responses;
+        bool completion;
+    } cases[] = {
+        {"chat", "{\"presence_penalty\":1.5}",
+         "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],"
+         "\"presence_penalty\":2.5}",
+         "missing messages", false, false, false},
+        {"anthropic", "{\"max_tokens\":1,\"presence_penalty\":1.5}",
+         "{\"max_tokens\":1,\"messages\":[{\"role\":\"user\","
+         "\"content\":\"hi\"}],\"presence_penalty\":-3}",
+         "missing messages", true, false, false},
+        {"responses", "{\"presence_penalty\":1.5}",
+         "{\"input\":\"hi\",\"presence_penalty\":9}",
+         "missing input", false, true, false},
+        {"completion", "{\"presence_penalty\":1.5}",
+         "{\"prompt\":\"hi\",\"presence_penalty\":2.0001}",
+         "missing prompt", false, false, true},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        for (int rejected = 0; rejected <= 1; rejected++) {
+            const char *body = rejected ? cases[i].rejected : cases[i].accepted;
+            err[0] = '\0';
+            bool ok;
+            if (cases[i].anthropic) {
+                ok = parse_anthropic_request(NULL, NULL, body, 128, 32768, &r,
+                                             err, sizeof(err));
+            } else if (cases[i].responses) {
+                ok = parse_responses_request(NULL, NULL, body, 128, 32768, &r,
+                                             err, sizeof(err));
+            } else if (cases[i].completion) {
+                ok = parse_completion_request(NULL, body, 128, 32768, &r,
+                                              err, sizeof(err));
+            } else {
+                ok = parse_chat_request(NULL, NULL, body, 128, 32768, &r,
+                                        err, sizeof(err));
+            }
+            TEST_ASSERT(!ok);
+            if (ok) request_free(&r);
+            if (rejected) {
+                TEST_ASSERT(!strcmp(err, REQUEST_PRESENCE_PENALTY_ERR));
+            } else {
+                TEST_ASSERT(!strcmp(err, cases[i].missing));
+            }
+        }
+    }
 }
 
 static void test_chat_ignore_eos_contract(void) {
@@ -22949,6 +23123,7 @@ static void ds4_server_unit_tests_run(void) {
     test_dispatch_routes_alien_request_to_empty_slot();
     test_request_defaults_use_min_p_filtering();
     test_chat_ignore_eos_contract();
+    test_presence_penalty_request_parsing();
     test_reasoning_effort_mapping();
     test_model_alias_thinking_controls();
     test_api_thinking_controls_parse();

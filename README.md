@@ -204,7 +204,9 @@ For V4.1, `ds4` and `ds4-agent` also accept
 0 disables thinking. `--think` selects 75, `--think-max` selects 100.
 Changing the level in a conversation rebuilds its cached prefix.
 The normal sampling defaults are temperature 1, top-p 1, and min-p 0.05;
-`--temp 0` selects greedy output.
+`--temp 0` selects greedy output. `--presence-penalty F` (-2 to 2, default 0)
+subtracts F from the logit of every token already generated in the current
+reply; Qwen3.8 Flash Next recommends 1.5 in no-think mode.
 
 For DeepSeek V4, `--power N` trades throughput for lower sustained GPU load.
 The default is 100. V4.1 and GLM currently require `--power 100`.

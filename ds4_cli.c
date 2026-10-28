@@ -69,6 +69,7 @@ typedef struct {
     float temperature;
     float top_p;
     float min_p;
+    float presence_penalty;
     bool temperature_set;
     bool top_p_set;
     bool min_p_set;
@@ -592,6 +593,8 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
 
     uint64_t rng = cfg->gen.seed ? cfg->gen.seed :
         ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
+    /* One reply is one history: the prompt just synced is the boundary. */
+    ds4_session_set_presence_penalty(session, cfg->gen.presence_penalty);
     int generated = 0;
     const bool speculative_argmax = cfg->gen.temperature <= 0.0f &&
         ((ds4_engine_mtp_draft_tokens(engine) > 1 &&
@@ -1241,6 +1244,7 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
             cfg->engine.tp.role == DS4_TP_LEADER ||
             getenv("DS4_CLI_FORCE_SESSION") != NULL ||
             cfg->gen.temperature > 0.0f ||
+            cfg->gen.presence_penalty != 0.0f ||
             ds4_engine_mtp_draft_tokens(engine) > 1) {
             /* TP leaders always drive the session path: the sync/eval
              * mirroring that keeps the worker in lockstep lives there.
@@ -1594,6 +1598,8 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat,
 
     uint64_t rng = cfg->gen.seed ? cfg->gen.seed :
         ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
+    /* Each turn starts its own history: only this reply is penalised. */
+    ds4_session_set_presence_penalty(chat->session, cfg->gen.presence_penalty);
     int generated = 0;
     const bool speculative_argmax = cfg->gen.temperature <= 0.0f &&
         ((ds4_engine_mtp_draft_tokens(engine) > 1 &&
@@ -2052,6 +2058,9 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--min-p")) {
             c.gen.min_p = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
             c.gen.min_p_set = true;
+        } else if (!strcmp(arg, "--presence-penalty")) {
+            c.gen.presence_penalty =
+                parse_float_range(need_arg(&i, argc, argv, arg), arg, -2.0f, 2.0f);
         } else if (!strcmp(arg, "--seed")) {
             c.gen.seed = parse_u64(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--quality")) {
