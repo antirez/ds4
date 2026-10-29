@@ -808,6 +808,7 @@ typedef struct {
     stop_list stops;
     char *raw_body;
     char *prompt_text;
+    bool prompt_from_ids;      /* prompt given as [token, ...]: r->prompt is authoritative */
     tool_schema_orders tool_orders;
     int max_tokens;
     int top_k;
@@ -5588,6 +5589,55 @@ static bool parse_prompt(const char **p, char **out) {
     return true;
 }
 
+/* Detect the OpenAI token-ID prompt form: an array whose first element is
+ * an integer. The pointer is left untouched; the caller re-parses on top. */
+static bool prompt_looks_like_token_ids(const char *p) {
+    json_ws(&p);
+    if (*p != '[') return false;
+    p++;
+    json_ws(&p);
+    return *p == '-' || (*p >= '0' && *p <= '9');
+}
+
+/* Parse "prompt": [id, id, ...] into r->prompt as exact token IDs.
+ * json_int() folds negative and NaN values to 0; out-of-range IDs are
+ * surfaced by the engine. On failure the request is left unchanged. */
+static bool parse_prompt_token_ids(const char **p, request *r) {
+    ds4_tokens ids = {0};
+    json_ws(p);
+    if (**p != '[') return false;
+    (*p)++;
+    json_ws(p);
+    if (**p == ']') {
+        (*p)++;
+        goto ok;
+    }
+    for (;;) {
+        int id = 0;
+        if (!json_int(p, &id)) goto bad;
+        ds4_tokens_push(&ids, id);
+        json_ws(p);
+        if (**p == ',') {
+            (*p)++;
+            json_ws(p);
+            continue;
+        }
+        if (**p == ']') {
+            (*p)++;
+            break;
+        }
+        goto bad;
+    }
+ok:
+    ds4_tokens_free(&r->prompt);
+    r->prompt = ids;
+    r->prompt_from_ids = true;
+    return true;
+bad:
+    ds4_tokens_free(&ids);
+    return false;
+}
+
 static bool parse_completion_request(ds4_engine *e, const char *body, int def_tokens,
                                      int ctx_size, request *r, char *err, size_t errlen) {
     request_init(r, REQ_COMPLETION, def_tokens);
@@ -5612,14 +5662,21 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
         }
         p++;
         if (!strcmp(key, "prompt")) {
-            char *tmp = NULL;
-            if (!parse_prompt(&p, &tmp)) {
-                free(tmp);
-                free(key);
-                goto bad;
+            if (prompt_looks_like_token_ids(p)) {
+                if (!parse_prompt_token_ids(&p, r)) {
+                    free(key);
+                    goto bad;
+                }
+            } else {
+                char *tmp = NULL;
+                if (!parse_prompt(&p, &tmp)) {
+                    free(tmp);
+                    free(key);
+                    goto bad;
+                }
+                free(prompt);
+                prompt = tmp;
             }
-            free(prompt);
-            prompt = tmp;
         } else if (!strcmp(key, "model")) {
             if (!json_string_replace(&p, &r->model)) {
                 free(key);
@@ -5710,6 +5767,13 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
         json_ws(&p);
     }
     if (*p != '}') goto bad;
+    if (r->prompt_from_ids) {
+        /* Exact token IDs: no chat template wrap, no re-tokenization.
+         * Keep a non-NULL prompt_text so later text-prefix lookups and
+         * tracing see an ordinary (empty) string. */
+        r->prompt_text = xstrdup("");
+        return true;
+    }
     if (!prompt) {
         snprintf(err, errlen, "missing prompt");
         request_free(r);
