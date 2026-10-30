@@ -231,6 +231,17 @@ static int ds4_oriented_rgb(
     return 1;
 }
 
+void ds4_image_fingerprint_with_grid(uint8_t fingerprint[32], uint32_t grid_h, uint32_t grid_w) {
+    static const char tag[] = "ds4-image-grid";
+    ds4_sha256 sha;
+    ds4_sha256_init(&sha);
+    ds4_sha256_update(&sha, tag, sizeof(tag) - 1);
+    ds4_sha256_update(&sha, fingerprint, 32);
+    ds4_sha256_update(&sha, &grid_h, sizeof(grid_h));
+    ds4_sha256_update(&sha, &grid_w, sizeof(grid_w));
+    ds4_sha256_final(&sha, fingerprint);
+}
+
 int ds4_image_decode_memory(
         ds4_image *out,
         const uint8_t *encoded,
@@ -726,8 +737,8 @@ static int ds4_deepseek4_safe_resize(
         uint32_t *best_width,
         uint32_t *llm_height,
         uint32_t *llm_width,
+        uint32_t max_tokens,
         bool v41) {
-    const uint32_t max_tokens = v41 ? 1024u : 381u;
     uint32_t budget = max_tokens;
     uint32_t tokens = ds4_deepseek4_grid_tokens(
             *best_height, *best_width, llm_height, llm_width, v41);
@@ -744,11 +755,28 @@ static int ds4_deepseek4_safe_resize(
     return 1;
 }
 
+/* Largest token budget whose resized image still fits the decoded-image limits
+ * (DS4_IMAGE_MAX_DIMENSION / DS4_IMAGE_MAX_PIXELS) for this aspect ratio. Bounds
+ * DS4_IMAGE_BUDGET_NATIVE and any explicit budget larger than the image could use. */
+static uint32_t ds4_deepseek4_limit_budget(uint32_t height, uint32_t width, bool v41) {
+    double scale = 1.0;
+    const double px = (double)width * height;
+    if (px > (double)DS4_IMAGE_MAX_PIXELS) scale = sqrt((double)DS4_IMAGE_MAX_PIXELS / px);
+    scale = fmin(scale, fmin((double)DS4_IMAGE_MAX_DIMENSION / width,
+                             (double)DS4_IMAGE_MAX_DIMENSION / height));
+    uint32_t w = (uint32_t)floor(width * scale / 14.0) * 14u;
+    uint32_t h = (uint32_t)floor(height * scale / 14.0) * 14u;
+    if (w < 14u) w = 14u;
+    if (h < 14u) h = 14u;
+    return ds4_deepseek4_grid_tokens(h, w, NULL, NULL, v41);
+}
+
 static int ds4_image_preprocess_deepseek(
         ds4_deepseek4_image_patches *out,
         const ds4_image *image,
         char *error,
         size_t error_cap,
+        uint32_t max_tokens,
         bool v41) {
     if (!out) return 0;
     memset(out, 0, sizeof(*out));
@@ -777,9 +805,13 @@ static int ds4_image_preprocess_deepseek(
     uint32_t best_width = ds4_align_u32(planned_width, 14u);
     uint32_t best_height = ds4_align_u32(planned_height, 14u);
     uint32_t llm_height = 0, llm_width = 0;
+    if (max_tokens == 0) max_tokens = v41 ? DS4_DEEPSEEK41_IMAGE_TOKENS_DEFAULT
+                                          : DS4_DEEPSEEK4_IMAGE_TOKENS_DEFAULT;
+    const uint32_t limit = ds4_deepseek4_limit_budget(best_height, best_width, v41);
+    if (max_tokens > limit) max_tokens = limit;
     if (!ds4_deepseek4_safe_resize(planned_height, planned_width,
                                    &best_height, &best_width,
-                                   &llm_height, &llm_width, v41)) {
+                                   &llm_height, &llm_width, max_tokens, v41)) {
         ds4_image_error(error, error_cap,
                         "unable to fit image within the vision token budget");
         return 0;
@@ -874,14 +906,55 @@ static int ds4_image_preprocess_deepseek(
 int ds4_image_preprocess_deepseek4(
         ds4_deepseek4_image_patches *out, const ds4_image *image,
         char *error, size_t error_cap) {
-    return ds4_image_preprocess_deepseek(out, image, error, error_cap, false);
+    return ds4_image_preprocess_deepseek(out, image, error, error_cap,
+                                         DS4_DEEPSEEK4_IMAGE_TOKENS_DEFAULT, false);
 }
 
 int ds4_image_preprocess_deepseek41(
         ds4_deepseek4_image_patches *out, const ds4_image *image,
         char *error, size_t error_cap) {
-    return ds4_image_preprocess_deepseek(out, image, error, error_cap, true);
+    return ds4_image_preprocess_deepseek(out, image, error, error_cap,
+                                         DS4_DEEPSEEK41_IMAGE_TOKENS_DEFAULT, true);
 }
+
+int ds4_image_preprocess_deepseek4_budget(
+        ds4_deepseek4_image_patches *out, const ds4_image *image,
+        uint32_t max_tokens, char *error, size_t error_cap) {
+    return ds4_image_preprocess_deepseek(out, image, error, error_cap, max_tokens, false);
+}
+
+int ds4_image_preprocess_deepseek41_budget(
+        ds4_deepseek4_image_patches *out, const ds4_image *image,
+        uint32_t max_tokens, char *error, size_t error_cap) {
+    return ds4_image_preprocess_deepseek(out, image, error, error_cap, max_tokens, true);
+}
+
+uint32_t ds4_image_deepseek_token_cost(uint32_t width, uint32_t height,
+                                       uint32_t max_tokens, int v41) {
+    if (!width || !height) return 0;
+    if (!v41 && (uint64_t)width > (uint64_t)height * 8u) width = height * 8u;
+    const uint32_t min_pixels = v41 ? 295936u : 147456u;
+    if ((uint64_t)width * height < min_pixels) {
+        const double scale = sqrt((double)min_pixels / ((double)width * height));
+        width = (uint32_t)(width * scale);
+        height = (uint32_t)(height * scale);
+        if (!width) width = 1;
+        if (!height) height = 1;
+    }
+    uint32_t bw = ds4_align_u32(width, 14u), bh = ds4_align_u32(height, 14u);
+    uint32_t lh = 0, lw = 0;
+    if (max_tokens == 0) max_tokens = v41 ? DS4_DEEPSEEK41_IMAGE_TOKENS_DEFAULT
+                                          : DS4_DEEPSEEK4_IMAGE_TOKENS_DEFAULT;
+    const uint32_t limit = ds4_deepseek4_limit_budget(bh, bw, v41 != 0);
+    if (max_tokens > limit) max_tokens = limit;
+    if (!ds4_deepseek4_safe_resize(height, width, &bh, &bw, &lh, &lw, max_tokens, v41 != 0))
+        return 0;
+    return ds4_deepseek4_grid_tokens(bh, bw, NULL, NULL, v41 != 0);
+}
+
+/* Grid sanity bound for prompt layouts: far above any budget the decoded-image limits
+ * allow (64 MP / 42^2 px per token ~ 38k tokens), well below allocation overflow. */
+#define DS4_DEEPSEEK41_MAX_LAYOUT_TOKENS (1u << 22)
 
 int ds4_deepseek41_image_layout_build(
         ds4_deepseek4_image_layout *out, uint32_t height, uint32_t width,
@@ -889,7 +962,7 @@ int ds4_deepseek41_image_layout_build(
     if (!out) return 0;
     memset(out, 0, sizeof(*out));
     const uint64_t count = (uint64_t)height * ((uint64_t)width + 1u) + 2u;
-    if (!height || !width || count > 1024u) {
+    if (!height || !width || count > DS4_DEEPSEEK41_MAX_LAYOUT_TOKENS) {
         ds4_image_error(error, error_cap, "invalid V4.1 image token grid");
         return 0;
     }

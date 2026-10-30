@@ -441,6 +441,7 @@ typedef struct {
     char marker[SERVER_IMAGE_MARKER_BYTES];
     uint8_t *encoded;
     size_t encoded_len;
+    uint32_t max_tokens;     /* per-image budget; 0 = server/engine default */
 } server_image_input;
 
 typedef struct {
@@ -1940,7 +1941,47 @@ bad:
     return false;
 }
 
+/* Per-image token budget from OpenAI's "detail" or the ds4 extension "max_tokens"
+ * (a number or "native"). "low" caps the image at 256 tokens; "native"/"original"
+ * lifts the cap; "high" and "auto" keep the server default (--vision-max-tokens),
+ * so clients that always send "high" do not change cost unless the operator opts
+ * in. 0 = server default. */
+#define SERVER_IMAGE_DETAIL_LOW_TOKENS 256u
+static uint32_t server_image_budget_from_detail(const char *detail) {
+    if (!detail) return 0;
+    if (!strcmp(detail, "low")) return SERVER_IMAGE_DETAIL_LOW_TOKENS;
+    if (!strcmp(detail, "native") || !strcmp(detail, "original"))
+        return DS4_VISION_BUDGET_NATIVE;
+    return 0;
+}
+
+static bool parse_image_budget_value(const char **p, uint32_t *budget) {
+    json_ws(p);
+    if (**p == '"') {
+        char *s = NULL;
+        if (!json_string(p, &s)) return false;
+        *budget = server_image_budget_from_detail(s);
+        free(s);
+        return true;
+    }
+    char *raw = NULL;
+    if (!json_raw_value(p, &raw)) return false;
+    char *end = NULL;
+    const unsigned long long v = strtoull(raw, &end, 10);
+    const bool ok = end && end != raw && v > 0;
+    if (ok) *budget = v >= UINT32_MAX ? DS4_VISION_BUDGET_NATIVE : (uint32_t)v;
+    free(raw);
+    return ok;
+}
+
+static bool parse_image_url_value_budget(const char **p, char **url, uint32_t *budget);
+
 static bool parse_image_url_value(const char **p, char **url) {
+    uint32_t ignored = 0;
+    return parse_image_url_value_budget(p, url, &ignored);
+}
+
+static bool parse_image_url_value_budget(const char **p, char **url, uint32_t *budget) {
     json_ws(p);
     if (**p == '"') return json_string(p, url);
     if (**p != '{') return false;
@@ -1963,6 +2004,8 @@ static bool parse_image_url_value(const char **p, char **url) {
                 free(*url);
                 *url = next;
             }
+        } else if (!strcmp(key, "detail") || !strcmp(key, "max_tokens")) {
+            ok = parse_image_budget_value(p, budget);
         } else {
             ok = json_skip_value(p);
         }
@@ -1983,6 +2026,7 @@ static bool parse_openai_content_object(const char **p, chat_msg *msg) {
     char *type = NULL;
     char *text = NULL;
     char *image_url = NULL;
+    uint32_t image_budget = 0;   /* "detail" may sit beside image_url (Responses API) */
     json_ws(p);
     while (**p && **p != '}') {
         char *key = NULL;
@@ -2001,8 +2045,10 @@ static bool parse_openai_content_object(const char **p, chat_msg *msg) {
         else if (!strcmp(key, "image_url")) {
             free(image_url);
             image_url = NULL;
-            ok = parse_image_url_value(p, &image_url);
-        } else
+            ok = parse_image_url_value_budget(p, &image_url, &image_budget);
+        } else if (!strcmp(key, "detail") || !strcmp(key, "max_tokens"))
+            ok = parse_image_budget_value(p, &image_budget);
+        else
             ok = json_skip_value(p);
         free(key);
         if (!ok) goto bad;
@@ -2017,6 +2063,7 @@ static bool parse_openai_content_object(const char **p, chat_msg *msg) {
         char marker[SERVER_IMAGE_MARKER_BYTES];
         if (!server_image_inputs_push_data_uri(&msg->images, image_url, marker))
             goto bad;
+        msg->images.v[msg->images.len - 1].max_tokens = image_budget;
         append_owned_text(&msg->content, marker);
     } else if (text) {
         append_owned_text(&msg->content, text);
@@ -3657,6 +3704,8 @@ static DS4_SERVER_MAYBE_UNUSED char *render_chat_prompt_text(
                                               tool_orders, think_mode);
 }
 
+static int server_max_images(const server *s);
+
 static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
                                                request *r,
                                                const chat_msgs *msgs,
@@ -3667,8 +3716,10 @@ static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
         ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
         return true;
     }
-    if (count > 16) {
-        snprintf(err, errlen, "too many images; at most 16 are allowed");
+    const int max_images = server_max_images(s);
+    if (max_images > 0 && count > (size_t)max_images) {
+        snprintf(err, errlen, "too many images; at most %d are allowed (--max-images)",
+                 max_images);
         return false;
     }
     if (!e || !s || !ds4_engine_has_vision(e)) {
@@ -10062,6 +10113,7 @@ struct server_slot {
 typedef struct {
     uint8_t *encoded;
     size_t encoded_len;
+    uint32_t max_tokens;     /* budget the embedding was made at (part of the key) */
     ds4_vision_embedding embedding;
     size_t data_bytes;
     uint64_t used;
@@ -10093,6 +10145,7 @@ static bool server_image_cache_get(server_image_cache *cache,
     for (size_t i = 0; i < SERVER_IMAGE_CACHE_ENTRIES; i++) {
         server_image_cache_entry *entry = &cache->entries[i];
         if (!entry->encoded || entry->encoded_len != input->encoded_len ||
+            entry->max_tokens != input->max_tokens ||
             memcmp(entry->encoded, input->encoded, input->encoded_len)) continue;
         float *data = malloc(entry->data_bytes);
         if (!data) return false;
@@ -10144,6 +10197,7 @@ static void server_image_cache_put(server_image_cache *cache,
     memcpy(data, embedding->data, (size_t)bytes);
     *dest = (server_image_cache_entry) {
         .encoded = encoded, .encoded_len = input->encoded_len,
+        .max_tokens = input->max_tokens,
         .embedding = *embedding, .data_bytes = (size_t)bytes,
         .used = ++cache->clock,
     };
@@ -10176,6 +10230,7 @@ struct server {
     pthread_cond_t model_cv;
     bool model_busy;
     bool qwen4_batch_mtp;
+    int max_images;          /* images per request; 0 = unlimited (--max-images) */
     bool model_stopping;
     int decode_pending;
     int active_generations;
@@ -10193,6 +10248,10 @@ struct server {
     uint64_t trace_seq;
 };
 
+static int server_max_images(const server *s) {
+    return s ? s->max_images : 16;
+}
+
 static void server_inference_lock(server *s) {
     pthread_mutex_lock(&s->inference_mu);
 }
@@ -10209,8 +10268,9 @@ static bool server_encode_image(server *s, const server_image_input *input,
         server_log(DS4_LOG_KVCACHE, "ds4-server: vision embedding cache hit");
         return true;
     }
-    if (!ds4_engine_vision_encode_memory(s->engine, input->encoded,
-                                         input->encoded_len, out, err, errlen))
+    if (!ds4_engine_vision_encode_memory_budget(s->engine, input->encoded,
+                                                input->encoded_len, input->max_tokens,
+                                                out, err, errlen))
         return false;
     /* Row width must match the encoder's allocation: the mmproj projection
      * dim is validated to equal the model's n_embd at load (Qwen3.8 is
@@ -10218,8 +10278,8 @@ static bool server_encode_image(server *s, const server_image_input *input,
     server_image_cache_put(&s->image_cache, input, out,
                             (uint32_t)ds4_engine_embd_dim(s->engine),
                             SERVER_IMAGE_CACHE_BYTES);
-    server_log(DS4_LOG_KVCACHE, "ds4-server: vision embedding encoded; cache=%zu bytes",
-               s->image_cache.bytes);
+    server_log(DS4_LOG_KVCACHE, "ds4-server: vision embedding encoded; tokens=%u grid=%ux%u cache=%zu bytes",
+               out->token_count, out->grid_width, out->grid_height, s->image_cache.bytes);
     return true;
 }
 
@@ -15453,6 +15513,8 @@ typedef struct {
     bool enable_cors;
     int batched_sessions;
     int mixed_prefill_quantum;
+    uint32_t vision_max_tokens;   /* default image budget; 0 = model's, UINT32_MAX = native */
+    int max_images;               /* images per request; 0 = unlimited */
 } server_config;
 
 static int parse_int_arg(const char *s, const char *opt) {
@@ -15601,6 +15663,7 @@ static server_config parse_options(int argc, char **argv) {
         .ctx_size = 32768,
         .default_tokens = 393216,
         .tool_memory_max_ids = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS,
+        .max_images = 16,
         .mixed_prefill_quantum = 128,
     };
     c.kv_cache = kv_cache_default_options();
@@ -15653,6 +15716,23 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--vision")) {
             c.engine.vision_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--vision-max-tokens")) {
+            const char *v = need_arg(&i, argc, argv, arg);
+            if (!strcmp(v, "native") || !strcmp(v, "auto") || !strcmp(v, "unlimited"))
+                c.vision_max_tokens = DS4_VISION_BUDGET_NATIVE;
+            else if (!strcmp(v, "model") || !strcmp(v, "default"))
+                c.vision_max_tokens = 0;
+            else
+                c.vision_max_tokens = (uint32_t)parse_int_arg(v, arg);
+        } else if (!strcmp(arg, "--max-images")) {
+            const char *v = need_arg(&i, argc, argv, arg);
+            char *end = NULL;
+            const long n = strtol(v, &end, 10);
+            if (!end || *end || n < 0 || n > INT_MAX) {
+                fprintf(stderr, "ds4-server: invalid value for %s: %s (0 = unlimited)\n", arg, v);
+                exit(2);
+            }
+            c.max_images = (int)n;
         } else if (!strcmp(arg, "--mtp")) {
             c.engine.glm_mtp = true;
         } else if (!strcmp(arg, "--mtp-model")) {
@@ -15958,6 +16038,8 @@ int main(int argc, char **argv) {
     server s = {0};
     s.engine = engine;
     s.tp_leader = tp_leader;
+    s.max_images = cfg.max_images;
+    if (cfg.vision_max_tokens) ds4_engine_set_vision_max_tokens(engine, cfg.vision_max_tokens);
     s.ctx_size = cfg.ctx_size;
     s.slot_count = slot_count;
     s.batched_mode = cfg.batched_sessions > 0;

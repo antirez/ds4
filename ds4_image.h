@@ -104,6 +104,32 @@ int ds4_image_preprocess_deepseek41(
         ds4_deepseek4_image_patches *out, const ds4_image *image,
         char *error, size_t error_cap);
 
+/* Image token budgets. The model ships a default (deepseek4-vision.image.max_tokens:
+ * 1024 for V4.1, 381 for V4); nothing in the encoder architecture caps it (2D RoPE is
+ * computed per grid). DS4_IMAGE_BUDGET_NATIVE keeps the image at its native resolution
+ * (aligned to 14 px), bounded only by the decoded-image limits below. */
+#define DS4_IMAGE_BUDGET_NATIVE UINT32_MAX
+#define DS4_DEEPSEEK41_IMAGE_TOKENS_DEFAULT 1024u
+#define DS4_DEEPSEEK4_IMAGE_TOKENS_DEFAULT 381u
+
+/* Same as the functions above with an explicit budget: the image is shrunk until it
+ * costs at most max_tokens LLM tokens (DS4_IMAGE_BUDGET_NATIVE: never shrunk). */
+int ds4_image_preprocess_deepseek4_budget(
+        ds4_deepseek4_image_patches *out, const ds4_image *image,
+        uint32_t max_tokens, char *error, size_t error_cap);
+int ds4_image_preprocess_deepseek41_budget(
+        ds4_deepseek4_image_patches *out, const ds4_image *image,
+        uint32_t max_tokens, char *error, size_t error_cap);
+
+/* Re-key an image fingerprint by the patch grid an embedding was produced at, so
+ * embeddings of the same image at different budgets never share a cache identity. */
+void ds4_image_fingerprint_with_grid(uint8_t fingerprint[32], uint32_t grid_h, uint32_t grid_w);
+
+/* LLM tokens a DeepSeek image would cost at a given budget, without preprocessing
+ * (0 on failure). Lets callers plan context and video frame budgets. */
+uint32_t ds4_image_deepseek_token_cost(uint32_t width, uint32_t height,
+                                       uint32_t max_tokens, int v41);
+
 int ds4_deepseek41_image_layout_build(
         ds4_deepseek4_image_layout *out, uint32_t height, uint32_t width,
         char *error, size_t error_cap);

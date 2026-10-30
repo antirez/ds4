@@ -149,6 +149,8 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     opt(fp, c, "-m, --model FILE", "GGUF model path. Default: ds4flash.gguf");
     if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT || tool == DS4_HELP_SERVER) {
         opt(fp, c, "--vision FILE", "Vision encoder GGUF for the selected model.");
+        opt(fp, c, "--vision-max-tokens N|native", "Default image token budget (default: the model's, 1024 for V4.1). native = no downscaling. Per image: image_url.detail = low (256) or native, or image_url.max_tokens = N|native.");
+        opt(fp, c, "--max-images N", "Images allowed per request (default 16, 0 = unlimited).");
     }
 #ifdef DS4_ROCM_BUILD
     opt(fp, c, "--metal | --rocm | --cpu", "Select the backend explicitly.");
