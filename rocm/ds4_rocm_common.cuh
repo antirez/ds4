@@ -318,8 +318,18 @@ __global__ static void matmul_f32_kernel(
     float sum = 0.0f;
     const float *wr = w + row * in_dim;
     const float *xr = x + tok * in_dim;
-    for (uint64_t i = threadIdx.x; i < in_dim; i += blockDim.x) {
-        sum += wr[i] * xr[i];
+    if ((in_dim & 3u) == 0u) {
+        /* float4 loads: the 4096x288 GLM router read at ~130 GB/s scalar. */
+        const float4 *w4 = (const float4 *)wr;
+        const float4 *x4 = (const float4 *)xr;
+        for (uint64_t i = threadIdx.x; i < (in_dim >> 2u); i += blockDim.x) {
+            const float4 a = w4[i], b = x4[i];
+            sum += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+        }
+    } else {
+        for (uint64_t i = threadIdx.x; i < in_dim; i += blockDim.x) {
+            sum += wr[i] * xr[i];
+        }
     }
 
     __shared__ float partial[256];

@@ -100,6 +100,22 @@ int ds4_dist_session_eval(
         char *err,
         size_t errlen);
 
+/* Legacy-MTP speculative decode cycle over the pipeline split.  Decodes
+ * first_token, then drafts, verifies, and commits as many follow-up tokens
+ * as the worker's MTP head and the target model agree on.  Requires the
+ * --mtp support model and --mtp-draft >= 2 on both machines; otherwise
+ * callers should use the ordinary per-token path. */
+int ds4_dist_session_mtp_spec_cycle(
+        ds4_dist_session *d,
+        ds4_session *owner,
+        int first_token,
+        int max_tokens,
+        int eos_token,
+        int *accepted,
+        int accepted_cap,
+        char *err,
+        size_t errlen);
+
 /* Save/load use the normal DSV4 payload format. The coordinator gathers or
  * pushes remote layer shards internally so saved files are topology-neutral.
  */
