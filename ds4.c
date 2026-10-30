@@ -527,6 +527,7 @@ typedef enum {
     DS4_MODEL_FAMILY_GLM_DSA   = 1,
     DS4_MODEL_FAMILY_DEEPSEEK41 = 2,
     DS4_MODEL_FAMILY_QWEN4_EXP = 3,
+    DS4_MODEL_FAMILY_QWEN35MOE = 4,
 } ds4_model_family;
 
 typedef enum {
@@ -537,6 +538,9 @@ typedef enum {
     DS4_VARIANT_FLASH41 = 4,
     DS4_VARIANT_QWEN4_EXP = 5,
     DS4_VARIANT_QWEN4_MINI = 6,
+    DS4_VARIANT_QWEN36 = 7,
+    DS4_VARIANT_ORNITH = 8,
+    DS4_VARIANT_QWEN35MOE = 9,
 } ds4_variant;
 
 typedef struct {
@@ -1008,6 +1012,57 @@ static bool ds4_glm53_layer_is_kda(uint32_t il) {
 
 static bool ds4_model_is_qwen4(void) {
     return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4_EXP;
+}
+
+static bool ds4_model_is_qwen35moe(void) {
+    return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35MOE;
+}
+static bool ds4_model_is_qwen_chat(void) {
+    return ds4_model_is_qwen4() || ds4_model_is_qwen35moe();
+}
+typedef struct qwen35moe_weights qwen35moe_weights;
+typedef struct qwen35moe_state qwen35moe_state;
+/* fstat identity of this local GGUF; serialized as seven little-endian u64s. */
+typedef struct { uint64_t field[7]; } qwen35moe_file_identity;
+static uint32_t qwen35moe_prefill_chunk(void);
+static int qwen35moe_routed_quant_bits(const qwen35moe_weights *w);
+#define DS4_MAX_THREADS 32
+static uint32_t g_requested_threads;
+static uint32_t ds4_cpu_thread_count(void) {
+    uint32_t n_threads = 12;
+    const long online_cpus = sysconf(_SC_NPROCESSORS_ONLN);
+    if (online_cpus > 0)
+        n_threads = online_cpus < 12 ? (uint32_t)online_cpus : 12;
+    const char *env = getenv("DS4_THREADS");
+    if (env && env[0]) {
+        long value = strtol(env, NULL, 10);
+        if (value > 0) n_threads = (uint32_t)value;
+    }
+    if (g_requested_threads > 0) n_threads = g_requested_threads;
+    if (n_threads > DS4_MAX_THREADS) n_threads = DS4_MAX_THREADS;
+    return n_threads ? n_threads : 1;
+}
+static ds4_context_memory qwen35moe_context_memory(uint32_t ctx) {
+    ds4_context_memory m = {0};
+    m.prefill_cap = qwen35moe_prefill_chunk();
+    m.raw_cap = ctx;
+    m.raw_bytes = 10ull * ctx * 512u * 2u * sizeof(uint16_t) +
+        30ull * 32u * 128u * 128u * sizeof(float) +
+        30ull * 3u * 8192u * sizeof(float);
+    m.scratch_bytes = (2ull * DS4_N_VOCAB + 5u * 2048u + 2u * 8192u +
+        2u * 4096u + 2u * 32u + 256u + 2u * 512u +
+        (uint64_t)m.prefill_cap * (2048u + 2048u + 8192u + 4096u + 1024u + 32u + 32u +
+                4096u + 2048u + 256u + 512u + 512u + 2048u + 2048u +
+                8u * 2048u)) * sizeof(float) +
+        ((uint64_t)m.prefill_cap + 1u) * sizeof(uint64_t) * 32u * 292u / 8u + 256u * 1024u;
+    /* Expert workers allocate their own bounded activation and intermediate
+     * rows. Attention tiles and transient Q4_K panels use less than the
+     * 64 KiB per-worker allowance below and run at different stages. */
+    m.scratch_bytes += (uint64_t)ds4_cpu_thread_count() *
+        ((uint64_t)m.prefill_cap * ((2048u + 512u + 512u + 2048u) * sizeof(float) +
+                 sizeof(uint64_t) * 32u * 292u / 8u) + 64u * 1024u);
+    m.total_bytes = m.raw_bytes + m.scratch_bytes;
+    return m;
 }
 
 /* Trunk layers repeat 3 GDN + 1 full attention; the MTP block is attention. */
@@ -2078,8 +2133,6 @@ static void cpu_directional_steering_project_rows(
 
 typedef void (*ds4_parallel_fn)(void *ctx, uint64_t row0, uint64_t row1);
 
-#define DS4_MAX_THREADS 32
-
 typedef struct {
     pthread_t threads[DS4_MAX_THREADS];
     pthread_mutex_t mutex;
@@ -2098,7 +2151,6 @@ typedef struct {
 
 static ds4_thread_pool g_pool;
 static __thread int g_parallel_depth;
-static uint32_t g_requested_threads;
 
 static void *ds4_worker_main(void *arg) {
     const uint32_t tid = (uint32_t)(uintptr_t)arg;
@@ -2147,20 +2199,7 @@ static void ds4_threads_init(void) {
 
     pthread_once(&iq2xxs_signed_grid_once, iq2xxs_signed_grid_init);
 
-    uint32_t n_threads = 12;
-    const long online_cpus = sysconf(_SC_NPROCESSORS_ONLN);
-    if (online_cpus > 0) {
-        n_threads = online_cpus < 12 ? (uint32_t)online_cpus : 12;
-    }
-
-    const char *env = getenv("DS4_THREADS");
-    if (env && env[0]) {
-        long v = strtol(env, NULL, 10);
-        if (v > 0) n_threads = (uint32_t)v;
-    }
-    if (g_requested_threads > 0) n_threads = g_requested_threads;
-    if (n_threads > DS4_MAX_THREADS) n_threads = DS4_MAX_THREADS;
-    if (n_threads == 0) n_threads = 1;
+    uint32_t n_threads = ds4_cpu_thread_count();
 
     pthread_mutex_init(&g_pool.mutex, NULL);
     pthread_cond_init(&g_pool.work_cond, NULL);
@@ -7153,10 +7192,16 @@ static void config_validate_qwen4_model(const ds4_model *m) {
     }
 }
 
+static void qwen35moe_validate(const ds4_model *m);
+
 static void config_validate_model(const ds4_model *m) {
     g_ds4_flash_vision_exp = false;
     ds4_str arch = {0};
     if (model_get_string(m, "general.architecture", &arch)) {
+        if (ds4_streq(arch, "qwen35moe")) {
+            qwen35moe_validate(m);
+            return;
+        }
         if (ds4_streq(arch, "deepseek41")) {
             config_validate_deepseek41_model(m);
             return;
@@ -40425,6 +40470,7 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
         bool        ssd_streaming) {
     ds4_context_memory m = {0};
     uint32_t ctx = ctx_size > 0 ? (uint32_t)ctx_size : 1u;
+    if (ds4_model_is_qwen35moe()) return qwen35moe_context_memory(ctx);
     if (ds4_backend_uses_graph(backend) && ds4_model_is_qwen4()) {
         /* per-token f16 K/V and raw indexer keys per attention layer, pooled
          * block keys, rope positions; transients scale with the prefill chunk */
@@ -43176,6 +43222,11 @@ typedef enum {
 } ds4_vision_kind;
 
 struct ds4_engine {
+    qwen35moe_weights *qwen35moe_weights;
+    const char *qwen35moe_model_name;
+    uint32_t qwen35moe_model_variant;
+    qwen35moe_file_identity qwen35moe_model_identity;
+    bool qwen35moe_model_invalid; /* Sticky after detected file changes; reopening clears it. */
     char *model_path;
     uint64_t ds41_session_bytes;
     ds4_model model;
@@ -44160,7 +44211,7 @@ static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_ve
         bpe_tokenize_text_glm4(vocab, text, out);
         return;
     }
-    if (ds4_model_is_qwen4()) {
+    if (ds4_model_is_qwen_chat()) {
         bpe_tokenize_text_qwen35(vocab, text, out);
         return;
     }
@@ -44287,7 +44338,7 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
     vocab->im_end_id = -1;
     vocab->endoftext_id = -1;
 
-    if (ds4_model_is_qwen4()) {
+    if (ds4_model_is_qwen_chat()) {
         /* ChatML without BOS; <|endoftext|> is the document separator and a
          * second generation stop. */
         vocab->im_start_id = vocab_lookup(vocab, "<|im_start|>");
@@ -44414,7 +44465,7 @@ static void chat_push_think_prefix(const ds4_vocab *vocab,
             token_vec_push(out, vocab->system_id);
             bpe_tokenize_text(vocab, effort, out);
         }
-    } else if (think_mode == DS4_THINK_MAX) {
+    } else if (!ds4_model_is_qwen_chat() && think_mode == DS4_THINK_MAX) {
         bpe_tokenize_text(vocab, DS4_REASONING_EFFORT_MAX_PREFIX, out);
     }
 }
@@ -44455,7 +44506,7 @@ static void qwen4_chat_assistant_prefix(const ds4_vocab *vocab, ds4_think_mode t
 }
 
 static void qwen4_chat_system(const ds4_vocab *vocab, const char *system, ds4_think_mode think_mode, token_vec *out) {
-    const char *instruction = ds4_qwen4_reasoning_effort_text(think_mode);
+    const char *instruction = ds4_model_is_qwen35moe() ? NULL : ds4_qwen4_reasoning_effort_text(think_mode);
     const bool have_system = system && system[0];
     if (!instruction && !have_system) return;
     qwen4_chat_open(vocab, "system", out);
@@ -44473,7 +44524,7 @@ static void encode_chat_prompt(
         const char      *prompt,
         ds4_think_mode   think_mode,
         token_vec       *out) {
-    if (ds4_model_is_qwen4()) {
+    if (ds4_model_is_qwen_chat()) {
         if (vocab->im_start_id < 0 || vocab->im_end_id < 0 ||
             vocab->think_start_id < 0 || vocab->think_end_id < 0) {
             ds4_die("this tokenizer does not provide the Qwen chat markers; use raw prompt tokenization");
@@ -44670,7 +44721,7 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
     if (!role) role = "user";
     if (!content) content = "";
 
-    if (ds4_model_is_qwen4()) {
+    if (ds4_model_is_qwen_chat()) {
         if (!strcmp(role, "tool") || !strcmp(role, "function")) {
             qwen4_chat_open(vocab, "user", tokens);
             bpe_tokenize_text(vocab, "<tool_response>\n", tokens);
@@ -44736,7 +44787,7 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
 }
 
 void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode think_mode) {
-    if (ds4_model_is_qwen4()) {
+    if (ds4_model_is_qwen_chat()) {
         qwen4_chat_assistant_prefix(&e->vocab, think_mode, tokens);
         return;
     }
@@ -60497,6 +60548,7 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
     (void)ssd_streaming;
     ds4_context_memory m = {0};
     uint32_t ctx = ctx_size > 0 ? (uint32_t)ctx_size : 1u;
+    if (ds4_model_is_qwen35moe()) return qwen35moe_context_memory(ctx);
 
     m.raw_cap = ds4_default_raw_cap(ctx);
     m.raw_bytes = (uint64_t)DS4_N_LAYER *
@@ -61218,6 +61270,7 @@ typedef struct {
 } ds4_vision_identity;
 
 struct ds4_session {
+    qwen35moe_state *qwen35moe_state;
     ds4_engine *engine;
     ds4_dist_session *distributed;
     uint64_t tp_session_id;
@@ -62390,7 +62443,17 @@ static uint64_t session_cpu_payload_live_tensor_bytes(const ds4_session *s) {
     return bytes;
 }
 
+static void qwen35moe_state_reset(qwen35moe_state *st);
+static bool ds4_session_cancelled(ds4_session *s);
+static uint64_t qwen35moe_payload_bytes(const ds4_session *s);
+static int qwen35moe_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen);
+static int qwen35moe_load_payload(ds4_session *s, FILE *fp, uint64_t bytes, char *err, size_t errlen);
+
 static void session_cpu_reset_cache(ds4_session *s) {
+    if (s->qwen35moe_state) {
+        qwen35moe_state_reset(s->qwen35moe_state);
+        return;
+    }
     kv_cache_free(&s->cpu_cache);
     kv_cache_init(&s->cpu_cache, (uint32_t)s->ctx_size, 0);
 }
@@ -63209,6 +63272,7 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
 
 int ds4_engine_routed_quant_bits(ds4_engine *e) {
     if (!e) return 0;
+    if (e->qwen35moe_weights) return qwen35moe_routed_quant_bits(e->qwen35moe_weights);
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const ds4_tensor *gate = e->weights.layer[il].ffn_gate_exps;
         if (!gate) continue;
@@ -63219,7 +63283,7 @@ int ds4_engine_routed_quant_bits(ds4_engine *e) {
 }
 
 bool ds4_engine_has_output_head(ds4_engine *e) {
-    return e && weights_have_output_head(&e->weights);
+    return e && (e->qwen35moe_weights || weights_have_output_head(&e->weights));
 }
 
 #ifndef DS4_NO_GPU
@@ -63561,6 +63625,7 @@ static uint64_t qwen4_payload_tensor_bytes(uint32_t rows, uint32_t mtp_rows);
 #endif
 
 uint64_t ds4_session_payload_bytes(ds4_session *s) {
+    if (s && s->qwen35moe_state) return qwen35moe_payload_bytes(s);
     if (s && !s->distributed && ds4_session_is_qwen4(s)) {
 #ifndef DS4_HAS_QWEN4_GPU
         return 0;
@@ -63946,6 +64011,7 @@ static int qwen4_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *
 #endif
 
 int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
+    if (s && s->qwen35moe_state) return qwen35moe_save_payload(s, fp, err, errlen);
     if (!s || !fp || !s->checkpoint_valid) {
         payload_set_err(err, errlen, "session has no valid checkpoint to save");
         return 1;
@@ -64297,6 +64363,8 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
 }
 
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen) {
+    if (s && s->qwen35moe_state)
+        return qwen35moe_load_payload(s, fp, payload_bytes, err, errlen);
     if (!s || !fp) {
         payload_set_err(err, errlen, "invalid session payload load");
         return 1;
@@ -66144,6 +66212,49 @@ int ds4_engine_generate_argmax(
         void              *emit_ud,
         ds4_session_progress_fn progress,
         void              *progress_ud) {
+    if (e->qwen35moe_weights) {
+        ds4_session *s = NULL;
+        char err[256] = {0};
+        if (ds4_session_create(&s, e, ctx_size))
+            return 1;
+        ds4_session_set_progress(s, progress, progress_ud);
+        double started = now_sec();
+        int rc = ds4_session_sync(s, prompt, err, sizeof(err));
+        double prefill = now_sec() - started;
+        started = now_sec();
+        int generated = 0;
+        /* The final available emission has no following eval to advance the
+         * checkpoint. Bound the loop so its unchanged position cannot repeat
+         * that token once the context is full. */
+        int generation_room = ctx_size - ds4_session_pos(s);
+        if (n_predict > generation_room) n_predict = generation_room;
+        if (!rc)
+            for (int i = 0; i < n_predict && ds4_session_pos(s) < ctx_size; i++) {
+                int token = ds4_session_argmax(s);
+                if (token < 0) {
+                    rc = 1;
+                    break;
+                }
+                if (ds4_token_is_stop(e, token))
+                    break;
+                if (emit)
+                    emit(emit_ud, token);
+                generated++;
+                if (i + 1 < n_predict && ds4_session_pos(s) + 1 < ctx_size)
+                    if (ds4_session_eval(s, token, err, sizeof(err))) {
+                        rc = 1;
+                        break;
+                    }
+            }
+        if (done)
+            done(emit_ud);
+        if (rc)
+            fprintf(stderr, "ds4: qwen35moe generation failed: %s\n", err);
+        ds4_log(stderr, DS4_LOG_TIMING, "ds4: prefill: %.2f t/s, generation: %.2f t/s\n",
+                prefill > 0 ? prompt->len / prefill : 0, generated / (now_sec() - started));
+        ds4_session_free(s);
+        return rc;
+    }
     const ds4_model *model = &e->model;
     const ds4_vocab *vocab = &e->vocab;
     const ds4_weights *weights = &e->weights;
@@ -67928,6 +68039,10 @@ static int glm_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt) {
 #endif
 
 static bool engine_legacy_graph_test_supported(ds4_engine *e) {
+    if (e && e->qwen35moe_weights) {
+        fprintf(stderr, "ds4: qwen35moe CPU diagnostics use session logits; legacy graph tests are unsupported\n");
+        return false;
+    }
     if (!ds4_engine_is_deepseek41(e)) return true;
     fprintf(stderr, "ds4: legacy graph diagnostics do not implement DeepSeek V4.1; use session logits instead\n");
     return false;
@@ -69094,6 +69209,8 @@ static int qwen4_first_token_test(const ds4_model *model, const ds4_vocab *vocab
     free(seq);
     return 0;
 }
+
+#include "ds4_qwen35moe_cpu.inc"
 
 int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt) {
     if (!engine_legacy_graph_test_supported(e)) return 1;
@@ -71911,6 +72028,41 @@ static int ds4_engine_open_internal(ds4_engine **out,
         return 1;
     }
     config_validate_model(&e->model);
+    if (ds4_model_is_qwen35moe()) {
+        if (e->backend != DS4_BACKEND_CPU || e->ssd_streaming || e->glm_mtp || e->dspark ||
+            opt->vision_path || opt->mtp_path || load_slice ||
+            e->distributed.role != DS4_DISTRIBUTED_NONE || opt->tp.role != DS4_TP_NONE ||
+            e->cuda_tensor_parallel || (gpu_cfg && gpu_cfg->n_gpus) || e->power_percent != 100 ||
+            opt->directional_steering_file || opt->first_token_test) {
+            fprintf(stderr,
+                    "ds4: qwen35moe currently supports CPU text generation only; use --cpu\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        if (qwen35moe_file_identity_read(&e->model, &e->qwen35moe_model_identity)) {
+            fprintf(stderr, "ds4: cannot identify the mapped qwen35moe model file\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        e->qwen35moe_model_name = g_ds4_shape.name;
+        e->qwen35moe_model_variant = g_ds4_shape.variant;
+        e->qwen35moe_weights = qwen35moe_bind(&e->model);
+        e->model_path = strdup(opt->model_path);
+        vocab_load(&e->vocab, &e->model);
+        if (engine_warm_full_model(opt)) qwen35moe_warm_text_weights(&e->model, e->qwen35moe_weights);
+        char identity_err[128];
+        if (qwen35moe_file_identity_check(e, identity_err, sizeof(identity_err))) {
+            fprintf(stderr, "ds4: %s\n", identity_err);
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        e->prefill_chunk = qwen35moe_prefill_chunk();
+        *out = e;
+        return 0;
+    }
     if (ds4_model_is_qwen4() && !opt->inspect_only) {
         const bool backend_ok =
 #ifdef DS4_HAS_QWEN4_GPU
@@ -73189,12 +73341,16 @@ int ds4_engine_power(ds4_engine *e) {
 
 int ds4_engine_set_power(ds4_engine *e, int power_percent) {
     if (!e || power_percent < 1 || power_percent > 100) return 1;
+    if (e->qwen35moe_weights && power_percent != 100) {
+        fprintf(stderr, "ds4: qwen35moe CPU power throttling is unsupported\n");
+        return 1;
+    }
     e->power_percent = power_percent;
     return 0;
 }
 
 const char *ds4_engine_model_name(ds4_engine *e) {
-    (void)e;
+    if (e && e->qwen35moe_model_name) return e->qwen35moe_model_name;
     return DS4_MODEL_SHAPE_NAME;
 }
 
@@ -73251,13 +73407,17 @@ bool ds4_engine_glm_layer_payload_bytes(ds4_engine *e,
 }
 
 int ds4_engine_model_id(ds4_engine *e) {
-    (void)e;
+    if (e && e->qwen35moe_model_name) return (int)e->qwen35moe_model_variant;
     return (int)DS4_MODEL_VARIANT;
 }
 
 bool ds4_engine_is_glm53(ds4_engine *e) {
     (void)e;
     return ds4_model_is_glm53();
+}
+
+bool ds4_engine_is_qwen35moe(ds4_engine *e) {
+    return e && e->qwen35moe_weights != NULL;
 }
 
 bool ds4_engine_is_qwen4(ds4_engine *e) {
@@ -73333,6 +73493,11 @@ int ds4_engine_embd_dim(ds4_engine *e) {
 
 uint64_t ds4_engine_model_bytes(ds4_engine *e) {
     return e->model.size;
+}
+
+uint64_t ds4_engine_text_model_bytes(ds4_engine *e) {
+    if (!e) return 0;
+    return e->qwen35moe_weights ? qwen35moe_text_model_bytes(&e->model, e->qwen35moe_weights) : e->model.size;
 }
 
 bool ds4_engine_has_vision(ds4_engine *e) {
@@ -74113,6 +74278,7 @@ void ds4_engine_close(ds4_engine *e) {
     }
 #endif
     ds4_expert_profile_close();
+    free(e->qwen35moe_weights);
     weights_free(&e->weights);
     vocab_free(&e->vocab);
     ds4_threads_shutdown();
@@ -74282,6 +74448,21 @@ static int ds4_session_tp_register(ds4_session *s) {
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     if (!out || !e || ctx_size <= 0) return 1;
     if (e->backend == DS4_BACKEND_CPU) {
+        if (e->qwen35moe_weights) {
+            if (ctx_size > 262144) {
+                fprintf(stderr, "ds4: qwen35moe context exceeds native limit\n");
+                return 1;
+            }
+            ds4_session *s = xcalloc(1, sizeof(*s));
+            s->engine = e;
+            s->ctx_size = ctx_size;
+            s->prefill_cap = qwen35moe_prefill_chunk();
+            s->qwen35moe_state = qwen35moe_state_new((uint32_t)ctx_size);
+            s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+            s->sample_probs = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+            *out = s;
+            return 0;
+        }
         if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
             fprintf(stderr, "ds4: GLM sessions currently require a graph backend\n");
             return 1;
@@ -74781,6 +74962,7 @@ void ds4_session_free(ds4_session *s) {
 #ifndef DS4_NO_GPU
     ds4_session_print_dspark_stats(s);
 #endif
+    qwen35moe_state_free(s->qwen35moe_state);
     ds4_dist_session_free(s->distributed);
     if (ds4_session_is_cpu(s)) {
         kv_cache_free(&s->cpu_cache);
@@ -74854,6 +75036,10 @@ bool ds4_session_is_distributed(ds4_session *s) {
 
 int ds4_session_set_power(ds4_session *s, int power_percent) {
     if (!s || !s->engine || power_percent < 1 || power_percent > 100) return 1;
+    if (s->qwen35moe_state && power_percent != 100) {
+        fprintf(stderr, "ds4: qwen35moe CPU power throttling is unsupported\n");
+        return 1;
+    }
     if (ds4_engine_is_deepseek41(s->engine)) {
         if (power_percent == 100) return 0;
         fprintf(stderr, "ds4: session power throttling is not supported for DeepSeek V4.1\n");
@@ -76755,6 +76941,8 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         snprintf(err, errlen, "missing session or prompt");
         return 1;
     }
+    if (s->qwen35moe_state && qwen35moe_require_model_valid(s->engine, err, errlen))
+        return 1;
     if (prompt->len <= 0) {
         snprintf(err, errlen, "empty prompt");
         return 1;
@@ -76768,6 +76956,34 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
     if (ds4_session_cancelled(s)) {
         snprintf(err, errlen, "interrupted");
         return DS4_SESSION_SYNC_INTERRUPTED;
+    }
+    if (s->qwen35moe_state) {
+        int common = ds4_session_common_prefix(s, prompt);
+        if (common != s->checkpoint.len || !s->checkpoint_valid) {
+            qwen35moe_state_reset(s->qwen35moe_state);
+            s->checkpoint.len = 0;
+            common = 0;
+        }
+        s->checkpoint_valid = false;
+        const int chunk_cap = (int)qwen35moe_prefill_chunk();
+        for (int i = common; i < prompt->len;) {
+            if (ds4_session_cancelled(s)) {
+                snprintf(err, errlen, "interrupted");
+                return DS4_SESSION_SYNC_INTERRUPTED;
+            }
+            int count = prompt->len - i;
+            if (count > chunk_cap) count = chunk_cap;
+            if (qwen35moe_forward_batch(s, s->qwen35moe_state, prompt->v + i, (uint32_t)count,
+                                  (uint32_t)i, i + count == prompt->len ? s->logits : NULL,
+                                  err, errlen))
+                return ds4_session_cancelled(s) ? DS4_SESSION_SYNC_INTERRUPTED : 1;
+            for (int j = i; j < i + count; j++) token_vec_push(&s->checkpoint, prompt->v[j]);
+            i += count;
+            if (s->progress)
+                s->progress(s->progress_ud, "prefill_chunk", i, prompt->len);
+        }
+        s->checkpoint_valid = true;
+        return 0;
     }
     if (s->distributed) {
         const ds4_tokens *checkpoint = s->checkpoint_valid ? &s->checkpoint : NULL;
@@ -79003,6 +79219,20 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
 #ifndef DS4_NO_GPU
     s->dspark_rewind_end = 0;
 #endif
+    if (s->qwen35moe_state) {
+        if (qwen35moe_require_model_valid(s->engine, err, errlen)) return 1;
+        if (!s->checkpoint_valid || s->checkpoint.len >= s->ctx_size) {
+            snprintf(err, errlen, "qwen35moe requires a valid prompt and context room");
+            return 1;
+        }
+        int rc = qwen35moe_forward(s, s->qwen35moe_state, token, (uint32_t)s->checkpoint.len,
+                             s->logits, err, errlen);
+        if (!rc)
+            token_vec_push(&s->checkpoint, token);
+        else if (token >= 0 && (uint32_t)token < DS4_N_VOCAB)
+            s->checkpoint_valid = false;
+        return rc;
+    }
     if (s->distributed) {
         if (!s->checkpoint_valid) {
             if (errlen) snprintf(err, errlen, "distributed decode requires a valid checkpoint");
@@ -87531,6 +87761,23 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     }
 #endif
     s->checkpoint.len = pos;
+    if (s->qwen35moe_state && s->checkpoint_valid) {
+        char err[128] = "";
+        qwen35moe_state_reset(s->qwen35moe_state);
+        state_ok = true;
+        const int chunk_cap = (int)qwen35moe_prefill_chunk();
+        for (int i = 0; i < pos;) {
+            int count = pos - i;
+            if (count > chunk_cap) count = chunk_cap;
+            if (qwen35moe_forward_batch(s, s->qwen35moe_state, s->checkpoint.v + i,
+                                  (uint32_t)count, (uint32_t)i,
+                                  i + count == pos ? s->logits : NULL, err, sizeof(err))) {
+                state_ok = false;
+                break;
+            }
+            i += count;
+        }
+    }
     /* DeepSeek compressors cannot be rolled back by truncating their row
      * counts. Without a saved frontier the caller must rebuild this prefix. */
     if (!state_ok) s->checkpoint_valid = false;

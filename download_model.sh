@@ -40,6 +40,9 @@ GLM53_VISION_FILE="GLM-5.3-Flash-Vision-Encoder.gguf"
 QWEN38_Q4_FILE="Qwen3.8-Flash-Next-Q4.gguf"
 QWEN38_Q2_FILE="Qwen3.8-Flash-Next-Q2.gguf"
 QWEN38_VISION_FILE="mmproj-Qwen3.8-Flash-Next-Q8_0.gguf"
+ORNITH_REPO="bartowski/Ornith-1.5-35B-A3B-GGUF"
+ORNITH_FILE="Ornith-1.5-35B-A3B-IQ2_XXS.gguf"
+ORNITH_REVISION="64b0493d34a5ca4c1b4ad67bb99b41d74b4f07d6"
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 OUT_DIR=${DS4_GGUF_DIR:-"$ROOT/gguf"}
@@ -84,6 +87,7 @@ Usage:
   ./download_model.sh qwen38-q2 [--token TOKEN]
   ./download_model.sh qwen38-q4k [--token TOKEN]
   ./download_model.sh qwen38-vision [--token TOKEN]
+  ./download_model.sh ornith15-iq2xxs [--token TOKEN]
 
 Targets:
 
@@ -224,6 +228,10 @@ Targets:
        Qwen3.8-Flash-Next vision encoder, about 0.6 GB on disk. Load it
        with --vision; this target does not update ./ds4flash.gguf.
 
+  ornith15-iq2xxs
+       Ornith 1.5 35B-A3B IQ2_XXS GGUF, about 9.55 GiB on disk.
+       CPU text inference; run with --cpu. Context buffers need additional RAM.
+
 Options:
   --token TOKEN  Hugging Face token. Otherwise HF_TOKEN or the local HF token
                  cache is used if present.
@@ -248,6 +256,7 @@ After downloading DSpark support, enable it explicitly:
 PRO, V4.1, GLM and Qwen files use the official Hugging Face downloader
 because they are too large, sharded, or nested for the curl path used by the
 smaller DeepSeek Flash GGUF files.
+Ornith also uses the official Hugging Face downloader.
 EOF
 }
 
@@ -262,6 +271,7 @@ MODEL_FILES=
 LINK_MODEL=1
 FORCE_HF_DOWNLOAD=0
 FLATTEN_DOWNLOADS=0
+MODEL_REVISION=
 
 case "$MODEL" in
     ds4f-q2) MODEL_FILE=$DS4F_Q2_FILE ;;
@@ -392,6 +402,12 @@ case "$MODEL" in
         MODEL_FILE=$QWEN38_VISION_FILE
         FORCE_HF_DOWNLOAD=1
         LINK_MODEL=0
+        ;;
+    ornith15-iq2xxs)
+        REPO=$ORNITH_REPO
+        MODEL_FILE=$ORNITH_FILE
+        MODEL_REVISION=$ORNITH_REVISION
+        FORCE_HF_DOWNLOAD=1
         ;;
     -h|--help|help)
         usage
@@ -533,6 +549,10 @@ artifact_identity() {
             expected_bytes=970555552
             expected_sha=cc283f032b3e8b8d78aeb5fccaa14e97b859b0c53aae3cd6bffa690ddf0e9e15
             ;;
+        "$ORNITH_FILE")
+            expected_bytes=10255140512
+            expected_sha=14963c6830ae8287ad42a53c0fd87ca9fc67a8de8da1d18e3a076a348e96a32f
+            ;;
         *) return 1 ;;
     esac
 }
@@ -588,14 +608,20 @@ download_one_hf() {
 
     echo "Downloading $file"
     echo "from https://huggingface.co/$REPO"
+    if [ -n "$MODEL_REVISION" ]; then
+        echo "at revision $MODEL_REVISION"
+    fi
     echo "using $HF_CMD download"
     echo "If the download stops, run the same command again to resume it."
 
-    if [ -n "$TOKEN" ]; then
-        "$HF_CMD" download "$REPO" "$file" --repo-type model --local-dir "$OUT_DIR" --token "$TOKEN"
-    else
-        "$HF_CMD" download "$REPO" "$file" --repo-type model --local-dir "$OUT_DIR"
+    set -- download "$REPO" "$file" --repo-type model --local-dir "$OUT_DIR"
+    if [ -n "$MODEL_REVISION" ]; then
+        set -- "$@" --revision "$MODEL_REVISION"
     fi
+    if [ -n "$TOKEN" ]; then
+        set -- "$@" --token "$TOKEN"
+    fi
+    "$HF_CMD" "$@"
 
     if [ "$hf_out" != "$out" ] && [ -s "$hf_out" ]; then
         mv "$hf_out" "$out"
@@ -818,4 +844,7 @@ if [ "$MODEL" = qwen38-vision ]; then
     echo
     echo "Qwen3.8 vision encoder downloaded. Pass it with --vision, for example:"
     printf '  ./ds4 --vision "%s/%s"\n' "$OUT_DIR" "$QWEN38_VISION_FILE"
+fi
+if [ "$MODEL" = ornith15-iq2xxs ]; then
+    echo "Run ./ds4 --cpu."
 fi

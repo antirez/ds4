@@ -35,7 +35,9 @@
 #include <unistd.h>
 #ifdef __APPLE__
 #include <copyfile.h>
+#include <sys/sysctl.h>
 #elif defined(__linux__)
+#include "ds4_linux_memory.h"
 #include <sys/xattr.h>
 #endif
 
@@ -89,6 +91,7 @@ typedef struct {
     const char *gpu_vram_arg;
     const char *gpu_devices_arg;
     const char *chdir_path;
+    bool ctx_explicit;
     bool non_interactive;
     bool edit_upto;
 } agent_config;
@@ -410,7 +413,8 @@ static int agent_read_default_lines(agent_worker *w);
 static int agent_compact_reserve_tokens(agent_worker *w);
 
 static agent_tool_syntax agent_tool_syntax_for_engine(ds4_engine *engine) {
-    if (ds4_engine_is_qwen4(engine)) return AGENT_TOOL_SYNTAX_QWEN;
+    if (ds4_engine_is_qwen4(engine) || ds4_engine_is_qwen35moe(engine))
+        return AGENT_TOOL_SYNTAX_QWEN;
     return ds4_engine_is_glm_dsa(engine) ? AGENT_TOOL_SYNTAX_GLM
          : ds4_engine_is_deepseek41(engine) ? AGENT_TOOL_SYNTAX_DSML41
                                            : AGENT_TOOL_SYNTAX_DSML;
@@ -849,6 +853,7 @@ static agent_config parse_options(int argc, char **argv) {
             c.engine.dspark_exact_sampling = true;
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
             c.gen.ctx_size = parse_int(need_arg(&i, argc, argv, arg), arg);
+            c.ctx_explicit = true;
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
             c.gen.n_predict = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--temp")) {
@@ -1553,7 +1558,17 @@ static void agent_append_system_prompt(ds4_engine *engine, ds4_tokens *tokens,
      * supplied -sys text: arbitrary user text containing <｜User｜>, <think>, or
      * ｜DSML｜ must remain plain content, not control tokens. */
     char *tools_prompt = agent_build_tools_prompt(engine, edit_upto);
-    if (agent_syntax_is_xml_tool_call(agent_tool_syntax_for_engine(engine)))
+    if (ds4_engine_is_qwen35moe(engine)) {
+        /* Trusted ChatML examples need their dedicated tool/think IDs; plain
+         * message content intentionally leaves those spellings ordinary text. */
+        static const char start[] = "<|im_start|>system\n";
+        static const char end[] = "<|im_end|>\n";
+        size_t cap = strlen(tools_prompt) + sizeof(start) + sizeof(end) - 1;
+        char *rendered = xmalloc(cap);
+        snprintf(rendered, cap, "%s%s%s", start, tools_prompt, end);
+        ds4_tokenize_rendered_chat(engine, rendered, tokens);
+        free(rendered);
+    } else if (agent_syntax_is_xml_tool_call(agent_tool_syntax_for_engine(engine)))
         ds4_chat_append_message(engine, tokens, "system", tools_prompt);
     else {
         if (ds4_engine_is_deepseek41(engine))
@@ -2275,6 +2290,17 @@ static void agent_qwen_tool_parse(agent_dsml_parser *p) {
             p->parse_pos = (size_t)(gt + 1 - raw);
             continue;
         }
+
+        /* Some Qwen tool replies close the outer call directly after the
+         * final complete parameter. Treat that as an implicit function close;
+         * an unfinished parameter still waits for its own delimiter above. */
+        if (agent_bytes_starts_with(cur, end, close)) {
+            p->parse_pos += sizeof(close) - 1;
+            agent_tool_calls_push(&p->calls, &p->current);
+            p->glm_after_call = true;
+            continue;
+        }
+        if (agent_bytes_partial_prefix_at(cur, end, close)) return;
 
         if (agent_bytes_starts_with(cur, end, fn_close)) {
             const char *after = agent_skip_ascii_space(cur + sizeof(fn_close) - 1, end);
@@ -4697,6 +4723,8 @@ static bool agent_mkdir_p(const char *path) {
 }
 
 static char *agent_default_cache_dir(void) {
+    const char *override = getenv("DS4_AGENT_CACHE_DIR");
+    if (override && override[0]) return xstrdup(override);
     const char *home = getenv("HOME");
     if (!home || !home[0]) home = ".";
     agent_buf b = {0};
@@ -4744,6 +4772,8 @@ static void agent_worker_clear_session_identity(agent_worker *w) {
 typedef struct {
     bool has_title_trailer;
     bool legacy_identity;
+    bool rebuilt_from_text;
+    bool preserve_source;
     char *title;
     uint64_t created_at;
     char sha[41];
@@ -4850,7 +4880,7 @@ static bool agent_kv_read_title_trailer(FILE *fp, const ds4_kvstore_entry *hdr,
     /* Same cap as agent_kv_read_text: reject a title length larger than the
      * bytes left in the file before allocating. */
     uint64_t title_remaining = 0;
-    if (!agent_fp_remaining(fp, &title_remaining) || title_bytes > title_remaining) {
+    if (!agent_fp_remaining(fp, &title_remaining) || title_bytes != title_remaining) {
         if (err && err_len) snprintf(err, err_len, "truncated agent session title trailer");
         fseeko(fp, payload_pos, SEEK_SET);
         return false;
@@ -4863,6 +4893,12 @@ static bool agent_kv_read_title_trailer(FILE *fp, const ds4_kvstore_entry *hdr,
         return false;
     }
     title[title_bytes] = '\0';
+    if (memchr(title, '\0', title_bytes)) {
+        if (err && err_len) snprintf(err, err_len, "invalid agent session title trailer");
+        free(title);
+        fseeko(fp, payload_pos, SEEK_SET);
+        return false;
+    }
     if (fseeko(fp, payload_pos, SEEK_SET) != 0) {
         if (err && err_len) snprintf(err, err_len, "%s", strerror(errno));
         free(title);
@@ -4881,6 +4917,31 @@ static void agent_kv_identity_sha(const ds4_kvstore_entry *hdr,
     } else {
         ds4_kvstore_sha1_bytes_hex(text, text_bytes, sha_out);
     }
+}
+
+static bool agent_session_model_allowed(const agent_worker *w, int saved_id) {
+    return saved_id == ds4_engine_model_id(w->engine);
+}
+
+static bool agent_qwen35moe_payload_recovery(bool named_session, bool qwen35moe,
+                                             int current_id, int saved_id,
+                                             int load_result) {
+    return named_session && qwen35moe &&
+        saved_id == current_id &&
+        load_result == DS4_SESSION_PAYLOAD_INCOMPATIBLE;
+}
+
+/* Check the complete physical payload segment, including files without a title
+ * trailer. A seek past EOF alone does not detect a truncated checkpoint. */
+static bool agent_kv_payload_extent(FILE *fp, const ds4_kvstore_entry *hdr,
+                                     bool has_title, char *err, size_t err_len) {
+    uint64_t remaining = 0;
+    if (!agent_fp_remaining(fp, &remaining) || hdr->payload_bytes > remaining ||
+        (!has_title && hdr->payload_bytes != remaining)) {
+        if (err && err_len) snprintf(err, err_len, "invalid KV payload extent");
+        return false;
+    }
+    return true;
 }
 
 static bool agent_kv_payload_requires_rebuild(const agent_worker *w,
@@ -4917,15 +4978,31 @@ static bool agent_kv_load_path(agent_worker *w, const char *path,
     bool has_title = ok && (hdr.ext_flags & DS4_KVSTORE_EXT_SESSION_TITLE);
     if (has_title)
         ok = agent_kv_read_title_trailer(fp, &hdr, &title, err, err_len);
+    const int current_model_id = ds4_engine_model_id(w->engine);
+    const bool named_qwen35moe = expected_sha && ds4_engine_is_qwen35moe(w->engine);
+    const bool rebuildable_session = named_qwen35moe &&
+        hdr.model_id == (uint8_t)current_model_id;
+    if (ok && named_qwen35moe &&
+        (hdr.ext_flags & ~DS4_KVSTORE_EXT_SESSION_TITLE)) {
+        snprintf(err, err_len, "unsupported named session trailer");
+        ok = false;
+    }
+    if (ok && expected_sha)
+        ok = agent_kv_payload_extent(fp, &hdr, has_title, err, err_len);
+    if (ok && expected_sha && memchr(text, '\0', text_bytes)) {
+        snprintf(err, err_len, "invalid cached rendered text");
+        ok = false;
+    }
     uint32_t expected_tokens = hdr.tokens;
     if (ok && hdr.payload_bytes != 0 &&
-        hdr.model_id != (uint8_t)ds4_engine_model_id(w->engine))
+        hdr.model_id != (uint8_t)current_model_id)
     {
         snprintf(err, err_len, "KV checkpoint was written for a different model");
         ok = false;
     }
     if (ok && hdr.payload_bytes != 0 &&
-        hdr.quant_bits != (uint8_t)ds4_engine_routed_quant_bits(w->engine))
+        hdr.quant_bits != (uint8_t)ds4_engine_routed_quant_bits(w->engine) &&
+        !rebuildable_session)
     {
         snprintf(err, err_len, "KV checkpoint was written for a different quantization");
         ok = false;
@@ -4947,27 +5024,49 @@ static bool agent_kv_load_path(agent_worker *w, const char *path,
         }
     }
 
+    bool rebuild = agent_kv_payload_requires_rebuild(w, hdr.payload_bytes);
+    bool recovered_payload = false;
     char load_err[160] = {0};
-    if (ok && agent_kv_payload_requires_rebuild(w, hdr.payload_bytes)) {
-        /* A saved payload contains only the leader's graph state. Rebuild from
-         * rendered text under TP so session_sync mirrors the same token prefix
-         * to the worker before either rank resumes decoding. */
-        ds4_tokens rebuilt = {0};
-        ds4_tokenize_rendered_chat(w->engine, text, &rebuilt);
-        expected_tokens = (uint32_t)rebuilt.len;
-        if (agent_worker_sync_tokens(w, &rebuilt, true, err, err_len) != 0) {
+    if (ok && !rebuild) {
+        int result = ds4_session_load_payload(w->session, fp, hdr.payload_bytes,
+                                              load_err, sizeof(load_err));
+        recovered_payload = agent_qwen35moe_payload_recovery(expected_sha != NULL,
+            ds4_engine_is_qwen35moe(w->engine), current_model_id, hdr.model_id, result);
+        /* A named session can retain its conversation after changing the
+         * model's quantization, but its saved numerical state must be rebuilt. */
+        if (result == 0 && rebuildable_session &&
+            hdr.quant_bits != ds4_engine_routed_quant_bits(w->engine))
+            recovered_payload = true;
+        if (recovered_payload) {
+            rebuild = true;
+            ds4_session_invalidate(w->session);
+        } else if (result != 0) {
+            snprintf(err, err_len, "%s", load_err[0] ? load_err : "failed to load KV payload");
             ds4_session_invalidate(w->session);
             ok = false;
         }
-        ds4_tokens_free(&rebuilt);
-    } else if (ok &&
-               ds4_session_load_payload(w->session, fp, hdr.payload_bytes,
-                                        load_err, sizeof(load_err)) != 0)
-    {
-        snprintf(err, err_len, "%s", load_err[0] ? load_err : "failed to load KV payload");
-        ds4_session_invalidate(w->session);
-        ok = false;
     }
+    ds4_tokens rebuilt = {0};
+    if (ok && rebuild) {
+        /* TP payloads contain only the leader's state; stripped and incompatible
+         * qwen35moe sessions share the same rendered-text rebuild path. */
+        ds4_tokenize_rendered_chat(w->engine, text, &rebuilt);
+        if (named_qwen35moe) {
+            size_t rendered_len = 0;
+            char *rendered = ds4_kvstore_render_tokens_text(w->engine, &rebuilt, &rendered_len);
+            if (!rendered || rendered_len != text_bytes || memcmp(rendered, text, text_bytes)) {
+                snprintf(err, err_len, "cached rendered text mismatch");
+                ok = false;
+            }
+            free(rendered);
+        }
+        expected_tokens = (uint32_t)rebuilt.len;
+        if (ok && agent_worker_sync_tokens(w, &rebuilt, true, err, err_len) != 0) {
+            ds4_session_invalidate(w->session);
+            ok = false;
+        }
+    }
+    ds4_tokens_free(&rebuilt);
     fclose(fp);
 
     if (ok) {
@@ -4984,6 +5083,8 @@ static bool agent_kv_load_path(agent_worker *w, const char *path,
             agent_kv_session_meta_free(meta_out);
             meta_out->has_title_trailer = has_title;
             meta_out->legacy_identity = !has_title;
+            meta_out->rebuilt_from_text = rebuild;
+            meta_out->preserve_source = named_qwen35moe && rebuild;
             meta_out->created_at = hdr.created_at;
             agent_kv_identity_sha(&hdr, text, text_bytes, title, meta_out->sha);
             meta_out->title = has_title ?
@@ -5339,6 +5440,14 @@ static int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
     return rc;
 }
 
+static bool agent_sysprompt_cache_tokens_match(ds4_engine *engine,
+                                               const ds4_tokens *cached,
+                                               const ds4_tokens *intended) {
+    /* Identical rendered bytes can hide an older plain-tokenized tool prompt.
+     * Only this implementation cache must match today's intended prefix. */
+    return !ds4_engine_is_qwen35moe(engine) || agent_tokens_equal(cached, intended);
+}
+
 /* Start a new session at the system/tool prompt.  A fixed sysprompt.kv
  * checkpoint avoids paying this prefill cost repeatedly, but only when the
  * rendered prompt text still matches the file.  The same fixed path is shared
@@ -5364,6 +5473,11 @@ static bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t e
                                     text, text_len, &w->transcript,
                                     NULL,
                                     load_err, sizeof(load_err));
+        if (loaded && !agent_sysprompt_cache_tokens_match(w->engine, &w->transcript, &sys)) {
+            ds4_session_invalidate(w->session);
+            loaded = false;
+            agent_trace(w, "sysprompt kv miss: cached tokens differ from intended system prefix");
+        }
         if (loaded) {
             agent_trace(w, "sysprompt kv hit file=%s tokens=%d",
                         w->sysprompt_path, w->transcript.len);
@@ -6193,7 +6307,6 @@ static void agent_worker_list_sessions(agent_worker *w) {
 
     agent_session_list_item *sessions = NULL;
     int sessions_len = 0, sessions_cap = 0;
-    const uint8_t model_id = (uint8_t)ds4_engine_model_id(w->engine);
     struct dirent *de;
     while ((de = readdir(d)) != NULL) {
         char sha[41];
@@ -6201,7 +6314,7 @@ static void agent_worker_list_sessions(agent_worker *w) {
         char *path = ds4_kvstore_path_join(w->cache_dir, de->d_name);
         ds4_kvstore_entry e = {0};
         if (ds4_kvstore_read_entry_file(path, sha, &e)) {
-            if (e.model_id == model_id) {
+            if (agent_session_model_allowed(w, e.model_id)) {
                 char *title = agent_session_title_from_file(path, title_budget);
                 agent_session_list_push(&sessions, &sessions_len, &sessions_cap,
                                         e, title);
@@ -6301,7 +6414,6 @@ static void agent_switch_completion_callback(const char *buf,
     if (!d) return;
 
     agent_completion_sessions sessions = {0};
-    const uint8_t model_id = (uint8_t)ds4_engine_model_id(w->engine);
     struct dirent *de;
     while ((de = readdir(d)) != NULL) {
         char sha[41];
@@ -6312,7 +6424,7 @@ static void agent_switch_completion_callback(const char *buf,
         char *path = ds4_kvstore_path_join(w->cache_dir, de->d_name);
         ds4_kvstore_entry e = {0};
         if (ds4_kvstore_read_entry_file(path, sha, &e)) {
-            if (e.model_id == model_id) last_used = e.last_used;
+            if (agent_session_model_allowed(w, e.model_id)) last_used = e.last_used;
             else last_used = UINT64_MAX;
             ds4_kvstore_entry_free(&e);
         } else {
@@ -6360,7 +6472,6 @@ static bool agent_worker_find_session(agent_worker *w, const char *prefix,
     int matches = 0;
     char match_sha[41] = {0};
     char *match_path = NULL;
-    const uint8_t model_id = (uint8_t)ds4_engine_model_id(w->engine);
     struct dirent *de;
     while ((de = readdir(d)) != NULL) {
         char sha[41];
@@ -6369,7 +6480,7 @@ static bool agent_worker_find_session(agent_worker *w, const char *prefix,
         char *path = ds4_kvstore_path_join(w->cache_dir, de->d_name);
         ds4_kvstore_entry e = {0};
         bool same_model = ds4_kvstore_read_entry_file(path, sha, &e) &&
-                          e.model_id == model_id;
+                          agent_session_model_allowed(w, e.model_id);
         ds4_kvstore_entry_free(&e);
         if (!same_model) {
             free(path);
@@ -6569,7 +6680,8 @@ static bool agent_worker_switch_session(agent_worker *w, const char *prefix,
         w->session_created_at = meta.created_at ? meta.created_at : (uint64_t)time(NULL);
         memcpy(w->session_sha, sha, sizeof(w->session_sha));
         free(w->legacy_session_path_to_delete);
-        w->legacy_session_path_to_delete = meta.legacy_identity ? xstrdup(path) : NULL;
+        w->legacy_session_path_to_delete = meta.legacy_identity && !meta.preserve_source ?
+            xstrdup(path) : NULL;
         w->datetime_context_injected = true;
         pthread_mutex_lock(&w->mu);
         w->hints = (agent_hints){.applied = AGENT_HINTS_UNKNOWN};
@@ -6584,7 +6696,7 @@ static bool agent_worker_switch_session(agent_worker *w, const char *prefix,
         agent_wake_locked(w);
         pthread_mutex_unlock(&w->mu);
         printf("switched to session %.8s (%d tokens%s)\n",
-               sha, w->transcript.len, stripped ? ", rebuilt from text" : "");
+               sha, w->transcript.len, meta.rebuilt_from_text ? ", rebuilt from text" : "");
         if (history_turns > 0)
             (void)agent_worker_show_history(w, history_turns, err, err_len);
     } else {
@@ -7085,6 +7197,19 @@ static int agent_copy_file_xattrs(int src, int dst) {
         ssize_t readlen = fgetxattr(src, name, value, (size_t)len);
         int copied = readlen < 0 ? -1 : fsetxattr(dst, name, value, (size_t)readlen, 0);
         int saved_errno = errno;
+        if (copied != 0 && readlen >= 0 &&
+            (saved_errno == ENOTSUP || saved_errno == EOPNOTSUPP || saved_errno == EPERM)) {
+            /* Container filesystems may refuse to set a managed security
+             * label even when the new file already inherited that label. */
+            ssize_t present_len = fgetxattr(dst, name, NULL, 0);
+            if (present_len == readlen) {
+                void *present = xmalloc(readlen ? (size_t)readlen : 1);
+                if (fgetxattr(dst, name, present, (size_t)readlen) == readlen &&
+                    memcmp(present, value, (size_t)readlen) == 0)
+                    copied = 0;
+                free(present);
+            }
+        }
         free(value);
         errno = saved_errno;
         if (copied != 0) goto done;
@@ -7620,7 +7745,7 @@ static void test_agent_qwen_tool_parser_chunked_multi_arg(void) {
     agent_dsml_parser_free(&p);
 }
 
-static void test_agent_qwen_tool_parser_two_calls_and_error(void) {
+static void test_agent_qwen_tool_parser_two_calls_and_implicit_close(void) {
     const char *text =
         "<tool_call>\n<function=list>\n<parameter=path>\n.\n</parameter>\n</function>\n</tool_call>\n"
         "<tool_call>\n<function=read>\n<parameter=path>\n/tmp/x\n</parameter>\n</function>\n</tool_call>";
@@ -7636,15 +7761,49 @@ static void test_agent_qwen_tool_parser_two_calls_and_error(void) {
     AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&p.calls.v[1], "path"), "/tmp/x"));
     agent_dsml_parser_free(&p);
 
-    const char *bad = "<tool_call>\n<function=list>\n<parameter=path>\n.\n</parameter>\n</tool_call>";
+    const char *without_function_close =
+        "<tool_call>\n<function=list>\n<parameter=path>\n.\n</parameter>\n</tool_call>";
     agent_dsml_parser q = {
         .syntax = AGENT_TOOL_SYNTAX_QWEN,
         .state = AGENT_DSML_SEARCH,
     };
-    agent_dsml_feed(&q, bad, strlen(bad));
+    agent_dsml_feed(&q, without_function_close, strlen(without_function_close));
     agent_dsml_finish(&q);
-    AGENT_TEST_ASSERT(q.state == AGENT_DSML_ERROR);
+    AGENT_TEST_ASSERT(q.state == AGENT_DSML_DONE && q.calls.len == 1);
+    AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&q.calls.v[0], "path"), "."));
     agent_dsml_parser_free(&q);
+
+    agent_dsml_parser split = {
+        .syntax = AGENT_TOOL_SYNTAX_QWEN, .state = AGENT_DSML_SEARCH,
+    };
+    const char *open = "<tool_call><function=read><parameter=path>\nfile\n</parameter></tool";
+    agent_dsml_feed(&split, open, strlen(open));
+    AGENT_TEST_ASSERT(split.state == AGENT_DSML_STRUCTURAL && split.calls.len == 0);
+    agent_dsml_feed(&split, "_call>", 6);
+    agent_dsml_finish(&split);
+    AGENT_TEST_ASSERT(split.state == AGENT_DSML_DONE && split.calls.len == 1);
+    agent_dsml_parser_free(&split);
+
+    agent_dsml_parser incomplete = {
+        .syntax = AGENT_TOOL_SYNTAX_QWEN, .state = AGENT_DSML_SEARCH,
+    };
+    const char *unfinished = "<tool_call><function=read><parameter=path>\nfile\n</tool_call>";
+    agent_dsml_feed(&incomplete, unfinished, strlen(unfinished));
+    agent_dsml_finish(&incomplete);
+    AGENT_TEST_ASSERT(incomplete.state == AGENT_DSML_PARAM_VALUE && incomplete.calls.len == 0);
+    agent_dsml_parser_free(&incomplete);
+
+    agent_dsml_parser literal = {
+        .syntax = AGENT_TOOL_SYNTAX_QWEN, .state = AGENT_DSML_SEARCH,
+    };
+    const char *marker_value =
+        "<tool_call><function=write><parameter=content>\nliteral </tool_call> text\n</parameter></tool_call>";
+    agent_dsml_feed(&literal, marker_value, strlen(marker_value));
+    agent_dsml_finish(&literal);
+    AGENT_TEST_ASSERT(literal.state == AGENT_DSML_DONE && literal.calls.len == 1);
+    AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&literal.calls.v[0], "content"),
+                              "literal </tool_call> text"));
+    agent_dsml_parser_free(&literal);
 }
 
 static void test_agent_qwen_stream_tool_call_chunked(void) {
@@ -8173,7 +8332,7 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_glm_stream_tool_call_chunked();
     test_agent_tool_argument_literal_markup();
     test_agent_qwen_tool_parser_chunked_multi_arg();
-    test_agent_qwen_tool_parser_two_calls_and_error();
+    test_agent_qwen_tool_parser_two_calls_and_implicit_close();
     test_agent_qwen_stream_tool_call_chunked();
     test_agent_qwen_argument_markers_bytewise();
     test_agent_glm_stream_ignores_tool_inside_think();
@@ -9720,12 +9879,41 @@ static int agent_compact_tail_boundary(const ds4_tokens *tokens, int bottom,
     return target;
 }
 
+static bool agent_qwen_user_turn_at(agent_worker *w, int pos) {
+    if (!w || !w->engine ||
+        !(ds4_engine_is_qwen4(w->engine) || ds4_engine_is_qwen35moe(w->engine)))
+        return false;
+    ds4_tokens marker = {0};
+    ds4_tokenize_rendered_chat(w->engine, "<|im_start|>user\n", &marker);
+    bool match = pos >= 0 && pos + marker.len <= w->transcript.len && marker.len > 0;
+    for (int i = 0; match && i < marker.len; i++)
+        match = w->transcript.v[pos + i] == marker.v[i];
+    ds4_tokens_free(&marker);
+    return match;
+}
+
 /* Prefer a complete recent user turn, with a bounded fragment as fallback. */
 static int agent_compact_tail_start(agent_worker *w, int bottom, int sys_len) {
     int tail_budget = agent_worker_effective_ctx_size(w) / AGENT_COMPACT_TAIL_DIVISOR;
     if (tail_budget > AGENT_COMPACT_TAIL_CAP_TOKENS)
         tail_budget = AGENT_COMPACT_TAIL_CAP_TOKENS;
     if (tail_budget < 1) tail_budget = 1;
+    if (ds4_engine_is_qwen4(w->engine) || ds4_engine_is_qwen35moe(w->engine)) {
+        ds4_tokens marker = {0};
+        ds4_tokenize_rendered_chat(w->engine, "<|im_start|>user\n", &marker);
+        int earliest = bottom - 2 * tail_budget;
+        if (earliest < sys_len) earliest = sys_len;
+        for (int i = bottom - marker.len; i >= earliest; i--)
+            if (marker.len > 0 &&
+                memcmp(w->transcript.v + i, marker.v,
+                       (size_t)marker.len * sizeof(int)) == 0) {
+                ds4_tokens_free(&marker);
+                return i;
+            }
+        ds4_tokens_free(&marker);
+        int target = bottom - tail_budget;
+        return target < sys_len ? sys_len : target;
+    }
     int user_id = agent_special_token_id(w->engine,
         ds4_engine_is_glm_dsa(w->engine) ? "<|user|>" : "<｜User｜>");
     return agent_compact_tail_boundary(&w->transcript, bottom, sys_len, tail_budget, user_id);
@@ -10010,6 +10198,7 @@ static bool agent_worker_compact_transcript(agent_worker *w, const char *reason,
         ds4_chat_append_assistant_prefix(w->engine, &compacted,
             in_think ? DS4_THINK_HIGH : DS4_THINK_NONE);
     } else if (tail_start < bottom &&
+        !agent_qwen_user_turn_at(w, tail_start) &&
         w->transcript.v[tail_start] != ds4_token_user(w->engine) &&
         w->transcript.v[tail_start] != ds4_token_assistant(w->engine)) {
         ds4_chat_append_message(w->engine, &compacted, "user",
@@ -13511,6 +13700,106 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
     return 0;
 }
 
+static int agent_qwen35moe_context_for_budget(uint64_t bytes) {
+    if (ds4_context_memory_estimate(DS4_BACKEND_CPU, 4096).total_bytes > bytes)
+        return 0;
+    int lo = 4, hi = 256;
+    while (lo < hi) {
+        int mid = (lo + hi + 1) / 2;
+        ds4_context_memory memory = ds4_context_memory_estimate(DS4_BACKEND_CPU, mid * 1024);
+        if (memory.total_bytes <= bytes) lo = mid;
+        else hi = mid - 1;
+    }
+    return lo * 1024;
+}
+static uint64_t agent_qwen35moe_budget_from_available(uint64_t available,
+                                                    uint64_t model, uint64_t reserve) {
+    return available > model + reserve ? available - model - reserve : 0;
+}
+static uint64_t agent_qwen35moe_cgroup_available(uint64_t limit, uint64_t current,
+                                               uint64_t file_cache) {
+    uint64_t free_bytes = limit > current ? limit - current : 0;
+    if (file_cache > current) file_cache = current;
+    return file_cache > limit - free_bytes ? limit : free_bytes + file_cache;
+}
+
+/* Keep room for the mapped model and the OS while letting Qwen use the
+ * largest context whose estimated KV state fits this machine. Explicit --ctx
+ * always wins; the native model limit is 262144 tokens. */
+static int agent_qwen35moe_auto_context(ds4_engine *engine) {
+    uint64_t limit = 0;
+#ifdef __APPLE__
+    size_t limit_len = sizeof(limit);
+    if (sysctlbyname("hw.memsize", &limit, &limit_len, NULL, 0) != 0 ||
+        limit_len != sizeof(limit)) limit = 0;
+#else
+    long pages = sysconf(_SC_PHYS_PAGES), page_size = sysconf(_SC_PAGESIZE);
+    if (pages > 0 && page_size > 0) limit = (uint64_t)pages * (uint64_t)page_size;
+#endif
+    if (!limit) {
+        fprintf(stderr, "ds4-agent: cannot measure RAM for %s; specify --ctx explicitly\n",
+                ds4_engine_model_name(engine));
+        return 0;
+    }
+    uint64_t cgroup_available = UINT64_MAX;
+#ifdef __linux__
+    FILE *fp = fopen("/sys/fs/cgroup/memory.max", "r");
+    if (fp) {
+        unsigned long long cgroup_limit;
+        if (fscanf(fp, "%llu", &cgroup_limit) == 1) {
+            if (cgroup_limit < limit) limit = cgroup_limit;
+            FILE *current = fopen("/sys/fs/cgroup/memory.current", "r");
+            if (current) {
+                unsigned long long used;
+                if (fscanf(current, "%llu", &used) == 1) {
+                    uint64_t file_bytes = 0, shmem_bytes = 0;
+                    FILE *stat = fopen("/sys/fs/cgroup/memory.stat", "r");
+                    if (stat) {
+                        char line[256];
+                        unsigned long long value;
+                        while (fgets(line, sizeof(line), stat)) {
+                            if (sscanf(line, "file %llu", &value) == 1) file_bytes = value;
+                            else if (sscanf(line, "shmem %llu", &value) == 1) shmem_bytes = value;
+                        }
+                        fclose(stat);
+                    }
+                    uint64_t reclaimable = file_bytes > shmem_bytes ? file_bytes - shmem_bytes : 0;
+                    cgroup_available = agent_qwen35moe_cgroup_available(cgroup_limit, used, reclaimable);
+                }
+                fclose(current);
+            }
+        }
+        fclose(fp);
+    }
+#endif
+    const uint64_t os_reserve = 2ull * 1024 * 1024 * 1024;
+    const uint64_t current_headroom = 256ull * 1024 * 1024;
+    uint64_t model_bytes = ds4_engine_text_model_bytes(engine);
+    uint64_t state_budget = agent_qwen35moe_budget_from_available(limit, model_bytes, os_reserve);
+    if (cgroup_available != UINT64_MAX) {
+        uint64_t current_budget = agent_qwen35moe_budget_from_available(
+            cgroup_available, model_bytes, current_headroom);
+        if (current_budget < state_budget) state_budget = current_budget;
+    }
+#ifdef __linux__
+    uint64_t available;
+    if (ds4_linux_nonmovable_memory(&available)) {
+        /* MemAvailable already excludes current unreclaimable OS/workload
+         * use. Charge bound model pages once and keep smaller new headroom. */
+        uint64_t current_budget = agent_qwen35moe_budget_from_available(
+            available, model_bytes, current_headroom);
+        if (current_budget < state_budget) state_budget = current_budget;
+    }
+#endif
+    int ctx = agent_qwen35moe_context_for_budget(state_budget);
+    if (ctx) return ctx;
+    fprintf(stderr,
+            "ds4-agent: current memory estimate leaves insufficient headroom for "
+            "%s text weights and a 4K context; free memory or specify --ctx "
+            "explicitly to accept possible paging\n", ds4_engine_model_name(engine));
+    return 0;
+}
+
 #ifndef DS4_AGENT_TEST_NO_MAIN
 int main(int argc, char **argv) {
     agent_config cfg = parse_options(argc, argv);
@@ -13565,6 +13854,17 @@ int main(int argc, char **argv) {
         }
     } else if (ds4_engine_open(&engine, &cfg.engine) != 0) {
         return 1;
+    }
+    if (ds4_engine_is_qwen35moe(engine) && !cfg.ctx_explicit) {
+        cfg.gen.ctx_size = agent_qwen35moe_auto_context(engine);
+        if (!cfg.gen.ctx_size) {
+            ds4_engine_close(engine);
+            return 2;
+        }
+        cfg.engine.context_size = cfg.gen.ctx_size;
+        cfg.engine.placement_ctx_hint = cfg.gen.ctx_size;
+        fprintf(stderr, "ds4-agent: %s automatic context %d tokens\n",
+                ds4_engine_model_name(engine), cfg.gen.ctx_size);
     }
     if (ds4_think_mode_level(cfg.gen.think_mode) >= 0 && !ds4_engine_is_deepseek41(engine)) {
         fprintf(stderr, "ds4-agent: --think-level requires a DeepSeek V4.1 model\n");

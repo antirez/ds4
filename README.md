@@ -9,10 +9,11 @@ a small native inference engine optimized first for
 **DeepSeek V4 Flash** (including the experimental vision model),
 **DeepSeek V4.1 Flash** (Metal, and text inference on CUDA),
 and additionally **GLM 5.2 and 5.3**, **GLM 5.3 Flash** and
-**DeepSeek V4 PRO**, and **Qwen3.8 Flash Next** (Metal and CUDA). The code is self-contained and
-deliberately narrow, not a general GGUF runner: you need to use the
-GGUF files the project produces, that are part of the project
-itself.
+**DeepSeek V4 PRO**, **Qwen3.8 Flash Next** (Metal and CUDA), and CPU text
+inference for **Qwen3.6 and Ornith 1.5 35B-A3B**. The code is self-contained and
+deliberately narrow, not a general GGUF runner. Use the supported GGUF files
+documented by the project. The `ornith15-iq2xxs` download target provides Ornith;
+Qwen3.6 uses a separately obtained local GGUF selected with `-m`.
 
 We test things in integration: model loading, prompt rendering,
 tool calls, KV state, the HTTP server, and the coding agent are built and tested together.
@@ -162,6 +163,11 @@ the [client setup guide](docs/CLIENTS.md).
 requirements. DeepSeek Vision Experimental uses a different checkpoint from
 Flash 0731; GLM 5.3 Flash and Qwen3.8 Flash Next add vision to the same text
 model through a separate encoder.
+
+Qwen3.6 and Ornith 1.5 35B-A3B use a shared CPU text path on x86-64 Linux.
+Pass their local GGUFs with `-m`; see
+[model setup and validation](docs/MODELS.md#qwen36-and-ornith-15-35b-a3b)
+for build commands, supported features, and local checks.
 
 DeepSeek V4.1 Flash text and vision run on Metal; text also runs on a DGX Spark.
 Q2 runs with SSD streaming on one 128 GB Mac or Spark, or resident across two

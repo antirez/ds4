@@ -261,6 +261,8 @@ uint32_t ds4_engine_layer_compress_ratio(ds4_engine *e, uint32_t layer);
 uint64_t ds4_engine_hidden_f32_values(ds4_engine *e);
 int ds4_engine_embd_dim(ds4_engine *e);
 uint64_t ds4_engine_model_bytes(ds4_engine *e);
+/* Bound text-path tensor pages plus metadata; excludes qwen35moe's unused MTP block. */
+uint64_t ds4_engine_text_model_bytes(ds4_engine *e);
 bool ds4_engine_has_vision(ds4_engine *e);
 int ds4_engine_vision_encode_file(ds4_engine *e,
                                   const char *path,
@@ -308,6 +310,7 @@ int ds4_engine_model_id(ds4_engine *e);
 bool ds4_engine_is_glm_dsa(ds4_engine *e);
 bool ds4_engine_is_glm53(ds4_engine *e);
 bool ds4_engine_is_qwen4(ds4_engine *e);
+bool ds4_engine_is_qwen35moe(ds4_engine *e);
 /* Qwen3.8 reasoning-effort system instruction for a think mode (NULL when none) */
 const char *ds4_qwen4_reasoning_effort_text(ds4_think_mode mode);
 const char *ds4_backend_name(ds4_backend backend);
@@ -644,6 +647,11 @@ int ds4_session_eval_output_head_from_hc(ds4_session *s,
 #define DS4_SESSION_PAYLOAD_MAGIC UINT32_C(0x34565344) /* "DSV4" */
 #define DS4_SESSION_PAYLOAD_VERSION UINT32_C(2)
 #define DS4_SESSION_PAYLOAD_U32_FIELDS 13u
+/* Well-formed qwen35moe saved payload with an unusable identity/version, while
+ * the current mapped model remains valid. Callers may rebuild from independently
+ * validated saved text. A changed current model is a hard error requiring reopen.
+ * Other failures remain nonzero; existing callers need no change. */
+#define DS4_SESSION_PAYLOAD_INCOMPATIBLE 2
 #define DS4_SESSION_LAYER_PAYLOAD_MAGIC UINT32_C(0x4c565344) /* "DSVL" */
 #define DS4_SESSION_LAYER_PAYLOAD_VERSION UINT32_C(1)
 #define DS4_SESSION_LAYER_PAYLOAD_U32_FIELDS 14u

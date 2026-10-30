@@ -2,8 +2,9 @@
 
 [README](../README.md) | [Getting started](../README.md#start-here)
 
-DwarfStar is not a general GGUF runner. Use the download targets below: other
-GGUFs may have unsupported tensor layouts, metadata, or quantization mixes.
+DwarfStar is not a general GGUF runner. Use the supported model files documented below;
+other GGUFs may have unsupported tensor layouts, metadata, or quantization
+mixes. Qwen3.6 uses a separately obtained local GGUF.
 Run `./download_model.sh --help` for filenames and all available targets.
 
 Main-model downloads update `ds4flash.gguf`. Encoders, draft models, packaged
@@ -139,6 +140,73 @@ on both TP ranks. Use `/read image.png` in `ds4`, `view_image` in `ds4-agent`,
 or the [server image API](SERVER.md#images). V4 Flash vision encoders do not
 work with V4.1. See [conversion](../gguf-tools/README.md#convert-deepseek-v41-flash)
 to build the GGUFs from safetensors.
+
+## Qwen3.6 and Ornith 1.5 35B-A3B
+
+The shared `qwen35moe` path supports CPU text inference for the 35B-A3B
+checkpoints. It has been tested on x86-64 Linux with GCC. CLI, native agent,
+and HTTP serving are integrated. GPU backends, vision, MTP execution,
+SSD streaming, and distributed execution are not implemented for this family.
+
+Run `./download_model.sh ornith15-iq2xxs` to download Ornith IQ2_XXS and select
+it through `ds4flash.gguf`, then start it with `./ds4 --cpu`.
+Qwen3.6 requires a separately obtained GGUF. Pass `-m` to choose a local file
+explicitly:
+
+```sh
+make cpu -j4
+./ds4 --cpu -m /path/to/Qwen_Qwen3.6-35B-A3B-IQ2_XXS.gguf --ctx 4096
+./ds4-agent --cpu -m /path/to/Ornith-1.5-35B-A3B-IQ2_XXS.gguf --ctx 4096
+```
+
+The two IQ2_XXS files above are the tested checkpoints. Other files must match
+this implementation's tensor layout and supported quantization formats.
+Weights remain memory mapped; context and runtime state require additional
+memory. The engine executes the 40 text layers with prefill chunks of at most
+1,024 tokens and the existing CPU thread pool. The extra MTP block is unused.
+
+Server model IDs are `qwen3.6-35b-a3b` and `ornith-1.5-35b-a3b`; `qwen/`
+and `ornith/` aliases and `-chat` / `-reasoner` selectors are recognized.
+Thinking is enabled by default and can be disabled with `--nothink`.
+Native numerical reasoning-effort levels do not apply to this family.
+
+Saved state is tied to the opened GGUF's device, inode, size, modification
+time, and change time. Copying or touching the file invalidates that state;
+a well-formed named session for the same model can rebuild from its saved
+conversation text. Corrupted checkpoints and checkpoints for another model
+are rejected. Changing a model file while it is mapped requires reopening
+the engine.
+
+Ornith can emit malformed tool-call text for a nonthinking, no-argument
+`clock` request.
+The server does not constrain decoding with a tool grammar, so the complete
+Ornith tool suite reports this failure. Default-thinking `read_file` call and
+result-continuation checks passed. These checks cover specific prompts,
+not general task quality.
+
+Local checks:
+
+```sh
+make test-qwen35moe-quants
+make test-qwen35moe-core
+make test-cpu-frontends
+DS4_QWEN35MOE_MODEL=/path/to/model.gguf make test-qwen35moe-workflow
+DS4_QWEN35MOE_MODEL=/path/to/model.gguf make test-qwen35moe-agent
+```
+
+See [CPU kernel provenance](../cpu/ggml/VENDOR.md) for source and license
+details.
+
+Against an already-running CPU HTTP server:
+
+```sh
+python3 tests/test_server_qwen35moe.py \
+  --url http://127.0.0.1:8080 --model ornith-1.5-35b-a3b \
+  --case all --output /tmp/ornith15-http-check
+```
+
+The HTTP helper also supports `--case protocol` and `--case tools`, and
+retains failed requests and responses.
 
 ## Qwen3.8 Flash Next
 

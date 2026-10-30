@@ -26,8 +26,8 @@ DS4_DSPARK_SUPPORT ?= gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf
 
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
-CORE_OBJS = ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_metal.o ds4_layer_pack.o ds4_engram.o
-CPU_CORE_OBJS = ds4_cpu.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+CORE_OBJS = cpu/ggml/qwen35moe-quants.o ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_metal.o ds4_layer_pack.o ds4_engram.o
+CPU_CORE_OBJS = cpu/ggml/qwen35moe-quants.o ds4_cpu.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
 else
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
 CUDA_HOME ?= $(shell if [ -x /usr/local/cuda/bin/nvcc ]; then \
@@ -53,8 +53,8 @@ NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NA
 # Vendored llama.cpp mmq prefill tier (cuda/mmq/, see cuda/mmq/VENDOR.md).
 MMQ_INCLUDES := -Icuda/mmq
 MMQ_OBJS := cuda/mmq/ds4_ggml_stubs.o cuda/mmq/ds4_mmq.o cuda/mmq/ds4_mmq_d2r.o cuda/mmq/quantize.o cuda/mmq/mmid.o cuda/mmq/mmvq.o cuda/mmq/ds4_repack.o
-CORE_OBJS = ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_cuda.o ds4_layer_pack.o ds4_engram.o $(MMQ_OBJS)
-CPU_CORE_OBJS = ds4_cpu.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+CORE_OBJS = cpu/ggml/qwen35moe-quants.o ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_cuda.o ds4_layer_pack.o ds4_engram.o $(MMQ_OBJS)
+CPU_CORE_OBJS = cpu/ggml/qwen35moe-quants.o ds4_cpu.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
 HIPCC ?= $(shell command -v hipcc 2>/dev/null || echo /opt/rocm/bin/hipcc)
 ROCM_ARCH ?= gfx1151
@@ -328,7 +328,7 @@ cuda:
 
 strix-halo:
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent \
-		CORE_OBJS="ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o ds4_engram.o $(ROCM_MMQ_OBJS)" \
+		CORE_OBJS="cpu/ggml/qwen35moe-quants.o ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o ds4_engram.o $(ROCM_MMQ_OBJS)" \
 		CFLAGS="$(CFLAGS) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD" \
 		DS4_LINK="$(HIPCC) $(ROCM_CFLAGS)" \
 		DS4_LINK_LIBS="$(ROCM_LDLIBS)"
@@ -344,7 +344,7 @@ test-rocm:
 		test-session-state \
 		tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args tests/test_prompt_prefix \
 		ds4 ds4-server ds4-bench ds4-agent \
-		CORE_OBJS="ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o ds4_engram.o $(ROCM_MMQ_OBJS)" \
+		CORE_OBJS="cpu/ggml/qwen35moe-quants.o ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o ds4_engram.o $(ROCM_MMQ_OBJS)" \
 		CFLAGS="$(CFLAGS) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD" \
 		DS4_LINK="$(HIPCC) $(ROCM_CFLAGS)" \
 		DS4_LINK_LIBS="$(ROCM_LDLIBS)"
@@ -1144,13 +1144,13 @@ ds4_cpu_test_hooks.o: ds4.c ds4.h ds4_image.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer
 tests/test_engine_mgpu_placement.o: tests/test_engine_mgpu_placement.c ds4.h ds4_gpu_mgpu.h ds4_layer_pack.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
-tests/test_engine_mgpu_placement: tests/test_engine_mgpu_placement.o ds4_cpu_test_hooks.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+tests/test_engine_mgpu_placement: tests/test_engine_mgpu_placement.o ds4_cpu_test_hooks.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o cpu/ggml/qwen35moe-quants.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 tests/test_sampling.o: tests/test_sampling.c ds4.h
 	$(CC) $(CFLAGS) -fno-finite-math-only -DDS4_TEST_HOOKS -I. -c -o $@ $<
 
-tests/test_sampling: tests/test_sampling.o ds4_cpu_test_hooks.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+tests/test_sampling: tests/test_sampling.o ds4_cpu_test_hooks.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o cpu/ggml/qwen35moe-quants.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 tests/test_session_state.o: tests/test_session_state.c ds4.c ds4.h ds4_gpu.h ds4_image.h ds4_tp.h
@@ -1362,11 +1362,14 @@ test-quality-api: tests/test_quality_api.c gguf-tools/quality-testing/score_offi
 	python3 tests/test_collect_official.py
 
 ds4.o ds4_cpu.o ds4_agent.o ds4_agent_cpu.o ds4_server.o ds4_server_cpu.o \
-ds4_test.o ds4_agent_test.o \
+ds4_test.o ds4_agent_test.o ds4_test_cpu.o ds4_agent_test_cpu.o \
 ds4_cpu_test_hooks.o ds4_cuda_test_hooks.o tests/test_session_state.o \
 tests/test_session_state_gpu.o: ds4_tool_text.h
 
 clean:
+	rm -f ds4_test_cpu ds4_agent_test_cpu
+	rm -f tests/test_qwen35moe_core tests/qwen35moe_workflow
+	rm -f cpu/ggml/qwen35moe-quants.o tests/test_qwen35moe_quants
 	rm -f tests/test_mmvq_cuda tests/test_mmvq_rocm
 	rm -f tests/test_qwen4_ngrams
 	rm -f tests/test_qwen4_ngram_state
@@ -1431,6 +1434,66 @@ clean:
 
 # The active tokenizer includes generated Unicode classes.
 ds4.o ds4_cpu.o ds4_cpu_test_hooks.o: ds4_qwen4_unicode.inc
+
+# Shared CPU primitives and their standalone numerical checks.
+cpu/ggml/qwen35moe-quants.o: cpu/ggml/qwen35moe-quants.c cpu/ggml/ggml-common.h cpu/ggml/qwen35moe-quants.h
+	$(CC) $(CFLAGS) -Wno-unused-function -fno-fast-math -fno-strict-aliasing -c -o $@ $<
+
+tests/test_qwen35moe_quants: tests/test_qwen35moe_quants.c cpu/ggml/qwen35moe-quants.o cpu/ggml/qwen35moe-quants.h cpu/ggml/ggml-common.h
+	$(CC) $(CFLAGS) -fno-fast-math -fno-strict-aliasing -I. -o $@ $< cpu/ggml/qwen35moe-quants.o $(LDLIBS)
+
+.PHONY: test-qwen35moe-quants
+test-qwen35moe-quants: tests/test_qwen35moe_quants
+	./tests/test_qwen35moe_quants
+
+# The include scopes precise FP arithmetic to this architecture; existing
+# backends retain their original compiler options.
+ds4.o ds4_cpu.o ds4_cpu_test_hooks.o ds4_cuda_test_hooks.o \
+tests/test_session_state.o tests/test_session_state_gpu.o \
+tests/test_deepseek41_gguf.o tests/test_deepseek41_graph.o \
+tests/test_deepseek41_prefill.o tests/test_deepseek41_dspark.o \
+tests/test_deepseek_indexer.o ds4_verify_test_hooks.o tests/test_qwen4_ngrams.o \
+tests/test_qwen4_ngram_state.o: ds4_qwen35moe_cpu.inc cpu/ggml/qwen35moe-quants.h
+
+tests/test_qwen35moe_core.o: tests/test_qwen35moe_core.c ds4.c ds4.h ds4_qwen35moe_cpu.inc cpu/ggml/qwen35moe-quants.h
+	$(CC) $(CFLAGS) -Wno-unused-function -fno-fast-math -DDS4_NO_GPU -I. -c -o $@ $<
+
+tests/test_qwen35moe_core: tests/test_qwen35moe_core.o $(filter-out ds4_cpu.o,$(CPU_CORE_OBJS))
+	$(CC) $(CFLAGS) -fno-fast-math -o $@ $^ $(LDLIBS)
+
+.PHONY: test-qwen35moe-core
+test-qwen35moe-core: tests/test_qwen35moe_core
+	./tests/test_qwen35moe_core
+
+tests/qwen35moe_workflow: tests/qwen35moe_workflow.c $(CPU_CORE_OBJS)
+	$(CC) $(CFLAGS) -DDS4_NO_GPU -I. -o $@ $< $(CPU_CORE_OBJS) $(LDLIBS)
+
+ds4_test_cpu.o: tests/ds4_test.c ds4_server.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvstore.h rax.h
+	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_NO_GPU -c -o $@ $<
+
+ds4_test_cpu: ds4_test_cpu.o ds4_help.o ds4_kvstore.o rax.o $(CPU_CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+ds4_agent_test_cpu.o: tests/ds4_agent_test.c ds4_agent.c ds4.h ds4_ssd.h ds4_distributed.h ds4_tp.h ds4_help.h ds4_prompt_prefix.h ds4_kvstore.h ds4_web.h ds4_linux_memory.h linenoise.h
+	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_NO_GPU -c -o $@ $<
+
+ds4_agent_test_cpu: ds4_agent_test_cpu.o ds4_help.o ds4_prompt_prefix.o ds4_web.o ds4_kvstore.o linenoise.o $(CPU_CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+.PHONY: test-cpu-frontends test-qwen35moe-workflow test-qwen35moe-agent
+test-cpu-frontends: ds4_test_cpu ds4_agent_test_cpu
+	./ds4_test_cpu --server
+	./ds4_agent_test_cpu
+
+DS4_QWEN35MOE_MODEL ?= gguf/Qwen_Qwen3.6-35B-A3B-IQ2_XXS.gguf
+test-qwen35moe-workflow: tests/qwen35moe_workflow
+	DS4_QWEN35MOE_PREFILL_BATCH=1 ./tests/qwen35moe_workflow "$(DS4_QWEN35MOE_MODEL)"
+	./tests/qwen35moe_workflow "$(DS4_QWEN35MOE_MODEL)"
+
+test-qwen35moe-agent: ds4_agent_test_cpu
+	./ds4_agent_test_cpu
+	./ds4_agent_test_cpu --qwen35moe-save "$(DS4_QWEN35MOE_MODEL)"
+	./ds4_agent_test_cpu --qwen35moe-compact "$(DS4_QWEN35MOE_MODEL)"
 
 ds4_verify_test_hooks.o: ds4.c ds4.h ds4_deepseek41_dspark.h ds4_gpu.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -DDS4_TEST_HOOKS -Wno-unused-function -c -o $@ $<
