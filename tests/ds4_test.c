@@ -7399,6 +7399,11 @@ static void test_run_entry(const ds4_test_entry *entry) {
     int before = test_failures;
     fprintf(stderr, "%s:\n", entry->name);
     entry->fn();
+#ifndef DS4_NO_GPU
+    /* Each test owns its engines. Later tests may open a differently configured
+     * engine directly, which must not collide with this test's instance lock. */
+    test_close_engines();
+#endif
     fprintf(stderr, "%s: ", entry->name);
     ds4_log(stderr,
             test_failures == before ? DS4_LOG_OK : DS4_LOG_ERROR,
