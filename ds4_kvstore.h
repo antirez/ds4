@@ -130,6 +130,12 @@ void ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
         const ds4_tokens *exact_prefix,
         const char *suffix_text,
         ds4_tokens *out);
+void ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix_masked(
+        ds4_engine *engine,
+        const ds4_tokens *exact_prefix,
+        const char *suffix_text,
+        const unsigned char *suffix_trusted,
+        ds4_tokens *out);
 
 int ds4_kvstore_store_len(const ds4_kvstore *kc, int tokens);
 int ds4_kvstore_chat_anchor_pos(const ds4_kvstore *kc,
