@@ -877,6 +877,11 @@ static const ds4_shape DS4_SHAPE_QWEN4_MINI = {
     .rope_orig_ctx = 262144,
 };
 
+/* Width of the widest Qwen shared expert.  The stock checkpoint uses the
+ * routed width (640); a pruned top-5 checkpoint can carry a wider, healed
+ * shared expert in its trunk while the MTP block keeps the stock one. */
+static uint32_t g_qwen4_shared_ff;
+
 static ds4_shape g_ds4_shape = {
     .name = "DeepSeek V4 Flash",
     .family = DS4_MODEL_FAMILY_DEEPSEEK4,
@@ -5625,9 +5630,18 @@ static void weights_validate_qwen4_layout(
         } else {
             tensor_expect_layout(l->ffn_gate_inp_shexp, DS4_TENSOR_F32, 2, DS4_N_EMBD, 1, 0);
         }
-        tensor_expect_qwen4_dense_layout(l->ffn_gate_shexp, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
-        tensor_expect_qwen4_dense_layout(l->ffn_up_shexp,   2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
-        tensor_expect_qwen4_dense_layout(l->ffn_down_shexp, 2, DS4_N_FF_EXP, DS4_N_EMBD, 0);
+        {
+            /* trunk and MTP may differ: the healed top-5 trunk is wider */
+            const uint32_t sf = (uint32_t)l->ffn_gate_shexp->dim[1];
+            if (sf != DS4_N_FF_EXP && sf != g_qwen4_shared_ff) {
+                fprintf(stderr, "ds4: layer %u shared expert width %u is neither %u nor %u\n",
+                        il, sf, DS4_N_FF_EXP, g_qwen4_shared_ff);
+                exit(1);
+            }
+            tensor_expect_qwen4_dense_layout(l->ffn_gate_shexp, 2, DS4_N_EMBD, sf, 0);
+            tensor_expect_qwen4_dense_layout(l->ffn_up_shexp,   2, DS4_N_EMBD, sf, 0);
+            tensor_expect_qwen4_dense_layout(l->ffn_down_shexp, 2, sf, DS4_N_EMBD, 0);
+        }
         if (ds4_qwen4_layer_is_nextn(il)) {
             tensor_expect_qwen4_dense_layout(l->nextn_eh_proj, 2, 2u * DS4_N_EMBD, DS4_N_EMBD, 0);
             tensor_expect_layout(l->nextn_enorm, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
@@ -7066,12 +7080,46 @@ static void config_validate_qwen4_model(const ds4_model *m) {
                           required_f32(m, "qwen4exp.attention.layer_norm_rms_epsilon"),
                           DS4_RMS_EPS);
     config_expect_u32("expert_count", required_u32(m, "qwen4exp.expert_count"), DS4_N_EXPERT);
-    config_expect_u32("expert_used_count", required_u32(m, "qwen4exp.expert_used_count"),
-                      DS4_N_EXPERT_USED);
+    /* Routed experts per token come from the file, so a pruned checkpoint
+     * (top-5 with a healed shared expert) runs without a separate profile.
+     * DS4_QWEN4_EXPERTS_USED overrides it for experiments; the router and the
+     * expert kernels take any count up to 32. */
+    {
+        uint32_t used = required_u32(m, "qwen4exp.expert_used_count");
+        const char *env = getenv("DS4_QWEN4_EXPERTS_USED");
+        if (env && *env) {
+            char *end = NULL;
+            const unsigned long v = strtoul(env, &end, 10);
+            if (!end || *end || v == 0) {
+                fprintf(stderr, "ds4: DS4_QWEN4_EXPERTS_USED=%s is not a positive count\n", env);
+                exit(1);
+            }
+            used = (uint32_t)v;
+        }
+        if (used == 0 || used > 32u || used > DS4_N_EXPERT) {
+            fprintf(stderr, "ds4: qwen4exp expert_used_count %u is outside 1..32\n", used);
+            exit(1);
+        }
+        if (used != DS4_N_EXPERT_USED) {
+            fprintf(stderr, "ds4: Qwen routed experts per token: %u (profile default %u)\n",
+                    used, DS4_N_EXPERT_USED);
+        }
+        g_ds4_shape.n_expert_used = used;
+    }
     config_expect_u32("expert_feed_forward_length",
                       required_u32(m, "qwen4exp.expert_feed_forward_length"), DS4_N_FF_EXP);
-    config_expect_u32("expert_shared_feed_forward_length",
-                      required_u32(m, "qwen4exp.expert_shared_feed_forward_length"), DS4_N_FF_EXP);
+    {
+        const uint32_t shared_ff = required_u32(m, "qwen4exp.expert_shared_feed_forward_length");
+        if (shared_ff < DS4_N_FF_EXP || shared_ff % 64u || shared_ff > 8u * DS4_N_FF_EXP) {
+            fprintf(stderr, "ds4: qwen4exp expert_shared_feed_forward_length %u: expected a multiple of 64 "
+                    "from %u to %u\n", shared_ff, DS4_N_FF_EXP, 8u * DS4_N_FF_EXP);
+            exit(1);
+        }
+        g_qwen4_shared_ff = shared_ff;
+        if (shared_ff != DS4_N_FF_EXP) {
+            fprintf(stderr, "ds4: Qwen shared expert width: %u (routed experts %u)\n", shared_ff, DS4_N_FF_EXP);
+        }
+    }
     config_expect_u32("ssm.conv_kernel", required_u32(m, "qwen4exp.ssm.conv_kernel"), DS4_N_LIN_CONV);
     config_expect_u32("ssm.state_size", required_u32(m, "qwen4exp.ssm.state_size"), DS4_N_LIN_HEAD_DIM);
     config_expect_u32("ssm.group_count", required_u32(m, "qwen4exp.ssm.group_count"), DS4_N_LIN_K_HEAD);
@@ -58915,9 +58963,10 @@ static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint
     QWEN4_ALLOC(sh_gate_logit, T);
     QWEN4_ALLOC(moe_lists, (uint64_t)DS4_N_EXPERT * T);
     QWEN4_ALLOC(moe_counts, DS4_N_EXPERT);
-    QWEN4_ALLOC(sh_gate, T * DS4_N_FF_EXP);
-    QWEN4_ALLOC(sh_up, T * DS4_N_FF_EXP);
-    QWEN4_ALLOC(sh_mid, T * DS4_N_FF_EXP);
+    const uint64_t shared_ff = g_qwen4_shared_ff > DS4_N_FF_EXP ? g_qwen4_shared_ff : DS4_N_FF_EXP;
+    QWEN4_ALLOC(sh_gate, T * shared_ff);
+    QWEN4_ALLOC(sh_up, T * shared_ff);
+    QWEN4_ALLOC(sh_mid, T * shared_ff);
     QWEN4_ALLOC(sh_out, T * E);
     QWEN4_ALLOC(hc_u, T * hc_dim);
     QWEN4_ALLOC(hc_lo_act, T * DS4_N_HC_LOWRANK);
@@ -59497,6 +59546,7 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
     const bool profile = T > 8u && getenv("DS4_QWEN4_MOE_PROFILE") != NULL;
     double elapsed[7] = {0}, last = 0;
     if (!qwen4_moe_profile_boundary(profile, &last, &elapsed[0])) return false;
+    const uint32_t SF = (uint32_t)l->ffn_gate_shexp->dim[1];
     bool ok = qwen4_gemv(g->router, m, l->ffn_gate_inp, g->mixed, T) &&
               ds4_gpu_qwen4_router_topk_tensor(g->selected, g->weights, g->router, g->mixed, m->map, m->size,
                                                l->ffn_gate_inp_shexp->abs_offset, l->ffn_gate_inp_shexp->type,
@@ -59536,7 +59586,7 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
                  qwen4_moe_profile_boundary(profile, &last, &elapsed[2]) &&
                  qwen4_gemv(g->sh_gate, m, l->ffn_gate_shexp, g->mixed, T) &&
                  qwen4_gemv(g->sh_up, m, l->ffn_up_shexp, g->mixed, T) &&
-                 ds4_gpu_swiglu_tensor(g->sh_mid, g->sh_gate, g->sh_up, T * DS4_N_FF_EXP, 0.0f, 1.0f) &&
+                 ds4_gpu_swiglu_tensor(g->sh_mid, g->sh_gate, g->sh_up, T * SF, 0.0f, 1.0f) &&
                  qwen4_moe_profile_boundary(profile, &last, &elapsed[3]);
         }
         if (ok) {
@@ -59564,17 +59614,21 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
      * rows, as the prefill path does: as a slot of the per-token kernels it
      * is read once per row, 5 MB of Q8 per row and layer.  Single tokens and
      * verify rows keep the slot. */
+    /* A shared expert wider than the routed ones (healed top-5 trunk) cannot
+     * ride along as an extra slot of the routed kernels: run it dense. */
+    const bool shared_wide = SF != DS4_N_FF_EXP;
 #ifdef DS4_HAS_QWEN4_METAL
-    const bool shared_dense = T > 8u &&
+    const bool shared_dense = (T > 8u || shared_wide) &&
         qwen4_graph_dense_ok(l->ffn_gate_shexp) && qwen4_graph_dense_ok(l->ffn_up_shexp) &&
         qwen4_graph_dense_ok(l->ffn_down_shexp);
 #else
-    const bool shared_dense = false;
+    const bool shared_dense = shared_wide;
 #endif
+    if (shared_wide && !shared_dense) return false;
     if (ok && shared_dense) {
         ok = qwen4_gemv(g->sh_gate, m, l->ffn_gate_shexp, g->mixed, T) &&
              qwen4_gemv(g->sh_up, m, l->ffn_up_shexp, g->mixed, T) &&
-             ds4_gpu_swiglu_tensor(g->sh_mid, g->sh_gate, g->sh_up, T * DS4_N_FF_EXP, 0.0f, 1.0f) &&
+             ds4_gpu_swiglu_tensor(g->sh_mid, g->sh_gate, g->sh_up, T * SF, 0.0f, 1.0f) &&
              qwen4_gemv(g->sh_out, m, l->ffn_down_shexp, g->sh_mid, T);
     }
     /* Sixteen rows pick ten experts each but only a third as many distinct
@@ -68635,8 +68689,11 @@ static void qwen4_ref_moe(const ds4_model *m, const ds4_layer_weights *l, const 
     double *prob = xmalloc(NE * sizeof(double));
     const uint32_t down_width = (uint32_t)l->ffn_down_exps->dim[0];
     float *g = xcalloc(down_width, sizeof(float));
-    float *u = xmalloc(F * sizeof(float));
+    const uint32_t SF = (uint32_t)l->ffn_gate_shexp->dim[1];
+    const uint32_t gu = down_width > SF ? down_width : SF;
+    float *u = xmalloc((F > SF ? F : SF) * sizeof(float));
     float *y = xmalloc(E * sizeof(float));
+    if (gu > down_width) { free(g); g = xcalloc(gu, sizeof(float)); }
     qwen4_ref_matvec(m, l->ffn_gate_inp, x, logits);
     double mx = -DBL_MAX, sum = 0.0;
     for (uint32_t e = 0; e < NE; e++) if (logits[e] > mx) mx = logits[e];
@@ -68667,7 +68724,7 @@ static void qwen4_ref_moe(const ds4_model *m, const ds4_layer_weights *l, const 
     }
     qwen4_ref_matvec(m, l->ffn_gate_shexp, x, g);
     qwen4_ref_matvec(m, l->ffn_up_shexp, x, u);
-    for (uint32_t f = 0; f < F; f++) g[f] = silu(g[f]) * u[f];
+    for (uint32_t f = 0; f < SF; f++) g[f] = silu(g[f]) * u[f];
     qwen4_ref_matvec(m, l->ffn_down_shexp, g, y);
     float sg;
     qwen4_ref_matvec(m, l->ffn_gate_inp_shexp, x, &sg);

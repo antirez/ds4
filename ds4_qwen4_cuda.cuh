@@ -1147,18 +1147,29 @@ __global__ void matvec_q8(float *out, const char *w, const float *x,
     if (row >= M) return;
     const char *wr = w+(uint64_t)row*stride;
     float acc[ROWS] = {};
-    for (unsigned i = lane*4; i < K; i += 128) {
+    /* Each lane takes eight consecutive quants of one block per step (four
+     * 16-bit loads; Q8_0 quants are only 2-byte aligned), and two steps are
+     * in flight, so a warp keeps more weight bytes outstanding than with the
+     * four-quant step.  The per-row arithmetic does not depend on ROWS, so
+     * every T rounds a row the same way. */
+    #pragma unroll 2
+    for (unsigned i = lane*8; i < K; i += 256) {
         const char *b = wr+(i/32)*34;
         const float scale = __half2float(*(const __half *)b);
         const uint16_t *q = (const uint16_t *)(b+2+i%32);
-        const unsigned q01 = q[0], q23 = q[1];
+        const unsigned q01 = q[0], q23 = q[1], q45 = q[2], q67 = q[3];
         #pragma unroll
         for (unsigned t = 0; t < ROWS; t++) if (t < T) {
             const float4 v = *(const float4 *)(x+(uint64_t)t*K+i);
+            const float4 u = *(const float4 *)(x+(uint64_t)t*K+i+4);
             float part = (float)(int8_t)q01*v.x;
             part += (float)(int8_t)(q01>>8)*v.y;
             part += (float)(int8_t)q23*v.z;
             part += (float)(int8_t)(q23>>8)*v.w;
+            part += (float)(int8_t)q45*u.x;
+            part += (float)(int8_t)(q45>>8)*u.y;
+            part += (float)(int8_t)q67*u.z;
+            part += (float)(int8_t)(q67>>8)*u.w;
             acc[t] += part*scale;
         }
     }
@@ -1169,11 +1180,157 @@ __global__ void matvec_q8(float *out, const char *w, const float *x,
     }
 }
 
+/* F16 matrices with few output rows and a long input (the hyper-connection
+ * down projections: 320 rows of 10240) leave most of the GPU idle with one
+ * warp per row.  Here eight warps share a row, each over an interleaved
+ * eighth of K, and the partial sums are added in warp order, so every T
+ * (1..8) rounds a row the same way. */
+template<unsigned ROWS>
+__global__ void matvec_f16_split(float *out, const char *w, const float *x,
+        unsigned T, unsigned K, unsigned M, uint64_t stride) {
+    const unsigned row = blockIdx.x, warp = threadIdx.x/32, lane = threadIdx.x&31;
+    __shared__ float part[8][ROWS];
+    const char *wr = w+(uint64_t)row*stride;
+    float a[ROWS] = {};
+    for (unsigned i = (warp*32+lane)*4; i < K; i += 1024) {
+        const float4 v = value4<1>(wr,i,NULL,NULL);
+        #pragma unroll
+        for (unsigned t = 0; t < ROWS; t++) if (t < T) {
+            const float4 xv = *(const float4 *)(x+(uint64_t)t*K+i);
+            a[t] += v.x*xv.x; a[t] += v.y*xv.y; a[t] += v.z*xv.z; a[t] += v.w*xv.w;
+        }
+    }
+    #pragma unroll
+    for (unsigned t = 0; t < ROWS; t++) if (t < T) {
+        const float v = sum(a[t]);
+        if (!lane) part[warp][t] = v;
+    }
+    __syncthreads();
+    if (threadIdx.x < T) {
+        float v = 0;
+        #pragma unroll
+        for (unsigned k = 0; k < 8; k++) v += part[k][threadIdx.x];
+        out[(uint64_t)threadIdx.x*M+row] = v;
+    }
+}
+
+/* Q4_0 rows (an int4 output head): a lane takes four bytes of one block,
+ * which hold quants j..j+3 (low nibbles) and j+16..j+19 (high nibbles), so a
+ * warp covers eight blocks per step.  Same arithmetic for every ROWS. */
+template<unsigned ROWS>
+__global__ void matvec_q4(float *out, const char *w, const float *x,
+        unsigned T, unsigned K, unsigned M, uint64_t stride) {
+    const unsigned row = blockIdx.x*4+threadIdx.x/32, lane = threadIdx.x&31;
+    if (row >= M) return;
+    const char *wr = w+(uint64_t)row*stride;
+    float acc[ROWS] = {};
+    const unsigned sub = (lane&3)*4;
+    #pragma unroll 2
+    for (unsigned blk = lane>>2; blk < K/32; blk += 8) {
+        const char *b = wr+(uint64_t)blk*18;
+        const float scale = __half2float(*(const __half *)b);
+        const uint16_t *q = (const uint16_t *)(b+2+sub);
+        const unsigned q0 = q[0], q1 = q[1];
+        const float l0 = (float)((int)(q0&15)-8), h0 = (float)((int)((q0>>4)&15)-8);
+        const float l1 = (float)((int)((q0>>8)&15)-8), h1 = (float)((int)((q0>>12)&15)-8);
+        const float l2 = (float)((int)(q1&15)-8), h2 = (float)((int)((q1>>4)&15)-8);
+        const float l3 = (float)((int)((q1>>8)&15)-8), h3 = (float)((int)((q1>>12)&15)-8);
+        const unsigned i = blk*32+sub;
+        #pragma unroll
+        for (unsigned t = 0; t < ROWS; t++) if (t < T) {
+            const float4 v = *(const float4 *)(x+(uint64_t)t*K+i);
+            const float4 u = *(const float4 *)(x+(uint64_t)t*K+i+16);
+            float part = l0*v.x;
+            part += l1*v.y; part += l2*v.z; part += l3*v.w;
+            part += h0*u.x; part += h1*u.y; part += h2*u.z; part += h3*u.w;
+            acc[t] += part*scale;
+        }
+    }
+    #pragma unroll
+    for (unsigned t = 0; t < ROWS; t++) if (t < T) {
+        const float v = sum(acc[t]);
+        if (!lane) out[(uint64_t)t*M+row] = v;
+    }
+}
+
+/* Q8_0 counterpart of matvec_f16_split: eight warps per row, each taking
+ * eight-quant chunks of an interleaved eighth of K, partials added in warp
+ * order.  Used for every T on short-and-wide matrices (Q8_0 hyper-connection
+ * down projections), so all T round a row the same way. */
+template<unsigned ROWS>
+__global__ void matvec_q8_split(float *out, const char *w, const float *x,
+        unsigned T, unsigned K, unsigned M, uint64_t stride) {
+    const unsigned row = blockIdx.x, warp = threadIdx.x/32, lane = threadIdx.x&31;
+    __shared__ float part[8][ROWS];
+    const char *wr = w+(uint64_t)row*stride;
+    float acc[ROWS] = {};
+    for (unsigned i = (warp*32+lane)*8; i < K; i += 2048) {
+        const char *b = wr+(i/32)*34;
+        const float scale = __half2float(*(const __half *)b);
+        const uint16_t *q = (const uint16_t *)(b+2+i%32);
+        const unsigned q01 = q[0], q23 = q[1], q45 = q[2], q67 = q[3];
+        #pragma unroll
+        for (unsigned t = 0; t < ROWS; t++) if (t < T) {
+            const float4 v = *(const float4 *)(x+(uint64_t)t*K+i);
+            const float4 u = *(const float4 *)(x+(uint64_t)t*K+i+4);
+            float p = (float)(int8_t)q01*v.x;
+            p += (float)(int8_t)(q01>>8)*v.y;
+            p += (float)(int8_t)q23*v.z;
+            p += (float)(int8_t)(q23>>8)*v.w;
+            p += (float)(int8_t)q45*u.x;
+            p += (float)(int8_t)(q45>>8)*u.y;
+            p += (float)(int8_t)q67*u.z;
+            p += (float)(int8_t)(q67>>8)*u.w;
+            acc[t] += p*scale;
+        }
+    }
+    #pragma unroll
+    for (unsigned t = 0; t < ROWS; t++) if (t < T) {
+        const float v = sum(acc[t]);
+        if (!lane) part[warp][t] = v;
+    }
+    __syncthreads();
+    if (threadIdx.x < T) {
+        float v = 0;
+        #pragma unroll
+        for (unsigned k = 0; k < 8; k++) v += part[k][threadIdx.x];
+        out[(uint64_t)threadIdx.x*M+row] = v;
+    }
+}
+
 static int matvec_dispatch(float *out, const char *w, const float *x,
                            unsigned type, unsigned T, unsigned K, unsigned M) {
     const dim3 grid((M + 3) / 4, T);
     const uint64_t stride = row_bytes(type, K);
     if (!stride) return 0;
+    if (type == 1 && T <= 8 && M <= 1024 && K >= 4096 && !(K%1024) && !((uintptr_t)x&15) &&
+        !((uintptr_t)w&7) && !(stride&7)) {
+#define QWEN_F16_SPLIT(N) matvec_f16_split<N><<<M,256,0,cuda_decode_stream()>>>(out,w,x,T,K,M,stride)
+        if (T == 1) { QWEN_F16_SPLIT(1); }
+        else if (T == 2) { QWEN_F16_SPLIT(2); }
+        else if (T <= 4) { QWEN_F16_SPLIT(4); }
+        else { QWEN_F16_SPLIT(8); }
+#undef QWEN_F16_SPLIT
+        return launched();
+    }
+    if (type == 2 && T <= 8 && !(K%32) && !((uintptr_t)x&15) && !((uintptr_t)w&1)) {
+#define QWEN_Q4_ROWS(N) matvec_q4<N><<<(M+3)/4,128,0,cuda_decode_stream()>>>(out,w,x,T,K,M,stride)
+        if (T == 1) { QWEN_Q4_ROWS(1); }
+        else if (T == 2) { QWEN_Q4_ROWS(2); }
+        else if (T <= 4) { QWEN_Q4_ROWS(4); }
+        else { QWEN_Q4_ROWS(8); }
+#undef QWEN_Q4_ROWS
+        return launched();
+    }
+    if (type == 8 && T <= 8 && M <= 1024 && K >= 4096 && !((uintptr_t)x&15)) {
+#define QWEN_Q8_SPLIT(N) matvec_q8_split<N><<<M,256,0,cuda_decode_stream()>>>(out,w,x,T,K,M,stride)
+        if (T == 1) { QWEN_Q8_SPLIT(1); }
+        else if (T == 2) { QWEN_Q8_SPLIT(2); }
+        else if (T <= 4) { QWEN_Q8_SPLIT(4); }
+        else { QWEN_Q8_SPLIT(8); }
+#undef QWEN_Q8_SPLIT
+        return launched();
+    }
     if (type == 8 && T <= 8 && !((uintptr_t)x&15)) {
 #define QWEN_Q8_ROWS(N) matvec_q8<N><<<(M+3)/4,128,0,cuda_decode_stream()>>>(out,w,x,T,K,M,stride)
         if (T == 1) { QWEN_Q8_ROWS(1); }
