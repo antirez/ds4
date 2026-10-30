@@ -19,11 +19,13 @@ Sections:
             (reported in the server log) -- never the long image-conditioned
             conversation, and neither by an unrelated request nor by a new
             image conversation.
+  responses-tool-users  Qwen tool outputs followed by user messages retain the
+                        validated live frontier; checks 0/1/9 users and guards.
   tool-409  A tool-result-only continuation has no replayable history, so when
             its live frontier cannot be rebuilt the server must answer 409
             instead of generating from a context-free prompt.
 
-Both sections are real-model checks; they assert on usage counters (cached
+These sections are real-model checks; they assert on usage counters (cached
 tokens), the server log, and HTTP status, not on generated text quality.
 """
 
@@ -32,6 +34,7 @@ import base64
 import json
 from pathlib import Path
 import re
+import time
 import urllib.error
 import urllib.request
 
@@ -244,16 +247,109 @@ def tool_409_section(args):
           "unreconstructable and reuse it otherwise", flush=True)
 
 
+def responses_tool_users_section(args):
+    """Omit tool-turn reasoning to require ID reuse, rather than visible replay.
+
+    Each case obtains a fresh real tool-call frontier with one retained image.
+    No tool is executed. Only new results/users are appended; negative controls
+    deliberately change the earlier parent or image. No server is launched.
+    """
+    assert args.log, "responses-tool-users requires --log to verify the reuse tier"
+    tools = [{"type": "function", "name": "echo", "description": "Echo a note.",
+              "parameters": {"type": "object", "properties": {
+                  "note": {"type": "string"}}, "required": ["note"],
+                  "additionalProperties": False}}]
+    failures = []
+
+    def run(history, label):
+        offset = args.log.stat().st_size if args.log else 0
+        started = time.monotonic()
+        status, reply = post(args.url, "/v1/responses", {
+            "model": args.model, "input": history, "tools": tools,
+            "reasoning": {"effort": "medium", "summary": "auto"},
+            "stream": False, "store": False, "temperature": 0,
+            "max_output_tokens": 1024})
+        wall = time.monotonic() - started
+        assert status == 200 and reply.get("status") == "completed", (
+            label, status, json.dumps(reply)[:500])
+        usage = reply["usage"]
+        cached = usage.get("input_tokens_details", {}).get("cached_tokens", 0)
+        log = ""
+        if args.log:
+            with args.log.open("rb") as source:
+                source.seek(offset)
+                log = source.read().decode(errors="replace")
+        match = re.search(r"responses live continuation .*match=([^ ]+)", log)
+        prefill = re.search(r"prompt done ([0-9.]+)s", log)
+        print(json.dumps({"case": label, "cached_tokens": cached,
+                          "input_tokens": usage["input_tokens"],
+                          "evaluated_tokens": usage["input_tokens"] - cached,
+                          "output_tokens": usage["output_tokens"],
+                          "wall_seconds": wall,
+                          "prefill_seconds": float(prefill[1]) if prefill else None,
+                          "tier": match[1] if match else None}), flush=True)
+        return reply, cached, log
+
+    for count, change in ((0, None), (1, None), (9, None),
+                          (1, "parent"), (1, "image")):
+        label = "users-%d%s" % (count, "-changed-" + change if change else "")
+        parent = [{"role": "developer", "content":
+                   "When asked, call echo exactly once. After its result, call "
+                   "no tool; reply with the newest NOTICE marker, or OK if none. "
+                   "Do not describe the image."},
+                  {"role": "user", "content": [
+                      {"type": "input_text", "text": "Call echo with note=ready."},
+                      image_part("text.png", "responses")]}]
+        first, _, _ = run(parent, label + "-call")
+        calls = [item for item in first["output"] if item.get("type") == "function_call"]
+        assert len(calls) == 1 and calls[0]["name"] == "echo", label
+        assert any(item.get("type") == "reasoning" and item.get("summary")
+                   for item in first["output"]), "need emitted reasoning to omit"
+        frontier = first["usage"]["input_tokens"] + first["usage"]["output_tokens"]
+        history = json.loads(json.dumps(parent))
+        history.extend(item for item in first["output"]
+                       if item.get("type") != "reasoning")
+        history.append({"type": "function_call_output", "call_id": calls[0]["call_id"],
+                        "output": "Echo result: ready. Reply briefly now."})
+        for i in range(count):
+            history.append({"role": "user", "content": [{"type": "input_text",
+                "text": "Background notification %d: NOTICE%d." % (i + 1, i + 1)}]})
+        assert history[:len(parent)] == parent
+        if change == "parent":
+            history[0]["content"] += " Changed earlier instruction: preserve this edit."
+        elif change == "image":
+            history[1]["content"][1] = image_part("spatial.png", "responses")
+        reply, cached, log = run(history, label + "-result")
+        should_reuse = change is None
+        if should_reuse and cached < frontier:
+            failures.append("%s: cached=%d below frontier=%d" % (label, cached, frontier))
+        if should_reuse and args.log and not re.search(
+                r"responses live continuation .*match=tool-output-ids", log):
+            failures.append(label + ": missing tool-output-ID tier")
+        if not should_reuse and (cached != 0 or "match=tool-output-ids" in log):
+            failures.append(label + ": changed parent/image reused the old frontier")
+        if should_reuse and count:
+            text = " ".join(part.get("text", "") for item in reply["output"]
+                            if item.get("type") == "message"
+                            for part in item.get("content", []))
+            if "NOTICE%d" % count not in text:
+                failures.append(label + ": final user notification not reflected in answer")
+    assert not failures, "\n".join(failures)
+    print("PASS: tool results retain queued users and reject changed parent/image", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", default="http://127.0.0.1:8080")
     parser.add_argument("--model", default="deepseek-v4-flash")
-    parser.add_argument("--section", choices=["eviction", "tool-409"], required=True)
+    parser.add_argument("--section", choices=["eviction", "tool-409", "responses-tool-users"], required=True)
     parser.add_argument("--log", type=Path,
-                        help="server stderr log, for the eviction assertions")
+                        help="server log; required for Responses tool-user reuse assertions")
     args = parser.parse_args()
     if args.section == "eviction":
         eviction_section(args)
+    elif args.section == "responses-tool-users":
+        responses_tool_users_section(args)
     else:
         tool_409_section(args)
 
