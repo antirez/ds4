@@ -98,6 +98,7 @@
 /tests/test_deepseek41_gguf
 /tests/test_qwen4_ngrams
 /tests/test_qwen4_ngram_state
+/tests/test_qwen4_ple_prefetch
 /tests/test_deepseek41_graph
 /tests/test_deepseek41_prefill
 /tests/test_deepseek41_cli

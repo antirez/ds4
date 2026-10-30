@@ -59614,9 +59614,45 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
     return ok;
 }
 
+/* Only the next chunk's n-gram disk reads run on this worker.  It owns its
+ * output and a copy of the PLE history; GPU writes and live graph state stay
+ * on the session thread. */
+typedef struct {
+    pthread_t thread;
+    const ds4_model *model;
+    const int *tokens;
+    uint32_t count;
+    int ple_prev[DS4_MAX_PLE_NGRAM];
+    float *rows;
+    bool ok;
+    int error;
+    double read_sec;
+} qwen4_ple_prefetch;
+
+static void *qwen4_ple_prefetch_run(void *context) {
+    qwen4_ple_prefetch *p = context;
+    const double started = now_sec();
+    uint32_t ids[256 * DS4_MAX_PLE_HEADS];
+    for (uint32_t t = 0; t < p->count; t++) {
+        qwen4_ple_step(p->tokens[t], p->ple_prev, ids + (t % 256u) * DS4_N_PLE_HEADS);
+        if (t % 256u == 255u || t + 1u == p->count) {
+            const uint32_t start = t / 256u * 256u;
+            if (!qwen4_ngram_read(p->model, ids, (t - start + 1u) * DS4_N_PLE_HEADS,
+                                  p->rows + (uint64_t)start * DS4_N_EMBD)) {
+                p->error = errno;
+                p->read_sec = now_sec() - started;
+                return NULL;
+            }
+        }
+    }
+    p->ok = true;
+    p->read_sec = now_sec() - started;
+    return NULL;
+}
+
 /* host side: embedding rows tiled into R and the PLE n-gram gather */
 static bool qwen4_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
-                                     const int *tokens, uint32_t T) {
+                                     const int *tokens, uint32_t T, const float *prefetched_ple) {
     const uint32_t E = DS4_N_EMBD, hc = DS4_N_HC, hc_dim = E * hc;
     float *row = g->host_row;
     const ds4_vision_span *spans = g->vis_spans;
@@ -59647,7 +59683,7 @@ static bool qwen4_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m,
             memcpy(g->snap2_ple_prev, g->ple_prev, sizeof(g->snap2_ple_prev));
             g->snap2_pos = g->pos + 2u;
         }
-        if (t % 256u == 255u || t + 1 == T) {
+        if (!prefetched_ple && (t % 256u == 255u || t + 1 == T)) {
             const uint32_t start = t / 256u * 256u;
             if (!qwen4_ngram_read(m, ids, (t-start+1u) * DS4_N_PLE_HEADS,
                                   row + (uint64_t)start * E)) {
@@ -59656,7 +59692,8 @@ static bool qwen4_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m,
             }
         }
     }
-    return ds4_gpu_tensor_write(g->ple_emb, 0, row, (uint64_t)T * E * sizeof(float)) != 0;
+    return ds4_gpu_tensor_write(g->ple_emb, 0, prefetched_ple ? prefetched_ple : row,
+                                (uint64_t)T * E * sizeof(float)) != 0;
 }
 
 /* Forward T tokens at g->pos..; logits (optional) receive the last token's
@@ -59664,8 +59701,9 @@ static bool qwen4_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m,
  * everything is causal by construction because the recurrent kernels walk
  * tokens in order and attention reads the caches written for the same
  * chunk.  g->R keeps the pre-mixer streams of every row afterwards. */
-static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
-                                       const int *tokens, uint32_t T, float *logits_out, bool all_rows) {
+static bool qwen4_graph_forward_tokens_impl(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
+                                            const int *tokens, uint32_t T, float *logits_out, bool all_rows,
+                                            bool inputs_staged, double stage_start) {
     if (!g || T == 0 || T > g->cap_tokens || g->pos + T > g->ctx_cap) return false;
     if (all_rows && T > g->n_logit_rows) return false;
     for (uint32_t t = 0; t < T; t++) {
@@ -59693,8 +59731,8 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
             flush_layer = (uint32_t)layer;
         }
     }
-    const double t0 = timing ? now_sec() : 0.0;
-    if (!qwen4_graph_stage_inputs(g, m, w, tokens, T)) return false;
+    const double t0 = timing ? (inputs_staged ? stage_start : now_sec()) : 0.0;
+    if (!inputs_staged && !qwen4_graph_stage_inputs(g, m, w, tokens, T, NULL)) return false;
     const double t1 = timing ? now_sec() : 0.0;
     if (!glm_graph_begin_commands_if_needed()) return false;
     bool ok = true;
@@ -59822,6 +59860,11 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
         g->snap_after_second = false;
     }
     return ok;
+}
+
+static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
+                                       const int *tokens, uint32_t T, float *logits_out, bool all_rows) {
+    return qwen4_graph_forward_tokens_impl(g, m, w, tokens, T, logits_out, all_rows, false, 0.0);
 }
 
 static bool qwen4_graph_forward_token(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
@@ -76758,6 +76801,18 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         /* A one-token prefill tail is still a prompt row. Speculative verify
          * batches, despite having multiple rows, must never overwrite dumps. */
         s->qwen4_graph.dump_prompt_rows = true;
+        qwen4_ple_prefetch prefetch = {0};
+        const uint64_t prefetch_bytes = (uint64_t)s->qwen4_graph.cap_tokens *
+                                        DS4_N_EMBD * sizeof(float);
+        /* One next-chunk buffer at most; skip tiny chunks where thread startup
+         * outweighs the disk read and large chunks that add memory pressure. */
+        if (!getenv("DS4_QWEN4_NO_PLE_PREFETCH") &&
+            prompt->len - start > (int)s->qwen4_graph.cap_tokens &&
+            s->qwen4_graph.cap_tokens >= 256u && prefetch_bytes <= 128u * 1024u * 1024u) {
+            prefetch.rows = malloc((size_t)prefetch_bytes);
+            if (!prefetch.rows) fprintf(stderr, "ds4: Qwen PLE prefetch buffer allocation failed\n");
+        }
+        bool prefetch_ready = false;
         int prefill_rc = 0;
         for (int i = start; i < prompt->len;) {
             if (ds4_session_cancelled(s)) {
@@ -76772,8 +76827,48 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
              * may leave it as the live session. Every completed chunk needs
              * its own logits as well as recurrent/KV state. */
             s->checkpoint_valid = false;
-            if (!qwen4_graph_forward_tokens(&s->qwen4_graph, &e->model, &e->weights,
-                                            prompt->v + i, chunk, s->logits, false)) {
+            bool ok;
+            if (prefetch.rows) {
+                const double stage_start = now_sec();
+                ok = qwen4_graph_stage_inputs(&s->qwen4_graph, &e->model, &e->weights,
+                                              prompt->v + i, chunk,
+                                              prefetch_ready ? prefetch.rows : NULL);
+                prefetch_ready = false;
+                bool reading = false;
+                if (ok && i + (int)chunk < prompt->len) {
+                    prefetch.model = &e->model;
+                    prefetch.tokens = prompt->v + i + (int)chunk;
+                    prefetch.count = (uint32_t)(prompt->len - i - (int)chunk);
+                    if (prefetch.count > s->qwen4_graph.cap_tokens)
+                        prefetch.count = s->qwen4_graph.cap_tokens;
+                    memcpy(prefetch.ple_prev, s->qwen4_graph.ple_prev, sizeof(prefetch.ple_prev));
+                    prefetch.ok = false;
+                    prefetch.error = 0;
+                    reading = pthread_create(&prefetch.thread, NULL, qwen4_ple_prefetch_run,
+                                             &prefetch) == 0;
+                    if (!reading) fprintf(stderr, "ds4: Qwen PLE prefetch thread unavailable\n");
+                }
+                if (ok) ok = qwen4_graph_forward_tokens_impl(&s->qwen4_graph, &e->model,
+                    &e->weights, prompt->v + i, chunk, s->logits, false, true, stage_start);
+                /* Join before the progress callback can expose this frontier.
+                 * A failed read falls back to synchronous staging next chunk. */
+                if (reading) {
+                    const double join_start = now_sec();
+                    if (pthread_join(prefetch.thread, NULL)) ds4_die("cannot join Qwen PLE prefetch");
+                    prefetch_ready = prefetch.ok;
+                    if (!prefetch.ok) fprintf(stderr,
+                        "ds4: Qwen PLE prefetch failed at token %d: %s; retrying synchronously\n",
+                        i + (int)chunk, strerror(prefetch.error));
+                    if (getenv("DS4_QWEN4_PLE_PREFETCH_TRACE")) fprintf(stderr,
+                        "ds4: Qwen PLE prefetch pos=%d count=%u read_ms=%.3f join_ms=%.3f ready=%d\n",
+                        i + (int)chunk, prefetch.count, 1e3 * prefetch.read_sec,
+                        1e3 * (now_sec() - join_start), prefetch_ready ? 1 : 0);
+                }
+            } else {
+                ok = qwen4_graph_forward_tokens(&s->qwen4_graph, &e->model, &e->weights,
+                                                prompt->v + i, chunk, s->logits, false);
+            }
+            if (!ok) {
                 snprintf(err, errlen, "Qwen3.8 prefill failed at token %d", i);
                 s->checkpoint_valid = false;
                 prefill_rc = 1;
@@ -76786,6 +76881,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             s->mtp_draft_valid = false;
             if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i, prompt->len);
         }
+        free(prefetch.rows);
         s->qwen4_graph.vis_spans = NULL;
         s->qwen4_graph.vis_span_count = 0;
         s->qwen4_graph.dump_prompt_rows = false;

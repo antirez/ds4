@@ -1022,6 +1022,16 @@ else
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 endif
 
+tests/test_qwen4_ple_prefetch.o: tests/test_qwen4_ple_prefetch.c ds4.c ds4.h ds4_qwen4_vision.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
+
+tests/test_qwen4_ple_prefetch: tests/test_qwen4_ple_prefetch.o $(filter-out ds4.o,$(CORE_OBJS))
+ifeq ($(UNAME_S),Darwin)
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -o $@ $^ $(METAL_LDLIBS)
+else
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+endif
+
 tests/test_qwen4_prefill.o: tests/test_qwen4_prefill.c ds4.h
 	$(CC) $(QUALITY_CFLAGS) -I. -c -o $@ $<
 
@@ -1350,6 +1360,7 @@ clean:
 	rm -f tests/test_mmvq_cuda tests/test_mmvq_rocm
 	rm -f tests/test_qwen4_ngrams
 	rm -f tests/test_qwen4_ngram_state
+	rm -f tests/test_qwen4_ple_prefetch
 	rm -f tests/test_web_recovery
 	rm -f tests/test_metal_ssd_experts
 	rm -f tests/test_metal_command_memory
