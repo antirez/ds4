@@ -82,7 +82,8 @@ Merge the provider into `~/.config/opencode/opencode.json`:
 }
 ```
 
-Select `ds4/deepseek-v4-flash` as the model.
+Select `ds4/deepseek-v4-flash` as the model. Clients that pin a different
+name can be pointed at any id by starting the server with `--alias NAME`.
 
 ## Codex CLI
 

@@ -32,6 +32,15 @@ relative runtime files such as Metal kernels can be found.
 The Flash and PRO names accepted by the model endpoints are compatibility
 aliases, not separate loaded models. The GGUF passed at startup selects the model.
 
+`-a NAME` / `--alias NAME` renames the model id the server advertises, like
+`llama-server -a`. `/v1/models` then lists only that id, requests that omit
+`model` echo it back, and `GET /v1/models/NAME` resolves. Built-in aliases stay
+accepted for requests.
+
+```sh
+./ds4-server -m ds4flash.gguf --alias gpt-4o-mini
+```
+
 ```sh
 curl http://127.0.0.1:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \

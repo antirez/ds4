@@ -1228,6 +1228,13 @@ static const char *server_model_id_from_engine(ds4_engine *engine) {
            "deepseek-v4-pro" : "deepseek-v4-flash";
 }
 
+/* A --alias override renames the loaded model in the OpenAI surface, like
+ * llama-server's -a.  The engine still serves the one GGUF, so the built-in
+ * compatibility aliases stay accepted for requests. */
+static const char *server_model_id(const char *alias, ds4_engine *engine) {
+    return alias ? alias : server_model_id_from_engine(engine);
+}
+
 static bool server_model_alias_known(const char *id) {
     return id &&
            (!strcmp(id, "deepseek-v4-flash") ||
@@ -10160,6 +10167,7 @@ struct server {
     server_slot *slots;
     int slot_count;
     int ctx_size;
+    const char *model_alias;
     bool batched_mode;
     pthread_t *slot_threads;
     pthread_t decode_thread;
@@ -15159,33 +15167,47 @@ static bool send_model(server *s, int fd, const char *id) {
     return ok;
 }
 
-static bool send_models(server *s, int fd) {
-    buf b = {0};
-    buf_puts(&b, "{\"object\":\"list\",\"data\":[");
-    if (ds4_engine_is_deepseek41(s->engine)) {
-        append_model_json(&b, s, server_model_id_from_engine(s->engine));
+/* GET /v1/models/<id> answers for the built-in compatibility aliases and for
+ * the --alias name clients were told to use. */
+static bool server_model_id_served(const server *s, const char *id) {
+    return server_model_alias_known(id) ||
+           (s->model_alias && !strcmp(id, s->model_alias));
+}
+
+static void append_models_json(buf *b, const server *s) {
+    buf_puts(b, "{\"object\":\"list\",\"data\":[");
+    if (s->model_alias) {
+        append_model_json_values(b, s->model_alias, s->model_alias,
+                                 s->ctx_size, s->default_tokens);
+    } else if (ds4_engine_is_deepseek41(s->engine)) {
+        append_model_json(b, s, server_model_id_from_engine(s->engine));
     } else if (ds4_engine_is_qwen4(s->engine)) {
-        append_model_json(&b, s, "qwen3.8-flash-next");
-        buf_putc(&b, ',');
-        append_model_json(&b, s, "qwen3.8-flash-next-chat");
-        buf_putc(&b, ',');
-        append_model_json(&b, s, "qwen3.8-flash-next-reasoner");
+        append_model_json(b, s, "qwen3.8-flash-next");
+        buf_putc(b, ',');
+        append_model_json(b, s, "qwen3.8-flash-next-chat");
+        buf_putc(b, ',');
+        append_model_json(b, s, "qwen3.8-flash-next-reasoner");
     } else if (ds4_engine_is_glm_dsa(s->engine)) {
         const char *base = server_model_id_from_engine(s->engine);
         char variant[64];
-        append_model_json(&b, s, base);
-        buf_putc(&b, ',');
+        append_model_json(b, s, base);
+        buf_putc(b, ',');
         snprintf(variant, sizeof(variant), "%s-chat", base);
-        append_model_json(&b, s, variant);
-        buf_putc(&b, ',');
+        append_model_json(b, s, variant);
+        buf_putc(b, ',');
         snprintf(variant, sizeof(variant), "%s-reasoner", base);
-        append_model_json(&b, s, variant);
+        append_model_json(b, s, variant);
     } else {
-        append_model_json(&b, s, "deepseek-v4-flash");
-        buf_putc(&b, ',');
-        append_model_json(&b, s, "deepseek-v4-pro");
+        append_model_json(b, s, "deepseek-v4-flash");
+        buf_putc(b, ',');
+        append_model_json(b, s, "deepseek-v4-pro");
     }
-    buf_puts(&b, "]}\n");
+    buf_puts(b, "]}\n");
+}
+
+static bool send_models(server *s, int fd) {
+    buf b = {0};
+    append_models_json(&b, s);
     bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
     return ok;
@@ -15321,7 +15343,7 @@ static void *client_main(void *arg) {
     const size_t model_path_prefix_len = strlen(model_path_prefix);
     if (!strcmp(hr.method, "GET") &&
         !strncmp(hr.path, model_path_prefix, model_path_prefix_len) &&
-        server_model_alias_known(hr.path + model_path_prefix_len))
+        server_model_id_served(s, hr.path + model_path_prefix_len))
     {
         send_model(s, fd, hr.path + model_path_prefix_len);
         http_request_free(&hr);
@@ -15357,7 +15379,7 @@ static void *client_main(void *arg) {
     }
     if (!req.model_from_request) {
         free(req.model);
-        req.model = xstrdup(server_model_id_from_engine(s->engine));
+        req.model = xstrdup(server_model_id(s->model_alias, s->engine));
     }
     if (request_exceeds_context(&req, ctx_size)) {
         http_error_context_length_exceeded(fd, s->enable_cors, &req, req.prompt.len, ctx_size);
@@ -15453,6 +15475,7 @@ typedef struct {
     bool enable_cors;
     int batched_sessions;
     int mixed_prefill_quantum;
+    const char *model_alias;
 } server_config;
 
 static int parse_int_arg(const char *s, const char *opt) {
@@ -15688,6 +15711,8 @@ static server_config parse_options(int argc, char **argv) {
             c.host = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--port")) {
             c.port = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "-a") || !strcmp(arg, "--alias")) {
+            c.model_alias = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--cors")) {
             c.enable_cors = true;
         } else if (!strcmp(arg, "--trace")) {
@@ -15959,6 +15984,7 @@ int main(int argc, char **argv) {
     s.engine = engine;
     s.tp_leader = tp_leader;
     s.ctx_size = cfg.ctx_size;
+    s.model_alias = cfg.model_alias;
     s.slot_count = slot_count;
     s.batched_mode = cfg.batched_sessions > 0;
     s.qwen4_batch_mtp = cfg.engine.backend == DS4_BACKEND_METAL &&
@@ -21179,6 +21205,42 @@ static void test_model_metadata_clamps_completion_to_context(void) {
     buf_free(&b);
 }
 
+/* -a/--alias renames the served model, so /v1/models advertises only the
+ * alias and requests that omit model echo it back. */
+static void test_model_alias_renames_openai_model_id(void) {
+    char *alias_argv[] = {"ds4-server", "-a", "my-model"};
+    server_config alias_cfg = parse_options(3, alias_argv);
+    TEST_ASSERT(alias_cfg.model_alias && !strcmp(alias_cfg.model_alias, "my-model"));
+
+    char *long_argv[] = {"ds4-server", "--alias", "my-model"};
+    server_config long_cfg = parse_options(3, long_argv);
+    TEST_ASSERT(long_cfg.model_alias && !strcmp(long_cfg.model_alias, "my-model"));
+
+    char *default_argv[] = {"ds4-server"};
+    server_config defaults = parse_options(1, default_argv);
+    TEST_ASSERT(defaults.model_alias == NULL);
+
+    server s = {0};
+    s.model_alias = alias_cfg.model_alias;
+    s.ctx_size = 4096;
+    s.default_tokens = 1024;
+    TEST_ASSERT(!strcmp(server_model_id(s.model_alias, NULL), "my-model"));
+
+    buf b = {0};
+    append_models_json(&b, &s);
+    TEST_ASSERT(strstr(b.ptr, "\"id\":\"my-model\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "deepseek-v4-flash") == NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"context_length\":4096") != NULL);
+    buf_free(&b);
+
+    TEST_ASSERT(server_model_id_served(&s, "my-model"));
+    TEST_ASSERT(!server_model_id_served(&s, "other-model"));
+    TEST_ASSERT(server_model_id_served(&s, "deepseek-v4-flash"));
+    server bare = {0};
+    TEST_ASSERT(!server_model_id_served(&bare, "my-model"));
+    TEST_ASSERT(server_model_id_served(&bare, "deepseek-v4-flash"));
+}
+
 static void test_live_prefix_rewind_target(void) {
     TEST_ASSERT(live_prefix_rewind_target(true, 17, 8, 8) == 7);
     TEST_ASSERT(live_prefix_rewind_target(true, 49826, 48379, 48379) == 48378);
@@ -23121,6 +23183,7 @@ static void ds4_server_unit_tests_run(void) {
     test_json_int_handles_non_finite_values();
     test_tool_history_validation_handles_large_replays();
     test_model_metadata_clamps_completion_to_context();
+    test_model_alias_renames_openai_model_id();
     test_live_prefix_rewind_target();
     test_client_socket_nonblocking_flag();
     test_client_disconnect_probe();
