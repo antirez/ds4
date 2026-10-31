@@ -47084,6 +47084,17 @@ static uint32_t glm_graph_limit_indexed_prefill_chunk(
     const uint32_t dense_limit = glm_graph_dense_compact_attention_limit(g);
     if (pos < dense_limit) {
         const uint32_t bridge = dense_limit - pos;
+#ifdef __APPLE__
+        /* The compact graph slices attention at the dense frontier inside
+         * each layer. Keep both sides on full-size matrix tiles and read each
+         * IQ2 layer once instead of sweeping all the weights twice. */
+        if (chunk > bridge && bridge % 256u == 0 && (chunk - bridge) % 256u == 0 &&
+            g && !g->glm53 && g->generic_routed_moe && g->ssd_streaming &&
+            !g->full_kv_cache && !g->quality && !g->imatrix && g->tp_world < 2 &&
+            g->layer_start == 0 && g->layer_count == glm_graph_normal_layer_count() &&
+            glm_graph_indexed_prefill_batch_available(g) &&
+            !getenv("DS4_METAL_DISABLE_GLM_MIXED_PREFILL")) return chunk;
+#endif
         if (bridge != 0 && chunk > bridge) chunk = bridge;
     }
     return chunk;
@@ -54578,6 +54589,9 @@ static bool glm_graph_forward_indexed_tokens(
         n_rows :
         (g->glm53 ? glm53_graph_indexer_selected_limit() : indexer_top_k);
     const bool use_causal_range_select = n_rows <= dense_limit;
+    /* The dense attention slice consumes the implicit causal range. */
+    const uint32_t first_scored = !g->glm53 && !use_causal_range_select && pos0 < dense_limit ?
+        dense_limit - pos0 : 0u;
     const bool trace = glm_graph_indexed_prefill_trace_enabled();
     const bool trace_all = trace && glm_graph_indexed_prefill_trace_all();
     const double trace_slow_ms = trace ?
@@ -55250,7 +55264,7 @@ static bool glm_graph_forward_indexed_tokens(
                 } else if (use_scalar_indexer) {
                     const float indexer_scale =
                         1.0f / sqrtf((float)(DS4_N_INDEXER_HEAD_DIM * DS4_N_INDEXER_HEAD));
-                    for (uint32_t t = 0; ok && t < n_tokens; t++) {
+                    for (uint32_t t = first_scored; ok && t < n_tokens; t++) {
                         const uint32_t visible = pos0 + t + 1u;
                         ds4_gpu_tensor *indexer_q_view =
                             glm_graph_tensor_row_view_strided(
@@ -55326,7 +55340,7 @@ static bool glm_graph_forward_indexed_tokens(
                     ds4_gpu_tensor *selected_base = g->glm53 ?
                         g->batch_indexer_pool_selected :
                         g->batch_indexer_selected;
-                    for (uint32_t t0 = 0; ok && t0 < n_tokens; ) {
+                    for (uint32_t t0 = first_scored; ok && t0 < n_tokens; ) {
                         uint32_t slice = n_tokens - t0;
                         if (slice > score_cap) slice = score_cap;
                         if (slice == 0) {
