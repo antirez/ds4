@@ -1727,6 +1727,27 @@ int ds4_gpu_rope_tail_decode_rows_tensor(
         float                               beta_fast,
         float                               beta_slow);
 
+int ds4_gpu_glm_attention_indexed_decode_exact_typed_tensor(
+        ds4_gpu_tensor       *heads,
+        ds4_gpu_tensor       *scores,
+        ds4_gpu_tensor       *lora,
+        ds4_gpu_tensor       *denom,
+        const ds4_gpu_tensor *qk_low,
+        const ds4_gpu_tensor *kv_lora_cache,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              value_weight_offset,
+        uint32_t              value_weight_type,
+        const ds4_gpu_tensor *selected,
+        uint32_t              n_selected,
+        uint32_t              cache_cap,
+        bool                  cache_f16,
+        uint32_t              n_head,
+        uint32_t              kv_lora_dim,
+        uint32_t              qk_nope,
+        uint32_t              qk_rope,
+        uint32_t              value_dim);
+
 int ds4_gpu_glm_attention_indexed_decode_typed_tensor(
         ds4_gpu_tensor       *heads,
         const ds4_gpu_tensor *q,

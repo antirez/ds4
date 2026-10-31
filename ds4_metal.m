@@ -36774,6 +36774,175 @@ int ds4_gpu_glm_value_project_q8_0_batch_heads_tensor(
                                                               value_dim);
 }
 
+typedef struct {
+    uint32_t n_selected;
+    uint32_t cache_cap;
+    uint32_t n_head;
+    uint32_t kv_lora_dim;
+    uint32_t value_dim;
+    uint32_t value_row_bytes;
+    uint32_t value_type;
+    uint32_t stage_rows;
+    uint32_t heads_per_group;
+    float    scale;
+} ds4_gpu_glm_attention_indexed_decode_exact_args;
+
+int ds4_gpu_glm_attention_indexed_decode_exact_typed_tensor(
+        ds4_gpu_tensor       *heads,
+        ds4_gpu_tensor       *scores,
+        ds4_gpu_tensor       *lora,
+        ds4_gpu_tensor       *denom,
+        const ds4_gpu_tensor *qk_low,
+        const ds4_gpu_tensor *kv_lora_cache,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              value_weight_offset,
+        uint32_t              value_weight_type,
+        const ds4_gpu_tensor *selected,
+        uint32_t              n_selected,
+        uint32_t              cache_cap,
+        bool                  cache_f16,
+        uint32_t              n_head,
+        uint32_t              kv_lora_dim,
+        uint32_t              qk_nope,
+        uint32_t              qk_rope,
+        uint32_t              value_dim) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    const uint32_t stage_rows = n_selected <= 2051u && n_head == 64u &&
+        [g_device.name isEqualToString:@"Apple M3 Ultra"] ? 2u : 16u;
+    const uint32_t heads_per_group = 8u;
+    const uint32_t value_threads = 64u;
+    const uint64_t stage_bytes =
+        (uint64_t)stage_rows * ((kv_lora_dim / 4u) | 1u) * 4u * sizeof(uint16_t);
+    if (!heads || !scores || !lora || !denom || !qk_low || !kv_lora_cache ||
+        !model_map || !selected ||
+        n_selected == 0 || cache_cap == 0 || n_selected > cache_cap ||
+        n_head == 0 || n_head > 1024u / stage_rows ||
+        kv_lora_dim == 0 || (kv_lora_dim % 64u) != 0 || stage_bytes > 32768u ||
+        qk_nope == 0 || qk_rope != 0 || value_dim == 0 ||
+        !cache_f16 || value_weight_type != DS4_METAL_TENSOR_Q8_0) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> headsbuf = ds4_gpu_tensor_buffer(heads);
+        id<MTLBuffer> scoresbuf = ds4_gpu_tensor_buffer(scores);
+        id<MTLBuffer> lorabuf = ds4_gpu_tensor_buffer(lora);
+        id<MTLBuffer> denombuf = ds4_gpu_tensor_buffer(denom);
+        id<MTLBuffer> lowbuf = ds4_gpu_tensor_buffer(qk_low);
+        id<MTLBuffer> kvcachebuf = ds4_gpu_tensor_buffer(kv_lora_cache);
+        id<MTLBuffer> selectedbuf = ds4_gpu_tensor_buffer(selected);
+        uint64_t value_row_bytes = 0;
+        if (!ds4_gpu_quant_row_bytes(value_weight_type, kv_lora_dim, &value_row_bytes)) {
+            fprintf(stderr, "ds4: Metal GLM exact indexed attention received unsupported value type\n");
+            return 0;
+        }
+        const uint64_t value_weight_bytes = (uint64_t)n_head * value_dim * value_row_bytes;
+        if (!headsbuf || !scoresbuf || !lorabuf || !denombuf || !lowbuf ||
+            !kvcachebuf || !selectedbuf ||
+            ds4_gpu_tensor_bytes(heads) < (uint64_t)n_head * value_dim * sizeof(float) ||
+            ds4_gpu_tensor_bytes(scores) < (uint64_t)n_head * n_selected * sizeof(float) ||
+            ds4_gpu_tensor_bytes(lora) < (uint64_t)n_head * kv_lora_dim * sizeof(float) ||
+            ds4_gpu_tensor_bytes(denom) < (uint64_t)n_head * sizeof(float) ||
+            ds4_gpu_tensor_bytes(qk_low) < (uint64_t)n_head * kv_lora_dim * sizeof(float) ||
+            ds4_gpu_tensor_bytes(kv_lora_cache) < (uint64_t)cache_cap * kv_lora_dim * sizeof(uint16_t) ||
+            ds4_gpu_tensor_bytes(selected) < (uint64_t)n_selected * sizeof(uint32_t)) {
+            fprintf(stderr, "ds4: Metal GLM exact indexed attention received undersized buffers\n");
+            return 0;
+        }
+        if (value_weight_offset > model_size ||
+            value_weight_bytes > model_size - value_weight_offset) {
+            fprintf(stderr, "ds4: Metal GLM exact indexed attention value range is outside the mapped model\n");
+            return 0;
+        }
+        uint64_t value_inner = 0;
+        id<MTLBuffer> valuebuf =
+            ds4_gpu_wrap_model_range(model_map, model_size, value_weight_offset,
+                                      value_weight_bytes, &value_inner);
+        if (!valuebuf) return 0;
+
+        id<MTLComputePipelineState> scores_pipeline =
+            ds4_gpu_get_pipeline("kernel_glm_attention_indexed_decode_exact_scores");
+        id<MTLComputePipelineState> weights_pipeline =
+            ds4_gpu_get_pipeline("kernel_glm_attention_indexed_decode_exact_weights");
+        id<MTLComputePipelineState> lora_pipeline =
+            ds4_gpu_get_pipeline("kernel_glm_attention_indexed_decode_exact_lora");
+        id<MTLComputePipelineState> value_pipeline =
+            ds4_gpu_get_pipeline("kernel_glm_attention_indexed_decode_exact_value");
+        if (!scores_pipeline || !weights_pipeline || !lora_pipeline || !value_pipeline) return 0;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        ds4_gpu_glm_attention_indexed_decode_exact_args args = {
+            .n_selected = n_selected,
+            .cache_cap = cache_cap,
+            .n_head = n_head,
+            .kv_lora_dim = kv_lora_dim,
+            .value_dim = value_dim,
+            .value_row_bytes = (uint32_t)value_row_bytes,
+            .value_type = value_weight_type,
+            .stage_rows = stage_rows,
+            .heads_per_group = heads_per_group,
+            /* The generic kernel's scale, computed the same way. */
+            .scale = 1.0f / sqrtf((float)(qk_nope + qk_rope)),
+        };
+
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:scores_pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:lowbuf offset:ds4_gpu_tensor_offset(qk_low) atIndex:1];
+        [enc setBuffer:kvcachebuf offset:ds4_gpu_tensor_offset(kv_lora_cache) atIndex:2];
+        [enc setBuffer:selectedbuf offset:ds4_gpu_tensor_offset(selected) atIndex:3];
+        [enc setBuffer:scoresbuf offset:ds4_gpu_tensor_offset(scores) atIndex:4];
+        [enc setThreadgroupMemoryLength:(NSUInteger)stage_bytes atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake((n_selected + stage_rows - 1u) / stage_rows, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake((NSUInteger)n_head * stage_rows, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:weights_pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:scoresbuf offset:ds4_gpu_tensor_offset(scores) atIndex:1];
+        [enc setBuffer:denombuf offset:ds4_gpu_tensor_offset(denom) atIndex:2];
+        [enc setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(n_head, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:lora_pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:kvcachebuf offset:ds4_gpu_tensor_offset(kv_lora_cache) atIndex:1];
+        [enc setBuffer:selectedbuf offset:ds4_gpu_tensor_offset(selected) atIndex:2];
+        [enc setBuffer:scoresbuf offset:ds4_gpu_tensor_offset(scores) atIndex:3];
+        [enc setBuffer:denombuf offset:ds4_gpu_tensor_offset(denom) atIndex:4];
+        [enc setBuffer:lorabuf offset:ds4_gpu_tensor_offset(lora) atIndex:5];
+        /* Two staging buffers of 32 rows x 128 bytes plus 32 weights per head. */
+        [enc setThreadgroupMemoryLength:2u * (32u * 128u + (NSUInteger)heads_per_group * 32u * sizeof(float))
+                                atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake((n_head + heads_per_group - 1u) / heads_per_group,
+                                              kv_lora_dim / 64u, 1)
+             threadsPerThreadgroup:MTLSizeMake((NSUInteger)heads_per_group * 32u, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:value_pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:lorabuf offset:ds4_gpu_tensor_offset(lora) atIndex:1];
+        [enc setBuffer:valuebuf offset:(NSUInteger)value_inner atIndex:2];
+        [enc setBuffer:headsbuf offset:ds4_gpu_tensor_offset(heads) atIndex:3];
+        [enc setThreadgroupMemoryLength:(NSUInteger)kv_lora_dim * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(n_head, (value_dim + value_threads - 1u) / value_threads, 1)
+             threadsPerThreadgroup:MTLSizeMake(value_threads, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "GLM exact indexed attention decode")) return 0;
+    }
+    return 1;
+}
+
 int ds4_gpu_glm_attention_indexed_decode_typed_tensor(
         ds4_gpu_tensor       *heads,
         const ds4_gpu_tensor *q,

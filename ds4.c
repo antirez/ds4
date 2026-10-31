@@ -57249,6 +57249,25 @@ static bool glm_graph_forward_token(
                  * rest of the layer stays finite (timing-only). */
                 ok = ds4_gpu_tensor_fill_f32(g->heads, 0.0f,
                                              (uint64_t)g->heads_dim) != 0;
+#ifdef __APPLE__
+            } else if (ok && g->glm53 && g->tp_world != 2 && DS4_N_ROT == 0 &&
+                       DS4_N_KV_LORA == 512u && DS4_N_HEAD <= 64u &&
+                       l->attn_v_b->type == DS4_TENSOR_Q8_0 && glm_graph_compact_cache_is_f16() &&
+                       last_indexer_selected_count >= 128u &&
+                       (uint64_t)last_indexer_selected_count * DS4_N_HEAD * sizeof(float) <=
+                           ds4_gpu_tensor_bytes(g->attn_partial_lora) &&
+                       !getenv("DS4_METAL_DISABLE_GLM53_DSA_EXACT")) {
+                /* The score stage finishes reading qk_low before the value
+                 * accumulation reuses it. The split-attention scratch holds
+                 * the scores and denominators for the same selected rows. */
+                ok = ds4_gpu_glm_attention_indexed_decode_exact_typed_tensor(
+                    g->heads, g->attn_partial_lora, g->qk_low, g->attn_partial_ms,
+                    g->qk_low, g->layer_kv_lora_cache[il], model->map, model->size,
+                    l->attn_v_b->abs_offset, l->attn_v_b->type, last_indexer_selected,
+                    last_indexer_selected_count, g->compact_cache_cap, true,
+                    DS4_N_HEAD, DS4_N_KV_LORA, (uint32_t)g->q_nope, DS4_N_ROT,
+                    DS4_N_VALUE_MLA) != 0;
+#endif
             } else if (ok && glm_graph_indexed_decode_split_group8_available(last_indexer_selected_count)) {
                 const uint32_t split_block_rows =
                     glm_graph_indexed_decode_split_block_rows_for(last_indexer_selected_count);

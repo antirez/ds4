@@ -10,6 +10,11 @@
 #include "ds4.h"
 #include "ds4_gpu.h"
 
+typedef struct {
+    uint16_t d;
+    int8_t qs[32];
+} test_block_q8_0;
+
 #ifdef DS4_ROCM_BUILD
 typedef struct {
     uint16_t d;
@@ -17,11 +22,6 @@ typedef struct {
     uint8_t scales[12];
     uint8_t qs[128];
 } test_block_q4_K;
-
-typedef struct {
-    uint16_t d;
-    int8_t qs[32];
-} test_block_q8_0;
 
 extern int ds4_gpu_matmul_q4_K_tensor(
     ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
@@ -72,6 +72,42 @@ static float bf16_to_f32(uint16_t value) {
     return bits.f;
 }
 
+#ifdef __APPLE__
+/* Compare all four phases with the generic kernel, using the same alias
+ * between query and accumulated values as the single-token graph. */
+static void check_phased_attention(uint8_t *model, uint64_t bytes, uint64_t offset) {
+    enum { H = 8, K = 512, V = 2, N = 131, CAP = 145 };
+    ds4_gpu_tensor *low = ds4_gpu_tensor_alloc_managed(H * K * 4);
+    ds4_gpu_tensor *cache = ds4_gpu_tensor_alloc_managed(CAP * K * 2);
+    ds4_gpu_tensor *sel = ds4_gpu_tensor_alloc_managed(N * 4);
+    ds4_gpu_tensor *scores = ds4_gpu_tensor_alloc(H * N * 4);
+    ds4_gpu_tensor *denom = ds4_gpu_tensor_alloc(H * 4);
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(H * V * 4);
+    require_ok(low && cache && sel && scores && denom && out, "phased attention allocation");
+    float *q = ds4_gpu_tensor_contents(low);
+    _Float16 *kv = ds4_gpu_tensor_contents(cache);
+    uint32_t *ids = ds4_gpu_tensor_contents(sel);
+    for (unsigned i = 0; i < H * K; i++) q[i] = ((int)(i % 43) - 20) * 0.03125f;
+    for (unsigned i = 0; i < CAP * K; i++) kv[i] = (_Float16)(((int)(i % 79) - 38) * 0.015625f);
+    for (unsigned i = 0; i < N; i++) ids[i] = i % 7 == 0 ? 3u : (i * 47u) % CAP;
+    test_block_q8_0 *w = (test_block_q8_0 *)(model + offset);
+    for (unsigned i = 0; i < H * V * K / 32; i++) {
+        w[i].d = 0x3000u;
+        for (unsigned j = 0; j < 32; j++) w[i].qs[j] = (int)((i * 13 + j) % 97) - 48;
+    }
+    float expected[H * V], got[H * V];
+    require_ok(ds4_gpu_glm_attention_indexed_decode_typed_tensor(out, low, low, cache, cache,
+        model, bytes, offset, 8, sel, N, CAP, true, H, K, 256, 0, V, 0, 0, 0, 0, 1, 0, 0) &&
+        ds4_gpu_tensor_read(out, 0, expected, sizeof(expected)), "generic indexed attention");
+    require_ok(ds4_gpu_glm_attention_indexed_decode_exact_typed_tensor(out, scores, low, denom,
+        low, cache, model, bytes, offset, 8, sel, N, CAP, true, H, K, 256, 0, V) &&
+        ds4_gpu_tensor_read(out, 0, got, sizeof(got)), "phased indexed attention");
+    require_ok(memcmp(expected, got, sizeof(got)) == 0, "phased attention exact output");
+    ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(denom); ds4_gpu_tensor_free(scores);
+    ds4_gpu_tensor_free(sel); ds4_gpu_tensor_free(cache); ds4_gpu_tensor_free(low);
+}
+#endif
+
 int main(void) {
     enum {
         D = 128,
@@ -96,7 +132,8 @@ int main(void) {
         Q4_OUT = 37,
         Q4_ROWS = 3,
         Q8_OFFSET = 60000,
-        MODEL_BYTES = 65536,
+        PHASE_WEIGHTS = 65536,
+        MODEL_BYTES = PHASE_WEIGHTS + 16384,
     };
 
     uint8_t *model = mmap(NULL, MODEL_BYTES, PROT_READ | PROT_WRITE,
@@ -998,6 +1035,9 @@ int main(void) {
     ds4_gpu_tensor_free(q);
     ds4_gpu_tensor_free(bf16_out);
     ds4_gpu_tensor_free(bf16_x);
+#ifdef __APPLE__
+    check_phased_attention(model, MODEL_BYTES, PHASE_WEIGHTS);
+#endif
     ds4_gpu_cleanup();
     munmap(model, MODEL_BYTES);
     puts("GLM-5.3 KDA GPU tests: PASS");
