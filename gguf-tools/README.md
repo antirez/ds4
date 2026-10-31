@@ -250,6 +250,24 @@ Pass `--quant q4` to the audit as well when checking a Q4 file.
 The audit checks the complete layout, all non-expert tensors, sampled experts
 and native Engram rows. It does not replace [inference quality tests](quality-testing/deepseek-v4.1-flash-20260910/README.md).
 
+### Convert V4.1 DSpark
+
+The V4.1 support converter needs NumPy, the official config and tensor index,
+and only the shards containing `mtp.*` tensors (44, 45 and 46 of the pinned
+checkpoint). No imatrix or main-model GGUF is needed:
+
+```sh
+python3 gguf-tools/deepseek41_dspark.py \
+  --hf models/DeepSeek-V4.1-Flash \
+  --source-revision df42c109f1defefcbfcedbe7d905718a12266e40 \
+  --out gguf/DeepSeek-V4.1-Flash-DSpark.gguf
+```
+
+The result is 8.04 GiB. Routed experts keep their native MXFP4 payloads;
+dense weights expand losslessly to F16 or F32. Add `--dry-run` to inspect the
+layout, or `--verify` to compare every tensor in an existing output against
+the source. This file works only with the V4.1 Flash target.
+
 ## Convert A DSpark Support Checkpoint
 
 The DSpark Flash checkpoint is published as Hugging Face safetensors and stores

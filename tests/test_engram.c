@@ -232,10 +232,78 @@ static void test_all_scaled_values(void) {
     close(fd);
 }
 
+static void test_reader(void) {
+    char path[] = "/tmp/ds4-engram-reader-XXXXXX";
+    const int fd = mkstemp(path);
+    assert(fd >= 0 && unlink(path) == 0);
+    const off_t offset = (off_t)1 << 33;
+    uint8_t raw[4][DS4_ENGRAM_ROW_BYTES];
+    for (unsigned r = 0; r < 4; r++) {
+        for (unsigned i = 0; i < DS4_ENGRAM_DIM; i++) raw[r][i] = (i + r * 7u) % 127u;
+        memset(raw[r] + DS4_ENGRAM_DIM, 127 + r, 8);
+    }
+    assert(pwrite(fd, raw, sizeof(raw), offset) == sizeof(raw));
+    ds4_engram_table tables[2];
+    uint32_t ids[2][DS4_ENGRAM_COLS];
+    float expected[2][DS4_ENGRAM_COLS * DS4_ENGRAM_DIM];
+    for (unsigned t = 0; t < 2; t++) {
+        tables[t] = (ds4_engram_table){.fd = fd, .offset = offset + t * 2u * sizeof(raw[0]), .rows = 2};
+        for (unsigned c = 0; c < DS4_ENGRAM_COLS; c++) ids[t][c] = (c + t) % 2;
+        assert(ds4_engram_read(&tables[t], ids[t], DS4_ENGRAM_COLS, expected[t]));
+    }
+    const size_t count = 2u * DS4_ENGRAM_COLS * DS4_ENGRAM_DIM;
+    float *output[2] = {malloc((count + 1u) * sizeof(float)), malloc((count + 1u) * sizeof(float))};
+    ds4_engram_reader *readers[2] = {ds4_engram_reader_create(), ds4_engram_reader_create()};
+    assert(output[0] && output[1] && readers[0] && readers[1]);
+    assert(!ds4_engram_reader_wait(readers[0], 0) && errno == EINVAL);
+    assert(!ds4_engram_reader_wait(readers[0], 2) && errno == EINVAL);
+    for (unsigned repeat = 0; repeat < 100; repeat++) {
+        for (unsigned r = 0; r < 2; r++) {
+            memset(output[r], 0xff, count * sizeof(float));
+            output[r][count] = 123456.0f;
+            assert(ds4_engram_reader_start(readers[r], tables, ids, output[r]));
+        }
+        for (unsigned r = 0; r < 2; r++) {
+            assert(ds4_engram_reader_wait(readers[r], 0));
+            assert(!memcmp(output[r], expected[0], sizeof(expected[0])));
+            assert(ds4_engram_reader_wait(readers[r], 1));
+            assert(!memcmp(output[r], expected, sizeof(expected)));
+            assert(output[r][count] == 123456.0f);
+        }
+    }
+    ids[1][23] = 2;
+    assert(!ds4_engram_reader_start(readers[0], tables, ids, output[0]) && errno == EINVAL);
+    ids[1][23] = 0;
+    assert(ftruncate(fd, offset + sizeof(raw) - 1) == 0);
+    assert(ds4_engram_reader_start(readers[0], tables, ids, output[0]));
+    assert(ds4_engram_reader_wait(readers[0], 0));
+    assert(!ds4_engram_reader_wait(readers[0], 1) && errno == EIO);
+    assert(pwrite(fd, raw, sizeof(raw), offset) == sizeof(raw));
+    uint8_t bad = 127;
+    assert(pwrite(fd, &bad, 1, offset) == 1);
+    assert(ds4_engram_reader_start(readers[0], tables, ids, output[0]));
+    assert(!ds4_engram_reader_wait(readers[0], 0) && errno == EDOM);
+    assert(ds4_engram_reader_wait(readers[0], 1));
+    assert(pwrite(fd, raw, sizeof(raw), offset) == sizeof(raw));
+    assert(ds4_engram_reader_start(readers[0], tables, ids, output[0]));
+    assert(ds4_engram_reader_wait(readers[0], 0));
+    assert(ds4_engram_reader_wait(readers[0], 1));
+    assert(!memcmp(output[0], expected, sizeof(expected)));
+    /* Joining on destruction is required even after an early caller failure. */
+    for (unsigned r = 0; r < 2; r++) {
+        assert(ds4_engram_reader_start(readers[r], tables, ids, output[r]));
+        ds4_engram_reader_free(readers[r]);
+        free(output[r]);
+    }
+    ds4_engram_reader_free(NULL);
+    assert(close(fd) == 0);
+}
+
 int main(void) {
     test_hash();
     test_rows();
     test_all_scaled_values();
+    test_reader();
     puts("Engram hashes, history and bounded disk rows: PASS");
     return 0;
 }

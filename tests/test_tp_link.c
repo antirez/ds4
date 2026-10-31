@@ -283,9 +283,18 @@ int main(int argc, char **argv) {
     CHECK(ds4_tp_agree_execution_mode(tp, 0, error, sizeof(error)));
     CHECK(ds4_tp_agree_execution_mode(tp, DS4_TP_MODE_EXPERT_INTERMEDIATE_SPLIT,
                                      error, sizeof(error)));
+    CHECK(ds4_tp_agree_execution_mode(tp, DS4_TP_MODE_V41_SHARED_OWNER,
+                                     error, sizeof(error)));
+    CHECK(ds4_tp_agree_execution_mode(tp, DS4_TP_MODE_V41_SHARED_OWNER |
+                                     DS4_TP_MODE_V41_SHARED_BALANCE, error, sizeof(error)));
+    CHECK(ds4_tp_agree_execution_mode(tp, DS4_TP_MODE_V41_DSPARK |
+                                     DS4_TP_MODE_V41_SHARED_OWNER, error, sizeof(error)));
     if (getenv("DS4_TEST_TP_MODE_MISMATCH")) {
+        const int test = atoi(getenv("DS4_TEST_TP_MODE_MISMATCH"));
+        const uint32_t mode = test == 3 ? DS4_TP_MODE_V41_DSPARK :
+            test == 2 ? DS4_TP_MODE_V41_SHARED_BALANCE : DS4_TP_MODE_EXPERT_INTERMEDIATE_SPLIT;
         CHECK(!ds4_tp_agree_execution_mode(tp, rank ?
-            DS4_TP_MODE_EXPERT_INTERMEDIATE_SPLIT : 0, error, sizeof(error)));
+            mode : 0, error, sizeof(error)));
         CHECK(ds4_tp_failed(tp));
         CHECK(strstr(error, "execution mode mismatch") != NULL);
         fprintf(stderr, "rank=%d mismatched execution modes refused: PASS\n", rank);

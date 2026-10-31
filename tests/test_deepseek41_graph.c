@@ -430,7 +430,10 @@ done:
     ds4_session_free(too_large);
     ds4_session_free(s);
     ds4_engine_close(engine);
-    if (cwd_fd >= 0) { fchdir(cwd_fd); close(cwd_fd); }
+    if (cwd_fd >= 0) {
+        if (fchdir(cwd_fd) != 0) { perror("restore working directory"); rc = 1; }
+        close(cwd_fd);
+    }
     return rc;
 }
 

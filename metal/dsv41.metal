@@ -75,10 +75,12 @@ kernel void kernel_dsv41_quantize(
         const float scale = dsv41_pow2_ceil(max(amax, 1.0e-4f) * (1.0f / 448.0f));
         result = copysign(dsv4_e4m3fn_dequant(abs(value) / scale), value) * scale;
     } else if (args.mode == 2u || args.mode == 3u) {
+        // Exact divisions: a fast-math reciprocal can land one ulp past a
+        // rounding midpoint and flip the E4M3 scale or E2M1 value.
         const float scale = args.mode == 3u
-            ? dsv4_e4m3fn_dequant(max(amax, 0.01171875f) / 6.0f)
+            ? dsv4_e4m3fn_dequant(precise::divide(max(amax, 0.01171875f), 6.0f))
             : dsv41_pow2_ceil(max(amax, 7.052966104933725e-38f) * (1.0f / 6.0f));
-        result = copysign(dsv4_e2m1fn_dequant(abs(value) / scale), value) * scale;
+        result = copysign(dsv4_e2m1fn_dequant(precise::divide(abs(value), scale)), value) * scale;
     }
     if (valid) x[index] = dsv41_bf16(result);
 }

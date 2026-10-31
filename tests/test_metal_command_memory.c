@@ -1,5 +1,6 @@
 /* Exercise the C entry points without an Objective-C caller's autorelease pool. */
 #include "ds4_gpu.h"
+#include <mach/mach.h>
 #include <malloc/malloc.h>
 #include <stdio.h>
 #include <string.h>
@@ -22,6 +23,50 @@ static int big_exchange(void *ud, uint32_t layer, uint64_t seq,
     if (bytes != 1024 || !exchange(ud, layer, 1, seq)) return 0;
     memcpy(in, out, (size_t)bytes);
     return 1;
+}
+
+/* C callers have no outer autorelease pool. Releasing a CPU-touched tensor
+ * must release its Metal allocation too, rather than retaining it until the
+ * thread exits. Heap statistics alone miss these large shared buffers. */
+static int check_tensor_memory(void) {
+    ds4_gpu_tensor *tensor = NULL;
+    const uint64_t bytes = 16u * 1024u * 1024u;
+    uint64_t baseline = 0, footprint = 0;
+    int rc = 1;
+    CHECK(ds4_gpu_init());
+    for (int i = 0; i < 40; i++) {
+        tensor = ds4_gpu_tensor_alloc(bytes);
+        CHECK(tensor);
+        unsigned char *data = ds4_gpu_tensor_contents(tensor);
+        CHECK(data);
+        memset(data, i, (size_t)bytes);
+        const uint32_t value = (uint32_t)i + 1234u;
+        uint32_t readback = 0;
+        CHECK(ds4_gpu_tensor_write(tensor, bytes - sizeof(value), &value, sizeof(value)));
+        CHECK(ds4_gpu_tensor_read(tensor, bytes - sizeof(value), &readback, sizeof(readback)));
+        CHECK(readback == value && data[0] == (unsigned char)i);
+        ds4_gpu_tensor_free(tensor);
+        tensor = NULL;
+        if (i == 7 || i == 39) {
+            task_vm_info_data_t info = {0};
+            mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+            CHECK(task_info(mach_task_self(), TASK_VM_INFO,
+                            (task_info_t)&info, &count) == KERN_SUCCESS);
+            footprint = info.phys_footprint;
+            if (i == 7) baseline = footprint;
+        }
+    }
+    fprintf(stderr, "Metal CPU-touched buffers: footprint %.3f -> %.3f MiB\n",
+            baseline / 1048576.0, footprint / 1048576.0);
+    /* A leaked buffer per iteration adds 512 MiB; allow bounded driver
+     * bookkeeping without requiring exact allocator reuse. */
+    CHECK(footprint <= baseline + 32u * 1024u * 1024u);
+    puts("Metal CPU-touched buffer lifetime: PASS");
+    rc = 0;
+done:
+    ds4_gpu_tensor_free(tensor);
+    ds4_gpu_cleanup();
+    return rc;
 }
 
 static int check_tp_memory(int mode) {
@@ -79,12 +124,13 @@ done:
 
 int main(int argc, char **argv) {
     if (argc == 2) {
+        if (!strcmp(argv[1], "buffers")) return check_tensor_memory();
         const char *modes[] = {"row", "session", "batch", "big"};
         for (int i = 0; i < 4; i++)
             if (!strcmp(argv[1], modes[i])) return check_tp_memory(i);
     }
     if (argc != 1) {
-        fprintf(stderr, "usage: %s [row|session|batch|big]\n", argv[0]);
+        fprintf(stderr, "usage: %s [buffers|row|session|batch|big]\n", argv[0]);
         return 2;
     }
     ds4_gpu_tensor *a = NULL, *b = NULL;

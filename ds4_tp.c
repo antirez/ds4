@@ -2521,12 +2521,13 @@ int ds4_tp_agree_execution_mode(ds4_tp *tp, uint32_t flags, char *err, size_t er
         tp_set_err(err, errlen, "tp execution mode exchange failed");
         return 0;
     }
-    if (peer[0] != mine[0] || peer[1] != flags ||
-        (flags & ~DS4_TP_MODE_EXPERT_INTERMEDIATE_SPLIT) != 0) {
+    const uint32_t known = DS4_TP_MODE_EXPERT_INTERMEDIATE_SPLIT |
+        DS4_TP_MODE_V41_SHARED_OWNER | DS4_TP_MODE_V41_SHARED_BALANCE |
+        DS4_TP_MODE_V41_DSPARK;
+    if (peer[0] != mine[0] || peer[1] != flags || (flags & ~known) != 0) {
         ds4_tp_mark_failed(tp);
         tp_set_err(err, errlen, "tp execution mode mismatch (peer 0x%x, local 0x%x); "
-                   "set DS4_CUDA_DISABLE_TP_EXPERT_SPLIT=1 on both ranks "
-                   "for 50/50 expert ownership",
+                   "use matching builds and expert ownership settings on both ranks",
                    peer[1], flags);
         return 0;
     }
@@ -3854,6 +3855,9 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
                                                     (int)command.n_tokens,
                                                     (uint32_t)command.value,
                                                     err, sizeof(err));
+            if (ds4_engine_is_deepseek41(engine) &&
+                !ds4_tp_send_command_ack(tp, command.session_id, spec_rc ? -1 : 0))
+                spec_rc = 1;
             if (spec_rc != 0) {
                 ds4_log(stderr, DS4_LOG_ERROR, "tp worker verify: %s", err);
                 rc = 1;

@@ -104,6 +104,10 @@ bool ds4_engram_table_open(ds4_engram_table *t, const char *path,
     }
 #ifdef __APPLE__
     if (fcntl(fd, F_NOCACHE, 1) != 0 || fcntl(fd, F_RDAHEAD, 0) != 0) goto fail;
+#elif defined(POSIX_FADV_RANDOM)
+    /* Hashed rows are scattered across the table. Read-ahead fetches unused
+     * pages and competes with the model's limited memory headroom. */
+    (void)posix_fadvise(fd, (off_t)offset, (off_t)bytes, POSIX_FADV_RANDOM);
 #endif
     *t = (ds4_engram_table){.fd = fd, .offset = offset, .rows = rows};
     return true;
@@ -324,4 +328,146 @@ bool ds4_engram_read_batch(const ds4_engram_table *t, const uint32_t *rows,
     free(request);
     errno = saved;
     return ok;
+}
+
+enum { TOKEN_READERS = 4 };
+
+typedef struct {
+    pthread_t thread;
+    ds4_engram_reader *reader;
+    unsigned index;
+} engram_read_worker;
+
+struct ds4_engram_reader {
+    engram_read_worker workers[TOKEN_READERS];
+    unsigned threads;
+    pthread_mutex_t mutex;
+    pthread_cond_t work, done;
+    bool active, shutdown;
+    uint64_t generation;
+    unsigned completed[2];
+    int errors[2];
+    ds4_engram_table tables[2];
+    uint32_t ids[2][DS4_ENGRAM_COLS];
+    float *out;
+};
+
+static void *read_token_thread(void *context) {
+    const engram_read_worker *worker = context;
+    ds4_engram_reader *r = worker->reader;
+    const unsigned index = worker->index;
+    uint64_t seen = 0;
+    pthread_mutex_lock(&r->mutex);
+    for (;;) {
+        while (r->generation == seen && !r->shutdown) pthread_cond_wait(&r->work, &r->mutex);
+        if (r->shutdown) break;
+        seen = r->generation;
+        pthread_mutex_unlock(&r->mutex);
+        for (unsigned table = 0; table < 2; table++) {
+            const unsigned first = index * DS4_ENGRAM_COLS / TOKEN_READERS;
+            const unsigned end = (index + 1u) * DS4_ENGRAM_COLS / TOKEN_READERS;
+            const bool ok = ds4_engram_read(&r->tables[table], r->ids[table] + first,
+                end - first, r->out + (table * DS4_ENGRAM_COLS + first) * DS4_ENGRAM_DIM);
+            const int error = ok ? 0 : errno ? errno : EIO;
+            pthread_mutex_lock(&r->mutex);
+            if (!r->errors[table]) r->errors[table] = error;
+            if (++r->completed[table] == TOKEN_READERS) {
+                if (table == 1) r->active = false;
+                pthread_cond_broadcast(&r->done);
+            }
+            pthread_mutex_unlock(&r->mutex);
+        }
+        pthread_mutex_lock(&r->mutex);
+    }
+    pthread_mutex_unlock(&r->mutex);
+    return NULL;
+}
+
+ds4_engram_reader *ds4_engram_reader_create(void) {
+    ds4_engram_reader *r = calloc(1, sizeof(*r));
+    if (!r) return NULL;
+    int error = pthread_mutex_init(&r->mutex, NULL);
+    if (error) goto fail;
+    error = pthread_cond_init(&r->work, NULL);
+    if (error) goto mutex;
+    error = pthread_cond_init(&r->done, NULL);
+    if (error) goto work;
+    for (unsigned i = 0; i < TOKEN_READERS; i++) {
+        r->workers[i].reader = r;
+        r->workers[i].index = i;
+        error = pthread_create(&r->workers[i].thread, NULL, read_token_thread, &r->workers[i]);
+        if (error) break;
+        r->threads++;
+    }
+    if (!error) return r;
+    pthread_mutex_lock(&r->mutex);
+    r->shutdown = true;
+    pthread_cond_broadcast(&r->work);
+    pthread_mutex_unlock(&r->mutex);
+    for (unsigned i = 0; i < r->threads; i++)
+        if (pthread_join(r->workers[i].thread, NULL)) abort();
+    pthread_cond_destroy(&r->done);
+work:
+    pthread_cond_destroy(&r->work);
+mutex:
+    pthread_mutex_destroy(&r->mutex);
+fail:
+    free(r);
+    errno = error;
+    return NULL;
+}
+
+bool ds4_engram_reader_start(ds4_engram_reader *r,
+    const ds4_engram_table tables[2], const uint32_t ids[2][DS4_ENGRAM_COLS], float *out) {
+    if (!r || !tables || !ids || !out) { errno = EINVAL; return false; }
+    for (unsigned t = 0; t < 2; t++) {
+        if (tables[t].fd < 0) { errno = EINVAL; return false; }
+        for (unsigned col = 0; col < DS4_ENGRAM_COLS; col++)
+            if (ids[t][col] >= tables[t].rows) { errno = EINVAL; return false; }
+    }
+    pthread_mutex_lock(&r->mutex);
+    if (r->active || r->shutdown) {
+        pthread_mutex_unlock(&r->mutex);
+        errno = EBUSY;
+        return false;
+    }
+    memcpy(r->tables, tables, sizeof(r->tables));
+    memcpy(r->ids, ids, sizeof(r->ids));
+    memset(r->errors, 0, sizeof(r->errors));
+    r->out = out;
+    memset(r->completed, 0, sizeof(r->completed));
+    r->generation++;
+    r->active = true;
+    pthread_cond_broadcast(&r->work);
+    pthread_mutex_unlock(&r->mutex);
+    return true;
+}
+
+bool ds4_engram_reader_wait(ds4_engram_reader *r, unsigned table) {
+    if (!r || table >= 2) { errno = EINVAL; return false; }
+    pthread_mutex_lock(&r->mutex);
+    if (!r->active && !r->completed[1]) {
+        pthread_mutex_unlock(&r->mutex);
+        errno = EINVAL;
+        return false;
+    }
+    while (r->completed[table] < TOKEN_READERS) pthread_cond_wait(&r->done, &r->mutex);
+    const int error = r->errors[table];
+    pthread_mutex_unlock(&r->mutex);
+    if (error) errno = error;
+    return !error;
+}
+
+void ds4_engram_reader_free(ds4_engram_reader *r) {
+    if (!r) return;
+    pthread_mutex_lock(&r->mutex);
+    r->shutdown = true;
+    pthread_cond_broadcast(&r->work);
+    pthread_mutex_unlock(&r->mutex);
+    for (unsigned i = 0; i < r->threads; i++)
+        if (pthread_join(r->workers[i].thread, NULL)) abort();
+    pthread_cond_destroy(&r->done);
+    pthread_cond_destroy(&r->work);
+    pthread_mutex_destroy(&r->mutex);
+    free(r);
 }

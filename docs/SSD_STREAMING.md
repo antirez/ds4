@@ -74,6 +74,25 @@ Leave expert preloading enabled for normal use. `--ssd-streaming-cold` and
 `--ssd-streaming-preload-experts N` are mainly useful for controlled measurements.
 See [benchmarking](PERFORMANCE.md) and the [release QA guide](../QA_BEFORE_RELEASES.md).
 
+## CUDA expert reads
+
+DeepSeek V4.1 CUDA prefill reads selected experts in file order and combines
+adjacent reads by default, instead of prefetching every expert in the next
+layer. Single-token decode retains its original read order, which avoids a
+slowdown with small expert caches. The weight formats, routing, and cache
+budget are unchanged; no extra flags are needed.
+
+For comparisons on other storage or workloads,
+`DS4_CUDA_ENABLE_SSD_PREFETCH=1` restores whole-next-layer prefetch.
+`DS4_CUDA_DISABLE_SSD_SORT_SELECTED_READS=1` restores the original selected-read
+order. Set both to reproduce the previous policy.
+`DS4_CUDA_DISABLE_SSD_PREFETCH=1` still overrides prefetch enablement.
+For experiments, `DS4_CUDA_SSD_SORT_SELECTED_READS=1` also orders single-token
+loads; the explicit sort-disable switch takes precedence.
+Unset that old experimental sort flag to use the new prefill-only default.
+These switches use presence semantics: unset them to return to the default;
+setting a switch to `0` still enables it.
+
 ## M5 Max measurements
 
 On a 128 GB M5 Max, with automatic cache sizing and no speculative decoding:

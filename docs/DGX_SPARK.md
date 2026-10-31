@@ -36,8 +36,10 @@ other programs and the context. Use the same options with `ds4-agent` or
 
 Two Sparks can instead keep half the experts each, using
 [network tensor parallelism](DISTRIBUTED.md#tensor-parallelism-between-two-sparks).
-Both need the complete GGUF on their local SSD. V4.1 CUDA vision and DSpark
-are not supported. The [model guide](MODELS.md#deepseek-v41-flash) covers
+Both need the complete GGUF on their local SSD. Single-host V4.1
+[DSpark](SPECULATIVE_DECODING.md#deepseek-v41-flash-dspark) also works with SSD
+streaming; TP speculation and CUDA vision are not supported for V4.1.
+The [model guide](MODELS.md#deepseek-v41-flash) covers
 thinking levels and the separate Metal configurations.
 
 September 13-14, 2026, Q2 SSD with automatic cache sizing: a 3,241-token

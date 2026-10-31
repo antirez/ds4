@@ -108,9 +108,14 @@ bool ds4_tp_is_rdma(const ds4_tp *tp);
  * not disabled with DS4_TP_DISABLE_RDMA_MAILBOX on either rank). */
 bool ds4_tp_command_mailbox_active(const ds4_tp *tp);
 uint32_t ds4_tp_peer_ctx(const ds4_tp *tp);
-enum { DS4_TP_MODE_EXPERT_INTERMEDIATE_SPLIT = 1u };
-/* Call on both engines before binding the GPU slab. The actual resident
- * layouts must match; environment settings alone cannot establish this. */
+enum {
+    DS4_TP_MODE_EXPERT_INTERMEDIATE_SPLIT = 1u,
+    DS4_TP_MODE_V41_SHARED_OWNER = 2u,
+    DS4_TP_MODE_V41_SHARED_BALANCE = 4u,
+    DS4_TP_MODE_V41_DSPARK = 8u,
+};
+/* Call on both engines before binding the GPU slab. Resident layouts and
+ * shared-expert ownership must match before either rank can reduce results. */
 int ds4_tp_agree_execution_mode(ds4_tp *tp, uint32_t flags, char *err, size_t errlen);
 bool ds4_tp_failed(const ds4_tp *tp);
 void ds4_tp_mark_failed(ds4_tp *tp);

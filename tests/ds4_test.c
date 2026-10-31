@@ -4,6 +4,7 @@
 #include "../ds4_server.c"
 #ifndef DS4_NO_GPU
 #include "../ds4_gpu.h"
+#include "../ds4_image.h"
 #include <math.h>
 
 bool ds4_test_dspark_cache_window_crop(void);
@@ -3528,6 +3529,120 @@ static void test_metal_contiguous_compressed_f16_attention_exact(void) {
     ds4_gpu_tensor_free(raw);
 }
 
+static void test_metal_compressed_selection_causality(void) {
+    enum { tokens = 8, heads = 2, dim = 512, max_comp = 514 };
+    const uint32_t positions[] = {0, 1, 2044, 2048};
+    const uint64_t output_bytes = (uint64_t)tokens * heads * dim * sizeof(float);
+    const uint64_t page = (uint64_t)getpagesize();
+    void *model = NULL;
+    TEST_ASSERT(posix_memalign(&model, (size_t)page, (size_t)page) == 0);
+    ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(output_bytes);
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(output_bytes);
+    ds4_gpu_tensor *raw = ds4_gpu_tensor_alloc(tokens * dim * sizeof(float));
+    ds4_gpu_tensor *comp = ds4_gpu_tensor_alloc(max_comp * dim * sizeof(float));
+    ds4_gpu_tensor *comp_half = ds4_gpu_tensor_alloc(max_comp * dim * sizeof(uint16_t));
+    /* A nonzero view offset catches accidental indexing from the backing buffer. */
+    ds4_gpu_tensor *mask_base = ds4_gpu_tensor_alloc((tokens * max_comp + 4) * sizeof(float));
+    ds4_gpu_tensor *mask = mask_base
+        ? ds4_gpu_tensor_view(mask_base, 4 * sizeof(float), tokens * max_comp * sizeof(float)) : NULL;
+    float *values = malloc(max_comp * dim * sizeof(float));
+    float *selected = malloc(tokens * max_comp * sizeof(float));
+    float *actual = malloc((size_t)output_bytes);
+    const bool allocated = model && q && out && raw && comp && comp_half &&
+        mask && values && selected && actual;
+    TEST_ASSERT(allocated);
+    size_t mismatches = 0;
+    float max_error = 0;
+    const uint32_t neg_inf_bits = 0xff800000u;
+    float neg_inf;
+    memcpy(&neg_inf, &neg_inf_bits, sizeof(neg_inf));
+    if (allocated) {
+        memset(model, 0, (size_t)page);
+        TEST_ASSERT(ds4_gpu_set_model_map(model, page) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_fill_f32(q, 0, tokens * heads * dim) != 0);
+        for (uint32_t k = 0; k < tokens; k++)
+            for (uint32_t d = 0; d < dim; d++) values[k * dim + d] = (k + 1) / 16.0f;
+        TEST_ASSERT(ds4_gpu_tensor_write(raw, 0, values, tokens * dim * sizeof(float)) != 0);
+        for (uint32_t c = 0; c < max_comp; c++)
+            for (uint32_t d = 0; d < dim; d++)
+                values[c * dim + d] = c >= 511 ? 8.0f : (c % 7 + 1) / 8.0f;
+        TEST_ASSERT(ds4_gpu_tensor_write(comp, 0, values, max_comp * dim * sizeof(float)) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_copy_f32_to_f16(comp_half, 0, comp, 0, max_comp * dim) != 0);
+        /* First four tokens form an image. Its later raw rows must remain
+         * visible even when their compressed summaries are still in the future. */
+        const uint32_t vocab = 129280;
+        const int32_t image_tokens[tokens] = {
+            vocab + DS4_DEEPSEEK4_IMAGE_START,
+            vocab + DS4_DEEPSEEK4_IMAGE_PAD,
+            vocab + DS4_DEEPSEEK4_IMAGE_PAD,
+            vocab + DS4_DEEPSEEK4_IMAGE_END, 1, 1, 1, 1
+        };
+        for (size_t pi = 0; pi < sizeof(positions) / sizeof(positions[0]); pi++) {
+            const uint32_t pos0 = positions[pi], n_comp = (pos0 + tokens) / 4;
+            for (uint32_t mode = 0; mode < 4; mode++) {
+                for (uint32_t t = 0; t < tokens; t++) {
+                    for (uint32_t c = 0; c < n_comp; c++) {
+                        const bool chosen = c < 512 && mode != 3 &&
+                            (mode != 2 || (c + t) % 3 != 1);
+                        selected[t * n_comp + c] = chosen ? 0 : neg_inf;
+                    }
+                }
+                TEST_ASSERT(ds4_gpu_tensor_write(mask, 0, selected,
+                    tokens * n_comp * sizeof(float)) != 0);
+                for (uint32_t half = 0; half < 2; half++) {
+                    for (uint32_t visual = 0; visual < 2; visual++) {
+                        int ok;
+                        if (visual) {
+                            ok = ds4_gpu_attention_visual_mixed_batch_heads_tensor(
+                                out, model, page, 0, q, raw, half ? comp_half : comp,
+                                half, mask, mode != 0, image_tokens, vocab,
+                                tokens, pos0, tokens, tokens, 0, n_comp, 128, 4, heads, dim);
+                        } else {
+                            ok = ds4_gpu_attention_decode_mixed_batch_heads_tensor(
+                                out, model, page, 0, q, raw, half ? comp_half : comp,
+                                half, mask, mode != 0, tokens, pos0, tokens, tokens,
+                                0, n_comp, 128, 4, heads, dim);
+                        }
+                        TEST_ASSERT(ok != 0);
+                        TEST_ASSERT(ds4_gpu_tensor_read(out, 0, actual, output_bytes) != 0);
+                        for (uint32_t t = 0; t < tokens; t++) {
+                            /* Zero queries and sinks give uniform attention.
+                             * A compressed row is available only once its last
+                             * source token has arrived. Selection cannot alter that. */
+                            float sum = 0;
+                            uint32_t count = 1; /* zero-valued attention sink */
+                            const uint32_t last_raw = visual && t < 4 ? 3 : t;
+                            for (uint32_t k = 0; k <= last_raw; k++) {
+                                sum += (k + 1) / 16.0f; count++;
+                            }
+                            for (uint32_t c = 0; c < n_comp; c++) {
+                                if ((c + 1) * 4 - 1 > pos0 + t) continue;
+                                if (mode != 0 && selected[t * n_comp + c] != 0) continue;
+                                sum += c >= 511 ? 8.0f : (c % 7 + 1) / 8.0f;
+                                count++;
+                            }
+                            const float expected = sum / count;
+                            for (uint32_t d = 0; d < heads * dim; d++) {
+                                const float error = fabsf(actual[t * heads * dim + d] - expected);
+                                /* FlashAttention rounds block probabilities to half. */
+                                if (!(error <= 0.001f)) mismatches++;
+                                if (error > max_error) max_error = error;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    fprintf(stderr, "ds4-test: compressed selection causality mismatches=%zu max_abs=%g\n",
+            mismatches, max_error);
+    TEST_ASSERT(mismatches == 0);
+    free(actual); free(selected); free(values); free(model);
+    ds4_gpu_tensor_free(mask); ds4_gpu_tensor_free(mask_base);
+    ds4_gpu_tensor_free(comp_half); ds4_gpu_tensor_free(comp);
+    ds4_gpu_tensor_free(raw); ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(q);
+}
+
 static void test_metal_persistent_zero_attention_mask_exact_case(
         uint32_t raw_cap,
         uint32_t n_raw,
@@ -5146,6 +5261,7 @@ static void test_metal_kernel_group(void) {
     test_metal_contiguous_f32_f16_roundtrip_exact();
     test_metal_gathered_kv_stage_exact();
     test_metal_contiguous_compressed_f16_attention_exact();
+    test_metal_compressed_selection_causality();
     test_metal_persistent_zero_attention_mask_exact();
     test_metal_zero_prefix_prefill_mask_cache_exact();
     test_metal_hc_split_weighted_sum_norm_batch_exact();

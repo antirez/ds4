@@ -62,6 +62,22 @@ larger mixed and Q4 models have substantially higher memory requirements.
 Flash's ROCm resident and pipeline paths should not be confused with the GLM
 SSD-streaming path.
 
+## DeepSeek V4.1 Flash
+
+Use Q2 with SSD streaming on a 128 GB machine:
+
+```sh
+./download_model.sh ds41f-q2
+./ds4 --rocm -m gguf/DeepSeek-V4.1-Flash-Q2.gguf \
+  --ssd-streaming --ctx 4096
+```
+
+The 341 GiB GGUF includes disk-only Engram tables. Keep it on a fast local
+SSD and start with automatic cache sizing. The matching
+[V4.1 DSpark](SPECULATIVE_DECODING.md#deepseek-v41-flash-dspark) support file
+is optional. V4.1 vision and network TP are not supported on ROCm.
+Large prefills are not yet tuned on this backend and can be slow.
+
 ## GLM 5.3 Flash
 
 The reference Q2 setup uses SSD streaming to leave room for its graph and KV

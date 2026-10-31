@@ -9,8 +9,9 @@ QWEN38_REPO="antirez/qwen3.8-flash-next-gguf"
 QWEN38_MMPROJ_REPO="ggml-org/Qwen3.8-Flash-Next-GGUF"
 REPO="antirez/deepseek-v4-gguf"
 DS41_REPO="antirez/deepseek-v4.1-flash-gguf"
-DS41_Q2_FILE="DeepSeek-V4.1-Flash-Q2.gguf"
+DS41_Q2_FILE="DeepSeek-V4.1-Flash-1017-IQ2_XXS-Q2_K-imatrix.gguf"
 DS41_Q4_FILE="DeepSeek-V4.1-Flash-Q4.gguf"
+DS41_MXFP4_BASE="DeepSeek-V4.1-Flash-1017-MXFP4-experts"
 DS41_VISION_FILE="DeepSeek-V4.1-Flash-Vision.gguf"
 DS4F_Q2_FILE="DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf"
 DS4F_Q4_FILE="DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf"
@@ -65,6 +66,7 @@ Usage:
   ./download_model.sh ds4f-vision-dspark [--token TOKEN]
   ./download_model.sh ds41f-q2 [--token TOKEN]
   ./download_model.sh ds41f-q4 [--token TOKEN]
+  ./download_model.sh ds41f-mxfp4 [--token TOKEN]
   ./download_model.sh ds41f-vision [--token TOKEN]
   ./download_model.sh pro-q2-imatrix [--token TOKEN]
   ./download_model.sh pro-q4-layers00-30 [--token TOKEN]
@@ -142,6 +144,12 @@ Targets:
        occupy 294 GiB; Engram tables stay on disk. Metal only: use SSD streaming
        on smaller Macs or full residency on a 512 GB Mac. Downloads two parts
        and joins them automatically; allow another 37 GiB of free disk space.
+
+  ds41f-mxfp4
+       DeepSeek V4.1 Flash 1017 MXFP4 routed experts, about 467 GiB on disk.
+       Downloads and verifies all nine GGUF shards, then restores the original
+       page-aligned GGUF for DwarfStar. Retains the shards: allow about 935 GiB
+       of disk space for shards plus output. Downloads and merging can resume.
 
   pro-q2-imatrix
        DeepSeek V4 PRO 0813 q2 imatrix quant, as a single GGUF file. About
@@ -294,6 +302,14 @@ case "$MODEL" in
     ds41f-q4)
         REPO=$DS41_REPO
         MODEL_FILE=$DS41_Q4_FILE
+        FORCE_HF_DOWNLOAD=1
+        ;;
+    ds41f-mxfp4)
+        REPO=$DS41_REPO
+        MODEL_FILE="$DS41_MXFP4_BASE.gguf"
+        for part in 00001 00002 00003 00004 00005 00006 00007 00008 00009; do
+            MODEL_FILES="$MODEL_FILES $DS41_MXFP4_BASE-${part}-of-00009.gguf"
+        done
         FORCE_HF_DOWNLOAD=1
         ;;
     ds41f-vision)
@@ -459,7 +475,7 @@ artifact_identity() {
             ;;
         "$DS41_Q2_FILE")
             expected_bytes=365713686528
-            expected_sha=1ce6a8f8806205c13330d7ca287bd198331dc5ca35ccc5d8a9a92a188a6f6f42
+            expected_sha=5296e85ff64b42ecb62c8d0c0c54e1caa07e3df8e93112f2365ebbaed62ce93a
             ;;
         "$DS41_Q4_FILE")
             expected_bytes=518596067328
@@ -472,6 +488,46 @@ artifact_identity() {
         "$DS41_Q4_FILE.part2")
             expected_bytes=38596067328
             expected_sha=7c3e10646c918eeaffbc39305a75ec96117450262c61454ff194cef00d7617f0
+            ;;
+        "$DS41_MXFP4_BASE.gguf")
+            expected_bytes=501609136128
+            expected_sha=79608a69cd5bb919d8140c37105edc3a33419692d4e6caf4e68c901e4b359141
+            ;;
+        "$DS41_MXFP4_BASE-00001-of-00009.gguf")
+            expected_bytes=49353784544
+            expected_sha=636918b09de6253bf41af29f06aac3ceeda220e46379d8a2058ef92c4e433ed8
+            ;;
+        "$DS41_MXFP4_BASE-00002-of-00009.gguf")
+            expected_bytes=49412635712
+            expected_sha=b26d3fc1e6ae1be6c52665542f3c1fee6a33791478f26e6cd90b5a75940a9f96
+            ;;
+        "$DS41_MXFP4_BASE-00003-of-00009.gguf")
+            expected_bytes=49582960352
+            expected_sha=20c7fe7adb0578336d8a5e5f9eed521aeb88e8c119ba46e0916cdaab28931c80
+            ;;
+        "$DS41_MXFP4_BASE-00004-of-00009.gguf")
+            expected_bytes=49418206432
+            expected_sha=67592ba15870c4292a615666adcc2736b53cc345b2cccb1c36710a0a6caf15b4
+            ;;
+        "$DS41_MXFP4_BASE-00005-of-00009.gguf")
+            expected_bytes=49412829632
+            expected_sha=ecd04e0aa71bfab8cfe79ea7fef7f35b6be0b6772455139e2081d6ce1dcc18ed
+            ;;
+        "$DS41_MXFP4_BASE-00006-of-00009.gguf")
+            expected_bytes=49257603776
+            expected_sha=88214e0cc80fbae578b80c114527e6ce725199684e0b6849475c7d00b3d0f54c
+            ;;
+        "$DS41_MXFP4_BASE-00007-of-00009.gguf")
+            expected_bytes=2406482112
+            expected_sha=38939faf3e4258f3ae333f0fa1954ce89515b75ceee90d37bf4ebe5fafe285e6
+            ;;
+        "$DS41_MXFP4_BASE-00008-of-00009.gguf")
+            expected_bytes=101377628544
+            expected_sha=a9d1634da2ac57459a64b10b69ddedfadda7dcde0e71ca6e55bea7c293c4a9f0
+            ;;
+        "$DS41_MXFP4_BASE-00009-of-00009.gguf")
+            expected_bytes=101380404256
+            expected_sha=b9832b355288c005da6ef444d02424464dd27f6ebdefeadbec2244264eb65285
             ;;
         "$DS41_VISION_FILE")
             expected_bytes=970555552
@@ -671,7 +727,57 @@ with Path(str(pending) + ".lock").open("a") as lock:
 PY
 }
 
-if [ "$MODEL" = "ds41f-q4" ]; then
+download_ds41_mxfp4() {
+    mx_out="$OUT_DIR/$MODEL_FILE"
+    if [ -e "$mx_out" ]; then
+        verify_download "$MODEL_FILE" "$mx_out"
+        echo "Already downloaded: $mx_out"
+        return
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "Merging the MXFP4 shards requires Python 3." >&2
+        exit 1
+    fi
+    if [ ! -f "$ROOT/gguf-tools/merge_deepseek41_shards.py" ]; then
+        echo "Missing gguf-tools/merge_deepseek41_shards.py; use a complete checkout." >&2
+        exit 1
+    fi
+    mkdir -p "$OUT_DIR"
+    artifact_identity "$MODEL_FILE"
+    mx_bytes=$expected_bytes
+    mx_sha=$expected_sha
+    set -- "$mx_out.assembling" "$mx_bytes"
+    for shard in $MODEL_FILES; do
+        artifact_identity "$shard"
+        set -- "$@" "$OUT_DIR/$shard" "$expected_bytes"
+    done
+    # Check peak storage before downloading hundreds of GB. Retain the input
+    # shards and account for a resumable output; HF partial caches are extra.
+    python3 - "$OUT_DIR" "$@" <<'PY'
+from pathlib import Path
+import shutil
+import sys
+
+needed = 1 << 30
+for name, size in zip(sys.argv[2::2], sys.argv[3::2]):
+    path = Path(name)
+    needed += max(0, int(size) - (path.stat().st_size if path.exists() else 0))
+if shutil.disk_usage(sys.argv[1]).free < needed:
+    sys.exit("Not enough disk space for MXFP4 shards and merged GGUF: "
+             f"need {needed / (1 << 30):.1f} GiB free. Existing files were kept.")
+PY
+    set --
+    for shard in $MODEL_FILES; do
+        download_one_hf "$shard"
+        set -- "$@" "$OUT_DIR/$shard"
+    done
+    python3 "$ROOT/gguf-tools/merge_deepseek41_shards.py" \
+        --output "$mx_out" --expected-bytes "$mx_bytes" --sha256 "$mx_sha" "$@"
+}
+
+if [ "$MODEL" = "ds41f-mxfp4" ]; then
+    download_ds41_mxfp4
+elif [ "$MODEL" = "ds41f-q4" ]; then
     download_ds41_q4
 elif [ -n "$MODEL_FILES" ]; then
     for file in $MODEL_FILES; do

@@ -32,6 +32,9 @@ static void usage(const char *prog) {
             "[--max-cases N] "
             "[--continued-prefill N] "
             "[--session-batch N] "
+#ifdef DS4_TEST_HOOKS
+            "[--mtp-model FILE] [--verify-batch 1..6] "
+#endif
             "[--tensor-parallel --role coordinator --listen HOST PORT "
             "[--transport auto|rdma|tcp]]\n",
             prog);
@@ -562,7 +565,7 @@ static int api_top1_update(ds4_engine *engine, const api_pos *pos,
 
 static bool local_logits(ds4_session *session, float *logits, int n_vocab,
                          double *logsum, int *argmax) {
-    if (ds4_session_copy_logits(session, logits, n_vocab) != n_vocab) return false;
+    if (session && ds4_session_copy_logits(session, logits, n_vocab) != n_vocab) return false;
     float max_logit = -INFINITY;
     int best = -1;
     for (int i = 0; i < n_vocab; i++) {
@@ -691,6 +694,10 @@ int main(int argc, char **argv) {
     int max_cases = 0;
     int continued_prefill = 0;
     int session_count = 1;
+#ifdef DS4_TEST_HOOKS
+    const char *mtp_path = NULL;
+    int verify_batch = 0;
+#endif
     ds4_dist_options dist = {0};
     ds4_tp_options tp = {0};
 
@@ -715,6 +722,17 @@ int main(int argc, char **argv) {
         }
         if (tp_parse == DS4_TP_CLI_MATCHED) continue;
 
+#ifdef DS4_TEST_HOOKS
+        if (!strcmp(arg, "--mtp-model")) {
+            mtp_path = need_arg(&i, argc, argv, arg);
+            continue;
+        }
+        if (!strcmp(arg, "--verify-batch")) {
+            verify_batch = parse_positive_int(need_arg(&i, argc, argv, arg), arg);
+            if (verify_batch > 6) die("--verify-batch must be between 1 and 6");
+            continue;
+        }
+#endif
         if (!strcmp(arg, "--quality")) {
             quality = true;
         } else if (!strcmp(arg, "--rendered-prompt")) {
@@ -764,19 +782,27 @@ int main(int argc, char **argv) {
         }
     }
     if (ctx_size < 1024) ctx_size = 1024;
-
     char tp_err[256] = {0};
     if (!ds4_tp_adopt_distributed_options(&tp, &dist,
                                           tp_err, sizeof(tp_err))) {
         fprintf(stderr, "score_official: %s\n", tp_err);
         return 2;
     }
+#ifdef DS4_TEST_HOOKS
+    if (verify_batch && (!mtp_path || session_count != 1 ||
+                         dist.role != DS4_DISTRIBUTED_NONE))
+        die("--verify-batch requires --mtp-model and one session without pipeline execution");
+#endif
     if (tp.role == DS4_TP_WORKER || dist.role == DS4_DISTRIBUTED_WORKER) {
         die("score_official: start workers with ./ds4");
     }
 
     ds4_engine_options opt = {
         .model_path = model_path,
+#ifdef DS4_TEST_HOOKS
+        .mtp_path = mtp_path,
+        .dspark = mtp_path != NULL,
+#endif
 #ifdef __APPLE__
         .backend = DS4_BACKEND_METAL,
 #else
@@ -886,6 +912,10 @@ int main(int argc, char **argv) {
     const int n_vocab = ds4_engine_vocab_size(engine);
     float *logits = malloc((size_t)n_vocab * sizeof(logits[0]));
     if (!logits) die("out of memory");
+#ifdef DS4_TEST_HOOKS
+    float *verify_logits = verify_batch ? malloc((size_t)(verify_batch + 1) * n_vocab * sizeof(float)) : NULL;
+    if (verify_batch && !verify_logits) die("out of memory");
+#endif
 
     FILE *mf = fopen(manifest_path, "rb");
     if (!mf) {
@@ -994,7 +1024,24 @@ int main(int argc, char **argv) {
         for (int i = 0; i < target.len; i++) {
             double logsum = 0.0;
             int greedy = -1;
-            if (!local_logits(session, logits, n_vocab, &logsum, &greedy)) {
+            ds4_session *logit_session = session;
+#ifdef DS4_TEST_HOOKS
+            if (verify_batch) {
+                const int row = i % verify_batch;
+                if (!row) {
+                    const int rows = target.len - i < verify_batch ? target.len - i : verify_batch;
+                    if (ds4_session_copy_logits(session, verify_logits, n_vocab) != n_vocab ||
+                        ds4_test_ds41_verify_tokens(session, target.v + i, rows,
+                            verify_logits + n_vocab, err, sizeof(err))) {
+                        fprintf(stderr, "%s verify failed at token %d: %s\n", id, i, err);
+                        return 1;
+                    }
+                }
+                memcpy(logits, verify_logits + (size_t)row * n_vocab, (size_t)n_vocab * sizeof(float));
+                logit_session = NULL;
+            }
+#endif
+            if (!local_logits(logit_session, logits, n_vocab, &logsum, &greedy)) {
                 fprintf(stderr,
                         "%s logits copy failed or returned a non-finite value "
                         "at target token %d\n",
@@ -1078,6 +1125,9 @@ int main(int argc, char **argv) {
                 }
             }
 
+#ifdef DS4_TEST_HOOKS
+            if (verify_batch) continue;
+#endif
             if (eval_with_companions(sessions, session_count, target.v[i], (unsigned)i,
                                      err, sizeof(err)) != 0) {
                 fprintf(stderr, "%s eval failed at target token %d: %s\n", id, i, err);
@@ -1177,6 +1227,9 @@ int main(int argc, char **argv) {
     fclose(out);
     fclose(mf);
     free(logits);
+#ifdef DS4_TEST_HOOKS
+    free(verify_logits);
+#endif
     for (int i = 0; i < session_count; i++) {
         ds4_session_free(sessions[i]);
         ds4_tokens_free(&companion_prompt[i]);

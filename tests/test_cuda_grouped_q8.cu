@@ -119,12 +119,12 @@ static void run(unsigned width, unsigned rank, unsigned groups, bool bench) {
     printf("grouped Q8 width=%u rank=%u groups=%u: scalar rows exact PASS\n", width, rank, groups);
 }
 
-/* Q8 K-slice rows (the TP o_b and shared-expert down halves): every batch of
- * 1..8 rows must reproduce each row computed alone, for both K halves, with
+/* Q8 K-slice rows (the TP o_b and shared-expert down halves): small and
+ * prefill-sized batches must reproduce each scalar row, for both K halves,
  * ragged output counts and slices shorter than or not a multiple of a warp's
- * 32 blocks.  Rows past the batch must stay untouched. */
+ * 32 blocks. Rows past the batch must stay untouched. */
 static void run_kslice(unsigned in_dim, unsigned out_dim, unsigned split) {
-    const unsigned rows = 8;
+    const unsigned rows = 129;
     const uint64_t size = (uint64_t)out_dim * ((in_dim + 31) / 32) * 34;
     std::vector<unsigned char> model(size);
     const int fd = map_random_q8(model);
@@ -148,7 +148,8 @@ static void run_kslice(unsigned in_dim, unsigned out_dim, unsigned split) {
         std::vector<float> expected((size_t)rows * out_dim), actual(expected.size());
         assert(ds4_gpu_tensor_read(out, 0, expected.data(), expected.size() * 4));
         for (float v : expected) assert(!std::isnan(v));
-        for (unsigned n = 1; n <= rows; n++) {
+        for (unsigned n : {1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u, 15u, 16u,
+                           17u, 32u, 33u, 127u, 128u, 129u}) {
             assert(ds4_gpu_tensor_fill_f32(out, NAN, expected.size()));
             assert(ds4_gpu_matmul_q8_0_kslice_rows_tensor(out, model.data(), size, 0,
                 in_dim, out_dim, start, count, x, n));
@@ -180,4 +181,5 @@ int main(int argc, char **argv) {
     run_kslice(2407, 37, 1184);
     run_kslice(2048, 4096, 1024);
     run_kslice(8192, 4096, 4096);
+    run_kslice(8192, 5120, 4096);
 }

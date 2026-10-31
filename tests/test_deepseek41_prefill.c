@@ -6,6 +6,12 @@
     fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x); goto done; \
 } } while (0)
 
+#ifdef __APPLE__
+#define MEDIUM_SWEEP_OFF "DS4_METAL_DISABLE_V41_MEDIUM_SWEEP"
+#else
+#define MEDIUM_SWEEP_OFF "DS4_CUDA_DISABLE_SSD_MEDIUM_SWEEP"
+#endif
+
 static int check_dispatch(void) {
     int rc = 1;
     g_ds4_shape = DS4_SHAPE_FLASH41;
@@ -37,7 +43,8 @@ static int check_dispatch(void) {
                 uint32_t expected = cold[i];
 #ifdef __APPLE__
                 if (warm && cache == half && remaining[i] < 1024) expected = 1;
-#elif !defined(DS4_ROCM_BUILD)
+#endif
+#if !defined(DS4_ROCM_BUILD)
                 if (remaining[i] > 2048 && remaining[i] < 8192 && remaining[i] % 2048 >= 256)
                     expected = remaining[i];
 #endif
@@ -56,13 +63,13 @@ static int check_dispatch(void) {
         }
     }
     g.pos = 0;
-#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+#if !defined(DS4_ROCM_BUILD)
     CHECK(ds41_prefill_count(&g, 2303) == 2048);
     CHECK(ds41_prefill_count(&g, 2304) == 2304);
     CHECK(ds41_prefill_count(&g, 3241) == 3241);
-    CHECK(setenv("DS4_CUDA_DISABLE_SSD_MEDIUM_SWEEP", "1", 1) == 0);
+    CHECK(setenv(MEDIUM_SWEEP_OFF, "1", 1) == 0);
     CHECK(ds41_prefill_count(&g, 3241) == 2048);
-    CHECK(unsetenv("DS4_CUDA_DISABLE_SSD_MEDIUM_SWEEP") == 0);
+    CHECK(unsetenv(MEDIUM_SWEEP_OFF) == 0);
     g.prefill_cap = 1024;
     CHECK(ds41_prefill_count(&g, 3241) == 1024);
     g.prefill_cap = 8192;
@@ -285,6 +292,8 @@ static int check_mixed(const char *model, const char *prompt_path,
         const char *ablation = tp ? "DS4_METAL_DISABLE_V41_TP_DECODE_QUEUE" :
             "DS4_METAL_DISABLE_V41_DEFER_DECODER";
         CHECK(setenv(ablation, "1", 1) == 0);
+        /* The control session keeps the two-sweep medium append. */
+        if (!cuda && !tp) CHECK(setenv("DS4_METAL_DISABLE_V41_MEDIUM_SWEEP", "1", 1) == 0);
         if (cuda && !tp) {
             CHECK(setenv("DS4_CUDA_SESSION_BATCH_MOE", "0", 1) == 0);
             CHECK(setenv("DS4_CUDA_DISABLE_SSD_PREFETCH", "1", 1) == 0);
@@ -303,6 +312,7 @@ static int check_mixed(const char *model, const char *prompt_path,
             CHECK(unsetenv("DS4_CUDA_DISABLE_SSD_PREFETCH") == 0);
             CHECK(unsetenv("DS4_CUDA_DISABLE_SSD_MEDIUM_SWEEP") == 0);
         }
+        if (!cuda && !tp) CHECK(unsetenv("DS4_METAL_DISABLE_V41_MEDIUM_SWEEP") == 0);
         CHECK(unsetenv(ablation) == 0);
         prefill_progress p = {.session = mixed, .frontier = start,
             .current = start, .target = tokens.len, .begin = now_sec()};

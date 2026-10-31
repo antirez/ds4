@@ -146,8 +146,10 @@ kernel void kernel_argsort_f32_i32(
     }
 }
 
-// Host-visible sort variant used by DS4 top-k selection.
-template [[host_name("kernel_argsort_f32_i32_desc")]] kernel argsort_t kernel_argsort_f32_i32<DS4_SORT_ORDER_DESC>;
+// Host-visible sort variant used by DS4 top-k selection. Uses the register/
+// simd_shuffle_xor network for the j < 32 stages; output is identical to the
+// threadgroup-memory network.
+template [[host_name("kernel_argsort_f32_i32_desc")]] kernel argsort_t kernel_argsort_f32_i32<DS4_SORT_ORDER_DESC, false, true>;
 template [[host_name("kernel_argsort_f32_i32_desc_causal")]] kernel argsort_t kernel_argsort_f32_i32<DS4_SORT_ORDER_DESC, true>;
 template [[host_name("kernel_argsort_f32_i32_desc_causal_shuffle")]] kernel argsort_t kernel_argsort_f32_i32<DS4_SORT_ORDER_DESC, true, true>;
 

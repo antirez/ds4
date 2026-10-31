@@ -2015,6 +2015,100 @@ kernel void kernel_glm_indexer_score_one_direct(
     }
 }
 
+/* One SIMD group scores four key rows at a time. Every lane keeps its own
+ * float4 of each row in a register, so a row never round-trips through
+ * threadgroup memory; the query float4 is read once per head and reused by all
+ * four rows, which is what keeps the per-row query traffic from growing with
+ * the head count. Per-row math is unchanged (32-lane float4 dot, then
+ * simd_sum, then max(s*scale,0)*w[head] accumulated on lane 0 in head order),
+ * so the scores are bit-identical to kernel_glm_indexer_score_one_direct. */
+static inline float4 glm_indexer_cache_row4(
+        device const char *indexer_key_cache,
+        uint row,
+        ushort lane,
+        uint cache_f16) {
+    const uint64_t idx = (uint64_t)row * 128u + (uint64_t)lane * 4u;
+    if (cache_f16 != 0u) {
+        return float4(glm_cache_load_f32_or_f16(indexer_key_cache, idx + 0u, cache_f16),
+                      glm_cache_load_f32_or_f16(indexer_key_cache, idx + 1u, cache_f16),
+                      glm_cache_load_f32_or_f16(indexer_key_cache, idx + 2u, cache_f16),
+                      glm_cache_load_f32_or_f16(indexer_key_cache, idx + 3u, cache_f16));
+    }
+    return *(device const float4 *)((device const float *)indexer_key_cache + idx);
+}
+
+static inline float4 glm_indexer_score_rows_in_simd(
+        constant ds4_metal_args_glm_indexer_score_one & args,
+        device const float *q,
+        device const float *weights,
+        device const char *indexer_key_cache,
+        uint r0, uint r1, uint r2, uint r3,
+        ushort lane) {
+    const float4 kv0 = glm_indexer_cache_row4(indexer_key_cache, r0, lane, args.cache_f16);
+    const float4 kv1 = glm_indexer_cache_row4(indexer_key_cache, r1, lane, args.cache_f16);
+    const float4 kv2 = glm_indexer_cache_row4(indexer_key_cache, r2, lane, args.cache_f16);
+    const float4 kv3 = glm_indexer_cache_row4(indexer_key_cache, r3, lane, args.cache_f16);
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    /* The scalar kernel rounds max(s*scale,0)*w into threadgroup memory and
+     * then adds it, so its term is rounded twice. Contracting that add into an
+     * fma would remove a rounding and change the scores, and this library is
+     * built with fast math. Keep the contraction off around the accumulate
+     * only, so the dot and the reduction compile exactly as in the scalar
+     * kernel. The pragma has to start a compound statement. */
+    for (uint head = 0; head < 32u; head++) {
+        device const float4 *q4 = (device const float4 *)(q + (uint64_t)head * 128u);
+        float s0 = dot(q4[lane], kv0);
+        float s1 = dot(q4[lane], kv1);
+        float s2 = dot(q4[lane], kv2);
+        float s3 = dot(q4[lane], kv3);
+        s0 = simd_sum(s0);
+        s1 = simd_sum(s1);
+        s2 = simd_sum(s2);
+        s3 = simd_sum(s3);
+        if (lane == 0u) {
+            const float t0 = max(s0 * args.scale, 0.0f) * weights[head];
+            const float t1 = max(s1 * args.scale, 0.0f) * weights[head];
+            const float t2 = max(s2 * args.scale, 0.0f) * weights[head];
+            const float t3 = max(s3 * args.scale, 0.0f) * weights[head];
+            {
+#pragma clang fp contract(off)
+                a0 += t0;
+                a1 += t1;
+                a2 += t2;
+                a3 += t3;
+            }
+        }
+    }
+    return float4(a0, a1, a2, a3);
+}
+
+/* Grid: ceil(n_rows / 16); the threadgroup is 32x4, so each SIMD group covers
+ * four rows and a threadgroup covers sixteen. */
+kernel void kernel_glm_indexer_score_one_rows4(
+        constant ds4_metal_args_glm_indexer_score_one & args,
+        device const float *q,
+        device const float *weights,
+        device const char *indexer_key_cache,
+        device float *scores,
+        uint tg [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    if (args.n_head != 32u || args.head_dim != 128u) return;
+    const uint first = tg * 16u + (uint)sg * 4u;
+    const uint r0 = first, r1 = first + 1u, r2 = first + 2u, r3 = first + 3u;
+    /* Rows past the end fall back to row 0 so the cache load stays in bounds;
+     * their results are dropped instead of being written. n_rows >= 1. */
+    const float4 acc = glm_indexer_score_rows_in_simd(args, q, weights, indexer_key_cache,
+            r0 < args.n_rows ? r0 : 0u, r1 < args.n_rows ? r1 : 0u,
+            r2 < args.n_rows ? r2 : 0u, r3 < args.n_rows ? r3 : 0u, lane);
+    if (lane == 0u) {
+        if (r0 < args.n_rows) scores[r0] = acc.x;
+        if (r1 < args.n_rows) scores[r1] = acc.y;
+        if (r2 < args.n_rows) scores[r2] = acc.z;
+        if (r3 < args.n_rows) scores[r3] = acc.w;
+    }
+}
+
 kernel void kernel_glm_indexer_scores_batch(
         constant ds4_metal_args_glm_indexer_scores_batch & args,
         device const char *q,
@@ -5472,6 +5566,24 @@ kernel void kernel_dsv4_topk_mask_scatter(
     if (idx >= 0 && (int64_t)idx < args.ne0) {
         *((device float *) (dst + (int64_t)idx*args.nb0 + it*args.nb1)) = 0.0f;
     }
+}
+
+// Copy the selected compressed-key mask while retaining causal visibility.
+// Image bidirectionality applies to raw keys only, never compressed keys.
+struct ds4_metal_args_causal_comp_mask {
+    uint n_comp, n_tokens, pos0, ratio, n_keys;
+};
+
+kernel void kernel_dsv4_causal_comp_mask(
+        constant ds4_metal_args_causal_comp_mask &args,
+        device const float *selected_mask,
+        device half *dst,
+        uint2 gid [[thread_position_in_grid]]) {
+    const uint col = gid.x, row = gid.y;
+    if (col >= args.n_comp || row >= args.n_tokens) return;
+    const ulong visible = (ulong(args.pos0) + ulong(row) + 1ul) / args.ratio;
+    dst[ulong(row) * args.n_keys + col] = ulong(col) < visible
+        ? half(selected_mask[ulong(row) * args.n_comp + col]) : half(-INFINITY);
 }
 
 // Sorts each token's selected compressed rows by row id. The indexer selects by

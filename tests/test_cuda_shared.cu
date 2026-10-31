@@ -42,7 +42,7 @@ static void check(uint32_t width, uint32_t hidden, float clamp) {
     }
     auto start = [&](uint64_t offset) {
         return ds4_gpu_dsv41_shared_start(out[1], gate[1], up[1], mid[1], x,
-            model.data(), model.size(), 0, gu, offset, width, hidden, clamp);
+            model.data(), model.size(), 0, gu, offset, width, hidden, clamp, nullptr);
     };
     auto serial = [&]() {
         CHECK(ds4_gpu_matmul_q8_0_tensor(gate[0], model.data(), model.size(),
@@ -123,11 +123,78 @@ static void check(uint32_t width, uint32_t hidden, float clamp) {
     CHECK(ds4_gpu_tensor_read(out[1], 0, actual.data(), width * 4u));
     CHECK(!memcmp(expected.data(), actual.data(), width * 4u));
 
+    if (width % 32u == 0 && hidden % 32u == 0) {
+        auto *selected = ds4_gpu_tensor_alloc(6u * sizeof(int32_t));
+        CHECK(selected);
+        /* Reuse captured graphs while ownership changes. Overwriting the
+         * router output after start must not race the side-stream decision. */
+        for (unsigned rank = 0; rank < 2; rank++) {
+            for (unsigned tie = 0; tie < 2; tie++) {
+                ds4_v41_shared_owner owner = {selected, 384u, 6u, rank, tie};
+                key.variant = 2u + rank * 2u + tie;
+                for (unsigned round = 0; round < 14; round++) {
+                    const unsigned left = round % 7;
+                    int32_t ids[6];
+                    for (unsigned i = 0; i < 6; i++) ids[i] = i < left ? i : 192u + i;
+                    CHECK(ds4_gpu_tensor_write(selected, 0, ids, sizeof(ids)));
+                    CHECK(ds4_gpu_tensor_fill_f32(out[1], NAN, width + 8u));
+                    const int graph = ds4_gpu_decode_graph_begin(&key);
+                    if (graph != 1) {
+                        CHECK(ds4_gpu_dsv41_shared_start(out[1], gate[1], up[1], mid[1], x,
+                            model.data(), model.size(), 0, gu, 2u * gu, width, hidden, clamp, &owner) == 1);
+                        CHECK(ds4_gpu_add_tensor(selected, selected, selected, 6));
+                        unrelated(1);
+                        CHECK(ds4_gpu_dsv41_shared_join());
+                        if (graph == 0) CHECK(ds4_gpu_decode_graph_end(&key) == 0);
+                    }
+                    CHECK(ds4_gpu_tensor_read(out[1], 0, actual.data(), actual.size() * 4u));
+                    const unsigned selected_owner = left == 3 ? tie : left < 3 ? 0u : 1u;
+                    if (rank == selected_owner) CHECK(!memcmp(actual.data(), expected.data(), width * 4u));
+                    else for (unsigned i = 0; i < width; i++) CHECK(actual[i] == 0.0f);
+                    for (size_t i = width; i < actual.size(); i++) CHECK(std::isnan(actual[i]));
+                }
+            }
+        }
+        ds4_gpu_decode_graphs_invalidate();
+        ds4_gpu_tensor_free(selected);
+
+        auto *batch_ids = ds4_gpu_tensor_alloc(8u * 6u * sizeof(int32_t));
+        auto *batch = ds4_gpu_tensor_alloc((8u * width + 8u) * sizeof(float));
+        CHECK(batch_ids && batch);
+        int32_t ids[8][6];
+        std::vector<float> values(8u * width + 8u, NAN), masked(values.size());
+        for (unsigned row = 0; row < 8; row++) {
+            for (unsigned i = 0; i < 6; i++) ids[row][i] = i < row % 7u ? i : 192u + i;
+            memcpy(values.data() + row * width, expected.data(), width * sizeof(float));
+        }
+        CHECK(ds4_gpu_tensor_write(batch_ids, 0, ids, sizeof(ids)));
+        for (unsigned rank = 0; rank < 2; rank++) {
+            for (unsigned tie = 0; tie < 2; tie++) {
+                CHECK(ds4_gpu_tensor_write(batch, 0, values.data(), values.size() * sizeof(float)));
+                CHECK(ds4_gpu_dsv41_shared_mask(batch, batch_ids, width, 8, 384, 6, rank, tie));
+                CHECK(ds4_gpu_tensor_read(batch, 0, masked.data(), masked.size() * sizeof(float)));
+                for (unsigned row = 0; row < 8; row++) {
+                    const unsigned left = row % 7u;
+                    const unsigned selected_owner = left == 3 ? tie : left < 3 ? 0u : 1u;
+                    if (rank == selected_owner)
+                        CHECK(!memcmp(masked.data() + row * width, expected.data(), width * sizeof(float)));
+                    else for (unsigned i = 0; i < width; i++) CHECK(masked[row * width + i] == 0.0f);
+                }
+                for (unsigned i = 8u * width; i < masked.size(); i++) CHECK(std::isnan(masked[i]));
+            }
+        }
+        CHECK(!ds4_gpu_dsv41_shared_mask(batch, batch_ids, width, 9, 384, 6, 0, 0));
+        CHECK(!ds4_gpu_dsv41_shared_mask(batch, batch_ids, width, 8, 383, 6, 0, 0));
+        CHECK(!ds4_gpu_dsv41_shared_mask(batch, batch_ids, width, 8, 384, 6, 2, 0));
+        ds4_gpu_tensor_free(batch_ids);
+        ds4_gpu_tensor_free(batch);
+    }
+
     ds4_gpu_tensor *large_x = ds4_gpu_tensor_alloc(65536u * 4u);
     ds4_gpu_tensor *large_out = ds4_gpu_tensor_alloc(65536u * 4u);
     CHECK(large_x && large_out && ds4_gpu_tensor_fill_f32(large_out, NAN, 65536u));
     CHECK(ds4_gpu_dsv41_shared_start(large_out, gate[1], up[1], mid[1], large_x,
-        model.data(), model.size(), 0, gu, 2u * gu, 65536u, 1u, 10.0f) == 0);
+        model.data(), model.size(), 0, gu, 2u * gu, 65536u, 1u, 10.0f, nullptr) == 0);
     CHECK(ds4_gpu_dsv41_shared_join());
     std::vector<float> untouched(65536u);
     CHECK(ds4_gpu_tensor_read(large_out, 0, untouched.data(), untouched.size() * 4u));
