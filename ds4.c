@@ -38108,6 +38108,25 @@ static bool metal_graph_prefill_layer_major(
         glm_graph_env_present("DS4_ROCM_GRAPH_PREFILL_PROFILE",
                               "DS4_METAL_GRAPH_PREFILL_PROFILE") ||
         split_profile;
+#ifdef __APPLE__
+    /* A flush leaves the next command batch open. Limit retained work to two
+     * layers. Larger chunks did not benefit from overlapping submissions. */
+    const char *disable_layer_overlap = getenv("DS4_METAL_DISABLE_PREFILL_LAYER_OVERLAP");
+    const bool layer_overlap = callback_split && n_tokens <= 512 && !g->ssd_streaming &&
+        !profile && !throttle && !imatrix && !g->placement &&
+        g->tp_world <= 1 && !g->prefill_has_visual &&
+        (!disable_layer_overlap || strcmp(disable_layer_overlap, "0") == 0) &&
+        !glm_graph_env_present("DS4_ROCM_LAYER_STAGE_PROFILE",
+                               "DS4_METAL_LAYER_STAGE_PROFILE") &&
+        !glm_graph_env_present("DS4_ROCM_Q_STAGE_PROFILE",
+                               "DS4_METAL_Q_STAGE_PROFILE") &&
+        !glm_graph_env_present("DS4_ROCM_INDEXER_STAGE_PROFILE",
+                               "DS4_METAL_INDEXER_STAGE_PROFILE") &&
+        getenv("DS4_METAL_FLASH_ATTN_STAGE_PROFILE") == NULL &&
+        getenv("DS4_METAL_ATTN_OUT_STAGE_PROFILE") == NULL;
+#else
+    const bool layer_overlap = false;
+#endif
     const double t0 = profile ? now_sec() : 0.0;
     double encode_s = 0.0;
     double execute_s = 0.0;
@@ -38327,6 +38346,7 @@ static bool metal_graph_prefill_layer_major(
         return false;
     }
 
+    uint32_t completed_layers = 0;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         double layer_elapsed = 0.0;
         const bool layer_selected_addr =
@@ -38529,7 +38549,9 @@ static bool metal_graph_prefill_layer_major(
                     (t_ffn_done - t_ffn_encoded) * 1000.0);
         } else {
             const double t_chunk0 = (profile || throttle) ? now_sec() : 0.0;
-            ok = ds4_gpu_begin_commands() != 0;
+            ok = layer_overlap && (il & 1u) ?
+                ds4_gpu_commands_active() != 0 :
+                ds4_gpu_begin_commands() != 0;
             if (ok) ok = metal_graph_encode_layer_batch(g,
                                                         model,
                                                         &weights->layer[il],
@@ -38556,7 +38578,11 @@ static bool metal_graph_prefill_layer_major(
             }
 #endif
             const double t_encoded = (profile || throttle) ? now_sec() : 0.0;
-            if (ok) ok = ds4_gpu_end_commands() != 0;
+            if (ok) {
+                ok = layer_overlap && (il & 1u) == 0 && il + 1 < DS4_N_LAYER ?
+                    ds4_gpu_flush_commands() != 0 :
+                    ds4_gpu_end_commands() != 0;
+            }
             const double t_done = (profile || throttle) ? now_sec() : 0.0;
 #ifdef DS4_ROCM_BUILD
             if (ok) {
@@ -38627,16 +38653,21 @@ static bool metal_graph_prefill_layer_major(
             }
             return false;
         }
-        graph_power_note_prefill_layer(g, il, layer_elapsed);
-        gpu_graph_report_prefill_display_progress(display_progress,
-                                                  display_progress_ud,
-                                                  start,
-                                                  n_tokens,
-                                                  il + 1,
-                                                  prompt->len);
-        if (show_progress) {
-            fprintf(stderr, "ds4: gpu prefill layer %u/%u\r", il + 1, (uint32_t)DS4_N_LAYER);
-            fflush(stderr);
+        if (!layer_overlap || (il & 1u) || il + 1 == DS4_N_LAYER) {
+            for (uint32_t done = completed_layers; done <= il; done++) {
+                graph_power_note_prefill_layer(g, done, layer_elapsed);
+                gpu_graph_report_prefill_display_progress(display_progress,
+                                                          display_progress_ud,
+                                                          start,
+                                                          n_tokens,
+                                                          done + 1,
+                                                          prompt->len);
+                if (show_progress) {
+                    fprintf(stderr, "ds4: gpu prefill layer %u/%u\r", done + 1, (uint32_t)DS4_N_LAYER);
+                    fflush(stderr);
+                }
+            }
+            completed_layers = il + 1;
         }
     }
     if (!ok) {

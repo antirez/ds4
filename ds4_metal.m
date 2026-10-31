@@ -25906,7 +25906,8 @@ static int ds4_gpu_attention_output_q8_batch_impl(
         const NSUInteger ids_bytes = (NSUInteger)n_tokens * (NSUInteger)n_groups * sizeof(int32_t);
         id<MTLBuffer> group_ids_buffer = nil;
         if (!use_direct_low && !use_mpp_low) {
-            if (getenv("DS4_METAL_DISABLE_ATTN_OUT_IDS_CACHE") != NULL) {
+            if (getenv("DS4_METAL_DISABLE_ATTN_OUT_IDS_CACHE") != NULL ||
+                [g_pending_cbs count] != 0) {
                 group_ids_buffer =
                     ds4_gpu_new_transient_buffer(ids_bytes, "attention output group ids");
                 if (!group_ids_buffer) {
@@ -26333,7 +26334,8 @@ int ds4_gpu_attention_output_q4_K_batch_tensor(
         const NSUInteger ids_bytes = (NSUInteger)n_tokens * (NSUInteger)n_groups * sizeof(int32_t);
         id<MTLBuffer> group_ids_buffer = nil;
         if (!use_mpp_low) {
-            if (getenv("DS4_METAL_DISABLE_ATTN_OUT_IDS_CACHE") != NULL) {
+            if (getenv("DS4_METAL_DISABLE_ATTN_OUT_IDS_CACHE") != NULL ||
+                [g_pending_cbs count] != 0) {
                 group_ids_buffer =
                     ds4_gpu_new_transient_buffer(ids_bytes, "attention output Q4 group ids");
             } else if (ds4_gpu_ensure_scratch_buffer(&g_attn_out_group_ids_buffer,
