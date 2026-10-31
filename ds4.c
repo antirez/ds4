@@ -42190,8 +42190,16 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
 #else
     const bool queue_single = false;
 #endif
-    const bool queue_layers = (g->tp_world == 2 || queue_single) && !g->imatrix &&
-        !getenv("DS4_METAL_DISABLE_V41_TP_DECODE_QUEUE");
+    /* Streaming must synchronize to obtain routed expert IDs before cache
+     * replacement. Those waits already bound the work submitted per layer. */
+#ifdef __APPLE__
+    const bool queue_stream = g->tp_world == 1 && g->streaming && !g->quality &&
+        !g->imatrix && !getenv("DS4_METAL_DISABLE_V41_STREAM_DECODE_QUEUE");
+#else
+    const bool queue_stream = false;
+#endif
+    const bool queue_layers = queue_stream || ((g->tp_world == 2 || queue_single) && !g->imatrix &&
+        !getenv("DS4_METAL_DISABLE_V41_TP_DECODE_QUEUE"));
 #ifdef __APPLE__
     /* Only a single-token layer sweep owns layer 20's block IDs until the
      * last reindex. Interleaved prefill and verifier rows share that scratch. */

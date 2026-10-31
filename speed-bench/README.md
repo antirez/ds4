@@ -54,6 +54,22 @@ legacy decode path, including token selection, use:
   --tokens 1024
 ```
 
+For single-host V4.1 Flash SSD decode on Metal, use the per-layer wait
+as the rollback arm. The harness labels the default schedule as control
+and the rollback as candidate.
+
+```sh
+./speed-bench/metal_decode_schedule_bench \
+  -m gguf/DeepSeek-V4.1-Flash-Q2.gguf --ssd-streaming \
+  --prompt-file speed-bench/promessi_sposi.txt --prefix-tokens 2048 \
+  --ctx 8257 --tokens 512 --include-selection \
+  --candidate-env DS4_METAL_DISABLE_V41_STREAM_DECODE_QUEUE
+```
+
+Expert selection and cache replacement synchronize within each layer.
+The default schedule waits at token completion. For the original M2 Ultra
+measurements, see the [SSD decode queue benchmarks](v41_decode_queue_m2_ultra.md).
+
 ### Metal prefill variant A/B
 
 Build the balanced prefill comparison. To compare the default resident pre-M5
