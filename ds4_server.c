@@ -15052,11 +15052,22 @@ static long content_length(const char *h, size_t n) {
     return 0;
 }
 
+static size_t server_max_body_bytes(void) {
+    size_t limit = 256 * (size_t)1024 * 1024;
+    const char *env = getenv("DS4_SERVER_MAX_BODY_MB");
+    if (env && env[0]) {
+        char *end = NULL;
+        long v = strtol(env, &end, 10);
+        if (end != env && *end == '\0' && v > 0) limit = (size_t)v * 1024 * 1024;
+    }
+    return limit;
+}
+
 static bool read_http_request(int fd, http_request *r) {
     buf b = {0};
     ssize_t hend = -1;
     const size_t max_header = 64 * 1024;
-    const size_t max_body = 64 * 1024 * 1024;
+    const size_t max_body = server_max_body_bytes();
 
     while (hend < 0 && b.len < max_header) {
         char tmp[4096];
