@@ -508,6 +508,7 @@ static id<MTLComputePipelineState> g_dsv4_topk_mask_pipeline;
 static id<MTLComputePipelineState> g_dsv4_topk_mask_scatter_pipeline;
 static id<MTLComputePipelineState> g_dsv4_indexer_weighted_sum_pipeline;
 static id<MTLComputePipelineState> g_dsv4_indexer_score_one_direct_pipeline;
+static id<MTLComputePipelineState> g_dsv4_indexer_score_one_heads_pipeline;
 static id<MTLComputePipelineState> g_dsv4_compressor_store_one_pipeline;
 static id<MTLComputePipelineState> g_dsv4_sort_i32_rows_asc_pipeline;
 static id<MTLComputePipelineState> g_dsv4_indexed_attention_heads8_pipeline;
@@ -8904,6 +8905,8 @@ int ds4_gpu_init(void) {
 
         g_dsv4_indexer_score_one_direct_pipeline =
             ds4_gpu_get_pipeline("kernel_dsv4_indexer_score_one_direct");
+        g_dsv4_indexer_score_one_heads_pipeline =
+            ds4_gpu_get_pipeline("kernel_dsv4_indexer_score_one_heads");
         g_dsv4_compressor_store_one_pipeline =
             ds4_gpu_get_pipeline("kernel_dsv4_compressor_store_one");
         g_dsv4_compressor_pack_ratio4_pipeline =
@@ -9074,7 +9077,7 @@ int ds4_gpu_init(void) {
             ds4_gpu_get_pipeline("kernel_dsv4_router_weights_batch");
         g_dsv4_hc_expand4_pipeline =
             ds4_gpu_get_pipeline("kernel_dsv4_hc_expand4");
-        if (!g_dsv4_indexer_score_one_direct_pipeline ||
+        if (!g_dsv4_indexer_score_one_direct_pipeline || !g_dsv4_indexer_score_one_heads_pipeline ||
             !g_dsv4_compressor_store_one_pipeline ||
             !g_dsv4_sort_i32_rows_asc_pipeline ||
             !g_dsv4_indexed_attention_heads8_pipeline ||
@@ -11704,6 +11707,7 @@ void ds4_gpu_cleanup(void) {
         g_dsv4_topk_mask_scatter_pipeline = nil;
         g_dsv4_indexer_weighted_sum_pipeline = nil;
         g_dsv4_indexer_score_one_direct_pipeline = nil;
+        g_dsv4_indexer_score_one_heads_pipeline = nil;
         g_dsv4_compressor_store_one_pipeline = nil;
         g_dsv4_sort_i32_rows_asc_pipeline = nil;
         g_dsv4_indexed_attention_heads8_pipeline = nil;
@@ -18757,9 +18761,12 @@ int ds4_gpu_indexer_score_one_tensor(
         }
 
         if (n_head == 64 && head_dim == 128) {
-            id<MTLComputePipelineState> direct_pipeline =
-                ds4_gpu_hot_pipeline(g_dsv4_indexer_score_one_direct_pipeline,
-                                        "kernel_dsv4_indexer_score_one_direct");
+            /* Single-host decode benefits from reducing all 64 heads at once.
+             * The four-head schedule is faster on the two-Mac RDMA path. */
+            const bool single = g_tp_split_world == 1;
+            id<MTLComputePipelineState> direct_pipeline = single ?
+                ds4_gpu_hot_pipeline(g_dsv4_indexer_score_one_heads_pipeline, "kernel_dsv4_indexer_score_one_heads") :
+                ds4_gpu_hot_pipeline(g_dsv4_indexer_score_one_direct_pipeline, "kernel_dsv4_indexer_score_one_direct");
             if (!direct_pipeline) return 0;
 
             ds4_gpu_dsv4_indexer_scores_fused_args args = {
@@ -18787,7 +18794,7 @@ int ds4_gpu_indexer_score_one_tensor(
             [enc setBuffer:wbuf offset:ds4_gpu_tensor_offset(weights) atIndex:2];
             [enc setBuffer:compbuf offset:ds4_gpu_tensor_offset(index_comp) atIndex:3];
             [enc setBuffer:scorebuf offset:ds4_gpu_tensor_offset(scores) atIndex:4];
-            [enc setThreadgroupMemoryLength:64u * sizeof(float) atIndex:0];
+            [enc setThreadgroupMemoryLength:(single ? 64u : 136u) * sizeof(float) atIndex:0];
             [enc dispatchThreadgroups:MTLSizeMake(n_comp, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
             ds4_gpu_end_compute_encoder(cb, enc);
