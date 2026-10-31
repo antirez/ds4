@@ -52385,7 +52385,7 @@ static bool glm_graph_mtp_step(
         uint32_t           pos,
         uint32_t           min_pos,
         int               *draft_out) {
-    if (!g || !model || !weights || !draft_out) return false;
+    if (!g || !model || !weights) return false;
     if (DS4_N_NEXTN_PREDICT == 0) return false;
     const uint32_t cache_cap = glm_graph_mtp_cache_cap(g);
     if (pos >= cache_cap || min_pos > pos) {
@@ -52587,6 +52587,9 @@ static bool glm_graph_mtp_step(
                                                      DS4_N_KV_LORA,
                                                      DS4_N_ROT,
                                                      glm_graph_compact_cache_is_f16()) != 0;
+    /* A catch-up call only publishes the KV row. The next real draft
+     * consumes that cache after the accepted target hidden state is loaded. */
+    if (!draft_out) goto finish;
     DS4_GLM_MTP_STAGE("qk_low");
     if (ok) ok = ds4_gpu_glm_qk_lowrank_typed_tensor(g->qk_low,
                                                      g->q,
@@ -52763,10 +52766,11 @@ static bool glm_graph_mtp_step(
                                       DS4_N_EMBD,
                                       DS4_N_VOCAB,
                                       g->output_norm);
+finish:
     DS4_GLM_MTP_STAGE("end");
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
-    if (ok) {
+    if (ok && draft_out) {
         ok = ds4_gpu_tensor_read(g->logits,
                                  0,
                                  g->mtp_logits_host,
@@ -52780,6 +52784,7 @@ static bool glm_graph_mtp_step(
         return false;
     }
 #undef DS4_GLM_MTP_STAGE
+    if (!draft_out) return true;
     int best = 0;
     float best_v = g->mtp_logits_host[0];
     for (uint32_t i = 1; i < DS4_N_VOCAB; i++) {
@@ -75502,13 +75507,13 @@ static int ds4_session_glm_spec_cycle_impl(
         n_committed = 2;
         /* s->logits already holds row1 (position pos+1) logits. */
         const int n2 = glm_session_logits_argmax(s->logits);
-        int dummy = -1, nd = -1;
+        int nd = -1;
         ds4_gpu_tensor *target_hidden = g->glm53 ? g->hc_cur : g->cur;
         const bool cu =
             ds4_gpu_tensor_write(target_hidden, 0, s->glm_mtp_hc,
                                  hc_row_bytes) != 0 &&
             glm_graph_mtp_step(g, &e->model, &e->weights, d, pos,
-                               s->glm_mtp_min_pos, &dummy) &&
+                               s->glm_mtp_min_pos, NULL) &&
             ds4_gpu_tensor_write(target_hidden,
                                  0,
                                  s->glm_mtp_hc + hc_row_values,
@@ -75573,8 +75578,7 @@ static int ds4_session_glm_spec_cycle_impl(
                                    &e->weights,
                                    next,
                                    pos + 1u,
-                                   s->glm_mtp_min_pos,
-                                   &nd)) {
+                                   s->glm_mtp_min_pos, &nd)) {
                 s->glm_mtp_draft = nd;
                 s->glm_mtp_parent = next;
                 s->glm_mtp_have = 1;
