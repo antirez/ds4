@@ -193,7 +193,7 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
             opt(fp, c, "--dspark-strict", "Load DSpark support but keep target-only decode.");
         } else if (tool == DS4_HELP_BENCH) {
             opt(fp, c, "--dspark", "Benchmark greedy DSpark using the support GGUF passed with --mtp-model.");
-            opt(fp, c, "--dspark-confidence F", "DSpark confidence pruning threshold 0..1.");
+            opt(fp, c, "--dspark-confidence F", "DSpark confidence pruning threshold 0..1 (Muse Metal default: 0.7).");
         }
         opt(fp, c, "--quality", "Prefer exact kernels where faster approximate paths exist.");
         opt(fp, c, "--warm-weights", "Touch resident weights at startup to reduce first-use stalls.");
@@ -381,6 +381,14 @@ static void print_kv_cache(FILE *fp, const help_colors *c) {
 }
 
 static void print_bench_specific(FILE *fp, const help_colors *c) {
+    title(fp, c, "Model And Runtime");
+    opt(fp, c, "-m, --model FILE", "Target model GGUF.");
+    opt(fp, c, "--mtp-model FILE", "Muse DSpark draft support GGUF.");
+    opt(fp, c, "--dspark", "Enable experimental Muse DSpark speculative decode.");
+    opt(fp, c, "--dspark-confidence F", "Muse DSpark confidence threshold, 0..1; implies --dspark.");
+    opt(fp, c, "--metal | --cpu", "Select the runtime backend.");
+    opt(fp, c, "--warm-weights", "Warm model weights before recording measurements.");
+    fputc('\n', fp);
     title(fp, c, "Benchmark Input");
     opt(fp, c, "--prompt-file FILE", "Raw benchmark text; token sequence is sliced at each frontier.");
     opt(fp, c, "--chat-prompt-file FILE", "Render FILE as one no-thinking chat user message.");

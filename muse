@@ -1,0 +1,103 @@
+#!/bin/bash
+# Portable Muse Spark launcher for the DwarfStar native terminal agent.
+set -u
+
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+    SOURCE_DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+    SOURCE="$(readlink "$SOURCE")"
+    case "$SOURCE" in
+        /*) ;;
+        *) SOURCE="$SOURCE_DIR/$SOURCE" ;;
+    esac
+done
+DS4_DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/ds4"
+CONFIG_FILE="$CONFIG_DIR/muse-model"
+
+usage() {
+    cat <<'EOF'
+Usage:
+  muse [ds4-agent options]
+  muse --install /path/to/Muse-Spark-Open-816B-A42B-UD-IQ2_XXS-00001-of-00006.gguf
+
+The one-time --install command saves the first GGUF shard path and creates
+~/bin/muse. Set MUSE_BIN_DIR to choose a different command directory.
+
+You can override the saved model with MUSE_MODEL=/path/to/model.gguf or the
+normal ds4-agent -m/--model option. CTX changes the default 16384-token context.
+EOF
+}
+
+if [ "${1:-}" = "--install" ]; then
+    if [ "$#" -ne 2 ]; then
+        usage >&2
+        exit 2
+    fi
+    MODEL_INPUT="$2"
+    if [ ! -f "$MODEL_INPUT" ]; then
+        echo "muse: model shard not found: $MODEL_INPUT" >&2
+        exit 1
+    fi
+    MODEL_DIR="$(cd -P "$(dirname "$MODEL_INPUT")" >/dev/null 2>&1 && pwd)"
+    MODEL_PATH="$MODEL_DIR/$(basename "$MODEL_INPUT")"
+    BIN_DIR="${MUSE_BIN_DIR:-$HOME/bin}"
+    mkdir -p "$CONFIG_DIR" "$BIN_DIR"
+    printf '%s\n' "$MODEL_PATH" > "$CONFIG_FILE"
+    ln -sfn "$DS4_DIR/muse" "$BIN_DIR/muse"
+    echo "Muse model saved in $CONFIG_FILE"
+    echo "Muse command installed at $BIN_DIR/muse"
+    case ":$PATH:" in
+        *":$BIN_DIR:"*) echo "Run: muse" ;;
+        *) echo "Add this to your shell profile, then open a new terminal:"
+           echo "  export PATH=\"$BIN_DIR:\$PATH\"" ;;
+    esac
+    exit 0
+fi
+
+if [ "${1:-}" = "--help-launcher" ]; then
+    usage
+    exit 0
+fi
+
+if [ ! -x "$DS4_DIR/ds4-agent" ]; then
+    echo "muse: $DS4_DIR/ds4-agent is not built" >&2
+    echo "Run: make -C \"$DS4_DIR\" -j8 ds4-agent" >&2
+    exit 1
+fi
+
+HAVE_MODEL_ARG=0
+PREV_MODEL_ARG=0
+for ARG in "$@"; do
+    if [ "$PREV_MODEL_ARG" -eq 1 ]; then
+        HAVE_MODEL_ARG=1
+        PREV_MODEL_ARG=0
+        continue
+    fi
+    case "$ARG" in
+        -m|--model) PREV_MODEL_ARG=1 ;;
+    esac
+done
+
+MODEL_ARGS=()
+if [ "$HAVE_MODEL_ARG" -eq 0 ]; then
+    MODEL_PATH="${MUSE_MODEL:-}"
+    if [ -z "$MODEL_PATH" ] && [ -f "$CONFIG_FILE" ]; then
+        IFS= read -r MODEL_PATH < "$CONFIG_FILE"
+    fi
+    if [ -z "$MODEL_PATH" ]; then
+        echo "muse: no model configured" >&2
+        echo "Run: $DS4_DIR/muse --install /path/to/Muse-Spark-Open-816B-A42B-UD-IQ2_XXS-00001-of-00006.gguf" >&2
+        exit 1
+    fi
+    if [ ! -f "$MODEL_PATH" ]; then
+        echo "muse: configured model shard not found: $MODEL_PATH" >&2
+        echo "Run --install again with its current location." >&2
+        exit 1
+    fi
+    MODEL_ARGS=(-m "$MODEL_PATH")
+fi
+
+PROJECT_DIR="$PWD"
+exec "$DS4_DIR/ds4-agent" --metal "${MODEL_ARGS[@]}" \
+    --ctx "${CTX:-16384}" --chdir "$PROJECT_DIR" "$@"

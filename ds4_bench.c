@@ -786,7 +786,10 @@ int main(int argc, char **argv) {
     const bool distributed =
         cfg.dist.role == DS4_DISTRIBUTED_COORDINATOR ||
         cfg.tp.role == DS4_TP_LEADER;
-    const bool speculative = cfg.dspark && ds4_engine_mtp_draft_tokens(engine) > 1;
+    const bool speculative =
+        (cfg.dspark && ds4_engine_mtp_draft_tokens(engine) > 1) ||
+        (!cfg.dspark && !cfg.teacher_forced_decode &&
+         ds4_engine_is_muse_spark(engine));
     if (cfg.dspark && !speculative) {
         fprintf(stderr, "ds4-bench: DSpark support model did not enable speculative decoding\n");
         if (out != stdout) fclose(out);
@@ -796,9 +799,18 @@ int main(int argc, char **argv) {
         return 1;
     }
     if (speculative) {
-        fprintf(stderr,
-                "ds4-bench: DSpark enabled with draft width %d; frontier restoration uses session snapshots\n",
-                ds4_engine_mtp_draft_tokens(engine));
+        if (cfg.dspark) {
+            if (ds4_engine_is_muse_spark(engine))
+                fprintf(stderr,
+                        "ds4-bench: Muse DSpark enabled (one-draft optimized default; checkpoint width %d)\n",
+                        ds4_engine_mtp_draft_tokens(engine));
+            else
+                fprintf(stderr,
+                        "ds4-bench: DSpark enabled with draft width %d; frontier restoration uses session snapshots\n",
+                        ds4_engine_mtp_draft_tokens(engine));
+        } else {
+            fprintf(stderr, "ds4-bench: Muse prompt lookup enabled\n");
+        }
     }
     ds4_session_snapshot snap = {0};
     const uint64_t snapshot_max_bytes = bench_snapshot_max_bytes();

@@ -914,9 +914,9 @@ static void test_attn_mm_keys(uint32_t T, uint32_t pos0, bool sparse, uint32_t k
     require_ok(gk && gv && gsel && gcnt && ds4_gpu_tensor_write(gk, 0, kc, kvn * 2) && ds4_gpu_tensor_write(gv, 0, vc, kvn * 2) &&
                ds4_gpu_tensor_write(gsel, 0, sel, (uint64_t)T * sel_stride * 4) && ds4_gpu_tensor_write(gcnt, 0, cnt, T * 4), "attn mm setup");
     setenv("DS4_QWEN4_NO_ATTN_MM", "1", 1);
-    require_ok(ds4_gpu_qwen4_attn_decode_tensor(go_ref, gq, ggate, gk, gv, gsel, gcnt, NULL, T, H, Hkv, D, pos0, sparse, sel_stride, 0.0625f), "attn reference");
+    require_ok(ds4_gpu_qwen4_attn_decode_tensor(go_ref, gq, ggate, gk, gv, gsel, gcnt, NULL, T, H, Hkv, D, pos0, sparse, sel_stride, 0.0625f, 0u), "attn reference");
     unsetenv("DS4_QWEN4_NO_ATTN_MM");
-    require_ok(ds4_gpu_qwen4_attn_decode_tensor(go_new, gq, ggate, gk, gv, gsel, gcnt, partial, T, H, Hkv, D, pos0, sparse, sel_stride, 0.0625f), "attn mm");
+    require_ok(ds4_gpu_qwen4_attn_decode_tensor(go_new, gq, ggate, gk, gv, gsel, gcnt, partial, T, H, Hkv, D, pos0, sparse, sel_stride, 0.0625f, 0u), "attn mm");
     float *ref = download(go_ref, qn), *got = download(go_new, qn);
     double worst = 0.0, scale = 0.0;
     for (uint64_t i = 0; i < qn; i++) {
@@ -1335,7 +1335,7 @@ static void test_attention(arena_t *a, uint32_t H, uint32_t Hkv, uint32_t D, uin
         }
         /* even positions exercise the key-split partials (main sets DS4_QWEN4_ATTN_SPLIT_KEYS=8) */
         require_ok(ds4_gpu_qwen4_attn_decode_tensor(vout, gq, ggate, gkc, gvc, gselt, gnsel, (pos % 2) ? NULL : gpart,
-                                                    1, H, Hkv, D, pos, sparse, sel_stride, scale), "attn decode");
+                                                    1, H, Hkv, D, pos, sparse, sel_stride, scale, 0u), "attn decode");
         ds4_gpu_tensor_free(vout); ds4_gpu_tensor_free(vik); ds4_gpu_tensor_free(viq);
         ds4_gpu_tensor_free(vv); ds4_gpu_tensor_free(vk); ds4_gpu_tensor_free(vqg);
     }
@@ -1460,7 +1460,7 @@ static void test_attention_rows(arena_t *a) {
             require_ok(ds4_gpu_qwen4_idx_expand_tensor(v[12], v[13], v[11], 1, k_blocks, ratio, pos, sel_stride), "rows: expand");
         }
         require_ok(ds4_gpu_qwen4_attn_decode_tensor(v[8], v[5], v[6], kc[0][r], vc[0][r], v[12], v[13], part1,
-                                                    1, H, Hkv, D, pos, sparse, sel_stride, scale), "rows: decode");
+                                                    1, H, Hkv, D, pos, sparse, sel_stride, scale, 0u), "rows: decode");
         for (int i = 0; i < 14; i++) ds4_gpu_tensor_free(v[i]);
     }
 
@@ -3131,7 +3131,7 @@ static int bench_hc_mix2(void *ud) { bench_ctx *c = ud; return ds4_gpu_qwen4_hc_
 static int bench_attn(void *ud) {
     bench_ctx *c = ud;
     return ds4_gpu_qwen4_attn_decode_tensor(c->t[6], c->t[7], c->t[7], c->t[8], c->t[9], NULL, NULL, c->n[1] ? c->t[10] : NULL,
-                                            1, 24, 2, 256, c->n[0], false, 0, 0.0625f);
+                                            1, 24, 2, 256, c->n[0], false, 0, 0.0625f, 0u);
 }
 static int bench_gdn_front(void *ud) {
     bench_ctx *c = ud;
@@ -3195,7 +3195,7 @@ static int bench_p_idx_select_1k(void *ud) { bench_ctx *c = ud; return ds4_gpu_q
 static int bench_p_attn_sparse(void *ud) {
     bench_ctx *c = ud;
     return ds4_gpu_qwen4_attn_decode_tensor(c->t[37], c->t[33], c->t[34], c->t[31], c->t[32], c->n[2] ? c->t[36] : c->t[35], c->t[38], NULL,
-                                            1024, 24, 2, 256, 262144 - 1024, true, 2052, 0.0625f);
+                                            1024, 24, 2, 256, 262144 - 1024, true, 2052, 0.0625f, 0u);
 }
 static int bench_p_gdn_r4(void *ud) { bench_ctx *c = ud; return ds4_gpu_qwen4_gdn_scan_tensor(c->t[15], c->t[1], c->t[11], c->t[13], c->t[14], 1024, 16, 48, 128, NULL, 0u, NULL, 0u); }
 static int bench_p_moe_mm(void *ud) {

@@ -3579,14 +3579,60 @@ int ds4_gpu_qwen4_idx_expand_tensor(
         ds4_gpu_tensor *sel_tokens, ds4_gpu_tensor *n_sel, const ds4_gpu_tensor *sel_blocks,
         uint32_t n_tokens, uint32_t n_sel_blocks, uint32_t ratio, uint32_t pos0, uint32_t sel_stride);
 /* part (optional, decode-sized batches): partial-softmax scratch of
- * ds4_gpu_qwen4_attn_part_floats() floats enabling key-split parallelism */
+ * ds4_gpu_qwen4_attn_part_floats() floats enabling key-split parallelism.
+ * filled_sel is how many selected-index entries hold keys (Muse's sliding
+ * window fills min(pos+1, window) of a window-sized buffer). 0 keeps the
+ * historical span, sel_stride or pos+tokens. */
 uint64_t ds4_gpu_qwen4_attn_part_floats(uint32_t n_tokens, uint32_t n_head, uint32_t head_dim);
 int ds4_gpu_qwen4_attn_decode_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *gate,
         const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache,
         const ds4_gpu_tensor *sel_tokens, const ds4_gpu_tensor *n_sel, ds4_gpu_tensor *part,
         uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim,
-        uint32_t pos0, bool use_sel, uint32_t sel_stride, float scale);
+        uint32_t pos0, bool use_sel, uint32_t sel_stride, float scale,
+        uint32_t filled_sel);
+/* Close the open batch compute encoder. The next dispatch opens another
+ * encoder in the same command buffer. Tracked buffers still fence a real
+ * read-after-write; independent encoders overlap. */
+void ds4_gpu_break_batch_encoder(void);
+int ds4_gpu_muse_attn_prep_tensor(
+        ds4_gpu_tensor *q_out, ds4_gpu_tensor *gate_out,
+        ds4_gpu_tensor *k_cache, ds4_gpu_tensor *v_cache,
+        const ds4_gpu_tensor *qproj, const ds4_gpu_tensor *kproj,
+        const ds4_gpu_tensor *vproj, const ds4_gpu_tensor *gateproj,
+        const void *model_map, uint64_t model_size,
+        uint64_t q_norm_offset, uint64_t k_norm_offset,
+        uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv,
+        uint32_t head_dim, uint32_t n_rot, uint32_t pos0,
+        uint32_t cache_cap, bool use_rope, float rope_base, float eps, float q_scale);
+int ds4_gpu_muse_sigmoid_mul_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const ds4_gpu_tensor *gate,
+        uint32_t n_tokens, uint32_t dim);
+int ds4_gpu_muse_residual_blend_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *a, const ds4_gpu_tensor *b,
+        const void *model_map, uint64_t model_size, uint64_t alpha_offset, uint64_t beta_offset,
+        uint32_t n_tokens, uint32_t dim);
+int ds4_gpu_muse_weight_mul_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint32_t n_tokens, uint32_t dim);
+int ds4_gpu_muse_weighted_rms_8192_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint32_t n_tokens, uint32_t dim, float eps);
+int ds4_gpu_muse_expert_finalize_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *part,
+        const ds4_gpu_tensor *route_weight,
+        const void *model_map, uint64_t model_size, uint64_t norm_weight_offset,
+        uint32_t n_tokens, uint32_t n_slots, uint32_t dim, float eps);
+int ds4_gpu_muse_router_topk_tensor(
+        ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, const ds4_gpu_tensor *logits,
+        const void *model_map, uint64_t model_size, uint64_t bias_offset,
+        uint32_t n_tokens, uint32_t n_expert, uint32_t n_used);
+int ds4_gpu_muse_swa_indices_tensor(
+        ds4_gpu_tensor *selected, ds4_gpu_tensor *counts,
+        uint32_t n_tokens, uint32_t pos0, uint32_t window, uint32_t stride);
+int ds4_gpu_muse_logits_tensor(ds4_gpu_tensor *logits, uint32_t count, float scale, float softcap);
 /* Routed experts; shared_type == UINT32_MAX disables the shared-expert slot,
  * otherwise mid/part carry n_slots+1 entries and the reduce weights the last
  * one by sigmoid(shared_gate). */

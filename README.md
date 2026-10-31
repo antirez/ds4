@@ -9,7 +9,8 @@ a small native inference engine optimized first for
 **DeepSeek V4 Flash** (including the experimental vision model),
 **DeepSeek V4.1 Flash** (Metal, and text inference on CUDA),
 and additionally **GLM 5.2 and 5.3**, **GLM 5.3 Flash** and
-**DeepSeek V4 PRO**, and **Qwen3.8 Flash Next** (Metal and CUDA). The code is self-contained and
+**DeepSeek V4 PRO**, **Qwen3.8 Flash Next** (Metal and CUDA), and experimental
+**Muse Spark Open** support on Metal. The code is self-contained and
 deliberately narrow, not a general GGUF runner: you need to use the
 GGUF files the project produces, that are part of the project
 itself.
@@ -176,6 +177,7 @@ in the CLI or `view_image` in the native agent.
 Qwen3.8's smaller Q2 release has **41.73 GiB** of main/MTP weights,
 with imatrix IQ2_XXS gate/up experts and padded Q2_K down projections.
 It is the starting option for 64 GB Macs.
+
 The GGUF also contains 95.37 GiB of original BF16 n-grams, read directly
 from disk rather than loaded into RAM. Keep it on a fast SSD. Start with 8K context:
 
@@ -189,6 +191,11 @@ Add `--mtp` for speculative decoding. The larger
 `qwen38-q4k` target is also available. Download the optional vision encoder
 with `./download_model.sh qwen38-vision` and pass it with `--vision`.
 See [Qwen setup](docs/QWEN38_FLASH_NEXT.md) for details.
+
+Muse Spark Open's UD-IQ2_XXS release runs resident on a 256 GB Apple Silicon
+Mac. See the [Muse Spark guide](docs/MUSE_SPARK.md) for setup, measured speed,
+the one-time `muse` command installer, current bottlenecks, and useful
+optimization targets.
 
 Speculative decoding is opt-in. GLM and Qwen use `--mtp`; V4 Flash DSpark needs a matching
 support GGUF. It can improve generation, but not every workload benefits.
@@ -250,6 +257,7 @@ DGX Spark results, comparison conditions, and benchmark commands.
 
 - [Models and vision](docs/MODELS.md): Flash, PRO, GLM, Qwen, and matching encoders.
 - [Qwen3.8 Flash Next](docs/QWEN38_FLASH_NEXT.md): model setup, MTP, vision, and validation.
+- [Muse Spark Open](docs/MUSE_SPARK.md): Metal setup, benchmarks, and optimization notes.
 - [SSD streaming](docs/SSD_STREAMING.md): run larger than RAM and size the cache.
 - [Inference across machines](docs/DISTRIBUTED.md): two-Mac TP/RDMA and layer pipelines.
 - [Speculative decoding](docs/SPECULATIVE_DECODING.md): DSpark, GLM and Qwen MTP, and sampling.

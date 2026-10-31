@@ -79,6 +79,7 @@ typedef struct {
     bool temperature_set;
     bool top_p_set;
     bool min_p_set;
+    bool think_mode_set;
     uint64_t seed;
     ds4_think_mode think_mode;
 } agent_generation_options;
@@ -366,6 +367,10 @@ typedef struct {
     agent_token_renderer *renderer;
     agent_dsml_parser *parser;
     agent_tool_syntax syntax;
+    bool muse;
+    char *muse_text;
+    size_t muse_text_len;
+    size_t muse_text_cap;
     agent_tool_visualizer viz;
     bool in_think;
     bool dsml_active;
@@ -410,6 +415,9 @@ static int agent_read_default_lines(agent_worker *w);
 static int agent_compact_reserve_tokens(agent_worker *w);
 
 static agent_tool_syntax agent_tool_syntax_for_engine(ds4_engine *engine) {
+    /* Muse currently uses its native recipient/message chat framing; the
+     * generic DSML parser is not its ATEM tool-call decoder. */
+    if (ds4_engine_is_muse_spark(engine)) return AGENT_TOOL_SYNTAX_DSML;
     if (ds4_engine_is_qwen4(engine)) return AGENT_TOOL_SYNTAX_QWEN;
     return ds4_engine_is_glm_dsa(engine) ? AGENT_TOOL_SYNTAX_GLM
          : ds4_engine_is_deepseek41(engine) ? AGENT_TOOL_SYNTAX_DSML41
@@ -867,12 +875,16 @@ static agent_config parse_options(int argc, char **argv) {
                 fprintf(stderr, "ds4-agent: --think-level requires an integer from 0 to 100\n");
                 exit(2);
             }
+            c.gen.think_mode_set = true;
         } else if (!strcmp(arg, "--think")) {
             c.gen.think_mode = DS4_THINK_HIGH;
+            c.gen.think_mode_set = true;
         } else if (!strcmp(arg, "--think-max")) {
             c.gen.think_mode = DS4_THINK_MAX;
+            c.gen.think_mode_set = true;
         } else if (!strcmp(arg, "--nothink")) {
             c.gen.think_mode = DS4_THINK_NONE;
+            c.gen.think_mode_set = true;
         } else if (!strcmp(arg, "--backend")) {
             c.engine.backend = parse_backend(need_arg(&i, argc, argv, arg));
         } else if (!strcmp(arg, "--metal")) {
@@ -1006,7 +1018,18 @@ static agent_config parse_options(int argc, char **argv) {
 static void agent_apply_model_sampling_defaults(
         ds4_engine               *engine,
         agent_generation_options *gen) {
-    if (!engine || !gen || !ds4_engine_is_glm_dsa(engine)) return;
+    if (!engine || !gen) return;
+
+    if (ds4_engine_is_muse_spark(engine)) {
+        /* Use the checkpoint's published sampling defaults. The native agent
+         * defaults Muse to low reasoning; explicit CLI choices still win. */
+        if (!gen->temperature_set) gen->temperature = 1.0f;
+        if (!gen->top_p_set) gen->top_p = 1.0f;
+        if (!gen->min_p_set) gen->min_p = 0.0f;
+        if (!gen->think_mode_set) gen->think_mode = DS4_THINK_LOW;
+        return;
+    }
+    if (!ds4_engine_is_glm_dsa(engine)) return;
 
     if (!gen->temperature_set) gen->temperature = 1.0f;
     if (!gen->top_p_set) gen->top_p = 0.95f;
@@ -1552,6 +1575,32 @@ static void agent_append_system_prompt(ds4_engine *engine, ds4_tokens *tokens,
      * the model's dedicated DSML token.  Do not apply that tokenizer to user
      * supplied -sys text: arbitrary user text containing <｜User｜>, <think>, or
      * ｜DSML｜ must remain plain content, not control tokens. */
+    if (ds4_engine_is_muse_spark(engine)) {
+        /* Muse has its own ATEM recipient protocol, which the generic agent's
+         * DSML tool prompt does not describe. Until the native agent has an
+         * ATEM dispatcher, keep this path a plain chat assistant. */
+        if (extra && !strcmp(extra,
+                "You are a helpful coding assistant running inside ds4-agent."))
+            extra = NULL;
+        const char *base =
+            "Match the amount of reasoning to the task. Keep straightforward "
+            "requests brief and reserve extended analysis for genuinely complex "
+            "tasks. Use recipient self only for private reasoning and recipient "
+            "user for the final answer. For direct requests, provide the requested "
+            "result without narrating your plan or asking avoidable clarification "
+            "questions.";
+        if (extra && extra[0]) {
+            size_t n = strlen(base) + strlen(extra) + 3;
+            char *combined = xmalloc(n);
+            snprintf(combined, n, "%s\n\n%s", base, extra);
+            ds4_chat_append_message(engine, tokens, "system", combined);
+            free(combined);
+        } else {
+            ds4_chat_append_message(engine, tokens, "system", base);
+        }
+        return;
+    }
+
     char *tools_prompt = agent_build_tools_prompt(engine, edit_upto);
     if (agent_syntax_is_xml_tool_call(agent_tool_syntax_for_engine(engine)))
         ds4_chat_append_message(engine, tokens, "system", tools_prompt);
@@ -1610,7 +1659,9 @@ static void agent_worker_maybe_append_system_prompt_reminder(agent_worker *w) {
     agent_publish_system_status(w, "Re-injecting system prompt reminder...");
     agent_trace(w, "system prompt reminder injected at transcript=%d",
                 w->transcript.len);
-    if (agent_syntax_is_xml_tool_call(agent_tool_syntax_for_engine(w->engine))) {
+    if (ds4_engine_is_muse_spark(w->engine)) {
+        ds4_chat_append_message(w->engine, &w->transcript, "system", reminder);
+    } else if (agent_syntax_is_xml_tool_call(agent_tool_syntax_for_engine(w->engine))) {
         ds4_chat_append_message(w->engine, &w->transcript, "system", reminder);
     } else {
         ds4_tokenize_rendered_chat(w->engine, reminder, &w->transcript);
@@ -4434,6 +4485,43 @@ static void agent_stream_normal_byte(agent_stream_renderer *sr, char c) {
  * from parser state changes.  The sampled transcript remains unchanged: only
  * the terminal projection is rewritten. */
 static void agent_stream_text(agent_stream_renderer *sr, const char *text, size_t len, bool finish) {
+    if (sr->muse) {
+        if (len) {
+            if (sr->muse_text_len + len + 1 > sr->muse_text_cap) {
+                size_t cap = sr->muse_text_cap ? sr->muse_text_cap * 2 : 4096;
+                while (cap < sr->muse_text_len + len + 1) cap *= 2;
+                sr->muse_text = xrealloc(sr->muse_text, cap);
+                sr->muse_text_cap = cap;
+            }
+            memcpy(sr->muse_text + sr->muse_text_len, text, len);
+            sr->muse_text_len += len;
+            sr->muse_text[sr->muse_text_len] = '\0';
+        }
+        static const char user_marker[] = "to=user<|message|>";
+        const char *answer = sr->muse_text ? strstr(sr->muse_text, user_marker) : NULL;
+        if (answer) {
+            answer += sizeof(user_marker) - 1;
+            const size_t answer_len = sr->muse_text_len -
+                (size_t)(answer - sr->muse_text);
+            char *visible = xmalloc(answer_len ? answer_len : 1);
+            if (answer_len) memcpy(visible, answer, answer_len);
+            free(sr->muse_text);
+            sr->muse_text = NULL;
+            sr->muse_text_len = sr->muse_text_cap = 0;
+            sr->muse = false;
+            agent_stream_text(sr, visible, answer_len, finish);
+            free(visible);
+        } else if (finish) {
+            static const char notice[] =
+                "[Muse finished without a user-visible reply.]\n";
+            renderer_write(sr->renderer, notice, sizeof(notice) - 1);
+            free(sr->muse_text);
+            sr->muse_text = NULL;
+            sr->muse_text_len = sr->muse_text_cap = 0;
+        }
+        return;
+    }
+
     const char *think_open = "<think>";
     const char *think_close = "</think>";
     size_t total = sr->pending_len + len;
@@ -10225,6 +10313,60 @@ static int worker_force_generated_text(agent_worker *w,
     return 0;
 }
 
+/* Muse normally closes its private assistant message on its own. Keep a
+ * generous fallback so a bad sample cannot spend the whole turn planning
+ * without ever opening a user-visible answer. */
+#define AGENT_MUSE_REASONING_TOKEN_BUDGET 256
+
+static bool agent_muse_reasoning_budget_exhausted(
+        const agent_stream_renderer *stream, int generated) {
+    if (!stream || !stream->muse || !stream->muse_text) return false;
+    static const char self_marker[] = "to=self<|message|>";
+    static const char user_marker[] = "to=user<|message|>";
+    if (!strstr(stream->muse_text, self_marker) ||
+        strstr(stream->muse_text, user_marker)) return false;
+    /* The route and message marker currently take three generated tokens. */
+    return generated >= AGENT_MUSE_REASONING_TOKEN_BUDGET + 3;
+}
+
+static int worker_force_muse_user_route(agent_worker *w,
+                                        int assistant_start,
+                                        int max_tokens,
+                                        int *generated,
+                                        double t0,
+                                        agent_stream_renderer *stream,
+                                        char *err,
+                                        size_t err_len) {
+    ds4_tokens route = {0};
+    ds4_tokenize_rendered_chat(w->engine,
+        "<|start|>assistant to=user<|message|>", &route);
+    if (route.len > max_tokens - *generated) {
+        snprintf(err, err_len, "not enough generation room for Muse final message");
+        ds4_tokens_free(&route);
+        return 1;
+    }
+    /* Discard the private assistant message before starting the user-facing
+     * answer. Leaving it in context makes this low-bit checkpoint continue
+     * narrating its plan after the forced recipient change. */
+    if (agent_worker_rewind(w, assistant_start, err, err_len) != 0) {
+        ds4_tokens_free(&route);
+        return 1;
+    }
+    w->transcript.len = assistant_start;
+    agent_trace(w,
+                "Muse private reasoning reached %d-token budget; discarded it and routing cleanly to user",
+                AGENT_MUSE_REASONING_TOKEN_BUDGET);
+    for (int i = 0; i < route.len; i++) {
+        if (worker_accept_generated_token(w, route.v[i], generated, t0,
+                                          stream, err, err_len) != 0) {
+            ds4_tokens_free(&route);
+            return 1;
+        }
+    }
+    ds4_tokens_free(&route);
+    return 0;
+}
+
 /* ============================================================================
  * Model Worker Thread
  * ============================================================================
@@ -10457,6 +10599,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             .renderer = &renderer,
             .parser = &dsml,
             .syntax = tool_syntax,
+            .muse = ds4_engine_is_muse_spark(w->engine),
             .in_think = in_think,
         };
         agent_edit_upto_forcer upto_forcer = {0};
@@ -10579,6 +10722,22 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 if (next_greedy != status_greedy_sampling) {
                     worker_set_greedy_sampling(w, next_greedy);
                     status_greedy_sampling = next_greedy;
+                }
+
+                if (agent_muse_reasoning_budget_exhausted(&stream, generated)) {
+                    if ((ti + 1 < ntok &&
+                         agent_worker_rewind(w, block_start + ti + 1,
+                                             err, sizeof(err)) != 0) ||
+                        worker_force_muse_user_route(w, assistant_start,
+                                                     max_tokens, &generated,
+                                                     t0, &stream,
+                                                     err, sizeof(err)) != 0) {
+                        agent_dsml_parser_free(&dsml);
+                        agent_set_error(w, err);
+                        return 1;
+                    }
+                    restart_sampling = true;
+                    break;
                 }
 
                 if (dsml.state == AGENT_DSML_DONE) {
