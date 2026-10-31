@@ -55569,7 +55569,12 @@ static bool glm_graph_forward_indexed_tokens(
                                 selected_view,
                                 slice,
                                 last_indexer_selected_count,
+#ifdef __APPLE__
+                                /* Only the live legacy rows need their RoPE rotation. */
+                                g->glm53 ? g->compact_cache_cap : n_rows,
+#else
                                 g->compact_cache_cap,
+#endif
                                 glm_graph_compact_cache_is_f16(),
                                 DS4_N_HEAD,
                                 DS4_N_KV_LORA,

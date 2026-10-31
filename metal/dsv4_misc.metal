@@ -4210,7 +4210,25 @@ kernel void kernel_glm_attention_indexed_batch_group2(
     }
 }
 
-template <bool assume_valid_rows, bool assume_valid_heads>
+/* Sparse queries reuse the same compact RoPE rows across tokens and heads. */
+kernel void kernel_glm_prepare_indexed_rope(
+        constant ds4_metal_args_glm_attention_indexed_batch &args,
+        device const char *rope,
+        device float2 *rotated,
+        uint idx [[thread_position_in_grid]]) {
+    const uint row = idx / 32u;
+    if (row >= args.cache_cap) return;
+    const uint r = 2u * (idx % 32u);
+    float corr_dims[2] = {0.0f, 0.0f};
+    if (args.qk_rope != 0u && args.ext_factor != 0.0f)
+        glm_rope_yarn_corr_dims((int)args.qk_rope, (int)args.n_ctx_orig,
+                args.freq_base, args.beta_fast, args.beta_slow, corr_dims);
+    rotated[idx] = glm_cache_load_rotated_rope_pair_f16_only(rope,
+            (uint64_t)row * args.qk_rope, r, row, args.qk_rope, args.freq_base,
+            args.freq_scale, args.ext_factor, args.attn_factor, corr_dims[0], corr_dims[1]);
+}
+
+template <bool assume_valid_rows, bool assume_valid_heads, bool rotated = false>
 static inline void glm_attention_indexed_batch_lora_group8_vec_body(
         constant ds4_metal_args_glm_attention_indexed_batch & args,
         device const char *q,
@@ -4318,7 +4336,9 @@ static inline void glm_attention_indexed_batch_lora_group8_vec_body(
             const uint r = vv * 4u;
             const uint row = token_selected[base + rr];
             const bool valid_row = assume_valid_rows || row < args.cache_cap;
-            if (valid_row) {
+            if (rotated) {
+                rope_shared[off] = ((device const float4 *)k_rope_cache)[(uint64_t)row * 16u + vv];
+            } else if (valid_row) {
                 const uint64_t rope_base = (uint64_t)row * args.qk_rope;
                 const float2 y0 =
                     glm_cache_load_rotated_rope_pair_f16_only(k_rope_cache,
@@ -4397,7 +4417,7 @@ static inline void glm_attention_indexed_batch_lora_group8_vec_body(
     }
 }
 
-template <bool assume_valid_rows, bool assume_valid_heads, bool check_prefix = false>
+template <bool assume_valid_rows, bool assume_valid_heads, bool check_prefix = false, bool rotated = false>
 kernel void kernel_glm_attention_indexed_batch_lora_group8_vec_impl(
         constant ds4_metal_args_glm_attention_indexed_batch & args,
         device const char *q,
@@ -4432,7 +4452,7 @@ kernel void kernel_glm_attention_indexed_batch_lora_group8_vec_impl(
             return;
         }
     }
-    glm_attention_indexed_batch_lora_group8_vec_body<assume_valid_rows, assume_valid_heads>(
+    glm_attention_indexed_batch_lora_group8_vec_body<assume_valid_rows, assume_valid_heads, rotated>(
         args, q, qk_low, kv_lora_cache, k_rope_cache, selected, lora_out,
         scratch, tgpig, tid_u, lane_u, sg_u, active_rows);
 }
@@ -4451,6 +4471,10 @@ kernel_glm_attention_indexed_batch_lora_group8_vec_impl<true, false>;
 template [[host_name("kernel_glm_attention_indexed_batch_lora_group8_vec_valid_fullheads")]]
 kernel glm_attention_indexed_batch_lora_group8_vec_t
 kernel_glm_attention_indexed_batch_lora_group8_vec_impl<true, true>;
+
+template [[host_name("kernel_glm_attention_indexed_batch_lora_group8_vec_valid_rotated")]]
+kernel glm_attention_indexed_batch_lora_group8_vec_t
+kernel_glm_attention_indexed_batch_lora_group8_vec_impl<true, true, false, true>;
 
 template [[host_name("kernel_glm_attention_indexed_batch_lora_group8_vec_prefix_fullheads")]]
 kernel glm_attention_indexed_batch_lora_group8_vec_t

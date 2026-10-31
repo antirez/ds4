@@ -667,6 +667,8 @@ static id<MTLBuffer> g_flash_attn_tmp_buffer;
 static id<MTLBuffer> g_flash_attn_blk_buffer;
 static id<MTLBuffer> g_flash_attn_ring_buffer;
 static id<MTLBuffer> g_flash_attn_kv_buffer;
+static id<MTLBuffer> g_glm_indexed_rope_buffer;
+static NSUInteger g_glm_indexed_rope_bytes;
 static id<MTLBuffer> g_glm_flash_attn_mask_buffer;
 static id<MTLBuffer> g_compressor_pool_kv_buffer;
 static id<MTLBuffer> g_compressor_pool_score_buffer;
@@ -11803,6 +11805,8 @@ void ds4_gpu_cleanup(void) {
         ds4_gpu_clear_zero_prefix_prefill_mask_cache();
         g_flash_attn_ring_buffer = nil;
         g_flash_attn_kv_buffer = nil;
+        g_glm_indexed_rope_buffer = nil;
+        g_glm_indexed_rope_bytes = 0;
         g_glm_flash_attn_mask_buffer = nil;
         g_compressor_pool_kv_buffer = nil;
         g_compressor_pool_score_buffer = nil;
@@ -37792,8 +37796,23 @@ static int ds4_gpu_glm_attention_indexed_batch_lora_layout_tensor(
             cache_f16 && kv_lora_dim == 512u &&
             (qk_rope == 0u || qk_rope == 64u);
         const bool full_head_groups = (n_head % 8u) == 0u;
+        id<MTLComputePipelineState> prepare = nil;
+        id<MTLComputePipelineState> rotated = nil;
+        if (selected_rows_valid && full_head_groups && use_vec_lora && qk_rope == 64u &&
+            ext_factor == 0.0f && !g_tp_attn_head_split && !g_batch_encoder_concurrent &&
+            n_tokens >= 64u && n_selected >= 64u && cache_cap <= 65536u &&
+            cache_cap <= (uint64_t)n_tokens * n_selected &&
+            !getenv("DS4_METAL_DISABLE_GLM_PREFILL_ROPE_REUSE")) {
+            prepare = ds4_gpu_get_pipeline("kernel_glm_prepare_indexed_rope");
+            rotated = ds4_gpu_get_pipeline("kernel_glm_attention_indexed_batch_lora_group8_vec_valid_rotated");
+            if (!prepare || !rotated || !ds4_gpu_ensure_scratch_buffer(&g_glm_indexed_rope_buffer,
+                    &g_glm_indexed_rope_bytes, (NSUInteger)cache_cap * 64u * sizeof(float),
+                    "glm_indexed_rope")) rotated = nil;
+        }
         id<MTLComputePipelineState> pipeline = nil;
-        if (use_vec_lora && selected_rows_valid && full_head_groups) {
+        if (rotated) {
+            pipeline = rotated;
+        } else if (use_vec_lora && selected_rows_valid && full_head_groups) {
             pipeline = ds4_gpu_hot_pipeline(
                     g_glm_attention_indexed_batch_lora_group8_vec_valid_fullheads_pipeline,
                     "kernel_glm_attention_indexed_batch_lora_group8_vec_valid_fullheads");
@@ -37851,12 +37870,21 @@ static int ds4_gpu_glm_attention_indexed_batch_lora_layout_tensor(
              8u * (NSUInteger)kv_lora_dim * sizeof(float));
 
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        if (rotated) {
+            [enc setComputePipelineState:prepare];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            [enc setBuffer:ropecachebuf offset:ds4_gpu_tensor_offset(k_rope_cache) atIndex:1];
+            [enc setBuffer:g_glm_indexed_rope_buffer offset:0 atIndex:2];
+            [enc dispatchThreads:MTLSizeMake((NSUInteger)cache_cap * 32u, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        }
         [enc setComputePipelineState:pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:qbuf offset:ds4_gpu_tensor_offset(q) atIndex:1];
         [enc setBuffer:lowbuf offset:ds4_gpu_tensor_offset(qk_low) atIndex:2];
         [enc setBuffer:kvcachebuf offset:ds4_gpu_tensor_offset(kv_lora_cache) atIndex:3];
-        [enc setBuffer:ropecachebuf offset:ds4_gpu_tensor_offset(k_rope_cache) atIndex:4];
+        [enc setBuffer:(rotated ? g_glm_indexed_rope_buffer : ropecachebuf)
+                offset:(rotated ? 0 : ds4_gpu_tensor_offset(k_rope_cache)) atIndex:4];
         if (use_vec_lora) {
             [enc setBuffer:selectedbuf offset:ds4_gpu_tensor_offset(selected) atIndex:5];
             [enc setBuffer:lorabuf offset:ds4_gpu_tensor_offset(lora_out) atIndex:6];

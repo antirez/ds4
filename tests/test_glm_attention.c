@@ -309,6 +309,42 @@ static void metal_prefill_prefix_case(uint32_t heads, uint32_t count, uint32_t r
 }
 #endif
 
+#ifdef __APPLE__
+/* Compare cached RoPE rotations with the original fused rotation on the same
+ * Metal device. Changing constant folding in the rotation can move low bits. */
+static void selected_rope_prefill_case(void) {
+    enum { T = 67, H = 8, D = 512, R = 64, N = 192, CAP = 257, K = 65 };
+    const size_t n = (size_t)T * H * D;
+    float *data = malloc(n * sizeof(*data));
+    float *reference = malloc(n * sizeof(*reference));
+    int32_t ids[T * K];
+    check(data && reference, "RoPE fixture allocation");
+    for (size_t i = 0; i < n; i++)
+        data[i] = ((int)(i % 127u) - 63) / 64.0f;
+    for (size_t i = 0; i < T * K; i++) ids[i] = (int32_t)((37u * i) % CAP);
+    ds4_gpu_tensor *q = upload(data, (size_t)T * H * (N + R) * sizeof(float));
+    ds4_gpu_tensor *low = upload(data, n * sizeof(float));
+    ds4_gpu_tensor *kv = upload_cache(data, CAP * D, true);
+    ds4_gpu_tensor *rope = upload_cache(data, CAP * R, true);
+    ds4_gpu_tensor *sel = upload(ids, sizeof(ids));
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(n * sizeof(float));
+    check(out != NULL, "RoPE output allocation");
+    for (uint32_t pass = 0; pass < 2; pass++) {
+        if (!pass) setenv("DS4_METAL_DISABLE_GLM_PREFILL_ROPE_REUSE", "1", 1);
+        else unsetenv("DS4_METAL_DISABLE_GLM_PREFILL_ROPE_REUSE");
+        check(ds4_gpu_glm_attention_indexed_batch_lora_valid_tensor(
+                  out, q, low, kv, rope, sel, T, K, CAP, true, H, D, N, R,
+                  0, 8000000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f) &&
+              ds4_gpu_tensor_read(out, 0, pass ? data : reference, n * sizeof(float)),
+              "selected RoPE prefill");
+    }
+    check(!memcmp(data, reference, n * sizeof(float)), "exact selected RoPE prefill");
+    ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(sel); ds4_gpu_tensor_free(rope);
+    ds4_gpu_tensor_free(kv); ds4_gpu_tensor_free(low); ds4_gpu_tensor_free(q);
+    free(reference); free(data);
+}
+#endif
+
 static void pooled_decode_cases(void) {
 #ifdef __APPLE__
     enum { D = 512, H = 8, V = 4, R = 64, C = 2056, S = 2051, B = 17,
@@ -552,6 +588,9 @@ int main(int argc, char **argv) {
         }
         reduction_cases();
         pooled_decode_cases();
+#ifdef __APPLE__
+        selected_rope_prefill_case();
+#endif
     }
     return 0;
 }
