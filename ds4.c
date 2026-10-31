@@ -59865,18 +59865,32 @@ static bool qwen4_graph_stage_embeddings(ds4_qwen4_gpu_graph *g, const ds4_model
     const ds4_vision_span *spans = g->vis_spans;
     size_t n_spans = g->vis_span_count;
     if (!spans) spans = qwen4_fake_spans(&n_spans);
+    /* The routing and block-output workspaces are idle until the first layer.
+     * Gather text embeddings once on the device, then expand the HC rows there. */
+#ifdef DS4_ROCM_BUILD
+    const bool device_rows = false;
+#else
+    const bool device_rows = T >= 128u && !n_spans && w->token_embd->type == DS4_TENSOR_BF16;
+#endif
+    if (device_rows &&
+        (!ds4_gpu_tensor_write(g->selected, 0, tokens, (uint64_t)T * sizeof(int32_t)) ||
+         !ds4_gpu_glm53_embedding_bf16(g->blk, m->map, m->size, w->token_embd->abs_offset,
+                                       g->selected, T, E, DS4_N_VOCAB) ||
+         !ds4_gpu_repeat_hc_rows_tensor(g->R, g->blk, T, E, hc))) return false;
     for (uint32_t t = 0; t < T; t++) {
-        float *dst = row + (uint64_t)t * hc_dim;
-        const float *img = n_spans ? qwen4_span_row(spans, n_spans, g->pos + t) : NULL;
-        if (img) memcpy(dst, img, E * sizeof(float));
-        else qwen4_ref_row(m, w->token_embd, (uint64_t)tokens[t], dst);
-        for (uint32_t s = 1; s < hc; s++) memcpy(dst + (uint64_t)s * E, dst, E * sizeof(float));
+        if (!device_rows) {
+            float *dst = row + (uint64_t)t * hc_dim;
+            const float *img = n_spans ? qwen4_span_row(spans, n_spans, g->pos + t) : NULL;
+            if (img) memcpy(dst, img, E * sizeof(float));
+            else qwen4_ref_row(m, w->token_embd, (uint64_t)tokens[t], dst);
+            for (uint32_t s = 1; s < hc; s++) memcpy(dst + (uint64_t)s * E, dst, E * sizeof(float));
+        }
         qwen4_mrope_pos(spans, n_spans, g->pos + t, &g->mrope_delta, g->host_pos3 + (uint64_t)t * 4u);
         g->host_pos3[(uint64_t)t * 4u + 3u] = 0;
         if (t == 0 && g->snap_after_first) g->snap_mrope_delta = g->mrope_delta;
         if (t == 1u && g->snap_after_second) g->snap2_mrope_delta = g->mrope_delta;
     }
-    return ds4_gpu_tensor_write(g->R, 0, row, (uint64_t)T * hc_dim * sizeof(float)) &&
+    return (device_rows || ds4_gpu_tensor_write(g->R, 0, row, (uint64_t)T * hc_dim * sizeof(float))) &&
            ds4_gpu_tensor_write(g->pos3, (uint64_t)g->pos * 16u, g->host_pos3, (uint64_t)T * 16u);
 }
 
