@@ -42214,7 +42214,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
 #ifdef __APPLE__
     /* Only a single-token layer sweep owns layer 20's block IDs until the
      * last reindex. Interleaved prefill and verifier rows share that scratch. */
-    g->score_selected_blocks = !g->streaming && g->tp_world == 1 &&
+    g->score_selected_blocks = g->tp_world == 1 &&
         !getenv("DS4_V41_DISABLE_CANDIDATE_SCORING") &&
         !getenv("DS4_METAL_DISABLE_V41_SCORE_ROWS4");
 #endif
