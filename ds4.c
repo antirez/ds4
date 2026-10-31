@@ -2393,6 +2393,7 @@ typedef struct ds4_model {
     const uint8_t *map;
     uint64_t size;       /* Addressable weights, excluding disk-only n-grams. */
     uint64_t file_size;
+    bool non_routed_weights_locked;
 
     uint32_t version;
     uint64_t n_kv;
@@ -21221,11 +21222,21 @@ static bool metal_graph_stream_prefill_layer_pagein_start(
 
     const uint32_t n_threads =
         metal_graph_stream_prefill_layer_pagein_threads();
-    ds4_model_map_span_vec spans;
-    const bool spans_ok = decode_only ?
-        weights_model_map_decode_layer_spans(weights, il, &spans) :
-        weights_model_map_spans(weights, il, il, false, &spans);
-    if (!spans_ok) return false;
+    ds4_model_map_span_vec spans = {0};
+    if (model->non_routed_weights_locked && pread_only && !decode_only &&
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
+        /* The engine has already wired the static tensors of every layer.
+         * Only the routed matrices can incur a page fault during this sweep. */
+        const ds4_layer_weights *l = &weights->layer[il];
+        model_map_span_vec_include_one(&spans, l->ffn_gate_exps);
+        model_map_span_vec_include_one(&spans, l->ffn_up_exps);
+        model_map_span_vec_include_one(&spans, l->ffn_down_exps);
+        if (!spans.len) return true;
+        if (!model_map_span_vec_finish(&spans)) { free(spans.v); return false; }
+    } else if (!(decode_only ? weights_model_map_decode_layer_spans(weights, il, &spans) :
+                               weights_model_map_spans(weights, il, il, false, &spans))) {
+        return false;
+    }
     metal_graph_stream_pagein_range *ranges =
         xmalloc((size_t)spans.len * n_threads * sizeof(ranges[0]));
     uint32_t n_ranges = 0;
@@ -72962,6 +72973,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
                         off += len;
                     }
                 }
+                e->model.non_routed_weights_locked = locked != 0 && failed == 0;
                 fprintf(stderr, "ds4: Metal SSD static weights locked %.2f GiB"
                         "; pageable %.2f GiB\n", locked / 1073741824.0,
                         failed / 1073741824.0);
