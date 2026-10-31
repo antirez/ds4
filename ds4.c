@@ -42663,7 +42663,15 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
     const bool batch_core = batch_attention && !getenv("DS4_METAL_DISABLE_V41_BATCH_CORE");
     const bool batch_hc = batch_attention && batch_moe &&
         !getenv("DS4_METAL_DISABLE_V41_BATCH_HC");
-    const bool decoder_suffix = wide && total_count >= 8192u &&
+    /* A medium single-host text sweep can discard complete decoder chunks
+     * without changing the batched attention and MoE partitions. */
+#ifdef DS4_ROCM_BUILD
+    const bool medium_suffix = false;
+#else
+    const bool medium_suffix = total_count >= 4096u && total_count < 8192u &&
+        g->tp_world == 1u && !g->dspark && !g->image_count && encoder_chunk >= 128u;
+#endif
+    const bool decoder_suffix = wide && (total_count >= 8192u || medium_suffix) &&
         !getenv("DS4_METAL_DISABLE_V41_DECODER_SUFFIX");
     if ((encoder_only || resume_encoder) && !decoder_suffix) return false;
     uint32_t (*ids)[2][DS4_ENGRAM_COLS] = g->prefill_ids;
@@ -42749,19 +42757,23 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
 #endif
         }
         const double t_map = profile ? now_sec() : 0;
-        uint32_t first = 0;
-        if (ok && decoder_suffix && il >= 20u) {
-            if (il == 20u)
-                ok = ds41_decoder_prepare(g, m, &w->layer[il], il, initial_start,
-                    0, total_count, true, batch_hc, batch_attention, cancel, cancel_ud);
-            const uint32_t needed = (g->dspark ? 128u : 1u) + (DS4_N_LAYER - 1u - il) * 127u;
-            first = total_count - needed;
-            if (ok) ok = ds41_decoder_prepare(g, m, &w->layer[il], il, initial_start,
-                first - 127u, 127u, false, batch_hc, batch_attention, cancel, cancel_ud);
-        }
         /* Keep the decoder suffix's established matrix partitions; unlike
          * the encoder, its shrinking tail is not aligned to large tiles. */
         const uint32_t chunk = wide && il >= 20u && encoder_chunk > 2048u ? 2048u : encoder_chunk;
+        uint32_t first = 0;
+        if (ok && decoder_suffix && il >= 20u) {
+            const uint32_t needed = (g->dspark ? 128u : 1u) + (DS4_N_LAYER - 1u - il) * 127u;
+            first = total_count - needed;
+            /* A medium sweep used the complete 2048-row partitions here.
+             * Retain that grid, and reconstruct the raw ring at its edge. */
+            if (medium_suffix) first -= first % chunk;
+            if (first && il == 20u)
+                ok = ds41_decoder_prepare(g, m, &w->layer[il], il, initial_start,
+                    0, total_count, true, batch_hc, batch_attention, cancel, cancel_ud);
+            const uint32_t warm = medium_suffix ? 128u : 127u;
+            if (ok && first) ok = ds41_decoder_prepare(g, m, &w->layer[il], il, initial_start,
+                first - warm, warm, false, batch_hc, batch_attention, cancel, cancel_ud);
+        }
         for (uint32_t off = first; ok && off < total_count; off += chunk) {
             if (cancel && cancel(cancel_ud)) { ok = false; break; }
             const uint32_t count = total_count - off < chunk ? total_count - off : chunk;

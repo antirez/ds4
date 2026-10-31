@@ -1255,7 +1255,7 @@ done:
     return rc;
 }
 
-static int check_decoder_suffix(const char *path, const char *prompt_path) {
+static int check_decoder_suffix(const char *path, const char *prompt_path, bool medium) {
     ds4_engine *engine = NULL;
     ds4_session *control = NULL, *candidate = NULL;
     ds4_tokens tokens = {0};
@@ -1266,8 +1266,10 @@ static int check_decoder_suffix(const char *path, const char *prompt_path) {
         .context_size = 18432, .power_percent = 100, .ssd_streaming = true,
         .ssd_streaming_cache_bytes = UINT64_C(64) << 30};
     /* Hold arithmetic fixed to isolate dependency pruning from GEMM tiling. */
-    setenv("DS4_METAL_DISABLE_V41_BATCH_MOE", "1", 1);
-    setenv("DS4_METAL_DISABLE_V41_BATCH_ATTN", "1", 1);
+    if (!medium) {
+        setenv("DS4_METAL_DISABLE_V41_BATCH_MOE", "1", 1);
+        setenv("DS4_METAL_DISABLE_V41_BATCH_ATTN", "1", 1);
+    }
     REQUIRE(imatrix_read_text_file(prompt_path, &prompt, &prompt_bytes));
     REQUIRE(ds4_engine_open(&engine, &opt) == 0);
     ds4_encode_chat_prompt(engine, NULL, prompt, DS4_THINK_NONE, &tokens);
@@ -1276,7 +1278,8 @@ static int check_decoder_suffix(const char *path, const char *prompt_path) {
     REQUIRE(ds4_session_create(&candidate, engine, 18432) == 0);
     ds41_gpu_graph *a = &control->ds41_graph, *b = &candidate->ds41_graph;
     for (uint32_t pass = 0; pass < 2; pass++) {
-        const uint32_t start = a->pos, count = 8192;
+        const uint32_t start = a->pos;
+        const uint32_t count = medium ? (pass ? 6144u : 4353u) : 8192u;
         setenv("DS4_METAL_DISABLE_V41_DECODER_SUFFIX", "1", 1);
         double t0 = now_sec();
         REQUIRE(ds41_graph_prefill(a, &engine->model, &engine->weights,
@@ -1994,7 +1997,9 @@ int main(int argc, char **argv) {
     if (argc == 4 && !strcmp(argv[2], "--chunk-prefill"))
         return check_wide_prefill(argv[1], argv[3], false, false, "DS4_METAL_DISABLE_V41_WIDE_CHUNK");
     if (argc == 4 && !strcmp(argv[2], "--decoder-suffix"))
-        return check_decoder_suffix(argv[1], argv[3]);
+        return check_decoder_suffix(argv[1], argv[3], false);
+    if (argc == 4 && !strcmp(argv[2], "--medium-decoder-suffix"))
+        return check_decoder_suffix(argv[1], argv[3], true);
     if (argc == 4 && !strcmp(argv[2], "--sweep-partitions"))
         return check_sweep_partitions(argv[1], argv[3]);
     if (argc == 4 && !strcmp(argv[2], "--deferred-decoder"))
