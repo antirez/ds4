@@ -108,6 +108,11 @@ int ds4_gpu_dsv41_indexer_scores_batch(ds4_gpu_tensor *scores,
                                      const ds4_gpu_tensor *keys,
                                      uint32_t source_rows, uint32_t rows,
                                      uint32_t start, uint32_t ratio);
+#ifndef __APPLE__
+int ds4_gpu_dsv41_indexer_scores_masked_one(ds4_gpu_tensor *scores,
+        const ds4_gpu_tensor *q, const ds4_gpu_tensor *weights, const ds4_gpu_tensor *keys,
+        const ds4_gpu_tensor *block_mask, uint32_t width);
+#endif
 int ds4_gpu_dsv41_tensor_ops_available(void);
 /* Reuse exact BF16 views of FP4 queries/keys across score tiles. Invalid
  * casts retain the F32 arithmetic for the affected tile. */

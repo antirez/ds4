@@ -733,6 +733,21 @@ static int check_indexer_batch(void) {
         CHECK(ds4_gpu_dsv41_quantize(qt, DIM, ROWS * HEADS, DS4_V41_FP4_E8M0));
         CHECK(ds4_gpu_dsv41_quantize(kt, DIM, KEYS, DS4_V41_FP4_E8M0));
         if (range == 2) { q[0] = 1.0001f; k[67u * DIM] = 1.0003f; }
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+        /* The fused rejection must leave the same original score slots,
+         * including a partial final block whether retained or rejected. */
+        float mask[(KEYS + 7u) / 8u];
+        for (size_t i = 0; i < sizeof(mask) / sizeof(mask[0]); i++)
+            mask[i] = (i + range) % 3u ? -INFINITY : 0.0f;
+        ds4_gpu_tensor *mt = upload(mask, sizeof(mask));
+        CHECK(mt && ds4_gpu_dsv41_indexer_scores_batch(reference, qt, wt, kt, KEYS, 1, KEYS - 1, 1));
+        CHECK(ds4_gpu_dsv41_candidate_filter(reference, mt, KEYS, 1, KEYS - 1, 1));
+        s[KEYS] = 12345;
+        CHECK(ds4_gpu_dsv41_indexer_scores_masked_one(st, qt, wt, kt, mt, KEYS));
+        CHECK(ds4_gpu_synchronize() && s[KEYS] == 12345);
+        CHECK(!memcmp(s, ds4_gpu_tensor_contents(reference), KEYS * sizeof(float)));
+        ds4_gpu_tensor_free(mt);
+#endif
         uint32_t *packed_guard = (uint32_t *)((char *)ds4_gpu_tensor_contents(pt) + packed_bytes);
         *packed_guard = 0xabcdef01;
         if (packed_available) CHECK(ds4_gpu_dsv41_indexer_pack(pt, qt, kt, KEYS, ROWS));

@@ -558,13 +558,14 @@ extern "C" int ds4_gpu_dsv41_gather_kv(ds4_gpu_tensor *out, const ds4_gpu_tensor
 
 /* A warp owns one score. Preserve the 128-lane reduction tree, but keep
  * all partials in registers instead of synchronizing a block per head. */
+template<bool masked>
 __global__ static void dsv41_index_scores_kernel(float *scores, const float *q,
-        const float *weights, const float *keys, uint32_t width,
+        const float *weights, const float *keys, const float *block_mask, uint32_t width,
         uint32_t start, uint32_t ratio) {
     const uint32_t key = blockIdx.x * 8u + threadIdx.x / 32u;
     const uint32_t row = blockIdx.y, lane = threadIdx.x & 31u;
     if (key >= width) return;
-    if (key >= (start + row + 1u) / ratio) {
+    if (key >= (start + row + 1u) / ratio || (masked && block_mask[blockIdx.x] != 0.0f)) {
         if (!lane) scores[(uint64_t)row * width + key] = -INFINITY;
         return;
     }
@@ -594,10 +595,26 @@ extern "C" int ds4_gpu_dsv41_indexer_scores_batch(ds4_gpu_tensor *scores,
         !dsv41_has_floats(keys, (uint64_t)source_rows * 128u)) return 0;
     /* FP4 with power-of-two scales can exceed FP16's exponent range.
      * Do not pass these already-quantized values through the GLM FP16 tile. */
-    dsv41_index_scores_kernel<<<dim3((source_rows + 7u) / 8u, rows), 256, 0, cuda_decode_stream()>>>(
+    dsv41_index_scores_kernel<false><<<dim3((source_rows + 7u) / 8u, rows), 256, 0, cuda_decode_stream()>>>(
         (float *)scores->ptr, (const float *)q->ptr, (const float *)weights->ptr,
-        (const float *)keys->ptr, source_rows, start, ratio);
+        (const float *)keys->ptr, NULL, source_rows, start, ratio);
     return cuda_ok(cudaGetLastError(), "V4.1 index scores");
+}
+
+/* Each CTA covers one eight-key V4.1 candidate block. The rejection
+ * sentinel and original key positions are exactly those of candidate_filter. */
+extern "C" int ds4_gpu_dsv41_indexer_scores_masked_one(ds4_gpu_tensor *scores,
+        const ds4_gpu_tensor *q, const ds4_gpu_tensor *weights, const ds4_gpu_tensor *keys,
+        const ds4_gpu_tensor *block_mask, uint32_t width) {
+    if (!width || width > INT32_MAX) return 0;
+    const uint32_t blocks = (width + 7u) / 8u;
+    if (!dsv41_has_floats(scores, width) || !dsv41_has_floats(q, 32u * 128u) ||
+        !dsv41_has_floats(weights, 32u) || !dsv41_has_floats(keys, (uint64_t)width * 128u) ||
+        !dsv41_has_floats(block_mask, blocks)) return 0;
+    dsv41_index_scores_kernel<true><<<blocks, 256, 0, cuda_decode_stream()>>>(
+        (float *)scores->ptr, (const float *)q->ptr, (const float *)weights->ptr,
+        (const float *)keys->ptr, (const float *)block_mask->ptr, width, width - 1u, 1u);
+    return cuda_ok(cudaGetLastError(), "V4.1 masked index scores");
 }
 
 extern "C" int ds4_gpu_dsv41_tensor_ops_available(void) { return 0; }

@@ -41532,6 +41532,17 @@ static bool ds41_attention_select_published(ds41_gpu_graph *g, const ds4_model *
         } else if (!ds4_gpu_glm_indexer_score_one_tensor(g->index_scores, g->index_q, g->index_weights,
                 g->index_cache[owner], n_comp, DS4_N_INDEXER_HEAD, 128, 1.0f / 64.0f, false)) return false;
 #else
+#ifndef DS4_ROCM_BUILD
+        /* The later reindex layers can skip rejected eight-key blocks.
+         * Keep the original full-width slots and the existing top-k order. */
+        if (il > 20u && n_comp > 2048u * 8u && ds4_gpu_device_is_spark() &&
+            !getenv("DS4_CUDA_DISABLE_V41_MASKED_SCORE")) {
+            return ds4_gpu_dsv41_indexer_scores_masked_one(g->index_scores, g->index_q,
+                g->index_weights, g->index_cache[owner], g->block_mask, n_comp) &&
+                ds4_gpu_indexer_topk_tensor(g->selected_comp, g->index_scores, n_comp, 1,
+                                            DS4_N_INDEXER_TOP_K);
+        }
+#endif
         if (!ds4_gpu_dsv41_indexer_scores_batch(g->index_scores, g->index_q, g->index_weights,
                 g->index_cache[owner], n_comp, 1, pos, ratio)) return false;
 #endif
