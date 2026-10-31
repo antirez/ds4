@@ -40961,6 +40961,7 @@ static uint32_t ds41_carry_cap(uint32_t ctx) {
     X(shared_gate, DS4_N_FF_EXP) X(shared_up, DS4_N_FF_EXP) \
     X(shared_mid, DS4_N_FF_EXP) X(shared, DS4_N_EMBD) \
     X(engram_rows, DS4_ENGRAM_COLS * DS4_ENGRAM_DIM) \
+    X(engram_rows_second, DS4_TP_BATCH_MAX_ROWS * DS4_ENGRAM_COLS * DS4_ENGRAM_DIM) \
     X(engram_prefetch, (g->carry_cap ? g->carry_cap : g->prefill_cap) * DS4_ENGRAM_COLS * DS4_ENGRAM_DIM) \
     X(engram_kv, (DS4_N_HC + 1u) * DS4_N_EMBD) X(logits, DS4_N_VOCAB)
 
@@ -40981,6 +40982,10 @@ typedef struct {
     uint32_t (*prefill_ids)[2][DS4_ENGRAM_COLS];
     ds4_engram_table table[2];
     ds4_engram_reader *engram_reader;
+    /* Queued single-token decode points this at the table's own input buffer
+     * while encoding an Engram layer; prefill row copies leave it NULL and use
+     * the row's view instead. */
+    ds4_gpu_tensor *engram_input;
     float rows[2][DS4_ENGRAM_COLS * DS4_ENGRAM_DIM];
     ds4_gpu_tensor *window[40];
     ds4_gpu_tensor *compressed[4], *index_cache[4];
@@ -41714,7 +41719,8 @@ static bool ds41_graph_before_attention(ds41_gpu_graph *g, const ds4_model *m,
                                        const ds4_layer_weights *l, uint32_t il) {
     if (ds41_engram_layer(il) && !ds41_image_at(g, g->pos)) {
         const uint32_t i = il == 1 ? 0 : 1;
-        if (!ds41_matmul(g->engram_kv, m, l->engram_kv, g->engram_rows, true) ||
+        ds4_gpu_tensor *input = g->engram_input ? g->engram_input : g->engram_rows;
+        if (!ds41_matmul(g->engram_kv, m, l->engram_kv, input, true) ||
             !ds4_gpu_dsv41_engram_add(g->residual, g->engram_kv,
                 g->engram_q_norm[i], g->engram_k_norm[i], NULL, DS4_N_EMBD, 1, DS4_RMS_EPS))
             return false;
@@ -42169,7 +42175,18 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
      * layer mapped, using the same admitted reserve as layer-major prefill. */
     const bool layer_resident = g->streaming && g->quality;
     if (layer_resident && !ds4_gpu_end_commands()) ok = false;
-    const bool queue_layers = g->tp_world == 2 && !g->imatrix &&
+    /* Single-host decode would pay a full wait per layer. Committing each
+     * layer's command buffer without waiting keeps the GPU queue fed while
+     * the CPU encodes the next layer; the final-layer drain bounds the queue
+     * and preserves the buffer hazards. The disable switch exists for A/B
+     * measurements only. */
+#ifdef __APPLE__
+    const bool queue_single = g->tp_world != 2 && !g->streaming && !g->imatrix &&
+        getenv("DS4_METAL_DISABLE_V41_DECODE_PIPELINE") == NULL;
+#else
+    const bool queue_single = false;
+#endif
+    const bool queue_layers = (g->tp_world == 2 || queue_single) && !g->imatrix &&
         !getenv("DS4_METAL_DISABLE_V41_TP_DECODE_QUEUE");
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &w->layer[il];
@@ -42177,8 +42194,14 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
             ok = metal_graph_stream_map_layer(m, w, il) && ds4_gpu_begin_commands();
         if (ok && ds41_engram_layer(il)) {
             const uint32_t i = il == 1 ? 0 : 1;
+            /* Each Engram table owns its input buffer. The second table's
+             * upload no longer overwrites storage that the first table's
+             * queued layers may still be reading, so the queue can run
+             * through layer 13 without a drain. */
+            ds4_gpu_tensor *input = i == 0 ? g->engram_rows : g->engram_rows_second;
+            g->engram_input = input;
             ok = (!overlap_engram || ds4_engram_reader_wait(g->engram_reader, i)) &&
-                ds4_gpu_tensor_write(g->engram_rows, 0, g->rows[i], sizeof(g->rows[i]));
+                ds4_gpu_tensor_write(input, 0, g->rows[i], sizeof(g->rows[i]));
         }
         if (ok) {
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
@@ -42187,11 +42210,20 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
             ok = ds41_graph_layer(g, m, l, il, token);
 #endif
         }
-        /* TP gates already submit ordered, bounded command buffers. Drain
-         * before overwriting the first Engram table's shared input at layer
-         * 14, and before publishing the completed token to the CPU. */
-        const bool drain = !queue_layers || il == 13 || il + 1u == DS4_N_LAYER;
-        if (drain && !ds4_gpu_end_commands()) ok = false;
+        /* Clear even on failure: a retry that falls back to row prefill must
+         * not inherit this decode-only pointer through row = *g. */
+        g->engram_input = NULL;
+        /* TP keeps its layer-13 drain: that path cannot be exercised on this
+         * machine, so it retains the scheduling it was validated with. The
+         * single-host queue only needs the final drain now that the Engram
+         * tables have separate input buffers. */
+        const bool drain = !queue_layers || (il == 13 && g->tp_world == 2) ||
+            il + 1u == DS4_N_LAYER;
+        if (drain) {
+            if (!ds4_gpu_end_commands()) ok = false;
+        } else if (queue_single && !ds4_gpu_flush_commands()) {
+            ok = false;
+        }
         if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
         if (ok && g->imatrix)
             ok = imatrix_collect_tensor_batch(g->imatrix, g->norm, g->mid,
@@ -42950,6 +42982,19 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
     if (!g) return false;
     const uint32_t rows = (uint32_t)count;
     const bool prefill_only = prefill_rows == rows && !g->verify_prefix;
+    /* Overlap CPU layer encoding with GPU execution for single-host batched
+     * decode. Each Engram table owns its row buffer, so the queue can run
+     * through layer 13 on single-host; TP keeps its layer-13 drain. SSD
+     * streaming is excluded from the per-layer flush because its cache is
+     * reconfigured per layer; ds4_gpu_routed_moe_batch_tensor already ends
+     * the command batch before that reconfiguration, so it does not need the
+     * layer-13 drain. Disable switch for A/B only. */
+#ifdef __APPLE__
+    const bool batch_queue = g->tp_world != 2 && !g->streaming &&
+        getenv("DS4_METAL_DISABLE_V41_BATCH_DECODE_PIPELINE") == NULL;
+#else
+    const bool batch_queue = false;
+#endif
     const bool shared_owner = g->tp_world == 2 &&
         !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER");
     ds41_prefill_row active = {0};
@@ -42967,6 +43012,12 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         (uint64_t)rows * (width) * sizeof(float))) != NULL;
     DS41_PREFILL_ROWS(DS41_SESSION_VIEW)
 #undef DS41_SESSION_VIEW
+    /* The second Engram table gets its own row buffer, as in single-token
+     * decode.  DS41_SCRATCH sizes this for DS4_TP_BATCH_MAX_ROWS rows; the
+     * prefill-capacity row storage would otherwise double every session's
+     * batch workspace. */
+    const uint64_t engram_row_bytes =
+        (uint64_t)DS4_ENGRAM_COLS * DS4_ENGRAM_DIM * sizeof(float);
     const uint64_t head_bytes = (uint64_t)(DS4_N_HEAD / g->tp_world) * DS4_N_HEAD_DIM * sizeof(float);
     for (int i = 0; ok && i < count; i++) {
         queries[i] = ds4_gpu_tensor_view(g->batch.q, (uint64_t)i * head_bytes, head_bytes);
@@ -42997,7 +43048,11 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
             const unsigned table = il == 1 ? 0 : 1;
             for (int i = 0; ok && i < count; i++) {
                 ds41_gpu_graph *s = graphs[i];
-                ok = ds4_gpu_tensor_write(g->rows_view[i].engram_rows, 0,
+                ds4_gpu_tensor *dst = table == 0 ? g->rows_view[i].engram_rows :
+                                                   g->engram_rows_second;
+                const uint64_t dst_off = table == 0 ? 0 :
+                    (uint64_t)i * engram_row_bytes;
+                ok = ds4_gpu_tensor_write(dst, dst_off,
                     engram && (uint32_t)i < prefill_rows ? engram[i][table] : s->rows[table],
                     sizeof(s->rows[table]));
             }
@@ -43005,8 +43060,13 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         for (int i = 0; ok && i < count; i++)
             ok = ds41_dspark_capture(graphs[i]->dspark, il, positions[i],
                 g->rows_view[i].residual, 1);
-        if (ok) ok = ds41_before_attention_batch(g, &active, model, l, il, rows) &&
-            ds41_attention_project_batch(g, model, l, rows);
+        if (ok) {
+            ds4_gpu_tensor *saved_engram = active.engram_rows;
+            if (il == 14) active.engram_rows = g->engram_rows_second;
+            ok = ds41_before_attention_batch(g, &active, model, l, il, rows);
+            active.engram_rows = saved_engram;
+            if (ok) ok = ds41_attention_project_batch(g, model, l, rows);
+        }
         bool batch_output = false;
 #ifndef DS4_ROCM_BUILD
         batch_output =
@@ -43044,8 +43104,12 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
             ds4_gpu_hc_expand_split_tensor(active.residual, active.block, active.after_attn,
                 active.ffn_split, DS4_N_EMBD, DS4_N_HC) &&
             ds4_gpu_dsv41_quantize(active.residual, DS4_N_EMBD * DS4_N_HC, rows, DS4_V41_BF16);
-        /* The second Engram upload reuses the first one's input storage. */
-        if (ok && il == 13) ok = ds4_gpu_end_commands() && ds4_gpu_begin_commands();
+        /* TP keeps its layer-13 drain.  Single-host batches use separate
+         * Engram row buffers, so the queue can continue without a drain. */
+        if (ok && il == 13 && g->tp_world == 2)
+            ok = ds4_gpu_end_commands() && ds4_gpu_begin_commands();
+        else if (ok && batch_queue && il + 1u < DS4_N_LAYER &&
+                 !ds4_gpu_flush_commands()) ok = false;
     }
     const uint64_t logits_bytes = (uint64_t)DS4_N_VOCAB * sizeof(float) /
                                   (g->tp_logits_half ? 2u : 1u);
