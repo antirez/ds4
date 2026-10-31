@@ -48194,10 +48194,12 @@ enum {
     QWEN4_K_ATTN_MERGE_WIDE_NPT4,
     QWEN4_K_ATTN_MM,
     QWEN4_K_MOE_MID,
+    QWEN4_K_MOE_MID_IQ2XXS,
     QWEN4_K_MOE_MID_Q4K,
     QWEN4_K_MOE_MID_Q4K_NR1,
     QWEN4_K_MOE_DOWN,
     QWEN4_K_MOE_DOWN_MXFP4_PF,
+    QWEN4_K_MOE_DOWN_REDUCE,
     QWEN4_K_MOE_MID_Q4K_GROUPED,
     QWEN4_K_MOE_DOWN_MXFP4_GROUPED,
     QWEN4_K_MOE_REDUCE,
@@ -48299,10 +48301,12 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_attn_merge_wide_npt4",
     "kernel_qwen4_attn_mm",
     "kernel_qwen4_moe_mid",
+    "kernel_qwen4_moe_mid_iq2xxs",
     "kernel_qwen4_moe_mid_q4k",
     "kernel_qwen4_moe_mid_q4k_nr1",
     "kernel_qwen4_moe_down",
     "kernel_qwen4_moe_down_mxfp4_pf",
+    "kernel_qwen4_moe_down_reduce",
     "kernel_qwen4_moe_mid_q4k_grouped",
     "kernel_qwen4_moe_down_mxfp4_grouped",
     "kernel_qwen4_moe_reduce",
@@ -48380,7 +48384,7 @@ static MTLSize qwen4_moe_mm_grid(uint32_t row_blocks, uint32_t n_expert, uint32_
 }
 
 static id<MTLComputePipelineState> g_qwen4_pipelines[QWEN4_K_COUNT];
-#define QWEN4_ATTN_NSG 4
+#define QWEN4_ATTN_NSG 6
 #define QWEN4_ATTN_MAX_SPLITS 64
 #define QWEN4_ATTN_ROWS_MAX 64     /* decode batch rows the attention rows kernels take */
 
@@ -48388,21 +48392,24 @@ typedef struct {
     uint32_t n_tokens, n_slots, in_dim, out_rows, weight_type, row_bytes;
     uint64_t expert_bytes;
     uint32_t has_shared, shared_type, shared_row_bytes, n_total_expert;
-    uint32_t list_cap, pad0;
+    uint32_t list_cap;
+    uint32_t n_hc;         /* kernel_qwen4_moe_down_reduce only; 0 elsewhere */
 } qwen4_moe_args;
 
 static bool qwen4_moe_mv_specialize(uint32_t type) {
     /* Constant quantization and logical width remove the generic decode
      * branches. Keep the original per-lane reduction order and padded stride.
-     * M3 Ultra uses low-bit and MXFP4 down rows; M5 uses MXFP4 down rows. */
+     * M3 Ultra and M5 use low-bit and MXFP4 down rows. */
     const int override = ds4_gpu_env_bool("DS4_QWEN4_MOE_MV_SPECIALIZE");
     return override >= 0 ? override != 0 :
-        ((type == 16u || type == 10u || type == 39u) && ds4_gpu_device_name_contains("M3 Ultra")) ||
-        (type == 39u && ds4_gpu_device_is_m5_apple_silicon());
+        (type == 16u || type == 10u || type == 39u) &&
+        (ds4_gpu_device_name_contains("M3 Ultra") || ds4_gpu_device_is_m5_apple_silicon());
 }
 
-static uint32_t qwen4_moe_mv_rows(void) {
-    return (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_MOE_MV_NR", 1u, 1u, 4u);
+static uint32_t qwen4_moe_mv_rows(uint32_t type) {
+    char name[40];
+    snprintf(name, sizeof(name), "DS4_QWEN4_MOE_MV_NR_%u", type);
+    return (uint32_t)ds4_gpu_env_u64(name, ds4_gpu_env_u64("DS4_QWEN4_MOE_MV_NR", 1u, 1u, 4u), 1u, 4u);
 }
 
 static uint32_t qwen4_moe_mv_groups(uint32_t type) {
@@ -48411,7 +48418,9 @@ static uint32_t qwen4_moe_mv_groups(uint32_t type) {
     const uint32_t default_nsg =
         ((type == 10u || type == 39u) && ds4_gpu_device_name_contains("M3 Ultra")) ||
         (type == 39u && ds4_gpu_device_is_m5_apple_silicon()) ? 16u : 8u;
-    return (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_MOE_MV_NSG", default_nsg, 1u, 16u);
+    char name[40];
+    snprintf(name, sizeof(name), "DS4_QWEN4_MOE_MV_NSG_%u", type);
+    return (uint32_t)ds4_gpu_env_u64(name, ds4_gpu_env_u64("DS4_QWEN4_MOE_MV_NSG", default_nsg, 1u, 16u), 1u, 16u);
 }
 
 /* resident: buffers the kernel reaches through GPU addresses rather than
@@ -48424,10 +48433,11 @@ static int qwen4_dispatch_resident(int kernel, const void *args, size_t args_len
     if (!g_initialized && !ds4_gpu_init()) return 0;
     @autoreleasepool {
         id<MTLComputePipelineState> pipeline = nil;
-        if (kernel == QWEN4_K_MOE_MID || kernel == QWEN4_K_MOE_DOWN || kernel == QWEN4_K_MOE_DOWN_MXFP4_PF) {
+        if (kernel == QWEN4_K_MOE_MID || kernel == QWEN4_K_MOE_MID_IQ2XXS || kernel == QWEN4_K_MOE_DOWN || kernel == QWEN4_K_MOE_DOWN_MXFP4_PF ||
+            kernel == QWEN4_K_MOE_DOWN_REDUCE) {
             const qwen4_moe_args *a = args;
             const bool specialize = qwen4_moe_mv_specialize(a->weight_type);
-            const uint32_t values[] = {a->weight_type, a->shared_type, specialize ? a->in_dim : 0u, specialize ? qwen4_moe_mv_rows() : 0u};
+            const uint32_t values[] = {a->weight_type, a->shared_type, specialize ? a->in_dim : 0u, specialize ? qwen4_moe_mv_rows(a->weight_type) : 0u};
             NSString *key = [NSString stringWithFormat:@"%s_type=%u_shared=%u_dim=%u_rows=%u",
                              qwen4_kernel_names[kernel], values[0], values[1], values[2], values[3]];
             pipeline = [g_pipeline_cache objectForKey:key];
@@ -49631,7 +49641,7 @@ int ds4_gpu_qwen4_moe_mid_tensor(
     const bool specialize = !q4k && qwen4_moe_mv_specialize(weight_type);
     const uint64_t nr_env = q4k ?
         ds4_gpu_env_u64("DS4_QWEN4_Q4K_MID_NR", default_nr, 1u, UINT64_MAX) :
-        (specialize ? qwen4_moe_mv_rows() : 2u);
+        (specialize ? qwen4_moe_mv_rows(weight_type) : 2u);
     const uint32_t nr = nr_env >= 1u && nr_env <= (q4k ? 2u : 4u) ? (uint32_t)nr_env : default_nr;
     /* NR2 without an NSG override restores the former ordered dispatch. */
     const uint32_t default_nsg = nr != 1u ? 2u : m3_ultra ? 8u : m5_single ? 4u : 2u;
@@ -49639,7 +49649,9 @@ int ds4_gpu_qwen4_moe_mid_tensor(
         (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_Q4K_MID_NSG", default_nsg, 1u, 8u) :
         (specialize ? qwen4_moe_mv_groups(weight_type) : 4u);
     const uint32_t rows_per_tg = nr * nsg;
-    const int kernel = !q4k ? QWEN4_K_MOE_MID : nr == 1u ? QWEN4_K_MOE_MID_Q4K_NR1 : QWEN4_K_MOE_MID_Q4K;
+    const bool iq2xxs = weight_type == 16u && getenv("DS4_QWEN4_NO_IQ2XXS_MID") == NULL;
+    const int kernel = q4k ? (nr == 1u ? QWEN4_K_MOE_MID_Q4K_NR1 : QWEN4_K_MOE_MID_Q4K) :
+                       iq2xxs ? QWEN4_K_MOE_MID_IQ2XXS : QWEN4_K_MOE_MID;
     return qwen4_dispatch(kernel, &args, sizeof(args), b, 7,
                           MTLSizeMake((ff_dim + rows_per_tg - 1) / rows_per_tg, n_out, n_tokens),
                           MTLSizeMake(32u * nsg, 1, 1), 0);
@@ -49676,7 +49688,7 @@ int ds4_gpu_qwen4_moe_down_tensor(
         b[4] = b[0];
     }
     const uint32_t nsg = qwen4_moe_mv_specialize(weight_type) ? qwen4_moe_mv_groups(weight_type) : 4u;
-    const uint32_t rows_per_tg = nsg * (qwen4_moe_mv_specialize(weight_type) ? qwen4_moe_mv_rows() : 2u);
+    const uint32_t rows_per_tg = nsg * (qwen4_moe_mv_specialize(weight_type) ? qwen4_moe_mv_rows(weight_type) : 2u);
     /* MXFP4 rows with four blocks per lane requested ahead (same lane map and
      * chain order, byte-identical); M5 default, DS4_QWEN4_MOE_DOWN_PREFETCH=0/1
      * overrides on any device. */
@@ -49746,6 +49758,38 @@ int ds4_gpu_qwen4_moe_down_grouped_tensor(
     return qwen4_dispatch(QWEN4_K_MOE_DOWN_MXFP4_GROUPED, &args, sizeof(args), b, 6,
                           MTLSizeMake((out_dim + rows_per_tg - 1) / rows_per_tg, n_slots, n_tokens),
                           MTLSizeMake(32u * nsg, 1, 1), 0);
+}
+
+/* Single-token routed down rows with kernel_qwen4_moe_reduce folded in (see
+ * kernel_qwen4_moe_down_reduce); same outputs as moe_down + moe_reduce. */
+int ds4_gpu_qwen4_moe_down_reduce_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *mid, const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights, const ds4_gpu_tensor *shared_gate, ds4_gpu_tensor *R,
+        const ds4_gpu_tensor *inj, const void *model_map, uint64_t model_size, uint64_t down_offset,
+        uint32_t weight_type, uint32_t n_total_expert, uint32_t n_slots, uint32_t ff_dim, uint32_t out_dim,
+        uint64_t shared_down_offset, uint32_t shared_type, uint32_t n_hc) {
+    if (n_slots == 0 || n_slots > 16u || n_hc == 0 || n_hc > 8u) return 0;
+    const uint32_t row_bytes = qwen4_expert_row_bytes(weight_type, weight_type == 10u ? (ff_dim + 255u) / 256u * 256u : ff_dim);
+    const uint64_t expert_bytes = (uint64_t)row_bytes * out_dim;
+    const uint32_t sh_row_bytes = qwen4_expert_row_bytes(shared_type, ff_dim);
+    if (row_bytes == 0 || sh_row_bytes == 0 || (ff_dim % 32u) != 0 || out_dim == 0) return 0;
+    qwen4_moe_args args = { 1u, n_slots, ff_dim, out_dim, weight_type, row_bytes, expert_bytes,
+                            1u, shared_type, sh_row_bytes, n_total_expert, 0u, n_hc };
+    qwen4_bind b[10];
+    if (!qwen4_bind_weight(&b[0], model_map, model_size, down_offset, expert_bytes * n_total_expert, "moe down experts") ||
+        !qwen4_bind_tensor(&b[1], selected, (uint64_t)n_slots * sizeof(int32_t), "moe selected") ||
+        !qwen4_bind_tensor(&b[2], mid, (uint64_t)(n_slots + 1u) * ff_dim * sizeof(float), "moe mid") ||
+        !qwen4_bind_weight(&b[3], model_map, model_size, shared_down_offset, (uint64_t)sh_row_bytes * out_dim, "shared down") ||
+        !qwen4_bind_tensor(&b[4], weights, (uint64_t)n_slots * sizeof(float), "moe weights") ||
+        !qwen4_bind_tensor(&b[5], shared_gate, sizeof(float), "shared gate") ||
+        !qwen4_bind_tensor(&b[6], out, (uint64_t)out_dim * sizeof(float), "moe out") ||
+        !qwen4_bind_tensor(&b[7], R, (uint64_t)out_dim * n_hc * sizeof(float), "moe residual") ||
+        !qwen4_bind_tensor(&b[8], inj, (uint64_t)n_hc * DS4_QWEN4_HC_CHUNKS * n_hc * sizeof(float), "moe inject")) {
+        return 0;
+    }
+    const uint32_t rows = 4u;   /* QWEN4_DOWN_REDUCE_ROWS */
+    return qwen4_dispatch(QWEN4_K_MOE_DOWN_REDUCE, &args, sizeof(args), b, 9,
+                          MTLSizeMake((out_dim + rows - 1) / rows, 1, 1), MTLSizeMake(32u * (n_slots + 1u), 1, 1), 0);
 }
 
 int ds4_gpu_qwen4_moe_reduce_tensor(
