@@ -3729,6 +3729,19 @@ static inline void qwen4_load_raw16_next(thread qwen4_raw16 &r,
             r.q = *(device const uint4 *)(blk + 16 + (group >> 1) * 32 + q0 * 8);
         return;
     }
+    if (type == 10) {
+        const uint group = b % 8u, half_row = q0 / 2u;
+        device const uchar *blk = (device const uchar *)(row + (uint64_t)(b / 8u) * 84u);
+        if (group == 0u) r.h.x = *(device const uint *)(blk + 80u);
+        r.h.y = blk[group * 2u + half_row];
+        /* Four successive steps extract different two-bit planes of the
+         * same bytes. Q2_K superblocks are only four-byte aligned. */
+        if ((group & 3u) == 0u) {
+            device const uint *qs = (device const uint *)(blk + 16u + (group / 4u) * 32u + half_row * 16u);
+            r.q = uint4(qs[0], qs[1], qs[2], qs[3]);
+        }
+        return;
+    }
     r = qwen4_load_raw16(row, b, q0, type);
 }
 static inline void qwen4_dequant_raw16(qwen4_raw16 r, uint b, uint q0, uint type, threadgroup half *dst) {
