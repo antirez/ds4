@@ -32738,6 +32738,49 @@ __global__ static void glm_indexer_scores_wmma128_kernel(
 #endif
 }
 
+/* With one token the rows of a tensor-core tile can cover query heads.
+ * Each column is one key. The dot products retain the same eight MMA steps
+ * as batched scoring, then a lane sums that key's 32 heads in model order. */
+template<typename CT>
+__global__ static void glm_indexer_scores_one_wmma_kernel(float *scores, const float *q,
+        const float *weights, const CT *keys, uint32_t rows, float scale) {
+#if __CUDA_ARCH__ >= 700
+    namespace wmma = nvcuda::wmma;
+    const uint32_t tid = threadIdx.x, warp = tid / 32u, lane = tid % 32u;
+    const uint32_t base = blockIdx.x * 64u;
+    __shared__ __align__(32) __half queries[32u * 128u];
+    __shared__ __align__(32) __half cache[64u * 128u];
+    __shared__ __align__(32) float dots[4][16u * 16u];
+    for (uint32_t i = tid; i < 32u * 128u; i += 128u) queries[i] = __float2half(q[i]);
+    for (uint32_t i = tid; i < 64u * 128u; i += 128u)
+        cache[i] = base + i / 128u < rows ? __float2half((float)keys[(uint64_t)base * 128u + i]) :
+                                           __float2half(0.0f);
+    __syncthreads();
+
+    float total = 0.0f;
+    for (uint32_t h = 0; h < 32u; h += 16u) {
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> qa;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> kb;
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+        wmma::fill_fragment(acc, 0.0f);
+        for (uint32_t k = 0; k < 128u; k += 16u) {
+            wmma::load_matrix_sync(qa, queries + h * 128u + k, 128);
+            wmma::load_matrix_sync(kb, cache + warp * 16u * 128u + k, 128);
+            wmma::mma_sync(acc, qa, kb, acc);
+        }
+        wmma::store_matrix_sync(dots[warp], acc, 16, wmma::mem_row_major);
+        __syncwarp();
+        if (lane < 16u) {
+            for (uint32_t j = 0; j < 16u; j++)
+                total += fmaxf(dots[warp][j * 16u + lane], 0.0f) * weights[h + j];
+        }
+        __syncwarp();
+    }
+    const uint32_t row = base + warp * 16u + lane;
+    if (lane < 16u && row < rows) scores[row] = total * scale;
+#endif
+}
+
 static int glm_indexer_scores_launch(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,
@@ -32763,6 +32806,19 @@ static int glm_indexer_scores_launch(
         indexer_key_cache->bytes < (uint64_t)n_rows * head_dim * cache_elem ||
         scores->bytes < (uint64_t)n_tokens * n_rows * sizeof(float)) {
         return 0;
+    }
+    if (!g_quality_mode && !causal && n_tokens == 1u && n_head == 32u &&
+        ds4_gpu_device_is_spark() && !getenv("DS4_CUDA_DISABLE_GLM_INDEX_HEAD_TILE")) {
+        const uint32_t blocks = (n_rows - 1u) / 64u + 1u;
+        if (cache_f16)
+            glm_indexer_scores_one_wmma_kernel<<<blocks, 128>>>((float *)scores->ptr,
+                (const float *)q->ptr, (const float *)weights->ptr,
+                (const __half *)indexer_key_cache->ptr, n_rows, scale);
+        else
+            glm_indexer_scores_one_wmma_kernel<<<blocks, 128>>>((float *)scores->ptr,
+                (const float *)q->ptr, (const float *)weights->ptr,
+                (const float *)indexer_key_cache->ptr, n_rows, scale);
+        return cuda_ok(cudaGetLastError(), "GLM one-token index scores");
     }
     if (!g_quality_mode) {
         dim3 grid((n_rows + 127u) / 128u,
