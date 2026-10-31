@@ -453,6 +453,27 @@ static void pool_update(ds4_glm_gpu_graph *g, ds4_gpu_tensor *x,
     assert(ds4_gpu_synchronize());
 }
 
+/* The pair starting at top_k - 1 previously reached the verifier with a
+ * one-row chunk and invalidated the session. Nearby pairs must still use
+ * MTP, and GLM 5.3's mixed attention path must remain eligible. */
+static void test_glm_mtp_boundary(void) {
+    const ds4_shape saved_shape = g_ds4_shape;
+    g_ds4_shape = DS4_SHAPE_GLM53;
+    ds4_glm_gpu_graph *g = calloc(1, sizeof(*g));
+    assert(g);
+    const uint32_t limit = glm_graph_indexer_top_k_limit();
+    for (uint32_t pos = limit - 2u; pos <= limit + 1u; pos++) {
+        g->glm53 = false;
+        const bool bridge = glm_graph_mtp_needs_boundary_step(g, pos);
+        assert(bridge == (pos == limit - 1u));
+        if (!bridge) assert(glm_graph_limit_indexed_prefill_chunk(g, pos, 2u) == 2u);
+        g->glm53 = true;
+        assert(!glm_graph_mtp_needs_boundary_step(g, pos));
+    }
+    free(g);
+    g_ds4_shape = saved_shape;
+}
+
 static void test_glm_spec_rollback(void) {
     const ds4_shape saved_shape = g_ds4_shape;
     g_ds4_shape = DS4_SHAPE_GLM53;
@@ -768,6 +789,7 @@ int main(void) {
     test_text_observations();
 #ifndef DS4_NO_GPU
     test_glm_attention_budget();
+    test_glm_mtp_boundary();
     test_glm_spec_rollback();
 #endif
 #if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)

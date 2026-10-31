@@ -47035,6 +47035,16 @@ static uint32_t glm_graph_limit_indexed_prefill_chunk(
     return chunk;
 }
 
+/* A legacy GLM verifier needs both target rows in one attention regime.
+ * At the dense/indexed seam the chunker admits only one row, so use the
+ * ordinary target step and seed the next draft there. GLM 5.3 has its own
+ * mixed-attention verification path and does not need this bridge. */
+static bool glm_graph_mtp_needs_boundary_step(
+        const ds4_glm_gpu_graph *g, uint32_t pos) {
+    return !g->glm53 &&
+           glm_graph_limit_indexed_prefill_chunk(g, pos, 2u) < 2u;
+}
+
 static uint32_t glm_graph_indexed_prefill_chunk_tokens(
         uint32_t full_attention_cap,
         uint32_t compact_cap) {
@@ -75291,6 +75301,7 @@ static int ds4_session_glm_spec_cycle_impl(
         s->glm_mtp_have = 0;
     }
     if (!s->glm_mtp_have || accepted_cap < 2 ||
+        glm_graph_mtp_needs_boundary_step(g, pos) ||
         pos + 2 > g->ctx_size ||
         (g->compact_cache_cap != 0 && pos + 1 >= g->compact_cache_cap)) {
         /* Plain step, then seed the first draft from g->cur. */
