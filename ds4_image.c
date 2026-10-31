@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -388,14 +389,20 @@ static double ds4_cubic(double x, double a) {
     return 0.0;
 }
 
-static void ds4_resize_rgb_bicubic(
-        const uint8_t *src,
-        uint32_t src_width,
-        uint32_t src_height,
-        float *dst,
-        uint32_t dst_width,
-        uint32_t dst_height,
-        uint32_t dst_stride) {
+typedef struct {
+    const uint8_t *src;
+    float *dst;
+    uint32_t src_width, src_height, dst_width, dst_height, dst_stride;
+    uint32_t first_y, end_y;
+} ds4_resize_rows;
+
+static void *ds4_resize_bicubic_rows(void *context) {
+    const ds4_resize_rows *rows = context;
+    const uint8_t *src = rows->src;
+    float *dst = rows->dst;
+    const uint32_t src_width = rows->src_width, src_height = rows->src_height;
+    const uint32_t dst_width = rows->dst_width, dst_height = rows->dst_height;
+    const uint32_t dst_stride = rows->dst_stride;
     double scale_x = (double)src_width / dst_width;
     double scale_y = (double)src_height / dst_height;
     double filter_x = scale_x >= 1.0 ? 1.0 / scale_x : 1.0;
@@ -403,7 +410,7 @@ static void ds4_resize_rgb_bicubic(
     double support_x = scale_x >= 1.0 ? 2.0 * scale_x : 2.0;
     double support_y = scale_y >= 1.0 ? 2.0 * scale_y : 2.0;
 
-    for (uint32_t dy = 0; dy < dst_height; dy++) {
+    for (uint32_t dy = rows->first_y; dy < rows->end_y; dy++) {
         double center_y = scale_y * ((double)dy + 0.5);
         int y0 = (int)(center_y - support_y + 0.5);
         int y1 = (int)(center_y + support_y + 0.5);
@@ -440,6 +447,44 @@ static void ds4_resize_rgb_bicubic(
                 pixel[c] = (float)value;
             }
         }
+    }
+    return NULL;
+}
+
+static void ds4_resize_rgb_bicubic(
+        const uint8_t *src,
+        uint32_t src_width,
+        uint32_t src_height,
+        float *dst,
+        uint32_t dst_width,
+        uint32_t dst_height,
+        uint32_t dst_stride) {
+    enum { MAX_WORKERS = 8 };
+    /* Separate output row ranges use the original horizontal and vertical
+     * coordinates, including when the destination is a padded canvas. */
+    const uint64_t work = (uint64_t)(src_width > dst_width ? src_width : dst_width) *
+                          (src_height > dst_height ? src_height : dst_height);
+    uint32_t workers = work / 65536u < MAX_WORKERS ? (uint32_t)(work / 65536u) : MAX_WORKERS;
+    if (workers > dst_height) workers = dst_height;
+    ds4_resize_rows whole = {src, dst, src_width, src_height, dst_width, dst_height,
+                             dst_stride, 0, dst_height};
+    if (workers < 2u) {
+        ds4_resize_bicubic_rows(&whole);
+        return;
+    }
+    ds4_resize_rows rows[MAX_WORKERS];
+    pthread_t threads[MAX_WORKERS - 1];
+    uint32_t started = 0;
+    for (; started + 1u < workers; started++) {
+        rows[started] = whole;
+        rows[started].first_y = (uint64_t)dst_height * started / workers;
+        rows[started].end_y = (uint64_t)dst_height * (started + 1u) / workers;
+        if (pthread_create(&threads[started], NULL, ds4_resize_bicubic_rows, &rows[started])) break;
+    }
+    whole.first_y = (uint64_t)dst_height * started / workers;
+    ds4_resize_bicubic_rows(&whole);
+    for (uint32_t i = 0; i < started; i++) {
+        if (pthread_join(threads[i], NULL)) abort();
     }
 }
 
