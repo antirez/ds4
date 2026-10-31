@@ -1978,7 +1978,7 @@ kernel void kernel_glm_indexer_score_one_direct(
     }
 
     threadgroup float *ktg = shared;
-    threadgroup float *psum = ktg + 128u;
+    threadgroup float *psum = ktg + 128u;   /* two 4-float phases */
 
     if (tid < 128u) {
         ktg[tid] = glm_cache_load_f32_or_f16(indexer_key_cache,
@@ -1997,17 +1997,20 @@ kernel void kernel_glm_indexer_score_one_direct(
 
         float s = dot(q4[lane], k4[lane]);
         s = simd_sum(s);
+        /* Alternate the partial buffer so the next iteration cannot overwrite
+         * the slots thread 0 is still reading. This removes the second
+         * barrier while keeping the accumulation order identical. */
+        threadgroup float *ps = psum + (head0 & 4u);
         if (lane == 0) {
-            psum[sg] = max(s * args.scale, 0.0f) * weights[head];
+            ps[sg] = max(s * args.scale, 0.0f) * weights[head];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (tid == 0) {
-            acc += psum[0];
-            acc += psum[1];
-            acc += psum[2];
-            acc += psum[3];
+            acc += ps[0];
+            acc += ps[1];
+            acc += ps[2];
+            acc += ps[3];
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     if (tid == 0) {
@@ -2015,6 +2018,9 @@ kernel void kernel_glm_indexer_score_one_direct(
     }
 }
 
+/* Same math as kernel_glm_indexer_score_one_direct, but the row for each
+ * output slot comes from a compact candidate list. Used by V4.1 layers whose
+ * indexer candidate set is restricted by an earlier block selection. */
 /* One SIMD group scores four key rows at a time. Every lane keeps its own
  * float4 of each row in a register, so a row never round-trips through
  * threadgroup memory; the query float4 is read once per head and reused by all
@@ -2084,17 +2090,13 @@ static inline float4 glm_indexer_score_rows_in_simd(
 
 /* Grid: ceil(n_rows / 16); the threadgroup is 32x4, so each SIMD group covers
  * four rows and a threadgroup covers sixteen. */
-kernel void kernel_glm_indexer_score_one_rows4(
+static inline void glm_indexer_score_four_rows(
         constant ds4_metal_args_glm_indexer_score_one & args,
         device const float *q,
         device const float *weights,
         device const char *indexer_key_cache,
         device float *scores,
-        uint tg [[threadgroup_position_in_grid]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]]) {
-    if (args.n_head != 32u || args.head_dim != 128u) return;
-    const uint first = tg * 16u + (uint)sg * 4u;
+        uint first, ushort lane) {
     const uint r0 = first, r1 = first + 1u, r2 = first + 2u, r3 = first + 3u;
     /* Rows past the end fall back to row 0 so the cache load stays in bounds;
      * their results are dropped instead of being written. n_rows >= 1. */
@@ -2107,6 +2109,34 @@ kernel void kernel_glm_indexer_score_one_rows4(
         if (r2 < args.n_rows) scores[r2] = acc.z;
         if (r3 < args.n_rows) scores[r3] = acc.w;
     }
+}
+
+kernel void kernel_glm_indexer_score_one_rows4(
+        constant ds4_metal_args_glm_indexer_score_one & args,
+        device const float *q,
+        device const float *weights,
+        device const char *indexer_key_cache,
+        device float *scores,
+        uint tg [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    if (args.n_head != 32u || args.head_dim != 128u) return;
+    glm_indexer_score_four_rows(args, q, weights, indexer_key_cache, scores, tg * 16u + sg * 4u, lane);
+}
+
+kernel void kernel_dsv41_indexer_score_blocks(
+        constant ds4_metal_args_glm_indexer_score_one & args,
+        device const float *q,
+        device const float *weights,
+        device const char *indexer_key_cache,
+        device float *scores,
+        device const uint *blocks,
+        uint tg [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    const uint block = blocks[tg];
+    if (block > (args.n_rows - 1u) / 8u) return;
+    glm_indexer_score_four_rows(args, q, weights, indexer_key_cache, scores, block * 8u + sg * 4u, lane);
 }
 
 kernel void kernel_glm_indexer_scores_batch(

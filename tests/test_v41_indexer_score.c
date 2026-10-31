@@ -151,12 +151,69 @@ done:
     return rc;
 }
 
+/* V4.1's full-width bitonic sort can permute equal scores differently
+ * if the keys are repacked. Exercise ties at the top-512 cutoff as well
+ * as score writes at a partial final block and the output guard. */
+static int check_block_selection(void) {
+    enum { FULL = 32773, BLOCKS = 2048, TOP = 512 };
+    const uint32_t neginf = 0xff800000u;
+    ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(N_HEAD * ROW_BYTES);
+    ds4_gpu_tensor *weights = ds4_gpu_tensor_alloc(N_HEAD * sizeof(float));
+    ds4_gpu_tensor *cache = ds4_gpu_tensor_alloc(FULL * ROW_BYTES);
+    ds4_gpu_tensor *blocks = ds4_gpu_tensor_alloc(BLOCKS * sizeof(uint32_t));
+    ds4_gpu_tensor *full = ds4_gpu_tensor_alloc(FULL * sizeof(float));
+    ds4_gpu_tensor *partial = ds4_gpu_tensor_alloc((FULL + 1u) * sizeof(float));
+    ds4_gpu_tensor *full_top = ds4_gpu_tensor_alloc(TOP * sizeof(uint32_t));
+    ds4_gpu_tensor *partial_top = ds4_gpu_tensor_alloc(TOP * sizeof(uint32_t));
+    int failed = 1;
+    if (!q || !weights || !cache || !blocks || !full || !partial || !full_top || !partial_top) goto done;
+    float *qp = ds4_gpu_tensor_contents(q), *wp = ds4_gpu_tensor_contents(weights);
+    float *keys = ds4_gpu_tensor_contents(cache), *ps = ds4_gpu_tensor_contents(partial);
+    uint32_t *ids = ds4_gpu_tensor_contents(blocks);
+    for (size_t i = 0; i < N_HEAD * HEAD_DIM; i++) qp[i] = rng_float();
+    for (size_t i = 0; i < N_HEAD; i++) wp[i] = rng_float();
+    for (size_t i = 0; i < 97 * HEAD_DIM; i++) keys[i] = rng_fp4();
+    for (uint32_t r = 97; r < FULL; r++)
+        memcpy(keys + r * HEAD_DIM, keys + (r % 97u) * HEAD_DIM, ROW_BYTES);
+    for (uint32_t i = 0; i < BLOCKS - 1; i++) ids[i] = 2u * i + 1u;
+    ids[BLOCKS - 1] = FULL / 8u;
+    /* Block top-k may return any order. */
+    for (uint32_t i = 0; i < BLOCKS / 2; i++) {
+        uint32_t t = ids[i]; ids[i] = ids[BLOCKS - 1u - i]; ids[BLOCKS - 1u - i] = t;
+    }
+    for (uint32_t r = 0; r < FULL; r++) memcpy(ps + r, &neginf, sizeof(neginf));
+    ps[FULL] = 12345;
+    if (!ds4_gpu_glm_indexer_score_one_tensor(full, q, weights, cache, FULL,
+                                              N_HEAD, HEAD_DIM, 1.0f / 64.0f, false) ||
+        !ds4_gpu_dsv41_indexer_score_blocks(partial, q, weights, cache, blocks, FULL, BLOCKS)) goto done;
+    float *fs = ds4_gpu_tensor_contents(full);
+    for (uint32_t r = 0; r < FULL; r++) {
+        const uint32_t block = r / 8u;
+        if (block != FULL / 8u && (!(block & 1u) || block == 4095u))
+            memcpy(fs + r, &neginf, sizeof(neginf));
+    }
+    if (ps[FULL] != 12345 || memcmp(fs, ps, FULL * sizeof(float))) goto done;
+    setenv("DS4_METAL_DISABLE_V41_TOPK_PREFIX", "1", 1);
+    if (!ds4_gpu_indexer_topk_tensor(full_top, full, FULL, 1, TOP)) goto done;
+    unsetenv("DS4_METAL_DISABLE_V41_TOPK_PREFIX");
+    if (!ds4_gpu_indexer_topk_tensor(partial_top, partial, FULL, 1, TOP)) goto done;
+    failed = memcmp(ds4_gpu_tensor_contents(full_top), ds4_gpu_tensor_contents(partial_top),
+                    TOP * sizeof(uint32_t)) != 0;
+done:
+    unsetenv("DS4_METAL_DISABLE_V41_TOPK_PREFIX");
+    ds4_gpu_tensor_free(q); ds4_gpu_tensor_free(weights); ds4_gpu_tensor_free(cache);
+    ds4_gpu_tensor_free(blocks); ds4_gpu_tensor_free(full); ds4_gpu_tensor_free(partial);
+    ds4_gpu_tensor_free(full_top); ds4_gpu_tensor_free(partial_top);
+    printf("candidate block scores and tied top-512: %s\n", failed ? "FAIL" : "identical");
+    return failed;
+}
+
 int main(void) {
     if (!ds4_gpu_init()) {
         fprintf(stderr, "metal init failed\n");
         return 1;
     }
-    int fail = 0;
+    int fail = check_block_selection();
     const uint32_t tails[] = {1, 2, 3, 4, 15, 16, 17, 31, 33, 1023, 1025};
     for (size_t i = 0; i < sizeof(tails) / sizeof(*tails); i++) {
         fail |= run_case("tail-f32", tails[i], 0, 0, 0);
