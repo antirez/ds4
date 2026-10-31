@@ -707,6 +707,39 @@ static int check_attention_output(bool large) {
     return 1;
 }
 
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+static int check_indexer_grouped_keys(const ds4_gpu_tensor *q, const ds4_gpu_tensor *weights) {
+    enum { KEYS = 8197, BLOCKS = (KEYS + 7) / 8, DIM = 128 };
+    ds4_gpu_tensor *keys = upload(NULL, KEYS * DIM * sizeof(float));
+    ds4_gpu_tensor *out = upload(NULL, (KEYS + 1) * sizeof(float));
+    ds4_gpu_tensor *reference = upload(NULL, KEYS * sizeof(float));
+    ds4_gpu_tensor *mask = upload(NULL, BLOCKS * sizeof(float));
+    CHECK(keys && out && reference && mask);
+    float *k = ds4_gpu_tensor_contents(keys), *m = ds4_gpu_tensor_contents(mask);
+    float *s = ds4_gpu_tensor_contents(out), *ref = ds4_gpu_tensor_contents(reference);
+    for (size_t i = 0; i < (size_t)KEYS * DIM; i++) k[i] = random_value();
+    CHECK(ds4_gpu_dsv41_quantize(keys, DIM, KEYS, DS4_V41_FP4_E8M0));
+    ds4_gpu_set_quality(true);
+    CHECK(ds4_gpu_glm_indexer_score_one_tensor(reference, q, weights, keys, KEYS, 32, DIM,
+                                               1.0f / 64.0f, false));
+    CHECK(ds4_gpu_synchronize());
+    ds4_gpu_set_quality(false);
+    s[KEYS] = 12345;
+    CHECK(ds4_gpu_dsv41_indexer_scores_batch(out, q, weights, keys, KEYS, 1, 2 * KEYS - 1, 2));
+    CHECK(ds4_gpu_synchronize() && s[KEYS] == 12345 && !memcmp(s, ref, KEYS * sizeof(float)));
+    for (unsigned phase = 0; phase < 2; phase++) {
+        for (unsigned i = 0; i < BLOCKS; i++) m[i] = (i + phase) % 2u ? -INFINITY : 0.0f;
+        CHECK(ds4_gpu_dsv41_indexer_scores_masked_one(out, q, weights, keys, mask, KEYS));
+        CHECK(ds4_gpu_synchronize() && s[KEYS] == 12345);
+        for (unsigned i = 0; i < KEYS; i++)
+            CHECK(m[i / 8] ? s[i] == -INFINITY : !memcmp(s + i, ref + i, sizeof(float)));
+    }
+    ds4_gpu_tensor_free(mask); ds4_gpu_tensor_free(reference);
+    ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(keys);
+    return 1;
+}
+#endif
+
 static int check_indexer_batch(void) {
     enum { KEYS = 1025, ROWS = 33, HEADS = 32, DIM = 128 };
     ds4_gpu_tensor *qt = upload(NULL, (size_t)ROWS * HEADS * DIM * sizeof(float));
@@ -822,6 +855,9 @@ static int check_indexer_batch(void) {
             }
         }
     }
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (ds4_gpu_device_is_spark()) CHECK(check_indexer_grouped_keys(qt, wt));
+#endif
     CHECK(!ds4_gpu_dsv41_indexer_scores_batch(st, qt, wt, kt, KEYS, ROWS, 0, 0));
     CHECK(!ds4_gpu_dsv41_indexer_scores_batch(st, qt, wt, kt, KEYS, ROWS, 0, 4));
     CHECK(!ds4_gpu_dsv41_indexer_scores_batch(st, qt, wt, kt, KEYS, ROWS, UINT32_MAX, 1));
