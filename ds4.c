@@ -42773,7 +42773,10 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
         const uint32_t chunk = wide && il >= 20u && encoder_chunk > 2048u ? 2048u : encoder_chunk;
         uint32_t first = 0;
         if (ok && decoder_suffix && il >= 20u) {
-            const uint32_t needed = (g->dspark ? 128u : 1u) + (DS4_N_LAYER - 1u - il) * 127u;
+            /* Preserve every key in the final raw window, including requests
+             * that immediately save or continue from this frontier. */
+            const uint32_t final_rows = (medium_suffix || g->dspark) ? 128u : 1u;
+            const uint32_t needed = final_rows + (DS4_N_LAYER - 1u - il) * 127u;
             first = total_count - needed;
             /* A medium sweep used the complete 2048-row partitions here.
              * Retain that grid, and reconstruct the raw ring at its edge. */

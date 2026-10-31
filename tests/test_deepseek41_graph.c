@@ -1277,9 +1277,10 @@ static int check_decoder_suffix(const char *path, const char *prompt_path, bool 
     REQUIRE(ds4_session_create(&control, engine, 18432) == 0);
     REQUIRE(ds4_session_create(&candidate, engine, 18432) == 0);
     ds41_gpu_graph *a = &control->ds41_graph, *b = &candidate->ds41_graph;
-    for (uint32_t pass = 0; pass < 2; pass++) {
+    const uint32_t sizes[] = {4096u, 6144u, 4353u};
+    for (uint32_t pass = 0; pass < (medium ? 3u : 2u); pass++) {
         const uint32_t start = a->pos;
-        const uint32_t count = medium ? (pass ? 6144u : 4353u) : 8192u;
+        const uint32_t count = medium ? sizes[pass] : 8192u;
         setenv("DS4_METAL_DISABLE_V41_DECODER_SUFFIX", "1", 1);
         double t0 = now_sec();
         REQUIRE(ds41_graph_prefill(a, &engine->model, &engine->weights,
@@ -1307,6 +1308,8 @@ static int check_decoder_suffix(const char *path, const char *prompt_path, bool 
         REQUIRE(!memcmp(control->logits, candidate->logits, DS4_N_VOCAB * sizeof(float)));
         fprintf(stderr, "V4.1 decoder suffix start=%u count=%u: exact state/logits, %.2f -> %.2f t/s\n",
                 start, count, count / reference, count / candidate_time);
+        /* Exercise a continued prefill starting exactly on the 4096 boundary. */
+        if (medium && pass == 0) continue;
         REQUIRE(ds41_graph_step(a, &engine->model, &engine->weights, tokens.v[a->pos], control->logits));
         REQUIRE(ds41_graph_step(b, &engine->model, &engine->weights, tokens.v[b->pos], candidate->logits));
         REQUIRE(!memcmp(control->logits, candidate->logits, DS4_N_VOCAB * sizeof(float)));
