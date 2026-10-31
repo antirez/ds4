@@ -46,6 +46,7 @@ enum {
     DS4_METAL_TENSOR_Q6_K    = 14,
     DS4_METAL_TENSOR_Q8_K    = 15,
     DS4_METAL_TENSOR_IQ2_XXS = 16,
+    DS4_METAL_TENSOR_IQ1_S   = 19,
     DS4_METAL_TENSOR_MXFP4   = 39,
 };
 
@@ -385,6 +386,7 @@ static id<MTLComputePipelineState> g_get_rows_i32_pipeline;
 static id<MTLComputePipelineState> g_get_rows_q8_0_pipeline;
 static id<MTLComputePipelineState> g_get_rows_q4_0_pipeline;
 static id<MTLComputePipelineState> g_get_rows_q4_K_pipeline;
+static id<MTLComputePipelineState> g_get_rows_q6_K_pipeline;
 static id<MTLComputePipelineState> g_repeat_f32_pipeline;
 static id<MTLComputePipelineState> g_concat_pipeline;
 static id<MTLComputePipelineState> g_cpy_f32_f32_pipeline;
@@ -432,6 +434,7 @@ static id<MTLComputePipelineState> g_unary_fill_f16_pipeline;
 static id<MTLComputePipelineState> g_bin_mul_scalar_pipeline;
 static id<MTLComputePipelineState> g_bin_div_row_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_iq2_xxs_pipeline;
+static id<MTLComputePipelineState> g_moe_mul_mv_id_iq1_s_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_iq2_xxs_pair_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_iq2_xxs_pair_swiglu_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_iq2_xxs_pair_swiglu_pack2_pipeline;
@@ -4766,6 +4769,7 @@ static NSString *ds4_gpu_full_source(void) {
         @[@"DS4_METAL_GLM53_VISION_SOURCE", @"metal/glm53_vision.metal"],
         @[@"DS4_METAL_DEEPSEEK4_VISION_SOURCE", @"metal/deepseek4_vision.metal"],
         @[@"DS4_METAL_GLM53_KDA_SOURCE",  @"metal/glm53_kda.metal"],
+        @[@"DS4_METAL_IQ1S_GRID_SOURCE",  @"metal/iq1s_grid.metal"],
         @[@"DS4_METAL_MOE_SOURCE",        @"metal/moe.metal"],
         @[@"DS4_METAL_DSV4_HC_SOURCE",    @"metal/dsv4_hc.metal"],
         @[@"DS4_METAL_UNARY_SOURCE",      @"metal/unary.metal"],
@@ -7055,6 +7059,23 @@ int ds4_gpu_init(void) {
             return 0;
         }
 
+        fn = [library newFunctionWithName:@"kernel_get_rows_q6_K_f32"];
+        if (!fn) {
+            fprintf(stderr, "ds4: Metal kernel_get_rows_q6_K_f32 function not found\n");
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+
+        g_get_rows_q6_K_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        if (!g_get_rows_q6_K_pipeline) {
+            fprintf(stderr, "ds4: Metal kernel_get_rows_q6_K_f32 pipeline failed: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+
         fn = [library newFunctionWithName:@"kernel_repeat_f32"];
         if (!fn) {
             fprintf(stderr, "ds4: Metal kernel_repeat_f32 function not found\n");
@@ -7655,6 +7676,26 @@ int ds4_gpu_init(void) {
         g_moe_mul_mv_id_iq2_xxs_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
         if (!g_moe_mul_mv_id_iq2_xxs_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_mul_mv_id_iq2_xxs_f32 pipeline failed: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+
+        error = nil;
+        fn = [library newFunctionWithName:@"kernel_mul_mv_id_iq1_s_f32"
+                           constantValues:moe_mv_id_constants
+                                    error:&error];
+        if (!fn) {
+            fprintf(stderr, "ds4: Metal kernel_mul_mv_id_iq1_s_f32 function not found: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+        g_moe_mul_mv_id_iq1_s_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        if (!g_moe_mul_mv_id_iq1_s_pipeline) {
+            fprintf(stderr, "ds4: Metal kernel_mul_mv_id_iq1_s_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
             g_queue = nil;
             g_device = nil;
@@ -11585,6 +11626,7 @@ void ds4_gpu_cleanup(void) {
         g_get_rows_q8_0_pipeline = nil;
         g_get_rows_q4_0_pipeline = nil;
         g_get_rows_q4_K_pipeline = nil;
+        g_get_rows_q6_K_pipeline = nil;
         g_repeat_f32_pipeline = nil;
         g_concat_pipeline = nil;
         g_cpy_f32_f32_pipeline = nil;
@@ -11628,6 +11670,7 @@ void ds4_gpu_cleanup(void) {
         g_output_hc_weights4_pipeline = nil;
         g_hc_expand_pipeline = nil;
         g_moe_mul_mv_id_iq2_xxs_pipeline = nil;
+        g_moe_mul_mv_id_iq1_s_pipeline = nil;
         g_moe_mul_mv_id_iq2_xxs_pair_pipeline = nil;
         g_moe_mul_mv_id_iq2_xxs_pair_swiglu_pipeline = nil;
         g_moe_mul_mv_id_iq2_xxs_pair_swiglu_pack2_pipeline = nil;
@@ -11963,6 +12006,14 @@ static int ds4_gpu_quant_row_bytes(
         if ((n_embd % 256u) != 0) return 0;
         *row_bytes_out = ((uint64_t)n_embd / 256u) * 144u;
         return 1;
+    case DS4_METAL_TENSOR_Q5_K:
+        if ((n_embd % 256u) != 0) return 0;
+        *row_bytes_out = ((uint64_t)n_embd / 256u) * 176u;
+        return 1;
+    case DS4_METAL_TENSOR_Q6_K:
+        if ((n_embd % 256u) != 0) return 0;
+        *row_bytes_out = ((uint64_t)n_embd / 256u) * 210u;
+        return 1;
     default:
         return 0;
     }
@@ -12093,6 +12144,9 @@ static int ds4_gpu_encode_get_rows_quant(
         block_width = 32u;
     } else if (weight_type == DS4_METAL_TENSOR_Q4_K) {
         pipeline = g_get_rows_q4_K_pipeline;
+        block_width = 256u;
+    } else if (weight_type == DS4_METAL_TENSOR_Q6_K) {
+        pipeline = g_get_rows_q6_K_pipeline;
         block_width = 256u;
     }
     if (!pipeline || block_width == 0) return 0;
@@ -19753,6 +19807,18 @@ int ds4_gpu_matmul_q8_0_decode_mpp_model_view_tensor(
 
 static const char *ds4_gpu_q4_mv_ext_name(uint32_t weight_type, int16_t r1ptg) {
     const char *prefix = NULL;
+    if (weight_type == DS4_METAL_TENSOR_Q5_K || weight_type == DS4_METAL_TENSOR_Q6_K) {
+        static const char *names[2][5] = {
+            {"kernel_mul_mv_ext_q5_K_f32_r1_1", "kernel_mul_mv_ext_q5_K_f32_r1_2",
+             "kernel_mul_mv_ext_q5_K_f32_r1_3", "kernel_mul_mv_ext_q5_K_f32_r1_4",
+             "kernel_mul_mv_ext_q5_K_f32_r1_5"},
+            {"kernel_mul_mv_ext_q6_K_f32_r1_1", "kernel_mul_mv_ext_q6_K_f32_r1_2",
+             "kernel_mul_mv_ext_q6_K_f32_r1_3", "kernel_mul_mv_ext_q6_K_f32_r1_4",
+             "kernel_mul_mv_ext_q6_K_f32_r1_5"},
+        };
+        if (r1ptg < 1 || r1ptg > 5) return NULL;
+        return names[weight_type == DS4_METAL_TENSOR_Q6_K][r1ptg - 1];
+    }
     if (weight_type == DS4_METAL_TENSOR_Q4_K) {
         prefix = "kernel_mul_mv_ext_q4_K_f32_r1_";
     } else if (weight_type == DS4_METAL_TENSOR_Q4_0) {
@@ -19781,6 +19847,8 @@ static const char *ds4_gpu_q4_mm_name(uint32_t weight_type) {
     switch (weight_type) {
     case DS4_METAL_TENSOR_Q4_0: return "kernel_mul_mm_q4_0_f32";
     case DS4_METAL_TENSOR_Q4_K: return "kernel_mul_mm_q4_K_f32";
+    case DS4_METAL_TENSOR_Q5_K: return "kernel_mul_mm_q5_K_f32";
+    case DS4_METAL_TENSOR_Q6_K: return "kernel_mul_mm_q6_K_f32";
     default: return NULL;
     }
 }
@@ -19795,6 +19863,16 @@ static const char *ds4_gpu_q4_nax_name(uint32_t weight_type, uint64_t tile_n) {
         return tile_n == 128u ? "kernel_mul_mm_q4_K_f32_nax_direct_rhs_n128" :
                tile_n == 64u  ? "kernel_mul_mm_q4_K_f32_nax_direct_rhs_n64" :
                                  "kernel_mul_mm_q4_K_f32_nax_direct_rhs";
+    }
+    if (weight_type == DS4_METAL_TENSOR_Q5_K) {
+        return tile_n == 128u ? "kernel_mul_mm_q5_K_f32_nax_direct_rhs_n128" :
+               tile_n == 64u  ? "kernel_mul_mm_q5_K_f32_nax_direct_rhs_n64" :
+                                 "kernel_mul_mm_q5_K_f32_nax_direct_rhs";
+    }
+    if (weight_type == DS4_METAL_TENSOR_Q6_K) {
+        return tile_n == 128u ? "kernel_mul_mm_q6_K_f32_nax_direct_rhs_n128" :
+               tile_n == 64u  ? "kernel_mul_mm_q6_K_f32_nax_direct_rhs_n64" :
+                                 "kernel_mul_mm_q6_K_f32_nax_direct_rhs";
     }
     return NULL;
 }
@@ -19918,6 +19996,53 @@ static int ds4_gpu_matmul_quant_impl_tensor(
                 ds4_gpu_end_compute_encoder(cb, enc);
 
                 if (!ds4_gpu_finish_command_buffer(cb, owned, "Q4_K classic mul_mv")) return 0;
+                return 1;
+            }
+        }
+
+        /*
+         * Single-token Q5_K/Q6_K (Unsloth V4.1 attention, shared expert and
+         * vocabulary head): the GLM routed down kernels with one always-
+         * selected expert are exactly a dense llama.cpp-style K-quant matvec.
+         * mul_mv_ext r1_1 streamed only ~130 GB/s on these shapes.
+         */
+        if ((weight_type == DS4_METAL_TENSOR_Q5_K || weight_type == DS4_METAL_TENSOR_Q6_K) &&
+            n_tok == 1u &&
+            (in_dim % 256u) == 0 &&
+            getenv("DS4_METAL_DISABLE_QK_SIMD_MV") == NULL) {
+            const bool q5 = weight_type == DS4_METAL_TENSOR_Q5_K;
+            id<MTLComputePipelineState> pipeline = q5 ?
+                ds4_gpu_hot_pipeline(g_glm_q5_k_down_f32_pipeline, "kernel_glm_q5_K_down_f32") :
+                ds4_gpu_hot_pipeline(g_glm_q6_k_down_f32_pipeline, "kernel_glm_q6_K_down_f32");
+            if (pipeline) {
+                ds4_gpu_glm_routed_moe_args args = {
+                    .in_dim = (uint32_t)in_dim,
+                    .mid_dim = (uint32_t)in_dim,
+                    .out_dim = (uint32_t)out_dim,
+                    .n_total_expert = 1,
+                    .n_expert_used = 1,
+                    .n_tokens = 1,
+                    .mid_token_stride = (uint32_t)in_dim,
+                    .down_type = weight_type,
+                    .tp_world = 1,
+                    .down_expert_bytes = weight_bytes,
+                    .down_row_bytes = row_bytes,
+                };
+                const int32_t expert = 0;
+                /* Two SIMD groups of N_R0_Q5_K = 4 or N_R0_Q6_K = 2 rows. */
+                const NSUInteger rows_ptg = q5 ? 8u : 4u;
+                id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+                [enc setComputePipelineState:pipeline];
+                [enc setBytes:&args length:sizeof(args) atIndex:0];
+                [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+                [enc setBytes:&expert length:sizeof(expert) atIndex:2];
+                [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:3];
+                [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:4];
+                [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + rows_ptg - 1u) / rows_ptg, 1, 1)
+                     threadsPerThreadgroup:MTLSizeMake(32, 2, 1)];
+                ds4_gpu_end_compute_encoder(cb, enc);
+
+                if (!ds4_gpu_finish_command_buffer(cb, owned, "Q5_K/Q6_K SIMD matvec")) return 0;
                 return 1;
             }
         }
@@ -31557,6 +31682,9 @@ static uint32_t ds4_gpu_routed_mv_nr0(uint32_t type) {
     case DS4_METAL_TENSOR_MXFP4:   return 2;
     case DS4_METAL_TENSOR_Q2_K:
     case DS4_METAL_TENSOR_IQ2_XXS: return 4;
+    /* Must match N_R0_IQ1_S. Two rows per SIMD group decode V4.1 Q1 routed
+     * experts ~1.5% faster than four on M5 Max; per-row sums are unchanged. */
+    case DS4_METAL_TENSOR_IQ1_S:   return 2;
     default:                       return 0;
     }
 }
@@ -31564,6 +31692,7 @@ static uint32_t ds4_gpu_routed_mv_nr0(uint32_t type) {
 static const char *ds4_gpu_metal_tensor_type_name(uint32_t type) {
     switch (type) {
     case DS4_METAL_TENSOR_IQ2_XXS: return "iq2_xxs";
+    case DS4_METAL_TENSOR_IQ1_S:   return "iq1_s";
     case DS4_METAL_TENSOR_Q2_K:    return "q2_k";
     case DS4_METAL_TENSOR_Q4_K:    return "q4_k";
     case DS4_METAL_TENSOR_Q5_K:    return "q5_k";
@@ -31675,6 +31804,7 @@ static id<MTLComputePipelineState> ds4_gpu_routed_mv_pipeline(uint32_t type) {
     case DS4_METAL_TENSOR_Q8_K:
         return ds4_gpu_get_mul_mv_pipeline("kernel_mul_mv_id_q8_K_f32", 2);
     case DS4_METAL_TENSOR_IQ2_XXS: return g_moe_mul_mv_id_iq2_xxs_pipeline;
+    case DS4_METAL_TENSOR_IQ1_S:   return g_moe_mul_mv_id_iq1_s_pipeline;
     case DS4_METAL_TENSOR_Q2_K:    return g_moe_mul_mv_id_q2_k_pipeline;
     case DS4_METAL_TENSOR_Q4_K:    return g_moe_mul_mv_id_q4_k_pipeline;
     case DS4_METAL_TENSOR_MXFP4:   return g_moe_mul_mv_id_mxfp4_pipeline;
@@ -31697,6 +31827,8 @@ static id<MTLComputePipelineState> ds4_gpu_routed_mm_pipeline(uint32_t type) {
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q8_K_f32", false);
     case DS4_METAL_TENSOR_IQ2_XXS:
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_iq2_xxs_f32", false);
+    case DS4_METAL_TENSOR_IQ1_S:
+        return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_iq1_s_f32", false);
     case DS4_METAL_TENSOR_Q2_K:
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q2_K_f32", false);
     case DS4_METAL_TENSOR_Q4_K:
@@ -31733,6 +31865,8 @@ static id<MTLComputePipelineState> ds4_gpu_routed_mm_f16_rhs_pipeline(uint32_t t
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q8_K_f16", false);
     case DS4_METAL_TENSOR_IQ2_XXS:
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_iq2_xxs_f16", false);
+    case DS4_METAL_TENSOR_IQ1_S:
+        return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_iq1_s_f16", false);
     case DS4_METAL_TENSOR_Q2_K:
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q2_K_f16", false);
     case DS4_METAL_TENSOR_Q4_K:

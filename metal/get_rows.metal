@@ -36,6 +36,13 @@ struct ds4_get_rows_block_q4_K {
     uchar qs[128];
 };
 
+struct ds4_get_rows_block_q6_K {
+    uchar ql[128];
+    uchar qh[64];
+    char scales[16];
+    half d;
+};
+
 static inline uchar2 ds4_get_rows_q4_K_scale_min(int j, int k, device const uchar *q) {
     return j < 4 ? uchar2{uchar(q[j + 0 + k] & 63), uchar(q[j + 4 + k] & 63)}
                  : uchar2{uchar((q[j + 4 + k] & 0x0f) | ((q[j - 4 + k] & 0xc0) >> 2)),
@@ -143,6 +150,45 @@ kernel void kernel_get_rows_q4_0_f32(
             const uint8_t packed = qb->qs[(uint)(i & 15)];
             const uint8_t q = (i < 16) ? (packed & 0x0f) : (packed >> 4);
             out[idx] = d * ((float)q - 8.0f);
+        }
+    }
+}
+
+/* ggml dequantize_row_q6_K, one element per lane: each 128-wide half holds
+ * four 32-wide quarters sharing ql (low/high nibble) and qh (2-bit fields). */
+kernel void kernel_get_rows_q6_K_f32(
+        constant ds4_metal_args_get_rows_q8_0 & args,
+        device const char    * src0,
+        device const char    * src1,
+        device       char    * dst,
+        uint3                  tgpig[[threadgroup_position_in_grid]],
+        ushort                 tiitg[[thread_index_in_threadgroup]],
+        ushort3                ntg [[threads_per_threadgroup]]) {
+    const int32_t block = (int32_t)tgpig.x;
+    const int32_t tok_i = (int32_t)tgpig.y;
+    if (tok_i >= args.n_tokens) return;
+
+    const int32_t token =
+        ((const device int32_t *)(src1 + (uint64_t)tok_i * args.token_stride))[0];
+    if (token < 0 || token >= args.n_vocab) return;
+
+    const device ds4_get_rows_block_q6_K *qb =
+        (const device ds4_get_rows_block_q6_K *)(src0 + (uint64_t)token * args.src_row_bytes) + block;
+    device float *out =
+        (device float *)(dst + (uint64_t)tok_i * args.dst_row_bytes);
+
+    const int32_t i0 = block * 256;
+    for (int32_t i = (int32_t)tiitg; i < 256; i += (int32_t)ntg.x) {
+        const int32_t idx = i0 + i;
+        if (idx < args.n_embd) {
+            const uint n = (uint)i >> 7u;
+            const uint quarter = ((uint)i >> 5u) & 3u;
+            const uint l = (uint)i & 31u;
+            const uint ql = ((uint)qb->ql[n * 64u + l + ((quarter & 1u) ? 32u : 0u)] >>
+                             (quarter >= 2u ? 4u : 0u)) & 0x0fu;
+            const uint qh = ((uint)qb->qh[n * 32u + l] >> (2u * quarter)) & 3u;
+            const int sc = (int)qb->scales[n * 8u + (l >> 4u) + 2u * quarter];
+            out[idx] = (float)qb->d * (float)sc * (float)((int)(ql | (qh << 4u)) - 32);
         }
     }
 }

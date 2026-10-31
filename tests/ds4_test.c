@@ -5241,6 +5241,146 @@ static void test_metal_router_weights_batch_exact(void) {
 }
 #endif
 
+#if defined(__APPLE__)
+/* Scalar ggml dequantize_row_q5_K / dequantize_row_q6_K for one block. */
+static void test_get_scale_min_k4(int j, const uint8_t *q, uint8_t *d, uint8_t *m) {
+    if (j < 4) {
+        *d = q[j] & 63;
+        *m = q[j + 4] & 63;
+    } else {
+        *d = (uint8_t)((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4));
+        *m = (uint8_t)((q[j + 4] >> 4) | ((q[j] >> 6) << 4));
+    }
+}
+
+static void test_dequant_k_block(uint32_t type, const uint8_t *b, float *y) {
+    if (type == 13u) {
+        uint16_t hd, hm;
+        memcpy(&hd, b, 2);
+        memcpy(&hm, b + 2, 2);
+        const float d = test_f16_to_f32(hd), min = test_f16_to_f32(hm);
+        const uint8_t *scales = b + 4, *qh = b + 16, *ql = b + 48;
+        int is = 0;
+        uint8_t u1 = 1, u2 = 2;
+        for (int j = 0; j < 256; j += 64) {
+            uint8_t sc, m;
+            test_get_scale_min_k4(is + 0, scales, &sc, &m);
+            const float d1 = d * sc, m1 = min * m;
+            test_get_scale_min_k4(is + 1, scales, &sc, &m);
+            const float d2 = d * sc, m2 = min * m;
+            for (int l = 0; l < 32; l++) *y++ = d1 * ((ql[l] & 0xF) + (qh[l] & u1 ? 16 : 0)) - m1;
+            for (int l = 0; l < 32; l++) *y++ = d2 * ((ql[l] >> 4) + (qh[l] & u2 ? 16 : 0)) - m2;
+            ql += 32; is += 2; u1 <<= 2; u2 <<= 2;
+        }
+    } else {
+        const uint8_t *ql = b, *qh = b + 128;
+        const int8_t *sc = (const int8_t *)(b + 192);
+        uint16_t hd;
+        memcpy(&hd, b + 208, 2);
+        const float d = test_f16_to_f32(hd);
+        for (int n = 0; n < 256; n += 128) {
+            for (int l = 0; l < 32; l++) {
+                const int is = l / 16;
+                y[l + 0]  = d * sc[is + 0] * (float)((int)((ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32);
+                y[l + 32] = d * sc[is + 2] * (float)((int)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32);
+                y[l + 64] = d * sc[is + 4] * (float)((int)((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32);
+                y[l + 96] = d * sc[is + 6] * (float)((int)((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32);
+            }
+            y += 128; ql += 64; qh += 32; sc += 8;
+        }
+    }
+}
+
+/* Q5_K/Q6_K dense weights (Unsloth V4.1 attention/shared/head) through the
+ * generic quant matmul at decode (SIMD matvec at 1, mv_ext at 4) and prefill
+ * (mm/NAX) widths, and
+ * the Q6_K embedding get-rows, against the scalar ggml dequantization. */
+static void test_metal_dense_q5_q6_k(void) {
+    const uint32_t in_dim = 512, out_dim = 64;
+    const uint32_t types[2] = {13u, 14u};
+    const uint32_t block_bytes[2] = {176u, 210u};
+    const uint32_t widths[3] = {1u, 4u, 64u};
+    for (int ti = 0; ti < 2; ti++) {
+        const uint64_t row_bytes = (uint64_t)(in_dim / 256u) * block_bytes[ti];
+        const uint64_t alloc = test_round_up_u64(out_dim * row_bytes, (uint64_t)getpagesize());
+        void *raw = NULL;
+        TEST_ASSERT(posix_memalign(&raw, (size_t)getpagesize(), (size_t)alloc) == 0);
+        if (!raw) return;
+        uint8_t *w = raw;
+        uint32_t seed = 0x9e3779b9u + (uint32_t)ti;
+        for (uint64_t i = 0; i < alloc; i++) {
+            seed = seed * 1664525u + 1013904223u;
+            w[i] = (uint8_t)(seed >> 24);
+        }
+        float *wf = malloc((size_t)out_dim * in_dim * sizeof(float));
+        float *x = malloc((size_t)64 * in_dim * sizeof(float));
+        float *y = malloc((size_t)64 * out_dim * sizeof(float));
+        TEST_ASSERT(wf && x && y);
+        if (!wf || !x || !y) { free(wf); free(x); free(y); free(raw); return; }
+        for (uint32_t o = 0; o < out_dim; o++) {
+            for (uint32_t b = 0; b < in_dim / 256u; b++) {
+                uint8_t *blk = w + o * row_bytes + (uint64_t)b * block_bytes[ti];
+                const uint16_t d = 0x2000, dmin = 0x1c00;
+                if (types[ti] == 13u) {
+                    memcpy(blk, &d, 2);
+                    memcpy(blk + 2, &dmin, 2);
+                } else {
+                    memcpy(blk + 208, &d, 2);
+                }
+                test_dequant_k_block(types[ti], blk, wf + (uint64_t)o * in_dim + b * 256u);
+            }
+        }
+        for (uint32_t i = 0; i < 64u * in_dim; i++)
+            x[i] = (float)((int)((i * 37u + 11u) % 97u) - 48) / 64.0f;
+        TEST_ASSERT(ds4_gpu_set_model_map(raw, alloc) != 0);
+        ds4_gpu_set_quality(false);
+        for (int wi = 0; wi < 3; wi++) {
+            const uint32_t n_tok = widths[wi];
+            ds4_gpu_tensor *xt = ds4_gpu_tensor_alloc((uint64_t)n_tok * in_dim * 4u);
+            ds4_gpu_tensor *yt = ds4_gpu_tensor_alloc((uint64_t)n_tok * out_dim * 4u);
+            TEST_ASSERT(xt && yt);
+            if (xt && yt) {
+                TEST_ASSERT(ds4_gpu_tensor_write(xt, 0, x, (uint64_t)n_tok * in_dim * 4u) != 0);
+                TEST_ASSERT(ds4_gpu_matmul_quant_tensor(yt, raw, alloc, 0, types[ti],
+                                                        in_dim, out_dim, xt, n_tok) != 0);
+                TEST_ASSERT(ds4_gpu_tensor_read(yt, 0, y, (uint64_t)n_tok * out_dim * 4u) != 0);
+                float max_rel = 0.0f;
+                for (uint32_t t = 0; t < n_tok; t++) {
+                    for (uint32_t o = 0; o < out_dim; o++) {
+                        double ref = 0.0, mag = 0.0;
+                        for (uint32_t i = 0; i < in_dim; i++) {
+                            const double p = (double)wf[(uint64_t)o * in_dim + i] * x[(uint64_t)t * in_dim + i];
+                            ref += p;
+                            mag += fabs(p);
+                        }
+                        const float rel = (float)(fabs(y[(uint64_t)t * out_dim + o] - ref) / (mag + 1e-6));
+                        if (rel > max_rel) max_rel = rel;
+                    }
+                }
+                /* mm stages weights and activations as half. */
+                TEST_ASSERT(max_rel < (n_tok > 8u ? 2e-3f : 1e-5f));
+            }
+            ds4_gpu_tensor_free(xt);
+            ds4_gpu_tensor_free(yt);
+        }
+        if (types[ti] == 14u) {
+            ds4_gpu_tensor *row = ds4_gpu_tensor_alloc((uint64_t)in_dim * 4u);
+            TEST_ASSERT(row != NULL);
+            if (row) {
+                const uint32_t token = 37u;
+                TEST_ASSERT(ds4_gpu_embed_token_quant_tensor(row, raw, alloc, 0, 14u,
+                                                             out_dim, token, in_dim) != 0);
+                TEST_ASSERT(ds4_gpu_tensor_read(row, 0, y, (uint64_t)in_dim * 4u) != 0);
+                for (uint32_t i = 0; i < in_dim; i++)
+                    TEST_ASSERT(y[i] == wf[(uint64_t)token * in_dim + i]);
+            }
+            ds4_gpu_tensor_free(row);
+        }
+        free(wf); free(x); free(y); free(raw);
+    }
+}
+#endif
+
 static void test_metal_kernel_group(void) {
     test_metal_f16_matvec_fast_nr0_4();
     test_metal_f16_prefill_matmul();
@@ -5250,6 +5390,7 @@ static void test_metal_kernel_group(void) {
     test_dspark_cache_window_crop();
     test_metal_q8_0_decode_pair_exact();
 #if defined(__APPLE__)
+    test_metal_dense_q5_q6_k();
     test_metal_f16_compressor_pair_state_store_exact();
     test_metal_compressor_ape_add_exact();
     test_metal_compressor_ratio4_pack_exact();
