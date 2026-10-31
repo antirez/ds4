@@ -371,6 +371,12 @@ bool ds4_tokens_starts_with(const ds4_tokens *tokens, const ds4_tokens *prefix);
 
 void ds4_tokenize_text(ds4_engine *e, const char *text, ds4_tokens *out);
 void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *out);
+/* `trusted` is a byte mask over `text`; only positions it marks may turn into
+ * control tokens. NULL keeps the historical scan-everything behavior. */
+void ds4_tokenize_rendered_chat_masked(ds4_engine *e, const char *text,
+                                       const unsigned char *trusted, ds4_tokens *out);
+bool ds4_text_has_untrusted_special(ds4_engine *e, const char *text,
+                                    const unsigned char *trusted);
 void ds4_chat_begin(ds4_engine *e, ds4_tokens *tokens);
 void ds4_encode_chat_prompt(
         ds4_engine *e,

@@ -688,19 +688,31 @@ static void tokens_append(ds4_tokens *dst, const ds4_tokens *src) {
     for (int i = 0; i < src->len; i++) ds4_tokens_push(dst, src->v[i]);
 }
 
-void ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
+void ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix_masked(
         ds4_engine *engine,
         const ds4_tokens *exact_prefix,
         const char *suffix_text,
+        const unsigned char *suffix_trusted,
         ds4_tokens *out) {
     ds4_tokens_copy(out, exact_prefix);
 
     ds4_tokens suffix = {0};
     /* The suffix may start with DS4 chat markers such as <｜User｜> or
-     * </think>, so use the rendered-chat tokenizer, not plain text BPE. */
-    ds4_tokenize_rendered_chat(engine, suffix_text ? suffix_text : "", &suffix);
+     * </think>, so use the rendered-chat tokenizer, not plain text BPE.
+     * Only the markers the renderer inserted are trusted. */
+    ds4_tokenize_rendered_chat_masked(engine, suffix_text ? suffix_text : "",
+                                      suffix_trusted, &suffix);
     tokens_append(out, &suffix);
     ds4_tokens_free(&suffix);
+}
+
+void ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
+        ds4_engine *engine,
+        const ds4_tokens *exact_prefix,
+        const char *suffix_text,
+        ds4_tokens *out) {
+    ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix_masked(
+        engine, exact_prefix, suffix_text, NULL, out);
 }
 
 int ds4_kvstore_store_len(const ds4_kvstore *kc, int tokens) {
