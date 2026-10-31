@@ -273,6 +273,29 @@ int ds4_engine_vision_encode_memory(ds4_engine *e,
                                     ds4_vision_embedding *out,
                                     char *error,
                                     size_t error_cap);
+/* Image token budgets (DeepSeek vision). max_tokens = 0 uses the engine default, which
+ * itself defaults to the checkpoint's deepseek4-vision.image.max_tokens (1024 for V4.1).
+ * DS4_VISION_BUDGET_NATIVE keeps native resolution, bounded only by the decoded-image
+ * limits. Embeddings made at a non-default budget get a grid-qualified fingerprint. */
+#define DS4_VISION_BUDGET_NATIVE UINT32_MAX
+int ds4_engine_vision_encode_memory_budget(ds4_engine *e,
+                                           const uint8_t *encoded,
+                                           size_t encoded_len,
+                                           uint32_t max_tokens,
+                                           ds4_vision_embedding *out,
+                                           char *error,
+                                           size_t error_cap);
+int ds4_engine_vision_encode_file_budget(ds4_engine *e,
+                                         const char *path,
+                                         uint32_t max_tokens,
+                                         ds4_vision_embedding *out,
+                                         char *error,
+                                         size_t error_cap);
+void ds4_engine_set_vision_max_tokens(ds4_engine *e, uint32_t max_tokens);
+uint32_t ds4_engine_vision_model_max_tokens(const ds4_engine *e);
+/* LLM tokens a width x height image costs at max_tokens (0 = engine default). */
+uint32_t ds4_engine_vision_token_cost(const ds4_engine *e, uint32_t width, uint32_t height,
+                                      uint32_t max_tokens);
 void ds4_vision_embedding_free(ds4_vision_embedding *embedding);
 int ds4_prompt_append_vision(ds4_engine *e,
                              ds4_tokens *tokens,

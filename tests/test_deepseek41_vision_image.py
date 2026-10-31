@@ -75,7 +75,13 @@ def main():
         finally:
             lib.ds4_deepseek4_image_patches_free(C.byref(patches))
             lib.ds4_deepseek4_image_layout_free(C.byref(layout))
-    for h, w in [(0, 1), (1, 0), (32, 32), (0xffffffff, 0xffffffff)]:
+    # Grids past the 1024-token default are valid layouts now that the budget is
+    # dynamic; only degenerate and overflowing grids are refused.
+    layout, err = Layout(), C.create_string_buffer(256)
+    assert lib.ds4_deepseek41_image_layout_build(C.byref(layout), 32, 32, err, len(err)), err.value
+    assert layout.token_count == 32 * 33 + 2 and layout.image_count == 32 * 32
+    lib.ds4_deepseek4_image_layout_free(C.byref(layout))
+    for h, w in [(0, 1), (1, 0), (0xffffffff, 0xffffffff)]:
         layout, err = Layout(), C.create_string_buffer(256)
         assert not lib.ds4_deepseek41_image_layout_build(C.byref(layout), h, w, err, len(err))
         assert not layout.types and not layout.perm
