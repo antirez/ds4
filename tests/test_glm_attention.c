@@ -206,6 +206,109 @@ static void attention_case(uint32_t tokens, uint32_t heads, uint32_t dim,
     free(kr); free(kv); free(low); free(q);
 }
 
+#ifdef __APPLE__
+static void metal_prefill_prefix_case(uint32_t heads, uint32_t count, uint32_t rope) {
+    enum { T = 8, D = 512, NOPE = 256, CAP = 8192, ID_OFFSET = 64, GUARD = 7 * D };
+    const char *flag = "DS4_METAL_DISABLE_GLM_PREFILL_PREFIX";
+    const char *env = getenv(flag);
+    char *saved = env ? strdup(env) : NULL;
+    check(!env || saved, "prefill environment copy");
+    const size_t n = (size_t)T * heads * D;
+    const size_t qn = (size_t)T * heads * (NOPE + rope);
+    const size_t kn = (size_t)CAP * D;
+    const size_t rn = rope ? (size_t)CAP * rope : 1;
+    const size_t idn = (size_t)T * count;
+    const size_t bytes = n * sizeof(float);
+    const size_t guarded_bytes = (n + GUARD) * sizeof(float);
+    float *q = malloc(qn * sizeof(float)), *low = malloc(bytes);
+    float *kv = malloc(kn * sizeof(float)), *kr = malloc(rn * sizeof(float));
+    int32_t *storage = malloc((ID_OFFSET + idn) * sizeof(int32_t));
+    float *ref = malloc(bytes), *oracle = malloc(bytes);
+    float *result = malloc(guarded_bytes), *poison = malloc(guarded_bytes);
+    check(q && low && kv && kr && storage && ref && oracle && result && poison,
+          "prefill host allocation");
+    /* Exactly f16-valued caches keep the CPU reference independent of rounding. */
+    for (size_t i = 0; i < kn; i++)
+        kv[i] = ((int)((i * 17 + i / D * 13) % 257) - 128) * 0.00390625f;
+    for (size_t i = 0; i < n; i++)
+        low[i] = ((int)((i * 13 + i / D * 7) % 127) - 63) * 0.00390625f;
+    for (size_t i = 0; i < qn; i++)
+        q[i] = ((int)((i * 7 + i / (NOPE + rope) * 3) % 67) - 33) * 0.015625f;
+    for (size_t i = 0; i < rn; i++)
+        kr[i] = ((int)((i * 11 + i / (rope ? rope : 1)) % 53) - 26) * 0.015625f;
+    for (size_t i = 0; i < ID_OFFSET; i++) storage[i] = -1;
+    int32_t *ids = storage + ID_OFFSET;
+    for (uint32_t t = 0; t < T; t++) {
+        /* 0..3: trailing sentinels; 4..5: holes with valid rows after; 6..7: empty. */
+        const uint32_t tail = t < 4 ? t : (t == 5 ? 3 : 0);
+        for (uint32_t i = 0; i < count; i++) {
+            /* Four-row pools plus up to three raw rows at stride 2051. */
+            uint32_t row = i < 2048 ?
+                (((i / 4) * 13 + t * 37) % (CAP / 4 - 1)) * 4 + i % 4 :
+                CAP - 4 + i - 2048;
+            if (i == 0) row = CAP - 1;
+            if (t >= 4 && (i == 1 || i == count / 2 - 1))
+                row = i == 1 ? UINT32_MAX : CAP;
+            if (i >= count - tail || t >= 6)
+                row = t == 7 || (t != 6 && i % 2) ? UINT32_MAX : CAP;
+            ids[(size_t)t * count + i] = (int32_t)row;
+        }
+    }
+    ds4_gpu_tensor *qg = upload(q, qn * sizeof(float));
+    ds4_gpu_tensor *lg = upload(low, bytes);
+    ds4_gpu_tensor *kg = upload_cache(kv, kn, true);
+    ds4_gpu_tensor *rg = upload_cache(kr, rn, true);
+    ds4_gpu_tensor *ib = upload(storage, (ID_OFFSET + idn) * sizeof(int32_t));
+    ds4_gpu_tensor *ig = ds4_gpu_tensor_view(ib, ID_OFFSET * sizeof(int32_t),
+                                           idn * sizeof(int32_t));
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(guarded_bytes);
+    check(ig && out, "prefill views/output allocation");
+    attention_reference(oracle, q, low, kv, kr, ids, T, heads, D,
+                        0, CAP, count, NOPE, rope, true);
+    for (int run = 0; run < 4; run++) {
+        const bool disabled = run == 0 || run == 3;
+        /* Presence disables the optimization, even for "0" or an empty value. */
+        check(disabled ? setenv(flag, run == 0 ? "0" : "", 1) == 0 :
+                         unsetenv(flag) == 0, "prefill selector");
+        for (size_t i = 0; i < n + GUARD; i++)
+            poison[i] = run % 2 ? -12345.0f : 12345.0f;
+        check(ds4_gpu_tensor_write(out, 0, poison, guarded_bytes), "prefill output poison");
+        check(ds4_gpu_synchronize(), "prefill pre-sync");
+        check(ds4_gpu_glm_attention_indexed_batch_lora_tensor(
+            out, qg, lg, kg, rg, ig, T, count, CAP, true,
+            heads, D, NOPE, rope, 4096, 10000, 1, 0, 1, 32, 1) &&
+            ds4_gpu_synchronize(), "prefill launch");
+        check(ds4_gpu_tensor_read(out, 0, result, guarded_bytes), "prefill read");
+        if (run == 0) memcpy(ref, result, bytes);
+        for (size_t i = 0; i < n; i++) {
+            const bool empty = i / (heads * D) >= 6;
+            if (!isfinite(result[i]) || result[i] == poison[i] ||
+                (empty && result[i] != 0.0f) ||
+                fabsf(result[i] - oracle[i]) > 0.002f ||
+                memcmp(result + i, ref + i, sizeof(float)) != 0) {
+                fprintf(stderr, "Metal prefill prefix heads=%u count=%u rope=%u "
+                        "disabled=%d run=%d index=%zu: %a != rollback %a, oracle %a\n",
+                        heads, count, rope, disabled, run, i,
+                        result[i], ref[i], oracle[i]);
+                exit(1);
+            }
+        }
+        check(memcmp(result + n, poison + n, GUARD * sizeof(float)) == 0,
+              "prefill partial-head output guard");
+    }
+    check(saved ? setenv(flag, saved, 1) == 0 : unsetenv(flag) == 0,
+          "prefill environment restore");
+    printf("Metal prefill prefix heads=%u count=%u rope=%u: "
+           "rollback/enabled bitwise and CPU reference PASS\n", heads, count, rope);
+    free(saved);
+    ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(ig); ds4_gpu_tensor_free(ib);
+    ds4_gpu_tensor_free(rg); ds4_gpu_tensor_free(kg);
+    ds4_gpu_tensor_free(lg); ds4_gpu_tensor_free(qg);
+    free(poison); free(result); free(oracle); free(ref); free(storage);
+    free(kr); free(kv); free(low); free(q);
+}
+#endif
+
 static void pooled_decode_cases(void) {
 #ifdef __APPLE__
     enum { D = 512, H = 8, V = 4, R = 64, C = 2056, S = 2051, B = 17,
@@ -420,6 +523,14 @@ int main(int argc, char **argv) {
         attention_case(256, 64, 512, 3840, 4096, false, true, true, true);
         ds4_gpu_cleanup();
     } else {
+#ifdef __APPLE__
+        const uint32_t prefill_heads[] = {8, 64, 17};
+        for (size_t h = 0; h < sizeof(prefill_heads) / sizeof(prefill_heads[0]); h++)
+            for (uint32_t rope = 0; rope <= 64; rope += 64) {
+                metal_prefill_prefix_case(prefill_heads[h], 17, rope);
+                metal_prefill_prefix_case(prefill_heads[h], 2051, rope);
+            }
+#endif
 #ifdef DS4_ROCM_BUILD
         for (int f16 = 0; f16 < 2; f16++) {
             attention_case(64, 17, 32, 0, 32, true, false, false, f16);

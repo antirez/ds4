@@ -565,6 +565,7 @@ static id<MTLComputePipelineState> g_glm_attention_indexed_batch_group2_pipeline
 static id<MTLComputePipelineState> g_glm_attention_indexed_batch_q2_group4_pipeline;
 static id<MTLComputePipelineState> g_glm_attention_indexed_batch_group8_pipeline;
 static id<MTLComputePipelineState> g_glm_attention_indexed_batch_lora_group8_vec_pipeline;
+static id<MTLComputePipelineState> g_glm_attention_indexed_batch_lora_group8_vec_prefix_fullheads_pipeline;
 static id<MTLComputePipelineState> g_glm_attention_indexed_batch_lora_group8_vec_valid_pipeline;
 static id<MTLComputePipelineState> g_glm_attention_indexed_batch_lora_group8_vec_valid_fullheads_pipeline;
 static id<MTLComputePipelineState> g_glm_attention_indexed_batch_lora_group8_vec_causal_pipeline;
@@ -9027,6 +9028,8 @@ int ds4_gpu_init(void) {
             ds4_gpu_get_pipeline("kernel_glm_attention_indexed_batch_group8");
         g_glm_attention_indexed_batch_lora_group8_vec_pipeline =
             ds4_gpu_get_pipeline("kernel_glm_attention_indexed_batch_lora_group8_vec");
+        g_glm_attention_indexed_batch_lora_group8_vec_prefix_fullheads_pipeline =
+            ds4_gpu_get_pipeline("kernel_glm_attention_indexed_batch_lora_group8_vec_prefix_fullheads");
         g_glm_attention_indexed_batch_lora_group8_vec_valid_pipeline =
             ds4_gpu_get_pipeline("kernel_glm_attention_indexed_batch_lora_group8_vec_valid");
         g_glm_attention_indexed_batch_lora_group8_vec_valid_fullheads_pipeline =
@@ -9127,6 +9130,7 @@ int ds4_gpu_init(void) {
             !g_glm_attention_indexed_batch_q2_group4_pipeline ||
             !g_glm_attention_indexed_batch_group8_pipeline ||
             !g_glm_attention_indexed_batch_lora_group8_vec_pipeline ||
+            !g_glm_attention_indexed_batch_lora_group8_vec_prefix_fullheads_pipeline ||
             !g_glm_attention_indexed_batch_lora_group8_vec_valid_pipeline ||
             !g_glm_attention_indexed_batch_lora_group8_vec_valid_fullheads_pipeline ||
             !g_glm_attention_indexed_batch_lora_group8_vec_causal_pipeline ||
@@ -11765,6 +11769,7 @@ void ds4_gpu_cleanup(void) {
         g_glm_attention_indexed_batch_q2_group4_pipeline = nil;
         g_glm_attention_indexed_batch_group8_pipeline = nil;
         g_glm_attention_indexed_batch_lora_group8_vec_pipeline = nil;
+        g_glm_attention_indexed_batch_lora_group8_vec_prefix_fullheads_pipeline = nil;
         g_glm_attention_indexed_batch_lora_group8_vec_valid_pipeline = nil;
         g_glm_attention_indexed_batch_lora_group8_vec_valid_fullheads_pipeline = nil;
         g_glm_attention_indexed_batch_lora_group8_vec_causal_pipeline = nil;
@@ -37796,6 +37801,11 @@ static int ds4_gpu_glm_attention_indexed_batch_lora_layout_tensor(
             pipeline = ds4_gpu_hot_pipeline(
                     g_glm_attention_indexed_batch_lora_group8_vec_valid_pipeline,
                     "kernel_glm_attention_indexed_batch_lora_group8_vec_valid");
+        } else if (use_vec_lora && full_head_groups && !g_tp_attn_head_split &&
+                   !getenv("DS4_METAL_DISABLE_GLM_PREFILL_PREFIX")) {
+            pipeline = ds4_gpu_hot_pipeline(
+                    g_glm_attention_indexed_batch_lora_group8_vec_prefix_fullheads_pipeline,
+                    "kernel_glm_attention_indexed_batch_lora_group8_vec_prefix_fullheads");
         } else if (use_vec_lora) {
             pipeline = ds4_gpu_hot_pipeline(
                     g_glm_attention_indexed_batch_lora_group8_vec_pipeline,
