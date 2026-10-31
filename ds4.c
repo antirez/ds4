@@ -43031,10 +43031,16 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
     ds41_prefill_row active = {0};
     ds4_engram_history history[DS4_TP_BATCH_MAX_ROWS];
     uint32_t positions[DS4_TP_BATCH_MAX_ROWS];
-    /* Only the leading prefill rows share a session. Keep their disk reads
-     * and hash history distinct until the final row is published. */
-    float (*engram)[2][DS4_ENGRAM_COLS * DS4_ENGRAM_DIM] = prefill_rows > 1 ?
-        malloc(prefill_rows * sizeof(*engram)) : NULL;
+    /* Consecutive prompt or verifier rows may share a session. Keep their
+     * Engram inputs distinct until each table has consumed the whole batch. */
+    uint32_t ids[DS4_TP_BATCH_MAX_ROWS][2][DS4_ENGRAM_COLS];
+    float (*engram)[DS4_ENGRAM_COLS * DS4_ENGRAM_DIM] = prefill_rows > 1 ?
+        malloc(2u * prefill_rows * sizeof(*engram)) : NULL;
+#ifdef __APPLE__
+    const bool batch_read = prefill_rows == rows && !getenv("DS4_METAL_DISABLE_V41_STEP_ENGRAM_BATCH");
+#else
+    const bool batch_read = false;
+#endif
     ds4_gpu_tensor *queries[DS4_TP_BATCH_MAX_ROWS] = {0};
     ds4_gpu_tensor *heads[DS4_TP_BATCH_MAX_ROWS] = {0};
     bool ok = rows <= g->prefill_cap && (prefill_rows <= 1 || engram);
@@ -43058,19 +43064,24 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
     const float initial_pre[] = {1, 0, 0, 0};
     for (int i = 0; ok && i < count; i++) {
         ds41_gpu_graph *s = graphs[i];
-        uint32_t ids[2][DS4_ENGRAM_COLS];
         const bool continued = i > 0 && (uint32_t)i < prefill_rows;
         positions[i] = s->pos + (continued ? (uint32_t)i : 0u);
         history[i] = continued ? history[i - 1] : s->history;
-        ok = ds4_engram_hash(&s->engram, &history[i], &tokens[i], NULL, 1, &ids[0][0]);
-        float (*disk_rows)[DS4_ENGRAM_COLS * DS4_ENGRAM_DIM] =
-            engram && (uint32_t)i < prefill_rows ? engram[i] : s->rows;
-        for (unsigned table = 0; ok && table < 2; table++)
-            ok = ds4_engram_read(&s->table[table], ids[table], DS4_ENGRAM_COLS, disk_rows[table]);
+        ok = ds4_engram_hash(&s->engram, &history[i], &tokens[i], NULL, 1, &ids[i][0][0]);
+        for (unsigned table = 0; ok && !batch_read && table < 2; table++) {
+            float *dst = engram && (uint32_t)i < prefill_rows ?
+                engram[table * prefill_rows + i] : s->rows[table];
+            ok = ds4_engram_read(&s->table[table], ids[i][table], DS4_ENGRAM_COLS, dst);
+        }
         if (ok) ok = ds4_gpu_tensor_write(g->rows_view[i].pre, 0, initial_pre, sizeof(initial_pre)) &&
             ds4_gpu_embed_token_hc_tensor(g->rows_view[i].residual, model->map, model->size,
                 weights->token_embd->abs_offset, DS4_N_VOCAB, (uint32_t)tokens[i], DS4_N_EMBD, DS4_N_HC);
     }
+    /* Each table uses the same read-only descriptor throughout these rows.
+     * The batch reader deduplicates row IDs and restores their original order. */
+    for (unsigned table = 0; ok && batch_read && table < 2; table++)
+        ok = ds4_engram_read_batch(&g->table[table], ids[0][table], rows,
+            2u * DS4_ENGRAM_COLS, engram[table * rows]);
     if (ok) ok = ds4_gpu_tensor_write(g->prefill_tokens, 0, tokens, rows * sizeof(int));
     uint32_t il = 0;
     for (; ok && il < DS4_N_LAYER; il++) {
@@ -43084,7 +43095,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
                 const uint64_t dst_off = table == 0 ? 0 :
                     (uint64_t)i * engram_row_bytes;
                 ok = ds4_gpu_tensor_write(dst, dst_off,
-                    engram && (uint32_t)i < prefill_rows ? engram[i][table] : s->rows[table],
+                    engram && (uint32_t)i < prefill_rows ? engram[table * prefill_rows + i] : s->rows[table],
                     sizeof(s->rows[table]));
             }
         }
