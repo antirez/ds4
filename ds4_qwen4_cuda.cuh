@@ -1147,6 +1147,9 @@ __global__ void matvec_q8(float *out, const char *w, const float *x,
     if (row >= M) return;
     const char *wr = w+(uint64_t)row*stride;
     float acc[ROWS] = {};
+    /* Issue independent weight loads ahead during single-token decode.
+     * Each lane still accumulates the same four quants in the same order. */
+    #pragma unroll (ROWS == 1 ? 4 : 0)
     for (unsigned i = lane*4; i < K; i += 128) {
         const char *b = wr+(i/32)*34;
         const float scale = __half2float(*(const __half *)b);
