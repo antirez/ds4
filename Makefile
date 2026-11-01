@@ -9,6 +9,7 @@ endif
 SAMPLING_TEST := tests/test_sampling
 GLM53_KDA_TEST := tests/test_glm53_kda
 QWEN4_KERNEL_TEST := tests/test_qwen4_kernels
+F16_ROW_BATCH_TEST := tests/test_f16_row_batch
 GLM53_KDA_ROCM_TEST := tests/test_glm53_kda_rocm
 
 DEBUG_FLAGS ?= -g
@@ -898,6 +899,16 @@ tests/test_qwen4_kernels.o: tests/test_qwen4_kernels.c ds4_gpu.h ds4.h
 
 $(QWEN4_KERNEL_TEST): tests/test_qwen4_kernels.o ds4_metal.o ds4_image.o
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+tests/test_f16_row_batch.o: tests/test_f16_row_batch.c ds4_gpu.h ds4_deepseek41_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ tests/test_f16_row_batch.c
+
+$(F16_ROW_BATCH_TEST): tests/test_f16_row_batch.o ds4_metal.o ds4_image.o
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+.PHONY: test-f16-row-batch
+test-f16-row-batch: $(F16_ROW_BATCH_TEST)
+	./$(F16_ROW_BATCH_TEST)
 
 endif
 

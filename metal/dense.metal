@@ -1363,6 +1363,210 @@ typedef decltype(kernel_mul_mv_t_t_4<half, half4, half, half4>) mul_mv_t_t_4;
 template [[host_name("kernel_mul_mv_f32_f32_4")]] kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<float, float4, float, float4>;
 template [[host_name("kernel_mul_mv_f16_f32_4")]] kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<half,  half4,  float, float4>;
 
+/* Reduction for the small-row F16 matvec: one independent copy of the
+ * single-row simd_sum -> threadgroup -> simd_sum tree per (output row,
+ * activation row).  Keeping the tree per row is what makes every result
+ * bit-identical to kernel_mul_mv_f16_f32_4. */
+template<short NR0, short NACT>
+static inline void helper_mv_reduce_and_write_rows_f16(
+        device float * dst_f32,
+        float sumf[NR0][NACT],
+        const int r0,
+        const int r1,
+        const int ne01,
+        const int ne11,
+        const int ne0,
+        ushort tiisg,
+        ushort sgitg,
+        threadgroup char * shmem) {
+    constexpr short NW = N_SIMDWIDTH;
+
+    threadgroup float * shmem_f32[NR0][NACT];
+
+    for (short row = 0; row < NR0; ++row) {
+        for (short a = 0; a < NACT; ++a) {
+            shmem_f32[row][a] = (threadgroup float *) shmem + NW*(row*NACT + a);
+
+            if (sgitg == 0) {
+                shmem_f32[row][a][tiisg] = 0.0f;
+            }
+
+            sumf[row][a] = simd_sum(sumf[row][a]);
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (short row = 0; row < NR0; ++row) {
+        for (short a = 0; a < NACT; ++a) {
+            if (tiisg == 0) {
+                shmem_f32[row][a][sgitg] = sumf[row][a];
+            }
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (short row = 0; row < NR0; ++row) {
+        for (short a = 0; a < NACT; ++a) {
+            float tot = simd_sum(shmem_f32[row][a][tiisg]);
+
+            if (tiisg == 0 && sgitg == 0 &&
+                r0 + row < ne01 && r1 + a < ne11) {
+                dst_f32[(uint64_t)(r1 + a)*ne0 + r0 + row] = tot;
+            }
+        }
+    }
+}
+
+/* Exact-row F16 matvec for small decode batches (2..8 activation rows).
+ *
+ * kernel_mul_mv_f16_f32_4 launches one threadgroup per activation row, so a
+ * broad projection streams the same weight row from DRAM once per activation.
+ * This variant keeps NR0 output rows per threadgroup but evaluates NACT
+ * activation rows there; the weight slice is loaded from the same address for
+ * each activation row, so it stays hot in L1 instead of being re-streamed.
+ * Every activation row keeps the original K walk, per-thread accumulation
+ * order and reduction tree.  The host picks NACT == rows, so each activation
+ * row appears in exactly one threadgroup. */
+template<short NR0, short NACT>
+void kernel_mul_mv_f16_f32_rows_impl(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NB = 32;
+    constexpr short NF = 16;
+    constexpr short NF4 = NF/4;
+
+    const int nb = args.ne00/NB;
+    const int r0 = tgpig.x*NR0;
+    const int r1 = tgpig.y*NACT;
+    const int im = tgpig.z;
+
+    const uint i12 = im%args.ne12;
+    const uint i13 = im/args.ne12;
+
+    const int act_count = args.ne11 - r1 < (int)NACT ? args.ne11 - r1 : (int)NACT;
+
+    device const half  * ax [NR0];
+    device const half4 * ax4[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        const uint64_t offset0 = (r0 + row)*args.nb01 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
+
+        ax [row] = (device const half  *) ((device char *) src0 + offset0);
+        ax4[row] = (device const half4 *) ((device char *) src0 + offset0);
+    }
+
+    device const float  * ay [NACT];
+    device const float4 * ay4[NACT];
+    device const float4 * yb4[NACT];
+    const short ix = tiisg/(NW/NF);
+    const short il = tiisg%(NW/NF);
+    const int ib0 = sgitg*NF + ix;
+    FOR_UNROLL (short a = 0; a < NACT; ++a) {
+        const uint64_t offset1 = (r1 + a)*args.nb11 + i12*args.nb12 + i13*args.nb13;
+
+        ay [a] = (device const float  *) (src1 + offset1);
+        ay4[a] = (device const float4 *) (src1 + offset1);
+        yb4[a] = ay4[a] + (ib0*NB + il*NF)/4;
+    }
+
+    float sumf[NR0][NACT];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        FOR_UNROLL (short a = 0; a < NACT; ++a) {
+            sumf[row][a] = 0.f;
+        }
+    }
+
+    for (int ib = ib0; ib < nb; ib += NSG*NF) {
+        /* The weight slice stays hot in L1 across the activation rows; the
+         * per-row expression is the single-row kernel verbatim, so the
+         * multiply-add sequence is unchanged. */
+        FOR_UNROLL (short a = 0; a < NACT; ++a) {
+            if (a >= act_count) break;
+
+            float4 yl4[NF4];
+            FOR_UNROLL (short i = 0; i < NF4; ++i) {
+                yl4[i] = yb4[a][i];
+            }
+
+            FOR_UNROLL (short row = 0; row < NR0; ++row) {
+                device const half4 * xb4 = ax4[row] + (ib*NB + il*NF)/4;
+
+                float sumq = 0.f;
+                FOR_UNROLL (short i = 0; i < NF4; ++i) {
+                    sumq += dot(float4(xb4[i]), yl4[i]);
+                }
+
+                sumf[row][a] += sumq;
+            }
+        }
+
+        FOR_UNROLL (short a = 0; a < NACT; ++a) {
+            yb4[a] += NSG*NF*NW/4;
+        }
+    }
+
+    for (int i = nb*NB + sgitg*NW + tiisg; i < args.ne00; i += NW*NSG) {
+        float xv[NR0];
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            xv[row] = ax[row][i];
+        }
+        FOR_UNROLL (short a = 0; a < NACT; ++a) {
+            if (a >= act_count) break;
+
+            FOR_UNROLL (short row = 0; row < NR0; ++row) {
+                sumf[row][a] += xv[row] * ay[a][i];
+            }
+        }
+    }
+
+    device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1;
+
+    helper_mv_reduce_and_write_rows_f16<NR0, NACT>(
+        dst_f32, sumf, r0, r1, args.ne01, args.ne11, args.ne0,
+        tiisg, sgitg, shmem);
+}
+
+#define DS4_F16_ROWS_KERNEL(NACT) \
+[[host_name("kernel_mul_mv_f16_f32_rows" #NACT)]] \
+kernel void kernel_mul_mv_f16_f32_rows##NACT( \
+        constant ds4_metal_args_mul_mv & args, \
+        device const char * src0, \
+        device const char * src1, \
+        device       char * dst, \
+        threadgroup  char * shmem [[threadgroup(0)]], \
+        uint3  tgpig [[threadgroup_position_in_grid]], \
+        ushort tiisg [[thread_index_in_simdgroup]], \
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) { \
+    switch (args.nr0) { \
+    case 1: kernel_mul_mv_f16_f32_rows_impl<1, NACT>( \
+        args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break; \
+    case 2: kernel_mul_mv_f16_f32_rows_impl<2, NACT>( \
+        args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break; \
+    case 4: kernel_mul_mv_f16_f32_rows_impl<4, NACT>( \
+        args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break; \
+    } \
+}
+
+DS4_F16_ROWS_KERNEL(2)
+DS4_F16_ROWS_KERNEL(3)
+DS4_F16_ROWS_KERNEL(4)
+DS4_F16_ROWS_KERNEL(5)
+DS4_F16_ROWS_KERNEL(6)
+DS4_F16_ROWS_KERNEL(7)
+DS4_F16_ROWS_KERNEL(8)
+
+#undef DS4_F16_ROWS_KERNEL
+
 // DS4 compressor projections always compute two same-shaped F16 matvecs from
 // the same normalized activation: one for projected KV and one for pooling
 // scores.  This paired variant keeps the exact dense F16 row-reduction shape

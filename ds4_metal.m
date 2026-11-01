@@ -21161,14 +21161,205 @@ int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out,
         weight_offset, in_dim, out_dim, x, n_tok, false);
 }
 
+static int ds4_gpu_f16_rows_dispatch(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t                n_rows,
+        uint64_t                in_offset,
+        uint64_t                in_row_stride,
+        uint64_t                out_offset,
+        uint64_t                out_row_stride);
+
 int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out,
                                  const void *model_map, uint64_t model_size,
                                  uint64_t weight_offset, uint32_t width,
                                  uint32_t outputs, uint32_t rows,
                                  const ds4_gpu_tensor *in) {
     if (!width || !outputs || !rows || rows > 8192u || !model_map) return 0;
+    /* 2..8 exact rows keep the weight slice in L1 across activation rows.
+     * Measured rows 2..6: out 2304 is neutral to 1.17x, out 4096+ wins
+     * 1.03..2.2x, so keep the per-row kernel below 2048 output rows. */
+    if (rows >= 2u && rows <= 8u && outputs >= 2048u &&
+        width >= 32u && (width % 4u) == 0 &&
+        ds4_gpu_env_bool("DS4_METAL_F16_ROWS_LEGACY") <= 0) {
+        return ds4_gpu_f16_rows_dispatch(out, model_map, model_size,
+            weight_offset, width, outputs, in, rows,
+            0, width, 0, outputs);
+    }
     return ds4_gpu_matmul_f16_tensor_impl(out, model_map, model_size,
         weight_offset, width, outputs, in, rows, true);
+}
+
+/* Exact-row F16 matvec for 2..8 activation rows.
+ *
+ * kernel_mul_mv_f16_f32_4 launches one threadgroup per activation row, so a
+ * broad projection re-reads the same weight row once per activation.  The rows
+ * kernel evaluates NACT activation rows in one threadgroup, hitting the same
+ * weight address for each row so the slice stays hot in L1; every row keeps
+ * the single-row K walk and reduction tree.
+ * in_offset/out_offset and the strides are in floats, so the DSpark
+ * attention-output groups stay in their row-major layout without a repack.
+ * Returns 0 on failure; the caller keeps the per-row path for ineligible
+ * shapes. */
+static int ds4_gpu_f16_rows_dispatch(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t                n_rows,
+        uint64_t                in_offset,
+        uint64_t                in_row_stride,
+        uint64_t                out_offset,
+        uint64_t                out_row_stride) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!out || !x || !model_map || n_rows < 2u || n_rows > 8u ||
+        in_dim < 32u || out_dim == 0 || (in_dim % 4u) != 0 ||
+        in_dim > INT32_MAX || out_dim > INT32_MAX ||
+        in_row_stride < in_dim || out_row_stride < out_dim ||
+        out_row_stride > INT32_MAX) {
+        return 0;
+    }
+
+    /* Callers pass float tensors; every row must stay inside its buffer. */
+    const uint64_t in_last = (uint64_t)(n_rows - 1u)*in_row_stride + in_dim;
+    const uint64_t out_last = (uint64_t)(n_rows - 1u)*out_row_stride + out_dim;
+    const uint64_t in_elems = ds4_gpu_tensor_bytes(x) / sizeof(float);
+    const uint64_t out_elems = ds4_gpu_tensor_bytes(out) / sizeof(float);
+    if (in_offset > in_elems || in_last > in_elems - in_offset ||
+        out_offset > out_elems || out_last > out_elems - out_offset) {
+        fprintf(stderr, "ds4: Metal F16 row matvec received undersized activation buffers\n");
+        return 0;
+    }
+
+    const uint64_t row_bytes = in_dim * sizeof(uint16_t);
+    if (out_dim > UINT64_MAX / row_bytes) return 0;
+    const uint64_t weight_bytes = row_bytes * out_dim;
+    if (weight_offset > model_size ||
+        weight_bytes > model_size - weight_offset) {
+        fprintf(stderr, "ds4: Metal F16 row matvec range is outside the mapped model\n");
+        return 0;
+    }
+
+    uint64_t inner_offset = 0;
+    id<MTLBuffer> wbuf = ds4_gpu_wrap_model_range(
+        model_map, model_size, weight_offset, weight_bytes, &inner_offset);
+    if (!wbuf) return 0;
+
+    @autoreleasepool {
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+        if (!xbuf || !outbuf) return 0;
+
+        ds4_gpu_f16_matvec_args mv_args =
+            ds4_gpu_make_f16_mv_args(in_dim, out_dim);
+        mv_args.ne11 = mv_args.ne1 = (int32_t)n_rows;
+        mv_args.nb11 = in_row_stride * sizeof(float);
+        mv_args.nb12 = mv_args.nb13 = 0;
+        mv_args.ne0 = (int32_t)out_row_stride;
+
+        ds4_gpu_mv_dispatch mv_dispatch =
+            ds4_gpu_make_plain_mv_dispatch(in_dim, 0);
+        if (!g_quality_mode && (out_dim == 512u || out_dim == 1024u) && in_dim >= 4096u) {
+            mv_dispatch.nr0 = 4;
+        }
+        if (ds4_gpu_plain_mv_single_row(out_dim)) {
+            mv_dispatch.nr0 = 1;
+        }
+        mv_args.nr0 = mv_dispatch.nr0;
+
+        char rows_fn[64];
+        snprintf(rows_fn, sizeof(rows_fn),
+                 "kernel_mul_mv_f16_f32_rows%u", n_rows);
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_mul_mv_pipeline(rows_fn, mv_dispatch.nsg);
+        if (!pipeline) return 0;
+
+        const NSUInteger smem = (NSUInteger)32u *
+            (NSUInteger)mv_dispatch.nr0 * (NSUInteger)n_rows * sizeof(float);
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&mv_args length:sizeof(mv_args) atIndex:0];
+        [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+        [enc setBuffer:xbuf
+                offset:(NSUInteger)(ds4_gpu_tensor_offset(x) +
+                                    in_offset * sizeof(float))
+               atIndex:2];
+        [enc setBuffer:outbuf
+                offset:(NSUInteger)(ds4_gpu_tensor_offset(out) +
+                                    out_offset * sizeof(float))
+               atIndex:3];
+        [enc setThreadgroupMemoryLength:smem atIndex:0];
+        [enc dispatchThreadgroups:
+                MTLSizeMake(((NSUInteger)out_dim +
+                             (NSUInteger)mv_dispatch.nr0 - 1u) /
+                                (NSUInteger)mv_dispatch.nr0,
+                            1,
+                            1)
+             threadsPerThreadgroup:
+                MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        return ds4_gpu_finish_command_buffer(
+            cb, owned, "F16 exact decode-row matvec");
+    }
+}
+
+/* Deliberately not gated by the 2048 threshold above: the DSpark
+ * attention-output group is out 1024, and merging its 40 draft matvecs into
+ * 8 group dispatches wins 1.45x per stage (legacy 1.041 ms, rows 0.718 ms,
+ * measured with an open command batch). */
+int ds4_gpu_dsv41_projection_rows_strided(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                width,
+        uint32_t                outputs,
+        uint32_t                rows,
+        const ds4_gpu_tensor *in,
+        uint64_t                in_offset,
+        uint64_t                in_row_stride,
+        uint64_t                out_offset,
+        uint64_t                out_row_stride) {
+    if (!width || !outputs || !rows || rows > 8u ||
+        !in_row_stride || !out_row_stride) {
+        return 0;
+    }
+    if (rows >= 2u && width >= 32u && (width % 4u) == 0 &&
+        ds4_gpu_env_bool("DS4_METAL_F16_ROWS_LEGACY") <= 0) {
+        return ds4_gpu_f16_rows_dispatch(out, model_map, model_size,
+            weight_offset, width, outputs, in, rows, in_offset, in_row_stride,
+            out_offset, out_row_stride);
+    }
+
+    /* Per-row fallback (also the A/B baseline): one dispatch per row. */
+    for (uint32_t r = 0; r < rows; r++) {
+        ds4_gpu_tensor *xr = ds4_gpu_tensor_view((ds4_gpu_tensor *)in,
+            (in_offset + (uint64_t)r * in_row_stride) * sizeof(float),
+            (uint64_t)width * sizeof(float));
+        ds4_gpu_tensor *orr = ds4_gpu_tensor_view(out,
+            (out_offset + (uint64_t)r * out_row_stride) * sizeof(float),
+            (uint64_t)outputs * sizeof(float));
+        const int ok = xr && orr && ds4_gpu_matmul_f16_tensor(
+            orr, model_map, model_size, weight_offset,
+            width, outputs, xr, 1);
+        ds4_gpu_tensor_free(xr);
+        ds4_gpu_tensor_free(orr);
+        if (!ok) return 0;
+    }
+    return 1;
 }
 
 int ds4_gpu_matmul_f16_pair_tensor(

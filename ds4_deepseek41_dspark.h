@@ -202,18 +202,40 @@ static bool ds41_dspark_attention_output(ds41_prefill_row *b, const ds4_model *m
     const uint32_t groups = DS4_N_OUT_GROUP, width = DS4_N_HEAD * DS4_N_HEAD_DIM / groups;
     uint64_t weight_row;
     if (!tensor_nbytes(l->attn_output_a->type, width, &weight_row)) return false;
-    for (uint32_t row = 0; row < DS41_DRAFT_ROWS; row++) {
+    if (l->attn_output_a->type == DS4_TENSOR_F16) {
+        /* One exact-row dispatch per group instead of one per (row, group):
+         * the draft rows share each weight row, and every row keeps the
+         * single-row K walk and reduction tree.  Rounding the complete low
+         * rows once afterwards matches the old per-slice ds41_matmul(..., true)
+         * because BF16 rounding is elementwise. */
+        const uint64_t in_stride = (uint64_t)groups * width;
+        const uint64_t out_stride = (uint64_t)groups * DS4_N_LORA_O;
         for (uint32_t group = 0; group < groups; group++) {
             ds4_tensor slice = *l->attn_output_a;
-            slice.abs_offset += group * DS4_N_LORA_O * weight_row;
+            slice.abs_offset += (uint64_t)group * DS4_N_LORA_O * weight_row;
             slice.dim[1] = DS4_N_LORA_O;
-            ds4_gpu_tensor *x = ds4_gpu_tensor_view(b->heads,
-                ((uint64_t)row * groups + group) * width * 4u, width * 4u);
-            ds4_gpu_tensor *y = ds4_gpu_tensor_view(b->low,
-                ((uint64_t)row * groups + group) * DS4_N_LORA_O * 4u, DS4_N_LORA_O * 4u);
-            const bool ok = x && y && ds41_matmul(y, m, &slice, x, true);
-            ds4_gpu_tensor_free(y); ds4_gpu_tensor_free(x);
-            if (!ok) return false;
+            if (!ds4_gpu_dsv41_projection_rows_strided(
+                    b->low, m->map, m->size, slice.abs_offset,
+                    width, DS4_N_LORA_O, DS41_DRAFT_ROWS, b->heads,
+                    (uint64_t)group * width, in_stride,
+                    (uint64_t)group * DS4_N_LORA_O, out_stride)) return false;
+        }
+        if (!ds4_gpu_dsv41_quantize(b->low, groups * DS4_N_LORA_O,
+                                    DS41_DRAFT_ROWS, DS4_V41_BF16)) return false;
+    } else {
+        for (uint32_t row = 0; row < DS41_DRAFT_ROWS; row++) {
+            for (uint32_t group = 0; group < groups; group++) {
+                ds4_tensor slice = *l->attn_output_a;
+                slice.abs_offset += group * DS4_N_LORA_O * weight_row;
+                slice.dim[1] = DS4_N_LORA_O;
+                ds4_gpu_tensor *x = ds4_gpu_tensor_view(b->heads,
+                    ((uint64_t)row * groups + group) * width * 4u, width * 4u);
+                ds4_gpu_tensor *y = ds4_gpu_tensor_view(b->low,
+                    ((uint64_t)row * groups + group) * DS4_N_LORA_O * 4u, DS4_N_LORA_O * 4u);
+                const bool ok = x && y && ds41_matmul(y, m, &slice, x, true);
+                ds4_gpu_tensor_free(y); ds4_gpu_tensor_free(x);
+                if (!ok) return false;
+            }
         }
     }
     return ds41_dspark_matmul_batch(b->block, m, l->attn_output_b, b->low, DS41_DRAFT_ROWS, true);
