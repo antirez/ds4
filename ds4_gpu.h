@@ -3354,6 +3354,7 @@ typedef struct {
     uint64_t hash_router_bias[3];
     ds4_deepseek4_vision_layer_weights layer[DS4_DEEPSEEK4_VISION_LAYERS];
     uint32_t projection_dim;
+    uint32_t image_max_tokens;   /* model default budget (deepseek4-vision.image.max_tokens) */
 } ds4_deepseek4_vision_weights;
 #endif
 

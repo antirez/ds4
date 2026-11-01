@@ -7382,8 +7382,15 @@ static void deepseek4_vision_weights_bind(
                       required_u32(m, "deepseek4-vision.patch_size"), 14u);
     config_expect_u32("DeepSeek vision downsample_ratio",
                       required_u32(m, "deepseek4-vision.downsample_ratio"), 3u);
-    config_expect_u32("DeepSeek vision max_tokens",
-                      required_u32(m, "deepseek4-vision.image.max_tokens"), v41 ? 1024u : 384u);
+    /* The image token budget is a preprocessing default, not an architectural limit
+     * (the ViT computes its 2D RoPE per grid). Keep the checkpoint's value as the default
+     * and let callers override it per engine or per image. V4's layout is fixed at 384
+     * tokens including alignment pads, so V4 stays at its 381-token body budget. */
+    {
+        const uint32_t meta_max = required_u32(m, "deepseek4-vision.image.max_tokens");
+        if (meta_max < 8u) ds4_die("DeepSeek vision image.max_tokens is implausibly small");
+        w->image_max_tokens = v41 ? meta_max : DS4_DEEPSEEK4_IMAGE_TOKENS_DEFAULT;
+    }
     config_expect_u32("DeepSeek vision min_pixels",
                       required_u32(m, "deepseek4-vision.image.min_pixels"), v41 ? 295936u : 147456u);
     config_expect_u32("DeepSeek vision max_width_height_ratio",
@@ -43237,6 +43244,7 @@ struct ds4_engine {
     bool metal_ready;
     bool mtp_ready;
     bool vision_ready;
+    uint32_t vision_max_tokens;     /* engine default image budget; 0 = the model's */
     bool vision_map_ready;
     bool share_session_prefill_workspace;
 #ifndef DS4_NO_GPU
@@ -73644,9 +73652,37 @@ int ds4_chat_append_multimodal_message(
     return 1;
 }
 
+/* Effective DeepSeek image budget: explicit per-image value, else the engine default,
+ * else the checkpoint's default. V4 (Vision-Exp) has a fixed 384-token layout. */
+static uint32_t ds4_engine_resolve_image_budget(const ds4_engine *e, uint32_t requested) {
+    const uint32_t model = e->deepseek4_vision_weights.image_max_tokens ?
+        e->deepseek4_vision_weights.image_max_tokens : DS4_DEEPSEEK41_IMAGE_TOKENS_DEFAULT;
+    uint32_t b = requested ? requested : (e->vision_max_tokens ? e->vision_max_tokens : model);
+    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41 && b > model) b = model;
+    return b;
+}
+
+static int ds4_engine_vision_encode_image_budget(
+        ds4_engine            *e,
+        const ds4_image       *image,
+        uint32_t               max_tokens,
+        ds4_vision_embedding  *out,
+        char                  *error,
+        size_t                 error_cap);
+
 static int ds4_engine_vision_encode_image(
         ds4_engine            *e,
         const ds4_image       *image,
+        ds4_vision_embedding  *out,
+        char                  *error,
+        size_t                 error_cap) {
+    return ds4_engine_vision_encode_image_budget(e, image, 0, out, error, error_cap);
+}
+
+static int ds4_engine_vision_encode_image_budget(
+        ds4_engine            *e,
+        const ds4_image       *image,
+        uint32_t               max_tokens,
         ds4_vision_embedding  *out,
         char                  *error,
         size_t                 error_cap) {
@@ -73689,12 +73725,20 @@ static int ds4_engine_vision_encode_image(
     uint32_t grid_width = 0, grid_height = 0;
     uint32_t layout = 0;
     int ok = 0;
+    bool nondefault_grid = false;          /* budget differs from the checkpoint default */
+    uint32_t fp_grid_h = 0, fp_grid_w = 0; /* 14 px patch grid the embedding was made at */
     if (e->vision_kind == DS4_VISION_DEEPSEEK4) {
         ds4_deepseek4_image_patches patches = {0};
+        const uint32_t budget = ds4_engine_resolve_image_budget(e, max_tokens);
         const bool preprocessed = DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 ?
-            ds4_image_preprocess_deepseek41(&patches, image, error, error_cap) :
-            ds4_image_preprocess_deepseek4(&patches, image, error, error_cap);
+            ds4_image_preprocess_deepseek41_budget(&patches, image, budget, error, error_cap) :
+            ds4_image_preprocess_deepseek4_budget(&patches, image, budget, error, error_cap);
         if (!preprocessed) return 0;
+        nondefault_grid = budget != (e->deepseek4_vision_weights.image_max_tokens ?
+                                     e->deepseek4_vision_weights.image_max_tokens :
+                                     DS4_DEEPSEEK41_IMAGE_TOKENS_DEFAULT);
+        fp_grid_h = patches.grid_height;
+        fp_grid_w = patches.grid_width;
         token_count = patches.llm_grid_height * patches.llm_grid_width;
         embedding = malloc((size_t)token_count * DS4_N_EMBD * sizeof(float));
         if (embedding) {
@@ -73770,6 +73814,11 @@ static int ds4_engine_vision_encode_image(
     out->content_width = content_width;
     out->content_height = content_height;
     memcpy(out->fingerprint, image->fingerprint, sizeof(out->fingerprint));
+    /* The embedding depends on the image AND the resized grid. Default-budget
+     * fingerprints stay the plain image hash (existing KV caches remain valid);
+     * any other budget folds the patch grid in, so KV reuse never mixes them. */
+    if (nondefault_grid)
+        ds4_image_fingerprint_with_grid(out->fingerprint, fp_grid_h, fp_grid_w);
     return 1;
 }
 
@@ -73839,6 +73888,52 @@ int ds4_engine_vision_encode_memory(
     int ok = ds4_engine_vision_encode_image(e, &image, out, error, error_cap);
     ds4_image_free(&image);
     return ok;
+}
+
+int ds4_engine_vision_encode_memory_budget(
+        ds4_engine *e,
+        const uint8_t *encoded,
+        size_t encoded_len,
+        uint32_t max_tokens,
+        ds4_vision_embedding *out,
+        char *error,
+        size_t error_cap) {
+    ds4_image image = {0};
+    if (!ds4_image_decode_memory(&image, encoded, encoded_len, error, error_cap)) return 0;
+    int ok = ds4_engine_vision_encode_image_budget(e, &image, max_tokens, out, error, error_cap);
+    ds4_image_free(&image);
+    return ok;
+}
+
+int ds4_engine_vision_encode_file_budget(
+        ds4_engine *e,
+        const char *path,
+        uint32_t max_tokens,
+        ds4_vision_embedding *out,
+        char *error,
+        size_t error_cap) {
+    ds4_image image = {0};
+    if (!ds4_image_decode_file(&image, path, error, error_cap)) return 0;
+    int ok = ds4_engine_vision_encode_image_budget(e, &image, max_tokens, out, error, error_cap);
+    ds4_image_free(&image);
+    return ok;
+}
+
+void ds4_engine_set_vision_max_tokens(ds4_engine *e, uint32_t max_tokens) {
+    if (e) e->vision_max_tokens = max_tokens;
+}
+
+uint32_t ds4_engine_vision_model_max_tokens(const ds4_engine *e) {
+    if (!e || e->vision_kind != DS4_VISION_DEEPSEEK4) return 0;
+    return e->deepseek4_vision_weights.image_max_tokens;
+}
+
+uint32_t ds4_engine_vision_token_cost(const ds4_engine *e, uint32_t width, uint32_t height,
+                                      uint32_t max_tokens) {
+    if (!e || e->vision_kind != DS4_VISION_DEEPSEEK4) return 0;
+    return ds4_image_deepseek_token_cost(width, height,
+                                         ds4_engine_resolve_image_budget(e, max_tokens),
+                                         DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41);
 }
 
 int ds4_engine_tp_vocab_split(ds4_engine *e) {
