@@ -1519,12 +1519,16 @@ mtp-verify-depth: ds4_test
 		DS4_TEST_MODEL="$(DS4_TEST_MODEL)" DS4_TEST_MTP="$(DS4_TEST_MTP)" ./ds4_test --mtp-verify-depth; \
 	fi
 
-q4k-dot-test: tests/test_q4k_dot.c
-	$(CC) -O2 -Wall -Wextra -std=c99 -o tests/test_q4k_dot tests/test_q4k_dot.c -lm -pthread
+tests/test_q4k_dot: tests/test_q4k_dot.c
+	$(CC) -O2 -Wall -Wextra -std=c99 -o $@ $< -lm -pthread
+
+q4k-dot-test: tests/test_q4k_dot
 	./tests/test_q4k_dot
 
-mxfp4-dot-test: tests/test_mxfp4_dot.c
-	$(CC) -O2 -Wall -Wextra -std=c99 -o tests/test_mxfp4_dot tests/test_mxfp4_dot.c -lm
+tests/test_mxfp4_dot: tests/test_mxfp4_dot.c
+	$(CC) -O2 -Wall -Wextra -std=c99 -o $@ $< -lm
+
+mxfp4-dot-test: tests/test_mxfp4_dot
 	./tests/test_mxfp4_dot
 
 .PHONY: test-download-model

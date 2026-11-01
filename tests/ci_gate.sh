@@ -1,24 +1,31 @@
 #!/usr/bin/env bash
 # Pull request gate: checks that need neither a model nor a GPU backend.
-# Run from a clean tree: objects that are already built emit no warnings.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-LOG=$(mktemp)
+# Objects that are already built emit no warnings and would pass unchecked.
+if compgen -G '*.o' >/dev/null || compgen -G 'tests/*.o' >/dev/null; then
+    echo "ci_gate: run make clean first" >&2
+    exit 2
+fi
+
+BUILD_LOG=$(mktemp)
 JOBS=$(getconf _NPROCESSORS_ONLN)
 
 build() {
-    make -j"$JOBS" "$@" 2>&1 | tee -a "$LOG"
+    make -j"$JOBS" "$@" 2>&1 | tee -a "$BUILD_LOG"
 }
 
 run() {
     echo "--- $*"
-    "$@" 2>&1 | tee -a "$LOG"
+    "$@"
 }
 
-UNIT_TESTS="tests/test_layer_pack tests/test_prompt_prefix tests/test_gpu_args
-    tests/test_image_decode tests/test_engine_mgpu_placement
+UNIT_TESTS="tests/test_q4k_dot tests/test_mxfp4_dot tests/test_engram
+    tests/test_session_state tests/test_tp_commands tests/test_tp_rdma
+    tests/test_tp_tcp tests/test_layer_pack tests/test_prompt_prefix
+    tests/test_gpu_args tests/test_image_decode tests/test_engine_mgpu_placement
     tests/test_deepseek4_vision_image tests/test_sampling"
 
 # Only the build differs: CI hosts have Metal on macOS but no nvcc on Linux,
@@ -34,9 +41,15 @@ else
     AGENT_TEST=./ds4_agent_test_cpu
 fi
 
-build q4k-dot-test mxfp4-dot-test test-engram test-session-state \
-    test-web-recovery $UNIT_TESTS
+build tests/test_web_recovery $UNIT_TESTS
 
+# Only build output counts: some tests print runtime warnings on purpose.
+if grep -E 'warning( #[0-9]+)?:' "$BUILD_LOG"; then
+    echo "ci_gate: compiler warnings are build failures" >&2
+    exit 1
+fi
+
+# Tests run one at a time, so timing-sensitive ones do not compete for CPU.
 run ./ds4-eval --validate-cases
 run ./ds4-eval --self-test-extractors
 run "$SERVER_TEST" --server
@@ -46,13 +59,9 @@ for bin in $UNIT_TESTS; do
     run "./$bin"
 done
 
+run python3 tests/test_web_recovery.py ./tests/test_web_recovery
 run ./tests/test_gpu_args_cli.sh
 
 for bin in ds4 ds4-server ds4-agent; do
     run "./$bin" --help >/dev/null
 done
-
-if grep -E 'warning( #[0-9]+)?:' "$LOG"; then
-    echo "ci_gate: compiler warnings are build failures" >&2
-    exit 1
-fi

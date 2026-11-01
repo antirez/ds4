@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, 'ci/**']
+    branches: [main]
   pull_request:
 
 permissions:
@@ -10,7 +10,8 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Every commit on main keeps its own result.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 defaults:
   run:
@@ -18,23 +19,31 @@ defaults:
 
 jobs:
   whitespace:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
       - run: git diff --check "$(git merge-base "origin/${GITHUB_BASE_REF:-main}" HEAD)" HEAD
 
   gate:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, ubuntu-latest]
+        # Runner images are pinned: zero warnings means a new compiler can
+        # fail every PR, so image updates are explicit changes here.
+        os: [macos-26, ubuntu-26.04, ubuntu-26.04-arm]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - run: tests/ci_gate.sh
-      - uses: astral-sh/setup-uv@6b9c6063abd6010835644d4c2e1bef4cf5cd0fca # v6.0.1
-      - run: uv run --no-project --with numpy --with pillow python -m unittest discover -s tests -p test_jpeg_decode.py
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: 0.9.27
+          enable-cache: false
+      - run: uv run --no-project --python 3.13 --with numpy==2.5.4 --with pillow==13.0.0 python -m unittest discover -s tests -p test_jpeg_decode.py

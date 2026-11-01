@@ -67,6 +67,8 @@ in this system.
 
 ## 2. Core Regression Tests
 
+- The pull request gate (`tests/ci_gate.sh`, run by CI) covers only checks that
+  need no model or GPU backend. It does not replace any step in this file.
 - Run the default suite:
   `make test`.
 - Run `tests/test_gpu_args_cli.sh` explicitly after changing executable option
