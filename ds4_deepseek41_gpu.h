@@ -142,6 +142,11 @@ int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out,
                                  uint32_t outputs, uint32_t rows,
                                  const ds4_gpu_tensor *in);
 /* Gather 512-wide F32 KV rows; IDs must come from top-k over source_rows. */
+/* Same gather from fp16 source rows (V4.1 compressed KV stored as fp16:
+ * every FP4-with-E4M3-scale value is exact in half precision). */
+int ds4_gpu_dsv41_gather_kv_f16(ds4_gpu_tensor *out, const ds4_gpu_tensor *source,
+                               const ds4_gpu_tensor *ids, uint32_t source_rows,
+                               uint32_t selected_rows);
 int ds4_gpu_dsv41_gather_kv(ds4_gpu_tensor *out, const ds4_gpu_tensor *source,
                            const ds4_gpu_tensor *ids, uint32_t source_rows,
                            uint32_t selected_rows);
