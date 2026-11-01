@@ -12423,9 +12423,23 @@ static void server_prefill_leave(server *s) {
     pthread_mutex_unlock(&s->model_mu);
 }
 
+/* Prefill quantum while no slot is generating. 2048 keeps the wait of a newly
+ * arrived request short; a larger quantum lets V4.1 use its wide carry sweeps
+ * (CUDA TP on two GB10 nodes: ~200 t/s in 2048-token quanta, ~320 t/s with one
+ * resident session). DS4_SERVER_PREFILL_QUANTUM (512..1048576) overrides it. */
+static int server_idle_prefill_quantum(void) {
+    static int cached;
+    if (!cached) {
+        const char *env = getenv("DS4_SERVER_PREFILL_QUANTUM");
+        const long v = env ? strtol(env, NULL, 10) : 0;
+        cached = v >= 512 && v <= 1048576 ? (int)v : 2048;
+    }
+    return cached;
+}
+
 static int server_prefill_quantum_for(const server *s,
                                       bool generation_active) {
-    int quantum = generation_active ? s->mixed_prefill_quantum : 2048;
+    int quantum = generation_active ? s->mixed_prefill_quantum : server_idle_prefill_quantum();
     if (generation_active && quantum < 1024 && s->engine &&
         ds4_engine_is_glm53(s->engine)) {
         quantum = 1024;
