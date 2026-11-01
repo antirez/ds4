@@ -3657,6 +3657,9 @@ static DS4_SERVER_MAYBE_UNUSED char *render_chat_prompt_text(
                                               tool_orders, think_mode);
 }
 
+/* Per-request image cap; session and TP image state is sized dynamically. */
+#define SERVER_MAX_IMAGES 256
+
 static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
                                                request *r,
                                                const chat_msgs *msgs,
@@ -3667,8 +3670,9 @@ static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
         ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
         return true;
     }
-    if (count > 16) {
-        snprintf(err, errlen, "too many images; at most 16 are allowed");
+    if (count > SERVER_MAX_IMAGES) {
+        snprintf(err, errlen, "too many images; at most %d are allowed",
+                 SERVER_MAX_IMAGES);
         return false;
     }
     if (!e || !s || !ds4_engine_has_vision(e)) {
@@ -9955,13 +9959,13 @@ typedef struct {
  * before any prefix is reused. Normalization preserves all byte offsets. */
 typedef struct {
     size_t count;
-    size_t offsets[16];
+    size_t offsets[SERVER_MAX_IMAGES];
 } visible_image_key;
 
 static char *visible_prompt_key(const request *req, const char *text,
                                  visible_image_key *images) {
     memset(images, 0, sizeof(*images));
-    if (!req || !text || req->image_count > 16 ||
+    if (!req || !text || req->image_count > SERVER_MAX_IMAGES ||
         (req->image_count && !req->image_markers)) return NULL;
     char *key = xstrdup(text);
     const char *cursor = text;
@@ -11488,8 +11492,8 @@ static bool build_live_prompt_suffix(server *s, server_slot *slot,
                                       const request *req, const char *suffix,
                                       ds4_tokens *out) {
     const ds4_tokens *live = ds4_session_tokens(slot->session);
-    if (!live || !suffix || req->image_count > 16) return false;
-    ds4_vision_span spans[16];
+    if (!live || !suffix || req->image_count > SERVER_MAX_IMAGES) return false;
+    ds4_vision_span spans[SERVER_MAX_IMAGES];
     size_t old_count = req->image_count;
     for (size_t i = 0; i < req->image_count; i++) {
         if (!req->image_markers) return false;
