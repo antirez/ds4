@@ -1275,6 +1275,126 @@ done:
     return rc;
 }
 
+/* The decoder suffix must reproduce full prefill with the DEFAULT batched
+ * kernels, not only with the arithmetic held fixed: the batched attention
+ * core splits raw from compressed context by chunk start and count, which is
+ * why the suffix aligns its chunks to the full-prefill grid. On a mismatch
+ * this prints the cache class and the rows that moved.
+ * Usage: --decoder-suffix-exact PROMPT_FILE [COUNT] */
+static void suffix_span_label(uint32_t j, uint32_t pos, char *buf, size_t cap) {
+    if (j < 40u) { snprintf(buf, cap, "window[%u]", j); return; }
+    uint32_t k = j - 40u;
+    static const char *names[2] = {"compressed", "index_cache"};
+    const bool previous = (pos & 1u) != 0;
+    for (uint32_t i = 0; i < 4u; i++) {
+        for (uint32_t m = 0; m < 2u; m++, k--)
+            if (!k) { snprintf(buf, cap, "%s[%u]", names[m], i); return; }
+        if (i < 3u && previous)
+            for (uint32_t m = 0; m < 2u; m++, k--)
+                if (!k) {
+                    snprintf(buf, cap, "%s[%u]",
+                             m ? "previous_score" : "previous_kv", i);
+                    return;
+                }
+    }
+    snprintf(buf, cap, "span[%u]", j);
+}
+
+static int check_decoder_suffix_exact(const char *path, const char *prompt_path, uint32_t count) {
+    ds4_engine *engine = NULL;
+    ds4_session *control = NULL, *candidate = NULL;
+    ds4_tokens tokens = {0};
+    char *prompt = NULL;
+    size_t prompt_bytes;
+    int rc = 1;
+    const uint32_t ctx = count > 8192u ? 16384u : 8192u;
+    ds4_engine_options opt = {.model_path = path, .backend = DS4_BACKEND_METAL,
+        .context_size = ctx, .power_percent = 100, .ssd_streaming = true,
+        .ssd_streaming_cache_bytes = UINT64_C(64) << 30};
+    REQUIRE(imatrix_read_text_file(prompt_path, &prompt, &prompt_bytes));
+    REQUIRE(ds4_engine_open(&engine, &opt) == 0);
+    ds4_encode_chat_prompt(engine, NULL, prompt, DS4_THINK_NONE, &tokens);
+    REQUIRE(tokens.len > (int)count);
+    tokens.len = (int)count;
+    REQUIRE(ds4_session_create(&control, engine, ctx) == 0);
+    REQUIRE(ds4_session_create(&candidate, engine, ctx) == 0);
+    ds41_gpu_graph *a = &control->ds41_graph, *b = &candidate->ds41_graph;
+
+    setenv("DS4_METAL_DISABLE_V41_DECODER_SUFFIX", "1", 1);
+    double t0 = now_sec();
+    REQUIRE(ds41_graph_prefill(a, &engine->model, &engine->weights,
+        tokens.v, count, NULL, NULL, (int)count, NULL, NULL));
+    const double reference = now_sec() - t0;
+    unsetenv("DS4_METAL_DISABLE_V41_DECODER_SUFFIX");
+    t0 = now_sec();
+    REQUIRE(ds41_graph_prefill(b, &engine->model, &engine->weights,
+        tokens.v, count, NULL, NULL, (int)count, NULL, NULL));
+    const double candidate_time = now_sec() - t0;
+
+    ds41_state_span sa[64], sb[64];
+    const uint32_t n = ds41_state_spans(a, a->pos, sa);
+    REQUIRE(a->pos == count && b->pos == count && n == ds41_state_spans(b, b->pos, sb));
+    uint32_t mismatched = 0, first_bad = UINT32_MAX;
+    for (uint32_t j = 0; j < n; j++) {
+        char label[64];
+        suffix_span_label(j, a->pos, label, sizeof(label));
+        REQUIRE(sa[j].bytes == sb[j].bytes);
+        const uint8_t *x = ds4_gpu_tensor_contents(sa[j].tensor);
+        const uint8_t *y = ds4_gpu_tensor_contents(sb[j].tensor);
+        if (!memcmp(x, y, (size_t)sa[j].bytes)) continue;
+        if (first_bad == UINT32_MAX) first_bad = j;
+        uint64_t first_byte = 0, changed = 0, first_row = UINT64_MAX, last_row = 0;
+        const uint64_t row_floats = strncmp(label, "index_cache", 11) == 0 ? 128u : 512u;
+        double max_abs = 0.0;
+        const uint64_t nfloats = sa[j].bytes / sizeof(float);
+        for (uint64_t i = 0; i < nfloats; i++) {
+            const float xf = ((const float *)x)[i], yf = ((const float *)y)[i];
+            if (xf != yf) {
+                if (!changed) first_byte = i * sizeof(float);
+                changed++;
+                const uint64_t row = i / row_floats;
+                if (row < first_row) first_row = row;
+                if (row > last_row) last_row = row;
+                const double d = fabs((double)yf - (double)xf);
+                if (isfinite(d) && d > max_abs) max_abs = d;
+            }
+        }
+        mismatched++;
+        if (mismatched <= 24u)
+            fprintf(stderr,
+                "DIAG %-16s bytes=%llu changed=%llu/%llu first_byte=%llu rows=[%llu,%llu] max_abs=%.9g\n",
+                label, (unsigned long long)sa[j].bytes, (unsigned long long)changed,
+                (unsigned long long)nfloats, (unsigned long long)first_byte,
+                (unsigned long long)first_row, (unsigned long long)last_row, max_abs);
+    }
+    REQUIRE(ds41_graph_logits(a, &engine->model, &engine->weights, control->logits));
+    REQUIRE(ds41_graph_logits(b, &engine->model, &engine->weights, candidate->logits));
+    uint64_t ldiff = 0;
+    double lmax = 0.0;
+    for (uint32_t i = 0; i < DS4_N_VOCAB; i++)
+        if (control->logits[i] != candidate->logits[i]) {
+            ldiff++;
+            const double d = fabs((double)candidate->logits[i] - control->logits[i]);
+            if (d > lmax) lmax = d;
+        }
+    char first_label[64] = "none";
+    if (first_bad != UINT32_MAX) suffix_span_label(first_bad, a->pos, first_label, sizeof(first_label));
+    fprintf(stderr, "decoder suffix exact count=%u state_spans=%u mismatched=%u first=%s "
+                    "logits_changed=%llu logits_max_abs=%.9g prefill %.2f -> %.2f t/s\n",
+        count, n, mismatched, first_label,
+        (unsigned long long)ldiff, lmax, count / reference, count / candidate_time);
+    REQUIRE(mismatched == 0 && ldiff == 0);
+    puts("V4.1 decoder suffix with default batched kernels: exact state/logits PASS");
+    rc = 0;
+done:
+    unsetenv("DS4_METAL_DISABLE_V41_DECODER_SUFFIX");
+    if (ds4_gpu_commands_active()) ds4_gpu_end_commands();
+    ds4_tokens_free(&tokens);
+    free(prompt);
+    ds4_session_free(candidate); ds4_session_free(control); ds4_engine_close(engine);
+    return rc;
+}
+
 static int check_decoder_publication(const char *path, bool encoder) {
     ds4_engine *engine = NULL;
     ds4_session *a = NULL, *b = NULL;
@@ -1949,6 +2069,10 @@ int main(int argc, char **argv) {
         return check_wide_prefill(argv[1], argv[3], false, false, "DS4_METAL_DISABLE_V41_WIDE_CHUNK");
     if (argc == 4 && !strcmp(argv[2], "--decoder-suffix"))
         return check_decoder_suffix(argv[1], argv[3]);
+    if (argc == 4 && !strcmp(argv[2], "--decoder-suffix-exact"))
+        return check_decoder_suffix_exact(argv[1], argv[3], 8406);
+    if (argc == 5 && !strcmp(argv[2], "--decoder-suffix-exact"))
+        return check_decoder_suffix_exact(argv[1], argv[3], (uint32_t)strtoul(argv[4], NULL, 10));
     if (argc == 4 && !strcmp(argv[2], "--sweep-partitions"))
         return check_sweep_partitions(argv[1], argv[3]);
     if (argc == 4 && !strcmp(argv[2], "--deferred-decoder"))
@@ -1981,7 +2105,9 @@ int main(int argc, char **argv) {
                         "--prefill-alias-fallback PROMPT_FILE | "
                         "--sweep-partitions PROMPT_FILE | "
                         "--deferred-decoder PROMPT_FILE | "
-                        "--decoder-suffix PROMPT_FILE | --session-accounting | --memory-plan | "
+                        "--decoder-suffix PROMPT_FILE | "
+                        "--decoder-suffix-exact PROMPT_FILE [COUNT] | "
+                        "--session-accounting | --memory-plan | "
                         "RENDERED_PROMPT [GENERATE])\n", argv[0]);
         return 2;
     }

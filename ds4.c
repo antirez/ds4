@@ -42655,6 +42655,9 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
 #endif
         }
         const double t_map = profile ? now_sec() : 0;
+        /* The decoder suffix keeps 2048-row partitions even when the encoder
+         * uses wider chunks; its shrinking tail is not aligned to large tiles. */
+        const uint32_t chunk = wide && il >= 20u && encoder_chunk > 2048u ? 2048u : encoder_chunk;
         uint32_t first = 0;
         if (ok && decoder_suffix && il >= 20u) {
             if (il == 20u)
@@ -42662,12 +42665,20 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                     0, total_count, true, batch_hc, batch_attention, cancel, cancel_ud);
             const uint32_t needed = (g->dspark ? 128u : 1u) + (DS4_N_LAYER - 1u - il) * 127u;
             first = total_count - needed;
-            if (ok) ok = ds41_decoder_prepare(g, m, &w->layer[il], il, initial_start,
-                first - 127u, 127u, false, batch_hc, batch_attention, cancel, cancel_ud);
+            /* Start on the full-prefill chunk grid. The batched attention
+             * core rounds probabilities per key block and splits raw from
+             * compressed context by chunk start and count, so a chunk that
+             * begins at an arbitrary row rounds differently than the full
+             * prefill's chunk containing that row. Aligning to the same grid
+             * makes every suffix chunk identical to its full-prefill
+             * counterpart. The 128-row warm-up (one more than the sliding
+             * window needs) then leaves the raw ring exactly as the previous
+             * full chunk did. --decoder-suffix-exact gates this. */
+            first -= first % chunk;
+            if (ok && first >= 128u)
+                ok = ds41_decoder_prepare(g, m, &w->layer[il], il, initial_start,
+                    first - 128u, 128u, false, batch_hc, batch_attention, cancel, cancel_ud);
         }
-        /* Keep the decoder suffix's established matrix partitions; unlike
-         * the encoder, its shrinking tail is not aligned to large tiles. */
-        const uint32_t chunk = wide && il >= 20u && encoder_chunk > 2048u ? 2048u : encoder_chunk;
         for (uint32_t off = first; ok && off < total_count; off += chunk) {
             if (cancel && cancel(cancel_ud)) { ok = false; break; }
             const uint32_t count = total_count - off < chunk ? total_count - off : chunk;
