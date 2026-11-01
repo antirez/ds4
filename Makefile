@@ -1294,6 +1294,32 @@ test-frontends: ds4_test ds4_agent_test test-web-recovery
 	./ds4_test --server
 	./ds4_agent_test
 
+# Optional real Qwen Metal state/logit gate; never run by default make test.
+QWEN4_CHECKPOINT_PROMPT ?= tests/long_context_story_prompt.txt
+QWEN4_CHECKPOINT_PREFIX ?= 16384
+QWEN4_CHECKPOINT_APPEND ?= 8
+.PHONY: test-qwen4-prompt-checkpoint
+test-qwen4-prompt-checkpoint: tests/test_qwen4_prompt_checkpoint
+	@test -n "$(QWEN4_CHECKPOINT_OUTPUT)" || { echo "Set QWEN4_CHECKPOINT_OUTPUT to a fresh test directory"; exit 2; }
+	./tests/test_qwen4_prompt_checkpoint "$(DS4_TEST_MODEL)" "$(QWEN4_CHECKPOINT_PROMPT)" "$(QWEN4_CHECKPOINT_PREFIX)" "$(QWEN4_CHECKPOINT_APPEND)" "$(QWEN4_CHECKPOINT_OUTPUT)"
+
+tests/test_qwen4_prompt_checkpoint.o: tests/test_qwen4_prompt_checkpoint.c ds4.h ds4_kvstore.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -c -o $@ $<
+
+tests/test_qwen4_prompt_checkpoint: tests/test_qwen4_prompt_checkpoint.o ds4_kvstore.o $(CORE_OBJS)
+ifeq ($(UNAME_S),Darwin)
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -o $@ $^ $(METAL_LDLIBS)
+else
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+endif
+
+.PHONY: test-kvstore-near-tail
+test-kvstore-near-tail: tests/test_kvstore_near_tail
+	./tests/test_kvstore_near_tail
+
+tests/test_kvstore_near_tail: tests/test_kvstore_near_tail.c ds4_kvstore.c ds4_kvstore.h ds4.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -DDS4_NO_GPU -I. -o $@ $< -lm -pthread
+
 .PHONY: test-web-recovery
 test-web-recovery: tests/test_web_recovery
 	python3 tests/test_web_recovery.py ./tests/test_web_recovery
@@ -1303,7 +1329,7 @@ tests/test_web_recovery: tests/test_web_recovery.c ds4_web.c ds4_web.h
 
 test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test test-session-state test-linux-memory test-engram test-web-recovery \
 	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
-	tests/test_deepseek4_vision_image tests/test_image_decode tests/test_prompt_prefix $(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
+	tests/test_deepseek4_vision_image tests/test_image_decode tests/test_prompt_prefix $(SAMPLING_TEST) test-kvstore-near-tail ds4 ds4-server ds4-bench ds4-agent
 	./ds4-eval --validate-cases
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
@@ -1367,6 +1393,8 @@ ds4_cpu_test_hooks.o ds4_cuda_test_hooks.o tests/test_session_state.o \
 tests/test_session_state_gpu.o: ds4_tool_text.h
 
 clean:
+	rm -f tests/test_qwen4_prompt_checkpoint tests/test_qwen4_prompt_checkpoint.o
+	rm -f tests/test_kvstore_near_tail
 	rm -f tests/test_mmvq_cuda tests/test_mmvq_rocm
 	rm -f tests/test_qwen4_ngrams
 	rm -f tests/test_qwen4_ngram_state

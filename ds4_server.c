@@ -10180,6 +10180,7 @@ struct server {
     pthread_cond_t model_cv;
     bool model_busy;
     bool qwen4_batch_mtp;
+    bool prompt_tail_cache; /* Qualified Metal prompt checkpoint policy. */
     bool model_stopping;
     int decode_pending;
     int active_generations;
@@ -11312,6 +11313,30 @@ static bool kv_cache_store_live_prefix(server *s, server_slot *slot,
                                        int store_len, const char *reason) {
     return kv_cache_store_live_prefix_text(s, slot, tokens, store_len, reason,
                                            NULL, 0, NULL);
+}
+
+/* Persist an already reached prompt frontier before the new
+ * sampled reasoning/output can make its visible key differ from replay.
+ * The effective exact tokens remain in the payload; Responses prompt bytes
+ * bind that state exactly as the existing Responses-visible checkpoint does.
+ * No split sync, rewind, changed geometry or periodic-schedule suppression. */
+static void kv_cache_maybe_store_prompt_tail(server *s, server_slot *slot,
+                                        const request *req,
+                                        const ds4_tokens *prompt, int cached,
+                                        int cold_saved_tokens) {
+    if (!s->prompt_tail_cache || !s->kv.enabled ||
+        !ds4_engine_is_qwen4(s->engine) || req->api != API_RESPONSES ||
+        req->image_count || !req->prompt_text || !req->prompt_text[0] ||
+        !prompt || prompt->len < s->kv.opt.min_tokens) return;
+    /* Only frontiers known to belong to this request count as coverage.
+     * The slot's periodic counter can belong to a different disk-hit branch. */
+    int covered = cached > cold_saved_tokens ? cached : cold_saved_tokens;
+    uint32_t chunk = ds4_engine_prefill_chunk(s->engine);
+    if (!chunk || covered < 0 || prompt->len <= covered ||
+        (uint32_t)(prompt->len - covered) < chunk) return;
+    (void)kv_cache_store_live_prefix_text(s, slot, prompt, prompt->len,
+                                         "near-tail", req->prompt_text,
+                                         KV_EXT_RESPONSES_VISIBLE, "responses-prompt");
 }
 
 static void kv_cache_store_current(server *s, server_slot *slot,
@@ -13723,6 +13748,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     ds4_session_set_progress(slot->session, server_progress_cb, &progress);
     ds4_session_set_display_progress(slot->session, server_progress_cb, &progress);
 
+    bool cold_saved = false;
     int cold_store_len = 0;
     if (!multimodal && cached == 0 &&
         s->kv.enabled &&
@@ -13774,6 +13800,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         }
         if (kv_cache_store_live_prefix(s, slot, prompt_for_sync,
                                        cold_store_len, "cold")) {
+            cold_saved = true;
             kv_cache_slot_note_store(slot, cold_store_len);
             suppressed_continued_last = -1;
         } else {
@@ -13833,6 +13860,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     if (cold_store_len == prompt_for_sync->len) {
         if (!multimodal && kv_cache_store_live_prefix(s, slot, prompt_for_sync,
                                        cold_store_len, "cold")) {
+            cold_saved = true;
             kv_cache_slot_note_store(slot, cold_store_len);
             suppressed_continued_last = -1;
         } else {
@@ -13840,6 +13868,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                                              cold_store_len);
         }
     }
+    if (!multimodal) kv_cache_maybe_store_prompt_tail(s, slot, &j->req, prompt_for_sync, cached, cold_saved ? cold_store_len : 0);
     char id[96];
     responses_random_id(id, sizeof(id),
                         j->req.kind == REQ_CHAT ? "chatcmpl-" : "cmpl-");
@@ -15970,6 +15999,7 @@ int main(int argc, char **argv) {
     s.ctx_size = cfg.ctx_size;
     s.slot_count = slot_count;
     s.batched_mode = cfg.batched_sessions > 0;
+    s.prompt_tail_cache = cfg.engine.backend == DS4_BACKEND_METAL;
     s.qwen4_batch_mtp = cfg.engine.backend == DS4_BACKEND_METAL &&
                        ds4_engine_is_qwen4(engine) && ds4_engine_mtp_draft_tokens(engine) > 1;
     s.mixed_prefill_quantum = cfg.mixed_prefill_quantum;

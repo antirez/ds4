@@ -179,6 +179,7 @@ uint8_t ds4_kvstore_reason_code(const char *reason) {
     if (!strcmp(reason, "shutdown")) return DS4_KVSTORE_REASON_SHUTDOWN;
     if (!strcmp(reason, "agent-system")) return DS4_KVSTORE_REASON_AGENT_SYSTEM;
     if (!strcmp(reason, "agent-session")) return DS4_KVSTORE_REASON_AGENT_SESSION;
+    if (!strcmp(reason, "near-tail")) return DS4_KVSTORE_REASON_NEAR_TAIL;
     return DS4_KVSTORE_REASON_UNKNOWN;
 }
 
@@ -428,7 +429,7 @@ bool ds4_kvstore_read_header(FILE *fp, ds4_kvstore_entry *e,
         h[2] != KV_CACHE_MAGIC2 || h[3] != KV_CACHE_VERSION) return false;
     if (h[20] != KV_CACHE_PAYLOAD_ABI) return false;
     e->quant_bits = h[4];
-    e->reason = h[5] <= DS4_KVSTORE_REASON_AGENT_SESSION ? h[5] :
+    e->reason = h[5] <= DS4_KVSTORE_REASON_NEAR_TAIL ? h[5] :
                 DS4_KVSTORE_REASON_UNKNOWN;
     e->ext_flags = h[6];
     e->model_id = h[7];
@@ -541,6 +542,8 @@ double ds4_kvstore_entry_eviction_score(
         uint64_t now,
         const ds4_kvstore_eviction_context *incoming) {
     if (!e || e->file_size == 0) return 0.0;
+    /* Supplementary snapshots must leave before any ordinary checkpoint. */
+    if (e->reason == DS4_KVSTORE_REASON_NEAR_TAIL) return 0.0;
     (void)live;
     double effective_hits = (double)e->hits;
     uint64_t used_at = e->last_used ? e->last_used : e->created_at;
@@ -926,6 +929,101 @@ static void kv_cache_rewrite_trailer(ds4_kvstore *kc, const char *path,
     (void)ok;
 }
 
+/* Supplementary storage: no ordinary entry is removed to
+ * admit a tail. At most two published tails use at most one eighth of budget,
+ * capped at 16 GiB. Existing atomic publication completes before pruning.
+ * A replacement temporarily needs room for both old and new published files. */
+static bool kv_cache_refresh_checked(ds4_kvstore *kc) {
+    ds4_kvstore_clear(kc);
+    DIR *dir = opendir(kc->dir);
+    if (!dir) return false;
+    bool ok = true;
+    struct dirent *de;
+    for (;;) {
+        errno = 0;
+        de = readdir(dir);
+        if (!de) { if (errno) ok = false; break; }
+        char sha[41];
+        if (!ds4_kvstore_sha_hex_name(de->d_name, sha)) continue;
+        char *path = ds4_kvstore_path_join(kc->dir, de->d_name);
+        ds4_kvstore_entry entry = {0};
+        ok = ds4_kvstore_read_entry_file(path, sha, &entry);
+        free(path);
+        if (!ok) break;
+        kv_cache_push(kc, entry);
+    }
+    if (closedir(dir) != 0) ok = false;
+    return ok;
+}
+
+static uint64_t kv_cache_tail_budget(const ds4_kvstore *kc) {
+    const uint64_t cap = 16ull * 1024ull * 1024ull * 1024ull;
+    const uint64_t share = kc->budget_bytes / 8u;
+    return share < cap ? share : cap;
+}
+
+static bool kv_cache_tail_admit(ds4_kvstore *kc, uint64_t published, uint64_t required) {
+    if (!kc->budget_bytes || published > kv_cache_tail_budget(kc)) return false;
+    if (!kv_cache_refresh_checked(kc)) return false;
+    uint64_t total = 0;
+    for (int i = 0; i < kc->len; i++) {
+        if (UINT64_MAX - total < kc->entry[i].file_size) return false;
+        total += kc->entry[i].file_size;
+    }
+    return total <= kc->budget_bytes && required <= kc->budget_bytes - total;
+}
+
+static bool kv_cache_tail_prune(ds4_kvstore *kc, const char *keep) {
+    if (!kv_cache_refresh_checked(kc)) return false;
+    uint64_t bytes = 0;
+    int count = 0;
+    bool seen_keep = false;
+    for (int i = 0; i < kc->len; i++) {
+        if (kc->entry[i].reason != DS4_KVSTORE_REASON_NEAR_TAIL) continue;
+        if (!strcmp(kc->entry[i].path, keep)) seen_keep = true;
+        if (UINT64_MAX - bytes < kc->entry[i].file_size) return false;
+        bytes += kc->entry[i].file_size;
+        count++;
+    }
+    if (!seen_keep) return false;
+    while (count > 2 || bytes > kv_cache_tail_budget(kc)) {
+        int victim = -1;
+        for (int i = 0; i < kc->len; i++) {
+            ds4_kvstore_entry *e = &kc->entry[i];
+            if (e->reason != DS4_KVSTORE_REASON_NEAR_TAIL || !strcmp(e->path, keep)) continue;
+            if (victim < 0 || e->last_used < kc->entry[victim].last_used ||
+                (e->last_used == kc->entry[victim].last_used && strcmp(e->sha, kc->entry[victim].sha) < 0)) victim = i;
+        }
+        if (victim < 0) return false;
+        ds4_kvstore_entry *e = &kc->entry[victim];
+        if (unlink(e->path) != 0) return false;
+        kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                "%s: kv cache evicted reason=near-tail-bound tokens=%u size=%.2f MiB file=%s",
+                kv_log_name(kc), e->tokens, (double)e->file_size / (1024.0 * 1024.0), e->path);
+        bytes -= e->file_size;
+        count--;
+        ds4_kvstore_entry_free(e);
+        kc->entry[victim] = kc->entry[--kc->len];
+    }
+    return true;
+}
+
+static bool kv_cache_tail_promote(const char *path, uint8_t reason) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return false;
+    ds4_kvstore_entry entry = {0};
+    uint32_t text_bytes = 0;
+    bool ok = ds4_kvstore_read_header(fp, &entry, &text_bytes);
+    if (fclose(fp) != 0) ok = false;
+    if (!ok || entry.reason != DS4_KVSTORE_REASON_NEAR_TAIL) return ok;
+    fp = fopen(path, "r+b");
+    if (!fp) return false;
+    /* Only the policy reason changes. The exact payload/key are retained. */
+    ok = fseek(fp, 5, SEEK_SET) == 0 && fputc(reason, fp) != EOF && fflush(fp) == 0;
+    if (fclose(fp) != 0) ok = false;
+    return ok;
+}
+
 bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                         ds4_engine *engine,
                                         ds4_session *session,
@@ -1000,14 +1098,53 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     char *path = ds4_kvstore_path_for_sha(kc, sha);
     const uint8_t reason_code = ds4_kvstore_reason_code(reason);
 
-    if (kv_cache_existing_compatible(kc, path, sha, text, text_len,
+    if (reason_code == DS4_KVSTORE_REASON_NEAR_TAIL) {
+        struct stat existing;
+        if (stat(path, &existing) == 0) {
+            /* Supplementary writes neither replace incompatible published
+             * anchors nor rewrite compatible payloads/trailers. */
+            ds4_kvstore_entry entry = {0};
+            bool compatible = ds4_kvstore_read_entry_file(path, sha, &entry) &&
+                entry.model_id == (uint8_t)model_id &&
+                (!kc->reject_different_quant || entry.quant_bits == (uint8_t)quant_bits) &&
+                entry.ctx_size <= (uint32_t)ds4_session_ctx(session) &&
+                kv_cache_file_text_matches(path, sha, text, text_len);
+            ds4_kvstore_entry_free(&entry);
+            free(text); free(path); ds4_tokens_free(&store_tokens);
+            return compatible;
+        }
+        if (errno != ENOENT) {
+            free(text); free(path); ds4_tokens_free(&store_tokens);
+            return false;
+        }
+    } else if (kv_cache_existing_compatible(kc, path, sha, text, text_len,
                                      model_id,
                                      quant_bits, ds4_session_ctx(session))) {
+        if (!kv_cache_tail_promote(path, reason_code)) {
+            kv_logf(kc, DS4_KVSTORE_LOG_WARNING, "%s: kv cache promotion failed file=%s", kv_log_name(kc), path);
+            free(text); free(path); ds4_tokens_free(&store_tokens);
+            return false;
+        }
         kv_cache_rewrite_trailer(kc, path, text, hooks);
         free(text);
         free(path);
         ds4_tokens_free(&store_tokens);
         return true;
+    }
+
+    if (reason_code == DS4_KVSTORE_REASON_NEAR_TAIL) {
+        uint64_t payload_est = ds4_session_payload_bytes(session);
+        uint64_t file_est = 0, required_est = 0;
+        if (!payload_est ||
+            !ds4_kvstore_file_size_fits(kc, (uint64_t)text_len, payload_est,
+                                       trailer_est_bytes, &file_est, &required_est) ||
+            !kv_cache_tail_admit(kc, file_est, required_est)) {
+            kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                    "%s: kv cache skipped tokens=%d reason=near-tail because supplementary admission has no room",
+                    kv_log_name(kc), store_tokens.len);
+            free(text); free(path); ds4_tokens_free(&store_tokens);
+            return false;
+        }
     }
 
     ds4_session_payload_file staged = {0};
@@ -1055,7 +1192,18 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         .ctx_size = (uint32_t)ds4_session_ctx(session),
         .reject_different_quant = kc->reject_different_quant,
     };
-    ds4_kvstore_evict(kc, live_tokens, est_file_bytes, &incoming);
+    if (reason_code == DS4_KVSTORE_REASON_NEAR_TAIL) {
+        if (!kv_cache_tail_admit(kc, est_file_bytes, est_required_bytes)) {
+            kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                    "%s: kv cache skipped tokens=%d reason=near-tail because supplementary admission has no room",
+                    kv_log_name(kc), store_tokens.len);
+            ds4_session_payload_file_free(&staged);
+            free(text); free(path); ds4_tokens_free(&store_tokens);
+            return false;
+        }
+    } else {
+        ds4_kvstore_evict(kc, live_tokens, est_file_bytes, &incoming);
+    }
 
     kv_buf tmpb = {0};
     kv_buf_printf(&tmpb, "%s.tmp.%ld", path, (long)getpid());
@@ -1110,8 +1258,26 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         final_size_over_budget = true;
         ok = false;
     }
+    /* Trailer hooks may have changed size since the estimate. Recheck
+     * admission before publication, while all prior files remain intact. */
+    if (ok && reason_code == DS4_KVSTORE_REASON_NEAR_TAIL &&
+        !kv_cache_tail_admit(kc, final_file_bytes, final_required_bytes)) {
+        saved_errno = ENOSPC;
+        ok = false;
+    }
     if (ok && rename(tmp, path) != 0) {
         saved_errno = errno;
+        ok = false;
+    }
+    if (ok && reason_code == DS4_KVSTORE_REASON_NEAR_TAIL && !kv_cache_tail_prune(kc, path)) {
+        saved_errno = errno ? errno : EIO;
+        /* A failed bound operation cannot silently retain an unbounded tail.
+         * Only this newly published supplementary path may be rolled back. */
+        if (unlink(path) != 0 && errno != ENOENT) {
+            kv_logf(kc, DS4_KVSTORE_LOG_WARNING,
+                    "%s: kv cache near-tail rollback failed file=%s: %s",
+                    kv_log_name(kc), path, strerror(errno));
+        }
         ok = false;
     }
     const double save_ms = (kv_now_sec() - save_t0) * 1000.0;

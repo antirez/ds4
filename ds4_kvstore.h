@@ -25,6 +25,7 @@ typedef enum {
     DS4_KVSTORE_REASON_SHUTDOWN  = 4,
     DS4_KVSTORE_REASON_AGENT_SYSTEM  = 5,
     DS4_KVSTORE_REASON_AGENT_SESSION = 6,
+    DS4_KVSTORE_REASON_NEAR_TAIL = 7, /* Supplementary completed prompt frontier. */
 } ds4_kvstore_reason;
 
 typedef enum {
