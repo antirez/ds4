@@ -112,6 +112,62 @@ static inline void helper_mv_reduce_and_write(
     }
 }
 
+/* Reduction for the small-row Q8_0 matvec: one independent copy of the
+ * single-row simd_sum -> threadgroup -> simd_sum tree per (output row,
+ * activation row).  Keeping the tree per row is what makes every result
+ * bit-identical to kernel_mul_mv_q8_0_f32_impl. */
+template<short NR0, short NACT>
+static inline void helper_mv_reduce_and_write_rows(
+        device float * dst_f32,
+        float sumf[NR0][NACT],
+        const int r0,
+        const int r1,
+        const int ne01,
+        const int ne11,
+        const int ne0,
+        ushort tiisg,
+        ushort sgitg,
+        threadgroup char * shmem) {
+    constexpr short NW = N_SIMDWIDTH;
+
+    threadgroup float * shmem_f32[NR0][NACT];
+
+    for (short row = 0; row < NR0; ++row) {
+        for (short a = 0; a < NACT; ++a) {
+            shmem_f32[row][a] = (threadgroup float *) shmem + NW*(row*NACT + a);
+
+            if (sgitg == 0) {
+                shmem_f32[row][a][tiisg] = 0.0f;
+            }
+
+            sumf[row][a] = simd_sum(sumf[row][a]);
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (short row = 0; row < NR0; ++row) {
+        for (short a = 0; a < NACT; ++a) {
+            if (tiisg == 0) {
+                shmem_f32[row][a][sgitg] = sumf[row][a];
+            }
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (short row = 0; row < NR0; ++row) {
+        for (short a = 0; a < NACT; ++a) {
+            float tot = simd_sum(shmem_f32[row][a][tiisg]);
+
+            if (tiisg == 0 && sgitg == 0 &&
+                r0 + row < ne01 && r1 + a < ne11) {
+                dst_f32[(uint64_t)(r1 + a)*ne0 + r0 + row] = tot;
+            }
+        }
+    }
+}
+
 template<short NR0, typename args_t>
 void kernel_mul_mv_q8_0_f32_impl(
         args_t args,
@@ -196,6 +252,127 @@ kernel void kernel_mul_mv_q8_0_f32(
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
+
+/* Exact-row Q8_0 matvec for small decode batches (2..8 activation rows).
+ *
+ * The single-row kernel launches one threadgroup per activation row, so a
+ * broad dense projection re-reads the same weight row once per activation.
+ * This variant keeps NR0 output rows per threadgroup but evaluates NACT
+ * activation rows there, loading each 8-value weight slice once and reusing
+ * it.  Every activation row keeps the original K walk, the original
+ * per-thread accumulation order and the original reduction tree; only the
+ * weight load is shared.  The host picks NACT == rows, so each activation
+ * row appears in exactly one threadgroup. */
+template<short NR0, short NACT>
+void kernel_mul_mv_q8_0_f32_rows_impl(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NQ = 8;
+
+    const int nb = args.ne00/QK8_0;
+
+    const int r0 = tgpig.x*NR0;
+    const int r1 = tgpig.y*NACT;
+    const int im = tgpig.z;
+
+    const uint i12 = im%args.ne12;
+    const uint i13 = im/args.ne12;
+
+    device const block_q8_0 * ax[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        const uint64_t offset0 = (r0 + row)*args.nb01 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
+
+        ax[row] = (device const block_q8_0 *) ((device char *) src0 + offset0);
+    }
+
+    float sumf[NR0][NACT];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        FOR_UNROLL (short a = 0; a < NACT; ++a) {
+            sumf[row][a] = 0.f;
+        }
+    }
+
+    const short ix = tiisg/(NW/NQ);
+    const short il = tiisg%(NW/NQ);
+
+    const int ib0 = sgitg*NQ + ix;
+
+    const int act_count = args.ne11 - r1 < (int)NACT ? args.ne11 - r1 : (int)NACT;
+
+    for (int ib = ib0; ib < nb; ib += NSG*NQ) {
+        /* One weight slice per output row, reused by every activation row. */
+        int8_t qv[NR0][NQ];
+        float d[NR0];
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            device const int8_t * qs = ax[row][ib].qs + il*NQ;
+            FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                qv[row][i] = qs[i];
+            }
+            d[row] = ax[row][ib].d;
+        }
+
+        FOR_UNROLL (short a = 0; a < NACT; ++a) {
+            if (a >= act_count) break;
+
+            const uint64_t offset1 = (r1 + a)*args.nb11 + (i12)*args.nb12 + (i13)*args.nb13;
+            device const float * yb = (device const float *) (src1 + offset1) + ib*QK8_0 + il*NQ;
+
+            float yl[NQ];
+            FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                yl[i] = yb[i];
+            }
+
+            FOR_UNROLL (short row = 0; row < NR0; ++row) {
+                float sumq = 0.f;
+                FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                    sumq += qv[row][i] * yl[i];
+                }
+
+                sumf[row][a] += sumq*d[row];
+            }
+        }
+    }
+
+    device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1;
+
+    helper_mv_reduce_and_write_rows<NR0, NACT>(
+        dst_f32, sumf, r0, r1, args.ne01, args.ne11, args.ne0,
+        tiisg, sgitg, shmem);
+}
+
+#define DS4_Q8_0_ROWS_KERNEL(NACT) \
+[[host_name("kernel_mul_mv_q8_0_f32_rows" #NACT)]] \
+kernel void kernel_mul_mv_q8_0_f32_rows##NACT( \
+        constant ds4_metal_args_mul_mv & args, \
+        device const char * src0, \
+        device const char * src1, \
+        device       char * dst, \
+        threadgroup  char * shmem [[threadgroup(0)]], \
+        uint3  tgpig[[threadgroup_position_in_grid]], \
+        ushort tiisg[[thread_index_in_simdgroup]], \
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) { \
+    kernel_mul_mv_q8_0_f32_rows_impl<N_R0_Q8_0, NACT>( \
+        args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); \
+}
+
+DS4_Q8_0_ROWS_KERNEL(2)
+DS4_Q8_0_ROWS_KERNEL(3)
+DS4_Q8_0_ROWS_KERNEL(4)
+DS4_Q8_0_ROWS_KERNEL(5)
+DS4_Q8_0_ROWS_KERNEL(6)
+DS4_Q8_0_ROWS_KERNEL(7)
+DS4_Q8_0_ROWS_KERNEL(8)
+
+#undef DS4_Q8_0_ROWS_KERNEL
 
 // Q8_0 matvec whose output is this rank's TP partial in its slab slot: same
 // K walk and reduction tree as kernel_mul_mv_q8_0_f32_impl, plus the checked

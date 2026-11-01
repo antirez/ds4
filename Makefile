@@ -215,6 +215,16 @@ tests/test_q8_prefill_variants: tests/test_q8_prefill_variants.o $(CORE_OBJS)
 test-q8-prefill-variants: tests/test_q8_prefill_variants
 	./tests/test_q8_prefill_variants
 
+tests/test_q8_row_batch.o: tests/test_q8_row_batch.c ds4_gpu.h
+	$(CC) $(CFLAGS) -fno-fast-math -I. -c -o $@ $<
+
+tests/test_q8_row_batch: tests/test_q8_row_batch.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+.PHONY: test-q8-row-batch
+test-q8-row-batch: tests/test_q8_row_batch
+	./tests/test_q8_row_batch
+
 tests/test_metal_ssd_experts.o: tests/test_metal_ssd_experts.c ds4_gpu.h
 	$(CC) $(CFLAGS) -fno-fast-math -I. -c -o $@ $<
 

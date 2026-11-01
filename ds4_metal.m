@@ -19694,8 +19694,29 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         args.ne1 = (int32_t)n_rows;
         args.nr0 = dispatch.nr0;
 
+        /* 2..8 exact activation rows share one weight read per threadgroup.
+         * Measured rows 2..6: out 512/1280 lose 3..21% (per-row arithmetic
+         * dominates) while out 2304+ win 10..49%, so keep the per-row kernel
+         * below 2048 output rows.  DS4_METAL_Q8_ROWS_LEGACY=1 forces the old
+         * path for A/B timing. */
+        const bool rows_kernel =
+            n_rows >= 2u && n_rows <= 8u && out_dim >= 2048u &&
+            ds4_gpu_env_bool("DS4_METAL_Q8_ROWS_LEGACY") <= 0;
+        char rows_fn[64];
+        const char *fn_name = dispatch.function_name;
+        NSUInteger row_groups = (NSUInteger)n_rows;
+        NSUInteger smem = dispatch.smem;
+        if (rows_kernel) {
+            snprintf(rows_fn, sizeof(rows_fn),
+                     "kernel_mul_mv_q8_0_f32_rows%u", n_rows);
+            fn_name = rows_fn;
+            row_groups = 1;
+            smem = 32u * (NSUInteger)dispatch.nr0 *
+                   (NSUInteger)n_rows * sizeof(float);
+        }
+
         id<MTLComputePipelineState> pipeline =
-            ds4_gpu_get_mul_mv_pipeline(dispatch.function_name, dispatch.nsg);
+            ds4_gpu_get_mul_mv_pipeline(fn_name, dispatch.nsg);
         if (!pipeline) return 0;
 
         int owned = 0;
@@ -19707,12 +19728,12 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
         [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
-        [enc setThreadgroupMemoryLength:dispatch.smem atIndex:0];
+        [enc setThreadgroupMemoryLength:smem atIndex:0];
         [enc dispatchThreadgroups:
                 MTLSizeMake(((NSUInteger)out_dim +
                              (NSUInteger)dispatch.nr0 - 1u) /
                                 (NSUInteger)dispatch.nr0,
-                            (NSUInteger)n_rows,
+                            row_groups,
                             1)
              threadsPerThreadgroup:
                 MTLSizeMake(32, (NSUInteger)dispatch.nsg, 1)];
