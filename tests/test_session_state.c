@@ -276,6 +276,35 @@ static void test_snapshot_bytes(void) {
         assert(fgetc(fp) == EOF);
         fclose(fp);
     }
+    /* An old or cross-backend payload must be rejected with an explicit
+     * expected-version message rather than being read with the wrong cache
+     * layout. */
+    {
+        char err[192] = {0};
+        FILE *fp = tmpfile();
+        assert(fp);
+        assert(ds4_session_save_payload(s, fp, err, sizeof(err)) == 0);
+        const long bytes = ftell(fp);
+        assert(bytes > 8);
+        uint8_t hdr[8];
+        rewind(fp);
+        assert(fread(hdr, 1, sizeof(hdr), fp) == sizeof(hdr));
+        const uint32_t bad_version = 1;
+        memcpy(hdr + 4, &bad_version, sizeof(bad_version));
+        rewind(fp);
+        assert(fwrite(hdr, 1, sizeof(hdr), fp) == sizeof(hdr));
+        rewind(fp);
+        char load_err[192] = {0};
+        assert(ds4_session_load_payload(s, fp, (uint64_t)bytes,
+                                        load_err, sizeof(load_err)) != 0);
+        char expect[64];
+        snprintf(expect, sizeof(expect), "(expected %u)",
+                 (unsigned)DS4_SESSION_PAYLOAD_VERSION);
+        assert(strstr(load_err, "session payload format 1") != NULL);
+        assert(strstr(load_err, expect) != NULL);
+        assert(strstr(load_err, "rebuilding") != NULL);
+        fclose(fp);
+    }
     ds4_session_snapshot_free(&snapshot);
     ds4_session_free(s);
     g_ds4_shape = saved_shape;

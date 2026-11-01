@@ -61,6 +61,23 @@ int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
 int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                    const ds4_gpu_tensor *src, uint64_t src_offset,
                                    uint64_t count);
+#if defined(__APPLE__)
+/* Stores the high 16 bits of each f32 verbatim; src values must be
+ * bf16-exact (low 16 bits zero). This keeps bf16 subnormals, unlike a
+ * hardware float-to-bf16 conversion. */
+int ds4_gpu_tensor_copy_f32_to_bf16(ds4_gpu_tensor *dst, uint64_t dst_offset,
+                                    const ds4_gpu_tensor *src, uint64_t src_offset,
+                                    uint64_t count);
+int ds4_gpu_glm_indexer_score_one_bf16_tensor(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *indexer_key_cache,
+        uint32_t              n_rows,
+        uint32_t              n_head,
+        uint32_t              head_dim,
+        float                 scale);
+#endif
 int ds4_gpu_moe_handoff_pack_tensor(
         ds4_gpu_tensor       *packed,
         const ds4_gpu_tensor *ffn_norm,

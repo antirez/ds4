@@ -39,6 +39,25 @@ kernel void kernel_dsv41_bf16_linear(
     }
 }
 
+/* Every V4.1 index-cache value is a quantized FP4 code times a power of two,
+ * so its f32 mantissa has only the top 16 bits set. Store the high half
+ * verbatim instead of converting, which would flush bf16 subnormals (the
+ * 2^-127 end of the E8M0 range) to zero. */
+kernel void kernel_dsv41_copy_f32_to_bf16(
+        constant ulong &count,
+        device const float *src,
+        device ushort *dst,
+        uint gid [[thread_position_in_grid]]) {
+    const ulong first = (ulong)gid * 4u;
+    if (first + 4u <= count) {
+        for (uint j = 0; j < 4u; j++)
+            dst[first + j] = (ushort)(as_type<uint>(src[first + j]) >> 16);
+    } else {
+        for (ulong i = first; i < count; i++)
+            dst[i] = (ushort)(as_type<uint>(src[i]) >> 16);
+    }
+}
+
 struct ds4_metal_args_dsv41_rope {
     uint width, heads, rows, start, inverse, stride;
     float frequencies[32];
@@ -220,7 +239,7 @@ kernel void kernel_dsv41_carry_copy(
 #ifdef DS4_METAL_HAS_TENSOR
 kernel void kernel_dsv41_indexer_pack(
         constant uint4 &args,
-        device const float *q, device const float *keys,
+        device const float *q, device const char *keys,
         device uint *flags, device bfloat *packed_q, device bfloat *packed_keys,
         threadgroup uint *valid [[threadgroup(0)]],
         uint group [[threadgroup_position_in_grid]],
@@ -231,7 +250,8 @@ kernel void kernel_dsv41_indexer_pack(
     bool exact = true;
     for (uint i = tid; i < count; i += 128u) {
         const float value = query ? q[offset + i] :
-            offset + i < (ulong)args.x * 128u ? keys[offset + i] : 0.0f;
+            offset + i < (ulong)args.x * 128u ?
+                float(((device const bfloat *)keys)[offset + i]) : 0.0f;
         const bfloat converted = bfloat(value);
         if (query) packed_q[offset + i] = converted;
         else packed_keys[offset + i] = converted;
@@ -241,6 +261,49 @@ kernel void kernel_dsv41_indexer_pack(
     if (!(tid % 32u)) valid[tid / 32u] = same;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (!tid) flags[group] = valid[0] && valid[1] && valid[2] && valid[3];
+}
+
+/* Decode score pass over the canonical bf16 index cache. One query token,
+ * all visible rows, 64 rows per threadgroup through the tensor API. The
+ * cache values are already bf16-exact, so there is no f32 fallback and no
+ * per-block flag: the accumulation order is the tensor core's, which is the
+ * same arithmetic the packed prefill path already uses. */
+kernel void kernel_dsv41_indexer_scores_bf16(
+        constant uint4 &args,
+        device const bfloat *q,
+        device const float *weights,
+        device const bfloat *keys,
+        device float *scores,
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint2 group [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]]) {
+    constexpr int HEADS = 32, KEYS = 64, DIM = 128;
+    const uint width = args.x, token = group.y, row0 = group.x * KEYS;
+    const uint visible = (args.z + token + 1u) / args.w;
+    if (row0 >= visible) {
+        if (tid < KEYS && row0 + tid < width)
+            scores[(ulong)token * width + row0 + tid] = -INFINITY;
+        return;
+    }
+    matmul2d<matmul2d_descriptor(HEADS, KEYS, DIM, false, true, false,
+        matmul2d_descriptor::mode::multiply_accumulate), execution_simdgroups<4>> mm;
+    auto result = tensor(scratch, dextents<int32_t, 2>(KEYS, HEADS));
+    auto query = tensor((device bfloat *)q + (ulong)token * HEADS * DIM,
+                         dextents<int32_t, 2>(DIM, HEADS));
+    auto key = tensor((device bfloat *)keys + (ulong)row0 * DIM,
+                       dextents<int32_t, 2>(DIM, KEYS));
+    auto dots = mm.get_destination_cooperative_tensor<decltype(query), decltype(key), float>();
+    for (uint16_t i = 0; i < dots.get_capacity(); i++)
+        if (dots.is_valid_element(i)) dots[i] = 0;
+    mm.run(query, key, dots);
+    dots.store(result);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < KEYS && row0 + tid < width) {
+        float sum = 0;
+        for (uint h = 0; h < HEADS; h++)
+            sum += max(scratch[h * KEYS + tid] * (1.0f / 64.0f), 0.0f) * weights[token * HEADS + h];
+        scores[(ulong)token * width + row0 + tid] = row0 + tid < visible ? sum : -INFINITY;
+    }
 }
 
 kernel void kernel_dsv41_indexer_scores_packed(

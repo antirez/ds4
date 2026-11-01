@@ -1866,6 +1866,165 @@ done:
     return rc;
 }
 
+/* Verify the producer side: every value the E8M0 quantizer writes must be
+ * bf16-exact (low 16 f32 bits zero), so the cache store can copy the high
+ * half verbatim. 2^-126 (the smallest normal) must survive. 2^-127 is
+ * reported separately: Metal f32 arithmetic may flush the FP4 0.5 code to
+ * zero before the store, which matches what main's f32 path does. */
+static int check_bf16_quantize_edge(void) {
+    enum { N = 128 };
+    static const float inputs[] = {0x1p-127f, 0x1p-126f};
+    float *in = malloc((size_t)N * sizeof(float));
+    float *out = malloc((size_t)N * sizeof(float));
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc((uint64_t)N * sizeof(float));
+    int rc = 1;
+    if (!in || !out || !x) goto done;
+    for (int k = 0; k < 2; k++) {
+        for (int i = 0; i < N; i++) in[i] = (i & 1) ? -inputs[k] : inputs[k];
+        if (!ds4_gpu_tensor_write(x, 0, in, (uint64_t)N * sizeof(float)) ||
+            !ds4_gpu_dsv41_quantize(x, N, 1, DS4_V41_FP4_E8M0) ||
+            !ds4_gpu_tensor_read(x, 0, out, (uint64_t)N * sizeof(float))) goto done;
+        int hit = 0;
+        uint32_t first_bits = 0;
+        for (int i = 0; i < N; i++) {
+            uint32_t bits;
+            memcpy(&bits, &out[i], sizeof(bits));
+            if (i == 0) first_bits = bits;
+            if (bits & 0xffffu) {
+                fprintf(stderr, "bf16-quantize-edge input=%.9g output[%d] not bf16-exact: 0x%08x\n",
+                        (double)inputs[k], i, bits);
+                goto done;
+            }
+            if (out[i] == inputs[k] || out[i] == -inputs[k]) hit++;
+        }
+        fprintf(stderr, "bf16-quantize-edge input=%.9g first=%.9g bits=0x%08x hits=%d/%d\n",
+                (double)inputs[k], (double)out[0], first_bits, hit, N);
+        if (k == 1 && hit != N) goto done;
+    }
+    puts("V4.1 E8M0 quantizer emits bf16-exact values PASS");
+    rc = 0;
+done:
+    ds4_gpu_tensor_free(x);
+    free(out);
+    free(in);
+    return rc;
+}
+
+/* Every cache value is an FP4 code times a power of two, so its f32 top 16
+ * bits are the exact bf16 bits. Store them verbatim: no rounding and no
+ * subnormal flush. */
+static int check_bf16_cache_store(void) {
+    static const float values[] = {0x1p-127f, -0x1p-127f, 0x1p-128f,
+                                   0x1p-130f, 0x1p-126f, 0x1p-125f,
+                                   1.5f * 0x1p-126f, 1.0f};
+    enum { N = (int)(sizeof(values) / sizeof(values[0])) };
+    ds4_gpu_tensor *src = ds4_gpu_tensor_alloc(sizeof(values));
+    ds4_gpu_tensor *dst = ds4_gpu_tensor_alloc(sizeof(uint16_t) * N);
+    uint16_t bits[N] = {0};
+    int rc = 1;
+    if (!src || !dst) goto done;
+    for (int i = 0; i < N; i++) {
+        uint32_t u;
+        memcpy(&u, &values[i], sizeof(u));
+        if (u & 0xffffu) {
+            fprintf(stderr, "bf16-cache-store input[%d] is not bf16-exact: 0x%08x\n",
+                    i, u);
+            goto done;
+        }
+    }
+    if (!ds4_gpu_tensor_write(src, 0, values, sizeof(values)) ||
+        !ds4_gpu_tensor_copy_f32_to_bf16(dst, 0, src, 0, N) ||
+        !ds4_gpu_tensor_read(dst, 0, bits, sizeof(bits))) goto done;
+    for (int i = 0; i < N; i++) {
+        uint32_t u;
+        memcpy(&u, &values[i], sizeof(u));
+        const uint16_t expect = (uint16_t)(u >> 16);
+        float back;
+        const uint32_t wide = (uint32_t)bits[i] << 16;
+        memcpy(&back, &wide, sizeof(back));
+        fprintf(stderr, "bf16-cache-store value[%d] bits=0x%04x expect=0x%04x back=%.9g\n",
+                i, bits[i], expect, (double)back);
+        if (bits[i] != expect || back != values[i]) goto done;
+    }
+    puts("V4.1 bf16 cache stores E8M0 edge values bit-exactly PASS");
+    rc = 0;
+done:
+    ds4_gpu_tensor_free(dst);
+    ds4_gpu_tensor_free(src);
+    return rc;
+}
+
+/* Compare the f32 SIMD, bf16 SIMD and tensor score paths on a row made only
+ * of the smallest cache value (and a normal control row). */
+static int check_bf16_cache_score(const char *label, float value) {
+    enum { HEADS = 32, DIM = 128, ROWS = 32, KEY_ROWS = 64 };
+    float *qf = malloc((size_t)HEADS * DIM * sizeof(float));
+    float *wf = malloc((size_t)HEADS * sizeof(float));
+    float *kf = malloc((size_t)KEY_ROWS * DIM * sizeof(float));
+    ds4_gpu_tensor *q = NULL, *w = NULL, *k32 = NULL, *kbf = NULL, *qbf = NULL;
+    ds4_gpu_tensor *scores = NULL;
+    float f32_score = 0.0f, simd_score = 0.0f, tensor_score = 0.0f;
+    int rc = 1;
+    if (!qf || !wf || !kf) goto done;
+    for (int i = 0; i < HEADS * DIM; i++) qf[i] = 1.0f;
+    for (int i = 0; i < HEADS; i++) wf[i] = 1.0f;
+    for (int i = 0; i < KEY_ROWS * DIM; i++) kf[i] = i < ROWS * DIM ? value : 0.0f;
+    q = ds4_gpu_tensor_alloc((uint64_t)HEADS * DIM * sizeof(float));
+    w = ds4_gpu_tensor_alloc((uint64_t)HEADS * sizeof(float));
+    k32 = ds4_gpu_tensor_alloc((uint64_t)KEY_ROWS * DIM * sizeof(float));
+    kbf = ds4_gpu_tensor_alloc((uint64_t)KEY_ROWS * DIM * sizeof(uint16_t));
+    qbf = ds4_gpu_tensor_alloc((uint64_t)HEADS * DIM * sizeof(uint16_t));
+    scores = ds4_gpu_tensor_alloc((uint64_t)ROWS * sizeof(float));
+    if (!q || !w || !k32 || !kbf || !qbf || !scores) goto done;
+    if (!ds4_gpu_tensor_write(q, 0, qf, (uint64_t)HEADS * DIM * sizeof(float)) ||
+        !ds4_gpu_tensor_write(w, 0, wf, (uint64_t)HEADS * sizeof(float)) ||
+        !ds4_gpu_tensor_write(k32, 0, kf, (uint64_t)KEY_ROWS * DIM * sizeof(float)) ||
+        !ds4_gpu_tensor_copy_f32_to_bf16(kbf, 0, k32, 0, (uint64_t)KEY_ROWS * DIM) ||
+        !ds4_gpu_tensor_copy_f32_to_bf16(qbf, 0, q, 0, (uint64_t)HEADS * DIM))
+        goto done;
+    if (!ds4_gpu_glm_indexer_score_one_tensor(scores, q, w, k32, ROWS, HEADS, DIM,
+                                              1.0f / 64.0f, false) ||
+        !ds4_gpu_tensor_read(scores, 0, &f32_score, sizeof(f32_score)))
+        goto done;
+    if (!ds4_gpu_glm_indexer_score_one_bf16_tensor(scores, q, w, kbf, ROWS, HEADS, DIM,
+                                                   1.0f / 64.0f) ||
+        !ds4_gpu_tensor_read(scores, 0, &simd_score, sizeof(simd_score)))
+        goto done;
+    if (!ds4_gpu_dsv41_indexer_scores_bf16(scores, qbf, w, kbf, ROWS, ROWS - 1u, 1u) ||
+        !ds4_gpu_tensor_read(scores, 0, &tensor_score, sizeof(tensor_score)))
+        goto done;
+    fprintf(stderr, "bf16-cache-score %-8s f32=%.9g bf16-simd=%.9g tensor=%.9g\n",
+            label, (double)f32_score, (double)simd_score, (double)tensor_score);
+    rc = 0;
+done:
+    ds4_gpu_tensor_free(scores);
+    ds4_gpu_tensor_free(qbf);
+    ds4_gpu_tensor_free(kbf);
+    ds4_gpu_tensor_free(k32);
+    ds4_gpu_tensor_free(w);
+    ds4_gpu_tensor_free(q);
+    free(kf);
+    free(wf);
+    free(qf);
+    return rc;
+}
+
+static int check_bf16_cache_edge(void) {
+    int rc = 1;
+    if (!ds4_gpu_init()) {
+        fprintf(stderr, "bf16-cache-edge: ds4_gpu_init failed\n");
+        return 1;
+    }
+    if (check_bf16_quantize_edge()) goto done;
+    if (check_bf16_cache_store()) goto done;
+    if (check_bf16_cache_score("denormal", 0x1p-127f)) goto done;
+    if (check_bf16_cache_score("normal", 1.0f)) goto done;
+    puts("V4.1 bf16 cache edge storage PASS");
+    rc = 0;
+done:
+    return rc;
+}
+
 int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--batch-admission"))
         return check_batch_admission();
@@ -1957,6 +2116,8 @@ int main(int argc, char **argv) {
         return check_chat(argv[2], argv[3], argv[4], argv[5]);
     if (argc == 3 && strcmp(argv[1], "--rope-reference") == 0)
         return check_rope_reference(argv[2]);
+    if (argc == 3 && !strcmp(argv[2], "--bf16-cache-edge"))
+        return check_bf16_cache_edge();
     if (argc == 3 && strcmp(argv[2], "--session-fixture") == 0)
         return check_sessions(argv[1]);
     if (argc < 3 || argc > 4 ||

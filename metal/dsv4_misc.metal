@@ -1641,8 +1641,11 @@ static inline float glm_cache_load_f32_or_f16(
         device const char *base,
         uint64_t index,
         uint cache_f16) {
-    if (cache_f16 != 0u) {
+    if (cache_f16 == 1u) {
         return (float)((device const half *)base)[index];
+    }
+    if (cache_f16 == 2u) {
+        return (float)((device const bfloat *)base)[index];
     }
     return ((device const float *)base)[index];
 }

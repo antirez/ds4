@@ -115,6 +115,13 @@ uint64_t ds4_gpu_dsv41_indexer_packed_bytes(uint32_t source_rows, uint32_t rows)
 int ds4_gpu_dsv41_indexer_pack(ds4_gpu_tensor *packed,
                               const ds4_gpu_tensor *q, const ds4_gpu_tensor *keys,
                               uint32_t source_rows, uint32_t rows);
+int ds4_gpu_dsv41_indexer_scores_bf16(ds4_gpu_tensor *scores,
+                                      const ds4_gpu_tensor *q,
+                                      const ds4_gpu_tensor *weights,
+                                      const ds4_gpu_tensor *keys,
+                                      uint32_t source_rows, uint32_t start,
+                                      uint32_t ratio);
+
 int ds4_gpu_dsv41_indexer_scores_packed(ds4_gpu_tensor *scores,
                                       const ds4_gpu_tensor *q,
                                       const ds4_gpu_tensor *weights,

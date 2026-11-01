@@ -40946,6 +40946,7 @@ static uint32_t ds41_carry_cap(uint32_t ctx) {
     X(raw_prefill, (g->prefill_cap + 128u) * DS4_N_HEAD_DIM) \
     X(pool_kv, DS4_N_HEAD_DIM) X(pool_score, DS4_N_HEAD_DIM) \
     X(index_q, DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM) \
+    X(index_q_bf16, DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM) \
     X(index_k, DS4_N_INDEXER_HEAD_DIM) X(index_weights, DS4_N_INDEXER_HEAD) \
     X(index_scores, DS41_INDEX_BATCH * g->ctx) X(selected_comp, DS4_N_INDEXER_TOP_K) \
     X(index_packed, ds4_gpu_dsv41_indexer_packed_bytes(g->ctx, g->prefill_cap) / 4u) \
@@ -40996,6 +40997,14 @@ typedef struct {
     DS41_SCRATCH(DS41_FIELD)
 #undef DS41_FIELD
 } ds41_gpu_graph;
+
+/* The V4.1 index cache is bf16 on Metal (values are bf16-exact) and f32 on
+ * the other backends. Session payloads are backend-specific. */
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+#define DS41_INDEX_CACHE_ELEM_BYTES 2u
+#else
+#define DS41_INDEX_CACHE_ELEM_BYTES 4u
+#endif
 
 static bool ds41_read_array(const ds4_model *m, const char *key, uint32_t type,
                             uint64_t count, void *out, size_t bytes) {
@@ -41155,8 +41164,22 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
     }
     for (uint32_t i = 0; i < 4; i++) {
         const uint64_t cap = ctx / (i < 3 ? 2u : 1u) + 1u;
+        /* The tensor score kernel reads 64-row key tiles; pad the cache so the
+         * last tile stays inside the allocation. The saved state still spans
+         * only the live rows. */
+        const uint64_t index_rows = (cap + 63u) & ~UINT64_C(63);
         g->compressed[i] = ds4_gpu_tensor_alloc(cap * 512u * sizeof(float));
-        g->index_cache[i] = ds4_gpu_tensor_alloc(cap * 128u * sizeof(float));
+        g->index_cache[i] = ds4_gpu_tensor_alloc(index_rows * 128u * DS41_INDEX_CACHE_ELEM_BYTES);
+        if (g->index_cache[i] && index_rows > cap) {
+            uint8_t zeros[4096] = {0};
+            const uint64_t base = cap * 128u * DS41_INDEX_CACHE_ELEM_BYTES;
+            const uint64_t pad = (index_rows - cap) * 128u * DS41_INDEX_CACHE_ELEM_BYTES;
+            for (uint64_t off = 0; off < pad; off += sizeof(zeros)) {
+                const uint64_t chunk = pad - off < sizeof(zeros) ? pad - off : sizeof(zeros);
+                if (!ds4_gpu_tensor_write(g->index_cache[i], base + off, zeros, chunk))
+                    goto fail;
+            }
+        }
         g->previous_kv[i] = ds4_gpu_tensor_alloc(512u * sizeof(float));
         g->previous_score[i] = ds4_gpu_tensor_alloc(512u * sizeof(float));
         if (!g->compressed[i] || !g->index_cache[i] || !g->previous_kv[i] || !g->previous_score[i]) goto fail;
@@ -41472,8 +41495,14 @@ static bool ds41_attention_publish(ds41_gpu_graph *g, const ds4_model *m,
                 !ds41_norm(g->index_k, g->index_k, m, l->indexer_k_norm) ||
                 !ds41_rope(g->index_k, 1, DS4_N_INDEXER_HEAD_DIM, il, rope_pos, false) ||
                 !ds4_gpu_dsv41_quantize(g->index_k, 128, 1, DS4_V41_FP4_E8M0) ||
+#if defined(__APPLE__)
+                !ds4_gpu_tensor_copy_f32_to_bf16(g->index_cache[owner],
+                                     (uint64_t)(n_comp - 1u) * 128u * sizeof(uint16_t),
+                                     g->index_k, 0, 128u) ||
+#else
                 !ds4_gpu_tensor_copy(g->index_cache[owner], (uint64_t)(n_comp - 1u) * 128u * 4u,
                                      g->index_k, 0, 128u * 4u) ||
+#endif
                 !ds41_rope(g->latent, 1, 512, il, rope_pos, false) ||
                 !ds4_gpu_dsv41_quantize(g->latent, 512, 1, DS4_V41_FP4_E4M3) ||
                 !ds4_gpu_tensor_copy(g->compressed[owner], (uint64_t)(n_comp - 1u) * 512u * 4u,
@@ -41509,6 +41538,51 @@ static bool ds41_attention_pick(ds41_gpu_graph *g, uint32_t il) {
         ds4_gpu_indexer_topk_tensor(g->selected_comp, g->index_scores, n_comp, 1, top));
 }
 
+#if defined(__APPLE__)
+/* Diagnostic for the tensor score path: score with the other kernel and
+ * compare the top-k set per layer/token. Slow; set
+ * DS4_V41_SCORE_SELECTION_CHECK=1 to enable. */
+static void ds41_score_selection_check(ds41_gpu_graph *g, uint32_t owner,
+                                       uint32_t n_comp, uint32_t pos, uint32_t ratio,
+                                       uint32_t il, bool tensor_used) {
+    const uint32_t top = n_comp < DS4_N_INDEXER_TOP_K ? n_comp : DS4_N_INDEXER_TOP_K;
+    if (!top) return;
+    ds4_gpu_tensor *other = ds4_gpu_tensor_alloc((uint64_t)n_comp * sizeof(float));
+    ds4_gpu_tensor *sel_a = ds4_gpu_tensor_alloc((uint64_t)top * sizeof(uint32_t));
+    ds4_gpu_tensor *sel_b = ds4_gpu_tensor_alloc((uint64_t)top * sizeof(uint32_t));
+    uint32_t *a = xmalloc((size_t)top * sizeof(uint32_t));
+    uint32_t *b = xmalloc((size_t)top * sizeof(uint32_t));
+    bool ok = other && sel_a && sel_b && a && b;
+    if (ok && tensor_used) {
+        ok = ds4_gpu_glm_indexer_score_one_bf16_tensor(other, g->index_q, g->index_weights,
+                g->index_cache[owner], n_comp, DS4_N_INDEXER_HEAD, 128, 1.0f / 64.0f);
+    } else if (ok) {
+        ok = ds4_gpu_tensor_copy_f32_to_bf16(g->index_q_bf16, 0, g->index_q, 0,
+                DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM) &&
+             ds4_gpu_dsv41_indexer_scores_bf16(other, g->index_q_bf16, g->index_weights,
+                g->index_cache[owner], n_comp, pos, ratio);
+    }
+    if (ok)
+        ok = ds4_gpu_indexer_topk_tensor(sel_a, g->index_scores, n_comp, 1, top) &&
+             ds4_gpu_indexer_topk_tensor(sel_b, other, n_comp, 1, top) &&
+             ds4_gpu_tensor_read(sel_a, 0, a, (uint64_t)top * sizeof(uint32_t)) &&
+             ds4_gpu_tensor_read(sel_b, 0, b, (uint64_t)top * sizeof(uint32_t));
+    if (ok) {
+        uint32_t diff = 0;
+        for (uint32_t i = 0; i < top; i++) if (a[i] != b[i]) diff++;
+        fprintf(stderr, "ds4: score selection pos=%u layer=%u mismatches=%u/%u\n",
+                pos, il, diff, top);
+    } else {
+        fprintf(stderr, "ds4: score selection pos=%u layer=%u check failed\n", pos, il);
+    }
+    ds4_gpu_tensor_free(other);
+    ds4_gpu_tensor_free(sel_a);
+    ds4_gpu_tensor_free(sel_b);
+    free(a);
+    free(b);
+}
+#endif
+
 static bool ds41_attention_select_published(ds41_gpu_graph *g, const ds4_model *m,
                                             const ds4_layer_weights *l, uint32_t il) {
     const uint32_t pos = g->pos, ratio = ds4_layer_compress_ratio(il);
@@ -41518,12 +41592,26 @@ static bool ds41_attention_select_published(ds41_gpu_graph *g, const ds4_model *
         if (!ds41_matmul(g->index_q, m, l->indexer_attn_q_b, g->qr, true) ||
             !ds41_rope(g->index_q, DS4_N_INDEXER_HEAD, 128, il, pos, false) ||
             !ds4_gpu_dsv41_quantize(g->index_q, 128, DS4_N_INDEXER_HEAD, DS4_V41_FP4_E8M0) ||
-            !ds41_matmul(g->index_weights, m, l->indexer_proj, g->norm, true) ||
+            !ds41_matmul(g->index_weights, m, l->indexer_proj, g->norm, true))
+            return false;
 #ifdef __APPLE__
-            !ds4_gpu_glm_indexer_score_one_tensor(g->index_scores, g->index_q, g->index_weights,
-                g->index_cache[owner], n_comp, DS4_N_INDEXER_HEAD, 128, 1.0f / 64.0f, false)) return false;
+        const bool tensor_score = ds4_gpu_dsv41_tensor_ops_available() &&
+            !getenv("DS4_METAL_DISABLE_V41_SCORE_TENSOR");
+        if (tensor_score) {
+            if (!ds4_gpu_tensor_copy_f32_to_bf16(g->index_q_bf16, 0, g->index_q, 0,
+                    DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM) ||
+                !ds4_gpu_dsv41_indexer_scores_bf16(g->index_scores, g->index_q_bf16,
+                    g->index_weights, g->index_cache[owner], n_comp, pos, ratio))
+                return false;
+        } else if (!ds4_gpu_glm_indexer_score_one_bf16_tensor(g->index_scores, g->index_q,
+                       g->index_weights, g->index_cache[owner], n_comp,
+                       DS4_N_INDEXER_HEAD, 128, 1.0f / 64.0f)) {
+            return false;
+        }
+        if (getenv("DS4_V41_SCORE_SELECTION_CHECK"))
+            ds41_score_selection_check(g, owner, n_comp, pos, ratio, il, tensor_score);
 #else
-            !ds4_gpu_dsv41_indexer_scores_batch(g->index_scores, g->index_q, g->index_weights,
+        if (!ds4_gpu_dsv41_indexer_scores_batch(g->index_scores, g->index_q, g->index_weights,
                 g->index_cache[owner], n_comp, 1, pos, ratio)) return false;
 #endif
     }
@@ -41851,8 +41939,14 @@ static bool ds41_attention_publish_batch(ds41_gpu_graph *g, ds41_prefill_row *b,
         ds4_gpu_dsv41_rope_stride(b->index_k, DS4_N_INDEXER_HEAD_DIM, 1, rows,
                                   first * ratio, ratio, true, false) &&
         ds4_gpu_dsv41_quantize(b->index_k, DS4_N_INDEXER_HEAD_DIM, rows, DS4_V41_FP4_E8M0) &&
+#if defined(__APPLE__)
+        ds4_gpu_tensor_copy_f32_to_bf16(g->index_cache[owner],
+            (uint64_t)first * DS4_N_INDEXER_HEAD_DIM * sizeof(uint16_t),
+            b->index_k, 0, (uint64_t)rows * DS4_N_INDEXER_HEAD_DIM) &&
+#else
         ds4_gpu_tensor_copy(g->index_cache[owner], (uint64_t)first * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
             b->index_k, 0, (uint64_t)rows * DS4_N_INDEXER_HEAD_DIM * sizeof(float)) &&
+#endif
         ds4_gpu_dsv41_rope_stride(b->latent, DS4_N_HEAD_DIM, 1, rows,
                                   first * ratio, ratio, true, false) &&
         ds4_gpu_dsv41_quantize(b->latent, DS4_N_HEAD_DIM, rows, DS4_V41_FP4_E4M3) &&
@@ -63460,7 +63554,7 @@ static uint32_t ds41_state_spans(ds41_gpu_graph *g, uint32_t pos,
     for (uint32_t i = 0; i < 4; i++) {
         const uint32_t live = pos / (i < 3 ? 2u : 1u);
         spans[n++] = (ds41_state_span){g->compressed[i], (uint64_t)live * 512u * 4u};
-        spans[n++] = (ds41_state_span){g->index_cache[i], (uint64_t)live * 128u * 4u};
+        spans[n++] = (ds41_state_span){g->index_cache[i], (uint64_t)live * 128u * DS41_INDEX_CACHE_ELEM_BYTES};
         if (i < 3 && (pos & 1u)) {
             spans[n++] = (ds41_state_span){g->previous_kv[i], 512u * 4u};
             spans[n++] = (ds41_state_span){g->previous_score[i], 512u * 4u};
@@ -64309,8 +64403,17 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
     for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++) {
         if (payload_read_u32(fp, &h[i], &remaining, err, errlen) != 0) return 1;
     }
-    if (h[0] != DS4_SESSION_PAYLOAD_MAGIC || h[1] != DS4_SESSION_PAYLOAD_VERSION) {
-        payload_set_err(err, errlen, "unsupported session payload version");
+    if (h[0] != DS4_SESSION_PAYLOAD_MAGIC) {
+        payload_set_err(err, errlen, "invalid session payload magic");
+        return 1;
+    }
+    if (h[1] != DS4_SESSION_PAYLOAD_VERSION) {
+        char msg[128];
+        snprintf(msg, sizeof(msg),
+                 "session payload format %u (expected %u); rebuilding",
+                 h[1], (unsigned)DS4_SESSION_PAYLOAD_VERSION);
+        payload_set_err(err, errlen, msg);
+        fprintf(stderr, "ds4: %s\n", msg);
         return 1;
     }
     if (s->engine && s->engine->tp.active) {
