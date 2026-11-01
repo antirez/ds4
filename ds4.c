@@ -41647,7 +41647,22 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
         if (shared_queued && balance_shared) shared_here = true;
     }
 #endif
-    if (shared_here && !shared_queued &&
+    /* One dispatch for gate, up and SwiGLU with their BF16 rounding, in place
+     * of five. Same bits as the unfused sequence below. */
+    bool shared_fused = false;
+#ifdef __APPLE__
+    shared_fused = shared_here && !shared_queued &&
+        l->ffn_gate_shexp->type == DS4_TENSOR_Q8_0 &&
+        l->ffn_up_shexp->type == DS4_TENSOR_Q8_0 &&
+        !getenv("DS4_METAL_DISABLE_V41_SHARED_FUSION");
+    if (shared_fused &&
+        (!ds4_gpu_dsv41_shared_gate_up_swiglu_q8_0_tensor(g->shared_gate, g->shared_up,
+            g->shared_mid, m->map, m->size, l->ffn_gate_shexp->abs_offset,
+            l->ffn_up_shexp->abs_offset, DS4_N_EMBD, DS4_N_FF_EXP, g->norm,
+            DS4_SWIGLU_CLAMP_EXP) ||
+        !ds41_matmul(g->shared, m, l->ffn_down_shexp, g->shared_mid, true))) return false;
+#endif
+    if (shared_here && !shared_queued && !shared_fused &&
         (!ds41_matmul(g->shared_gate, m, l->ffn_gate_shexp, g->norm, true) ||
         !ds41_matmul(g->shared_up, m, l->ffn_up_shexp, g->norm, true) ||
         !ds4_gpu_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up,

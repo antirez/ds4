@@ -473,7 +473,18 @@ kernel void kernel_mul_mv_q8_0_f32_pair(
 // same lane that owns the reduced output row.  The point is not to fuse two
 // independent weight streams into one matmul; it is to remove the separate
 // activation pass and its reread of the two 2048-wide rows.
-template<short NR0, bool STORE_GATE_UP>
+// BF16 = true is the DeepSeek V4.1 variant: gate, up and mid are each rounded
+// to BF16 (round-to-nearest-even, non-finite values left alone) at the points
+// where the unfused V4.1 graph rounds them, so the result is the same bits as
+// matvec + round, matvec + round, SwiGLU + round.
+static inline float ds4_shared_bf16(float x) {
+    uint bits = as_type<uint>(x);
+    if ((bits & 0x7f800000u) != 0x7f800000u)
+        bits += 0x7fffu + ((bits >> 16u) & 1u);
+    return as_type<float>(bits & 0xffff0000u);
+}
+
+template<short NR0, bool STORE_GATE_UP, bool BF16>
 void kernel_dsv4_shared_gate_up_swiglu_q8_0_impl(
         constant ds4_metal_args_mul_mv & args,
         device const char * src0_gate,
@@ -576,8 +587,12 @@ void kernel_dsv4_shared_gate_up_swiglu_q8_0_impl(
         (uint64_t)im * args.ne0 * args.ne1 + (uint64_t)r1 * args.ne0;
 
     FOR_UNROLL (short row = 0; row < NR0 && r0 + row < args.ne01; ++row) {
-        const float gate = simd_sum(sh_gate[row][tiisg]);
-        const float up = simd_sum(sh_up[row][tiisg]);
+        float gate = simd_sum(sh_gate[row][tiisg]);
+        float up = simd_sum(sh_up[row][tiisg]);
+        if (BF16) {
+            gate = ds4_shared_bf16(gate);
+            up = ds4_shared_bf16(up);
+        }
         if (tiisg == 0 && sgitg == 0) {
             const uint out_row = r0 + row;
             if (STORE_GATE_UP) {
@@ -591,7 +606,7 @@ void kernel_dsv4_shared_gate_up_swiglu_q8_0_impl(
                 u = clamp(u, -clamp_value, clamp_value);
             }
             const float silu = g / (1.0f + exp(-g));
-            mid_f32[out_row] = silu * u;
+            mid_f32[out_row] = BF16 ? ds4_shared_bf16(silu * u) : silu * u;
         }
     }
 }
@@ -610,7 +625,28 @@ kernel void kernel_dsv4_shared_gate_up_swiglu_q8_0(
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    kernel_dsv4_shared_gate_up_swiglu_q8_0_impl<N_R0_Q8_0, true>(
+    kernel_dsv4_shared_gate_up_swiglu_q8_0_impl<N_R0_Q8_0, true, false>(
+            args, src0_gate, src0_up, src1, dst_gate, dst_up, dst_mid,
+            clamp_value, shmem, tgpig, tiisg, sgitg);
+}
+
+// DeepSeek V4.1 shared expert: the same fused gate/up SwiGLU with BF16 rounding
+// of gate, up and mid.
+[[host_name("kernel_dsv41_shared_gate_up_swiglu_q8_0")]]
+kernel void kernel_dsv41_shared_gate_up_swiglu_q8_0(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0_gate,
+        device const char * src0_up,
+        device const char * src1,
+        device       char * dst_gate,
+        device       char * dst_up,
+        device       char * dst_mid,
+        constant     float &clamp_value,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_dsv4_shared_gate_up_swiglu_q8_0_impl<N_R0_Q8_0, true, true>(
             args, src0_gate, src0_up, src1, dst_gate, dst_up, dst_mid,
             clamp_value, shmem, tgpig, tiisg, sgitg);
 }
@@ -1124,7 +1160,7 @@ kernel void kernel_dsv4_shared_mid_swiglu_q8_0(
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    kernel_dsv4_shared_gate_up_swiglu_q8_0_impl<N_R0_Q8_0, false>(
+    kernel_dsv4_shared_gate_up_swiglu_q8_0_impl<N_R0_Q8_0, false, false>(
             args, src0_gate, src0_up, src1, dst_gate, dst_up, dst_mid,
             clamp_value, shmem, tgpig, tiisg, sgitg);
 }

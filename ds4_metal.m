@@ -20339,8 +20339,10 @@ static int ds4_gpu_shared_gate_up_swiglu_q8_0_impl(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         float                   clamp,
-        int                     store_gate_up) {
+        int                     store_gate_up,
+        int                     bf16) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (bf16 && !store_gate_up) return 0;
     if (!mid || !x || !model_map ||
         (store_gate_up && (!gate || !up)) ||
         (in_dim & 31u) != 0 ||
@@ -20393,7 +20395,9 @@ static int ds4_gpu_shared_gate_up_swiglu_q8_0_impl(
         ds4_gpu_q8_0_matvec_args args = ds4_gpu_make_q8_0_mv_args(in_dim, out_dim);
         ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch();
         args.nr0 = mv_dispatch.nr0;
-        const char *fn_name = store_gate_up ?
+        const char *fn_name = bf16 ?
+            "kernel_dsv41_shared_gate_up_swiglu_q8_0" :
+            store_gate_up ?
             "kernel_dsv4_shared_gate_up_swiglu_q8_0" :
             "kernel_dsv4_shared_mid_swiglu_q8_0";
         id<MTLComputePipelineState> pipeline =
@@ -20672,7 +20676,28 @@ int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
                                                    out_dim,
                                                    x,
                                                    clamp,
-                                                   1);
+                                                   1,
+                                                   0);
+}
+
+/* DeepSeek V4.1 shared expert gate/up SwiGLU in one dispatch, with the BF16
+ * rounding of gate, up and mid that the unfused V4.1 graph applies. */
+int ds4_gpu_dsv41_shared_gate_up_swiglu_q8_0_tensor(
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        float                   clamp) {
+    return ds4_gpu_shared_gate_up_swiglu_q8_0_impl(gate, up, mid, model_map,
+                                                   model_size, gate_offset,
+                                                   up_offset, in_dim, out_dim,
+                                                   x, clamp, 1, 1);
 }
 
 int ds4_gpu_shared_mid_swiglu_q8_0_tensor(
@@ -20696,6 +20721,7 @@ int ds4_gpu_shared_mid_swiglu_q8_0_tensor(
                                                    out_dim,
                                                    x,
                                                    clamp,
+                                                   0,
                                                    0);
 }
 
@@ -20722,7 +20748,8 @@ int ds4_gpu_shared_gate_up_swiglu_q8_0_model_view_tensor(
                                                    out_dim,
                                                    x,
                                                    clamp,
-                                                   1);
+                                                   1,
+                                                   0);
 }
 
 int ds4_gpu_shared_gate_up_swiglu_q8_0_rows_tensor(

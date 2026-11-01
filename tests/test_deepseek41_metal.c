@@ -707,6 +707,123 @@ static int check_attention_output(bool large) {
     return 1;
 }
 
+#ifdef __APPLE__
+static double now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+}
+
+/* The fused V4.1 shared-expert gate/up SwiGLU must produce the same bits as
+ * the unfused sequence it replaces: matvec + BF16, matvec + BF16, SwiGLU + BF16.
+ * Real V4.1 shapes, and Q8_0 scales that are NOT powers of two so the two
+ * paths only agree if they also reduce in the same order. */
+static int check_shared_fusion(bool timing) {
+    enum { IN = 5120, HIDDEN = 2304, LAYERS = 40 };
+    const float CLAMP = 10.0f;
+    typedef struct { uint16_t d; int8_t qs[32]; } q8_block;
+    const uint64_t w_bytes = (uint64_t)HIDDEN * IN / 32 * sizeof(q8_block);
+    const uint64_t model_bytes = 2 * w_bytes;
+    void *model = NULL;
+    CHECK(posix_memalign(&model, getpagesize(), model_bytes) == 0);
+    q8_block *w = model;
+    for (uint64_t i = 0; i < model_bytes / sizeof(*w); i++) {
+        w[i].d = (uint16_t)(0x1c00u + (uint32_t)(fabsf(random_value()) * 8192) % 0x7ffu);
+        for (int j = 0; j < 32; j++) w[i].qs[j] = (int8_t)((int)(random_value() * 8192) % 127);
+    }
+    const uint64_t xb = IN * 4, hb = HIDDEN * 4;
+    float *x = malloc(xb), *ref[3], *got[3], *plain = malloc(hb);
+    CHECK(x && plain);
+    for (int i = 0; i < 3; i++) CHECK((ref[i] = malloc(hb)) && (got[i] = malloc(hb)));
+    for (int i = 0; i < IN; i++) x[i] = random_value() * 0.37f;
+    ds4_gpu_tensor *xt = upload(x, xb);
+    ds4_gpu_tensor *t[3] = {upload(NULL, hb), upload(NULL, hb), upload(NULL, hb)};
+    CHECK(xt && t[0] && t[1] && t[2] && ds4_gpu_set_model_map(model, model_bytes));
+
+    CHECK(ds4_gpu_begin_commands());
+    CHECK(ds4_gpu_matmul_q8_0_tensor(t[0], model, model_bytes, 0, IN, HIDDEN, xt, 1));
+    CHECK(ds4_gpu_dsv41_quantize(t[0], HIDDEN, 1, DS4_V41_BF16));
+    CHECK(ds4_gpu_matmul_q8_0_tensor(t[1], model, model_bytes, w_bytes, IN, HIDDEN, xt, 1));
+    CHECK(ds4_gpu_dsv41_quantize(t[1], HIDDEN, 1, DS4_V41_BF16));
+    CHECK(ds4_gpu_swiglu_tensor(t[2], t[0], t[1], HIDDEN, CLAMP, 1.0f));
+    CHECK(ds4_gpu_dsv41_quantize(t[2], HIDDEN, 1, DS4_V41_BF16));
+    CHECK(ds4_gpu_end_commands());
+    for (int i = 0; i < 3; i++) CHECK(ds4_gpu_tensor_read(t[i], 0, ref[i], hb));
+
+    for (int i = 0; i < 3; i++) CHECK(ds4_gpu_tensor_fill_f32(t[i], NAN, HIDDEN));
+    CHECK(ds4_gpu_begin_commands());
+    CHECK(ds4_gpu_dsv41_shared_gate_up_swiglu_q8_0_tensor(t[0], t[1], t[2], model,
+        model_bytes, 0, w_bytes, IN, HIDDEN, xt, CLAMP));
+    CHECK(ds4_gpu_end_commands());
+    for (int i = 0; i < 3; i++) CHECK(ds4_gpu_tensor_read(t[i], 0, got[i], hb));
+    const char *names[3] = {"gate", "up", "mid"};
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < HIDDEN; j++) {
+            if (memcmp(&ref[i][j], &got[i][j], 4)) {
+                fprintf(stderr, "V4.1 shared fusion: %s[%d] unfused %a fused %a\n",
+                        names[i], j, ref[i][j], got[i][j]);
+                return 0;
+            }
+        }
+    }
+
+    /* The comparison must be able to fail. The V4 kernel (no rounding) has to
+     * differ from the V4.1 result, some gate has to reach the clamp, and the
+     * output has to be finite and non-zero. */
+    CHECK(ds4_gpu_begin_commands());
+    CHECK(ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(t[0], t[1], t[2], model,
+        model_bytes, 0, w_bytes, IN, HIDDEN, xt, CLAMP));
+    CHECK(ds4_gpu_end_commands());
+    CHECK(ds4_gpu_tensor_read(t[2], 0, plain, hb));
+    int unrounded = 0, clamped = 0, nonzero = 0;
+    for (int j = 0; j < HIDDEN; j++) {
+        unrounded += memcmp(&plain[j], &ref[2][j], 4) != 0;
+        clamped += ref[0][j] > CLAMP || fabsf(ref[1][j]) > CLAMP;
+        nonzero += isfinite(ref[2][j]) && ref[2][j] != 0.0f;
+    }
+    CHECK(unrounded > HIDDEN / 2 && clamped > 0 && nonzero > HIDDEN / 2);
+
+    if (timing) {
+        /* One decode token's worth: 40 layers in one command buffer per arm,
+         * arms alternated, paired per round. */
+        enum { ROUNDS = 15 };
+        double a[ROUNDS], b[ROUNDS];
+        for (int round = -2; round < ROUNDS; round++) {
+            double t0 = now_ms();
+            CHECK(ds4_gpu_begin_commands());
+            for (int l = 0; l < LAYERS; l++) {
+                CHECK(ds4_gpu_matmul_q8_0_tensor(t[0], model, model_bytes, 0, IN, HIDDEN, xt, 1));
+                CHECK(ds4_gpu_dsv41_quantize(t[0], HIDDEN, 1, DS4_V41_BF16));
+                CHECK(ds4_gpu_matmul_q8_0_tensor(t[1], model, model_bytes, w_bytes, IN, HIDDEN, xt, 1));
+                CHECK(ds4_gpu_dsv41_quantize(t[1], HIDDEN, 1, DS4_V41_BF16));
+                CHECK(ds4_gpu_swiglu_tensor(t[2], t[0], t[1], HIDDEN, CLAMP, 1.0f));
+                CHECK(ds4_gpu_dsv41_quantize(t[2], HIDDEN, 1, DS4_V41_BF16));
+            }
+            CHECK(ds4_gpu_end_commands());
+            double t1 = now_ms();
+            CHECK(ds4_gpu_begin_commands());
+            for (int l = 0; l < LAYERS; l++)
+                CHECK(ds4_gpu_dsv41_shared_gate_up_swiglu_q8_0_tensor(t[0], t[1], t[2], model,
+                    model_bytes, 0, w_bytes, IN, HIDDEN, xt, CLAMP));
+            CHECK(ds4_gpu_end_commands());
+            double t2 = now_ms();
+            if (round >= 0) { a[round] = t1 - t0; b[round] = t2 - t1; }
+        }
+        int wins = 0;
+        printf("V4.1 shared fusion, %d layers per round (ms unfused, fused, ratio):\n", LAYERS);
+        for (int r = 0; r < ROUNDS; r++) {
+            wins += b[r] < a[r];
+            printf("  %7.3f %7.3f %.3f\n", a[r], b[r], b[r] / a[r]);
+        }
+        printf("fused faster in %d of %d rounds\n", wins, ROUNDS);
+    }
+    for (int i = 0; i < 3; i++) { ds4_gpu_tensor_free(t[i]); free(ref[i]); free(got[i]); }
+    ds4_gpu_tensor_free(xt);
+    free(x); free(plain); free(model);
+    return 1;
+}
+#endif
+
 static int check_indexer_batch(void) {
     enum { KEYS = 1025, ROWS = 33, HEADS = 32, DIM = 128 };
     ds4_gpu_tensor *qt = upload(NULL, (size_t)ROWS * HEADS * DIM * sizeof(float));
@@ -1280,6 +1397,13 @@ int main(int argc, char **argv) {
         return ok ? 0 : 1;
     }
 #ifdef __APPLE__
+    if (argc == 2 && (!strcmp(argv[1], "--shared-fusion") ||
+                      !strcmp(argv[1], "--shared-fusion-timing"))) {
+        const int ok = ds4_gpu_init() && check_shared_fusion(
+            !strcmp(argv[1], "--shared-fusion-timing"));
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
     if (argc == 2 && !strcmp(argv[1], "--hc-scaled")) {
         const int ok = ds4_gpu_init() && check_hc_scaled();
         ds4_gpu_cleanup();
@@ -1321,6 +1445,9 @@ int main(int argc, char **argv) {
              check_candidates() && check_sparse_gather() && check_indexer_batch() &&
              check_embedding() && check_index_projection() && check_general_topk() && check_causal_topk() && check_compact_carry() && check_attention_output(false) &&
              check_tp_attention();
+#ifdef __APPLE__
+    ok = ok && check_shared_fusion(false);
+#endif
     ds4_gpu_cleanup();
     return ok ? 0 : 1;
 }
