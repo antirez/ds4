@@ -33,6 +33,24 @@ static void ds41_dspark_reset(ds41_dspark *d) {
     d->rewind_end = 0;
 }
 
+/* The target graph was rewound to `pos` (ds41_graph_rewind). Captured
+ * features and drafter KV rows of the abandoned tail must not be mistaken
+ * for the new tokens at those positions: forget them, and let the ordinary
+ * readiness check warm the window again by decoding. The verifier snapshot
+ * belongs to the old tail as well. */
+_Static_assert(DS41_VERIFY_ROWS <= DS41_RAW_LOG_SLACK,
+               "the rewind ring slack must cover a verification block");
+static void ds41_dspark_truncate(ds41_dspark *d, uint32_t pos) {
+    if (!d) return;
+    for (unsigned stage = 0; stage < 3; stage++)
+        for (uint32_t i = 0; i < DS41_DRAFT_WINDOW; i++)
+            if (d->positions[stage][i] >= pos)
+                d->positions[stage][i] = UINT32_MAX;
+    if (d->kv_end > pos) d->kv_valid = false;
+    d->verify_count = 0;
+    d->rewind_end = 0;
+}
+
 static void ds41_dspark_free(ds41_dspark *d) {
     if (!d) return;
 #define DS41_DRAFT_FREE(name, count) ds4_gpu_tensor_free(d->batch.name);
