@@ -1147,10 +1147,7 @@ __global__ void matvec_q8(float *out, const char *w, const float *x,
     if (row >= M) return;
     const char *wr = w+(uint64_t)row*stride;
     float acc[ROWS] = {};
-    /* Issue independent weight loads ahead during single-token decode.
-     * Each lane still accumulates the same four quants in the same order. */
-    #pragma unroll (ROWS == 1 ? 4 : 0)
-    for (unsigned i = lane*4; i < K; i += 128) {
+    auto accumulate = [&](unsigned i) {
         const char *b = wr+(i/32)*34;
         const float scale = __half2float(*(const __half *)b);
         const uint16_t *q = (const uint16_t *)(b+2+i%32);
@@ -1164,6 +1161,13 @@ __global__ void matvec_q8(float *out, const char *w, const float *x,
             part += (float)(int8_t)(q23>>8)*v.w;
             acc[t] += part*scale;
         }
+    };
+    if constexpr (ROWS == 1) {
+        /* Issue independent weight loads ahead without reordering the sum. */
+        #pragma unroll 4
+        for (unsigned i = lane*4; i < K; i += 128) accumulate(i);
+    } else {
+        for (unsigned i = lane*4; i < K; i += 128) accumulate(i);
     }
     #pragma unroll
     for (unsigned t = 0; t < ROWS; t++) if (t < T) {
