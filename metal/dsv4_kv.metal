@@ -90,6 +90,48 @@ static inline float dsv4_e4m3fn_dequant(float x) {
     return sign * dsv4_e4m3fn_value(best);
 }
 
+/* V4.1 packed compressed-KV rows.
+ *
+ * A compressed row is 512 FP4 (e2m1) values with an E4M3 scale per 16, so it
+ * needs 4 bits per value plus a scale per block, not the 4 bytes per value it
+ * used to be stored in: 32 fp16 scales (64 B) then 256 bytes of nibbles, 320 B
+ * a row against 2048. A nibble is the e2m1 magnitude index in bits 0-2 and the
+ * sign in bit 3; the even column of a pair is the low nibble. */
+#define DS4_V41_PACK_ROW_BYTES 320u
+#define DS4_V41_PACK_SCALE_BYTES 64u
+
+static inline int dsv4_e2m1fn_code(float ax) {
+    int best = 0;
+    float best_diff = abs(ax - dsv4_e2m1fn_values[0]);
+    for (int i = 1; i < 8; i++) {
+        const float diff = abs(ax - dsv4_e2m1fn_values[i]);
+        if (diff < best_diff || (diff == best_diff && ((i & 1) == 0) && ((best & 1) != 0))) {
+            best = i;
+            best_diff = diff;
+        }
+    }
+    return best;
+}
+
+/* Four values of a packed row (columns 4*col .. 4*col+3) as halves.  Every
+ * value is an e2m1 magnitude times an e4m3 scale: at most five significant
+ * bits, so the half is exact -- and these kernels consumed the old f32 rows
+ * as halves anyway. */
+static inline half4 dsv4_unpack_comp_h4(device const char *row, uint col) {
+    const half scale = ((device const half *)row)[col / 4u];
+    device const uchar *codes = (device const uchar *)(row + DS4_V41_PACK_SCALE_BYTES);
+    const uchar b0 = codes[col * 2u];
+    const uchar b1 = codes[col * 2u + 1u];
+    const uchar nib[4] = {(uchar)(b0 & 0x0Fu), (uchar)(b0 >> 4),
+                          (uchar)(b1 & 0x0Fu), (uchar)(b1 >> 4)};
+    half4 v;
+    for (uint i = 0; i < 4u; i++) {
+        const half mag = (half)dsv4_e2m1fn_values[nib[i] & 7u] * scale;
+        v[i] = (nib[i] & 8u) != 0u ? -mag : mag;
+    }
+    return v;
+}
+
 static inline float dsv4_e2m1fn_dequant(float x) {
     const float sign = x < 0.0f ? -1.0f : 1.0f;
     const float ax = min(abs(x), 6.0f);

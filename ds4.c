@@ -40968,6 +40968,7 @@ typedef struct {
     uint32_t ctx, pos, prefill_cap, carry_cap;
     uint64_t allocation_bytes;
     bool valid, streaming, encoder_resident, compact_carry, prefill_alias, quality;
+    uint32_t comp_format;        /* DS41_COMP_*: how compressed rows are stored */
     uint32_t tp_world, tp_rank;
     ds4_gpu_tensor *tp_logits_half;
     ds4_gpu_tensor **tp_out, **tp_in;
@@ -41047,6 +41048,30 @@ static void ds41_graph_free(ds41_gpu_graph *g) {
     g->table[0].fd = g->table[1].fd = -1;
 }
 
+/* Compressed KV rows hold FP4 (e2m1) values with E4M3 block scales, and used
+ * to be stored as f32: at most five significant bits in four bytes.  Packed --
+ * 4 bits a value plus an fp16 scale per 16 -- a row is 320 B instead of 2048,
+ * exactly the same values, which is 5.0 -> 0.8 GiB per session at 1M context.
+ * fp16 rows (1024 B) are also exact and read by an older kernel path.
+ * DS4_V41_COMP=packed|f16|f32 picks the format; packed is the default. */
+enum { DS41_COMP_F32 = 0, DS41_COMP_F16 = 1, DS41_COMP_PACKED = 2 };
+static uint32_t ds41_comp_format(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *env = getenv("DS4_V41_COMP");
+        v = DS41_COMP_PACKED;
+        if (getenv("DS4_V41_COMP_F32")) v = DS41_COMP_F32;
+        if (env && !strcmp(env, "f32")) v = DS41_COMP_F32;
+        else if (env && !strcmp(env, "f16")) v = DS41_COMP_F16;
+        else if (env && !strcmp(env, "packed")) v = DS41_COMP_PACKED;
+    }
+    return (uint32_t)v;
+}
+static uint32_t ds41_comp_row_bytes(uint32_t format) {
+    return format == DS41_COMP_PACKED ? DS4_V41_PACKED_ROW_BYTES :
+           format == DS41_COMP_F16 ? 512u * 2u : 512u * 4u;
+}
+
 static uint64_t ds41_graph_bytes(uint32_t ctx) {
     const ds41_gpu_graph shape = {.ctx = ctx,
         .prefill_cap = ds41_prefill_limit(ctx),
@@ -41055,7 +41080,8 @@ static uint64_t ds41_graph_bytes(uint32_t ctx) {
         .compact_carry = !getenv("DS4_METAL_DISABLE_V41_COMPACT_CARRY")}, *g = &shape;
     uint64_t floats = (uint64_t)40 * 128 * 512;
     for (uint32_t i = 0; i < 4; i++)
-        floats += ((uint64_t)ctx / (i < 3 ? 2u : 1u) + 1u) * (512u + 128u) + 2u * 512u;
+        floats += ((uint64_t)ctx / (i < 3 ? 2u : 1u) + 1u) *
+                  (ds41_comp_row_bytes(ds41_comp_format()) / 4u + 128u) + 2u * 512u;
     floats += (uint64_t)2 * 2 * DS4_N_EMBD * DS4_N_HC;
 #define DS41_COUNT(name, count) floats += (count);
     DS41_SCRATCH(DS41_COUNT)
@@ -41086,7 +41112,7 @@ static ds4_context_memory ds41_graph_memory(uint32_t ctx) {
     m.raw_bytes = 40u * 128u * 512u * sizeof(float);
     for (uint32_t i = 0; i < 4; i++)
         m.compressed_bytes += ((uint64_t)ctx / (i < 3 ? 2u : 1u) + 1u) *
-                              (512u + 128u) * sizeof(float);
+                              (ds41_comp_row_bytes(ds41_comp_format()) + 128u * sizeof(float));
     m.total_bytes = ds41_graph_bytes(ctx);
     m.scratch_bytes = m.total_bytes - m.raw_bytes - m.compressed_bytes;
     return m;
@@ -41113,6 +41139,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
     g->compact_carry = !getenv("DS4_METAL_DISABLE_V41_COMPACT_CARRY");
     g->prefill_alias = !getenv("DS4_METAL_DISABLE_V41_PREFILL_ALIAS");
     g->allocation_bytes = ds41_graph_bytes(ctx);
+    g->comp_format = ds41_comp_format();
     g->streaming = streaming;
     g->tp_world = 1;
     g->token_map = malloc((size_t)DS4_N_VOCAB * sizeof(uint32_t));
@@ -41155,7 +41182,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
     }
     for (uint32_t i = 0; i < 4; i++) {
         const uint64_t cap = ctx / (i < 3 ? 2u : 1u) + 1u;
-        g->compressed[i] = ds4_gpu_tensor_alloc(cap * 512u * sizeof(float));
+        g->compressed[i] = ds4_gpu_tensor_alloc(cap * ds41_comp_row_bytes(g->comp_format));
         g->index_cache[i] = ds4_gpu_tensor_alloc(cap * 128u * sizeof(float));
         g->previous_kv[i] = ds4_gpu_tensor_alloc(512u * sizeof(float));
         g->previous_score[i] = ds4_gpu_tensor_alloc(512u * sizeof(float));
@@ -41449,6 +41476,24 @@ static bool ds41_attention_output(ds41_gpu_graph *g, const ds4_model *m,
         ds41_matmul(g->block, m, l->attn_output_b, g->low, false);
 }
 
+static bool ds41_comp_store(ds41_gpu_graph *g, uint32_t owner, uint32_t row,
+                            const ds4_gpu_tensor *src, uint32_t rows) {
+    const uint64_t at = (uint64_t)row * ds41_comp_row_bytes(g->comp_format);
+    if (g->comp_format == DS41_COMP_PACKED) {
+        ds4_gpu_tensor *view = ds4_gpu_tensor_view(g->compressed[owner], at,
+            (uint64_t)rows * DS4_V41_PACKED_ROW_BYTES);
+        if (!view) return false;
+        const bool ok = ds4_gpu_dsv41_pack_comp(view, src, rows) != 0;
+        ds4_gpu_tensor_free(view);
+        return ok;
+    }
+    return g->comp_format == DS41_COMP_F16 ?
+        ds4_gpu_tensor_copy_f32_to_f16(g->compressed[owner], at, src, 0,
+                                       (uint64_t)rows * 512u) :
+        ds4_gpu_tensor_copy(g->compressed[owner], at, src, 0,
+                            (uint64_t)rows * 512u * 4u);
+}
+
 static bool ds41_attention_publish(ds41_gpu_graph *g, const ds4_model *m,
                                    const ds4_layer_weights *l, uint32_t il) {
     const uint32_t pos = g->pos, ratio = ds4_layer_compress_ratio(il);
@@ -41476,8 +41521,7 @@ static bool ds41_attention_publish(ds41_gpu_graph *g, const ds4_model *m,
                                      g->index_k, 0, 128u * 4u) ||
                 !ds41_rope(g->latent, 1, 512, il, rope_pos, false) ||
                 !ds4_gpu_dsv41_quantize(g->latent, 512, 1, DS4_V41_FP4_E4M3) ||
-                !ds4_gpu_tensor_copy(g->compressed[owner], (uint64_t)(n_comp - 1u) * 512u * 4u,
-                                     g->latent, 0, 512u * 4u)) return false;
+                !ds41_comp_store(g, owner, n_comp - 1u, g->latent, 1)) return false;
         }
     }
     return true;
@@ -41562,7 +41606,10 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
                              g->kv, 0, 512u * 4u) ||
         !ds41_attention_select(g, m, l, il)) return false;
     const uint32_t attended = n_comp < DS4_N_INDEXER_TOP_K ? n_comp : DS4_N_INDEXER_TOP_K;
-    if (n_comp && !ds4_gpu_dsv41_gather_kv(g->selected_kv, g->compressed[owner],
+    if (n_comp && !(g->comp_format == DS41_COMP_PACKED ? ds4_gpu_dsv41_gather_kv_packed :
+                    g->comp_format == DS41_COMP_F16 ? ds4_gpu_dsv41_gather_kv_f16 :
+                    ds4_gpu_dsv41_gather_kv)(
+                                         g->selected_kv, g->compressed[owner],
                                          g->selected_comp, n_comp, attended)) return false;
     const uint32_t n_raw = pos + 1u < 128u ? pos + 1u : 128u;
     if (!ds4_gpu_attention_decode_heads_tensor(g->heads, m->map, m->size,
@@ -41856,8 +41903,7 @@ static bool ds41_attention_publish_batch(ds41_gpu_graph *g, ds41_prefill_row *b,
         ds4_gpu_dsv41_rope_stride(b->latent, DS4_N_HEAD_DIM, 1, rows,
                                   first * ratio, ratio, true, false) &&
         ds4_gpu_dsv41_quantize(b->latent, DS4_N_HEAD_DIM, rows, DS4_V41_FP4_E4M3) &&
-        ds4_gpu_tensor_copy(g->compressed[owner], (uint64_t)first * DS4_N_HEAD_DIM * sizeof(float),
-            b->latent, 0, (uint64_t)rows * DS4_N_HEAD_DIM * sizeof(float));
+        ds41_comp_store(g, owner, first, b->latent, rows);
 }
 
 static bool ds41_index_batch(ds41_gpu_graph *g, const ds4_model *m,
@@ -41990,13 +42036,24 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
             ds4_gpu_tensor_free(q);
         }
     } else if (n_comp < DS4_N_INDEXER_TOP_K) {
+        /* The small-context path stages rows through flash attention, which
+         * reads f32 or fp16 only; fewer than top_k rows fit in selected_kv, so
+         * unpack them there and hand it the dense buffer. */
+        const ds4_gpu_tensor *comp = g->compressed[owner];
+        uint32_t comp_format = g->comp_format;
+        if (comp_format == DS41_COMP_PACKED) {
+            if (!ds4_gpu_dsv41_unpack_comp(g->selected_kv, g->compressed[owner], n_comp))
+                return false;
+            comp = g->selected_kv;
+            comp_format = DS41_COMP_F32;
+        }
         ok = ds4_gpu_attention_decode_mixed_batch_heads_tensor(b->heads, m->map, m->size,
-            sinks, b->q, g->raw_prefill, g->compressed[owner], 0, NULL, 0,
+            sinks, b->q, g->raw_prefill, comp, comp_format, NULL, 0,
             count, start, n_raw, g->prefill_cap + 128u, 0, n_comp, 128, ratio,
             heads, DS4_N_HEAD_DIM);
     } else {
         ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(b->heads, m->map, m->size,
-            sinks, b->q, g->raw_prefill, g->compressed[owner], 0,
+            sinks, b->q, g->raw_prefill, g->compressed[owner], g->comp_format,
             b->selected_comp, count, start, n_raw, g->prefill_cap + 128u, 0, n_comp,
             DS4_N_INDEXER_TOP_K, 128, ratio, heads, DS4_N_HEAD_DIM);
     }
@@ -63451,15 +63508,16 @@ typedef struct {
 
 /* The selection masks are rebuilt by each index-source layer on the next
  * token. Only owner caches, windows and unfinished compression pairs persist. */
-static uint32_t ds41_state_spans(ds41_gpu_graph *g, uint32_t pos,
-                                 ds41_state_span spans[54]) {
+static uint32_t ds41_state_spans_fmt(ds41_gpu_graph *g, uint32_t pos,
+                                     ds41_state_span spans[54], uint32_t comp_format) {
     uint32_t n = 0;
     const uint32_t raw = pos < 128u ? pos : 128u;
     for (uint32_t il = 0; il < 40; il++)
         spans[n++] = (ds41_state_span){g->window[il], (uint64_t)raw * 512u * 4u};
     for (uint32_t i = 0; i < 4; i++) {
         const uint32_t live = pos / (i < 3 ? 2u : 1u);
-        spans[n++] = (ds41_state_span){g->compressed[i], (uint64_t)live * 512u * 4u};
+        spans[n++] = (ds41_state_span){g->compressed[i],
+                                       (uint64_t)live * ds41_comp_row_bytes(comp_format)};
         spans[n++] = (ds41_state_span){g->index_cache[i], (uint64_t)live * 128u * 4u};
         if (i < 3 && (pos & 1u)) {
             spans[n++] = (ds41_state_span){g->previous_kv[i], 512u * 4u};
@@ -63467,6 +63525,127 @@ static uint32_t ds41_state_spans(ds41_gpu_graph *g, uint32_t pos,
         }
     }
     return n;
+}
+
+static uint32_t ds41_state_spans(ds41_gpu_graph *g, uint32_t pos,
+                                 ds41_state_span spans[54]) {
+    return ds41_state_spans_fmt(g, pos, spans, g->comp_format);
+}
+
+/* Payload marker: 'A41' f32 compressed rows, 'A42' fp16, 'A43' packed FP4.
+ * Any of them loads into any graph; rows are converted on the way in. */
+#define DS41_PAYLOAD_TAG_F32 0x413431u
+#define DS41_PAYLOAD_TAG_F16 0x413432u
+#define DS41_PAYLOAD_TAG_PACKED 0x413433u
+
+/* Converting compressed rows between the three storage formats on the CPU, for
+ * loading a checkpoint written by a server that used another one.  Every value
+ * is an e2m1 magnitude times an e4m3 block scale, so every conversion is
+ * exact: the block scale is the block's peak over 6 (that peak is the top e2m1
+ * code times the scale), clamped the way the quantizer clamps it. */
+static const float ds41_e2m1_values[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+static const float ds41_e4m3_min_scale = 0.001953125f;
+
+static float ds41_comp_value_get(const uint8_t *row, uint32_t format, uint32_t i) {
+    if (format == DS41_COMP_PACKED) {
+        _Float16 sh;
+        memcpy(&sh, row + (i / 16u) * sizeof(sh), sizeof(sh));
+        const uint8_t byte = row[DS4_V41_PACKED_SCALE_BYTES + i / 2u];
+        const uint8_t nib = (i & 1u) ? (uint8_t)(byte >> 4) : (uint8_t)(byte & 0x0Fu);
+        const float mag = ds41_e2m1_values[nib & 7u] * (float)sh;
+        return (nib & 8u) ? -mag : mag;
+    }
+    if (format == DS41_COMP_F16) {
+        _Float16 h;
+        memcpy(&h, row + i * sizeof(h), sizeof(h));
+        return (float)h;
+    }
+    float f;
+    memcpy(&f, row + i * sizeof(f), sizeof(f));
+    return f;
+}
+
+static uint8_t ds41_comp_code(float v, float scale) {
+    const float a = scale > 0.0f ? fabsf(v) / scale : 0.0f;
+    int best = 0;
+    float best_diff = fabsf(a - ds41_e2m1_values[0]);
+    for (int i = 1; i < 8; i++) {
+        const float diff = fabsf(a - ds41_e2m1_values[i]);
+        if (diff < best_diff) { best = i; best_diff = diff; }
+    }
+    return (uint8_t)(best | (signbit(v) ? 8 : 0));
+}
+
+static void ds41_comp_row_convert(uint8_t *dst, uint32_t dst_format,
+                                  const uint8_t *src, uint32_t src_format) {
+    float v[512];
+    for (uint32_t i = 0; i < 512u; i++) v[i] = ds41_comp_value_get(src, src_format, i);
+    if (dst_format == DS41_COMP_F32) { memcpy(dst, v, sizeof(v)); return; }
+    if (dst_format == DS41_COMP_F16) {
+        for (uint32_t i = 0; i < 512u; i++) {
+            const _Float16 h = (_Float16)v[i];
+            memcpy(dst + i * sizeof(h), &h, sizeof(h));
+        }
+        return;
+    }
+    for (uint32_t b = 0; b < 32u; b++) {
+        float amax = 0.0f;
+        for (uint32_t j = 0; j < 16u; j++) {
+            const float a = fabsf(v[b * 16u + j]);
+            if (a > amax) amax = a;
+        }
+        /* The block's peak is its top e2m1 code times the scale, and that code
+         * is 6 only when the scale was a normal e4m3 value: down in the
+         * subnormal range the scale can round up far enough that the peak
+         * lands on 4 instead, and peak/6 would then be a third too small.  So
+         * try each code the peak could be and keep the first scale that
+         * reproduces every value in the block exactly -- which scale it was
+         * originally does not matter, only that the values come back. */
+        float scale = ds41_e4m3_min_scale;
+        for (uint32_t c = 7u; c >= 1u; c--) {
+            const float cand = (_Float16)(amax / ds41_e2m1_values[c]);
+            if (!(cand >= ds41_e4m3_min_scale)) continue;
+            bool exact = true;
+            for (uint32_t j = 0; j < 16u && exact; j++) {
+                const float want = v[b * 16u + j];
+                const uint8_t code = ds41_comp_code(want, cand);
+                const float got = (float)(_Float16)((_Float16)ds41_e2m1_values[code & 7u] *
+                                                    (_Float16)cand);
+                exact = (code & 8u) ? (-got == want) : (got == want);
+            }
+            if (exact) { scale = cand; break; }
+        }
+        const _Float16 sh = (_Float16)scale;
+        memcpy(dst + b * sizeof(sh), &sh, sizeof(sh));
+        for (uint32_t j = 0; j < 16u; j += 2u) {
+            const uint8_t lo = ds41_comp_code(v[b * 16u + j], scale);
+            const uint8_t hi = ds41_comp_code(v[b * 16u + j + 1u], scale);
+            dst[DS4_V41_PACKED_SCALE_BYTES + (b * 16u + j) / 2u] =
+                (uint8_t)((lo & 0x0Fu) | (uint8_t)((hi & 0x0Fu) << 4));
+        }
+    }
+}
+
+static uint32_t ds41_payload_tag(uint32_t format) {
+    return format == DS41_COMP_PACKED ? DS41_PAYLOAD_TAG_PACKED :
+           format == DS41_COMP_F16 ? DS41_PAYLOAD_TAG_F16 : DS41_PAYLOAD_TAG_F32;
+}
+
+static int ds41_payload_format(uint32_t tag, uint32_t *format) {
+    if (tag == DS41_PAYLOAD_TAG_F32) *format = DS41_COMP_F32;
+    else if (tag == DS41_PAYLOAD_TAG_F16) *format = DS41_COMP_F16;
+    else if (tag == DS41_PAYLOAD_TAG_PACKED) *format = DS41_COMP_PACKED;
+    else return 0;
+    return 1;
+}
+
+static uint64_t ds41_payload_body_bytes_fmt(ds41_gpu_graph *g, uint32_t pos,
+                                            uint32_t comp_format) {
+    ds41_state_span spans[54];
+    const uint32_t n = ds41_state_spans_fmt(g, pos, spans, comp_format);
+    uint64_t bytes = ((uint64_t)pos + DS4_N_VOCAB) * sizeof(float);
+    for (uint32_t i = 0; i < n; i++) bytes += spans[i].bytes;
+    return bytes;
 }
 
 static uint64_t ds41_payload_body_bytes(ds41_gpu_graph *g, uint32_t pos) {
@@ -63486,7 +63665,8 @@ static int ds41_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
     }
     const uint32_t h[DS4_SESSION_PAYLOAD_U32_FIELDS] = {
         DS4_SESSION_PAYLOAD_MAGIC, DS4_SESSION_PAYLOAD_VERSION,
-        g->ctx, 1, 128, 128, g->ctx + 1u, g->pos, 40, 512, 128, DS4_N_VOCAB, 0x413431u
+        g->ctx, 1, 128, 128, g->ctx + 1u, g->pos, 40, 512, 128, DS4_N_VOCAB,
+        ds41_payload_tag(g->comp_format)
     };
     for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++)
         if (payload_write_u32(fp, h[i], err, errlen)) return 1;
@@ -63508,10 +63688,13 @@ static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
                               uint64_t remaining, char *err, size_t errlen) {
     ds41_gpu_graph *g = &s->ds41_graph;
     const uint32_t pos = h[7];
+    uint32_t load_format = DS41_COMP_F32;
+    const int tag_ok = ds41_payload_format(h[12], &load_format);
     if (!s->ds41_graph_ready || !pos || pos >= g->ctx || pos >= h[2] || h[2] > 1048576u ||
         h[3] != 1 || h[4] != 128 || h[5] != 128 || h[6] != h[2] + 1u ||
         h[8] != 40 || h[9] != 512 || h[10] != 128 || h[11] != DS4_N_VOCAB ||
-        h[12] != 0x413431u || remaining != ds41_payload_body_bytes(g, pos)) {
+        !tag_ok ||
+        remaining != ds41_payload_body_bytes_fmt(g, pos, load_format)) {
         payload_set_err(err, errlen, "invalid V4.1 snapshot dimensions or size");
         return 1;
     }
@@ -63536,12 +63719,42 @@ static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
             payload_set_err(err, errlen, "failed to restore V4.1 device logits");
             rc = 1;
         }
+        const uint32_t file_format = load_format;
         ds41_state_span spans[54];
-        const uint32_t n = ds41_state_spans(g, pos, spans);
+        const uint32_t n = ds41_state_spans_fmt(g, pos, spans, file_format);
         uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
-        for (uint32_t i = 0; i < n && !rc; i++)
-            rc = payload_read_tensor_span(fp, spans[i].tensor, 0, spans[i].bytes,
-                                           buf, DS4_SESSION_IO_CHUNK, &remaining, err, errlen);
+        for (uint32_t i = 0; i < n && !rc; i++) {
+            bool comp = false;
+            for (uint32_t c = 0; c < 4; c++) comp |= spans[i].tensor == g->compressed[c];
+            if (!comp || file_format == g->comp_format) {
+                rc = payload_read_tensor_span(fp, spans[i].tensor, 0, spans[i].bytes,
+                                               buf, DS4_SESSION_IO_CHUNK, &remaining, err, errlen);
+                continue;
+            }
+            /* Compressed rows in another storage format: convert row by row. */
+            const uint32_t in_row = ds41_comp_row_bytes(file_format);
+            const uint32_t out_row = ds41_comp_row_bytes(g->comp_format);
+            const uint64_t rows = spans[i].bytes / in_row;
+            const uint64_t step = DS4_SESSION_IO_CHUNK / in_row;
+            uint8_t *out = step ? xmalloc((size_t)step * out_row) : NULL;
+            if (!out) {
+                payload_set_err(err, errlen, "V4.1 snapshot conversion buffer");
+                rc = 1;
+            }
+            for (uint64_t done = 0; done < rows && !rc; done += step) {
+                const uint64_t k = rows - done < step ? rows - done : step;
+                rc = payload_read_bytes(fp, buf, k * in_row, &remaining, err, errlen);
+                if (rc) break;
+                for (uint64_t r = 0; r < k; r++)
+                    ds41_comp_row_convert(out + r * out_row, g->comp_format,
+                                          buf + r * in_row, file_format);
+                if (!ds4_gpu_tensor_write(spans[i].tensor, done * out_row, out, k * out_row)) {
+                    payload_set_err(err, errlen, "V4.1 snapshot conversion write failed");
+                    rc = 1;
+                }
+            }
+            free(out);
+        }
         free(buf);
         if (!rc) {
             ds41_graph_reset(g);

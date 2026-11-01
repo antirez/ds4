@@ -5241,6 +5241,181 @@ static void test_metal_router_weights_batch_exact(void) {
 }
 #endif
 
+#if defined(__APPLE__)
+/* V4.1 compressed KV rows stored packed (4-bit e2m1 codes + an fp16 scale per
+ * 16) must be read back bit-identical to the f32 rows the quantizer produced.
+ * The rows here come from the production quantizer kernel itself (mode
+ * FP4_E4M3) and deliberately cover blocks whose E4M3 scale is subnormal: there
+ * the peak of a quantized block need not be 6*scale, so re-deriving the scale
+ * as peak/6 (what the pack kernel did) changes values.  Every packed reader is
+ * then compared against its f32 twin: run unpack (flash staging path), the
+ * decode gather, and the indexed attention kernels that load packed rows in
+ * place. */
+static uint32_t test_v41_lcg(uint64_t *s) {
+    *s = *s * 6364136223846793005ull + 1442695040888963407ull;
+    return (uint32_t)(*s >> 33);
+}
+
+static void test_metal_v41_packed_comp_exact(void) {
+    enum { width = 512, rows = 640, n_head = 32, raw_cap = 128, n_raw = 16,
+           top_k = 512, ratio = 4 };
+    const uint64_t page = (uint64_t)getpagesize();
+    const uint64_t f32_bytes = (uint64_t)rows * width * sizeof(float);
+    const uint64_t packed_bytes = (uint64_t)rows * DS4_V41_PACKED_ROW_BYTES;
+    const uint32_t tokens_max = 4;
+    const uint64_t q_bytes = (uint64_t)tokens_max * n_head * width * sizeof(float);
+    const uint64_t raw_bytes = (uint64_t)raw_cap * width * sizeof(float);
+
+    ds4_gpu_tensor *comp = ds4_gpu_tensor_alloc(f32_bytes);
+    ds4_gpu_tensor *packed = ds4_gpu_tensor_alloc(packed_bytes);
+    ds4_gpu_tensor *unpacked = ds4_gpu_tensor_alloc(f32_bytes);
+    ds4_gpu_tensor *gather_ref = ds4_gpu_tensor_alloc(32u * width * sizeof(float));
+    ds4_gpu_tensor *gather_pk = ds4_gpu_tensor_alloc(32u * width * sizeof(float));
+    ds4_gpu_tensor *ids = ds4_gpu_tensor_alloc((uint64_t)tokens_max * top_k * sizeof(int32_t));
+    ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(q_bytes);
+    ds4_gpu_tensor *raw = ds4_gpu_tensor_alloc(raw_bytes);
+    ds4_gpu_tensor *heads_ref = ds4_gpu_tensor_alloc(q_bytes);
+    ds4_gpu_tensor *heads_pk = ds4_gpu_tensor_alloc(q_bytes);
+    float *host = malloc((size_t)f32_bytes);
+    float *ref = malloc((size_t)f32_bytes);
+    float *got = malloc((size_t)f32_bytes);
+    float *qh = malloc((size_t)q_bytes);
+    float *out_ref = malloc((size_t)q_bytes);
+    float *out_pk = malloc((size_t)q_bytes);
+    int32_t *idh = malloc((size_t)tokens_max * top_k * sizeof(int32_t));
+    void *model = NULL;
+    TEST_ASSERT(posix_memalign(&model, (size_t)page, (size_t)page) == 0);
+    const bool allocated = comp && packed && unpacked && gather_ref && gather_pk &&
+        ids && q && raw && heads_ref && heads_pk && host && ref && got && qh &&
+        out_ref && out_pk && idh && model;
+    TEST_ASSERT(allocated);
+    size_t unpack_bad = 0, gather_bad = 0, attn_bad = 0, sub_blocks = 0;
+    float unpack_max = 0.0f, attn_max = 0.0f;
+    if (allocated) {
+        uint64_t seed = 0x5eed41u;
+        for (uint32_t b = 0; b < rows * (width / 16u); b++) {
+            const uint32_t kind = test_v41_lcg(&seed) % 8u;
+            float amax;
+            if (kind == 0u) amax = 0.0f;
+            else if (kind <= 3u) /* E4M3 scale lands in the subnormal range */
+                amax = 0.0117f + 0.0821f * (float)(test_v41_lcg(&seed) % 100000u) / 100000.0f;
+            else
+                amax = ldexpf(1.0f + (float)(test_v41_lcg(&seed) % 1024u) / 1024.0f,
+                              (int)(test_v41_lcg(&seed) % 15u) - 4);
+            const uint32_t peak = test_v41_lcg(&seed) % 16u;
+            for (uint32_t j = 0; j < 16u; j++) {
+                const uint32_t r = test_v41_lcg(&seed);
+                float v = amax * ((float)(r % 20001u) / 10000.0f - 1.0f);
+                if (j == peak) v = (r & 1u) ? -amax : amax;
+                if ((r >> 20) % 13u == 0u) v = -1.0e-7f; /* quantizes to -0 */
+                if ((r >> 20) % 13u == 1u) v = -0.0f;
+                host[b * 16u + j] = v;
+            }
+        }
+        TEST_ASSERT(ds4_gpu_tensor_write(comp, 0, host, f32_bytes) != 0);
+        /* The f32 compressed rows exactly as production stores them. */
+        TEST_ASSERT(ds4_gpu_dsv41_quantize(comp, width, rows, DS4_V41_FP4_E4M3) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(comp, 0, ref, f32_bytes) != 0);
+        for (uint32_t b = 0; b < rows * (width / 16u); b++) {
+            float m = 0.0f;
+            for (uint32_t j = 0; j < 16u; j++) m = fmaxf(m, fabsf(ref[b * 16u + j]));
+            if (m > 0.0f && m < 0.09375f) sub_blocks++;
+        }
+
+        TEST_ASSERT(ds4_gpu_dsv41_pack_comp(packed, comp, rows) != 0);
+        TEST_ASSERT(ds4_gpu_dsv41_unpack_comp(unpacked, packed, rows) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(unpacked, 0, got, f32_bytes) != 0);
+        const test_float_compare_stats us =
+            test_compare_float_bits(ref, got, (size_t)rows * width);
+        unpack_bad = us.mismatch_count;
+        unpack_max = us.max_abs;
+        for (size_t i = 0; i < (size_t)rows * width && unpack_bad; i++) {
+            if (memcmp(&ref[i], &got[i], sizeof(float)) != 0) {
+                fprintf(stderr, "ds4-test: packed first mismatch row=%zu col=%zu "
+                        "f32=%a packed=%a\n", i / width, i % width,
+                        (double)ref[i], (double)got[i]);
+                break;
+            }
+        }
+
+        /* One-token decode gather, including empty (-1) slots. */
+        for (uint32_t i = 0; i < 32u; i++)
+            idh[i] = i % 11u == 5u ? -1 : (int32_t)(test_v41_lcg(&seed) % rows);
+        TEST_ASSERT(ds4_gpu_tensor_write(ids, 0, idh, 32u * sizeof(int32_t)) != 0);
+        TEST_ASSERT(ds4_gpu_dsv41_gather_kv(gather_ref, comp, ids, rows, 32u) != 0);
+        TEST_ASSERT(ds4_gpu_dsv41_gather_kv_packed(gather_pk, packed, ids, rows, 32u) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(gather_ref, 0, out_ref, 32u * width * sizeof(float)) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(gather_pk, 0, out_pk, 32u * width * sizeof(float)) != 0);
+        gather_bad = test_compare_float_bits(out_ref, out_pk, 32u * width).mismatch_count;
+
+        /* Indexed attention reading the packed rows in place vs the f32 rows. */
+        memset(model, 0, (size_t)page);
+        float *sinks = model;
+        for (uint32_t h = 0; h < 32u; h++) sinks[h] = (float)((int)(h % 7u) - 3) / 8.0f;
+        TEST_ASSERT(ds4_gpu_set_model_map(model, page) != 0);
+        for (uint64_t i = 0; i < (uint64_t)raw_cap * width; i++)
+            got[i] = (float)((int)(test_v41_lcg(&seed) % 257u) - 128) / 256.0f;
+        TEST_ASSERT(ds4_gpu_tensor_write(raw, 0, got, raw_bytes) != 0);
+        for (uint64_t i = 0; i < q_bytes / sizeof(float); i++)
+            qh[i] = (float)((int)(test_v41_lcg(&seed) % 509u) - 254) / 64.0f;
+        TEST_ASSERT(ds4_gpu_tensor_write(q, 0, qh, q_bytes) != 0);
+        static const struct { uint32_t heads, top_k, tokens; bool quality; } cfg[] = {
+            {8, 32, 1, false}, {8, 32, 1, true}, {8, 32, 4, false},
+            {8, 512, 1, false}, {32, 512, 4, false}, {32, 512, 4, true},
+        };
+        const uint32_t pos0 = rows * ratio + 8u;
+        for (size_t c = 0; c < sizeof(cfg) / sizeof(cfg[0]); c++) {
+            for (uint32_t t = 0; t < cfg[c].tokens; t++) {
+                /* Distinct visible rows, a fresh draw per token. */
+                for (uint32_t k = 0; k < cfg[c].top_k; k++) {
+                    int32_t v;
+                    bool dup;
+                    do {
+                        v = (int32_t)(test_v41_lcg(&seed) % rows);
+                        dup = false;
+                        for (uint32_t p = 0; p < k; p++) dup |= idh[t * cfg[c].top_k + p] == v;
+                    } while (dup);
+                    idh[t * cfg[c].top_k + k] = v;
+                }
+            }
+            TEST_ASSERT(ds4_gpu_tensor_write(ids, 0, idh,
+                (uint64_t)cfg[c].tokens * cfg[c].top_k * sizeof(int32_t)) != 0);
+            ds4_gpu_set_quality(cfg[c].quality);
+            for (uint32_t fmt = 0; fmt < 2u; fmt++) {
+                TEST_ASSERT(ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
+                    fmt ? heads_pk : heads_ref, model, page, 0, q, raw,
+                    fmt ? packed : comp, fmt ? 2u : 0u, ids, cfg[c].tokens, pos0,
+                    n_raw, raw_cap, 0, rows, cfg[c].top_k, 128, ratio,
+                    cfg[c].heads, width) != 0);
+            }
+            const uint64_t ob = (uint64_t)cfg[c].tokens * cfg[c].heads * width * sizeof(float);
+            TEST_ASSERT(ds4_gpu_tensor_read(heads_ref, 0, out_ref, ob) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_read(heads_pk, 0, out_pk, ob) != 0);
+            const test_float_compare_stats as =
+                test_compare_float_bits(out_ref, out_pk, ob / sizeof(float));
+            attn_bad += as.mismatch_count;
+            if (as.max_abs > attn_max) attn_max = as.max_abs;
+        }
+        ds4_gpu_set_quality(false);
+    }
+    fprintf(stderr, "ds4-test: V4.1 packed compressed KV exactness: subnormal-scale "
+            "blocks=%zu unpack mismatches=%zu (max_abs=%g) gather=%zu "
+            "indexed-attention=%zu (max_abs=%g)\n", sub_blocks, unpack_bad,
+            (double)unpack_max, gather_bad, attn_bad, (double)attn_max);
+    TEST_ASSERT(sub_blocks > 0);
+    TEST_ASSERT(unpack_bad == 0);
+    TEST_ASSERT(gather_bad == 0);
+    TEST_ASSERT(attn_bad == 0);
+    free(model); free(idh); free(out_pk); free(out_ref); free(qh);
+    free(got); free(ref); free(host);
+    ds4_gpu_tensor_free(heads_pk); ds4_gpu_tensor_free(heads_ref);
+    ds4_gpu_tensor_free(raw); ds4_gpu_tensor_free(q); ds4_gpu_tensor_free(ids);
+    ds4_gpu_tensor_free(gather_pk); ds4_gpu_tensor_free(gather_ref);
+    ds4_gpu_tensor_free(unpacked); ds4_gpu_tensor_free(packed);
+    ds4_gpu_tensor_free(comp);
+}
+#endif
+
 static void test_metal_kernel_group(void) {
     test_metal_f16_matvec_fast_nr0_4();
     test_metal_f16_prefill_matmul();
@@ -5259,6 +5434,7 @@ static void test_metal_kernel_group(void) {
     test_metal_contiguous_f32_f16_roundtrip_exact();
     test_metal_gathered_kv_stage_exact();
     test_metal_contiguous_compressed_f16_attention_exact();
+    test_metal_v41_packed_comp_exact();
     test_metal_compressed_selection_causality();
     test_metal_persistent_zero_attention_mask_exact();
     test_metal_zero_prefix_prefill_mask_cache_exact();

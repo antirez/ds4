@@ -142,6 +142,27 @@ int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out,
                                  uint32_t outputs, uint32_t rows,
                                  const ds4_gpu_tensor *in);
 /* Gather 512-wide F32 KV rows; IDs must come from top-k over source_rows. */
+/* Packed FP4 compressed-KV rows: 320 B each (32 fp16 block scales, then 256 B
+ * of 4-bit codes), exact for the FP4-with-E4M3-scale values V4.1 stores.
+ * pack_comp writes `rows` of 512 f32 values that DS4_V41_FP4_E4M3 quantization
+ * already produced (it recovers each block's scale; it does not re-quantize,
+ * which is not idempotent for subnormal E4M3 scales) as packed rows; unpack_comp
+ * expands a run back to f32; gather_kv_packed expands selected rows. */
+#define DS4_V41_PACKED_ROW_BYTES 320u
+#define DS4_V41_PACKED_SCALE_BYTES 64u
+int ds4_gpu_dsv41_pack_comp(ds4_gpu_tensor *dst, const ds4_gpu_tensor *src,
+                            uint32_t rows);
+int ds4_gpu_dsv41_unpack_comp(ds4_gpu_tensor *dst, const ds4_gpu_tensor *src,
+                              uint32_t rows);
+int ds4_gpu_dsv41_gather_kv_packed(ds4_gpu_tensor *out, const ds4_gpu_tensor *source,
+                                   const ds4_gpu_tensor *ids, uint32_t source_rows,
+                                   uint32_t selected_rows);
+
+/* Same gather from fp16 source rows (V4.1 compressed KV stored as fp16:
+ * every FP4-with-E4M3-scale value is exact in half precision). */
+int ds4_gpu_dsv41_gather_kv_f16(ds4_gpu_tensor *out, const ds4_gpu_tensor *source,
+                               const ds4_gpu_tensor *ids, uint32_t source_rows,
+                               uint32_t selected_rows);
 int ds4_gpu_dsv41_gather_kv(ds4_gpu_tensor *out, const ds4_gpu_tensor *source,
                            const ds4_gpu_tensor *ids, uint32_t source_rows,
                            uint32_t selected_rows);

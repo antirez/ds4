@@ -5809,15 +5809,19 @@ static inline void dsv4_attend_shared_h4_row_at(
                               o0, o1, o2, o3);
 }
 
+/* comp_format: 0 f32 rows, 1 fp16 rows, 2 packed FP4 rows (320 B). */
 static inline half4 dsv4_load_cache_h4(
         device const char *kv,
         uint64_t row_stride,
         uint row,
         uint col,
-        bool f16_rows) {
+        uint comp_format) {
     device const char *base = kv + (uint64_t)row * row_stride;
-    if (f16_rows) {
+    if (comp_format == 1u) {
         return ((device const half4 *)base)[col];
+    }
+    if (comp_format == 2u) {
+        return dsv4_unpack_comp_h4(base, col);
     }
     return (half4)((device const float4 *)base)[col];
 }
@@ -5926,7 +5930,7 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads8(
                                                 args.comp_row_stride,
                                                 (uint)idx,
                                                 tid,
-                                                args.comp_kv_f16 != 0u);
+                                                args.comp_kv_f16);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         dsv4_attend_shared_h4_row(kv_shared,
@@ -6029,7 +6033,7 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads16_dual(
         if ((uint)idx >= visible) break;
         if (tid < 128) {
             kv_shared[tid] = dsv4_load_cache_h4(comp_kv,
-                args.comp_row_stride, (uint)idx, tid, args.comp_kv_f16 != 0u);
+                args.comp_row_stride, (uint)idx, tid, args.comp_kv_f16);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         dsv4_attend_shared_h4_row(kv_shared, qa0, qa1, qa2, qa3,
@@ -6165,7 +6169,7 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads8_rb16(
                                                 args.comp_row_stride,
                                                 rows[r],
                                                 c,
-                                                args.comp_kv_f16 != 0u);
+                                                args.comp_kv_f16);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint r = 0; r < n_rows; r++) {
@@ -6282,7 +6286,7 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads8_split(
                                                args.comp_row_stride,
                                                (uint)idx,
                                                c,
-                                               args.comp_kv_f16 != 0u);
+                                               args.comp_kv_f16);
                 }
             }
             kv_shared[off] = value;

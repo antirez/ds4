@@ -85,6 +85,90 @@ kernel void kernel_dsv41_quantize(
     if (valid) x[index] = dsv41_bf16(result);
 }
 
+/* Pack compressed-KV rows that kernel_dsv41_quantize mode 3 already produced
+ * (the same f32 rows the f32/fp16 formats store) into packed FP4 rows.
+ *
+ * The input is already quantized, so the block scale must be recovered, not
+ * re-derived: quantizing again with scale = e4m3(peak / 6) is not idempotent.
+ * When the original scale was a subnormal e4m3 value (k * 2^-9, k < 8) it can
+ * round far enough from amax/6 that the block's top code is 4 (or 3 ...), not
+ * 6; peak/6 then rounds to a different scale and values move by up to 2^-8.
+ * So try each e2m1 magnitude the peak could be and keep the first scale that
+ * reproduces every value in the block bit for bit, which the original scale
+ * always does (same search as ds41_comp_row_convert on the CPU).  Only if none
+ * does -- the input was not quantizer output -- fall back to quantizing. */
+kernel void kernel_dsv41_pack_comp_fp4(
+        constant ds4_metal_args_dsv41_quantize &args,
+        device const float *src,
+        device uchar *dst,
+        uint2 group [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_simdgroup]]) {
+    const uint col = group.x * 16u + lane;
+    const bool valid = lane < 16u && col < args.width;
+    const float value = valid ? src[(ulong)group.y * args.width + col] : 0.0f;
+    const float mag = abs(value);
+    const float amax = simd_max(mag);
+    float scale = 0.0f;
+    for (int c = 7; c >= 1 && scale == 0.0f; c--) {
+        const float cand = (float)(half)(amax / dsv4_e2m1fn_values[c]);
+        if (!(cand >= 0.001953125f)) continue;
+        const int k = dsv4_e2m1fn_code(mag / cand);
+        const float back = (float)((half)dsv4_e2m1fn_values[k] * (half)cand);
+        if (simd_all(!valid || back == mag)) scale = cand;
+    }
+    if (amax == 0.0f) scale = 0.001953125f;
+    float qmag = mag;
+    if (scale == 0.0f) {
+        qmag = abs(dsv41_bf16(value));
+        scale = dsv4_e4m3fn_dequant(max(simd_max(qmag), 0.01171875f) / 6.0f);
+    }
+    device uchar *row = dst + (ulong)group.y * DS4_V41_PACK_ROW_BYTES;
+    if (lane == 0u) ((device half *)row)[group.x] = (half)scale;
+    uint code = 0u;
+    if (valid) {
+        code = (uint)dsv4_e2m1fn_code(dsv4_e2m1fn_dequant(qmag / scale));
+        if (signbit(value)) code |= 8u; /* keeps the quantizer's -0 */
+    }
+    const uint partner = simd_shuffle_xor(code, 1u);
+    if (valid && (lane & 1u) == 0u)
+        (row + DS4_V41_PACK_SCALE_BYTES)[col / 2u] =
+            (uchar)((code & 0x0Fu) | ((partner & 0x0Fu) << 4));
+}
+
+/* Unpack a run of packed rows into f32 rows, for the paths that still want a
+ * dense f32 compressed cache (the small-context flash staging path). */
+kernel void kernel_dsv41_unpack_rows(
+        constant ds4_metal_args_dsv41_quantize &args,
+        device const uchar *src,
+        device float *dst,
+        uint row [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]]) {
+    if (row >= args.rows || tid * 4u >= args.width) return;
+    device float4 *out = (device float4 *)(dst + (ulong)row * args.width);
+    out[tid] = (float4)dsv4_unpack_comp_h4(
+        (device const char *)src + (ulong)row * DS4_V41_PACK_ROW_BYTES, tid);
+}
+
+/* Gather selected packed rows into f32 rows, for the one-token decode path
+ * whose attention kernel takes a dense f32 buffer. */
+kernel void kernel_dsv41_unpack_gather(
+        constant ds4_metal_args_dsv41_quantize &args,
+        device const uchar *src,
+        device const int32_t *ids,
+        device float *dst,
+        uint row [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]]) {
+    if (row >= args.rows || tid * 4u >= args.width) return;
+    device float4 *out = (device float4 *)(dst + (ulong)row * args.width);
+    const int32_t idx = ids[row];
+    if (idx < 0) {
+        out[tid] = float4(0.0f);
+        return;
+    }
+    out[tid] = (float4)dsv4_unpack_comp_h4(
+        (device const char *)src + (ulong)idx * DS4_V41_PACK_ROW_BYTES, tid);
+}
+
 struct ds4_metal_args_dsv41_engram {
     uint width;
     uint rows;
