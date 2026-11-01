@@ -15105,8 +15105,12 @@ typedef struct {
     int fd;
 } client_arg;
 
+/* `vision` adds the image input modality.  Clients decide whether they may
+ * send images from this listing (Hermes probes it before its native image
+ * path, and without it routed every image through a describe-it-elsewhere
+ * lane), so a server started with --vision has to say so. */
 static void append_model_json_values(buf *b, const char *id, const char *name,
-                                     int ctx, int default_tokens) {
+                                     int ctx, int default_tokens, bool vision) {
     const int max_completion = default_tokens < ctx ? default_tokens : ctx;
     buf_printf(b,
         "{\"id\":");
@@ -15120,6 +15124,10 @@ static void append_model_json_values(buf *b, const char *id, const char *name,
     buf_printf(b,
         ","
         "\"context_length\":%d,"
+        "\"architecture\":{"
+            "\"modality\":\"%s\","
+            "\"input_modalities\":[\"text\"%s],"
+            "\"output_modalities\":[\"text\"]},"
         "\"top_provider\":{"
             "\"context_length\":%d,"
             "\"max_completion_tokens\":%d,"
@@ -15138,6 +15146,8 @@ static void append_model_json_values(buf *b, const char *id, const char *name,
             "\"stream\","
             "\"reasoning_effort\"]}",
         ctx,
+        vision ? "text+image->text" : "text->text",
+        vision ? ",\"image\"" : "",
         ctx,
         max_completion);
 }
@@ -15147,7 +15157,8 @@ static void append_model_json(buf *b, const server *s, const char *id) {
                              id,
                              ds4_engine_model_name(s->engine),
                              s->ctx_size,
-                             s->default_tokens);
+                             s->default_tokens,
+                             ds4_engine_has_vision(s->engine));
 }
 
 static bool send_model(server *s, int fd, const char *id) {
@@ -21162,16 +21173,18 @@ static void test_tool_history_validation_handles_large_replays(void) {
 static void test_model_metadata_clamps_completion_to_context(void) {
     buf b = {0};
     append_model_json_values(&b, "deepseek-v4-flash", "DeepSeek V4 Flash",
-                             32768, 393216);
+                             32768, 393216, true);
     TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4-flash\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"name\":\"DeepSeek V4 Flash\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"context_length\":32768") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"max_completion_tokens\":32768") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"ignore_eos\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"input_modalities\":[\"text\",\"image\"]") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "text+image->text") != NULL);
     buf_free(&b);
 
     append_model_json_values(&b, "deepseek-v4-pro", "DeepSeek V4 Pro",
-                             100000, 4096);
+                             100000, 4096, false);
     TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4-pro\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"name\":\"DeepSeek V4 Pro\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"context_length\":100000") != NULL);
