@@ -44576,29 +44576,70 @@ static void tokenize_span(const ds4_vocab *vocab, const char *p, size_t n, token
     free(tmp);
 }
 
-static void tokenize_rendered_chat_vocab(const ds4_vocab *vocab, const char *text,
-                                         token_vec *out) {
+/* `trusted`, when non-NULL, is a byte mask over `text`: only literals that the
+ * chat renderer itself inserted may become control tokens. User, tool, and
+ * model text is encoded by BPE even if it spells a control token, so content
+ * cannot inject chat syntax. */
+static void tokenize_rendered_chat_vocab_masked(const ds4_vocab *vocab, const char *text,
+                                                const unsigned char *trusted,
+                                                token_vec *out) {
     if (!text) text = "";
 
     const char *span = text;
     const char *p = text;
+    size_t index = 0;
     while (*p) {
         int token = -1;
         size_t len = 0;
         if (special_token_at(vocab, p, &token, &len)) {
-            tokenize_span(vocab, span, (size_t)(p - span), out);
-            token_vec_push(out, token);
-            p += len;
-            span = p;
-            continue;
+            bool trusted_span = true;
+            if (trusted)
+                for (size_t k = 0; k < len; k++)
+                    if (!trusted[index + k]) { trusted_span = false; break; }
+            if (trusted_span) {
+                tokenize_span(vocab, span, (size_t)(p - span), out);
+                token_vec_push(out, token);
+                p += len;
+                index += len;
+                span = p;
+                continue;
+            }
         }
         p++;
+        index++;
     }
     tokenize_span(vocab, span, (size_t)(p - span), out);
 }
 
+static void tokenize_rendered_chat_vocab(const ds4_vocab *vocab, const char *text,
+                                         token_vec *out) {
+    tokenize_rendered_chat_vocab_masked(vocab, text, NULL, out);
+}
+
 void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *out) {
-    tokenize_rendered_chat_vocab(&e->vocab, text, out);
+    tokenize_rendered_chat_vocab_masked(&e->vocab, text, NULL, out);
+}
+
+void ds4_tokenize_rendered_chat_masked(ds4_engine *e, const char *text,
+                                       const unsigned char *trusted, ds4_tokens *out) {
+    tokenize_rendered_chat_vocab_masked(&e->vocab, text, trusted, out);
+}
+
+/* True when the text spells a control token at a position the renderer did not
+ * mark trusted: such a prompt cannot share KV cache entries with a prompt that
+ * tokenizes the same bytes as syntax. */
+bool ds4_text_has_untrusted_special(ds4_engine *e, const char *text,
+                                    const unsigned char *trusted) {
+    if (!e || !text || !trusted) return false;
+    size_t index = 0;
+    for (const char *p = text; *p; p++, index++) {
+        int token = -1;
+        size_t len = 0;
+        if (!special_token_at(&e->vocab, p, &token, &len)) continue;
+        for (size_t k = 0; k < len; k++)
+            if (!trusted[index + k]) return true;
+    }
+    return false;
 }
 
 void ds4_chat_begin(ds4_engine *e, ds4_tokens *tokens) {
@@ -72165,6 +72206,9 @@ static int ds4_engine_open_internal(ds4_engine **out,
 #endif
     if (ds4_model_is_qwen4()) {
         if (opt->inspect_only) {
+            /* Tokenizer-only tests can use an inspect-only engine; no weights
+             * are read. */
+            vocab_load(&e->vocab, &e->model);
             *out = e;
             return 0;
         }
@@ -72203,6 +72247,9 @@ static int ds4_engine_open_internal(ds4_engine **out,
 
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         if (opt->inspect_only) {
+            /* Tokenizer-only tests can use an inspect-only engine; no weights
+             * are read. */
+            vocab_load(&e->vocab, &e->model);
             *out = e;
             return 0;
         }
