@@ -17,29 +17,32 @@ run() {
     "$@" 2>&1 | tee -a "$LOG"
 }
 
-# Linked without a GPU runtime, so these build and run on every host.
-PORTABLE_TESTS="q4k-dot-test mxfp4-dot-test test-engram test-web-recovery"
-PORTABLE_BINS="tests/test_layer_pack tests/test_prompt_prefix tests/test_gpu_args tests/test_image_decode"
+UNIT_TESTS="tests/test_layer_pack tests/test_prompt_prefix tests/test_gpu_args
+    tests/test_image_decode tests/test_engine_mgpu_placement
+    tests/test_deepseek4_vision_image tests/test_sampling"
 
-build $PORTABLE_TESTS $PORTABLE_BINS
-
+# Only the build differs: CI hosts have Metal on macOS but no nvcc on Linux,
+# where the runners link the CPU backend. Both run the same tests below.
 if [ "$(uname -s)" = Darwin ]; then
-    # Linux links the same tests through nvcc, which CI hosts do not have.
-    build test-session-state tests/test_engine_mgpu_placement \
-        tests/test_deepseek4_vision_image tests/test_sampling \
-        ds4 ds4-server ds4-bench ds4-agent ds4-eval ds4_test ds4_agent_test
-    PORTABLE_BINS="$PORTABLE_BINS tests/test_engine_mgpu_placement"
-    PORTABLE_BINS="$PORTABLE_BINS tests/test_deepseek4_vision_image tests/test_sampling"
-    run ./ds4-eval --validate-cases
-    run ./ds4-eval --self-test-extractors
-    run ./ds4_test --server
-    run ./ds4_agent_test
+    build ds4 ds4-server ds4-bench ds4-agent ds4-eval ds4_test ds4_agent_test
+    SERVER_TEST=./ds4_test
+    AGENT_TEST=./ds4_agent_test
 else
     # Compile check only: the CPU backend is reference code.
-    build cpu
+    build cpu ds4_test_cpu ds4_agent_test_cpu
+    SERVER_TEST=./ds4_test_cpu
+    AGENT_TEST=./ds4_agent_test_cpu
 fi
 
-for bin in $PORTABLE_BINS; do
+build q4k-dot-test mxfp4-dot-test test-engram test-session-state \
+    test-web-recovery $UNIT_TESTS
+
+run ./ds4-eval --validate-cases
+run ./ds4-eval --self-test-extractors
+run "$SERVER_TEST" --server
+run "$AGENT_TEST"
+
+for bin in $UNIT_TESTS; do
     run "./$bin"
 done
 
