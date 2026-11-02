@@ -432,12 +432,17 @@ static void *warm_thread(void *arg) {
             ok = false;
             break;
         }
-        const uint64_t want = w->end - off < WARM_CHUNK ? w->end - off : WARM_CHUNK;
-        for (uint64_t done = 0; ok && done < want;) {
-            const ssize_t got = pread(w->fd, buf + done, (size_t)(want - done), (off_t)(off + done));
+        size_t left = (size_t)(w->end - off < WARM_CHUNK ? w->end - off : WARM_CHUNK);
+        const uint64_t end = off + left;
+        while (left) {
+            /* A short read still warms those pages; only the file offset advances. */
+            const ssize_t got = pread(w->fd, buf, left, (off_t)(end - left));
             if (got < 0 && errno == EINTR) continue;
-            if (got <= 0) ok = false;
-            else done += (uint64_t)got;
+            if (got <= 0 || (size_t)got > left) {
+                ok = false;
+                break;
+            }
+            left -= (size_t)got;
         }
     }
     free(buf);

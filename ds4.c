@@ -41614,6 +41614,7 @@ static bool ds41_queued_head_off(void) {
     return metal_graph_env_flag("DS4_METAL_DISABLE_V41_QUEUED_HEAD", &cache);
 }
 
+#ifdef __APPLE__
 /* TP decode: the attention output's K slice rounds low on load instead of a
  * separate BF16 pass (DS4_METAL_DISABLE_V41_TP_KSLICE_ROUND_IN=1: separate). */
 static bool ds41_tp_kslice_round_in_on(void) {
@@ -41629,6 +41630,7 @@ static bool ds41_tp_concurrent_ffn_on(void) {
     if (fixed_off < 0) fixed_off = getenv("DS4_METAL_DISABLE_V41_TP_FIXED_ROUTE") != NULL;
     return !fixed_off && !metal_graph_env_flag("DS4_METAL_DISABLE_V41_TP_CONCURRENT_FFN", &cache);
 }
+#endif
 
 static bool ds41_short_sweep_off(void) {
     static int cache = -1;
@@ -41745,6 +41747,8 @@ static bool ds41_attention_low(ds41_gpu_graph *g, const ds4_model *m,
             return false;
         return l->attn_output_b->type == DS4_TENSOR_Q8_0 || ds41_bf16(g->low, groups * DS4_N_LORA_O);
     }
+#else
+    (void)transformed;
 #endif
     const bool fused = rope_il >= 0 &&
         ds4_gpu_dsv41_attention_low(g->low, m->map, m->size, offset, 4096, 1024, groups,
@@ -41754,16 +41758,20 @@ static bool ds41_attention_low(ds41_gpu_graph *g, const ds4_model *m,
                                                     g->pos, compressed, true)) ||
          !ds4_gpu_attention_output_low_q8_tensor(g->low, m->map, m->size, offset,
                                                  4096, 1024, groups, g->heads))) return false;
+#ifdef __APPLE__
     /* a TP rank's one-row K slice rounds low as it loads it */
     g->low_unrounded = g->tp_world == 2 && l->attn_output_b->type == DS4_TENSOR_Q8_0 &&
         ds41_tp_kslice_round_in_on();
-    return (g->tp_world != 2 && l->attn_output_b->type == DS4_TENSOR_Q8_0) || g->low_unrounded ?
+    if (g->low_unrounded) return true;
+#endif
+    return g->tp_world != 2 && l->attn_output_b->type == DS4_TENSOR_Q8_0 ?
         true : ds41_bf16(g->low, groups * DS4_N_LORA_O);
 }
 
 static bool ds41_attention_b(ds41_gpu_graph *g, const ds4_model *m,
                              const ds4_layer_weights *l, ds4_gpu_tensor *out) {
     const uint32_t groups = DS4_N_OUT_GROUP / g->tp_world;
+#ifdef __APPLE__
     if (g->tp_world == 2 && g->low_unrounded) {
         g->low_unrounded = false;
         uint64_t row = 0;
@@ -41773,6 +41781,7 @@ static bool ds41_attention_b(ds41_gpu_graph *g, const ds4_model *m,
             return true;
         if (!ds41_bf16(g->low, groups * DS4_N_LORA_O)) return false;
     }
+#endif
     return g->tp_world == 2 ?
         metal_graph_matmul_dense_quant_kslice(out, m, l->attn_output_b,
             8192, (uint64_t)g->tp_rank * groups * 1024u,
@@ -41898,6 +41907,8 @@ static bool ds41_index_q_project(ds41_gpu_graph *g, const ds4_model *m,
         ds4_gpu_matmul_e4m3_bf16_tensor(g->index_q, codes, scales, l->indexer_attn_q_b->dim[0],
                                         l->indexer_attn_q_b->dim[1], g->qr))
         return true;
+#else
+    (void)il;
 #endif
     return ds41_matmul(g->index_q, m, l->indexer_attn_q_b, g->qr, true);
 }
@@ -42117,11 +42128,13 @@ static void ds41_narrow_free(void) {
     memset(&g_ds41_narrow, 0, sizeof(g_ds41_narrow));
 }
 
+#ifdef __APPLE__
 static void ds41_narrow_own(const ds4_model *m) {
     if (g_ds41_narrow.owner == m) return;
     ds41_narrow_free();
     g_ds41_narrow.owner = m;
 }
+#endif
 
 /* The checkpoint's router weights are BF16; the GGUF widens them to F32.
  * Decode reads them as BF16 again (half the bytes) once every value is
