@@ -73115,11 +73115,6 @@ static int ds4_engine_open_internal(ds4_engine **out,
     const bool graph_backend = ds4_backend_uses_graph(opt->backend);
     if (graph_backend) ds4_linux_graph_backend_set_oom_score(opt->backend);
     model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only);
-#if defined(__APPLE__) && !defined(DS4_NO_GPU)
-    /* V4.1's model views are read-only to the GPU: untracked by default */
-    if (e->backend == DS4_BACKEND_METAL)
-        ds4_gpu_set_model_untracked_default(DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41);
-#endif
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 &&
         opt->vision_path && opt->vision_path[0] && e->backend != DS4_BACKEND_METAL) {
         fprintf(stderr, "ds4: V4.1 vision requires Metal\n");
@@ -73128,6 +73123,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
         return 1;
     }
     config_validate_model(&e->model);
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    /* V4.1's model views are read-only to the GPU: untracked by default */
+    if (e->backend == DS4_BACKEND_METAL)
+        ds4_gpu_set_model_untracked_default(DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41);
+#endif
     if (ds4_model_is_qwen4() && !opt->inspect_only) {
         const bool backend_ok =
 #ifdef DS4_HAS_QWEN4_GPU
