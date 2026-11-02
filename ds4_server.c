@@ -10184,6 +10184,7 @@ struct server {
     int decode_pending;
     int active_generations;
     int mixed_prefill_quantum;
+    int idle_prefill_quantum;   /* V4.1: the engine's prefill cap, wide chunks while nothing generates */
     int last_prefill_slot;
     pthread_mutex_t mu;
     pthread_cond_t cv;
@@ -12429,7 +12430,8 @@ static void server_prefill_leave(server *s) {
 
 static int server_prefill_quantum_for(const server *s,
                                       bool generation_active) {
-    int quantum = generation_active ? s->mixed_prefill_quantum : 2048;
+    int quantum = generation_active ? s->mixed_prefill_quantum :
+        s->idle_prefill_quantum > 2048 ? s->idle_prefill_quantum : 2048;
     if (generation_active && quantum < 1024 && s->engine &&
         ds4_engine_is_glm53(s->engine)) {
         quantum = 1024;
@@ -15966,6 +15968,10 @@ int main(int argc, char **argv) {
 
     server s = {0};
     s.engine = engine;
+    if (ds4_engine_is_deepseek41(engine))
+        s.idle_prefill_quantum = (int)ds4_context_memory_estimate_with_prefill_mode(
+            cfg.engine.backend, cfg.ctx_size, ds4_engine_prefill_chunk(engine),
+            cfg.engine.ssd_streaming).prefill_cap;
     s.tp_leader = tp_leader;
     s.ctx_size = cfg.ctx_size;
     s.slot_count = slot_count;

@@ -964,6 +964,25 @@ int main(int argc, char **argv) {
             }
 #endif
             const double token_t1 = bench_now_sec();
+            /* Diagnostic: DS4_BENCH_DECODE_LOGITS_HASH prints an FNV-1a hash of
+             * every decode step's full logits, to compare arms bit for bit. */
+            if (!speculative && getenv("DS4_BENCH_DECODE_LOGITS_HASH")) {
+                const int vocab = ds4_engine_vocab_size(engine);
+                float *lg = vocab > 0 ? malloc((size_t)vocab * sizeof(lg[0])) : NULL;
+                if (lg && ds4_session_copy_logits(session, lg, vocab) == vocab) {
+                    uint64_t h = 1469598103934665603ull;
+                    const unsigned char *b = (const unsigned char *)lg;
+                    for (size_t k = 0; k < (size_t)vocab * sizeof(lg[0]); k++) h = (h ^ b[k]) * 1099511628211ull;
+                    fprintf(stderr, "ds4-bench: decode-hash frontier=%d step=%d %016llx\n",
+                            frontier, gen_done, (unsigned long long)h);
+                    const char *dump = getenv("DS4_BENCH_DECODE_LOGITS_DUMP");
+                    if (dump) {
+                        FILE *fp = fopen(dump, "ab");
+                        if (fp) { fwrite(lg, sizeof(lg[0]), (size_t)vocab, fp); fclose(fp); }
+                    }
+                }
+                free(lg);
+            }
             int cycle_tokens = 0;
             for (int j = 0; j < ntok && gen_done < cfg.gen_tokens; j++) {
                 if (toks[j] == eos) {

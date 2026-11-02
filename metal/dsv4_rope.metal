@@ -600,7 +600,7 @@ kernel void kernel_flash_attn_ext_vec_reduce_rope(
         ushort tiitg[[thread_index_in_threadgroup]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    ds4_flash_attn_vec_reduce_row(args, htmp, dst, tgpig, tiisg, sgitg,
+    ds4_flash_attn_vec_reduce_row(args, htmp, dst, nullptr, tgpig, tiisg, sgitg,
                                   (short)FC_flash_attn_ext_vec_reduce_NWG,
                                   (short)FC_flash_attn_ext_vec_reduce_DV);
 

@@ -86,7 +86,8 @@ change floating-point reduction order slightly. V4.1 sessions containing images
 use the ordered fallback.
 
 Long prefills yield to active decoders in bounded intervals, normally 128
-tokens. `--mixed-prefill-quantum N` changes that interval for testing.
+tokens. `--mixed-prefill-quantum N` changes that interval for testing. While
+nothing is decoding, a V4.1 slot prefills in the engine's own chunk.
 Session-batched serving uses ordinary target decoding, except Qwen3.8 on
 Metal, where `--mtp` also batches speculative decoding. Its
 `--mtp-exact-sampling` mode uses ordinary batches for nonzero-temperature

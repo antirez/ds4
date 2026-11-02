@@ -21,7 +21,7 @@ import time
 from deepseek41_metadata import GGUF_ALIGNMENT, metadata
 from glm53_quantize import (
     SourceDB, TensorPlan, Quantizer, Imatrix, QTYPE_F32, QTYPE_F16,
-    QTYPE_Q8_0, QTYPE_Q2_K, QTYPE_Q4_K, QTYPE_IQ2_XXS, QTYPE_I8, align,
+    QTYPE_Q8_0, QTYPE_Q2_K, QTYPE_Q4_K, QTYPE_IQ2_XXS, QTYPE_I8, QTYPE_MXFP4, align,
     conversion_signature, kv_string, load_resume_state, print_plan,
     qtype_nbytes, save_resume_state, tensor_header,
 )
@@ -29,6 +29,7 @@ from glm53_quantize import (
 QUANTIZATION = {
     "q2": "IQ2_XXS gate/up; Q2_K down; Q8_0 attention/shared/head",
     "q4": "Q4_K gate/up/down; Q8_0 attention/shared/head",
+    "mxfp4": "released MXFP4 gate/up/down; Q8_0 attention/shared/head",
 }
 
 
@@ -132,7 +133,7 @@ def build_plan(db, config, quant="q2"):
             for expert in range(experts):
                 claim(pattern.format(expert=expert), (shape[0], shape[1] // 2), "I8")
             plan.append(TensorPlan(f"{dst}.ffn_{part}_exps.weight", (*reversed(shape), experts),
-                                   QTYPE_Q4_K if quant == "q4" else qt,
+                                   QTYPE_MXFP4 if quant == "mxfp4" else QTYPE_Q4_K if quant == "q4" else qt,
                                    "experts", source=pattern, expert_layer=layer,
                                    expert_part=part, expert_count=experts))
         if layer in c["engram_layer_ids"]:
@@ -191,6 +192,25 @@ class NativeQuantizer(Quantizer):
         if not np.all(np.isfinite(result)):
             raise ValueError(f"{name}: nonfinite dequantized weight")
         return np.ascontiguousarray(result, dtype=np.float32)
+
+    def to_mxfp4(self, db, name):
+        """Repack released E2M1 pairs into GGUF MXFP4 blocks without touching the values."""
+        np = self.np
+        info = db.info(name)
+        if info["dtype"] != "I8" or info["shape"][1] % 16:
+            raise ValueError(f"{name}: not a packed MXFP4 tensor")
+        rows, blocks = info["shape"][0], info["shape"][1] // 16
+        codes = np.frombuffer(db.read(name), dtype=np.uint8).reshape(rows, blocks, 16)
+        scales = np.frombuffer(db.read(scale_name(name)), dtype=np.uint8).reshape(rows, blocks)
+        if np.any(scales == 255):
+            raise ValueError(f"{name}: nonfinite scale")
+        values = np.empty((rows, blocks, 32), dtype=np.uint8)
+        values[:, :, 0::2] = codes & 15
+        values[:, :, 1::2] = codes >> 4
+        packed = np.empty((rows, blocks, 17), dtype=np.uint8)
+        packed[:, :, 0] = scales
+        packed[:, :, 1:] = values[:, :, :16] | (values[:, :, 16:] << 4)
+        return packed.tobytes()
 
     def encode(self, array, qtype, imatrix=None):
         if qtype == QTYPE_F16 and self.np.any(self.np.abs(array) > 65504):
@@ -268,6 +288,8 @@ def write_gguf(args, plan, records, db):
                 write_engram(fp, item, db, quantizer.np)
             elif item.is_expert:
                 def convert(expert):
+                    if item.qtype == QTYPE_MXFP4:
+                        return quantizer.to_mxfp4(db, item.source.format(expert=expert)), False
                     values = quantizer.to_f32(db, item.source.format(expert=expert))
                     importance = imatrix.expert(item.name, expert, item.shape[0], item.expert_count)
                     return quantizer.encode(values, item.qtype, importance), importance is None

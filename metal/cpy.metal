@@ -142,14 +142,18 @@ struct ds4_metal_args_flash_kv_stage_f16 {
 // by an already-F16 compressed cache. Pack both regions into the contiguous
 // F16 FlashAttention scratch in one dispatch. The raw conversion expression
 // and compressed ushort4 transport exactly match the standalone copy kernels.
-kernel void kernel_dsv4_flash_kv_stage_f16(
+// GATHER reads the compressed rows as f32 through ids (DeepSeek V4.1's
+// cache) instead of contiguous f16 rows.
+template<bool GATHER>
+static inline void dsv4_flash_kv_stage_body(
         constant ds4_metal_args_flash_kv_stage_f16 & args,
         device const char * raw_src,
         device const char * comp_src,
         device       char * dst,
         device const char * mask_src,
         device       char * pad_dst,
-        uint gid [[thread_position_in_grid]]) {
+        uint gid,
+        device const int  * ids) {
     constexpr uint row_vecs = 128;
     const uint raw_vecs = args.n_raw * row_vecs;
     const uint n_keys = args.n_raw + args.n_comp;
@@ -172,6 +176,16 @@ kernel void kernel_dsv4_flash_kv_stage_f16(
     }
 
     if (gid < total_vecs) {
+        if (GATHER) {
+            const uint comp_gid = gid - raw_vecs;
+            device const packed_float4 *comp =
+                (device const packed_float4 *)comp_src;
+            device packed_half4 *dst_half = (device packed_half4 *)dst;
+            const float4 value =
+                float4(comp[(uint)ids[comp_gid >> 7] * row_vecs + (comp_gid & 127u)]);
+            dst_half[gid] = packed_half4(half4(value));
+            return;
+        }
         device const packed_ushort4 *comp =
             (device const packed_ushort4 *)comp_src;
         device packed_ushort4 *dst_bits = (device packed_ushort4 *)dst;
@@ -215,6 +229,16 @@ kernel void kernel_dsv4_flash_kv_stage_f16(
             if (!args.shared_pad) {
                 pad_half[pad_vecs + pad_gid] = value_half;
             }
+        } else if (GATHER) {
+            device const packed_float4 *comp =
+                (device const packed_float4 *)comp_src;
+            const float4 value =
+                float4(comp[(uint)ids[logical_row - args.n_raw] * row_vecs + col]);
+            const packed_half4 value_half = packed_half4(half4(value));
+            pad_half[pad_gid] = value_half;
+            if (!args.shared_pad) {
+                pad_half[pad_vecs + pad_gid] = value_half;
+            }
         } else {
             device const packed_ushort4 *comp =
                 (device const packed_ushort4 *)comp_src;
@@ -240,6 +264,28 @@ kernel void kernel_dsv4_flash_kv_stage_f16(
     }
 }
 
+kernel void kernel_dsv4_flash_kv_stage_f16(
+        constant ds4_metal_args_flash_kv_stage_f16 & args,
+        device const char * raw_src,
+        device const char * comp_src,
+        device       char * dst,
+        device const char * mask_src,
+        device       char * pad_dst,
+        uint gid [[thread_position_in_grid]]) {
+    dsv4_flash_kv_stage_body<false>(args, raw_src, comp_src, dst, mask_src, pad_dst, gid, (device const int *)mask_src);
+}
+
+kernel void kernel_dsv41_flash_kv_stage(
+        constant ds4_metal_args_flash_kv_stage_f16 & args,
+        device const char * raw_src,
+        device const char * comp_src,
+        device       char * dst,
+        device const char * mask_src,
+        device       char * pad_dst,
+        device const int  * ids,
+        uint gid [[thread_position_in_grid]]) {
+    dsv4_flash_kv_stage_body<true>(args, raw_src, comp_src, dst, mask_src, pad_dst, gid, ids);
+}
 
 // Tiled-row expansion of a small table: dst row t = src row (pos0 + t) % ratio.
 // Replaces the per-segment copies the compressor store used to encode (one
