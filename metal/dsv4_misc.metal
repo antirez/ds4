@@ -546,6 +546,45 @@ kernel void kernel_dsv4_indexer_score_one_heads(
     }
 }
 
+// Four keys share each query load. Store every head's rounded contribution
+// before adding them in head order, as in the one-key kernel.
+kernel void kernel_dsv4_indexer_score_one_rows4(
+        constant ds4_metal_args_dsv4_indexer_scores_fused &args,
+        device const float4 *q, device const float *weights,
+        device const float4 *keys, device float *scores,
+        threadgroup float *partials [[threadgroup(0)]],
+        uint group [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
+    const uint first = group * 4u;
+    const uint last = args.n_comp - 1u;
+    const float4 k0 = keys[(ulong)first * 32u + lane];
+    const float4 k1 = keys[(ulong)min(first + 1u, last) * 32u + lane];
+    const float4 k2 = keys[(ulong)min(first + 2u, last) * 32u + lane];
+    const float4 k3 = keys[(ulong)min(first + 3u, last) * 32u + lane];
+    for (uint h = sg; h < 64u; h += 4u) {
+        const float4 query = q[h * 32u + lane];
+        const float s0 = simd_sum(dot(query, k0));
+        const float s1 = simd_sum(dot(query, k1));
+        const float s2 = simd_sum(dot(query, k2));
+        const float s3 = simd_sum(dot(query, k3));
+        if (lane == 0) {
+            // The fast-math one-key kernel rounds score times weight before scaling.
+#pragma clang fp reassociate(off)
+            const float w = weights[h];
+            partials[h] = max(s0, 0.0f) * w * args.scale;
+            partials[64u + h] = max(s1, 0.0f) * w * args.scale;
+            partials[128u + h] = max(s2, 0.0f) * w * args.scale;
+            partials[192u + h] = max(s3, 0.0f) * w * args.scale;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 4u && first + tid <= last) {
+        float acc = 0.0f;
+        for (uint h = 0; h < 64u; h++) acc += partials[64u * tid + h];
+        scores[first + tid] = acc;
+    }
+}
+
 // Decode router post-processing for one token. The selected expert ids are
 // already known; this gathers their probabilities, normalizes by the selected
 // sum, clamps the denominator like the reference path, and applies DS4's 1.5

@@ -208,12 +208,59 @@ done:
     return failed;
 }
 
+/* The V4 Flash kernel reduces 64 heads, with one shared query load per four
+ * keys. Check every tail length, exact float scores and the output boundary. */
+static int check_flash_score_rows4(void) {
+    enum { HEADS = 64, ROWS = 8193 };
+    const uint32_t widths[] = {2047, 2048, 2049, 2050, 2051, ROWS};
+    ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(HEADS * ROW_BYTES);
+    ds4_gpu_tensor *weights = ds4_gpu_tensor_alloc(HEADS * sizeof(float));
+    ds4_gpu_tensor *keys = ds4_gpu_tensor_alloc(ROWS * ROW_BYTES);
+    ds4_gpu_tensor *one = ds4_gpu_tensor_alloc((ROWS + GUARD_ROWS) * sizeof(float));
+    ds4_gpu_tensor *four = ds4_gpu_tensor_alloc((ROWS + GUARD_ROWS) * sizeof(float));
+    int failed = 1;
+    if (!q || !weights || !keys || !one || !four) goto done;
+    float *query = ds4_gpu_tensor_contents(q), *weight = ds4_gpu_tensor_contents(weights);
+    float *key = ds4_gpu_tensor_contents(keys), *a = ds4_gpu_tensor_contents(one);
+    float *b = ds4_gpu_tensor_contents(four);
+    const float scale = 1.0f / sqrtf((float)(HEADS * HEAD_DIM));
+    for (int fp4 = 0; fp4 <= 1; fp4++) {
+        for (size_t i = 0; i < HEADS * HEAD_DIM; i++)
+            query[i] = fp4 ? rng_fp4() : ldexpf(rng_float(), (int)(i % 23) - 11);
+        for (size_t i = 0; i < HEADS; i++) weight[i] = rng_float();
+        for (size_t i = 0; i < ROWS * HEAD_DIM; i++)
+            key[i] = fp4 ? rng_fp4() : ldexpf(rng_float(), (int)(i % 19) - 9);
+        for (size_t i = 0; i < sizeof(widths) / sizeof(widths[0]); i++) {
+            const uint32_t n = widths[i];
+            for (uint32_t j = n; j < n + GUARD_ROWS; j++) b[j] = -123.0f;
+            ds4_gpu_test_set_flags(DS4_GPU_TEST_INDEX_SCORE_DIRECT);
+            if (!ds4_gpu_indexer_score_one_tensor(one, q, weights, keys, n, HEADS, HEAD_DIM, scale)) goto done;
+            ds4_gpu_test_set_flags(DS4_GPU_TEST_COUNT_KERNELS);
+            const char *name = "kernel_dsv4_indexer_score_one_rows4";
+            const uint64_t before = ds4_gpu_test_kernel_runs(name);
+            if (!ds4_gpu_indexer_score_one_tensor(four, q, weights, keys, n, HEADS, HEAD_DIM, scale) ||
+                memcmp(a, b, n * sizeof(*a))) goto done;
+            if (!getenv("DS4_METAL_MATH_SAFE") &&
+                ds4_gpu_test_kernel_runs(name) != before + (n >= 2048u)) goto done;
+            for (uint32_t j = n; j < n + GUARD_ROWS; j++) if (b[j] != -123.0f) goto done;
+        }
+    }
+    failed = 0;
+done:
+    ds4_gpu_test_set_flags(0);
+    ds4_gpu_tensor_free(q); ds4_gpu_tensor_free(weights); ds4_gpu_tensor_free(keys);
+    ds4_gpu_tensor_free(one); ds4_gpu_tensor_free(four);
+    fprintf(stderr, "V4 Flash four-key score, exact scores and tail guards: %s\n", failed ? "FAIL" : "PASS");
+    return failed;
+}
+
 int main(void) {
     if (!ds4_gpu_init()) {
         fprintf(stderr, "metal init failed\n");
         return 1;
     }
     int fail = check_block_selection();
+    fail |= check_flash_score_rows4();
     const uint32_t tails[] = {1, 2, 3, 4, 15, 16, 17, 31, 33, 1023, 1025};
     for (size_t i = 0; i < sizeof(tails) / sizeof(*tails); i++) {
         fail |= run_case("tail-f32", tails[i], 0, 0, 0);
