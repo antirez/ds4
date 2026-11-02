@@ -43078,10 +43078,13 @@ static bool ds41_route_batch(ds41_gpu_graph *g, const ds4_model *m,
  * kernel leaves the mid activation unrounded. */
 static bool ds41_shared_down_batch(ds41_prefill_row *b, const ds4_model *m,
                                    const ds4_layer_weights *l, uint32_t count) {
-    return l->ffn_down_shexp->type == DS4_TENSOR_Q8_0 ?
-        ds4_gpu_matmul_q8_0_bf16io_tensor(b->shared, m->map, m->size, l->ffn_down_shexp->abs_offset,
-            l->ffn_down_shexp->dim[0], l->ffn_down_shexp->dim[1], b->shared_mid, count) != 0 :
-        ds4_gpu_dsv41_quantize(b->shared_mid, DS4_N_FF_EXP, count, DS4_V41_BF16) &&
+#ifdef __APPLE__
+    if (l->ffn_down_shexp->type == DS4_TENSOR_Q8_0)
+        return ds4_gpu_matmul_q8_0_bf16io_tensor(b->shared, m->map, m->size, l->ffn_down_shexp->abs_offset,
+            l->ffn_down_shexp->dim[0], l->ffn_down_shexp->dim[1], b->shared_mid, count) != 0;
+#endif
+    /* ds41_matmul_batch preserves the decode reduction for a few CUDA rows. */
+    return ds4_gpu_dsv41_quantize(b->shared_mid, DS4_N_FF_EXP, count, DS4_V41_BF16) &&
         ds41_matmul_batch(b->shared, m, l->ffn_down_shexp, b->shared_mid, count, true);
 }
 
