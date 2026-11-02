@@ -283,12 +283,35 @@ static NSString *candidate_source(NSString *repo, NSString *override) {
     NSError *error = nil;
     NSString *text = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:&error];
     if (!text) fail([NSString stringWithFormat:@"cannot read %@: %@", path, error]);
-    NSString *end = @"// Q8_0 matvec whose output is this rank";
-    if ([text componentsSeparatedByString:end].count != 2 ||
-        [text componentsSeparatedByString:@"[[host_name(\"kernel_mul_mv_q8_0_f32\")]]"].count != 2) {
-        fail(@"candidate source anchors missing/non-unique; update extraction explicitly");
+    /* Select only the production plain Q8 implementation and its NR2/NR4
+     * entry points. The adjacent BF16/RoPE/HC variants have their own
+     * arithmetic and need not become dependencies of this frozen oracle. */
+    NSString *declarationsEnd = @"template<short NR0, bool ROUND = false>\nstatic inline void helper_mv_reduce_and_write(";
+    NSString *plainBegin = @"template<short NR0>\nstatic inline void helper_q8_mv_reduce_and_write(";
+    NSString *plainImpl = @"template<short NR0, typename args_t>\nvoid kernel_mul_mv_q8_0_f32_plain_impl(";
+    NSString *plainEnd = @"// Rope folded into a matvec:";
+    NSString *kernelsBegin = @"// Decode-time Q8_0 matrix-vector multiply.";
+    NSString *kernelsEnd = @"[[host_name(\"kernel_mul_mv_q8_0_f32_bf16\")]]";
+    for (NSString *anchor in @[declarationsEnd, plainBegin, plainImpl, plainEnd,
+                               kernelsBegin, kernelsEnd,
+                               @"[[host_name(\"kernel_mul_mv_q8_0_f32\")]]",
+                               @"[[host_name(\"kernel_mul_mv_q8_0_f32_nr4\")]]"]) {
+        if ([text componentsSeparatedByString:anchor].count != 2)
+            fail(@"candidate source anchors missing/non-unique; update extraction explicitly");
     }
-    return [text substringToIndex:[text rangeOfString:end].location];
+    const NSUInteger declarationsStop = [text rangeOfString:declarationsEnd].location;
+    const NSUInteger plainStart = [text rangeOfString:plainBegin].location;
+    const NSUInteger implStart = [text rangeOfString:plainImpl].location;
+    const NSUInteger plainStop = [text rangeOfString:plainEnd].location;
+    const NSUInteger kernelsStart = [text rangeOfString:kernelsBegin].location;
+    const NSUInteger kernelsStop = [text rangeOfString:kernelsEnd].location;
+    if (!(declarationsStop < plainStart && plainStart < implStart && implStart < plainStop &&
+          plainStop < kernelsStart && kernelsStart < kernelsStop))
+        fail(@"invalid candidate declarations/plain/kernel source ranges");
+    return [NSString stringWithFormat:@"%@%@%@",
+        [text substringToIndex:declarationsStop],
+        [text substringWithRange:NSMakeRange(plainStart, plainStop - plainStart)],
+        [text substringWithRange:NSMakeRange(kernelsStart, kernelsStop - kernelsStart)]];
 }
 
 static id<MTLLibrary> make_library(id<MTLDevice> device, NSString *body, bool safe) {

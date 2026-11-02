@@ -102,7 +102,7 @@ static NSString *production_reduction(NSString *repo) {
         exit(1);
     }
     NSString *begin = @"template<short NR0>\nstatic inline void helper_q8_mv_reduce_and_write(";
-    NSString *end = @"template<short NR0, typename args_t>\nvoid kernel_mul_mv_q8_0_f32_impl(";
+    NSString *end = @"template<short NR0, typename args_t>\nvoid kernel_mul_mv_q8_0_f32_plain_impl(";
     if ([[dense componentsSeparatedByString:begin] count] != 2 ||
         [[dense componentsSeparatedByString:end] count] != 2) {
         fail("production helper anchors missing or non-unique; update extraction explicitly");
