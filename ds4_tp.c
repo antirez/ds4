@@ -86,6 +86,7 @@
  * microseconds. Fail well before Metal's command-buffer watchdog if the peer
  * stalls while keeping its sockets open. */
 #define DS4_TP_DEFAULT_GATE_TIMEOUT_MS 750
+#define DS4_TP_DEFAULT_BIG_GATE_ARRIVAL_MS 30000
 
 typedef struct {
     uint32_t magic;
@@ -2512,9 +2513,10 @@ fail:
     return 0;
 }
 
-int ds4_tp_agree_execution_mode(ds4_tp *tp, uint32_t flags, char *err, size_t errlen) {
+int ds4_tp_agree_execution_mode(ds4_tp *tp, uint32_t flags, bool *full_experts, char *err, size_t errlen) {
     if (!tp || ds4_tp_failed(tp)) return 0;
-    const uint32_t mine[2] = {DS4_TP_MAGIC, flags};
+    const uint32_t full = 1u << 4;   /* optional, independent of the required modes */
+    const uint32_t mine[2] = {DS4_TP_MAGIC, flags | (full_experts && *full_experts ? full : 0)};
     uint32_t peer[2];
     if (!tp_tcp_exchange(tp, NULL, NULL, mine, peer, sizeof(mine))) {
         ds4_tp_mark_failed(tp);
@@ -2524,13 +2526,14 @@ int ds4_tp_agree_execution_mode(ds4_tp *tp, uint32_t flags, char *err, size_t er
     const uint32_t known = DS4_TP_MODE_EXPERT_INTERMEDIATE_SPLIT |
         DS4_TP_MODE_V41_SHARED_OWNER | DS4_TP_MODE_V41_SHARED_BALANCE |
         DS4_TP_MODE_V41_DSPARK;
-    if (peer[0] != mine[0] || peer[1] != flags || (flags & ~known) != 0) {
+    if (peer[0] != mine[0] || (peer[1] & ~full) != flags || (flags & ~known) != 0) {
         ds4_tp_mark_failed(tp);
         tp_set_err(err, errlen, "tp execution mode mismatch (peer 0x%x, local 0x%x); "
                    "use matching builds and expert ownership settings on both ranks",
                    peer[1], flags);
         return 0;
     }
+    if (full_experts) *full_experts = (mine[1] & peer[1] & full) != 0;
     return 1;
 }
 
@@ -2778,10 +2781,23 @@ int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
     if (dbg < 0) dbg = getenv("DS4_TP_BIG_GATE_DEBUG") != NULL;
     const double t_start = dbg ? tp_now_sec() : 0.0;
 #endif
-    /* A cold prefill kernel can make one rank arrive much later than the
-     * other. Match the bulk RDMA window's bounded grace, without relaxing
-     * the decode timeout or any subsequent payload exchange. */
-    if (!tp_socket_set_gate_timeout(tp->data_fd, tp->gate_timeout_ms + 2000u)) return 0;
+    /* A cold prefill kernel, or the host-side Engram reads that precede
+     * layers 1 and 14 of each V4.1 prefill block, can make one rank arrive
+     * seconds after the other.  Only this arrival handshake gets the long
+     * grace; the decode timeout and the payload exchange stay strict, and a
+     * dead peer still fails at once on the closed socket.
+     * DS4_TP_BIG_GATE_ARRIVAL_MS overrides the default. */
+    static uint64_t arrival_ms = 0;
+    if (arrival_ms == 0) {
+        arrival_ms = DS4_TP_DEFAULT_BIG_GATE_ARRIVAL_MS;
+        const char *env = getenv("DS4_TP_BIG_GATE_ARRIVAL_MS");
+        if (env) {
+            const long v = strtol(env, NULL, 10);
+            if (v > 0 && v <= 600000) arrival_ms = (uint64_t)v;
+        }
+        if (arrival_ms < tp->gate_timeout_ms + 2000u) arrival_ms = tp->gate_timeout_ms + 2000u;
+    }
+    if (!tp_socket_set_gate_timeout(tp->data_fd, arrival_ms)) return 0;
     ds4_tp_gate_header h = { DS4_TP_BATCH_MAGIC, (uint16_t)layer, 0xB16u, seq };
     ds4_tp_gate_header ph;
     const bool header_ok = tp_write_full(tp->data_fd, &h, sizeof(h)) &&

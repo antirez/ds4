@@ -3563,6 +3563,20 @@ static inline qwen4_raw16 qwen4_load_raw16(device const char *row, uint b, uint 
     }
     return r;
 }
+/* Prefetch step b from step b - 1: Q4_K shares a header across eight
+ * groups and quant bytes across each low/high-nibble pair. */
+static inline void qwen4_load_raw16_next(thread qwen4_raw16 &r,
+        device const char *row, uint b, uint q0, uint type) {
+    if (type == 12) {
+        const uint group = b % 8;
+        device const uchar *blk = (device const uchar *)(row + (uint64_t)(b / 8) * 144);
+        if (group == 0) r.h = *(device const uint4 *)blk;
+        if ((group & 1u) == 0)
+            r.q = *(device const uint4 *)(blk + 16 + (group >> 1) * 32 + q0 * 8);
+        return;
+    }
+    r = qwen4_load_raw16(row, b, q0, type);
+}
 static inline void qwen4_dequant_raw16(qwen4_raw16 r, uint b, uint q0, uint type, threadgroup half *dst) {
     if (type == 12) {
         const uint group = b % 8;
@@ -4003,7 +4017,10 @@ kernel void kernel_qwen4_moe_mm_mid_nax_t(
                 } else {
                     for (uint i = 0; i < 16; i++) { dg[i] = 0.0h; du[i] = 0.0h; }
                 }
-                if (kb + 1 < nk) { rg = qwen4_load_raw16(grow, kb + 1, aq * 2, type); ru = qwen4_load_raw16(urow, kb + 1, aq * 2, type); }
+                if (kb + 1 < nk) {
+                    qwen4_load_raw16_next(rg, grow, kb + 1, aq * 2, type);
+                    qwen4_load_raw16_next(ru, urow, kb + 1, aq * 2, type);
+                }
             }
 #pragma unroll
             for (int b = 0; b < NB; b++) {
@@ -4153,7 +4170,8 @@ kernel void kernel_qwen4_moe_mm_down_nax_t(
                 threadgroup half *dd = As + ar * NK + aq * 16;
                 if (a_row) qwen4_dequant_raw16(rd, kb, aq * 2, type, dd);
                 else for (uint i = 0; i < 16; i++) dd[i] = 0.0h;
-                if (kb + 1 < nk) rd = qwen4_load_raw16(drow, kb + 1, aq * 2, type);
+                if (kb + 1 < nk)
+                    qwen4_load_raw16_next(rd, drow, kb + 1, aq * 2, type);
             }
 #pragma unroll
             for (int b = 0; b < NB; b++) {

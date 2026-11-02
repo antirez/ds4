@@ -2786,6 +2786,134 @@ static void test_moe_mm_tiles_exact(arena_t *a, uint32_t down_type) {
     ds4_gpu_tensor_free(glists); ds4_gpu_tensor_free(gsel); ds4_gpu_tensor_free(gx);
 }
 
+/* A baseline and candidate shader can run this same deterministic fixture in
+ * separate processes. RAW16_DUMP writes every mid/down bit, including guards,
+ * so a hash collision cannot hide drift in the exactness comparison. */
+static void raw16_record(FILE *dump, const float *v, uint64_t n,
+                         const uint32_t *meta, uint32_t stage) {
+    uint64_t hash = 1469598103934665603ull;
+    for (uint64_t i = 0; i < n; i++) {
+        uint32_t u; memcpy(&u, v + i, sizeof(u));
+        hash = (hash ^ u) * 1099511628211ull;
+    }
+    printf("  raw16 gate=%u down=%u K=%u F=%u O=%u nax=%u %s hash=%016llx\n",
+           meta[0], meta[1], meta[2], meta[3], meta[4], meta[5],
+           stage ? "down" : "mid", (unsigned long long)hash);
+    if (dump) {
+        require_ok(fwrite(meta, sizeof(*meta), 6, dump) == 6 &&
+                   fwrite(&stage, sizeof(stage), 1, dump) == 1 &&
+                   fwrite(&n, sizeof(n), 1, dump) == 1 &&
+                   fwrite(v, sizeof(*v), n, dump) == n, "raw16 output dump");
+    }
+}
+
+static void test_raw16_prefetch(arena_t *a) {
+    const int32_t count[] = {0, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65};
+    const uint32_t NE = sizeof(count) / sizeof(*count), T = 361, slots = 2,
+                   n_out = 3, cap = 65, guard = 17;
+    const uint32_t cases[][3] = {{12, 12, 512}, {12, 12, 2560},
+                                {12, 39, 2560}, {39, 39, 512}, {16, 10, 512}};
+    const uint32_t n_case = sizeof(cases) / sizeof(*cases);
+    const float sentinel = -1234.5f;
+    const char *path = getenv("DS4_TEST_QWEN4_RAW16_DUMP");
+    FILE *dump = path && path[0] ? fopen(path, "wb") : NULL;
+    require_ok(!path || !path[0] || dump != NULL, "open raw16 output dump");
+    require_ok(ds4_gpu_device_is_m5_apple_silicon(), "raw16 NAX fixture requires M5");
+    g_rng = 0x12345678u;
+    int32_t *list = malloc((uint64_t)NE * cap * sizeof(*list));
+    require_ok(list != NULL, "raw16 routing lists allocation");
+    for (uint32_t i = 0; i < NE * cap; i++) list[i] = -1;
+    uint32_t next = 0;
+    for (uint32_t e = 0; e < NE; e++) for (int32_t j = 0; j < count[e]; j++) {
+        const uint32_t tok = (next++ * 17u) % T;
+        list[e * cap + (uint32_t)j] = (int32_t)(tok * slots + tok % slots);
+    }
+    require_ok(next == T, "raw16 counts cover each token once");
+    ds4_gpu_tensor *glists = ds4_gpu_tensor_alloc((uint64_t)NE * cap * sizeof(*list));
+    ds4_gpu_tensor *gcounts = ds4_gpu_tensor_alloc(sizeof(count));
+    require_ok(glists && gcounts &&
+               ds4_gpu_tensor_write(glists, 0, list, (uint64_t)NE * cap * sizeof(*list)) &&
+               ds4_gpu_tensor_write(gcounts, 0, count, sizeof(count)), "raw16 frozen routing");
+    free(list);
+    setenv("DS4_QWEN4_MOE_TAILS", "1", 1);
+    setenv("DS4_QWEN4_MOE_MID_TILES", "1", 1);
+    setenv("DS4_QWEN4_MOE_DOWN_TILES", "1", 1);
+    for (uint32_t c = 0; c < n_case; c++) {
+        const uint32_t gt = cases[c][0], dt = cases[c][1], K = cases[c][2];
+        const uint32_t F = 512, O = 65;
+        double *shadow;
+        const uint64_t goff = arena_tier(a, gt, (uint64_t)NE * F, K, &shadow); free(shadow);
+        const uint64_t uoff = arena_tier(a, gt, (uint64_t)NE * F, K, &shadow); free(shadow);
+        const uint64_t doff = arena_tier(a, dt, (uint64_t)NE * O, F, &shadow); free(shadow);
+        /* Distinct finite signed scale/min headers catch reuse beyond a Q4
+         * superblock, which a constant d/dmin fixture would fail to expose. */
+        const uint64_t offsets[] = {goff, uoff, doff};
+        const uint32_t types[] = {gt, gt, dt}, widths[] = {K, K, F}, rows[] = {F, F, O};
+        const uint16_t scales[] = {0x0c00, 0x1000, 0x8c00, 0x0800, 0x0000, 0x9000};
+        for (uint32_t w = 0; w < 3; w++) if (types[w] == 12u) {
+            const uint64_t blocks = (uint64_t)NE * rows[w] * (widths[w] / 256u);
+            for (uint64_t b = 0; b < blocks; b++) {
+                uint8_t *blk = a->base + offsets[w] + b * 144u;
+                const uint16_t d = scales[b % 6u], dm = scales[(b + 1u) % 6u];
+                memcpy(blk, &d, 2); memcpy(blk + 2, &dm, 2);
+            }
+        }
+        if (gt == 39u) {
+            /* The generic MXFP4 generator repeats every 16 rows; down blocks
+             * eight apart then cancel a periodic mid exactly. Vary exponents
+             * across both periods so this fallback guard exercises live down
+             * values, with normalized inputs and finite half intermediates. */
+            for (uint32_t w = 0; w < 3; w++) {
+                const uint32_t blocks = widths[w] / 32u;
+                for (uint64_t r = 0; r < (uint64_t)NE * rows[w]; r++)
+                    for (uint32_t b = 0; b < blocks; b++)
+                        a->base[offsets[w] + (r * blocks + b) * 17u] =
+                            (uint8_t)(120u + (r / 16u + b / 8u) % 4u);
+            }
+        }
+        float *x = rand_vec((uint64_t)T * K, gt == 39u ? 1.0f : 0.0625f);
+        ds4_gpu_tensor *gx = upload(x, (uint64_t)T * K); free(x);
+        const uint64_t mn = (uint64_t)T * n_out * F, pn = (uint64_t)T * n_out * O;
+        ds4_gpu_tensor *gm = upload(NULL, mn + guard), *gp = upload(NULL, pn + guard);
+        for (uint32_t level = 0; level <= 6; level++) {
+            char value[4]; snprintf(value, sizeof(value), "%u", level);
+            setenv("DS4_QWEN4_MOE_MM_NAX", value, 1);
+            require_ok(ds4_gpu_tensor_fill_f32(gm, sentinel, mn + guard) &&
+                       ds4_gpu_tensor_fill_f32(gp, sentinel, pn + guard) &&
+                       ds4_gpu_begin_commands() &&
+                       ds4_gpu_qwen4_moe_mm_mid_tensor(gm, gx, glists, gcounts, a->base, a->size,
+                           goff, uoff, gt, NE, T, slots, n_out, K, F, cap) &&
+                       ds4_gpu_qwen4_moe_mm_down_tensor(gp, gm, glists, gcounts, a->base, a->size,
+                           doff, dt, NE, T, slots, n_out, F, O, cap) &&
+                       ds4_gpu_end_commands(), "raw16 mid/down dispatch");
+            const uint32_t meta[] = {gt, dt, K, F, O, level};
+            for (uint32_t stage = 0; stage < 2; stage++) {
+                const uint32_t width = stage ? O : F;
+                const uint64_t live_n = stage ? pn : mn, n = live_n + guard;
+                float *got = download(stage ? gp : gm, n);
+                bool nonzero = false;
+                for (uint64_t i = 0; i < n; i++) {
+                    const uint64_t pair = i / width, tok = pair / n_out;
+                    const bool live = i < live_n && pair % n_out == tok % slots;
+                    uint32_t bits; memcpy(&bits, got + i, sizeof(bits));
+                    if (live) {
+                        require_ok((bits & 0x7f800000u) != 0x7f800000u && got[i] != sentinel,
+                                   "raw16 finite live output");
+                        nonzero |= (bits & 0x7fffffffu) != 0;
+                    } else require_ok(got[i] == sentinel, "raw16 reserved slot/tail guard");
+                }
+                require_ok(nonzero, "raw16 nontrivial live output");
+                raw16_record(dump, got, n, meta, stage);
+                free(got);
+            }
+        }
+        ds4_gpu_tensor_free(gp); ds4_gpu_tensor_free(gm); ds4_gpu_tensor_free(gx);
+    }
+    ds4_gpu_tensor_free(gcounts); ds4_gpu_tensor_free(glists);
+    if (dump) require_ok(fclose(dump) == 0, "close raw16 output dump");
+    printf("all raw16 prefetch fixture guards passed; compare dumps with the baseline shader\n");
+}
+
 /* MTP input staging: cat rows [rms(e)*g_e | 0] and [0 | rms(R_s)*g_h_s]
  * (full-row or per-stream RMS), then R_out = proj[0] + proj[1+s]. */
 static void test_mtp(arena_t *a, uint32_t E, uint32_t hc) {
@@ -3537,6 +3665,7 @@ int main(void) {
     setenv("DS4_QWEN4_ATTN_SPLIT_KEYS", "8", 1);
     require_ok(ds4_gpu_init(), "GPU initialization");
     require_ok(ds4_gpu_set_model_map(arena.base, arena.size), "model map registration");
+    if (getenv("DS4_TEST_QWEN4_RAW16_ONLY")) { test_raw16_prefetch(&arena); return 0; }
 
 #ifndef __APPLE__
     if (getenv("DS4_TEST_QWEN4_ATTN_GROUPS")) { test_attn_groups(); return 0; }

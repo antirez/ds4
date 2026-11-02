@@ -244,7 +244,7 @@ static bool ds41_dspark_stage(ds41_dspark *d, const ds4_model *m, uint32_t stage
         !ds4_gpu_dsv41_quantize(b->heads, DS4_N_HEAD * DS4_N_HEAD_DIM, n, DS4_V41_BF16) ||
         !ds4_gpu_dsv41_rope(b->heads, DS4_N_HEAD_DIM, DS4_N_HEAD, n, pos, false, true) ||
         !ds41_dspark_attention_output(b, m, l) ||
-        !ds41_after_attention_batch(b, m, l, n)) {
+        !ds41_after_attention_batch(b, m, l, n, false)) {
         fprintf(stderr, "ds4: V4.1 draft attention failed\n");
         return false;
     }
