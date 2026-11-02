@@ -280,21 +280,27 @@ int main(int argc, char **argv) {
     int rc = 1;
     CHECK(ds4_tp_create(&tp, &opt, &id, error, sizeof(error)));
     CHECK(ds4_tp_is_rdma(tp) == (opt.transport == DS4_TP_TRANSPORT_RDMA));
-    CHECK(ds4_tp_agree_execution_mode(tp, 0, error, sizeof(error)));
+    CHECK(ds4_tp_agree_execution_mode(tp, 0, NULL, error, sizeof(error)));
     CHECK(ds4_tp_agree_execution_mode(tp, DS4_TP_MODE_EXPERT_INTERMEDIATE_SPLIT,
-                                     error, sizeof(error)));
+                                     NULL, error, sizeof(error)));
     CHECK(ds4_tp_agree_execution_mode(tp, DS4_TP_MODE_V41_SHARED_OWNER,
-                                     error, sizeof(error)));
+                                     NULL, error, sizeof(error)));
     CHECK(ds4_tp_agree_execution_mode(tp, DS4_TP_MODE_V41_SHARED_OWNER |
-                                     DS4_TP_MODE_V41_SHARED_BALANCE, error, sizeof(error)));
+                                     DS4_TP_MODE_V41_SHARED_BALANCE, NULL, error, sizeof(error)));
     CHECK(ds4_tp_agree_execution_mode(tp, DS4_TP_MODE_V41_DSPARK |
-                                     DS4_TP_MODE_V41_SHARED_OWNER, error, sizeof(error)));
+                                     DS4_TP_MODE_V41_SHARED_OWNER, NULL, error, sizeof(error)));
+    for (unsigned mask = 0; mask < 4; mask++) {
+        bool full = (mask & (1u << rank)) != 0;
+        CHECK(ds4_tp_agree_execution_mode(tp, DS4_TP_MODE_V41_SHARED_OWNER,
+                                         &full, error, sizeof(error)));
+        CHECK(full == (mask == 3));
+    }
     if (getenv("DS4_TEST_TP_MODE_MISMATCH")) {
         const int test = atoi(getenv("DS4_TEST_TP_MODE_MISMATCH"));
         const uint32_t mode = test == 3 ? DS4_TP_MODE_V41_DSPARK :
             test == 2 ? DS4_TP_MODE_V41_SHARED_BALANCE : DS4_TP_MODE_EXPERT_INTERMEDIATE_SPLIT;
         CHECK(!ds4_tp_agree_execution_mode(tp, rank ?
-            mode : 0, error, sizeof(error)));
+            mode : 0, NULL, error, sizeof(error)));
         CHECK(ds4_tp_failed(tp));
         CHECK(strstr(error, "execution mode mismatch") != NULL);
         fprintf(stderr, "rank=%d mismatched execution modes refused: PASS\n", rank);

@@ -41016,6 +41016,7 @@ typedef struct {
     uint64_t allocation_bytes;
     bool valid, streaming, encoder_resident, compact_carry, prefill_alias, quality;
     uint32_t tp_world, tp_rank;
+    bool tp_balanced_route;
     bool tp_gate_fused, shared_done, hc_attn_deferred, hc_ffn_deferred, scalar_decode, kv_stored;
     bool low_unrounded;   /* TP: low's BF16 rounding is left to its kslice consumer */
     /* Metal: one decode step's RoPE coefficient table, valid for position rope_tab_pos - 1 while that step runs
@@ -41526,19 +41527,13 @@ static bool ds41_tp_slab_off(void) {
 
 /* Each rank takes half of the ordered selection, so neither waits on an
  * uneven split of the experts it owns. Both ranks then map every expert. */
-static bool ds41_tp_balanced_route(void) {
 #ifdef __APPLE__
+static bool ds41_tp_balanced_requested(void) {
     static int off = -1;
     return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && !(DS4_N_EXPERT_USED & 1u) &&
         !metal_graph_env_flag("DS4_METAL_DISABLE_V41_TP_BALANCED_ROUTE", &off);
-#else
-    return false;
-#endif
 }
-
-#ifdef __APPLE__
 static bool ds41_tp_balanced_views(ds41_gpu_graph *g) {
-    if (!ds41_tp_balanced_route()) return false;
     const uint64_t bytes = (uint64_t)(DS4_N_EXPERT_USED / 2u) * sizeof(float);
     if (!g->selected_half) g->selected_half = ds4_gpu_tensor_view(g->selected, g->tp_rank * bytes, bytes);
     if (!g->route_weights_half) g->route_weights_half = ds4_gpu_tensor_view(g->route_weights, g->tp_rank * bytes, bytes);
@@ -42236,6 +42231,9 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
     const ds4_tensor *bias = ds41_image_at(g, g->pos) ? l->ffn_exp_probs_vl : l->ffn_exp_probs_b;
     if (!bias) return false;
 #ifdef __APPLE__
+    /* A rank must never switch expert ownership on its own after binding. */
+    const bool balanced = g->tp_world == 2 && g->tp_balanced_route;
+    if (balanced && !ds41_tp_balanced_views(g)) return false;
     ds4_gpu_tensor *router_bf16 = g->quality ? NULL : ds41_router_bf16(m, l, il);
     if (router_bf16 ? !ds4_gpu_matmul_bf16_weights_tensor(g->route_logits, router_bf16,
                                                           l->ffn_gate_inp->dim[0], l->ffn_gate_inp->dim[1], g->norm) :
@@ -42310,7 +42308,7 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
      * experts the same way: its lanes' mid, then its K slice of the down. */
     const bool concurrent_tp = !concurrent && shared_here && shared_split && shared_down &&
         g->tp_world == 2 && !g->streaming && !g->quality && ds41_concurrent_ffn_on() &&
-        ds41_tp_concurrent_ffn_on() && ds41_tp_balanced_route() &&
+        ds41_tp_concurrent_ffn_on() && g->tp_balanced_route &&
         l->ffn_gate_exps->type == DS4_TENSOR_MXFP4 && l->ffn_down_exps->type == DS4_TENSOR_MXFP4 &&
         ds4_gpu_parallel_ffn_start_bf16_kslice(g->shared_gate, g->shared_up, g->shared_mid, g->shared,
             m->map, m->size, l->ffn_gate_shexp->abs_offset, l->ffn_up_shexp->abs_offset,
@@ -42359,7 +42357,6 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
             DS4_N_EXPERT / 2u, DS4_SWIGLU_CLAMP_EXP, g->norm, il, 1, NULL);
     } else
 #else
-    const bool balanced = g->tp_world == 2 && ds41_tp_balanced_views(g);
     if (balanced) {
         n_used /= 2u;
         selected = g->selected_half;
@@ -44450,6 +44447,7 @@ typedef struct {
     /* Lockstep TP drafter: this rank built its DSpark expert halves at open
      * (dspark_split_built); both ranks agreed at bind (dspark_split); repeated
      * state disagreement between the ranks switched it off (dspark_split_off). */
+    bool v41_balanced_route;   /* both ranks mapped every routed expert */
     bool dspark_split_built;
     bool dspark_split;
     bool dspark_split_off;
@@ -44522,6 +44520,7 @@ struct ds4_engine {
     bool ssd_streaming_static_decode_map;
     ds4_distributed_options distributed;
     ds4_engine_tp_state tp;
+    bool v41_full_experts;     /* this rank mapped every V4.1 routed expert */
     bool cuda_tp_expert_split;  /* Resident expert layout, independent of binding. */
     bool metal_ready;
     bool mtp_ready;
@@ -73103,24 +73102,51 @@ static bool engine_warm_full_model(const ds4_engine_options *opt) {
 }
 
 #ifdef DS4_HAS_DEEPSEEK41_GPU
+static uint64_t ds41_memory_budget(uint64_t host, uint64_t recommended) {
+    const uint64_t budget = host / 8u * 7u;
+    return budget < recommended ? budget : recommended;
+}
+
+static uint64_t ds41_fixed_memory(const ds4_engine *e, uint64_t weights, uint64_t graph) {
+    weights = ds4_add_sat_u64(weights, e->vision_model.size);
+    weights = ds4_add_sat_u64(weights, e->mtp_model.size);
+    if (e->dspark) graph = ds4_add_sat_u64(graph,
+        ds4_mul_sat_u64(UINT64_C(64) << 20, engine_placement_session_count(e)));
+    return ds4_add_sat_u64(weights, ds4_add_sat_u64(graph,
+        ds4_add_sat_u64(UINT64_C(2) << 30, e->ssd_streaming_prefill_headroom_bytes)));
+}
+
+#ifdef __APPLE__
+/* A rank may replicate experts only if its model, optional sidecars and requested
+ * sessions fit. The two ranks agree on the route once their maps are ready. */
+static bool ds41_tp_can_replicate_experts(const ds4_engine *e, const ds4_engine_options *opt) {
+    if (!ds41_tp_balanced_requested()) return false;
+    const uint32_t ctx = opt->context_size > 0 ? (uint32_t)opt->context_size : 4096u;
+    uint64_t fixed = ds41_fixed_memory(e, e->model.size,
+        ds4_mul_sat_u64(ds41_graph_bytes(ctx), engine_placement_session_count(e)));
+    const char *sidecars[] = {opt->vision_path, opt->mtp_path};
+    for (size_t i = 0; i < sizeof(sidecars) / sizeof(sidecars[0]); i++) {
+        if (!sidecars[i] || !sidecars[i][0]) continue;
+        struct stat st;
+        if (stat(sidecars[i], &st) || st.st_size < 0) return false;
+        fixed = ds4_add_sat_u64(fixed, (uint64_t)st.st_size);
+    }
+    return fixed < ds41_memory_budget(glm_graph_host_memory_bytes(),
+                                       ds4_gpu_recommended_working_set_size());
+}
+#endif
+
 static bool ds41_memory_admit_for_host(ds4_engine *e, uint64_t graph_bytes,
                                       bool fit_cache, uint64_t host,
                                       uint64_t recommended) {
-    const uint64_t gib = UINT64_C(1073741824);
-    uint64_t budget = host / 8u * 7u;
+    const uint64_t budget = ds41_memory_budget(host, recommended);
     if (!host || !recommended) {
         fprintf(stderr, "ds4: cannot determine a safe V4.1 memory budget\n");
         return false;
     }
-    if (budget > recommended) budget = recommended;
     uint64_t weights = g_tp_shard_model_bytes ? g_tp_shard_model_bytes : e->model.size;
     if (e->ssd_streaming && !weights_streaming_non_routed_bytes(&e->weights, &weights)) return false;
-    weights = ds4_add_sat_u64(weights, e->vision_model.size);
-    weights = ds4_add_sat_u64(weights, e->mtp_model.size);
-    if (e->dspark) graph_bytes = ds4_add_sat_u64(graph_bytes,
-        ds4_mul_sat_u64(UINT64_C(64) << 20, engine_placement_session_count(e)));
-    const uint64_t fixed = ds4_add_sat_u64(weights,
-        ds4_add_sat_u64(graph_bytes, 2u * gib + e->ssd_streaming_prefill_headroom_bytes));
+    const uint64_t fixed = ds41_fixed_memory(e, weights, graph_bytes);
     uint64_t expert = 0;
     if (e->ssd_streaming && !ds4_streaming_routed_expert_bytes(&e->weights, &expert)) return false;
     if (fixed >= budget || (expert && budget - fixed < expert)) {
@@ -73487,9 +73513,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
      * immediately after binding so memory guards account only the bytes this
      * rank owns (replicated dense weights plus its expert shard). */
 #ifndef DS4_NO_GPU
-    const bool tp_shard =
-        opt->tp.role != DS4_TP_NONE &&
-        !e->ssd_streaming && !ds41_tp_balanced_route();
+    const bool resident_tp = opt->tp.role != DS4_TP_NONE && !e->ssd_streaming;
+#ifdef __APPLE__
+    e->v41_full_experts = resident_tp && ds41_tp_can_replicate_experts(e, opt);
+#endif
+    const bool tp_shard = resident_tp && !e->v41_full_experts;
     const int tp_shard_rank = opt->tp.role == DS4_TP_WORKER ? 1 : 0;
     bool tp_expert_split_active = false;
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
@@ -75332,7 +75360,8 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
         execution_mode |= DS4_TP_MODE_V41_SHARED_OWNER;
         if (ds41_shared_balance_enabled()) execution_mode |= DS4_TP_MODE_V41_SHARED_BALANCE;
     }
-    if (!ds4_tp_agree_execution_mode(tp, execution_mode, err, errlen)) return 0;
+    e->tp.v41_balanced_route = e->v41_full_experts;
+    if (!ds4_tp_agree_execution_mode(tp, execution_mode, &e->tp.v41_balanced_route, err, errlen)) return 0;
     const uint32_t slots = (uint32_t)DS4_N_LAYER * DS4_TP_GATES_PER_LAYER;
     const uint64_t vec_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
     const uint64_t slab_bytes = ds4_tp_slab_bytes((uint32_t)DS4_N_LAYER, (uint32_t)DS4_N_EMBD);
@@ -75451,7 +75480,8 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
     e->tp.active = true;
     ds4_log(stderr, DS4_LOG_OK,
             "tensor parallelism bound: rank %d, %s, %s transport\n",
-            e->tp.rank, e->cuda_tp_expert_split ? "MXFP4 expert intermediate split" :
+            e->tp.rank, e->tp.v41_balanced_route ? "balanced selected experts" :
+                        e->cuda_tp_expert_split ? "MXFP4 expert intermediate split" :
                                                "50/50 expert ownership",
             ds4_tp_is_rdma(tp) ? "rdma" : "tcp");
     return 1;
@@ -75747,6 +75777,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         }
         if (e->tp.active) {
             s->ds41_graph.tp_world = 2;
+            s->ds41_graph.tp_balanced_route = e->tp.v41_balanced_route;
             s->ds41_graph.tp_rank = (uint32_t)e->tp.rank;
             s->ds41_graph.tp_out = e->tp.out_views;
             s->ds41_graph.tp_in = e->tp.in_views;
