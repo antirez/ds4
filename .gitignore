@@ -44,6 +44,7 @@
 /tests/test_cuda_dspark_moe
 /tests/test_session_state
 /tests/test_session_state_gpu
+/tests/test_tokenizer
 /tests/test_tp_commands
 /tests/test_tp_rdma
 /tests/test_tp_tcp

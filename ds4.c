@@ -40839,9 +40839,23 @@ void ds4_tokens_free(ds4_tokens *tv) {
     token_vec_free(tv);
 }
 
+void ds4_tokens_append(ds4_tokens *dst, const ds4_tokens *src) {
+    if (!src->len) return;
+    if (src->len > INT32_MAX - dst->len) ds4_die("token vector is too large");
+    const int need = dst->len + src->len;
+    if (need > dst->cap) {
+        int cap = dst->cap ? dst->cap : 64;
+        while (cap < need) cap = cap > INT32_MAX / 2 ? need : cap * 2;
+        dst->v = xrealloc(dst->v, (size_t)cap * sizeof(dst->v[0]));
+        dst->cap = cap;
+    }
+    memmove(dst->v + dst->len, src->v, (size_t)src->len * sizeof(dst->v[0]));
+    dst->len = need;
+}
+
 void ds4_tokens_copy(ds4_tokens *dst, const ds4_tokens *src) {
     dst->len = 0;
-    for (int i = 0; i < src->len; i++) token_vec_push(dst, src->v[i]);
+    ds4_tokens_append(dst, src);
 }
 
 bool ds4_tokens_starts_with(const ds4_tokens *tokens, const ds4_tokens *prefix) {
@@ -44295,6 +44309,20 @@ static bool ds41_graph_short_prefill(ds41_gpu_graph *g, const ds4_model *m,
 #undef DS41_CARRY_ROWS
 #endif
 
+/* Merges resolved to token ids at load: (left id, right id) -> rank and
+ * merged id.  Every BPE symbol is a vocab entry, so the merge loop never
+ * builds or hashes strings. */
+typedef struct {
+    uint64_t key;   /* ((left << 32) | right) + 1, 0 marks an empty slot */
+    int rank;
+    int id;
+} bpe_merge_entry;
+
+typedef struct {
+    bpe_merge_entry *entry;
+    uint64_t cap;
+} bpe_merge_table;
+
 struct ds4_vocab {
     ds4_str *token;
     int n_vocab;
@@ -44320,7 +44348,10 @@ struct ds4_vocab {
     int im_end_id;
     int endoftext_id;
     str_i32_table token_to_id;
-    str_i32_table merge_rank;
+    bpe_merge_table merges;
+    int byte_token[256];  /* raw byte -> id of its byte-level symbol, or -1 */
+    ds4_str *text;        /* per-token decoded bytes, views into text_arena */
+    char *text_arena;
 };
 
 /* Engine-side tensor-parallel state.  The transport context is owned by the
@@ -44705,34 +44736,27 @@ static void utf8_put(char **p, uint32_t cp) {
     }
 }
 
-static uint32_t gpt2_byte_to_codepoint(uint8_t b) {
-    if ((b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174)) {
-        return b;
-    }
-
-    uint32_t n = 0;
-    for (uint32_t x = 0; x < 256; x++) {
-        if ((x >= 33 && x <= 126) || (x >= 161 && x <= 172) || (x >= 174)) {
-            continue;
-        }
-        if (x == b) return 256 + n;
-        n++;
-    }
-    return b;
+/* GPT-2 byte-level BPE maps every raw byte to a printable codepoint so merges
+ * operate on UTF-8 strings without losing byte identity.  Printable Latin-1
+ * bytes map to themselves; the other 68 (0-32, 127-160, 173) map in order to
+ * U+0100..U+0143. */
+static bool gpt2_byte_is_printable(uint32_t b) {
+    return (b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174 && b <= 255);
 }
 
-/* GPT-2 byte-level BPE first maps raw bytes to printable Unicode codepoints
- * so merges can operate on UTF-8 strings without losing byte identity. */
-static char *byte_encode(ds4_str in, uint64_t *out_len) {
-    char *out = xmalloc((size_t)in.len * 4 + 1);
-    char *p = out;
+static uint32_t gpt2_byte_to_codepoint(uint8_t b) {
+    if (gpt2_byte_is_printable(b)) return b;
+    if (b <= 32) return 256 + b;
+    if (b <= 160) return 256 + 33 + (b - 127);
+    return 256 + 33 + 34; /* 173 */
+}
 
-    for (uint64_t i = 0; i < in.len; i++) {
-        utf8_put(&p, gpt2_byte_to_codepoint((uint8_t)in.ptr[i]));
-    }
-    *p = '\0';
-    *out_len = (uint64_t)(p - out);
-    return out;
+static int gpt2_codepoint_to_byte(uint32_t cp) {
+    if (gpt2_byte_is_printable(cp)) return (int)cp;
+    if (cp >= 256 && cp < 256 + 33) return (int)(cp - 256);
+    if (cp >= 256 + 33 && cp < 256 + 33 + 34) return (int)(cp - 256 - 33 + 127);
+    if (cp == 256 + 33 + 34) return 173;
+    return -1;
 }
 
 static int utf8_len_from_first_byte(uint8_t c) {
@@ -44743,102 +44767,143 @@ static int utf8_len_from_first_byte(uint8_t c) {
     return 1;
 }
 
+static uint64_t bpe_pair_key(int left, int right) {
+    return (((uint64_t)(uint32_t)left << 32) | (uint32_t)right) + 1;
+}
+
+static uint64_t bpe_pair_slot(uint64_t key, uint64_t mask) {
+    key ^= key >> 33;
+    key *= 0xff51afd7ed558ccdULL;
+    key ^= key >> 33;
+    return key & mask;
+}
+
+/* Duplicate merges overwrite, so the last occurrence's rank wins, as with
+ * the string-keyed table this replaced. */
+static void bpe_merges_put(bpe_merge_table *t, int left, int right, int rank, int id) {
+    const uint64_t key = bpe_pair_key(left, right);
+    const uint64_t mask = t->cap - 1;
+    uint64_t i = bpe_pair_slot(key, mask);
+    while (t->entry[i].key && t->entry[i].key != key) i = (i + 1) & mask;
+    t->entry[i] = (bpe_merge_entry){ key, rank, id };
+}
+
+static const bpe_merge_entry *bpe_merges_get(const bpe_merge_table *t, int left, int right) {
+    if (!t->cap || left < 0 || right < 0) return NULL;
+    const uint64_t key = bpe_pair_key(left, right);
+    const uint64_t mask = t->cap - 1;
+    for (uint64_t i = bpe_pair_slot(key, mask); t->entry[i].key; i = (i + 1) & mask) {
+        if (t->entry[i].key == key) return &t->entry[i];
+    }
+    return NULL;
+}
+
 typedef struct {
-    char *ptr;
-    uint64_t len;
-} owned_str;
+    int id;   /* -1 for a byte with no vocab symbol: it never merges or emits */
+    int prev;
+    int next; /* -1 at the end; also -1 once absorbed into the left neighbour */
+} bpe_symbol;
 
-static owned_str owned_copy(const char *ptr, uint64_t len) {
-    owned_str s;
-    s.ptr = xmalloc((size_t)len);
-    memcpy(s.ptr, ptr, (size_t)len);
-    s.len = len;
-    return s;
+/* A merge candidate between adjacent symbols.  Merges never move a symbol's
+ * index, so (rank, left) orders candidates exactly like the reference scan:
+ * lowest rank first, leftmost pair on ties.  right_id detects candidates
+ * made stale by the right symbol merging with its own right neighbour. */
+typedef struct {
+    int rank;
+    int left;
+    int right;
+    int right_id;
+} bpe_candidate;
+
+static bool bpe_candidate_less(const bpe_candidate *a, const bpe_candidate *b) {
+    return a->rank < b->rank || (a->rank == b->rank && a->left < b->left);
 }
 
-/* Look up the merge rank for two adjacent BPE symbols. */
-static int bpe_rank(const ds4_vocab *vocab, const owned_str *a, const owned_str *b) {
-    uint64_t len = a->len + 1 + b->len;
-    char stack[512];
-    char *buf = len <= sizeof(stack) ? stack : xmalloc((size_t)len);
-
-    memcpy(buf, a->ptr, (size_t)a->len);
-    buf[a->len] = ' ';
-    memcpy(buf + a->len + 1, b->ptr, (size_t)b->len);
-
-    int rank = -1;
-    table_get(&vocab->merge_rank, buf, len, &rank);
-
-    if (buf != stack) free(buf);
-    return rank;
-}
-
-/* Apply byte-level BPE to one regex-like pre-tokenized piece and emit token ids. */
-static void bpe_emit_piece(const ds4_vocab *vocab, ds4_str raw_piece, token_vec *out) {
-    uint64_t encoded_len = 0;
-    char *encoded = byte_encode(raw_piece, &encoded_len);
-
-    int n_sym = 0;
-    int cap_sym = 32;
-    owned_str *sym = xcalloc((size_t)cap_sym, sizeof(sym[0]));
-
-    for (uint64_t off = 0; off < encoded_len;) {
-        int n = utf8_len_from_first_byte((uint8_t)encoded[off]);
-        if (off + (uint64_t)n > encoded_len) n = 1;
-        if (n_sym == cap_sym) {
-            cap_sym *= 2;
-            sym = xrealloc(sym, (size_t)cap_sym * sizeof(sym[0]));
-        }
-        sym[n_sym++] = owned_copy(encoded + off, (uint64_t)n);
-        off += (uint64_t)n;
+static void bpe_heap_push(bpe_candidate *heap, int *n, bpe_candidate c) {
+    int i = (*n)++;
+    while (i > 0) {
+        int parent = (i - 1) / 2;
+        if (!bpe_candidate_less(&c, &heap[parent])) break;
+        heap[i] = heap[parent];
+        i = parent;
     }
+    heap[i] = c;
+}
 
+static bpe_candidate bpe_heap_pop(bpe_candidate *heap, int *n) {
+    bpe_candidate top = heap[0];
+    bpe_candidate last = heap[--(*n)];
+    int i = 0;
     for (;;) {
-        int best_i = -1;
-        int best_rank = INT32_MAX;
+        int child = 2 * i + 1;
+        if (child >= *n) break;
+        if (child + 1 < *n && bpe_candidate_less(&heap[child + 1], &heap[child])) child++;
+        if (!bpe_candidate_less(&heap[child], &last)) break;
+        heap[i] = heap[child];
+        i = child;
+    }
+    if (*n) heap[i] = last;
+    return top;
+}
 
-        for (int i = 0; i + 1 < n_sym; i++) {
-            int rank = bpe_rank(vocab, &sym[i], &sym[i + 1]);
-            if (rank >= 0 && rank < best_rank) {
-                best_rank = rank;
-                best_i = i;
-            }
-        }
+static void bpe_push_pair(const ds4_vocab *vocab, const bpe_symbol *sym, int left,
+                          bpe_candidate *heap, int *n) {
+    const int right = sym[left].next;
+    if (right < 0) return;
+    const bpe_merge_entry *m = bpe_merges_get(&vocab->merges, sym[left].id, sym[right].id);
+    if (m) bpe_heap_push(heap, n, (bpe_candidate){ m->rank, left, right, sym[right].id });
+}
 
-        if (best_i < 0) break;
+/* Apply byte-level BPE to one pre-tokenized piece and emit token ids.  One
+ * symbol per raw byte, then repeatedly merge the best-ranked adjacent pair:
+ * O(n log n) with a heap of candidates instead of rescanning every pair after
+ * each merge, which matters for long letter runs such as base64 or hex. */
+static void bpe_emit_piece(const ds4_vocab *vocab, ds4_str piece, token_vec *out) {
+    if (!piece.len) return;
+    if (piece.len > INT32_MAX / 3) ds4_die("BPE piece is too large");
+    const int n = (int)piece.len;
 
-        owned_str merged;
-        merged.len = sym[best_i].len + sym[best_i + 1].len;
-        merged.ptr = xmalloc((size_t)merged.len);
-        memcpy(merged.ptr, sym[best_i].ptr, (size_t)sym[best_i].len);
-        memcpy(merged.ptr + sym[best_i].len, sym[best_i + 1].ptr, (size_t)sym[best_i + 1].len);
-
-        free(sym[best_i].ptr);
-        free(sym[best_i + 1].ptr);
-        sym[best_i] = merged;
-
-        for (int j = best_i + 1; j + 1 < n_sym; j++) {
-            sym[j] = sym[j + 1];
-        }
-        n_sym--;
+    bpe_symbol sym_stack[128];
+    bpe_candidate heap_stack[3 * 128];
+    bpe_symbol *sym = sym_stack;
+    bpe_candidate *heap = heap_stack;
+    if (n > 128) {
+        sym = xmalloc((size_t)n * sizeof(sym[0]));
+        /* n - 1 seeds plus at most two new neighbour pairs per merge. */
+        heap = xmalloc((size_t)n * 3 * sizeof(heap[0]));
     }
 
-    for (int i = 0; i < n_sym; i++) {
-        int token = -1;
-        if (table_get(&vocab->token_to_id, sym[i].ptr, sym[i].len, &token)) {
-            token_vec_push(out, token);
-        } else {
-            for (uint64_t j = 0; j < sym[i].len; j++) {
-                if (table_get(&vocab->token_to_id, sym[i].ptr + j, 1, &token)) {
-                    token_vec_push(out, token);
-                }
-            }
-        }
-        free(sym[i].ptr);
+    for (int i = 0; i < n; i++) {
+        sym[i] = (bpe_symbol){ vocab->byte_token[(uint8_t)piece.ptr[i]], i - 1, i + 1 };
+    }
+    sym[n - 1].next = -1;
+
+    int n_heap = 0;
+    for (int i = 0; i + 1 < n; i++) bpe_push_pair(vocab, sym, i, heap, &n_heap);
+
+    while (n_heap) {
+        const bpe_candidate c = bpe_heap_pop(heap, &n_heap);
+        if (sym[c.left].next != c.right || sym[c.right].id != c.right_id) continue;
+
+        const bpe_merge_entry *m =
+            bpe_merges_get(&vocab->merges, sym[c.left].id, sym[c.right].id);
+        sym[c.left].id = m->id;
+        sym[c.left].next = sym[c.right].next;
+        if (sym[c.left].next >= 0) sym[sym[c.left].next].prev = c.left;
+        sym[c.right].next = -1;
+
+        if (sym[c.left].prev >= 0) bpe_push_pair(vocab, sym, sym[c.left].prev, heap, &n_heap);
+        bpe_push_pair(vocab, sym, c.left, heap, &n_heap);
     }
 
-    free(sym);
-    free(encoded);
+    for (int i = 0; i >= 0; i = sym[i].next) {
+        if (sym[i].id >= 0) token_vec_push(out, sym[i].id);
+    }
+
+    if (sym != sym_stack) {
+        free(sym);
+        free(heap);
+    }
 }
 
 static uint64_t next_utf8_char(const char *s, uint64_t len, uint64_t pos) {
@@ -45050,8 +45115,8 @@ static uint32_t ascii_tolower_cp(uint32_t cp) {
 
 /* ChatGLM4/GLM pre-tokenization.  GLM GGUFs use tokenizer.ggml.pre="glm4",
  * which shares the llama3-style split shape used by llama.cpp's CHATGLM4 path. */
-static void bpe_tokenize_text_glm4(const ds4_vocab *vocab, const char *text, token_vec *out) {
-    const uint64_t len = strlen(text);
+static void bpe_tokenize_text_glm4(const ds4_vocab *vocab, const char *text, uint64_t len,
+                                   token_vec *out) {
     uint64_t pos = 0;
 
     while (pos < len) {
@@ -45200,6 +45265,14 @@ static qwen4_char_info qwen4_char_at(const char *s, uint64_t len, uint64_t pos) 
     if (pos >= len) return c;
     c.valid = true;
     c.cp = utf8_peek_one(s, len, pos, &c.next);
+    if (c.cp < 128) {
+        /* Same answers as the tables (tests/test_tokenizer checks all 128),
+         * without four binary searches per byte of code and JSON. */
+        c.letter = ascii_alpha((uint8_t)c.cp);
+        c.number = ascii_digit((uint8_t)c.cp);
+        c.space = ascii_space((uint8_t)c.cp);
+        return c;
+    }
     c.letter = DS4_QWEN4_CLASS(letter, c.cp);
     c.mark = DS4_QWEN4_CLASS(mark, c.cp);
     c.number = DS4_QWEN4_CLASS(number, c.cp);
@@ -45212,8 +45285,8 @@ static qwen4_char_info qwen4_char_at(const char *s, uint64_t len, uint64_t pos) 
  *   (?i:'s|'t|'re|'ve|'m|'ll|'d) | [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+ | \p{N} |
  *    ?[^\s\p{L}\p{M}\p{N}]+[\r\n]* | \s*[\r\n]+ | \s+(?!\S) | \s+
  * with the Unicode classes generated from the `regex` module. */
-static void bpe_tokenize_text_qwen35(const ds4_vocab *vocab, const char *text, token_vec *out) {
-    const uint64_t len = strlen(text);
+static void bpe_tokenize_text_qwen35(const ds4_vocab *vocab, const char *text, uint64_t len,
+                                     token_vec *out) {
     uint64_t pos = 0;
 
     while (pos < len) {
@@ -45339,17 +45412,17 @@ static void bpe_tokenize_text_qwen35(const ds4_vocab *vocab, const char *text, t
  * word (for example ">;\n").  Splitting those newlines separately changes the
  * token stream for code prompts and produces wrong long-context logits.
  */
-static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_vec *out) {
+static void bpe_tokenize_span(const ds4_vocab *vocab, const char *text, uint64_t len,
+                              token_vec *out) {
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
-        bpe_tokenize_text_glm4(vocab, text, out);
+        bpe_tokenize_text_glm4(vocab, text, len, out);
         return;
     }
     if (ds4_model_is_qwen4()) {
-        bpe_tokenize_text_qwen35(vocab, text, out);
+        bpe_tokenize_text_qwen35(vocab, text, len, out);
         return;
     }
 
-    const uint64_t len = strlen(text);
     uint64_t pos = 0;
 
     while (pos < len) {
@@ -45418,6 +45491,10 @@ static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_ve
     }
 }
 
+static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_vec *out) {
+    bpe_tokenize_span(vocab, text, strlen(text), out);
+}
+
 static int vocab_lookup(const ds4_vocab *vocab, const char *text) {
     int token = -1;
     if (!table_get(&vocab->token_to_id, text, strlen(text), &token)) {
@@ -45433,8 +45510,115 @@ static int vocab_lookup_optional(const ds4_vocab *vocab, const char *text) {
     return token;
 }
 
-/* Load token strings, special token ids, and merge ranks from GGUF metadata. */
+static uint32_t utf8_decode_one(const char *s, uint64_t len, uint64_t *pos) {
+    const uint8_t c = (uint8_t)s[*pos];
+    if (c < 0x80 || *pos + 1 >= len) {
+        (*pos)++;
+        return c;
+    }
+    if ((c & 0xe0) == 0xc0 && *pos + 1 < len) {
+        uint32_t cp = ((uint32_t)(c & 0x1f) << 6) | ((uint8_t)s[*pos + 1] & 0x3f);
+        *pos += 2;
+        return cp;
+    }
+    if ((c & 0xf0) == 0xe0 && *pos + 2 < len) {
+        uint32_t cp = ((uint32_t)(c & 0x0f) << 12) |
+                      ((uint32_t)((uint8_t)s[*pos + 1] & 0x3f) << 6) |
+                      ((uint8_t)s[*pos + 2] & 0x3f);
+        *pos += 3;
+        return cp;
+    }
+    if ((c & 0xf8) == 0xf0 && *pos + 3 < len) {
+        uint32_t cp = ((uint32_t)(c & 0x07) << 18) |
+                      ((uint32_t)((uint8_t)s[*pos + 1] & 0x3f) << 12) |
+                      ((uint32_t)((uint8_t)s[*pos + 2] & 0x3f) << 6) |
+                      ((uint8_t)s[*pos + 3] & 0x3f);
+        *pos += 4;
+        return cp;
+    }
+    (*pos)++;
+    return c;
+}
 
+static bool vocab_token_is_literal_special(ds4_str s) {
+    const unsigned char bar[] = {0xef, 0xbd, 0x9c}; /* U+FF5C fullwidth vertical bar. */
+    if (s.len < sizeof(bar)) return false;
+    for (uint64_t i = 0; i + sizeof(bar) <= s.len; i++) {
+        if (!memcmp(s.ptr + i, bar, sizeof(bar))) return true;
+    }
+    return false;
+}
+
+/* Derive the tokenizer's working tables from vocab->token and token_to_id:
+ * the symbol of every raw byte, merges keyed by token-id pairs, and the
+ * decoded bytes of every token.  Merges are "left right" strings; symbols are
+ * byte-level and never contain a literal space, so a merge without exactly
+ * one space, or with a side outside the vocabulary, can never fire and is
+ * skipped.  A merge whose result is not a vocab entry cannot be represented
+ * by id, and the reference tokenizer rejects it too. */
+static void vocab_index(ds4_vocab *vocab, const ds4_str *merge, uint64_t n_merges) {
+    for (int b = 0; b < 256; b++) {
+        char buf[4];
+        char *p = buf;
+        utf8_put(&p, gpt2_byte_to_codepoint((uint8_t)b));
+        vocab->byte_token[b] = -1;
+        table_get(&vocab->token_to_id, buf, (uint64_t)(p - buf), &vocab->byte_token[b]);
+    }
+
+    vocab->merges.cap = 16;
+    while (vocab->merges.cap < n_merges * 2) vocab->merges.cap <<= 1;
+    vocab->merges.entry = xcalloc((size_t)vocab->merges.cap, sizeof(vocab->merges.entry[0]));
+    char stack[512];
+    for (uint64_t i = 0; i < n_merges; i++) {
+        const ds4_str m = merge[i];
+        const char *space = memchr(m.ptr, ' ', (size_t)m.len);
+        if (!space) continue;
+        const uint64_t llen = (uint64_t)(space - m.ptr);
+        const uint64_t rlen = m.len - llen - 1;
+        if (memchr(space + 1, ' ', (size_t)rlen)) continue;
+
+        int left = -1, right = -1, id = -1;
+        if (!table_get(&vocab->token_to_id, m.ptr, llen, &left) ||
+            !table_get(&vocab->token_to_id, space + 1, rlen, &right)) continue;
+
+        char *buf = m.len <= sizeof(stack) ? stack : xmalloc((size_t)m.len);
+        memcpy(buf, m.ptr, (size_t)llen);
+        memcpy(buf + llen, space + 1, (size_t)rlen);
+        const bool found = table_get(&vocab->token_to_id, buf, llen + rlen, &id);
+        if (buf != stack) free(buf);
+        if (!found) {
+            fprintf(stderr, "ds4: tokenizer merge %llu (%.*s) produces a piece missing from the vocabulary\n",
+                    (unsigned long long)i, (int)m.len, m.ptr);
+            ds4_die("GGUF tokenizer merges are inconsistent with the token table");
+        }
+        bpe_merges_put(&vocab->merges, left, right, (int)i, id);
+    }
+
+    /* Tokens with the fullwidth bar (DeepSeek chat markers) are stored as
+     * literal UTF-8, not byte-level codepoints; everything else decodes
+     * codepoint by codepoint back to raw bytes. */
+    uint64_t total = 0;
+    for (int i = 0; i < vocab->n_vocab; i++) total += vocab->token[i].len;
+    vocab->text = xmalloc((size_t)(vocab->n_vocab ? vocab->n_vocab : 1) * sizeof(vocab->text[0]));
+    vocab->text_arena = xmalloc((size_t)total + 1);
+    char *p = vocab->text_arena;
+    for (int i = 0; i < vocab->n_vocab; i++) {
+        const ds4_str s = vocab->token[i];
+        vocab->text[i].ptr = p;
+        if (vocab_token_is_literal_special(s)) {
+            memcpy(p, s.ptr, (size_t)s.len);
+            p += s.len;
+        } else {
+            for (uint64_t pos = 0; pos < s.len;) {
+                int b = gpt2_codepoint_to_byte(utf8_decode_one(s.ptr, s.len, &pos));
+                if (b >= 0) *p++ = (char)b;
+            }
+        }
+        vocab->text[i].len = (uint64_t)(p - vocab->text[i].ptr);
+    }
+}
+
+/* Load token strings, special token ids, and merges from GGUF metadata. */
 static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
     memset(vocab, 0, sizeof(*vocab));
 
@@ -45460,13 +45644,14 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
         table_put(&vocab->token_to_id, vocab->token[i], i);
     }
 
-    table_init(&vocab->merge_rank, merges.len);
+    if (merges.len > INT32_MAX) ds4_die("GGUF tokenizer merge table is too large");
+    ds4_str *merge = xmalloc((size_t)(merges.len ? merges.len : 1) * sizeof(merge[0]));
     c = cursor_at(model, merges.data_pos);
     for (uint64_t i = 0; i < merges.len; i++) {
-        ds4_str merge;
-        if (!cursor_string(&c, &merge)) ds4_die(c.error);
-        table_put(&vocab->merge_rank, merge, (int)i);
+        if (!cursor_string(&c, &merge[i])) ds4_die(c.error);
     }
+    vocab_index(vocab, merge, merges.len);
+    free(merge);
     vocab->im_start_id = -1;
     vocab->im_end_id = -1;
     vocab->endoftext_id = -1;
@@ -45548,7 +45733,9 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
 static void vocab_free(ds4_vocab *vocab) {
     free(vocab->token);
     table_free(&vocab->token_to_id);
-    table_free(&vocab->merge_rank);
+    free(vocab->merges.entry);
+    free(vocab->text);
+    free(vocab->text_arena);
     memset(vocab, 0, sizeof(*vocab));
 }
 
@@ -45707,8 +45894,16 @@ void ds4_tokenize_text(ds4_engine *e, const char *text, ds4_tokens *out) {
     bpe_tokenize_text(&e->vocab, text ? text : "", out);
 }
 
-static bool special_token_at(const ds4_vocab *vocab, const char *p, int *token, size_t *len) {
-    struct special {
+/* Split rendered chat text at marker strings: markers become their control
+ * ids and the text between them goes through plain BPE.  At each position
+ * markers are tried in table order; only bytes that start an active marker
+ * are tried at all, so ordinary text costs one table lookup per byte.  Ids
+ * are resolved per call because the System marker depends on the family. */
+static void tokenize_rendered_chat_vocab(const ds4_vocab *vocab, const char *text,
+                                         token_vec *out) {
+    if (!text) text = "";
+
+    struct {
         const char *text;
         int token;
     } specials[] = {
@@ -45738,47 +45933,32 @@ static bool special_token_at(const ds4_vocab *vocab, const char *p, int *token, 
         {"<|im_end|>",             vocab->im_end_id},
         {"<|endoftext|>",          vocab->endoftext_id},
     };
-
-    for (size_t i = 0; i < sizeof(specials) / sizeof(specials[0]); i++) {
-        if (specials[i].token < 0) continue;
-        size_t n = strlen(specials[i].text);
-        if (!strncmp(p, specials[i].text, n)) {
-            *token = specials[i].token;
-            *len = n;
-            return true;
-        }
+    const int n_specials = (int)(sizeof(specials) / sizeof(specials[0]));
+    size_t len[sizeof(specials) / sizeof(specials[0])];
+    bool starts[256] = {false};
+    for (int i = 0; i < n_specials; i++) {
+        len[i] = strlen(specials[i].text);
+        if (specials[i].token >= 0) starts[(uint8_t)specials[i].text[0]] = true;
     }
-    return false;
-}
-
-static void tokenize_span(const ds4_vocab *vocab, const char *p, size_t n, token_vec *out) {
-    if (!n) return;
-    char *tmp = xmalloc(n + 1);
-    memcpy(tmp, p, n);
-    tmp[n] = '\0';
-    bpe_tokenize_text(vocab, tmp, out);
-    free(tmp);
-}
-
-static void tokenize_rendered_chat_vocab(const ds4_vocab *vocab, const char *text,
-                                         token_vec *out) {
-    if (!text) text = "";
 
     const char *span = text;
     const char *p = text;
     while (*p) {
-        int token = -1;
-        size_t len = 0;
-        if (special_token_at(vocab, p, &token, &len)) {
-            tokenize_span(vocab, span, (size_t)(p - span), out);
-            token_vec_push(out, token);
-            p += len;
-            span = p;
-            continue;
+        if (starts[(uint8_t)*p]) {
+            int i = 0;
+            while (i < n_specials &&
+                   (specials[i].token < 0 || strncmp(p, specials[i].text, len[i]))) i++;
+            if (i < n_specials) {
+                bpe_tokenize_span(vocab, span, (uint64_t)(p - span), out);
+                token_vec_push(out, specials[i].token);
+                p += len[i];
+                span = p;
+                continue;
+            }
         }
         p++;
     }
-    tokenize_span(vocab, span, (size_t)(p - span), out);
+    bpe_tokenize_span(vocab, span, (uint64_t)(p - span), out);
 }
 
 void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *out) {
@@ -45830,7 +46010,7 @@ static void bpe_tokenize_wrapped_payload_text(ds4_vocab *vocab, const char *cont
     const char *p = span;
     while (*p) {
         if (ds4_tool_text_needs_escape(p, end)) {
-            tokenize_span(vocab, span, (size_t)(p - span), out);
+            bpe_tokenize_span(vocab, span, (uint64_t)(p - span), out);
             bpe_tokenize_text(vocab, *p == '<' ? "&lt;" : "&amp;", out);
             p++;
             span = p;
@@ -45838,7 +46018,7 @@ static void bpe_tokenize_wrapped_payload_text(ds4_vocab *vocab, const char *cont
             p++;
         }
     }
-    tokenize_span(vocab, span, (size_t)(p - span), out);
+    bpe_tokenize_span(vocab, span, (uint64_t)(p - span), out);
 }
 
 static void bpe_tokenize_tool_result_text(ds4_vocab *vocab, const char *content, token_vec *out) {
@@ -45955,86 +46135,21 @@ static void dump_tokens(const ds4_vocab *vocab, const token_vec *tokens) {
     dump_tokens_fp(stdout, vocab, tokens);
 }
 
-static uint32_t utf8_decode_one(const char *s, uint64_t len, uint64_t *pos) {
-    const uint8_t c = (uint8_t)s[*pos];
-    if (c < 0x80 || *pos + 1 >= len) {
-        (*pos)++;
-        return c;
+const char *ds4_token_bytes(ds4_engine *e, int token, size_t *len) {
+    const ds4_vocab *vocab = &e->vocab;
+    if (token < 0 || token >= vocab->n_vocab) {
+        if (len) *len = 0;
+        return "";
     }
-    if ((c & 0xe0) == 0xc0 && *pos + 1 < len) {
-        uint32_t cp = ((uint32_t)(c & 0x1f) << 6) | ((uint8_t)s[*pos + 1] & 0x3f);
-        *pos += 2;
-        return cp;
-    }
-    if ((c & 0xf0) == 0xe0 && *pos + 2 < len) {
-        uint32_t cp = ((uint32_t)(c & 0x0f) << 12) |
-                      ((uint32_t)((uint8_t)s[*pos + 1] & 0x3f) << 6) |
-                      ((uint8_t)s[*pos + 2] & 0x3f);
-        *pos += 3;
-        return cp;
-    }
-    if ((c & 0xf8) == 0xf0 && *pos + 3 < len) {
-        uint32_t cp = ((uint32_t)(c & 0x07) << 18) |
-                      ((uint32_t)((uint8_t)s[*pos + 1] & 0x3f) << 12) |
-                      ((uint32_t)((uint8_t)s[*pos + 2] & 0x3f) << 6) |
-                      ((uint8_t)s[*pos + 3] & 0x3f);
-        *pos += 4;
-        return cp;
-    }
-    (*pos)++;
-    return c;
-}
-
-static int gpt2_codepoint_to_byte(uint32_t cp) {
-    if ((cp >= 33 && cp <= 126) || (cp >= 161 && cp <= 172) || (cp >= 174 && cp <= 255)) {
-        return (int)cp;
-    }
-
-    uint32_t n = 0;
-    for (uint32_t b = 0; b < 256; b++) {
-        if ((b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174)) {
-            continue;
-        }
-        if (cp == 256 + n) return (int)b;
-        n++;
-    }
-    return -1;
-}
-
-static bool vocab_token_is_literal_special(ds4_str s) {
-    const unsigned char bar[] = {0xef, 0xbd, 0x9c}; /* U+FF5C fullwidth vertical bar. */
-    if (s.len < sizeof(bar)) return false;
-    for (uint64_t i = 0; i + sizeof(bar) <= s.len; i++) {
-        if (!memcmp(s.ptr + i, bar, sizeof(bar))) return true;
-    }
-    return false;
+    if (len) *len = (size_t)vocab->text[token].len;
+    return vocab->text[token].ptr;
 }
 
 char *ds4_token_text(ds4_engine *e, int token, size_t *len) {
-    ds4_vocab *vocab = &e->vocab;
-    if (token < 0 || token >= vocab->n_vocab) {
-        if (len) *len = 0;
-        char *out = xmalloc(1);
-        out[0] = '\0';
-        return out;
-    }
-
-    ds4_str s = vocab->token[token];
-    char *out = xmalloc((size_t)s.len + 1);
-    if (vocab_token_is_literal_special(s)) {
-        memcpy(out, s.ptr, (size_t)s.len);
-        out[s.len] = '\0';
-        if (len) *len = (size_t)s.len;
-        return out;
-    }
-
     size_t n = 0;
-    uint64_t pos = 0;
-    while (pos < s.len) {
-        uint32_t cp = utf8_decode_one(s.ptr, s.len, &pos);
-        int b = gpt2_codepoint_to_byte(cp);
-        if (b >= 0) out[n++] = (char)b;
-    }
+    const char *bytes = ds4_token_bytes(e, token, &n);
+    char *out = xmalloc(n + 1);
+    memcpy(out, bytes, n);
     out[n] = '\0';
     if (len) *len = n;
     return out;

@@ -290,7 +290,6 @@ static void test_text_observations(void) {
     v->token = calloc((size_t)v->n_vocab, sizeof(*v->token));
     assert(v->token);
     table_init(&v->token_to_id, v->n_vocab);
-    table_init(&v->merge_rank, 0);
     for (int i = 0; i < 256; i++) {
         char *p = bytes[i];
         utf8_put(&p, gpt2_byte_to_codepoint((uint8_t)i));
@@ -304,6 +303,7 @@ static void test_text_observations(void) {
         v->token[256+i] = (ds4_str){special[i], strlen(special[i])};
         table_put(&v->token_to_id, v->token[256+i], 256+i);
     }
+    vocab_index(v, NULL, 0);
     v->user_id = 256;
     v->observation_id = 257;
     v->tool_response_start_id = 258;

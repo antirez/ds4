@@ -11900,10 +11900,9 @@ static void trace_write_token(FILE *fp, ds4_engine *engine, int token) {
         return;
     }
     size_t len = 0;
-    char *piece = ds4_token_text(engine, token, &len);
+    const char *piece = ds4_token_bytes(engine, token, &len);
     fprintf(fp, "%d ", token);
     trace_write_escaped_bytes(fp, piece, len);
-    free(piece);
 }
 
 static void trace_write_cache_diag(

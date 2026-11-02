@@ -662,9 +662,8 @@ char *ds4_kvstore_render_tokens_text(ds4_engine *engine,
     kv_buf b = {0};
     for (int i = 0; i < tokens->len; i++) {
         size_t len = 0;
-        char *piece = ds4_token_text(engine, tokens->v[i], &len);
+        const char *piece = ds4_token_bytes(engine, tokens->v[i], &len);
         kv_buf_append(&b, piece, len);
-        free(piece);
     }
     if (out_len) *out_len = b.len;
     return kv_buf_take(&b);
@@ -680,12 +679,12 @@ void ds4_kvstore_tokens_copy_prefix(ds4_tokens *dst, const ds4_tokens *src, int 
     dst->len = 0;
     if (!src) return;
     if (n > src->len) n = src->len;
-    for (int i = 0; i < n; i++) ds4_tokens_push(dst, src->v[i]);
+    ds4_tokens_append(dst, &(ds4_tokens){ .v = src->v, .len = n, .cap = n });
 }
 
 static void tokens_append(ds4_tokens *dst, const ds4_tokens *src) {
     if (!dst || !src) return;
-    for (int i = 0; i < src->len; i++) ds4_tokens_push(dst, src->v[i]);
+    ds4_tokens_append(dst, src);
 }
 
 void ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(

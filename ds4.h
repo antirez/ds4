@@ -367,6 +367,7 @@ int ds4_engine_metal_graph_prompt_test(ds4_engine *e, const ds4_tokens *prompt, 
 void ds4_tokens_push(ds4_tokens *tv, int token);
 void ds4_tokens_free(ds4_tokens *tv);
 void ds4_tokens_copy(ds4_tokens *dst, const ds4_tokens *src);
+void ds4_tokens_append(ds4_tokens *dst, const ds4_tokens *src);
 bool ds4_tokens_starts_with(const ds4_tokens *tokens, const ds4_tokens *prefix);
 
 void ds4_tokenize_text(ds4_engine *e, const char *text, ds4_tokens *out);
@@ -383,6 +384,9 @@ void ds4_chat_append_think_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_m
 void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role, const char *content);
 void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode think_mode);
 
+/* Decoded bytes of one token, owned by the engine and valid until it closes;
+ * not NUL-terminated.  ds4_token_text returns a malloc'd, terminated copy. */
+const char *ds4_token_bytes(ds4_engine *e, int token, size_t *len);
 char *ds4_token_text(ds4_engine *e, int token, size_t *len);
 int ds4_token_eos(ds4_engine *e);
 bool ds4_token_is_stop(ds4_engine *e, int token);
