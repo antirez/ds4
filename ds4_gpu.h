@@ -45,6 +45,29 @@ typedef struct {
 
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);
+#ifdef __APPLE__
+/* Metal: the V4.1 decode fast paths, each with one opt-out, DS4_METAL_DISABLE_V41_<NAME>, read once into this mask;
+ * "0" means not set. */
+enum {
+    DS4_GPU_V41_DEFERRED_HC = 1u << 0,
+    DS4_GPU_V41_LITERAL_SHAPES = 1u << 1,
+    DS4_GPU_V41_INDEXER_E4M3 = 1u << 2,
+    DS4_GPU_V41_MODEL_TRACKED = 1u << 3,   /* opt-out: DS4_METAL_MODEL_TRACKED */
+    DS4_GPU_V41_ROPE_TABLE = 1u << 4,
+    DS4_GPU_V41_SPLIT_REDUCE = 1u << 5,
+    DS4_GPU_V41_INDEX_BF16 = 1u << 6,
+    DS4_GPU_V41_DECODE_TOPK = 1u << 7,
+    DS4_GPU_V41_PLAIN_READERS = 1u << 29,   /* test only: the narrow readers' own kernels */
+    DS4_GPU_V41_UNFUSED_TOPK = 1u << 30,    /* test only: the decode top-k without its fused merge */
+};
+uint32_t ds4_gpu_v41_off(void);
+/* Weights built at load: allocated with the model views' storage options, and kept in a residency set of their
+ * own; ds4_gpu_weight_residency replaces that set, n == 0 releases it. */
+ds4_gpu_tensor *ds4_gpu_tensor_alloc_weights(uint64_t bytes);
+/* Model views and weights built at load skip hazard tracking (call before the model is mapped). */
+void ds4_gpu_set_model_untracked_default(int on);
+int ds4_gpu_weight_residency(ds4_gpu_tensor *const *tensors, uint32_t n);
+#endif
 
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes);
@@ -96,6 +119,38 @@ int ds4_gpu_parallel_ffn_start(
         uint64_t              down_offset,
         uint32_t              model_dim,
         uint32_t              shared_dim,
+        const ds4_gpu_tensor *x,
+        float                 clamp);
+int ds4_gpu_parallel_ffn_start_bf16(
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        ds4_gpu_tensor       *shared_out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              gate_offset,
+        uint64_t              up_offset,
+        uint64_t              down_offset,
+        uint32_t              model_dim,
+        uint32_t              shared_dim,
+        const ds4_gpu_tensor *x,
+        float                 clamp);
+/* A TP rank's lanes of the V4.1 shared expert beside its routed experts:
+ * BF16 mid, then the K slice of the down projection with F32 output. */
+int ds4_gpu_parallel_ffn_start_bf16_kslice(
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        ds4_gpu_tensor       *shared_out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              gate_offset,
+        uint64_t              up_offset,
+        uint64_t              down_offset,
+        uint32_t              model_dim,
+        uint32_t              shared_dim,
+        uint32_t              shared_lane_offset,
+        uint32_t              shared_lane_count,
         const ds4_gpu_tensor *x,
         float                 clamp);
 int ds4_gpu_parallel_ffn_start_sliced(
@@ -155,6 +210,8 @@ int ds4_gpu_add_tensor_tp_flag(
  * the gate's checked flag itself (taken by the attention output K-slice
  * matvec when its output is that slot; otherwise ignored). */
 void ds4_gpu_tp_flag_fold_request(uint32_t layer, uint32_t gate);
+/* Bind every routed expert and mask none (the caller splits the list). */
+void ds4_gpu_tp_full_expert_bind(int on);
 
 /* Deferred kv norm task: call before ds4_gpu_dsv4_qkv_rms_norm_kv_rope_fp8_store_tensor
  * to run only its q task now and fold the kv task into the KV staging
@@ -308,8 +365,15 @@ enum {
     DS4_GPU_TEST_MXFP4_DOWN_HALF_LUT = 1u << 4,
     DS4_GPU_TEST_OUTPUT_HC_WEIGHTS4 = 1u << 5,
     DS4_GPU_TEST_HC_RMS_SCALE_PROJ = 1u << 6,
+    DS4_GPU_TEST_INDEX_SCORE_DIRECT = 1u << 7,
+    DS4_GPU_TEST_INDEX_SCORE_WIDE = 1u << 8,
+    DS4_GPU_TEST_COUNT_KERNELS = 1u << 9,
 };
 void ds4_gpu_test_set_flags(uint32_t flags);
+/* With DS4_GPU_TEST_COUNT_KERNELS, each V4.1 fast path counts its dispatches by kernel name. */
+uint64_t ds4_gpu_test_kernel_runs(const char *name);
+/* Replaces the DS4_GPU_V41_* opt-out mask read from the environment. */
+void ds4_gpu_test_set_v41_off(uint32_t off);
 void ds4_gpu_release_zero_prefix_prefill_mask_cache(void);
 #else
 static inline int ds4_gpu_device_is_pre_m5_apple_silicon(void) { return 0; }
@@ -506,6 +570,12 @@ int ds4_gpu_matmul_q8_0_kslice_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         uint64_t                x_elem_off);
+/* One row's kslice matvec over an input not yet rounded to BF16: rounded as
+ * it loads. Returns 0 (nothing encoded) where only the rounded input works. */
+int ds4_gpu_matmul_q8_0_kslice_bf16in_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t full_in_dim, uint64_t k_off,
+        uint64_t k_cnt, uint64_t out_dim, const ds4_gpu_tensor *x);
 /* CUDA input rows contain only the owned contiguous K slice. Metal input
  * rows span full_in_dim and the kernel reads the slice at k_off within them.
  * Both backends produce full-width output rows. */
@@ -1139,6 +1209,12 @@ int ds4_gpu_qkv_pair_quad_compressor_store_tensor(
         uint32_t              ratio,
         uint32_t              pos);
 
+int ds4_gpu_matmul_e4m3_bf16_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *codes,
+                                    const ds4_gpu_tensor *scales, uint64_t in_dim, uint64_t out_dim,
+                                    const ds4_gpu_tensor *x);
+int ds4_gpu_matmul_bf16_weights_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *weights,
+                                       uint64_t in_dim, uint64_t out_dim,
+                                       const ds4_gpu_tensor *x);
 int ds4_gpu_matmul_f32_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
@@ -1148,6 +1224,18 @@ int ds4_gpu_matmul_f32_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
+/* The same over n_tok rows, with the kernel chosen as for plan_tok rows
+ * (plan_tok >= n_tok), so each row's result matches the larger dispatch. */
+int ds4_gpu_matmul_f32_plan_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok,
+        uint64_t                plan_tok);
 
 int ds4_gpu_repeat_hc_tensor(
         ds4_gpu_tensor       *out,
@@ -1175,6 +1263,23 @@ int ds4_gpu_rms_norm_plain_rows_tensor(
         uint32_t                rows,
         float                   eps);
 
+int ds4_gpu_rms_norm_weight_bf16_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                n,
+        float                   eps);
+int ds4_gpu_matmul_q8_0_bf16_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok);
 int ds4_gpu_rms_norm_weight_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *x,
@@ -2949,6 +3054,36 @@ int ds4_gpu_hc_split_sinkhorn_tensor(
         uint32_t                sinkhorn_iters,
         float                   eps);
 
+int ds4_gpu_hc_weighted_sum_bf16_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_embd,
+        uint32_t                n_hc);
+int ds4_gpu_matmul_q8_0_bf16io_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        ds4_gpu_tensor       *x,
+        uint64_t                n_tok);
+int ds4_gpu_hc_expand_split_add_bf16_tensor(
+        ds4_gpu_tensor       *out_hc,
+        const ds4_gpu_tensor *block_out,
+        const ds4_gpu_tensor *block_add,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc);
+int ds4_gpu_hc_expand_split_bf16_tensor(
+        ds4_gpu_tensor       *out_hc,
+        const ds4_gpu_tensor *block_out,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc);
 int ds4_gpu_hc_weighted_sum_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *residual_hc,
