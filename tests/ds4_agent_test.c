@@ -28,6 +28,415 @@ static int test_write_file(const char *path, const char *data, size_t len,
     return agent_replace_file(path, data, len, NULL, 0, err, errlen);
 }
 
+/* Tiny synthetic Qwen observations: exercise the real codec, not an encoder. */
+static agent_vision_input test_visual_input(size_t images) {
+    agent_vision_input input = {.image_count = images, .n_embd = 2,
+        .model = {.dev = 1, .ino = 2, .bytes = 1234, .mtime_ns = 5678,
+                  .volume_uuid = {1}},
+        .vision = {.dev = 9, .ino = 8, .bytes = 7654, .mtime_ns = 3210,
+                   .volume_uuid = {9}}};
+    input.images = xmalloc(images * sizeof(input.images[0]));
+    memset(input.images, 0, images * sizeof(input.images[0]));
+    ds4_tokens_push(&input.tokens, 11);
+    const float rows[] = {-1.25f, -0.0f, 0.125f, 2.5f,
+                          -3.75f, 1.0f / 3.0f, 0.0625f, -0.5f};
+    for (size_t i = 0; i < images; i++) {
+        ds4_vision_span *span = &input.images[i];
+        span->token_start = input.tokens.len;
+        span->embedding = (ds4_vision_embedding){.token_count = 4,
+            .grid_width = 2, .grid_height = 2, .width = 64, .height = 64,
+            .content_width = 64, .content_height = 64};
+        span->embedding.fingerprint[0] = (uint8_t)(i + 1);
+        span->embedding.fingerprint[31] = 0xa5;
+        span->embedding.data = xmalloc(sizeof(rows));
+        memcpy(span->embedding.data, rows, sizeof(rows));
+        span->embedding.data[7] -= (float)i;
+        for (int j = 0; j < 4; j++) ds4_tokens_push(&input.tokens, 7);
+        ds4_tokens_push(&input.tokens, 13);
+    }
+    return input;
+}
+
+static uint8_t *test_visual_input_bytes(const agent_vision_input *input, size_t *len) {
+    FILE *fp = tmpfile();
+    AGENT_TEST_ASSERT(fp != NULL);
+    if (!fp) return NULL;
+    char err[256] = {0};
+    uint64_t size = 0;
+    AGENT_TEST_ASSERT(agent_input_size(input, &size));
+    AGENT_TEST_ASSERT(agent_input_write(fp, input, err, sizeof(err)));
+    AGENT_TEST_ASSERT(fflush(fp) == 0 && (uint64_t)ftello(fp) == size);
+    *len = (size_t)size;
+    uint8_t *bytes = xmalloc(*len);
+    rewind(fp);
+    AGENT_TEST_ASSERT(fread(bytes, 1, *len, fp) == *len);
+    AGENT_TEST_ASSERT(fclose(fp) == 0);
+    return bytes;
+}
+
+static bool test_visual_input_read(const uint8_t *bytes, size_t len,
+                                   agent_vision_input *out, uint32_t dim,
+                                   uint32_t tokens, bool keep) {
+    FILE *fp = tmpfile();
+    AGENT_TEST_ASSERT(fp != NULL);
+    if (!fp) return false;
+    AGENT_TEST_ASSERT(fwrite(bytes, 1, len, fp) == len);
+    rewind(fp);
+    char err[256] = {0};
+    bool ok = agent_input_read(fp, out, dim, tokens, keep, err, sizeof(err));
+    AGENT_TEST_ASSERT(ok || err[0]);
+    AGENT_TEST_ASSERT(fclose(fp) == 0);
+    return ok;
+}
+
+static void test_visual_input_equal(const agent_vision_input *a,
+                                    const agent_vision_input *b, bool rows) {
+    AGENT_TEST_ASSERT(a->n_embd == b->n_embd && a->image_count == b->image_count);
+    AGENT_TEST_ASSERT(agent_tokens_equal(&a->tokens, &b->tokens));
+    AGENT_TEST_ASSERT(agent_file_identity_equal(&a->model, &b->model));
+    AGENT_TEST_ASSERT(agent_file_identity_equal(&a->vision, &b->vision));
+    for (size_t i = 0; i < a->image_count && i < b->image_count; i++) {
+        const ds4_vision_span *x = &a->images[i], *y = &b->images[i];
+        AGENT_TEST_ASSERT(x->token_start == y->token_start);
+        AGENT_TEST_ASSERT(x->embedding.token_count == y->embedding.token_count);
+        AGENT_TEST_ASSERT(x->embedding.layout == y->embedding.layout);
+        AGENT_TEST_ASSERT(x->embedding.grid_width == y->embedding.grid_width &&
+                           x->embedding.grid_height == y->embedding.grid_height);
+        AGENT_TEST_ASSERT(x->embedding.width == y->embedding.width &&
+                           x->embedding.height == y->embedding.height);
+        AGENT_TEST_ASSERT(x->embedding.content_width == y->embedding.content_width &&
+                           x->embedding.content_height == y->embedding.content_height);
+        AGENT_TEST_ASSERT(!memcmp(x->embedding.fingerprint, y->embedding.fingerprint, 32));
+        if (rows) {
+            AGENT_TEST_ASSERT(y->embedding.data && !memcmp(x->embedding.data,
+                y->embedding.data, (size_t)x->embedding.token_count * a->n_embd * 4));
+        } else AGENT_TEST_ASSERT(!y->embedding.data);
+    }
+}
+
+static void test_visual_input_rechecksum(uint8_t *bytes, size_t len) {
+    uint32_t crc = agent_input_crc32(UINT32_MAX, bytes, len - 4) ^ UINT32_MAX;
+    ds4_kvstore_le_put32(bytes + len - 4, crc);
+}
+
+static void test_visual_input_codec(void) {
+    const char vector[] = "123456789";
+    AGENT_TEST_ASSERT((agent_input_crc32(UINT32_MAX, vector, 9) ^ UINT32_MAX) == 0xcbf43926u);
+    uint32_t crc = agent_input_crc32(UINT32_MAX, vector, 4);
+    AGENT_TEST_ASSERT((agent_input_crc32(crc, vector + 4, 5) ^ UINT32_MAX) == 0xcbf43926u);
+    for (size_t images = 1; images <= 17; images += 16) {
+        agent_vision_input input = test_visual_input(images), out = {0};
+        size_t len = 0;
+        uint8_t *bytes = test_visual_input_bytes(&input, &len);
+        if (bytes) {
+            AGENT_TEST_ASSERT(len == AGENT_INPUT_HEADER_BYTES + 4 +
+                                    (size_t)input.tokens.len * 4 + images * (68 + 32));
+            AGENT_TEST_ASSERT(test_visual_input_read(bytes, len, &out, 2, 1000, true));
+            test_visual_input_equal(&input, &out, true);
+            agent_vision_input_free(&out);
+            AGENT_TEST_ASSERT(test_visual_input_read(bytes, len, &out, 0, 1000, false));
+            test_visual_input_equal(&input, &out, false);
+            free(bytes);
+        }
+        agent_vision_input_free(&out);
+        agent_vision_input_free(&input);
+    }
+
+    agent_vision_input input = test_visual_input(2), out = test_visual_input(1);
+    size_t len = 0;
+    uint8_t *original = test_visual_input_bytes(&input, &len);
+    if (!original) { agent_vision_input_free(&input); agent_vision_input_free(&out); return; }
+    uint8_t *bad = xmalloc(len);
+    int *old_tokens = out.tokens.v;
+    ds4_vision_span *old_images = out.images;
+    float *old_rows = out.images[0].embedding.data;
+#define REJECT_VISUAL_BYTES(length, dimension, limit) do { \
+    AGENT_TEST_ASSERT(!test_visual_input_read(bad, length, &out, dimension, limit, true)); \
+    AGENT_TEST_ASSERT(out.tokens.v == old_tokens && out.images == old_images && \
+                       out.image_count == 1 && out.images[0].embedding.data == old_rows); \
+} while (0)
+    memcpy(bad, original, len); bad[len - 1] ^= 1;
+    REJECT_VISUAL_BYTES(len, 2, 1000);
+    memcpy(bad, original, len);
+    REJECT_VISUAL_BYTES(0, 2, 1000);
+    REJECT_VISUAL_BYTES(31, 2, 1000);
+    REJECT_VISUAL_BYTES(99, 2, 1000);
+    REJECT_VISUAL_BYTES(len - 1, 2, 1000);
+    REJECT_VISUAL_BYTES(len, 3, 1000);
+    REJECT_VISUAL_BYTES(len, 2, (uint32_t)input.tokens.len - 1);
+    agent_le_put64(bad + 8, UINT64_MAX);
+    REJECT_VISUAL_BYTES(len, 2, 1000);
+    memcpy(bad, original, len); ds4_kvstore_le_put32(bad + 16, UINT32_MAX);
+    test_visual_input_rechecksum(bad, len);
+    REJECT_VISUAL_BYTES(len, 2, UINT32_MAX);
+    memcpy(bad, original, len); ds4_kvstore_le_put32(bad + 20, UINT32_MAX);
+    test_visual_input_rechecksum(bad, len);
+    REJECT_VISUAL_BYTES(len, 2, 1000);
+    memcpy(bad, original, len); ds4_kvstore_le_put32(bad + 24, UINT32_MAX);
+    test_visual_input_rechecksum(bad, len);
+    REJECT_VISUAL_BYTES(len, 0, 1000);
+    size_t span = AGENT_INPUT_HEADER_BYTES + (size_t)input.tokens.len * 4;
+    size_t second_span = span + 68 + 32;
+    memcpy(bad, original, len); ds4_kvstore_le_put32(bad + second_span, 2);
+    test_visual_input_rechecksum(bad, len);
+    REJECT_VISUAL_BYTES(len, 2, 1000);
+    memcpy(bad, original, len); ds4_kvstore_le_put32(bad + span + 12, 3);
+    test_visual_input_rechecksum(bad, len);
+    REJECT_VISUAL_BYTES(len, 2, 1000);
+    memcpy(bad, original, len); ds4_kvstore_le_put32(bad + span + 68, 0x7fc00000u);
+    test_visual_input_rechecksum(bad, len);
+    REJECT_VISUAL_BYTES(len, 2, 1000);
+#undef REJECT_VISUAL_BYTES
+    uint64_t size = 0;
+    input.images[1].token_start = 2;
+    AGENT_TEST_ASSERT(!agent_input_size(&input, &size));
+    input.images[1].token_start = 6;
+    input.n_embd = 0;
+    AGENT_TEST_ASSERT(!agent_input_size(&input, &size));
+    input.n_embd = 2;
+    const uint32_t nan_bits = UINT32_C(0x7fc00000);
+    memcpy(input.images[0].embedding.data, &nan_bits, sizeof(nan_bits));
+    FILE *fp = tmpfile();
+    AGENT_TEST_ASSERT(fp != NULL);
+    if (fp) {
+        char err[256] = {0};
+        AGENT_TEST_ASSERT(!agent_input_write(fp, &input, err, sizeof(err)) && err[0]);
+        fclose(fp);
+    }
+    free(bad); free(original);
+    agent_vision_input_free(&out); agent_vision_input_free(&input);
+}
+
+static void test_visual_file_identity_survives_remount(void) {
+    agent_vision_input input = test_visual_input(1), out = {0};
+    size_t len;
+    uint8_t *bytes = test_visual_input_bytes(&input, &len);
+    AGENT_TEST_ASSERT(test_visual_input_read(bytes, len, &out, 2, 1000, true));
+    /* The persisted volume survives mount-number changes; another volume and
+     * replaced/touched weights still fail even if their other fields match. */
+    input.model.dev++;
+    AGENT_TEST_ASSERT(agent_file_identity_equal(&input.model, &out.model));
+    agent_file_identity changed = out.model;
+    changed.dev = input.model.dev;
+    memset(changed.volume_uuid, 0, sizeof(changed.volume_uuid));
+    AGENT_TEST_ASSERT(!agent_file_identity_equal(&input.model, &changed));
+    changed = out.model;
+    changed.volume_uuid[15] ^= 1;
+    AGENT_TEST_ASSERT(!agent_file_identity_equal(&input.model, &changed));
+    changed = out.model; changed.ino++;
+    AGENT_TEST_ASSERT(!agent_file_identity_equal(&input.model, &changed));
+    changed = out.model; changed.bytes++;
+    AGENT_TEST_ASSERT(!agent_file_identity_equal(&input.model, &changed));
+    changed = out.model; changed.mtime_ns++;
+    AGENT_TEST_ASSERT(!agent_file_identity_equal(&input.model, &changed));
+
+    /* Build a genuine v1 section. Its ephemeral device check remains strict:
+     * never infer a missing UUID merely from a coincidentally equal inode. */
+    size_t legacy_len = len - 16;
+    uint8_t *legacy = xmalloc(legacy_len);
+    memcpy(legacy, bytes, 32);
+    ds4_kvstore_le_put32(legacy + 4, 1);
+    agent_le_put64(legacy + 8, legacy_len);
+    const agent_file_identity *ids[] = {&input.model, &input.vision};
+    for (int i = 0; i < 2; i++) {
+        uint8_t *p = legacy + 32 + i * 32;
+        agent_le_put64(p, ids[i]->dev); agent_le_put64(p + 8, ids[i]->ino);
+        agent_le_put64(p + 16, ids[i]->bytes); agent_le_put64(p + 24, ids[i]->mtime_ns);
+    }
+    memcpy(legacy + 96, bytes + AGENT_INPUT_HEADER_BYTES, len - AGENT_INPUT_HEADER_BYTES);
+    test_visual_input_rechecksum(legacy, legacy_len);
+    AGENT_TEST_ASSERT(test_visual_input_read(legacy, legacy_len, &out, 2, 1000, true));
+    test_visual_input_equal(&input, &out, true);
+    input.model.dev++;
+    AGENT_TEST_ASSERT(!agent_file_identity_equal(&input.model, &out.model));
+    legacy[4] = 3;
+    test_visual_input_rechecksum(legacy, legacy_len);
+    AGENT_TEST_ASSERT(!test_visual_input_read(legacy, legacy_len, &out, 2, 1000, true));
+    memset(bytes + 32, 0, 16);
+    test_visual_input_rechecksum(bytes, len);
+    AGENT_TEST_ASSERT(!test_visual_input_read(bytes, len, &out, 2, 1000, true));
+
+#ifdef __APPLE__
+    char path[] = "/tmp/ds4-agent-volume-identity-XXXXXX";
+    int fd = mkstemp(path);
+    AGENT_TEST_ASSERT(fd >= 0);
+    if (fd >= 0) {
+        agent_file_identity original, renamed;
+        char destination[PATH_MAX];
+        snprintf(destination, sizeof(destination), "%s-renamed", path);
+        AGENT_TEST_ASSERT(agent_file_identity_read(path, &original));
+        AGENT_TEST_ASSERT(agent_file_identity_has_uuid(&original));
+        AGENT_TEST_ASSERT(rename(path, destination) == 0);
+        AGENT_TEST_ASSERT(agent_file_identity_read(destination, &renamed));
+        AGENT_TEST_ASSERT(agent_file_identity_equal(&original, &renamed));
+        AGENT_TEST_ASSERT(write(fd, "changed", 7) == 7);
+        AGENT_TEST_ASSERT(agent_file_identity_read(destination, &renamed));
+        AGENT_TEST_ASSERT(!agent_file_identity_equal(&original, &renamed));
+        close(fd); unlink(destination);
+    }
+#endif
+    free(bytes); free(legacy);
+    agent_vision_input_free(&out); agent_vision_input_free(&input);
+}
+
+static void test_visual_session_fixture(const char *path, const agent_vision_input *input,
+                                        const char *title, uint64_t created) {
+    FILE *fp = fopen(path, "wb");
+    AGENT_TEST_ASSERT(fp != NULL);
+    if (!fp) return;
+    const char *text = "synthetic visual observation";
+    uint8_t header[DS4_KVSTORE_FIXED_HEADER], length[4], payload[128];
+    memset(payload, 0xa5, sizeof(payload));
+    ds4_kvstore_fill_header(header, ds4_engine_model_id(NULL), 2,
+        DS4_KVSTORE_REASON_AGENT_SESSION,
+        DS4_KVSTORE_EXT_SESSION_TITLE | DS4_KVSTORE_EXT_AGENT_INPUT,
+        input->tokens.len, 3, 32768, created, created + 1, sizeof(payload));
+    header[3] = DS4_KVSTORE_AGENT_VERSION;
+    ds4_kvstore_le_put32(length, strlen(text));
+    AGENT_TEST_ASSERT(fwrite(header, 1, sizeof(header), fp) == sizeof(header));
+    AGENT_TEST_ASSERT(fwrite(length, 1, sizeof(length), fp) == sizeof(length));
+    AGENT_TEST_ASSERT(fwrite(text, 1, strlen(text), fp) == strlen(text));
+    AGENT_TEST_ASSERT(fwrite(payload, 1, sizeof(payload), fp) == sizeof(payload));
+    char err[256] = {0};
+    AGENT_TEST_ASSERT(agent_kv_write_title_trailer(fp, title, err, sizeof(err)));
+    AGENT_TEST_ASSERT(agent_input_write(fp, input, err, sizeof(err)));
+    AGENT_TEST_ASSERT(fclose(fp) == 0);
+}
+
+static uint8_t *test_visual_session_section(const char *path, size_t *len,
+                                           ds4_kvstore_entry *entry) {
+    FILE *fp = fopen(path, "rb");
+    AGENT_TEST_ASSERT(fp != NULL);
+    if (!fp) return NULL;
+    uint32_t text_bytes = 0; char err[256] = {0};
+    AGENT_TEST_ASSERT(ds4_kvstore_read_agent_header(fp, entry, &text_bytes));
+    AGENT_TEST_ASSERT(agent_input_seek(fp, entry, err, sizeof(err)));
+    uint64_t bytes = 0;
+    AGENT_TEST_ASSERT(agent_fp_remaining(fp, &bytes));
+    *len = (size_t)bytes;
+    uint8_t *section = xmalloc(*len);
+    AGENT_TEST_ASSERT(fread(section, 1, *len, fp) == *len);
+    AGENT_TEST_ASSERT(fclose(fp) == 0);
+    return section;
+}
+
+static void test_visual_session_strip_preserves_input(void) {
+    char dir[] = "/tmp/ds4-agent-visual-strip-XXXXXX";
+    AGENT_TEST_ASSERT(mkdtemp(dir) != NULL);
+    const char *title = "Visual input round trip";
+    const uint64_t created = 123456;
+    char sha[41], stripped_sha[41], err[256] = {0};
+    agent_session_identity_sha(title, created, sha);
+    char *path = agent_kv_path_for_sha(dir, sha);
+    agent_vision_input input = test_visual_input(2), decoded = {0};
+    test_visual_session_fixture(path, &input, title, created);
+    ds4_kvstore_entry before = {0}, after = {0};
+    size_t before_len = 0, after_len = 0;
+    uint8_t *before_bytes = test_visual_session_section(path, &before_len, &before);
+    AGENT_TEST_ASSERT(before.payload_bytes == 128);
+    agent_worker worker = {.cache_dir = dir};
+    uint32_t tokens = 0;
+    AGENT_TEST_ASSERT(agent_worker_strip_session(&worker, sha, stripped_sha, &tokens, err, sizeof(err)));
+    AGENT_TEST_ASSERT(!strcmp(sha, stripped_sha) && tokens == (uint32_t)input.tokens.len);
+    uint8_t *after_bytes = test_visual_session_section(path, &after_len, &after);
+    AGENT_TEST_ASSERT(after.payload_bytes == 0 && after.tokens == before.tokens);
+    AGENT_TEST_ASSERT(after.ext_flags == before.ext_flags && after.ext_flags == 24);
+    AGENT_TEST_ASSERT(after.created_at == created && after.model_id == before.model_id);
+    AGENT_TEST_ASSERT(before_bytes && after_bytes && before_len == after_len &&
+                       !memcmp(before_bytes, after_bytes, before_len));
+    AGENT_TEST_ASSERT(test_visual_input_read(after_bytes, after_len, &decoded, 2, 1000, true));
+    test_visual_input_equal(&input, &decoded, true);
+    FILE *fp = fopen(path, "rb");
+    AGENT_TEST_ASSERT(fp != NULL);
+    if (fp) {
+        uint8_t header[48];
+        AGENT_TEST_ASSERT(fread(header, 1, sizeof(header), fp) == sizeof(header));
+        AGENT_TEST_ASSERT(header[3] == DS4_KVSTORE_AGENT_VERSION && header[20] == 2);
+        ds4_kvstore_entry impossible = after; impossible.payload_bytes = UINT64_MAX;
+        AGENT_TEST_ASSERT(!agent_input_seek(fp, &impossible, err, sizeof(err)));
+        fclose(fp);
+    }
+    /* A corrupt saved input must fail strip before any replacement is made. */
+    fp = fopen(path, "r+b");
+    AGENT_TEST_ASSERT(fp != NULL);
+    if (fp) {
+        AGENT_TEST_ASSERT(fseeko(fp, -1, SEEK_END) == 0);
+        int value = fgetc(fp);
+        AGENT_TEST_ASSERT(fseeko(fp, -1, SEEK_END) == 0 && fputc(value ^ 1, fp) != EOF);
+        fclose(fp);
+        char *old_file = NULL, *new_file = NULL; size_t old_len = 0, new_len = 0;
+        AGENT_TEST_ASSERT(!agent_read_file_bytes(path, &old_file, &old_len, err, sizeof(err)));
+        AGENT_TEST_ASSERT(!agent_worker_strip_session(&worker, sha, NULL, NULL, err, sizeof(err)));
+        AGENT_TEST_ASSERT(!agent_read_file_bytes(path, &new_file, &new_len, err, sizeof(err)));
+        AGENT_TEST_ASSERT(old_len == new_len && !memcmp(old_file, new_file, old_len));
+        free(old_file); free(new_file);
+    }
+    free(before_bytes); free(after_bytes);
+    agent_vision_input_free(&input); agent_vision_input_free(&decoded);
+    unlink(path); free(path);
+    AGENT_TEST_ASSERT(rmdir(dir) == 0);
+}
+
+static void test_session_commit_file(void) {
+    char dir[] = "/tmp/ds4-agent-session-commit-XXXXXX";
+    AGENT_TEST_ASSERT(mkdtemp(dir) != NULL);
+    char path[PATH_MAX], tmp[PATH_MAX], err[256];
+    snprintf(path, sizeof(path), "%s/session", dir);
+    for (int stage = AGENT_COMMIT_FLUSH; stage <= AGENT_COMMIT_BARRIER; stage++) {
+        FILE *fp = fopen(path, "wb");
+        AGENT_TEST_ASSERT(fp != NULL);
+        if (!fp) break;
+        AGENT_TEST_ASSERT(fwrite("old-session", 1, 11, fp) == 11 && fclose(fp) == 0);
+        snprintf(tmp, sizeof(tmp), "%s/session.tmp.XXXXXX", dir);
+        int fd = mkstemp(tmp);
+        AGENT_TEST_ASSERT(fd >= 0);
+        if (fd < 0) break;
+        fp = fdopen(fd, "wb");
+        AGENT_TEST_ASSERT(fp != NULL);
+        if (!fp) { close(fd); unlink(tmp); break; }
+        AGENT_TEST_ASSERT(fwrite("new-session", 1, 11, fp) == 11);
+        err[0] = '\0'; agent_commit_fail_stage = stage;
+        AGENT_TEST_ASSERT(!agent_commit_file(fp, tmp, path, true, err, sizeof(err)));
+        agent_commit_fail_stage = 0;
+        char *file = NULL; size_t len = 0; char read_err[256] = {0};
+        AGENT_TEST_ASSERT(!agent_read_file_bytes(path, &file, &len, read_err, sizeof(read_err)));
+        bool published = stage >= AGENT_COMMIT_DIRECTORY;
+        AGENT_TEST_ASSERT(len == 11 && !memcmp(file, published ? "new-session" : "old-session", 11));
+        AGENT_TEST_ASSERT(strstr(err, published ? "durability unconfirmed" : "session write failed"));
+        AGENT_TEST_ASSERT(access(tmp, F_OK) != 0);
+        free(file);
+    }
+    agent_commit_fail_stage = 0;
+    for (int durable = 0; durable <= 1; durable++) {
+        for (int replace = 0; replace <= 1; replace++) {
+            unlink(path);
+            if (replace) {
+                FILE *old = fopen(path, "wb");
+                AGENT_TEST_ASSERT(old != NULL);
+                if (old) { fputs("old", old); fclose(old); }
+            }
+            snprintf(tmp, sizeof(tmp), "%s/session.tmp.XXXXXX", dir);
+            int fd = mkstemp(tmp);
+            AGENT_TEST_ASSERT(fd >= 0);
+            if (fd < 0) continue;
+            FILE *fp = fdopen(fd, "wb");
+            AGENT_TEST_ASSERT(fp != NULL);
+            if (!fp) { close(fd); unlink(tmp); continue; }
+            const uint8_t bytes[] = {'K', 'V', 'C', 2, 0, 0xff, 0x80};
+            AGENT_TEST_ASSERT(fwrite(bytes, 1, sizeof(bytes), fp) == sizeof(bytes));
+            err[0] = '\0';
+            AGENT_TEST_ASSERT(agent_commit_file(fp, tmp, path, durable, err, sizeof(err)));
+            char *file = NULL; size_t len = 0;
+            AGENT_TEST_ASSERT(!agent_read_file_bytes(path, &file, &len, err, sizeof(err)));
+            AGENT_TEST_ASSERT(len == sizeof(bytes) && !memcmp(file, bytes, sizeof(bytes)));
+            AGENT_TEST_ASSERT(access(tmp, F_OK) != 0);
+            free(file);
+        }
+    }
+    unlink(path);
+    AGENT_TEST_ASSERT(rmdir(dir) == 0);
+}
+
 static void test_atomic_file_tools(void) {
     char dir[] = "/tmp/ds4-agent-files-XXXXXX";
     AGENT_TEST_ASSERT(mkdtemp(dir) != NULL);
@@ -1007,7 +1416,34 @@ static int test_full_context_save(const char *model) {
     return agent_test_failures ? 1 : 0;
 }
 
+static int test_visual_archive_files(const char *path, const char *model,
+                                     const char *vision) {
+    agent_config cfg = {0};
+    cfg.engine.model_path = model; cfg.engine.vision_path = vision;
+    agent_worker w = {.cfg = &cfg};
+    w.input_files_ready = agent_file_identity_read(model, &w.model_file) &&
+                          agent_file_identity_read(vision, &w.vision_file);
+    FILE *fp = fopen(path, "rb");
+    ds4_kvstore_entry hdr = {0};
+    uint32_t text_bytes;
+    agent_vision_input input = {0};
+    char err[256] = {0};
+    bool valid = fp && ds4_kvstore_read_agent_header(fp, &hdr, &text_bytes) &&
+        agent_input_seek(fp, &hdr, err, sizeof(err)) &&
+        agent_input_read(fp, &input, 0, hdr.ctx_size, false, err, sizeof(err));
+    bool match = valid && agent_input_files_match(&w, &input);
+    printf("visual input: %s; model/encoder files: %s; tokens=%d images=%zu\n",
+           valid ? "valid" : "invalid", match ? "match" : "mismatch",
+           input.tokens.len, input.image_count);
+    if (err[0]) fprintf(stderr, "%s\n", err);
+    if (fp) fclose(fp);
+    agent_vision_input_free(&input);
+    return match ? 0 : 1;
+}
+
 int main(int argc, char **argv) {
+    if (argc == 5 && !strcmp(argv[1], "--visual-archive-files"))
+        return test_visual_archive_files(argv[2], argv[3], argv[4]);
     if (argc == 3 && !strcmp(argv[1], "--full-context-save")) return test_full_context_save(argv[2]);
     if (argc == 3 && !strcmp(argv[1], "--think-fixture")) return test_v41_thinking(argv[2]);
     if (argc == 2 && !strcmp(argv[1], "--terminal-driver")) return test_terminal_driver();
@@ -1022,6 +1458,10 @@ int main(int argc, char **argv) {
     test_qwen_tool_syntax();
     test_compaction_boundaries();
     test_observation_error_is_not_context_exhaustion();
+    test_visual_input_codec();
+    test_visual_file_identity_survives_remount();
+    test_visual_session_strip_preserves_input();
+    test_session_commit_file();
     test_atomic_file_tools();
     test_streaming_file_tools();
     test_shell_spawn();

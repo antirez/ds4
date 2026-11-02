@@ -21891,6 +21891,130 @@ static void test_kv_cache_lookup_rejects_stale_payload_abi(void) {
     rmdir(dir);
 }
 
+static void test_agent_kv_header_versions_are_separate(void) {
+    const uint8_t input_flags = DS4_KVSTORE_EXT_SESSION_TITLE |
+                                DS4_KVSTORE_EXT_AGENT_INPUT;
+    const struct {
+        uint8_t version, reason, flags, abi;
+        bool generic, agent;
+    } cases[] = {
+        {1, DS4_KVSTORE_REASON_AGENT_SESSION, DS4_KVSTORE_EXT_SESSION_TITLE, 2, true, true},
+        {1, DS4_KVSTORE_REASON_AGENT_SYSTEM, 0, 2, true, true},
+        {1, KV_REASON_COLD, KV_EXT_TOOL_MAP | KV_EXT_THINKING_VISIBLE, 2, true, true},
+        {DS4_KVSTORE_AGENT_VERSION, DS4_KVSTORE_REASON_AGENT_SESSION, input_flags, 2, false, true},
+        {2, DS4_KVSTORE_REASON_AGENT_SYSTEM, input_flags, 2, false, false},
+        {2, KV_REASON_COLD, input_flags, 2, false, false},
+        {2, DS4_KVSTORE_REASON_AGENT_SESSION, DS4_KVSTORE_EXT_AGENT_INPUT, 2, false, false},
+        {2, DS4_KVSTORE_REASON_AGENT_SESSION, DS4_KVSTORE_EXT_SESSION_TITLE, 2, false, false},
+        {2, DS4_KVSTORE_REASON_AGENT_SESSION, input_flags | KV_EXT_TOOL_MAP, 2, false, false},
+        {2, DS4_KVSTORE_REASON_AGENT_SESSION, input_flags | (1u << 5), 2, false, false},
+        {1, DS4_KVSTORE_REASON_AGENT_SESSION, input_flags, 2, false, false},
+        {1, DS4_KVSTORE_REASON_AGENT_SESSION, DS4_KVSTORE_EXT_AGENT_INPUT, 2, false, false},
+        {2, DS4_KVSTORE_REASON_AGENT_SESSION, input_flags, 1, false, false},
+        {2, DS4_KVSTORE_REASON_AGENT_SESSION, input_flags, 3, false, false},
+        {1, DS4_KVSTORE_REASON_AGENT_SESSION, DS4_KVSTORE_EXT_SESSION_TITLE, 0, false, false},
+        {3, DS4_KVSTORE_REASON_AGENT_SESSION, input_flags, 2, false, false},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        FILE *fp = tmpfile();
+        TEST_ASSERT(fp != NULL);
+        if (!fp) continue;
+        uint8_t h[DS4_KVSTORE_FIXED_HEADER], text_len[4] = {0};
+        ds4_kvstore_fill_header(h, 5, 2, cases[i].reason, cases[i].flags,
+                                512, 7, 32768, 100, 200, 0);
+        TEST_ASSERT(h[3] == 1); /* Shared writers still produce ordinary v1 KV. */
+        h[3] = cases[i].version;
+        h[20] = cases[i].abi;
+        TEST_ASSERT(fwrite(h, 1, sizeof(h), fp) == sizeof(h));
+        TEST_ASSERT(fwrite(text_len, 1, sizeof(text_len), fp) == sizeof(text_len));
+        ds4_kvstore_entry entry = {0};
+        uint32_t text_bytes = 0;
+        rewind(fp);
+        TEST_ASSERT(ds4_kvstore_read_header(fp, &entry, &text_bytes) == cases[i].generic);
+        rewind(fp);
+        TEST_ASSERT(ds4_kvstore_read_agent_header(fp, &entry, &text_bytes) == cases[i].agent);
+        if (cases[i].agent) {
+            TEST_ASSERT(entry.model_id == 5 && entry.tokens == 512 && entry.hits == 7);
+            TEST_ASSERT(entry.ext_flags == cases[i].flags && text_bytes == 0);
+        }
+        TEST_ASSERT(fclose(fp) == 0);
+    }
+}
+
+static void test_agent_kv_files_are_not_server_cache_candidates(void) {
+    char tmpl[] = "/tmp/ds4-agent-kv-envelope-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    const char *agent_text = "agent input prefix";
+    const char *server_text = "server input prefix";
+    char sha[41];
+    sha1_bytes_hex(agent_text, strlen(agent_text), sha);
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    char *path = ds4_kvstore_path_for_sha(&kc, sha);
+
+    uint8_t original[256] = {0};
+    ds4_kvstore_fill_header(original, 5, 2, DS4_KVSTORE_REASON_AGENT_SESSION,
+                            DS4_KVSTORE_EXT_SESSION_TITLE | DS4_KVSTORE_EXT_AGENT_INPUT,
+                            512, 0, 32768, 100, 100, 4);
+    original[3] = DS4_KVSTORE_AGENT_VERSION;
+    size_t bytes = DS4_KVSTORE_FIXED_HEADER;
+    le_put32(original + bytes, (uint32_t)strlen(agent_text));
+    bytes += 4;
+    memcpy(original + bytes, agent_text, strlen(agent_text));
+    bytes += strlen(agent_text);
+    /* Opaque payload/trailer bytes: these tests exercise only the envelope. */
+    const char *tail = "KV!!Agent title and private input must survive";
+    memcpy(original + bytes, tail, strlen(tail));
+    bytes += strlen(tail);
+    FILE *fp = fopen(path, "wb");
+    TEST_ASSERT(fp != NULL);
+    if (fp) {
+        TEST_ASSERT(fwrite(original, 1, bytes, fp) == bytes);
+        TEST_ASSERT(fclose(fp) == 0);
+    }
+
+    ds4_kvstore_entry entry = {0};
+    TEST_ASSERT(!ds4_kvstore_read_entry_file(path, sha, &entry));
+    TEST_ASSERT(ds4_kvstore_read_agent_entry_file(path, sha, &entry));
+    TEST_ASSERT(entry.file_size == bytes && entry.payload_bytes == 4);
+    ds4_kvstore_entry_free(&entry);
+    TEST_ASSERT(!ds4_kvstore_touch_file(path, 99));
+
+    test_kv_text_stub_file_model(dir, server_text, 5, KV_REASON_COLD, 512, 0);
+    TEST_ASSERT(ds4_kvstore_find_text_prefix(&kc, "agent input prefix tail", 5, 2, 32768) < 0);
+    TEST_ASSERT(kc.len == 1); /* v2 is not counted, touched or offered to eviction. */
+    TEST_ASSERT(ds4_kvstore_find_text_prefix(&kc, "server input prefix tail", 5, 2, 32768) >= 0);
+    char server_sha[41];
+    sha1_bytes_hex(server_text, strlen(server_text), server_sha);
+    char *server_path = ds4_kvstore_path_for_sha(&kc, server_sha);
+    TEST_ASSERT(ds4_kvstore_touch_file(server_path, 99));
+    TEST_ASSERT(ds4_kvstore_read_entry_file(server_path, server_sha, &entry));
+    TEST_ASSERT(entry.hits == 99 && entry.ext_flags == 0);
+    ds4_kvstore_entry_free(&entry);
+    kc.budget_bytes = 1;
+    ds4_kvstore_evict(&kc, NULL, 0, NULL);
+    TEST_ASSERT(kc.len == 0);
+    TEST_ASSERT(access(path, F_OK) == 0);
+    uint8_t after[256] = {0};
+    fp = fopen(path, "rb");
+    TEST_ASSERT(fp != NULL);
+    if (fp) {
+        TEST_ASSERT(fread(after, 1, sizeof(after), fp) == bytes);
+        TEST_ASSERT(!memcmp(original, after, bytes));
+        TEST_ASSERT(fclose(fp) == 0);
+    }
+    kv_cache_close(&kc);
+    unlink(server_path);
+    free(server_path);
+    unlink(path);
+    free(path);
+    rmdir(dir);
+}
+
 static void test_kv_tool_map_filters_by_dsml_text(void) {
     const char *dsml_keep =
         "\n\n<｜DSML｜tool_calls>\n"
@@ -23171,6 +23295,8 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_lookup_uses_longest_text_prefix();
     test_kv_cache_lookup_rejects_wrong_model();
     test_kv_cache_lookup_rejects_stale_payload_abi();
+    test_agent_kv_header_versions_are_separate();
+    test_agent_kv_files_are_not_server_cache_candidates();
     test_kv_cache_eviction_values_fresh_snapshots();
     test_kv_cache_eviction_prefers_anchor_reason();
     test_kv_cache_eviction_makes_room_before_store();

@@ -1,4 +1,5 @@
 #include "ds4.h"
+#include "ds4_image.h"
 #include "ds4_tool_text.h"
 #include "ds4_distributed.h"
 #include "ds4_gpu_args.h"
@@ -35,6 +36,8 @@
 #include <unistd.h>
 #ifdef __APPLE__
 #include <copyfile.h>
+#include <sys/attr.h>
+#include <sys/mount.h>
 #elif defined(__linux__)
 #include <sys/xattr.h>
 #endif
@@ -120,6 +123,11 @@ typedef struct {
 } agent_status;
 
 typedef struct agent_bash_job agent_bash_job;
+typedef struct {
+    uint64_t dev, ino, bytes, mtime_ns;
+    uint8_t volume_uuid[16];
+    bool legacy;
+} agent_file_identity;
 
 /* Runtime preference only; never part of saved session metadata. */
 typedef struct {
@@ -141,6 +149,8 @@ typedef struct {
     ds4_vision_span *images;
     size_t image_count;
     size_t image_cap;
+    agent_file_identity model_file, vision_file;
+    bool input_files_ready;
     char *cache_dir;
     char *sysprompt_path;
     char session_sha[41];
@@ -403,6 +413,9 @@ static int agent_web_confirm(void *privdata, const char *message,
 static void agent_web_log(void *privdata, const char *message);
 static bool agent_preflight_edit_old(agent_worker *w, const agent_tool_call *call,
                                      char *err, size_t err_len);
+static int agent_worker_sync_input(agent_worker *w, const ds4_tokens *tokens,
+                                    const ds4_vision_span *images, size_t image_count,
+                                    bool publish_progress, char *err, size_t err_len);
 static int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
                                     bool publish_progress,
                                     char *err, size_t err_len);
@@ -522,16 +535,6 @@ static void agent_worker_images_append(agent_worker *w,
     memset(spans, 0, count * sizeof(spans[0]));
 }
 
-static bool agent_worker_images_fit_tokens(const agent_worker *w,
-                                           const ds4_tokens *tokens) {
-    if (!w || !tokens) return false;
-    for (size_t i = 0; i < w->image_count; i++) {
-        uint64_t end = (uint64_t)w->images[i].token_start +
-                       w->images[i].embedding.token_count;
-        if (end > (uint64_t)tokens->len) return false;
-    }
-    return true;
-}
 
 static void write_all(int fd, const char *p, size_t n) {
     if (fd == STDOUT_FILENO) {
@@ -4742,15 +4745,34 @@ static void agent_worker_clear_session_identity(agent_worker *w) {
 }
 
 typedef struct {
+    ds4_tokens tokens;
+    ds4_vision_span *images;
+    size_t image_count;
+    uint32_t n_embd;
+    agent_file_identity model, vision;
+} agent_vision_input;
+
+static void agent_vision_input_free(agent_vision_input *input) {
+    ds4_tokens_free(&input->tokens);
+    for (size_t i = 0; input->images && i < input->image_count; i++)
+        ds4_vision_embedding_free(&input->images[i].embedding);
+    free(input->images);
+    memset(input, 0, sizeof(*input));
+}
+
+typedef struct {
     bool has_title_trailer;
     bool legacy_identity;
     char *title;
     uint64_t created_at;
     char sha[41];
+    agent_vision_input input;
+    bool rebuilt;
 } agent_kv_session_meta;
 
 static void agent_kv_session_meta_free(agent_kv_session_meta *m) {
     free(m->title);
+    agent_vision_input_free(&m->input);
     memset(m, 0, sizeof(*m));
 }
 
@@ -4787,6 +4809,421 @@ static bool agent_fp_remaining(FILE *fp, uint64_t *out) {
     *out = end > pos ? (uint64_t)(end - pos) : 0;
     return true;
 }
+
+/* The decoder's input is exact tokens plus the particular FP32 rows it saw.
+ * Tokens intentionally also occur in the graph payload: /strip removes that
+ * payload, not the input needed to rebuild it. Image files are not dependencies. */
+#define AGENT_INPUT_HEADER_BYTES 112u
+#define AGENT_INPUT_VERSION 2u
+
+static bool agent_file_identity_has_uuid(const agent_file_identity *id) {
+    static const uint8_t zero[16];
+    return memcmp(id->volume_uuid, zero, sizeof(zero)) != 0;
+}
+
+static bool agent_file_identity_read(const char *path, agent_file_identity *out) {
+    struct stat st;
+    if (!path) return false;
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        close(fd); return false;
+    }
+#ifdef __APPLE__
+    uint64_t ns = (uint64_t)st.st_mtimespec.tv_sec * 1000000000ull + st.st_mtimespec.tv_nsec;
+#else
+    uint64_t ns = (uint64_t)st.st_mtim.tv_sec * 1000000000ull + st.st_mtim.tv_nsec;
+#endif
+    agent_file_identity id = {.dev = st.st_dev, .ino = st.st_ino,
+                              .bytes = st.st_size, .mtime_ns = ns};
+#ifdef __APPLE__
+    /* st_dev identifies a mount, not a persistent volume: APFS can assign a
+     * different number after reboot. Keep the full volume UUID in archives. */
+    struct statfs fs;
+    struct attrlist attrs = {.bitmapcount = ATTR_BIT_MAP_COUNT,
+                            .volattr = ATTR_VOL_INFO | ATTR_VOL_UUID};
+    struct { uint32_t bytes; uint8_t uuid[16]; } volume = {0};
+    if (fstatfs(fd, &fs) ||
+        getattrlist(fs.f_mntonname, &attrs, &volume, sizeof(volume), 0) ||
+        volume.bytes != sizeof(volume)) {
+        close(fd); return false;
+    }
+    memcpy(id.volume_uuid, volume.uuid, sizeof(id.volume_uuid));
+    if (!agent_file_identity_has_uuid(&id)) {
+        close(fd); return false;
+    }
+#else
+    /* Visual restore is Metal-only. Retain device identity for portable tests
+     * without claiming a persistent UUID on other filesystems. */
+    agent_le_put64(id.volume_uuid, id.dev);
+#endif
+    close(fd);
+    *out = id;
+    return true;
+}
+
+static bool agent_file_identity_equal(const agent_file_identity *a,
+                                       const agent_file_identity *b) {
+    bool volume = a->legacy || b->legacy
+        ? a->dev == b->dev /* v1 archives retain their original strict check. */
+        : agent_file_identity_has_uuid(a) && agent_file_identity_has_uuid(b) &&
+          !memcmp(a->volume_uuid, b->volume_uuid, sizeof(a->volume_uuid));
+    return volume && a->ino == b->ino &&
+           a->bytes == b->bytes && a->mtime_ns == b->mtime_ns;
+}
+
+static bool agent_input_files_match(const agent_worker *w,
+                                     const agent_vision_input *input) {
+    agent_file_identity model, vision;
+    return w->input_files_ready &&
+           agent_file_identity_read(w->cfg->engine.model_path, &model) &&
+           agent_file_identity_read(w->cfg->engine.vision_path, &vision) &&
+           agent_file_identity_equal(&model, &w->model_file) &&
+           agent_file_identity_equal(&vision, &w->vision_file) &&
+           agent_file_identity_equal(&model, &input->model) &&
+           agent_file_identity_equal(&vision, &input->vision);
+}
+
+/* This detects accidental input corruption, not authentication. The existing
+ * image fingerprint identifies decoded pixels, not these serialized FP32 rows. */
+static uint32_t agent_input_crc32(uint32_t crc, const void *data, size_t len) {
+    static const uint32_t nibble[16] = {
+        0x00000000,0x1db71064,0x3b6e20c8,0x26d930ac,
+        0x76dc4190,0x6b6b51f4,0x4db26158,0x5005713c,
+        0xedb88320,0xf00f9344,0xd6d6a3e8,0xcb61b38c,
+        0x9b64c2b0,0x86d3d2d4,0xa00ae278,0xbdbdf21c
+    };
+    const uint8_t *p = data;
+    while (len--) {
+        crc ^= *p++;
+        crc = (crc >> 4) ^ nibble[crc & 15];
+        crc = (crc >> 4) ^ nibble[crc & 15];
+    }
+    return crc;
+}
+
+static uint64_t agent_le_get64(const uint8_t *p) {
+    uint64_t value = 0;
+    for (int i = 0; i < 8; i++) value |= (uint64_t)p[i] << (8 * i);
+    return value;
+}
+
+typedef struct {
+    FILE *fp;
+    uint64_t remaining;
+    uint32_t crc;
+    bool writing;
+} agent_input_io;
+
+static bool agent_input_bytes(agent_input_io *io, void *data, size_t bytes) {
+    if (bytes > io->remaining) return false;
+    size_t done = io->writing ? fwrite(data, 1, bytes, io->fp) : fread(data, 1, bytes, io->fp);
+    if (done != bytes) return false;
+    io->crc = agent_input_crc32(io->crc, data, bytes);
+    io->remaining -= bytes;
+    return true;
+}
+
+static bool agent_input_u32(agent_input_io *io, uint32_t *value) {
+    uint8_t bytes[4];
+    if (io->writing) ds4_kvstore_le_put32(bytes, *value);
+    if (!agent_input_bytes(io, bytes, sizeof(bytes))) return false;
+    if (!io->writing) *value = ds4_kvstore_le_get32(bytes);
+    return true;
+}
+
+static bool agent_input_identity(agent_input_io *io, agent_file_identity *id,
+                                  uint32_t version) {
+    uint8_t bytes[40];
+    size_t prefix = version == 1 ? 8 : 16;
+    if (io->writing) {
+        if (version == 1) agent_le_put64(bytes, id->dev);
+        else memcpy(bytes, id->volume_uuid, prefix);
+        agent_le_put64(bytes + prefix, id->ino);
+        agent_le_put64(bytes + prefix + 8, id->bytes);
+        agent_le_put64(bytes + prefix + 16, id->mtime_ns);
+    }
+    if (!agent_input_bytes(io, bytes, prefix + 24)) return false;
+    if (!io->writing) {
+        *id = (agent_file_identity){.ino = agent_le_get64(bytes + prefix),
+            .bytes = agent_le_get64(bytes + prefix + 8),
+            .mtime_ns = agent_le_get64(bytes + prefix + 16)};
+        if (version == 1) {
+            id->dev = agent_le_get64(bytes);
+            id->legacy = true;
+        }
+        else {
+            memcpy(id->volume_uuid, bytes, prefix);
+            if (!agent_file_identity_has_uuid(id)) return false;
+        }
+    }
+    return true;
+}
+
+static bool agent_input_span(agent_input_io *io, ds4_vision_span *span) {
+    ds4_vision_embedding *e = &span->embedding;
+    return agent_input_u32(io, &span->token_start) && agent_input_u32(io, &e->token_count) &&
+        agent_input_u32(io, &e->layout) && agent_input_u32(io, &e->grid_width) &&
+        agent_input_u32(io, &e->grid_height) && agent_input_u32(io, &e->width) &&
+        agent_input_u32(io, &e->height) && agent_input_u32(io, &e->content_width) &&
+        agent_input_u32(io, &e->content_height) &&
+        agent_input_bytes(io, e->fingerprint, sizeof(e->fingerprint));
+}
+
+static bool agent_input_finite(const float *value) {
+    uint32_t bits;
+    memcpy(&bits, value, sizeof(bits));
+    return (bits & 0x7f800000u) != 0x7f800000u;
+}
+
+static bool agent_input_floats(agent_input_io *io, float *data, uint64_t count) {
+    uint8_t bytes[16384];
+    const uint32_t one = 1;
+    const bool little = *(const uint8_t *)&one == 1;
+    for (uint64_t offset = 0; offset < count;) {
+        size_t n = count - offset > sizeof(bytes)/4 ? sizeof(bytes)/4 : (size_t)(count - offset);
+        if (io->writing && little) {
+            for (size_t i = 0; i < n; i++) if (!agent_input_finite(data + offset + i)) return false;
+            if (!agent_input_bytes(io, data + offset, n * 4)) return false;
+        } else {
+            if (io->writing) {
+                for (size_t i = 0; i < n; i++) {
+                    uint32_t bits;
+                    if (!agent_input_finite(data + offset + i)) return false;
+                    memcpy(&bits, data + offset + i, 4);
+                    ds4_kvstore_le_put32(bytes + 4 * i, bits);
+                }
+            }
+            if (!agent_input_bytes(io, bytes, n * 4)) return false;
+            if (!io->writing) for (size_t i = 0; i < n; i++) {
+                uint32_t bits = ds4_kvstore_le_get32(bytes + 4 * i);
+                float value;
+                memcpy(&value, &bits, 4);
+                if ((bits & 0x7f800000u) == 0x7f800000u) return false;
+                if (data) data[offset + i] = value;
+            }
+        }
+        offset += n;
+    }
+    return true;
+}
+
+static bool agent_input_span_shape(const ds4_vision_span *span, uint32_t tokens,
+                                    uint64_t previous_end) {
+    const ds4_vision_embedding *e = &span->embedding;
+    uint64_t end = (uint64_t)span->token_start + e->token_count;
+    return e->token_count && span->token_start >= previous_end && end <= tokens &&
+        e->grid_width && e->grid_height &&
+        (uint64_t)e->grid_width * e->grid_height == e->token_count && e->layout == 0 &&
+        e->width && e->height && e->width <= DS4_IMAGE_MAX_DIMENSION && e->height <= DS4_IMAGE_MAX_DIMENSION &&
+        (uint64_t)e->width * e->height <= DS4_IMAGE_MAX_PIXELS &&
+        e->content_width <= DS4_IMAGE_MAX_DIMENSION && e->content_height <= DS4_IMAGE_MAX_DIMENSION &&
+        (uint64_t)e->content_width * e->content_height <= DS4_IMAGE_MAX_PIXELS &&
+        (uint64_t)e->grid_width * 32 == e->content_width &&
+        (uint64_t)e->grid_height * 32 == e->content_height;
+}
+
+static bool agent_input_size(const agent_vision_input *input, uint64_t *out) {
+    if (sizeof(float) != 4 || input->tokens.len <= 0 || !input->tokens.v ||
+        input->n_embd == 0 || input->n_embd > 16384 || !input->image_count ||
+        input->image_count > (size_t)input->tokens.len || !input->images ||
+        !agent_file_identity_has_uuid(&input->model) ||
+        !agent_file_identity_has_uuid(&input->vision)) return false;
+    uint64_t bytes = AGENT_INPUT_HEADER_BYTES + 4ull + (uint64_t)input->tokens.len * 4;
+    uint64_t end = 0;
+    for (size_t i = 0; i < input->image_count; i++) {
+        const ds4_vision_span *s = &input->images[i];
+        if (!s->embedding.data || !agent_input_span_shape(s, input->tokens.len, end)) return false;
+        uint64_t rows = (uint64_t)s->embedding.token_count * input->n_embd;
+        if (rows > (UINT64_MAX - bytes - 68) / 4) return false;
+        bytes += 68 + rows * 4;
+        end = (uint64_t)s->token_start + s->embedding.token_count;
+    }
+    *out = bytes;
+    return true;
+}
+
+static bool agent_input_write(FILE *fp, const agent_vision_input *input,
+                               char *err, size_t err_len) {
+    uint64_t size;
+    if (!agent_input_size(input, &size)) {
+        snprintf(err, err_len, "invalid saved visual input"); return false;
+    }
+    agent_input_io io = {fp, size - 4, UINT32_MAX, true};
+    uint8_t header[32] = "DS4V";
+    ds4_kvstore_le_put32(header + 4, AGENT_INPUT_VERSION);
+    agent_le_put64(header + 8, size);
+    ds4_kvstore_le_put32(header + 16, input->tokens.len);
+    ds4_kvstore_le_put32(header + 20, input->image_count);
+    ds4_kvstore_le_put32(header + 24, input->n_embd);
+    bool ok = agent_input_bytes(&io, header, sizeof(header));
+    agent_file_identity model = input->model, vision = input->vision;
+    ok = ok && agent_input_identity(&io, &model, AGENT_INPUT_VERSION) &&
+               agent_input_identity(&io, &vision, AGENT_INPUT_VERSION);
+    for (int i = 0; ok && i < input->tokens.len; i++) {
+        if (input->tokens.v[i] < 0) { ok = false; break; }
+        uint32_t token = (uint32_t)input->tokens.v[i];
+        ok = agent_input_u32(&io, &token);
+    }
+    for (size_t i = 0; ok && i < input->image_count; i++) {
+        ds4_vision_span span = input->images[i];
+        ok = agent_input_span(&io, &span) &&
+             agent_input_floats(&io, span.embedding.data,
+                               (uint64_t)span.embedding.token_count * input->n_embd);
+    }
+    uint8_t checksum[4];
+    ds4_kvstore_le_put32(checksum, io.crc ^ UINT32_MAX);
+    ok = ok && io.remaining == 0 && fwrite(checksum, 1, 4, fp) == 4;
+    if (!ok) snprintf(err, err_len, "failed to write complete visual input");
+    return ok;
+}
+
+/* /strip validates the whole section but streams past FP32 arrays rather than
+ * retaining a second copy. Restore owns arrays only after all checks succeed. */
+static bool agent_input_read(FILE *fp, agent_vision_input *out, uint32_t n_embd,
+                              uint32_t max_tokens, bool keep_embeddings,
+                              char *err, size_t err_len) {
+    off_t begin = ftello(fp);
+    uint64_t available;
+    uint8_t header[32];
+    if (begin < 0 || !agent_fp_remaining(fp, &available) || available < 100 ||
+        fread(header, 1, sizeof(header), fp) != sizeof(header)) goto invalid;
+    uint64_t size = agent_le_get64(header + 8);
+    uint32_t count = ds4_kvstore_le_get32(header + 16);
+    uint32_t images = ds4_kvstore_le_get32(header + 20);
+    uint32_t dim = ds4_kvstore_le_get32(header + 24);
+    uint32_t version = ds4_kvstore_le_get32(header + 4);
+    uint64_t minimum = (version == 1 ? 100ull : AGENT_INPUT_HEADER_BYTES + 4ull) +
+                       (uint64_t)count * 4 + (uint64_t)images * 68;
+    if (memcmp(header, "DS4V", 4) || (version != 1 && version != AGENT_INPUT_VERSION) ||
+        ds4_kvstore_le_get32(header + 28) || size != available || size < minimum ||
+        !count || count > max_tokens || count > INT_MAX || !images || images > count ||
+        !dim || dim > 16384 || (n_embd && dim != n_embd) || sizeof(float) != 4) goto invalid;
+    if (fseeko(fp, begin, SEEK_SET)) goto invalid;
+    agent_vision_input input = {.n_embd = dim, .image_count = images};
+    agent_input_io io = {fp, size - 4, UINT32_MAX, false};
+    if (!agent_input_bytes(&io, header, sizeof(header)) ||
+        !agent_input_identity(&io, &input.model, version) ||
+        !agent_input_identity(&io, &input.vision, version)) goto failed;
+    input.tokens.v = calloc(count, sizeof(input.tokens.v[0]));
+    input.images = calloc(images, sizeof(input.images[0]));
+    if (!input.tokens.v || !input.images) goto failed;
+    input.tokens.len = input.tokens.cap = (int)count;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t token;
+        if (!agent_input_u32(&io, &token) || token > INT_MAX) goto failed;
+        input.tokens.v[i] = (int)token;
+    }
+    uint64_t end = 0;
+    for (uint32_t i = 0; i < images; i++) {
+        ds4_vision_span *span = &input.images[i];
+        if (!agent_input_span(&io, span) || !agent_input_span_shape(span, count, end)) goto failed;
+        uint64_t values = (uint64_t)span->embedding.token_count * dim;
+        if (values > SIZE_MAX / 4 || values > io.remaining / 4) goto failed;
+        if (keep_embeddings) {
+            span->embedding.data = malloc((size_t)values * 4);
+            if (!span->embedding.data) goto failed;
+        }
+        if (!agent_input_floats(&io, span->embedding.data, values)) goto failed;
+        end = (uint64_t)span->token_start + span->embedding.token_count;
+    }
+    uint8_t checksum[4];
+    if (io.remaining || fread(checksum, 1, 4, fp) != 4 ||
+        ds4_kvstore_le_get32(checksum) != (io.crc ^ UINT32_MAX)) goto failed;
+    agent_vision_input_free(out);
+    *out = input;
+    return true;
+failed:
+    agent_vision_input_free(&input);
+invalid:
+    snprintf(err, err_len, "invalid, truncated or corrupt visual input section");
+    return false;
+}
+
+static bool agent_input_seek(FILE *fp, const ds4_kvstore_entry *hdr,
+                              char *err, size_t err_len) {
+    uint64_t start = DS4_KVSTORE_FIXED_HEADER + 4ull + hdr->text_bytes;
+    if (start > INT64_MAX || hdr->payload_bytes > INT64_MAX - start ||
+        fseeko(fp, (off_t)(start + hdr->payload_bytes), SEEK_SET)) goto invalid;
+    uint8_t title[4];
+    uint64_t left;
+    if (fread(title, 1, 4, fp) != 4 || !agent_fp_remaining(fp, &left) ||
+        ds4_kvstore_le_get32(title) > left ||
+        fseeko(fp, ds4_kvstore_le_get32(title), SEEK_CUR)) goto invalid;
+    return true;
+invalid:
+    snprintf(err, err_len, "missing visual input section"); return false;
+}
+
+enum { AGENT_COMMIT_FLUSH = 1, AGENT_COMMIT_DATA, AGENT_COMMIT_CLOSE,
+       AGENT_COMMIT_RENAME, AGENT_COMMIT_DIRECTORY, AGENT_COMMIT_BARRIER };
+#ifdef DS4_AGENT_TEST
+static int agent_commit_fail_stage;
+#endif
+static bool agent_commit_injected_failure(int stage) {
+#ifdef DS4_AGENT_TEST
+    if (agent_commit_fail_stage == stage) { errno = EIO; return true; }
+#else
+    (void)stage;
+#endif
+    return false;
+}
+
+static int agent_file_full_sync(int fd) {
+#ifdef __APPLE__
+    return fcntl(fd, F_FULLFSYNC);
+#else
+    return fsync(fd);
+#endif
+}
+
+/* Explicit user sessions, including text-only sessions, wait for durable
+ * publication. Bootstrap KV remains a disposable cache. After rename an error
+ * cannot roll the old file back: leave the complete new file and report it. */
+static bool agent_commit_file(FILE *fp, const char *tmp, const char *path,
+                               bool durable, char *err, size_t err_len) {
+    int barrier = -1;
+    bool published = false;
+    int saved_errno = 0;
+    bool ok = !agent_commit_injected_failure(AGENT_COMMIT_FLUSH) && fflush(fp) == 0;
+    if (ok && durable) {
+        barrier = dup(fileno(fp));
+        ok = barrier >= 0 && !agent_commit_injected_failure(AGENT_COMMIT_DATA) &&
+             agent_file_full_sync(barrier) == 0;
+    }
+    if (!ok) saved_errno = errno ? errno : EIO;
+    bool close_injected = agent_commit_injected_failure(AGENT_COMMIT_CLOSE);
+    if (fclose(fp) != 0 || close_injected) {
+        if (!saved_errno) saved_errno = errno ? errno : EIO;
+        ok = false;
+    }
+    if (ok) {
+        ok = !agent_commit_injected_failure(AGENT_COMMIT_RENAME) && rename(tmp, path) == 0;
+        if (ok) published = true;
+        else saved_errno = errno ? errno : EIO;
+    }
+    if (ok && durable) {
+        char *parent = xstrdup(path);
+        char *slash = strrchr(parent, '/');
+        if (!slash) { free(parent); parent = xstrdup("."); }
+        else if (slash == parent) slash[1] = '\0';
+        else *slash = '\0';
+        int dir = open(parent, O_RDONLY | O_DIRECTORY);
+        free(parent);
+        ok = dir >= 0 && !agent_commit_injected_failure(AGENT_COMMIT_DIRECTORY) && fsync(dir) == 0;
+        if (dir >= 0) close(dir);
+        if (ok) ok = !agent_commit_injected_failure(AGENT_COMMIT_BARRIER) && agent_file_full_sync(barrier) == 0;
+        if (!ok) saved_errno = errno ? errno : EIO;
+    }
+    if (barrier >= 0) close(barrier);
+    if (!ok) {
+        if (!published) unlink(tmp);
+        snprintf(err, err_len, "%s%s", published ? "session file published; durability unconfirmed: " : "session write failed: ",
+                 strerror(saved_errno ? saved_errno : EIO));
+    }
+    return ok;
+}
+
 
 static bool agent_kv_read_text(FILE *fp, uint32_t text_bytes,
                                char **text_out, char *err, size_t err_len) {
@@ -4900,99 +5337,145 @@ static bool agent_kv_load_path(agent_worker *w, const char *path,
                                ds4_tokens *loaded_tokens,
                                agent_kv_session_meta *meta_out,
                                char *err, size_t err_len) {
+    if (err_len) err[0] = '\0';
     FILE *fp = fopen(path, "rb");
-    if (!fp) {
-        snprintf(err, err_len, "%s", strerror(errno));
-        return false;
-    }
-
+    if (!fp) { snprintf(err, err_len, "%s", strerror(errno)); return false; }
     ds4_kvstore_entry hdr = {0};
     uint32_t text_bytes = 0;
-    bool ok = ds4_kvstore_read_header(fp, &hdr, &text_bytes);
+    bool ok = ds4_kvstore_read_agent_header(fp, &hdr, &text_bytes);
     if (!ok) snprintf(err, err_len, "invalid KV header");
-
-    char *text = NULL;
-    if (ok) ok = agent_kv_read_text(fp, text_bytes, &text, err, err_len);
-    char *title = NULL;
+    char *text = NULL, *title = NULL;
+    agent_vision_input input = {0};
+    bool touched = false, rebuilt = false;
     bool has_title = ok && (hdr.ext_flags & DS4_KVSTORE_EXT_SESSION_TITLE);
-    if (has_title)
-        ok = agent_kv_read_title_trailer(fp, &hdr, &title, err, err_len);
-    uint32_t expected_tokens = hdr.tokens;
-    if (ok && hdr.payload_bytes != 0 &&
-        hdr.model_id != (uint8_t)ds4_engine_model_id(w->engine))
-    {
-        snprintf(err, err_len, "KV checkpoint was written for a different model");
-        ok = false;
-    }
-    if (ok && hdr.payload_bytes != 0 &&
-        hdr.quant_bits != (uint8_t)ds4_engine_routed_quant_bits(w->engine))
-    {
-        snprintf(err, err_len, "KV checkpoint was written for a different quantization");
-        ok = false;
-    }
-    if (ok && expected_text) {
-        if ((size_t)text_bytes != expected_text_len ||
-            memcmp(text, expected_text, expected_text_len) != 0)
-        {
-            snprintf(err, err_len, "cached text does not match current system prompt");
-            ok = false;
+    bool visual = ok && (hdr.ext_flags & DS4_KVSTORE_EXT_AGENT_INPUT);
+    off_t payload_pos = -1;
+    if (ok && visual) {
+        /* Validate the self-contained input before trusting a rendered-text
+         * length. A damaged length in a multi-GB KV must not allocate GBs. */
+        uint64_t position = DS4_KVSTORE_FIXED_HEADER + 4ull + text_bytes;
+        ok = position <= INT64_MAX && !fseeko(fp, (off_t)position, SEEK_SET);
+        payload_pos = (off_t)position;
+        if (ok) ok = agent_input_seek(fp, &hdr, err, err_len) &&
+                     agent_input_read(fp, &input, ds4_engine_embd_dim(w->engine),
+                                      agent_worker_effective_ctx_size(w), true, err, err_len);
+        if (ok) ok = !fseeko(fp, payload_pos, SEEK_SET) &&
+                     agent_kv_read_title_trailer(fp, &hdr, &title, err, err_len);
+        int vocab = ds4_engine_vocab_size(w->engine);
+        for (int i = 0; ok && i < input.tokens.len; i++) if (input.tokens.v[i] >= vocab) ok = false;
+        size_t rendered = 0;
+        if (ok) text = ds4_kvstore_render_tokens_text(w->engine, &input.tokens, &rendered);
+        if (ok) ok = text && rendered == text_bytes &&
+                     !fseeko(fp, DS4_KVSTORE_FIXED_HEADER + 4, SEEK_SET);
+        uint8_t bytes[16384];
+        for (size_t offset = 0; ok && offset < rendered;) {
+            size_t n = rendered - offset > sizeof(bytes) ? sizeof(bytes) : rendered - offset;
+            ok = fread(bytes, 1, n, fp) == n && !memcmp(bytes, text + offset, n);
+            offset += n;
         }
+        if (!ok && !err[0]) snprintf(err, err_len, "invalid visual session text or token history");
+    } else if (ok) {
+        ok = agent_kv_read_text(fp, text_bytes, &text, err, err_len);
+        payload_pos = ok ? ftello(fp) : -1;
+        if (ok && has_title) ok = agent_kv_read_title_trailer(fp, &hdr, &title, err, err_len);
+    }
+    if (ok && (visual || hdr.payload_bytes != 0) &&
+        (hdr.model_id != (uint8_t)ds4_engine_model_id(w->engine) ||
+         hdr.quant_bits != (uint8_t)ds4_engine_routed_quant_bits(w->engine))) {
+        snprintf(err, err_len, "session was written for a different model or quantization"); ok = false;
+    }
+    if (ok && expected_text && ((size_t)text_bytes != expected_text_len ||
+        memcmp(text, expected_text, expected_text_len))) {
+        snprintf(err, err_len, "cached text does not match current system prompt"); ok = false;
     }
     if (ok && expected_sha) {
         char actual_sha[41];
         agent_kv_identity_sha(&hdr, text, text_bytes, title, actual_sha);
         if (strcmp(actual_sha, expected_sha)) {
-            snprintf(err, err_len, "cached session identity does not match file name");
-            ok = false;
+            snprintf(err, err_len, "cached session identity does not match file name"); ok = false;
         }
     }
-
-    char load_err[160] = {0};
-    if (ok && agent_kv_payload_requires_rebuild(w, hdr.payload_bytes)) {
-        /* A saved payload contains only the leader's graph state. Rebuild from
-         * rendered text under TP so session_sync mirrors the same token prefix
-         * to the worker before either rank resumes decoding. */
-        ds4_tokens rebuilt = {0};
-        ds4_tokenize_rendered_chat(w->engine, text, &rebuilt);
-        expected_tokens = (uint32_t)rebuilt.len;
-        if (agent_worker_sync_tokens(w, &rebuilt, true, err, err_len) != 0) {
-            ds4_session_invalidate(w->session);
-            ok = false;
+    if (ok && visual) {
+        if (!meta_out || ds4_engine_model_id(w->engine) != 5 ||
+            w->cfg->engine.backend != DS4_BACKEND_METAL ||
+            w->cfg->engine.distributed.role != DS4_DISTRIBUTED_NONE ||
+            ds4_tp_enabled(&w->cfg->engine.tp)) {
+            snprintf(err, err_len, "visual session restore requires Qwen3.8 Flash Next on local Metal"); ok = false;
         }
-        ds4_tokens_free(&rebuilt);
-    } else if (ok &&
-               ds4_session_load_payload(w->session, fp, hdr.payload_bytes,
-                                        load_err, sizeof(load_err)) != 0)
-    {
-        snprintf(err, err_len, "%s", load_err[0] ? load_err : "failed to load KV payload");
+        if (ok && (input.tokens.len != (int)hdr.tokens ||
+                   input.tokens.len >= agent_worker_effective_ctx_size(w))) {
+            snprintf(err, err_len, "visual session does not fit this context with generation room"); ok = false;
+        }
+        if (ok && !agent_input_files_match(w, &input)) {
+            snprintf(err, err_len, "visual session belongs to different or replaced model/encoder files"); ok = false;
+        }
+        int vocab = ds4_engine_vocab_size(w->engine);
+        for (int i = 0; ok && i < input.tokens.len; i++) if (input.tokens.v[i] >= vocab) {
+            snprintf(err, err_len, "saved input token is outside the vocabulary"); ok = false;
+        }
+    }
+    char load_err[160] = {0};
+    uint32_t expected_tokens = hdr.tokens;
+    if (ok && visual) {
+        bool hot = false;
+        if (hdr.payload_bytes && payload_pos >= 0 && !fseeko(fp, payload_pos, SEEK_SET)) {
+            touched = true;
+            hot = ds4_session_load_payload(w->session, fp, hdr.payload_bytes,
+                                           load_err, sizeof(load_err)) == 0 &&
+                  ds4_session_restore_vision_state(w->session, &input.tokens,
+                                                  input.images, input.image_count,
+                                                  load_err, sizeof(load_err)) == 0;
+        }
+        if (!hot) {
+            touched = true; rebuilt = true;
+            ds4_session_invalidate(w->session);
+            agent_publishf(w, "Rebuilding saved visual input%s%s...\n",
+                           load_err[0] ? ": " : "", load_err);
+            ok = agent_worker_sync_input(w, &input.tokens, input.images, input.image_count,
+                                          true, err, err_len) == 0;
+        }
+        if (ok && (!agent_tokens_equal(ds4_session_tokens(w->session), &input.tokens) ||
+                   !ds4_session_vision_state_matches(w->session, input.images, input.image_count))) {
+            snprintf(err, err_len, "restored visual input does not match the checkpoint"); ok = false;
+        }
+    } else if (ok && agent_kv_payload_requires_rebuild(w, hdr.payload_bytes)) {
+        ds4_tokens tokens = {0};
+        ds4_tokenize_rendered_chat(w->engine, text, &tokens);
+        expected_tokens = tokens.len;
+        touched = true; rebuilt = true;
         ds4_session_invalidate(w->session);
-        ok = false;
+        ok = agent_worker_sync_input(w, &tokens, NULL, 0, true, err, err_len) == 0;
+        ds4_tokens_free(&tokens);
+    } else if (ok) {
+        touched = true;
+        ok = ds4_session_load_payload(w->session, fp, hdr.payload_bytes,
+                                      load_err, sizeof(load_err)) == 0;
+        if (ok) ok = ds4_session_restore_vision_state(w->session,
+                           ds4_session_tokens(w->session), NULL, 0, load_err, sizeof(load_err)) == 0;
+        if (!ok) snprintf(err, err_len, "%s", load_err[0] ? load_err : "failed to load KV payload");
     }
     fclose(fp);
-
     if (ok) {
         const ds4_tokens *live = ds4_session_tokens(w->session);
         if (!live || live->len != (int)expected_tokens) {
-            snprintf(err, err_len, "KV payload token count mismatch");
-            ds4_session_invalidate(w->session);
-            ok = false;
+            snprintf(err, err_len, "KV payload token count mismatch"); ok = false;
         } else if (loaded_tokens) {
-            ds4_tokens_free(loaded_tokens);
-            ds4_tokens_copy(loaded_tokens, live);
-        }
-        if (meta_out) {
-            agent_kv_session_meta_free(meta_out);
-            meta_out->has_title_trailer = has_title;
-            meta_out->legacy_identity = !has_title;
-            meta_out->created_at = hdr.created_at;
-            agent_kv_identity_sha(&hdr, text, text_bytes, title, meta_out->sha);
-            meta_out->title = has_title ?
-                xstrdup(title) :
-                agent_session_title_from_text(text, text_bytes, 0);
+            ds4_tokens_free(loaded_tokens); ds4_tokens_copy(loaded_tokens, live);
         }
     }
-    free(title);
-    free(text);
+    if (ok && meta_out) {
+        agent_kv_session_meta_free(meta_out);
+        meta_out->has_title_trailer = has_title; meta_out->legacy_identity = !has_title;
+        meta_out->created_at = hdr.created_at; meta_out->rebuilt = rebuilt;
+        agent_kv_identity_sha(&hdr, text, text_bytes, title, meta_out->sha);
+        meta_out->title = has_title ? xstrdup(title) : agent_session_title_from_text(text, text_bytes, 0);
+        meta_out->input = input; memset(&input, 0, sizeof(input));
+        if (visual) agent_trace(w, "vision restore tokens=%u images=%zu path=%s cached=%d",
+                                hdr.tokens, meta_out->input.image_count, rebuilt ? "cold" : "hot",
+                                rebuilt ? 0 : (int)hdr.tokens);
+    }
+    if (!ok && touched) ds4_session_invalidate(w->session);
+    agent_vision_input_free(&input); free(title); free(text);
     return ok;
 }
 
@@ -5009,6 +5492,19 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
      * Named sessions can still use the existing text-only stripped format. */
     const bool text_only = session_title != NULL &&
         tokens->len >= agent_worker_effective_ctx_size(w);
+    const bool visual = session_title != NULL && w->image_count != 0;
+    double save_started = now_sec();
+    agent_vision_input input = {0};
+    if (visual) {
+        input = (agent_vision_input){.tokens = *tokens, .images = w->images,
+            .image_count = w->image_count, .n_embd = ds4_engine_embd_dim(w->engine),
+            .model = w->model_file, .vision = w->vision_file};
+        if (!agent_input_files_match(w, &input) ||
+            (!text_only && !ds4_session_vision_state_matches(w->session, w->images, w->image_count))) {
+            snprintf(err, err_len, "model files or visual checkpoint changed before save");
+            return false;
+        }
+    }
     const ds4_tokens *live = ds4_session_tokens(w->session);
     if (!text_only && !agent_tokens_equal(live, tokens)) {
         snprintf(err, err_len, "live KV state does not match session transcript");
@@ -5081,37 +5577,32 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
     uint8_t h[DS4_KVSTORE_FIXED_HEADER];
     ds4_kvstore_fill_header(h, (uint8_t)model_id, (uint8_t)quant_bits,
                             ds4_kvstore_reason_code(reason),
-                            session_identity ? DS4_KVSTORE_EXT_SESSION_TITLE : 0,
+                            (session_identity ? DS4_KVSTORE_EXT_SESSION_TITLE : 0) |
+                            (visual ? DS4_KVSTORE_EXT_AGENT_INPUT : 0),
                             (uint32_t)tokens->len, 0,
                             (uint32_t)ds4_session_ctx(w->session),
                             created_at, now, payload_bytes);
+    if (visual) h[3] = DS4_KVSTORE_AGENT_VERSION;
     uint8_t tb[4];
     ds4_kvstore_le_put32(tb, (uint32_t)text_len);
 
-    errno = 0;
     bool ok = fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
               fwrite(tb, 1, sizeof(tb), fp) == sizeof(tb) &&
               fwrite(text, 1, text_len, fp) == text_len &&
               (text_only || ds4_session_write_staged_payload(&staged, fp,
                                                save_err, sizeof(save_err)) == 0) &&
-              (!session_identity ||
-               agent_kv_write_title_trailer(fp, session_title,
-                                            save_err, sizeof(save_err))) &&
-              fflush(fp) == 0;
-    int saved_errno = errno;
-    if (fclose(fp) != 0) {
-        if (!saved_errno) saved_errno = errno;
-        ok = false;
-    }
-    if (ok && rename(tmp, path) != 0) {
-        saved_errno = errno;
-        ok = false;
-    }
-    if (!ok) {
-        snprintf(err, err_len, "%s",
-                 saved_errno ? strerror(saved_errno) :
-                 (save_err[0] ? save_err : "failed to write KV file"));
-        unlink(tmp);
+              (!session_identity || agent_kv_write_title_trailer(fp, session_title,
+                                               save_err, sizeof(save_err))) &&
+              (!visual || agent_input_write(fp, &input, save_err, sizeof(save_err)));
+    if (ok) ok = agent_commit_file(fp, tmp, path, session_identity, save_err, sizeof(save_err));
+    else { fclose(fp); unlink(tmp); }
+    if (!ok) snprintf(err, err_len, "%s", save_err[0] ? save_err : "failed to write KV file");
+    else if (session_identity) {
+        struct stat saved;
+        agent_trace(w, "session save tokens=%d images=%zu bytes=%llu durable=1 elapsed_ms=%.3f",
+                    tokens->len, visual ? input.image_count : 0,
+                    stat(path, &saved) == 0 ? (unsigned long long)saved.st_size : 0,
+                    (now_sec() - save_started) * 1000.0);
     }
 
     ds4_session_payload_file_free(&staged);
@@ -5283,7 +5774,8 @@ static void worker_answer_queued_user_drain(agent_worker *w, char *text) {
  * cache-saving operation: if the requested transcript extends the live session,
  * only the suffix is prefetched; otherwise the DS4 session rebuilds from the
  * longest common prefix it can retain. */
-static int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
+static int agent_worker_sync_input(agent_worker *w, const ds4_tokens *tokens,
+                                    const ds4_vision_span *images, size_t image_count,
                                     bool publish_progress,
                                     char *err, size_t err_len) {
     int old_pos = ds4_session_pos(w->session);
@@ -5318,15 +5810,8 @@ static int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
     ds4_session_set_cancel(w->session, worker_cancel_session_cb, w);
     double t_sync0 = now_sec();
     int rc;
-    if (w->image_count) {
-        if (!agent_worker_images_fit_tokens(w, tokens)) {
-            snprintf(err, err_len, "image spans do not fit the agent transcript");
-            rc = 1;
-        } else {
-            rc = ds4_session_sync_multimodal(w->session, tokens,
-                                             w->images, w->image_count,
-                                             err, err_len);
-        }
+    if (image_count) {
+        rc = ds4_session_sync_multimodal(w->session, tokens, images, image_count, err, err_len);
     } else {
         rc = ds4_session_sync(w->session, tokens, err, err_len);
     }
@@ -5337,6 +5822,12 @@ static int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
     agent_trace(w, "prefill sync done prompt=%d cached=%d suffix=%d rc=%d %.3f ms",
                 tokens->len, cached, suffix, rc, (t_sync1 - t_sync0) * 1000.0);
     return rc;
+}
+
+static int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
+                                    bool publish_progress, char *err, size_t err_len) {
+    return agent_worker_sync_input(w, tokens, w->images, w->image_count,
+                                   publish_progress, err, err_len);
 }
 
 /* Start a new session at the system/tool prompt.  A fixed sysprompt.kv
@@ -5503,9 +5994,12 @@ static bool agent_worker_save_session_now(agent_worker *w, char sha_out[41],
         snprintf(err, err_len, "nothing to save");
         return false;
     }
-    if (w->image_count) {
-        snprintf(err, err_len,
-                 "sessions containing images cannot be saved yet");
+    if (w->image_count &&
+        (ds4_engine_model_id(w->engine) != 5 || /* Qwen3.8 Flash Next's KVC id. */
+         w->cfg->engine.backend != DS4_BACKEND_METAL ||
+         w->cfg->engine.distributed.role != DS4_DISTRIBUTED_NONE ||
+         ds4_tp_enabled(&w->cfg->engine.tp))) {
+        snprintf(err, err_len, "visual session save currently requires Qwen3.8 Flash Next on local Metal");
         return false;
     }
 
@@ -5666,7 +6160,7 @@ static char *agent_session_title_from_file(const char *path, size_t max_bytes) {
     uint32_t text_bytes = 0;
     char *text = NULL;
     char *trailer_title = NULL;
-    bool ok = ds4_kvstore_read_header(fp, &hdr, &text_bytes) &&
+    bool ok = ds4_kvstore_read_agent_header(fp, &hdr, &text_bytes) &&
               agent_kv_read_text(fp, text_bytes, &text, NULL, 0);
     if (ok && (hdr.ext_flags & DS4_KVSTORE_EXT_SESSION_TITLE))
         ok = agent_kv_read_title_trailer(fp, &hdr, &trailer_title, NULL, 0);
@@ -6200,7 +6694,7 @@ static void agent_worker_list_sessions(agent_worker *w) {
         if (!ds4_kvstore_sha_hex_name(de->d_name, sha)) continue;
         char *path = ds4_kvstore_path_join(w->cache_dir, de->d_name);
         ds4_kvstore_entry e = {0};
-        if (ds4_kvstore_read_entry_file(path, sha, &e)) {
+        if (ds4_kvstore_read_agent_entry_file(path, sha, &e)) {
             if (e.model_id == model_id) {
                 char *title = agent_session_title_from_file(path, title_budget);
                 agent_session_list_push(&sessions, &sessions_len, &sessions_cap,
@@ -6311,7 +6805,7 @@ static void agent_switch_completion_callback(const char *buf,
         uint64_t last_used = 0;
         char *path = ds4_kvstore_path_join(w->cache_dir, de->d_name);
         ds4_kvstore_entry e = {0};
-        if (ds4_kvstore_read_entry_file(path, sha, &e)) {
+        if (ds4_kvstore_read_agent_entry_file(path, sha, &e)) {
             if (e.model_id == model_id) last_used = e.last_used;
             else last_used = UINT64_MAX;
             ds4_kvstore_entry_free(&e);
@@ -6368,7 +6862,7 @@ static bool agent_worker_find_session(agent_worker *w, const char *prefix,
         if (strncasecmp(sha, prefix, plen) != 0) continue;
         char *path = ds4_kvstore_path_join(w->cache_dir, de->d_name);
         ds4_kvstore_entry e = {0};
-        bool same_model = ds4_kvstore_read_entry_file(path, sha, &e) &&
+        bool same_model = ds4_kvstore_read_agent_entry_file(path, sha, &e) &&
                           e.model_id == model_id;
         ds4_kvstore_entry_free(&e);
         if (!same_model) {
@@ -6415,119 +6909,87 @@ static bool agent_worker_delete_session(agent_worker *w, const char *prefix,
     return true;
 }
 
-/* Strip the heavy backend payload from a saved session while preserving its
- * rendered transcript. Loading such a file later tokenizes the text and
- * rebuilds the live KV with a full prefill. */
+/* Strip only derived graph state. Visual input retains its exact token IDs:
+ * rendered text can re-tokenize differently and move the image spans. */
 static bool agent_worker_strip_session(agent_worker *w, const char *prefix,
-                                       char sha_out[41],
-                                       uint32_t *tokens_out,
+                                       char sha_out[41], uint32_t *tokens_out,
                                        char *err, size_t err_len) {
-    if (err && err_len) err[0] = '\0';
-    char sha[41];
-    char *path = NULL;
-    if (!agent_worker_find_session(w, prefix, sha, &path, err, err_len))
-        return false;
-
-    FILE *fp = fopen(path, "rb");
-    if (!fp) {
-        snprintf(err, err_len, "%s", strerror(errno));
-        free(path);
-        return false;
+    if (err_len) err[0] = '\0';
+    char sha[41]; char *path = NULL;
+    if (!agent_worker_find_session(w, prefix, sha, &path, err, err_len)) return false;
+    FILE *source = fopen(path, "rb");
+    if (!source) { snprintf(err, err_len, "%s", strerror(errno)); free(path); return false; }
+    ds4_kvstore_entry hdr = {0}; uint32_t text_bytes = 0;
+    char *text = NULL, *title = NULL;
+    agent_vision_input input = {0};
+    bool ok = ds4_kvstore_read_agent_header(source, &hdr, &text_bytes);
+    bool visual = ok && (hdr.ext_flags & DS4_KVSTORE_EXT_AGENT_INPUT);
+    off_t input_start = -1; uint64_t input_bytes = 0;
+    if (visual) {
+        ok = agent_input_seek(source, &hdr, err, err_len);
+        if (ok) {
+            input_start = ftello(source);
+            ok = input_start >= 0 && agent_fp_remaining(source, &input_bytes) &&
+                 agent_input_read(source, &input, 0, INT_MAX, false, err, err_len) &&
+                 input.tokens.len == (int)hdr.tokens;
+        }
     }
-
-    ds4_kvstore_entry hdr = {0};
-    uint32_t text_bytes = 0;
-    char *text = NULL;
-    char *title = NULL;
-    bool ok = ds4_kvstore_read_header(fp, &hdr, &text_bytes) &&
-              agent_kv_read_text(fp, text_bytes, &text, err, err_len);
+    if (ok) ok = !fseeko(source, DS4_KVSTORE_FIXED_HEADER + 4, SEEK_SET) &&
+                 agent_kv_read_text(source, text_bytes, &text, err, err_len);
     if (ok && (hdr.ext_flags & DS4_KVSTORE_EXT_SESSION_TITLE))
-        ok = agent_kv_read_title_trailer(fp, &hdr, &title, err, err_len);
-    fclose(fp);
-    if (!ok) {
-        if (!err[0]) snprintf(err, err_len, "failed to read session");
-        free(title);
-        free(text);
-        free(path);
-        return false;
-    }
-
+        ok = agent_kv_read_title_trailer(source, &hdr, &title, err, err_len);
     char actual_sha[41];
-    agent_kv_identity_sha(&hdr, text, text_bytes, title, actual_sha);
-    if (strcmp(actual_sha, sha)) {
-        snprintf(err, err_len, "cached session identity does not match file name");
-        free(title);
-        free(text);
-        free(path);
-        return false;
+    if (ok) {
+        agent_kv_identity_sha(&hdr, text, text_bytes, title, actual_sha);
+        ok = strcmp(actual_sha, sha) == 0;
+        if (!ok) snprintf(err, err_len, "cached session identity does not match file name");
     }
-
-    ds4_tokens stripped_tokens = {0};
-    ds4_tokenize_rendered_chat(w->engine, text, &stripped_tokens);
-    uint32_t stripped_token_count = (uint32_t)stripped_tokens.len;
-    ds4_tokens_free(&stripped_tokens);
-
-    agent_buf tmpl = {0};
-    agent_buf_puts(&tmpl, path);
-    agent_buf_puts(&tmpl, ".tmp.XXXXXX");
-    char *tmp = agent_buf_take(&tmpl);
-    int fd = mkstemp(tmp);
-    if (fd < 0) {
-        snprintf(err, err_len, "%s", strerror(errno));
-        free(tmp);
-        free(text);
-        free(path);
-        return false;
+    uint32_t count = hdr.tokens;
+    if (ok && !visual) {
+        ds4_tokens tokens = {0};
+        ds4_tokenize_rendered_chat(w->engine, text, &tokens);
+        count = tokens.len; ds4_tokens_free(&tokens);
     }
-
-    fp = fdopen(fd, "wb");
-    if (!fp) {
-        snprintf(err, err_len, "%s", strerror(errno));
-        close(fd);
-        unlink(tmp);
-        free(tmp);
-        free(text);
-        free(path);
-        return false;
+    char *tmp = NULL; FILE *dest = NULL;
+    if (ok) {
+        agent_buf name = {0}; agent_buf_puts(&name, path); agent_buf_puts(&name, ".tmp.XXXXXX");
+        tmp = agent_buf_take(&name);
+        int fd = mkstemp(tmp);
+        if (fd >= 0) dest = fdopen(fd, "wb");
+        if (!dest) { if (fd >= 0) close(fd); ok = false; snprintf(err, err_len, "%s", strerror(errno)); }
     }
-
-    uint8_t h[DS4_KVSTORE_FIXED_HEADER];
-    uint64_t now = (uint64_t)time(NULL);
-    ds4_kvstore_fill_header(h, hdr.model_id, hdr.quant_bits, hdr.reason, hdr.ext_flags,
-                            stripped_token_count, hdr.hits, hdr.ctx_size,
-                            hdr.created_at, now, 0);
-    uint8_t tb[4];
-    ds4_kvstore_le_put32(tb, text_bytes);
-
-    errno = 0;
-    ok = fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
-         fwrite(tb, 1, sizeof(tb), fp) == sizeof(tb) &&
-         fwrite(text, 1, text_bytes, fp) == text_bytes &&
-         (!(hdr.ext_flags & DS4_KVSTORE_EXT_SESSION_TITLE) ||
-          agent_kv_write_title_trailer(fp, title, err, err_len)) &&
-         fflush(fp) == 0;
-    int saved_errno = errno;
-    if (fclose(fp) != 0) {
-        if (!saved_errno) saved_errno = errno;
-        ok = false;
+    if (ok) {
+        uint8_t header[DS4_KVSTORE_FIXED_HEADER], length[4];
+        ds4_kvstore_fill_header(header, hdr.model_id, hdr.quant_bits, hdr.reason, hdr.ext_flags,
+                               count, hdr.hits, hdr.ctx_size, hdr.created_at, time(NULL), 0);
+        if (visual) header[3] = DS4_KVSTORE_AGENT_VERSION;
+        ds4_kvstore_le_put32(length, text_bytes);
+        ok = fwrite(header, 1, sizeof(header), dest) == sizeof(header) &&
+             fwrite(length, 1, sizeof(length), dest) == sizeof(length) &&
+             fwrite(text, 1, text_bytes, dest) == text_bytes &&
+             (!(hdr.ext_flags & DS4_KVSTORE_EXT_SESSION_TITLE) ||
+              agent_kv_write_title_trailer(dest, title, err, err_len));
+        if (ok && visual) {
+            ok = !fseeko(source, input_start, SEEK_SET);
+            uint8_t bytes[16384]; uint64_t left = input_bytes;
+            while (ok && left) {
+                size_t n = left > sizeof(bytes) ? sizeof(bytes) : (size_t)left;
+                ok = fread(bytes, 1, n, source) == n && fwrite(bytes, 1, n, dest) == n;
+                left -= n;
+            }
+        }
+        if (ok) { ok = agent_commit_file(dest, tmp, path, true, err, err_len); dest = NULL; }
+        else snprintf(err, err_len, "failed to write stripped session");
     }
-    if (ok && rename(tmp, path) != 0) {
-        saved_errno = errno;
-        ok = false;
-    }
-    if (!ok) {
-        snprintf(err, err_len, "%s",
-                 saved_errno ? strerror(saved_errno) : "failed to write stripped session");
-        unlink(tmp);
-    } else {
+    if (dest) fclose(dest);
+    if (!ok && tmp) unlink(tmp);
+    if (!ok && err_len && !err[0]) snprintf(err, err_len, "invalid saved session input");
+    if (ok) {
         if (sha_out) memcpy(sha_out, sha, 41);
-        if (tokens_out) *tokens_out = stripped_token_count;
+        if (tokens_out) *tokens_out = count;
     }
-
-    free(tmp);
-    free(title);
-    free(text);
-    free(path);
+    fclose(source); agent_vision_input_free(&input);
+    free(tmp); free(title); free(text); free(path);
     return ok;
 }
 
@@ -6547,12 +7009,12 @@ static bool agent_worker_switch_session(agent_worker *w, const char *prefix,
 
     bool stripped = false;
     ds4_kvstore_entry entry = {0};
-    if (ds4_kvstore_read_entry_file(path, sha, &entry)) {
+    if (ds4_kvstore_read_agent_entry_file(path, sha, &entry)) {
         stripped = entry.payload_bytes == 0;
         ds4_kvstore_entry_free(&entry);
     }
     if (stripped) {
-        printf("rebuilding stripped session %.8s from rendered text...\n", sha);
+        printf("rebuilding stripped session %.8s from saved input...\n", sha);
         fflush(stdout);
     }
 
@@ -6562,6 +7024,9 @@ static bool agent_worker_switch_session(agent_worker *w, const char *prefix,
                                  err, err_len);
     if (ok) {
         agent_worker_images_clear(w);
+        w->images = meta.input.images;
+        w->image_count = w->image_cap = meta.input.image_count;
+        meta.input.images = NULL; meta.input.image_count = 0;
         ds4_tokens_free(&w->transcript);
         w->transcript = loaded;
         free(w->session_title);
@@ -6584,7 +7049,8 @@ static bool agent_worker_switch_session(agent_worker *w, const char *prefix,
         agent_wake_locked(w);
         pthread_mutex_unlock(&w->mu);
         printf("switched to session %.8s (%d tokens%s)\n",
-               sha, w->transcript.len, stripped ? ", rebuilt from text" : "");
+               sha, w->transcript.len, meta.rebuilt ? ", rebuilt" : "");
+        if (w->image_count) printf("restored %zu images (%s)\n", w->image_count, meta.rebuilt ? "cold rebuild" : "hot KV");
         if (history_turns > 0)
             (void)agent_worker_show_history(w, history_turns, err, err_len);
     } else {
@@ -12668,6 +13134,8 @@ static int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *
     memset(w, 0, sizeof(*w));
     w->engine = engine;
     w->cfg = cfg;
+    w->input_files_ready = agent_file_identity_read(cfg->engine.model_path, &w->model_file) &&
+                          agent_file_identity_read(cfg->engine.vision_path, &w->vision_file);
     w->wake_fd[0] = -1;
     w->wake_fd[1] = -1;
     pthread_mutex_init(&w->mu, NULL);
@@ -13527,6 +13995,13 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
+    /* Model opening precedes --chdir. Keep the loaded files' identities tied
+     * to those paths rather than resolving them again in the task directory. */
+    char model_path[PATH_MAX], vision_path[PATH_MAX];
+    if (cfg.engine.model_path && realpath(cfg.engine.model_path, model_path))
+        cfg.engine.model_path = model_path;
+    if (cfg.engine.vision_path && realpath(cfg.engine.vision_path, vision_path))
+        cfg.engine.vision_path = vision_path;
     cfg.engine.context_size = cfg.gen.ctx_size;
     cfg.engine.placement_ctx_hint = cfg.gen.ctx_size;
     if (cfg.gpu_vram_arg || cfg.gpu_devices_arg) {

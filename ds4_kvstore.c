@@ -420,12 +420,20 @@ bool ds4_kvstore_quant_bits_supported(int quant_bits) {
            quant_bits == 6 || quant_bits == 8;
 }
 
-bool ds4_kvstore_read_header(FILE *fp, ds4_kvstore_entry *e,
-                             uint32_t *text_bytes) {
+static bool kv_read_header(FILE *fp, ds4_kvstore_entry *e,
+                            uint32_t *text_bytes, bool agent) {
     uint8_t h[DS4_KVSTORE_FIXED_HEADER];
     if (fread(h, 1, sizeof(h), fp) != sizeof(h)) return false;
     if (h[0] != KV_CACHE_MAGIC0 || h[1] != KV_CACHE_MAGIC1 ||
-        h[2] != KV_CACHE_MAGIC2 || h[3] != KV_CACHE_VERSION) return false;
+        h[2] != KV_CACHE_MAGIC2) return false;
+    if (h[3] == KV_CACHE_VERSION) {
+        if (h[6] & DS4_KVSTORE_EXT_AGENT_INPUT) return false;
+    } else if (!agent || h[3] != DS4_KVSTORE_AGENT_VERSION ||
+               h[5] != DS4_KVSTORE_REASON_AGENT_SESSION ||
+               h[6] != (DS4_KVSTORE_EXT_SESSION_TITLE |
+                         DS4_KVSTORE_EXT_AGENT_INPUT)) {
+        return false;
+    }
     if (h[20] != KV_CACHE_PAYLOAD_ABI) return false;
     e->quant_bits = h[4];
     e->reason = h[5] <= DS4_KVSTORE_REASON_AGENT_SESSION ? h[5] :
@@ -445,8 +453,18 @@ bool ds4_kvstore_read_header(FILE *fp, ds4_kvstore_entry *e,
     return e->tokens != 0 && ds4_kvstore_quant_bits_supported(e->quant_bits);
 }
 
-bool ds4_kvstore_read_entry_file(const char *path, const char sha[41],
-                                 ds4_kvstore_entry *out) {
+bool ds4_kvstore_read_header(FILE *fp, ds4_kvstore_entry *e,
+                             uint32_t *text_bytes) {
+    return kv_read_header(fp, e, text_bytes, false);
+}
+
+bool ds4_kvstore_read_agent_header(FILE *fp, ds4_kvstore_entry *e,
+                                   uint32_t *text_bytes) {
+    return kv_read_header(fp, e, text_bytes, true);
+}
+
+static bool kv_read_entry_file(const char *path, const char sha[41],
+                                ds4_kvstore_entry *out, bool agent) {
     struct stat st;
     if (stat(path, &st) != 0 ||
         st.st_size < (off_t)(DS4_KVSTORE_FIXED_HEADER + 4))
@@ -455,7 +473,7 @@ bool ds4_kvstore_read_entry_file(const char *path, const char sha[41],
     if (!fp) return false;
     ds4_kvstore_entry e = {0};
     uint32_t text_bytes = 0;
-    bool ok = ds4_kvstore_read_header(fp, &e, &text_bytes);
+    bool ok = kv_read_header(fp, &e, &text_bytes, agent);
     fclose(fp);
     if (!ok) return false;
     const uint64_t fixed = DS4_KVSTORE_FIXED_HEADER + 4ull;
@@ -469,6 +487,16 @@ bool ds4_kvstore_read_entry_file(const char *path, const char sha[41],
     e.file_size = (uint64_t)st.st_size;
     *out = e;
     return true;
+}
+
+bool ds4_kvstore_read_entry_file(const char *path, const char sha[41],
+                                 ds4_kvstore_entry *out) {
+    return kv_read_entry_file(path, sha, out, false);
+}
+
+bool ds4_kvstore_read_agent_entry_file(const char *path, const char sha[41],
+                                       ds4_kvstore_entry *out) {
+    return kv_read_entry_file(path, sha, out, true);
 }
 
 static void kv_cache_refresh(ds4_kvstore *kc) {

@@ -147,11 +147,46 @@ Sessions are stored in `~/.ds4/kvcache`:
 | `/list` | List saved sessions |
 | `/switch <sha>` | Resume a session |
 | `/del <sha>` | Delete a saved session |
-| `/strip <sha>` | Keep text and title, removing the large KV payload |
+| `/strip <sha>` | Keep input and title, removing the large KV payload |
 
 Compatible local KV snapshots avoid rebuilding the prompt. Stripped sessions
-and network TP restores require prefill. Sessions containing images cannot yet
-be saved. Saved conversations and traces may contain private information.
+and network TP restores require prefill. Qwen3.8 Flash Next image sessions can
+be saved and restored on single-host
+Metal with the same model and encoder files. The saved input includes exact
+FP32 image observations, so the source PNG/JPEG need not still exist. Matching
+KV restores stay hot; `/strip` removes KV while retaining the exact input for
+cold prefill. Other model/backend image sessions are not supported yet.
+Saved conversations and traces may contain private information.
+
+Image sessions use KVC v2; old binaries reject them. Text sessions remain v1.
+The visual input's v2 identities use persistent volume UUIDs on macOS rather
+than mount device numbers, which can change after reboot. Model/encoder inode,
+size and modification time must still match; these are file identities, not
+content hashes. Legacy visual input v1 remains readable with its strict device
+check and needs explicit migration if its mount number changed.
+Explicit `/save` and `/strip` wait for file and directory durability; on macOS
+this includes `F_FULLFSYNC`. A failure after publication reports unconfirmed
+durability instead of claiming the old file was rolled back.
+
+| Retained visual input | Size |
+| --- | --- |
+| Qwen FP32 rows, default image-token cap | Up to 10 MiB/image |
+| `DS4_QWEN4_IMAGE_MAX_TOKENS` | Can increase the cap and storage per image |
+| Exact token IDs at 262,144 tokens | 1 MiB, deliberately retained outside KV |
+| Image span metadata / checkpoint identity | 68 bytes / 40 bytes per image |
+
+`make test-vision-state-restore` and `make test-frontends` check bookkeeping,
+storage, corruption, commit failures and server version isolation without a
+model. The opt-in test below needs Python `pexpect` and Pillow, a free memory
+window and no other DS4 process. It uses one native agent at a time, temporarily
+moves aside the bootstrap cache and editor history, and preserves user sessions.
+Its output records save time/size, cache frontiers and image/tool results:
+
+```sh
+python3 tests/test_agent_vision_session.py --binary ./ds4-agent \
+  --model /path/to/Qwen3.8-Flash-Next.gguf --vision /path/to/mmproj.gguf \
+  --output /path/to/new-test-output
+```
 
 For Pi, OpenCode, Codex CLI, or Claude Code, use `ds4-server` instead and follow
 the [client setup guide](docs/CLIENTS.md).

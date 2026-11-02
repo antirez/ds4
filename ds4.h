@@ -445,6 +445,15 @@ int ds4_session_sync_multimodal(ds4_session *s,
                                 size_t image_count,
                                 char *err,
                                 size_t errlen);
+/* Attach image identities after loading the KV for exactly these tokens.
+ * The caller retains embeddings; this copies only spans/fingerprints, without
+ * evaluating tokens or changing graph state. The session must be idle. On
+ * failure its identities are unchanged; an empty array clears old identities. */
+int ds4_session_restore_vision_state(ds4_session *s,
+                                      const ds4_tokens *exact,
+                                      const ds4_vision_span *images,
+                                      size_t image_count,
+                                      char *err, size_t errlen);
 /* A reusable image prefix has unchanged spans/fingerprints for all historical
  * images, with any new images starting at or after the live token frontier.
  * The caller must also check the token prefix. Invalid checkpoints never match. */

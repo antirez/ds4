@@ -16,6 +16,8 @@
 #define DS4_KVSTORE_EXT_RESPONSES_VISIBLE (1u << 1)
 #define DS4_KVSTORE_EXT_THINKING_VISIBLE  (1u << 2)
 #define DS4_KVSTORE_EXT_SESSION_TITLE     (1u << 3)
+#define DS4_KVSTORE_EXT_AGENT_INPUT       (1u << 4)
+#define DS4_KVSTORE_AGENT_VERSION         2u
 
 typedef enum {
     DS4_KVSTORE_REASON_UNKNOWN   = 0,
@@ -200,6 +202,12 @@ bool ds4_kvstore_read_header(FILE *fp, ds4_kvstore_entry *e,
                              uint32_t *text_bytes);
 bool ds4_kvstore_read_entry_file(const char *path, const char sha[41],
                                  ds4_kvstore_entry *out);
+/* Only explicit Agent sessions may carry the v2 input section. Keep automatic
+ * text-prefix cache readers on v1 so they cannot consume or rewrite it. */
+bool ds4_kvstore_read_agent_header(FILE *fp, ds4_kvstore_entry *e,
+                                   uint32_t *text_bytes);
+bool ds4_kvstore_read_agent_entry_file(const char *path, const char sha[41],
+                                       ds4_kvstore_entry *out);
 void ds4_kvstore_fill_header(uint8_t h[DS4_KVSTORE_FIXED_HEADER],
                              uint8_t model_id, uint8_t quant_bits,
                              uint8_t reason, uint8_t ext_flags,

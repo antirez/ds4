@@ -76489,24 +76489,32 @@ static bool ds4_session_vision_range_overlaps(
     return false;
 }
 
-static bool ds4_session_store_vision_identities(ds4_session *s) {
+/* Allocate before replacing the old identities: a failed disk restore must
+ * not silently turn an image-conditioned checkpoint into a text-only one. */
+static bool ds4_session_replace_vision_identities(
+        ds4_session *s, const ds4_vision_span *images, size_t image_count) {
     ds4_vision_identity *copy = NULL;
-    if (s->sync_image_count != 0) {
-        if (s->sync_image_count > SIZE_MAX / sizeof(copy[0])) return false;
-        copy = calloc(s->sync_image_count, sizeof(copy[0]));
+    if (image_count != 0) {
+        if (!images || image_count > SIZE_MAX / sizeof(copy[0])) return false;
+        copy = calloc(image_count, sizeof(copy[0]));
         if (!copy) return false;
-        for (size_t i = 0; i < s->sync_image_count; i++) {
-            copy[i].token_start = s->sync_images[i].token_start;
-            copy[i].token_count = s->sync_images[i].embedding.token_count;
+        for (size_t i = 0; i < image_count; i++) {
+            copy[i].token_start = images[i].token_start;
+            copy[i].token_count = images[i].embedding.token_count;
             memcpy(copy[i].fingerprint,
-                   s->sync_images[i].embedding.fingerprint,
+                   images[i].embedding.fingerprint,
                    sizeof(copy[i].fingerprint));
         }
     }
     free(s->checkpoint_images);
     s->checkpoint_images = copy;
-    s->checkpoint_image_count = s->sync_image_count;
+    s->checkpoint_image_count = image_count;
     return true;
+}
+
+static bool ds4_session_store_vision_identities(ds4_session *s) {
+    return ds4_session_replace_vision_identities(
+            s, s->sync_images, s->sync_image_count);
 }
 
 typedef struct {
@@ -76674,18 +76682,20 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
     return rc;
 }
 
-int ds4_session_sync_multimodal(
-        ds4_session *s,
+static int ds4_session_validate_vision_spans(
+        const ds4_session *s,
         const ds4_tokens *prompt,
         const ds4_vision_span *images,
         size_t image_count,
         char *err,
         size_t errlen) {
-    if (!s || !prompt || (image_count != 0 && !images)) {
+    if (!s || !prompt || prompt->len < 0 ||
+        (prompt->len != 0 && !prompt->v) || image_count > (size_t)prompt->len ||
+        (image_count != 0 && !images)) {
         snprintf(err, errlen, "invalid multimodal prompt");
         return 1;
     }
-    if (image_count != 0 && !s->engine->vision_ready) {
+    if (image_count != 0 && (!s->engine || !s->engine->vision_ready)) {
         snprintf(err, errlen, "vision encoder is not loaded");
         return 1;
     }
@@ -76698,6 +76708,25 @@ int ds4_session_sync_multimodal(
             span->token_start < previous_end || end > (uint64_t)prompt->len) {
             snprintf(err, errlen, "invalid or overlapping image token span");
             return 1;
+        }
+        if (s->engine->vision_kind == DS4_VISION_QWEN4) {
+            const ds4_vision_embedding *image = &span->embedding;
+            /* Qwen's merged grid sets 3D RoPE, not just embedding row count.
+             * Encoding resizes to 32-pixel cells; restore must retain it. */
+            if (image->layout != 0 || !image->grid_width || !image->grid_height ||
+                (uint64_t)image->grid_width * image->grid_height != image->token_count ||
+                (uint64_t)image->grid_width * 32u != image->content_width ||
+                (uint64_t)image->grid_height * 32u != image->content_height ||
+                !image->width || !image->height ||
+                image->width > DS4_IMAGE_MAX_DIMENSION ||
+                image->height > DS4_IMAGE_MAX_DIMENSION ||
+                (uint64_t)image->width * image->height > DS4_IMAGE_MAX_PIXELS ||
+                image->content_width > DS4_IMAGE_MAX_DIMENSION ||
+                image->content_height > DS4_IMAGE_MAX_DIMENSION ||
+                (uint64_t)image->content_width * image->content_height > DS4_IMAGE_MAX_PIXELS) {
+                snprintf(err, errlen, "invalid Qwen3.8 image grid or dimensions");
+                return 1;
+            }
         }
         if (s->engine->vision_kind == DS4_VISION_DEEPSEEK4 && !ds4_session_is_ds41(s)) {
             uint32_t cursor = 0, block_start = 0, image_start = 0,
@@ -76722,6 +76751,49 @@ int ds4_session_sync_multimodal(
         }
         previous_end = end;
     }
+    return 0;
+}
+
+int ds4_session_restore_vision_state(
+        ds4_session *s, const ds4_tokens *exact,
+        const ds4_vision_span *images, size_t image_count,
+        char *err, size_t errlen) {
+    if (!s || !exact || exact->len < 0 || !s->checkpoint_valid ||
+        s->checkpoint.len != exact->len ||
+        (exact->len != 0 && (!exact->v || !s->checkpoint.v ||
+         memcmp(s->checkpoint.v, exact->v, (size_t)exact->len * sizeof(int))))) {
+        payload_set_err(err, errlen, "image restore tokens do not match the loaded checkpoint");
+        return 1;
+    }
+    if (s->sync_images || s->sync_image_count
+#ifndef DS4_NO_GPU
+        || s->graph.prefill_vision_spans || s->graph.prefill_vision_span_count
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+        || s->ds41_graph.images || s->ds41_graph.image_count
+#endif
+#ifdef DS4_HAS_QWEN4_GPU
+        || s->qwen4_graph.vis_spans || s->qwen4_graph.vis_span_count
+#endif
+#endif
+    ) {
+        payload_set_err(err, errlen, "cannot restore image identities during multimodal sync");
+        return 1;
+    }
+    if (ds4_session_validate_vision_spans(s, exact, images, image_count, err, errlen))
+        return 1;
+    if (!ds4_session_replace_vision_identities(s, images, image_count)) {
+        payload_set_err(err, errlen, "unable to retain restored image identities");
+        return 1;
+    }
+    return 0;
+}
+
+int ds4_session_sync_multimodal(
+        ds4_session *s, const ds4_tokens *prompt,
+        const ds4_vision_span *images, size_t image_count,
+        char *err, size_t errlen) {
+    if (ds4_session_validate_vision_spans(s, prompt, images, image_count, err, errlen))
+        return 1;
     s->sync_images = images;
     s->sync_image_count = image_count;
 #ifdef DS4_HAS_DEEPSEEK41_GPU
@@ -87568,20 +87640,8 @@ void ds4_session_free_test_checkpoint(ds4_session *s) {
 void ds4_session_set_test_images(ds4_session *s,
                                  const ds4_vision_span *images, size_t n) {
     if (!s) return;
-    free(s->checkpoint_images);
-    s->checkpoint_images = NULL;
-    s->checkpoint_image_count = 0;
-    if (n == 0 || !images) return;
-    s->checkpoint_images = xcalloc(n, sizeof(*s->checkpoint_images));
-    for (size_t i = 0; i < n; i++) {
-        s->checkpoint_images[i].token_start = images[i].token_start;
-        s->checkpoint_images[i].token_count =
-            images[i].embedding.token_count;
-        memcpy(s->checkpoint_images[i].fingerprint,
-               images[i].embedding.fingerprint,
-               sizeof(s->checkpoint_images[i].fingerprint));
-    }
-    s->checkpoint_image_count = n;
+    if (!ds4_session_replace_vision_identities(s, images, images ? n : 0))
+        ds4_die("unable to retain test image identities");
 }
 
 int ds4_session_ctx(ds4_session *s) {
