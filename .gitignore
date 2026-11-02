@@ -83,6 +83,7 @@
 /tests/test_linux_memory
 /tests/test_rocm_memory
 /tests/test_qwen4_kernels
+/tests/test_minimax3_kernels
 /tests/test_qwen4_moe_mm_specialize
 /tests/test_qwen4_vision
 /tests/test_deepseek4_vision_image

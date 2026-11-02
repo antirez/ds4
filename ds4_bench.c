@@ -964,6 +964,13 @@ int main(int argc, char **argv) {
             }
 #endif
             const double token_t1 = bench_now_sec();
+            /* teacher-forced decode logits every 16 steps: a fixed-token drift check */
+            if (cfg.teacher_forced_decode && ntok == 1 && (gen_done + 1) % 16 == 0 &&
+                write_frontier_logits_json(&cfg, engine, session, frontier + gen_done + 1,
+                                           frontier + gen_done) != 0) {
+                rc = 1;
+                break;
+            }
             int cycle_tokens = 0;
             for (int j = 0; j < ntok && gen_done < cfg.gen_tokens; j++) {
                 if (toks[j] == eos) {

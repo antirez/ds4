@@ -308,6 +308,11 @@ int ds4_engine_model_id(ds4_engine *e);
 bool ds4_engine_is_glm_dsa(ds4_engine *e);
 bool ds4_engine_is_glm53(ds4_engine *e);
 bool ds4_engine_is_qwen4(ds4_engine *e);
+bool ds4_engine_is_minimax3(ds4_engine *e);
+/* MiniMax-M3.1 root system text (think tokens spelled <think></think>) and the
+ * <effort> value for a think mode (NULL keeps the template default). */
+const char *ds4_minimax3_root_system(void);
+const char *ds4_minimax3_effort(ds4_think_mode mode);
 /* Qwen3.8 reasoning-effort system instruction for a think mode (NULL when none) */
 const char *ds4_qwen4_reasoning_effort_text(ds4_think_mode mode);
 const char *ds4_backend_name(ds4_backend backend);

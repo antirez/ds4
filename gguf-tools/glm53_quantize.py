@@ -346,11 +346,8 @@ class SourceDB:
             return fd
 
     def read(self, name):
-        info = self.info(name)
-        data = os.pread(self._fd(info["shard"]), info["nbytes"], info["offset"])
-        if len(data) != info["nbytes"]:
-            fail(f"short payload read for {name}")
-        return data
+        # chunked: macOS pread rejects a single read of 2 GiB or more with EINVAL
+        return b"".join(self.iter_read(name))
 
     def iter_read(self, name, byte_start=0, byte_count=None, chunk_size=16 << 20):
         info = self.info(name)

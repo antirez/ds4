@@ -268,6 +268,34 @@ dense weights expand losslessly to F16 or F32. Add `--dry-run` to inspect the
 layout, or `--verify` to compare every tensor in an existing output against
 the source. This file works only with the V4.1 Flash target.
 
+## Convert MiniMax M3.1 Flash
+
+MiniMax M3.1 Flash uses its own converter, built on the GLM 5.3 writer. Download
+[MiniMaxAI/MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash),
+install NumPy, then build the quantizer library:
+
+```sh
+make -C gguf-tools libds4quants.dylib
+python3 gguf-tools/minimax31_quantize.py \
+  --hf models/MiniMax-M3.1-Flash \
+  --source-revision 54e4e69dfc452b1e94a426c24a4fdeeaa8e3ad5e \
+  --out gguf/MiniMax-M3.1-Flash-Q2.gguf --dry-run
+```
+
+Omit `--dry-run` to write the file. Add `--resume` after an interrupted conversion.
+Use `libds4quants.so` on Linux. The release stores MXFP8 attention and dense
+weights and NVFP4 routed experts; both are dequantized and requantized. Gate/up
+experts use IQ2_XXS and down experts use Q2_K; attention, dense and shared
+experts, the embeddings and the output head use Q8_0. Without `--imatrix`,
+IQ2_XXS uses weight-energy importance. `--artifact q4` writes Q4_K experts
+instead; it has not been tested on the full model.
+
+`minimax31_reference.py` is a NumPy forward on the official checkpoint and the
+reference for the ds4 graph. On machines that cannot hold all 60 layers,
+`minimax31_truncate.py --layers N` copies the first N layers into a validation
+GGUF to compare with `minimax31_reference.py --layers N`.
+`make test-minimax3-kernels` runs the Metal kernel tests.
+
 ## Convert A DSpark Support Checkpoint
 
 The DSpark Flash checkpoint is published as Hugging Face safetensors and stores

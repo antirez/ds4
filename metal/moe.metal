@@ -3133,7 +3133,8 @@ void kernel_mul_mv_iq2_xxs_f32_impl(
     }
 }
 
-template<int nr0>
+/* act 1: write MiniMax SwiGLU-OAI(gate, up) to dst_gate only. */
+template<int nr0, int act = 0>
 void kernel_mul_mv_iq2_xxs_pair_f32_impl(
         ds4_metal_args_mul_mv args,
         device const char * src0_gate,
@@ -3212,14 +3213,15 @@ void kernel_mul_mv_iq2_xxs_pair_f32_impl(
             float sg = 0;
             float su = 0;
             for (short l = 0; l < 4; ++l) {
-                const threadgroup uint8_t * gridg = (const threadgroup uint8_t *)(svalues + aux8g[l]);
-                const threadgroup uint8_t * gridu = (const threadgroup uint8_t *)(svalues + aux8u[l]);
+                /* one 64-bit grid load per entry; same products and order */
+                const uint64_t gridg = svalues[aux8g[l]];
+                const uint64_t gridu = svalues[aux8u[l]];
                 const uint8_t signg = ssigns[(aux32g >> 7*l) & 127];
                 const uint8_t signu = ssigns[(aux32u >> 7*l) & 127];
                 for (short j = 0; j < 8; ++j) {
                     const float v = yl[8*l + j];
-                    sg += v * gridg[j] * (signg & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
-                    su += v * gridu[j] * (signu & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+                    sg += v * (float)(uint8_t)(gridg >> (8*j)) * (signg & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+                    su += v * (float)(uint8_t)(gridu >> (8*j)) * (signu & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
                 }
             }
             sumg[row] += dg * sg;
@@ -3240,7 +3242,11 @@ void kernel_mul_mv_iq2_xxs_pair_f32_impl(
     for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
         const float sum_gate = simd_sum(sumg[row]);
         const float sum_up   = simd_sum(sumu[row]);
-        if (tiisg == 0) {
+        if (tiisg == 0 && act == 1) {
+            const float g = min(sum_gate * 0.25f, 7.0f);
+            const float u = clamp(sum_up * 0.25f, -7.0f, 7.0f);
+            dst_gate_f32[first_row + row] = g / (1.0f + exp(-1.702f * g)) * (u + 1.0f);
+        } else if (tiisg == 0) {
             dst_gate_f32[first_row + row] = sum_gate * 0.25f;
             dst_up_f32[first_row + row]   = sum_up   * 0.25f;
         }
@@ -3499,6 +3505,46 @@ kernel void kernel_dsv4_attn_out_low_q4_K_f32(
         tgpig,
         tiisg,
         sgitg);
+}
+
+// MiniMax decode: the routed IQ2_XXS gate/up pair with SwiGLU-OAI applied as
+// each row is reduced (the products and sums are the pair kernel's); mid goes
+// to dst.
+kernel void kernel_mm3_mv_id_iq2_xxs_pair_glu_f32(
+        constant ds4_metal_args_mul_mv_id & args,
+        device const char * src0_gate,
+        device const char * src0_up,
+        device const char * src1,
+        device       char * dst,
+        device       char * unused,
+        device const char * ids,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const int iid1 = tgpig.z/args.nei0;
+    const int idx  = tgpig.z%args.nei0;
+    tgpig.z = 0;
+    const int32_t i02 = ((device const int32_t *) (ids + iid1*args.nbi1))[idx];
+    const int64_t i11 = idx % args.ne11;
+    const int64_t i12 = iid1;
+    device char * dst_cur = dst + (idx*args.ne0 + i12*args.ne1*args.ne0)*sizeof(float);
+    ds4_metal_args_mul_mv args0 = {
+        args.ne00, args.ne01, 1,
+        args.nb00, args.nb01, args.nb02, args.nb02,
+        args.ne10, 1, 1,
+        args.nb10, args.nb11, args.nb12, args.nb12,
+        args.ne0, 1, args.nr0, 1, 1,
+    };
+    (void)tiitg;
+    (void)unused;
+    kernel_mul_mv_iq2_xxs_pair_f32_impl<N_R0_IQ2_XXS, 1>(
+        args0,
+        src0_gate + (int64_t)i02*args.nb02,
+        src0_up   + (int64_t)i02*args.nb02,
+        src1 + i11*args.nb11 + i12*args.nb12,
+        dst_cur, dst_cur, shmem, tgpig, tiisg, sgitg);
 }
 
 kernel void kernel_mul_mv_id_iq2_xxs_pair_f32(

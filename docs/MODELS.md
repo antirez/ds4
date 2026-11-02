@@ -220,6 +220,27 @@ GLM uses graph-selected prefill chunks and does not accept `--prefill-chunk`
 or an external `--mtp-model`. It currently requires `--power 100`.
 Directional steering is supported for GLM 5.3, not GLM 5.2.
 
+## MiniMax M3.1 Flash
+
+MiniMax M3.1 Flash support is experimental and has no download target yet.
+Build the GGUF from the official checkpoint with the
+[converter](../gguf-tools/README.md#convert-minimax-m31-flash).
+
+The Q2 file is 121 GiB: IQ2_XXS gate/up and Q2_K down experts, with about
+13 GiB of Q8_0 attention, dense, shared-expert and output weights.
+It runs on Metal with SSD streaming. On one 128 GB Mac, leave the expert cache
+budget automatic:
+
+```sh
+./ds4-server -m gguf/MiniMax-M3.1-Flash-Q2.gguf --ssd-streaming --ctx 32768
+```
+
+The server renders the official chat template, including thinking and tool
+calls, and reports the model as `minimax-m3.1-flash`. CUDA, ROCm, distributed
+inference, speculative decoding and vision are not implemented. Keep the GGUF
+on a fast local SSD. The weights use the MiniMax Community License, which
+restricts commercial use.
+
 ## Vision
 
 PNG and JPEG input works in the CLI, native agent, and HTTP server on Metal,

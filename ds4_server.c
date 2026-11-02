@@ -673,7 +673,16 @@ typedef enum {
     SERVER_MODEL_SYNTAX_GLM,
     SERVER_MODEL_SYNTAX_DEEPSEEK41,
     SERVER_MODEL_SYNTAX_QWEN,
+    SERVER_MODEL_SYNTAX_MINIMAX,
 } server_model_syntax;
+
+/* MiniMax-M3.1 chat_template.jinja markers.  ]<]minimax[>[ is a special token
+ * prefixed to every tool-call tag; ds4 spells the <mm:think> tokens <think>. */
+#define MM_NS "]<]minimax[>["
+#define MM_BOS "]~b]"
+#define MM_EOS "[e~["
+#define MM_TOOL_CALLS_START MM_NS "<tool_call>"
+#define MM_TOOL_CALLS_END MM_NS "</tool_call>"
 
 #define DS41_TOOL_CALLS_START "<｜DSML｜ calls>"
 #define DS41_TOOL_CALLS_END "</｜DSML｜ calls>"
@@ -1214,6 +1223,7 @@ static bool model_alias_enables_thinking(const char *model) {
 
 static server_model_syntax server_model_syntax_for_engine(ds4_engine *engine) {
     if (ds4_engine_is_qwen4(engine)) return SERVER_MODEL_SYNTAX_QWEN;
+    if (ds4_engine_is_minimax3(engine)) return SERVER_MODEL_SYNTAX_MINIMAX;
     return ds4_engine_is_glm_dsa(engine) ?
            SERVER_MODEL_SYNTAX_GLM : ds4_engine_is_deepseek41(engine) ?
            SERVER_MODEL_SYNTAX_DEEPSEEK41 : SERVER_MODEL_SYNTAX_DEEPSEEK;
@@ -1222,6 +1232,7 @@ static server_model_syntax server_model_syntax_for_engine(ds4_engine *engine) {
 static const char *server_model_id_from_engine(ds4_engine *engine) {
     if (ds4_engine_is_deepseek41(engine)) return "deepseek-v4.1-flash";
     if (ds4_engine_is_qwen4(engine)) return "qwen3.8-flash-next";
+    if (ds4_engine_is_minimax3(engine)) return "minimax-m3.1-flash";
     if (ds4_engine_is_glm53(engine)) return "glm-5.3-flash";
     if (ds4_engine_is_glm_dsa(engine)) return "glm-5.2";
     return ds4_engine_model_id(engine) == 1 ?
@@ -3068,6 +3079,8 @@ static void append_qwen_tool_calls_text(buf *b, const tool_calls *calls, bool ha
     }
 }
 
+static void append_minimax_tool_calls_text(buf *b, const tool_calls *calls);
+
 static void append_tool_calls_text_for_syntax(buf *b,
                                               server_model_syntax syntax,
                                               const tool_calls *calls,
@@ -3076,6 +3089,8 @@ static void append_tool_calls_text_for_syntax(buf *b,
         append_glm_tool_calls_text(b, calls, tool_orders);
     } else if (syntax == SERVER_MODEL_SYNTAX_QWEN) {
         append_qwen_tool_calls_text(b, calls, b->len > 0, tool_orders);
+    } else if (syntax == SERVER_MODEL_SYNTAX_MINIMAX) {
+        append_minimax_tool_calls_text(b, calls);
     } else {
         append_dsml_tool_calls_text(b, calls, syntax == SERVER_MODEL_SYNTAX_DEEPSEEK41);
     }
@@ -3629,6 +3644,259 @@ static char *render_qwen_chat_prompt_text(const chat_msgs *msgs,
     return buf_take(&out);
 }
 
+/* ===================== MiniMax-M3.1 (chat_template.jinja) =====================
+ * ]~!b[ then role blocks "]~b]role\n ... [e~[\n": a root system block with the
+ * fixed identity, thinking instructions and optional <effort>, a developer
+ * block with the caller's first system message (or the default identity) and
+ * the tools, then user/ai/tool/developer blocks in order.  Thinking is
+ * adaptive: the generation prompt has no prefix, a disabled turn starts after
+ * </think>.  Text is rendered verbatim, as the template does, so a sampled
+ * turn re-renders to its own tokens. */
+
+/* json.dumps spacing (", " and ": "), as the template's tojson renders schemas. */
+static void append_pyjson_value(buf *b, const char *raw) {
+    bool in_str = false, esc = false;
+    for (const char *p = raw ? raw : ""; *p; p++) {
+        const char c = *p;
+        if (in_str) {
+            buf_putc(b, c);
+            if (esc) esc = false;
+            else if (c == '\\') esc = true;
+            else if (c == '"') in_str = false;
+        } else if (c == '"') {
+            in_str = true;
+            buf_putc(b, c);
+        } else if (c == ',') {
+            buf_puts(b, ", ");
+        } else if (c == ':') {
+            buf_puts(b, ": ");
+        } else if (!isspace((unsigned char)c)) {
+            buf_putc(b, c);
+        }
+    }
+}
+
+static void append_minimax_tools_prompt_text(buf *b, const char *tool_schemas) {
+    buf_puts(b, "\n\n# Tools\nYou may call one or more tools to assist with the user query.\n"
+                "Here are the tools available in JSONSchema format:\n\n<tools>\n");
+    const char *p = tool_schemas ? tool_schemas : "";
+    json_ws(&p);
+    while (*p) {
+        char *raw = NULL;
+        if (!json_raw_value(&p, &raw)) break;
+        buf inner = {0};
+        bool emitted = false;
+        if (!append_glm_tool_schema_json(&inner, raw, &emitted)) {
+            buf_puts(&inner, raw);
+            emitted = true;
+        }
+        if (emitted) {
+            buf_puts(b, "<tool>");
+            append_pyjson_value(b, inner.ptr ? inner.ptr : "{}");
+            buf_puts(b, "</tool>\n");
+        }
+        buf_free(&inner);
+        free(raw);
+        json_ws(&p);
+    }
+    buf_puts(b,
+        "</tools>\n\nTo call tools, wrap all invocations in a single " MM_TOOL_CALLS_START MM_TOOL_CALLS_END
+        " block. Parameter values containing nested objects or arrays are recursively expanded into XML "
+        "elements. Example:\n\n" MM_TOOL_CALLS_START "\n"
+        MM_NS "<invoke name=\"tool-name-1\">" MM_NS "<param-1>value-1" MM_NS "</param-1>"
+        MM_NS "<param-2>" MM_NS "<item>" MM_NS "<key-a>val-a" MM_NS "</key-a>" MM_NS "<key-b>val-b"
+        MM_NS "</key-b>" MM_NS "</item>" MM_NS "</param-2>" MM_NS "</invoke>\n"
+        MM_NS "<invoke name=\"tool-name-2\">" MM_NS "<param-1>value-1" MM_NS "</param-1>" MM_NS "</invoke>\n"
+        MM_TOOL_CALLS_END);
+}
+
+/* The template's to_xml: objects become child elements, arrays <item>
+ * elements, strings their text, other scalars their JSON text; nulls vanish. */
+static void append_minimax_xml_object(buf *b, const char *json);
+
+static void append_minimax_xml_value(buf *b, const char *json) {
+    const char *p = json ? json : "";
+    json_ws(&p);
+    if (*p == '{') {
+        append_minimax_xml_object(b, p);
+    } else if (*p == '[') {
+        p++;
+        for (;;) {
+            json_ws(&p);
+            if (!*p || *p == ']') break;
+            char *raw = NULL;
+            if (!json_raw_value(&p, &raw)) break;
+            buf_puts(b, MM_NS "<item>");
+            append_minimax_xml_value(b, raw);
+            buf_puts(b, MM_NS "</item>");
+            free(raw);
+            json_ws(&p);
+            if (*p == ',') p++;
+        }
+    } else if (*p == '"') {
+        char *str = NULL;
+        if (json_string(&p, &str)) buf_puts(b, str);
+        free(str);
+    } else if (strncmp(p, "null", 4) != 0) {
+        char *min = json_minify_raw_value(p);
+        buf_puts(b, min);
+        free(min);
+    }
+}
+
+static void append_minimax_xml_object(buf *b, const char *json) {
+    json_args args = {0};
+    if (!json_args_parse(json, &args)) {
+        buf_puts(b, json ? json : "");
+        return;
+    }
+    for (int i = 0; i < args.len; i++) {
+        const json_arg *arg = &args.v[i];
+        if (!arg->is_string && !strcmp(arg->value, "null")) continue;
+        buf_puts(b, MM_NS "<");
+        buf_puts(b, arg->key);
+        buf_putc(b, '>');
+        if (arg->is_string) buf_puts(b, arg->value);
+        else append_minimax_xml_value(b, arg->value);
+        buf_puts(b, MM_NS "</");
+        buf_puts(b, arg->key);
+        buf_putc(b, '>');
+    }
+    json_args_free(&args);
+}
+
+static void append_minimax_tool_calls_text(buf *b, const tool_calls *calls) {
+    if (!calls || calls->len == 0) return;
+    if (calls->raw_tool_text && calls->raw_tool_text[0]) {
+        buf_puts(b, calls->raw_tool_text);
+        return;
+    }
+    buf_puts(b, MM_TOOL_CALLS_START "\n");
+    for (int i = 0; i < calls->len; i++) {
+        buf_puts(b, MM_NS "<invoke name=\"");
+        buf_puts(b, calls->v[i].name ? calls->v[i].name : "");
+        buf_puts(b, "\">");
+        append_minimax_xml_object(b, calls->v[i].arguments && calls->v[i].arguments[0] ?
+                                     calls->v[i].arguments : "{}");
+        buf_puts(b, MM_NS "</invoke>\n");
+    }
+    buf_puts(b, MM_TOOL_CALLS_END);
+}
+
+static void append_minimax_tool_response(buf *b, const char *text, size_t len) {
+    char *body = xstrndup(text ? text : "", len);
+    buf_puts(b, "\n<response>");
+    append_glm_tag_body_text(b, body, "</response>");
+    buf_puts(b, "</response>");
+    free(body);
+}
+
+static void append_minimax_tool_result_message(buf *b, const chat_msg *m) {
+    const char *content = m && m->content ? m->content : "";
+    if (m && m->role && !strcmp(m->role, "user") && m->tool_call_ids_len > 0) {
+        static const char open[] = "<tool_result>";
+        static const char close[] = "</tool_result>";
+        const char *p = content;
+        bool found = false;
+        while ((p = strstr(p, open)) != NULL) {
+            const char *body = p + sizeof(open) - 1;
+            const char *end = strstr(body, close);
+            if (!end) break;
+            append_minimax_tool_response(b, body, (size_t)(end - body));
+            found = true;
+            p = end + sizeof(close) - 1;
+        }
+        if (found) return;
+    }
+    append_minimax_tool_response(b, content, strlen(content));
+}
+
+static void append_minimax_assistant_message(buf *out, const chat_msg *m) {
+    const char *content = m && m->content ? m->content : "";
+    buf_puts(out, MM_BOS "ai\n");
+    if (!text_starts_with_think_tag(content)) {
+        const char *reasoning = m && m->reasoning ? m->reasoning : "";
+        if (reasoning[0]) {
+            buf_puts(out, "<think>");
+            buf_puts(out, reasoning);
+        }
+        buf_puts(out, "</think>");
+    }
+    buf_puts(out, content);
+    append_minimax_tool_calls_text(out, m ? &m->calls : NULL);
+    buf_puts(out, MM_EOS "\n");
+}
+
+static void append_minimax_generation_prompt(buf *out, bool think) {
+    buf_puts(out, think ? MM_BOS "ai\n" : MM_BOS "ai\n</think>");
+}
+
+/* Messages from start on; skip is the system message already rendered as
+ * the developer block (-1: none). */
+static void append_minimax_conversation(buf *out, const chat_msgs *msgs, int start, int skip, bool think) {
+    bool pending_assistant = false;
+    bool tool_open = false;
+    for (int i = start; msgs && i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (chat_msg_is_glm_tool_result(m)) {
+            if (!tool_open) buf_puts(out, MM_BOS "tool");
+            append_minimax_tool_result_message(out, m);
+            tool_open = true;
+            pending_assistant = true;
+            continue;
+        }
+        if (tool_open) {
+            buf_puts(out, MM_EOS "\n");
+            tool_open = false;
+        }
+        if (role_is_system(m->role)) {
+            if (i == skip) continue;
+            buf_puts(out, MM_BOS "developer\n");
+            buf_puts(out, m->content && m->content[0] ? m->content : "You are a helpful assistant.");
+            buf_puts(out, MM_EOS "\n");
+        } else if (!strcmp(m->role, "user")) {
+            buf_puts(out, MM_BOS "user\n");
+            buf_puts(out, m->content ? m->content : "");
+            buf_puts(out, MM_EOS "\n");
+            pending_assistant = true;
+        } else if (!strcmp(m->role, "assistant")) {
+            append_minimax_assistant_message(out, m);
+            pending_assistant = false;
+        }
+    }
+    if (tool_open) buf_puts(out, MM_EOS "\n");
+    if (pending_assistant) append_minimax_generation_prompt(out, think);
+}
+
+static char *render_minimax_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
+                                             ds4_think_mode think_mode) {
+    const bool think = ds4_think_mode_enabled(think_mode);
+    const char *effort = think ? ds4_minimax3_effort(think_mode) : NULL;
+    const int skip = msgs && msgs->len > 0 && role_is_system(msgs->v[0].role) ? 0 : -1;
+    buf out = {0};
+    buf_puts(&out, "]~!b[" MM_BOS "system\n");
+    buf_puts(&out, ds4_minimax3_root_system());
+    if (effort) {
+        buf_puts(&out, "\n\n<effort>");
+        buf_puts(&out, effort);
+        buf_puts(&out, "</effort>");
+    }
+    buf_puts(&out, MM_EOS "\n" MM_BOS "developer\n");
+    const char *dev = skip == 0 ? msgs->v[0].content : NULL;
+    buf_puts(&out, dev && dev[0] ? dev : "You are a helpful assistant.");
+    if (tool_schemas && tool_schemas[0]) append_minimax_tools_prompt_text(&out, tool_schemas);
+    buf_puts(&out, MM_EOS "\n");
+    append_minimax_conversation(&out, msgs, 0, skip, think);
+    return buf_take(&out);
+}
+
+static char *render_minimax_live_tool_tail(const chat_msgs *msgs, int start, ds4_think_mode think_mode) {
+    buf out = {0};
+    buf_puts(&out, MM_EOS "\n");
+    append_minimax_conversation(&out, msgs, start, -1, ds4_think_mode_enabled(think_mode));
+    return buf_take(&out);
+}
+
 static char *render_chat_prompt_text_for_syntax(server_model_syntax syntax,
                                                 const chat_msgs *msgs,
                                                 const char *tool_schemas,
@@ -3642,6 +3910,9 @@ static char *render_chat_prompt_text_for_syntax(server_model_syntax syntax,
         return render_deepseek41_chat(msgs, 0, tool_schemas, think_mode, false);
     if (syntax == SERVER_MODEL_SYNTAX_QWEN) {
         return render_qwen_chat_prompt_text(msgs, tool_schemas, tool_orders, think_mode);
+    }
+    if (syntax == SERVER_MODEL_SYNTAX_MINIMAX) {
+        return render_minimax_chat_prompt_text(msgs, tool_schemas, think_mode);
     }
     return render_deepseek_chat_prompt_text(msgs, tool_schemas,
                                             tool_orders, think_mode);
@@ -3871,6 +4142,9 @@ static char *render_live_tool_tail_for_syntax(server_model_syntax syntax,
         return render_deepseek41_chat(msgs, start, NULL, think_mode, true);
     if (syntax == SERVER_MODEL_SYNTAX_QWEN) {
         return render_qwen_live_tool_tail(msgs, start, tool_orders, think_mode);
+    }
+    if (syntax == SERVER_MODEL_SYNTAX_MINIMAX) {
+        return render_minimax_live_tool_tail(msgs, start, think_mode);
     }
     return render_deepseek_live_tool_tail(msgs, start, think_mode);
 }
@@ -5861,6 +6135,7 @@ static void json_escape_fragment_n(buf *b, const char *s, size_t n) {
 static const char *find_any_tool_start(const char *s) {
     const char *best = NULL;
     const char *candidates[] = {
+        strstr(s, MM_TOOL_CALLS_START),
         strstr(s, DS41_TOOL_CALLS_START),
         strstr(s, DS4_TOOL_CALLS_START),
         strstr(s, DS4_TOOL_CALLS_START_SHORT),
@@ -6690,6 +6965,158 @@ static bool parse_qwen_generated_message_ex(const char *text,
     return true;
 }
 
+/* Parse the body of the element named key, after its opening tag, through
+ * its closing tag: child elements become an object (or an array when they
+ * are <item>s), text becomes a string, or the JSON scalar it spells unless the
+ * tool schema declares a string. */
+static bool minimax_parse_element(const char **pp, const char *key, buf *out, int depth,
+                                  bool declared_string) {
+    static const size_t ns = sizeof(MM_NS) - 1;
+    if (depth > 64) return false;
+    buf close = {0};
+    buf_puts(&close, MM_NS "</");
+    buf_puts(&close, key);
+    buf_putc(&close, '>');
+    const char *p = *pp;
+    const char *q = skip_ascii_ws(p);
+    bool ok = false;
+    if (!strncmp(q, MM_NS "<", ns + 1) && q[ns + 1] != '/') {
+        const bool list = !strncmp(q, MM_NS "<item>", ns + 6);
+        buf_putc(out, list ? '[' : '{');
+        bool first = true;
+        p = q;
+        for (;;) {
+            p = skip_ascii_ws(p);
+            if (strncmp(p, MM_NS "<", ns + 1) != 0 || p[ns + 1] == '/') break;
+            const char *name = p + ns + 1;
+            const char *gt = strchr(name, '>');
+            if (!gt) goto done;
+            char *child = xstrndup(name, (size_t)(gt - name));
+            p = gt + 1;
+            if (!first) buf_puts(out, ", ");
+            first = false;
+            if (!list) {
+                json_escape(out, child);
+                buf_puts(out, ": ");
+            }
+            const bool child_ok = minimax_parse_element(&p, child, out, depth + 1, false);
+            free(child);
+            if (!child_ok) goto done;
+        }
+        buf_putc(out, list ? ']' : '}');
+        if (strncmp(p, close.ptr, close.len) != 0) goto done;
+        p += close.len;
+    } else {
+        const char *end = strstr(p, close.ptr);
+        if (!end) goto done;
+        char *value = xstrndup(p, (size_t)(end - p));
+        if (!declared_string && qwen_param_value_is_json(value)) {
+            char *min = json_minify_raw_value(value);
+            buf_puts(out, min);
+            free(min);
+        } else {
+            json_escape(out, value);
+        }
+        free(value);
+        p = end + close.len;
+    }
+    *pp = p;
+    ok = true;
+done:
+    buf_free(&close);
+    return ok;
+}
+
+static bool parse_minimax_generated_message_ex(const char *text,
+                                               bool require_thinking_closed,
+                                               char **content_out,
+                                               char **reasoning_out,
+                                               tool_calls *calls,
+                                               const tool_schema_orders *orders) {
+    static const char invoke[] = MM_NS "<invoke name=\"";
+    static const char invoke_end[] = MM_NS "</invoke>";
+    static const size_t ns = sizeof(MM_NS) - 1;
+    text = text ? text : "";
+    const char *search = text;
+    bool recovered_unclosed_tool = false;
+    if (require_thinking_closed) {
+        const char *think_end = strstr(text, "</think>");
+        if (!think_end) {
+            const char *candidate = strstr(text, MM_TOOL_CALLS_START);
+            if (!candidate || !strstr(candidate, MM_TOOL_CALLS_END)) {
+                ds4_local_unterminated_reasoning(text, content_out, reasoning_out);
+                return true;
+            }
+            search = candidate;
+            recovered_unclosed_tool = true;
+        } else {
+            search = think_end + 8;
+        }
+    }
+    const char *start = strstr(search, MM_TOOL_CALLS_START);
+    if (!start) {
+        split_reasoning_content(text, strlen(text), content_out, reasoning_out);
+        return true;
+    }
+    const char *p = start + strlen(MM_TOOL_CALLS_START);
+    for (;;) {
+        p = skip_ascii_ws(p);
+        if (!strncmp(p, MM_TOOL_CALLS_END, strlen(MM_TOOL_CALLS_END))) {
+            p += strlen(MM_TOOL_CALLS_END);
+            break;
+        }
+        if (strncmp(p, invoke, sizeof(invoke) - 1) != 0) return false;
+        p += sizeof(invoke) - 1;
+        const char *q = strchr(p, '"');
+        if (!q || q[1] != '>') return false;
+        char *name = xstrndup(p, (size_t)(q - p));
+        p = q + 2;
+        buf args = {0};
+        bool ok = true;
+        for (;;) {
+            p = skip_ascii_ws(p);
+            if (!strncmp(p, invoke_end, sizeof(invoke_end) - 1)) {
+                p += sizeof(invoke_end) - 1;
+                break;
+            }
+            const char *gt = strncmp(p, MM_NS "<", ns + 1) || p[ns + 1] == '/' ? NULL : strchr(p + ns + 1, '>');
+            if (!gt) { ok = false; break; }
+            char *key = xstrndup(p + ns + 1, (size_t)(gt - (p + ns + 1)));
+            p = gt + 1;
+            if (args.len) buf_puts(&args, ", ");
+            json_escape(&args, key);
+            buf_puts(&args, ": ");
+            ok = minimax_parse_element(&p, key, &args, 0, qwen_param_declared_string(orders, name, key));
+            free(key);
+            if (!ok) break;
+        }
+        if (!ok) {
+            free(name);
+            buf_free(&args);
+            return false;
+        }
+        tool_call tc = {0};
+        tc.name = name;
+        buf wrapped = {0};
+        buf_putc(&wrapped, '{');
+        buf_puts(&wrapped, args.ptr ? args.ptr : "");
+        buf_putc(&wrapped, '}');
+        tc.arguments = buf_take(&wrapped);
+        tool_calls_push(calls, tc);
+        buf_free(&args);
+    }
+    if (calls->len == 0) return false;
+    free(calls->raw_tool_text);
+    calls->raw_tool_text = xstrndup(start, (size_t)(p - start));
+    const size_t content_len = (size_t)(start - text);
+    if (recovered_unclosed_tool) {
+        ds4_unterminated_reasoning_before_tool(text, content_len, content_out, reasoning_out);
+    } else {
+        split_reasoning_content(text, content_len, content_out, reasoning_out);
+    }
+    return true;
+}
+
 static bool parse_generated_message_ex_for_syntax(server_model_syntax syntax,
                                                   const char *text,
                                                   bool require_thinking_closed,
@@ -6704,6 +7131,10 @@ static bool parse_generated_message_ex_for_syntax(server_model_syntax syntax,
     if (syntax == SERVER_MODEL_SYNTAX_QWEN) {
         return parse_qwen_generated_message_ex(text, require_thinking_closed,
                                                content_out, reasoning_out, calls, NULL);
+    }
+    if (syntax == SERVER_MODEL_SYNTAX_MINIMAX) {
+        return parse_minimax_generated_message_ex(text, require_thinking_closed,
+                                                  content_out, reasoning_out, calls, NULL);
     }
     return parse_deepseek_generated_message_ex(text, require_thinking_closed,
                                                content_out, reasoning_out,
@@ -6821,6 +7252,9 @@ static bool parse_generated_message_for_response_for_syntax(server_model_syntax 
     bool parsed_ok = syntax == SERVER_MODEL_SYNTAX_QWEN ?
         parse_qwen_generated_message_ex(text, require_thinking_closed,
                                          content_out, reasoning_out, calls, orders) :
+        syntax == SERVER_MODEL_SYNTAX_MINIMAX ?
+        parse_minimax_generated_message_ex(text, require_thinking_closed,
+                                            content_out, reasoning_out, calls, orders) :
         parse_generated_message_ex_for_syntax(syntax,
                                                            text ? text : "",
                                                            require_thinking_closed,
@@ -7211,7 +7645,8 @@ typedef struct {
 
 static bool stream_needs_second_reasoning_guard(const request *r) {
     return ds4_think_mode_enabled(r->think_mode) && r->has_tools &&
-           r->model_syntax != SERVER_MODEL_SYNTAX_QWEN;
+           r->model_syntax != SERVER_MODEL_SYNTAX_QWEN &&
+           r->model_syntax != SERVER_MODEL_SYNTAX_MINIMAX;
 }
 
 static void openai_stream_start(const request *r, openai_stream *st) {
@@ -7413,6 +7848,14 @@ static const dsml_syntax qwen_tool_syntax = {
     "<function=", "</function>", "<parameter=", "</parameter>",
 };
 
+/* Parameter tags are named by their key, so any ns-prefixed tag opens a value
+ * and any ns-prefixed closing tag ends it; tag names are skipped as text.
+ * Nested values track loosely, enough to find the end of the block. */
+static const dsml_syntax minimax_tool_syntax = {
+    MM_TOOL_CALLS_START, MM_TOOL_CALLS_END,
+    MM_NS "<invoke", MM_NS "</invoke>", MM_NS "<", MM_NS "</",
+};
+
 typedef struct {
     dsml_track_mode mode;
     dsml_decode_state decode;
@@ -7429,6 +7872,8 @@ static size_t dsml_max_tool_start_len(void) {
         size_t n = strlen(dsml_syntaxes[i].tool_calls_start);
         if (n > max) max = n;
     }
+    /* MiniMax's start marker is longer than any DSML one. */
+    if (strlen(MM_TOOL_CALLS_START) > max) max = strlen(MM_TOOL_CALLS_START);
     return max;
 }
 
@@ -7621,9 +8066,11 @@ static void dsml_decode_tracker_update(dsml_decode_tracker *dt,
             const dsml_syntax *syn = NULL;
             bool found;
             if (dt->model_syntax == SERVER_MODEL_SYNTAX_GLM ||
-                dt->model_syntax == SERVER_MODEL_SYNTAX_QWEN) {
-                syn = dt->model_syntax == SERVER_MODEL_SYNTAX_QWEN ?
-                    &qwen_tool_syntax : &glm_tool_syntax;
+                dt->model_syntax == SERVER_MODEL_SYNTAX_QWEN ||
+                dt->model_syntax == SERVER_MODEL_SYNTAX_MINIMAX) {
+                syn = dt->model_syntax == SERVER_MODEL_SYNTAX_QWEN ? &qwen_tool_syntax :
+                      dt->model_syntax == SERVER_MODEL_SYNTAX_MINIMAX ? &minimax_tool_syntax :
+                      &glm_tool_syntax;
                 const char *start = find_lit_bounded(raw + dt->pos,
                     raw_len - dt->pos, syn->tool_calls_start);
                 found = start != NULL;
@@ -7727,6 +8174,15 @@ structural:
                 dt->pos = (size_t)(tag_end - raw) + 1;
                 continue;
             }
+            /* MiniMax's param_start (ns + "<") also prefixes its invoke and
+             * end markers; wait until a streamed marker is unambiguous. */
+            if (raw_partial_lit(raw, raw_len, dt->pos, dt->syn->tool_calls_end) ||
+                raw_partial_lit(raw, raw_len, dt->pos, dt->syn->invoke_start) ||
+                raw_partial_lit(raw, raw_len, dt->pos, dt->syn->invoke_end))
+            {
+                dt->decode = DSML_DECODE_STRUCTURAL;
+                return;
+            }
             if (raw_full_lit(raw, raw_len, dt->pos, dt->syn->param_start)) {
                 size_t tag_start = dt->pos;
                 const char *tag_end = memchr(raw + dt->pos, '>', raw_len - dt->pos);
@@ -7737,6 +8193,7 @@ structural:
                 size_t tag_after = (size_t)(tag_end - raw) + 1;
                 bool string_value = dt->model_syntax == SERVER_MODEL_SYNTAX_GLM ||
                     dt->model_syntax == SERVER_MODEL_SYNTAX_QWEN ||
+                    dt->model_syntax == SERVER_MODEL_SYNTAX_MINIMAX ||
                     dsml_attr_is_string_true(raw, raw_len, tag_start, tag_after);
                 dt->pos = tag_after;
                 if (string_value) {
@@ -7761,8 +8218,10 @@ structural:
                 return;
             }
 
-            if (dt->model_syntax == SERVER_MODEL_SYNTAX_GLM) {
-                /* GLM puts function and argument names between tags. */
+            if (dt->model_syntax == SERVER_MODEL_SYNTAX_GLM ||
+                dt->model_syntax == SERVER_MODEL_SYNTAX_MINIMAX) {
+                /* GLM puts function and argument names between tags;
+                 * MiniMax closing tags carry the key name. */
                 dt->pos++;
                 continue;
             }
@@ -9649,6 +10108,9 @@ static size_t text_stream_safe_limit(const char *raw, size_t start,
             for (size_t i = raw_len; i > scan; i--) {
                 if (raw[i - 1] == '<') {
                     size_t marker = i - 1;
+                    /* MiniMax's marker starts "]<]" */
+                    if (raw_partial_lit(raw, raw_len, marker - (marker > start), MM_TOOL_CALLS_START))
+                        marker -= marker > start;
                     if (marker < limit) limit = marker;
                     break;
                 }
@@ -12371,6 +12833,25 @@ static char *build_invalid_tool_call_error_suffix(const request *r,
     }
     if (r && r->model_syntax == SERVER_MODEL_SYNTAX_QWEN) {
         return build_invalid_qwen_tool_error_suffix(r, thinking, detail);
+    }
+    if (r && r->model_syntax == SERVER_MODEL_SYNTAX_MINIMAX) {
+        buf tool_error = {0};
+        buf_puts(&tool_error, "Tool error: invalid tool call");
+        if (detail && detail[0]) {
+            buf_puts(&tool_error, ": ");
+            buf_puts(&tool_error, detail);
+        }
+        buf_puts(&tool_error, "\nThe previous assistant output was not executed because its tool_call "
+                              "block was malformed. Emit a new valid tool_call block, or answer normally "
+                              "if no tool is needed.");
+        buf suffix = {0};
+        if (ds4_think_mode_enabled(r->think_mode) && thinking && thinking->inside) buf_puts(&suffix, "</think>");
+        buf_puts(&suffix, MM_EOS "\n" MM_BOS "tool");
+        append_minimax_tool_response(&suffix, tool_error.ptr ? tool_error.ptr : "", tool_error.len);
+        buf_puts(&suffix, MM_EOS "\n");
+        append_minimax_generation_prompt(&suffix, ds4_think_mode_enabled(r->think_mode));
+        buf_free(&tool_error);
+        return buf_take(&suffix);
     }
     return build_invalid_dsml_tool_error_suffix(r, thinking, detail);
 }
@@ -15172,6 +15653,8 @@ static bool send_models(server *s, int fd) {
     buf b = {0};
     buf_puts(&b, "{\"object\":\"list\",\"data\":[");
     if (ds4_engine_is_deepseek41(s->engine)) {
+        append_model_json(&b, s, server_model_id_from_engine(s->engine));
+    } else if (ds4_engine_is_minimax3(s->engine)) {
         append_model_json(&b, s, server_model_id_from_engine(s->engine));
     } else if (ds4_engine_is_qwen4(s->engine)) {
         append_model_json(&b, s, "qwen3.8-flash-next");
@@ -18640,6 +19123,53 @@ static void test_render_qwen_tool_round_trip(void) {
     chat_msgs_free(&msgs);
 }
 
+/* MiniMax: a sampled message splits into reasoning, content and typed
+ * arguments (nested object, array, schema-declared string), its raw block
+ * re-renders byte-exact, and calls rebuilt from JSON parse back to the same
+ * arguments. */
+static void test_minimax_tool_call_round_trip(void) {
+    const char *generated =
+        "need tools</think>Checking." MM_TOOL_CALLS_START "\n"
+        MM_NS "<invoke name=\"bash\">" MM_NS "<command>echo 42" MM_NS "</command>"
+        MM_NS "<timeout>10" MM_NS "</timeout>" MM_NS "<opts>" MM_NS "<env>" MM_NS "<item>a" MM_NS "</item>"
+        MM_NS "<item>true" MM_NS "</item>" MM_NS "</env>" MM_NS "</opts>" MM_NS "</invoke>\n"
+        MM_NS "<invoke name=\"bash\">" MM_NS "<command>7" MM_NS "</command>" MM_NS "</invoke>\n"
+        MM_TOOL_CALLS_END;
+    tool_schema_orders orders = make_bash_order();
+    char *content = NULL, *reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_minimax_generated_message_ex(generated, true, &content, &reasoning, &calls, &orders));
+    TEST_ASSERT(reasoning && !strcmp(reasoning, "need tools"));
+    TEST_ASSERT(content && !strcmp(content, "Checking."));
+    TEST_ASSERT(calls.len == 2);
+    TEST_ASSERT(!strcmp(calls.v[0].arguments,
+                        "{\"command\": \"echo 42\", \"timeout\": 10, \"opts\": {\"env\": [\"a\", true]}}"));
+    /* command is declared a string, so "7" stays text */
+    TEST_ASSERT(!strcmp(calls.v[1].arguments, "{\"command\": \"7\"}"));
+    buf raw = {0};
+    append_minimax_tool_calls_text(&raw, &calls);
+    TEST_ASSERT(raw.ptr && !strcmp(raw.ptr, strstr(generated, MM_TOOL_CALLS_START)));
+    buf_free(&raw);
+
+    free(calls.raw_tool_text);
+    calls.raw_tool_text = NULL;
+    buf rebuilt = {0};
+    append_minimax_tool_calls_text(&rebuilt, &calls);
+    char *c2 = NULL, *r2 = NULL;
+    tool_calls again = {0};
+    TEST_ASSERT(parse_minimax_generated_message_ex(rebuilt.ptr, false, &c2, &r2, &again, &orders));
+    TEST_ASSERT(again.len == 2 && !strcmp(again.v[0].arguments, calls.v[0].arguments) &&
+                !strcmp(again.v[1].arguments, calls.v[1].arguments));
+    buf_free(&rebuilt);
+    free(c2);
+    free(r2);
+    tool_calls_free(&again);
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+    tool_schema_orders_free(&orders);
+}
+
 static void test_parse_qwen_tool_call_message(void) {
     const char *generated =
         "need bash\n</think>\n\nOK\n\n"
@@ -20723,6 +21253,25 @@ static void test_tool_control_text_inside_arguments(void) {
         tool_calls_free(&calls);
         buf_free(&raw);
     }
+}
+
+static void test_minimax_decode_tracker_markers(void) {
+    /* Sampled text from a live trace; the server reported it as unterminated. */
+    const char *raw = "</think>I'll check." MM_TOOL_CALLS_START "\n"
+        MM_NS "<invoke name=\"bash\">" MM_NS "<command>wc -l /etc/hosts && cat -A /etc/hosts"
+        MM_NS "</command>" MM_NS "</invoke>\n" MM_TOOL_CALLS_END;
+    dsml_decode_tracker tracker;
+    dsml_decode_tracker_init(&tracker);
+    tracker.model_syntax = SERVER_MODEL_SYNTAX_MINIMAX;
+    bool start = false, end = false, orphan = false;
+    size_t len = strlen(raw);
+    for (size_t n = 1; n <= len; n++) {
+        dsml_decode_tracker_update(&tracker, raw, n);
+        char *prefix = xstrndup(raw, n);
+        observe_tool_markers(&tracker, prefix, &start, &end, &orphan);
+        free(prefix);
+    }
+    TEST_ASSERT(start && end && !orphan);
 }
 
 static void test_qwen_decode_tracker_markers(void) {
@@ -23041,8 +23590,10 @@ static void ds4_server_unit_tests_run(void) {
     test_render_glm_chat_prompt_text();
     test_render_qwen_chat_prompt_text();
     test_render_qwen_tool_round_trip();
+    test_minimax_tool_call_round_trip();
     test_qwen_tool_visible_checkpoint_boundary();
     test_qwen_decode_tracker_markers();
+    test_minimax_decode_tracker_markers();
     test_parse_qwen_tool_call_message();
     test_qwen_literal_tool_end_in_argument();
     test_qwen_string_arguments_follow_schema();

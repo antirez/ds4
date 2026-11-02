@@ -24,6 +24,20 @@ static inline float qwen4_silu(float x) {
     return x * qwen4_sigmoid(x);
 }
 
+/* SwiGLU-OAI with the gpt-oss constants MiniMax-M3 uses: g = min(g, 7),
+ * u = clamp(u, -7, 7), g * sigmoid(1.702 g) * (u + 1).  The host checks the
+ * GGUF constants. */
+static inline float qwen4_swiglu_oai(float g, float u) {
+    g = min(g, 7.0f);
+    u = clamp(u, -7.0f, 7.0f);
+    return g / (1.0f + exp(-1.702f * g)) * (u + 1.0f);
+}
+
+/* Expert GLU: act 0 SiLU(g) * u (Qwen), act 1 SwiGLU-OAI (MiniMax-M3).  A
+ * macro, not a function: under fast math, routing the SiLU product through a
+ * helper changes Qwen's generated code and its prefill logits. */
+#define QWEN4_GLU(g, u, act) ((act) == 0u ? qwen4_silu(g) * (u) : qwen4_swiglu_oai((g), (u)))
+
 static inline float qwen4_row_dot(device const char *row, device const float *x,
                                   uint weight_type, uint in_dim, ushort tiisg);
 
@@ -2578,7 +2592,7 @@ struct ds4_metal_args_qwen4_moe {
     uint32_t shared_row_bytes;
     uint32_t n_total_expert;
     uint32_t list_cap;     /* grouped kernels: row stride of the per-expert pair lists */
-    uint32_t pad0;
+    uint32_t act;          /* QWEN4_GLU activation */
 };
 
 /* dot of one quantized expert row with x, lanes split as in the K3 kernels:
@@ -2783,7 +2797,7 @@ kernel void kernel_qwen4_moe_mid(
         const float g = qwen4_row_dot(gb + off, xt, type, dim, tiisg);
         const float u = qwen4_row_dot(ub + off, xt, type, dim, tiisg);
         if (tiisg == 0) {
-            mid[((uint64_t)tok * n_out + slot) * args.out_rows + r] = qwen4_silu(g) * u;
+            mid[((uint64_t)tok * n_out + slot) * args.out_rows + r] = QWEN4_GLU(g, u, args.act);
         }
     }
 }
@@ -2817,7 +2831,7 @@ kernel void kernel_qwen4_moe_mid_q4k(
             const uint64_t off = (uint64_t)r * args.shared_row_bytes;
             const float g = qwen4_row_dot(sh_gate + off, xt, args.shared_type, args.in_dim, tiisg);
             const float u = qwen4_row_dot(sh_up + off, xt, args.shared_type, args.in_dim, tiisg);
-            if (tiisg == 0) mid[mid_base + r] = qwen4_silu(g) * u;
+            if (tiisg == 0) mid[mid_base + r] = QWEN4_GLU(g, u, args.act);
         }
         return;
     }
@@ -2871,7 +2885,7 @@ kernel void kernel_qwen4_moe_mid_q4k(
     for (uint r = 0; r < NR && row0 + r < args.out_rows; r++) {
         const float g = simd_sum(sumg[r]);
         const float u = simd_sum(sumu[r]);
-        if (tiisg == 0) mid[mid_base + row0 + r] = qwen4_silu(g) * u;
+        if (tiisg == 0) mid[mid_base + row0 + r] = QWEN4_GLU(g, u, args.act);
     }
 }
 
@@ -2973,7 +2987,7 @@ static inline void qwen4_moe_mid_q4k_pass(
         for (uint j = 0; j < NJ; j++) {
             const float g = simd_sum(sg_[j][r]);
             const float u = simd_sum(su_[j][r]);
-            if (tiisg == 0) mid[(uint64_t)pairs[j] * args.out_rows + row0 + r] = qwen4_silu(g) * u;
+            if (tiisg == 0) mid[(uint64_t)pairs[j] * args.out_rows + row0 + r] = QWEN4_GLU(g, u, args.act);
         }
     }
 }
@@ -3370,6 +3384,8 @@ struct ds4_metal_args_qwen4_moe_mm {
     uint32_t tiles_per_launch;
     uint32_t tail_base; /* host binds the same value to function constant 905 */
     uint32_t expert_major; /* grid x = tile * row_blocks + row_block, z = 1 */
+    uint32_t act;          /* QWEN4_GLU activation */
+    uint32_t pad0;
 };
 
 /* Threadgroup -> (row block, first tile).  Expert-major order keeps one
@@ -3736,7 +3752,7 @@ kernel void kernel_qwen4_moe_mm_mid(
                 const int pair = list[t0 + tok];
                 const uint t = (uint)pair / args.n_slots, slot = (uint)pair % args.n_slots;
                 const float g = Cs[sg][0][el], u = Cs[sg][1][el];
-                mid[((uint64_t)t * args.n_out + slot) * args.out_rows + row] = qwen4_silu(g) * u;
+                mid[((uint64_t)t * args.n_out + slot) * args.out_rows + row] = QWEN4_GLU(g, u, args.act);
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
@@ -4060,7 +4076,7 @@ kernel void kernel_qwen4_moe_mm_mid_nax_t(
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
 #pragma unroll
-        for (uint16_t i = 0; i < cG.get_capacity(); ++i) { if (cG.is_valid_element(i)) cG[i] = qwen4_silu(cG[i]) * cU[i]; }
+        for (uint16_t i = 0; i < cG.get_capacity(); ++i) { if (cG.is_valid_element(i)) cG[i] = QWEN4_GLU(cG[i], cU[i], args.act); }
         {
             auto tC = tensor(Cs, dextents<int32_t, 2>(NR0, NR1));
             auto mC = tC.slice(0, 0);

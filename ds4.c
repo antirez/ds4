@@ -497,7 +497,7 @@ enum {
     DS4_MAX_EMBD             = 7168,
     DS4_MAX_VOCAB            = 248320,
     DS4_MAX_HEAD             = 128,
-    DS4_MAX_HEAD_KV          = 2,
+    DS4_MAX_HEAD_KV          = 4,
     DS4_MAX_HEAD_DIM         = 576,
     DS4_MAX_VALUE_DIM        = 512,
     DS4_MAX_ROT              = 64,
@@ -527,6 +527,7 @@ typedef enum {
     DS4_MODEL_FAMILY_GLM_DSA   = 1,
     DS4_MODEL_FAMILY_DEEPSEEK41 = 2,
     DS4_MODEL_FAMILY_QWEN4_EXP = 3,
+    DS4_MODEL_FAMILY_MINIMAX3  = 4,
 } ds4_model_family;
 
 typedef enum {
@@ -537,6 +538,7 @@ typedef enum {
     DS4_VARIANT_FLASH41 = 4,
     DS4_VARIANT_QWEN4_EXP = 5,
     DS4_VARIANT_QWEN4_MINI = 6,
+    DS4_VARIANT_MINIMAX31_FLASH = 7,
 } ds4_variant;
 
 typedef struct {
@@ -838,6 +840,40 @@ static const ds4_shape DS4_SHAPE_QWEN4_EXP = {
     .rope_orig_ctx = 262144,
 };
 
+/* MiniMax-M3.1-Flash: 60 layers of GQA attention (64 query heads over 4 KV
+ * heads) with MiniMax Sparse Attention, three dense FFN layers, then
+ * sigmoid-routed MoE (4 of 128 experts plus one shared).  The indexer has one
+ * query head per KV head over a single shared index key; n_swa holds the
+ * 128-token sparse block and n_indexer_top_k the 16 attended blocks. */
+static const ds4_shape DS4_SHAPE_MINIMAX31_FLASH = {
+    .name = "MiniMax-M3.1-Flash",
+    .family = DS4_MODEL_FAMILY_MINIMAX3,
+    .variant = DS4_VARIANT_MINIMAX31_FLASH,
+    .n_layer = 60,
+    .n_embd = 6144,
+    .n_vocab = 200064,
+    .n_head = 64,
+    .n_head_kv = 4,
+    .n_head_dim = 128,
+    .n_value_dim = 128,
+    .n_rot = 64,
+    .n_expert = 128,
+    .n_expert_used = 4,
+    .n_expert_shared = 1,
+    .n_ff_exp = 3072,
+    .n_ff_dense = 12288,
+    .n_leading_dense = 3,
+    .n_swa = 128,
+    .n_indexer_head = 4,
+    .n_indexer_head_dim = 128,
+    .n_indexer_top_k = 16,
+    .rms_eps = 1.0e-6f,
+    .expert_weight_scale = 2.0f,
+    .swiglu_clamp_exp = 7.0f,
+    .rope_freq_base = 10000000.0f,
+    .rope_orig_ctx = 1048576,
+};
+
 /* Synthetic test model: same structure at toy widths, real tokenizer. */
 static const ds4_shape DS4_SHAPE_QWEN4_MINI = {
     .name = "Qwen3.8 Flash Next mini",
@@ -1008,6 +1044,10 @@ static bool ds4_glm53_layer_is_kda(uint32_t il) {
 
 static bool ds4_model_is_qwen4(void) {
     return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4_EXP;
+}
+
+static bool ds4_model_is_minimax3(void) {
+    return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MINIMAX3;
 }
 
 /* Trunk layers repeat 3 GDN + 1 full attention; the MTP block is attention. */
@@ -5346,7 +5386,7 @@ static void tensor_expect_routed_expert(
 
 static bool weights_have_output_head(const ds4_weights *w) {
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ||
-        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 || ds4_model_is_minimax3()) {
         return w && w->output_norm && w->output;
     }
     if (ds4_model_is_qwen4()) {
@@ -5362,7 +5402,7 @@ static bool weights_have_output_head(const ds4_weights *w) {
 
 static bool weights_have_partial_output_head(const ds4_weights *w) {
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ||
-        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 || ds4_model_is_minimax3()) {
         return w && (w->output_norm || w->output);
     }
     if (ds4_model_is_qwen4()) {
@@ -5639,10 +5679,79 @@ static void weights_validate_qwen4_layout(
     }
 }
 
+static bool weights_minimax3_layer_has_required(const ds4_layer_weights *l, uint32_t il) {
+    if (!l || !l->attn_norm || !l->attn_q || !l->attn_k || !l->attn_v || !l->attn_output ||
+        !l->attn_q_norm || !l->attn_k_norm || !l->indexer_q_proj || !l->indexer_k_proj ||
+        !l->indexer_q_norm || !l->indexer_k_norm || !l->ffn_norm) {
+        return false;
+    }
+    if (il < DS4_N_LEADING_DENSE) return l->ffn_gate && l->ffn_up && l->ffn_down;
+    return l->ffn_gate_inp && l->ffn_exp_probs_b && l->ffn_gate_exps && l->ffn_up_exps &&
+           l->ffn_down_exps && l->ffn_gate_shexp && l->ffn_up_shexp && l->ffn_down_shexp;
+}
+
+static void weights_validate_minimax3_layout(
+        const ds4_weights *w,
+        uint32_t           layer_start,
+        uint32_t           layer_end,
+        bool               require_token_embd,
+        bool               require_output) {
+    const uint64_t E = DS4_N_EMBD, D = DS4_N_HEAD_DIM;
+    if (layer_end == UINT32_MAX) layer_end = DS4_N_LAYER - 1u;
+    if (layer_start > layer_end || layer_end >= DS4_N_LAYER) {
+        ds4_die("invalid layer range in MiniMax weight layout validation");
+    }
+    if (require_token_embd && !w->token_embd) ds4_die("required token embedding tensor is missing");
+    if (w->token_embd) tensor_expect_qwen4_dense_layout(w->token_embd, 2, E, DS4_N_VOCAB, 0);
+    const bool have_output = weights_have_output_head(w);
+    if (require_output && !have_output) ds4_die("required output head tensors are missing");
+    if (have_output) {
+        tensor_expect_layout(w->output_norm, DS4_TENSOR_F32, 1, E, 0, 0);
+        tensor_expect_qwen4_dense_layout(w->output, 2, E, DS4_N_VOCAB, 0);
+    }
+    for (uint32_t il = layer_start; il <= layer_end; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        if (!weights_minimax3_layer_has_required(l, il)) {
+            fprintf(stderr, "ds4: required MiniMax tensors for layer %u are missing\n", il);
+            exit(1);
+        }
+        tensor_expect_layout(l->attn_norm, DS4_TENSOR_F32, 1, E, 0, 0);
+        tensor_expect_layout(l->ffn_norm, DS4_TENSOR_F32, 1, E, 0, 0);
+        tensor_expect_qwen4_dense_layout(l->attn_q, 2, E, (uint64_t)DS4_N_HEAD * D, 0);
+        tensor_expect_qwen4_dense_layout(l->attn_k, 2, E, (uint64_t)DS4_N_HEAD_KV * D, 0);
+        tensor_expect_qwen4_dense_layout(l->attn_v, 2, E, (uint64_t)DS4_N_HEAD_KV * D, 0);
+        tensor_expect_qwen4_dense_layout(l->attn_output, 2, (uint64_t)DS4_N_HEAD * D, E, 0);
+        tensor_expect_qwen4_dense_layout(l->indexer_q_proj, 2, E,
+                                         (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM, 0);
+        tensor_expect_qwen4_dense_layout(l->indexer_k_proj, 2, E, DS4_N_INDEXER_HEAD_DIM, 0);
+        tensor_expect_layout(l->attn_q_norm, DS4_TENSOR_F32, 1, D, 0, 0);
+        tensor_expect_layout(l->attn_k_norm, DS4_TENSOR_F32, 1, D, 0, 0);
+        tensor_expect_layout(l->indexer_q_norm, DS4_TENSOR_F32, 1, DS4_N_INDEXER_HEAD_DIM, 0, 0);
+        tensor_expect_layout(l->indexer_k_norm, DS4_TENSOR_F32, 1, DS4_N_INDEXER_HEAD_DIM, 0, 0);
+        if (il < DS4_N_LEADING_DENSE) {
+            tensor_expect_qwen4_dense_layout(l->ffn_gate, 2, E, DS4_N_FF_DENSE, 0);
+            tensor_expect_qwen4_dense_layout(l->ffn_up, 2, E, DS4_N_FF_DENSE, 0);
+            tensor_expect_qwen4_dense_layout(l->ffn_down, 2, DS4_N_FF_DENSE, E, 0);
+            continue;
+        }
+        tensor_expect_layout(l->ffn_gate_inp, DS4_TENSOR_F32, 2, E, DS4_N_EXPERT, 0);
+        tensor_expect_layout(l->ffn_exp_probs_b, DS4_TENSOR_F32, 1, DS4_N_EXPERT, 0, 0);
+        tensor_expect_qwen4_expert_layout(l->ffn_gate_exps, E, DS4_N_FF_EXP, DS4_N_EXPERT);
+        tensor_expect_qwen4_expert_layout(l->ffn_up_exps, E, DS4_N_FF_EXP, DS4_N_EXPERT);
+        tensor_expect_qwen4_expert_layout(l->ffn_down_exps, DS4_N_FF_EXP, E, DS4_N_EXPERT);
+        tensor_expect_qwen4_dense_layout(l->ffn_gate_shexp, 2, E, DS4_N_FF_EXP, 0);
+        tensor_expect_qwen4_dense_layout(l->ffn_up_shexp, 2, E, DS4_N_FF_EXP, 0);
+        tensor_expect_qwen4_dense_layout(l->ffn_down_shexp, 2, DS4_N_FF_EXP, E, 0);
+    }
+}
+
 static bool weights_layer_has_required(const ds4_layer_weights *l, uint32_t il) {
     if (!l) return false;
     if (ds4_model_is_qwen4()) {
         return weights_qwen4_layer_has_required(l, il);
+    }
+    if (ds4_model_is_minimax3()) {
+        return weights_minimax3_layer_has_required(l, il);
     }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         return weights_glm_dsa_layer_has_required(l, il);
@@ -5902,6 +6011,11 @@ static void weights_validate_layout(
     if (ds4_model_is_qwen4()) {
         weights_validate_qwen4_layout(w, layer_start, layer_end,
                                       require_token_embd, require_output);
+        return;
+    }
+    if (ds4_model_is_minimax3()) {
+        weights_validate_minimax3_layout(w, layer_start, layer_end,
+                                         require_token_embd, require_output);
         return;
     }
 
@@ -7153,6 +7267,65 @@ static void config_validate_qwen4_model(const ds4_model *m) {
     }
 }
 
+/* Metadata written by gguf-tools/minimax31_quantize.py.  Every value the
+ * graph hard-codes is checked here so a different checkpoint fails at load. */
+static void config_validate_minimax3_model(const ds4_model *m) {
+    g_ds4_shape = DS4_SHAPE_MINIMAX31_FLASH;
+    memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
+    const char *a = "minimax-m3";
+    char key[128];
+    /* Validation GGUFs keep a prefix of the layers (gguf-tools/minimax31_truncate.py)
+     * so the graph can be compared with the NumPy reference on machines that
+     * cannot hold all 60. */
+    const uint32_t n_layer = required_u32(m, "minimax-m3.block_count");
+    if (n_layer > DS4_SHAPE_MINIMAX31_FLASH.n_layer || n_layer <= DS4_SHAPE_MINIMAX31_FLASH.n_leading_dense) {
+        fprintf(stderr, "ds4: minimax-m3 block_count %u is outside 4..60\n", n_layer);
+        exit(1);
+    }
+    if (n_layer < DS4_SHAPE_MINIMAX31_FLASH.n_layer)
+        fprintf(stderr, "ds4: warning: truncated MiniMax validation model with %u of 60 layers\n", n_layer);
+    g_ds4_shape.n_layer = n_layer;
+#define MM3_U32(name_, expected_) do { \
+        snprintf(key, sizeof(key), "%s.%s", a, name_); \
+        config_expect_u32(name_, required_u32(m, key), (expected_)); \
+    } while (0)
+#define MM3_F32(name_, expected_) do { \
+        snprintf(key, sizeof(key), "%s.%s", a, name_); \
+        config_expect_f32(name_, required_f32(m, key), (expected_)); \
+    } while (0)
+    MM3_U32("block_count", DS4_N_LAYER);
+    MM3_U32("embedding_length", DS4_N_EMBD);
+    MM3_U32("vocab_size", DS4_N_VOCAB);
+    MM3_U32("feed_forward_length", DS4_N_FF_DENSE);
+    MM3_U32("expert_feed_forward_length", DS4_N_FF_EXP);
+    MM3_U32("expert_count", DS4_N_EXPERT);
+    MM3_U32("expert_used_count", DS4_N_EXPERT_USED);
+    MM3_U32("expert_shared_count", DS4_N_EXPERT_SHARED);
+    MM3_U32("leading_dense_block_count", DS4_N_LEADING_DENSE);
+    MM3_F32("expert_weights_scale", DS4_EXPERT_WEIGHT_SCALE);
+    MM3_F32("swiglu_alpha", 1.702f);   /* the Metal SwiGLU-OAI kernels fix both constants */
+    MM3_F32("swiglu_limit", DS4_SWIGLU_CLAMP_EXP);
+    MM3_U32("attention.head_count", DS4_N_HEAD);
+    MM3_U32("attention.head_count_kv", DS4_N_HEAD_KV);
+    MM3_U32("attention.key_length", DS4_N_HEAD_DIM);
+    MM3_U32("attention.value_length", DS4_N_VALUE_DIM);
+    MM3_U32("rope.dimension_count", DS4_N_ROT);
+    MM3_F32("rope.freq_base", DS4_ROPE_FREQ_BASE);
+    MM3_U32("attention.indexer.head_count", DS4_N_INDEXER_HEAD);
+    MM3_U32("attention.indexer.key_length", DS4_N_INDEXER_HEAD_DIM);
+    MM3_U32("attention.sparse.block_size", DS4_N_SWA);
+    MM3_U32("attention.sparse.top_k_blocks", DS4_N_INDEXER_TOP_K);
+    MM3_U32("attention.sparse.init_blocks", 0);
+    MM3_U32("attention.sparse.local_blocks", 1);
+#undef MM3_U32
+#undef MM3_F32
+    snprintf(key, sizeof(key), "%s.attention.layer_norm_rms_epsilon", a);
+    config_expect_epsilon("attention.layer_norm_rms_epsilon", required_f32(m, key), DS4_RMS_EPS);
+    snprintf(key, sizeof(key), "%s.expert_weights_norm", a);
+    bool norm = false;
+    if (!model_get_bool(m, key, &norm) || !norm) ds4_die("minimax-m3 expects normalized expert weights");
+}
+
 static void config_validate_model(const ds4_model *m) {
     g_ds4_flash_vision_exp = false;
     ds4_str arch = {0};
@@ -7171,6 +7344,10 @@ static void config_validate_model(const ds4_model *m) {
         }
         if (ds4_streq(arch, "qwen4exp")) {
             config_validate_qwen4_model(m);
+            return;
+        }
+        if (ds4_streq(arch, "minimax-m3")) {
+            config_validate_minimax3_model(m);
             return;
         }
     }
@@ -7662,7 +7839,7 @@ static void weights_bind_output(
             w->output         = model_find_tensor(m, "output.weight");
         }
     } else if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ||
-        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 || ds4_model_is_minimax3()) {
 
         if (required) {
             w->output_norm = required_tensor(m, "output_norm.weight");
@@ -7825,9 +8002,42 @@ static void weights_bind_qwen4_layer(ds4_layer_weights *l, const ds4_model *m, u
     }
 }
 
+static void weights_bind_minimax3_layer(ds4_layer_weights *l, const ds4_model *m, uint32_t il) {
+    l->attn_norm      = required_tensorf(m, "blk.%u.attn_norm.weight", il);
+    l->attn_q         = required_tensorf(m, "blk.%u.attn_q.weight", il);
+    l->attn_k         = required_tensorf(m, "blk.%u.attn_k.weight", il);
+    l->attn_v         = required_tensorf(m, "blk.%u.attn_v.weight", il);
+    l->attn_output    = required_tensorf(m, "blk.%u.attn_output.weight", il);
+    l->attn_q_norm    = required_tensorf(m, "blk.%u.attn_q_norm.weight", il);
+    l->attn_k_norm    = required_tensorf(m, "blk.%u.attn_k_norm.weight", il);
+    l->indexer_q_proj = required_tensorf(m, "blk.%u.indexer.q_proj.weight", il);
+    l->indexer_k_proj = required_tensorf(m, "blk.%u.indexer.k_proj.weight", il);
+    l->indexer_q_norm = required_tensorf(m, "blk.%u.indexer.q_norm.weight", il);
+    l->indexer_k_norm = required_tensorf(m, "blk.%u.indexer.k_norm.weight", il);
+    l->ffn_norm       = required_tensorf(m, "blk.%u.ffn_norm.weight", il);
+    if (il < DS4_N_LEADING_DENSE) {
+        l->ffn_gate = required_tensorf(m, "blk.%u.ffn_gate.weight", il);
+        l->ffn_up   = required_tensorf(m, "blk.%u.ffn_up.weight", il);
+        l->ffn_down = required_tensorf(m, "blk.%u.ffn_down.weight", il);
+        return;
+    }
+    l->ffn_gate_inp    = required_tensorf(m, "blk.%u.ffn_gate_inp.weight", il);
+    l->ffn_exp_probs_b = required_tensorf(m, "blk.%u.exp_probs_b.bias", il);
+    l->ffn_gate_exps   = required_tensorf(m, "blk.%u.ffn_gate_exps.weight", il);
+    l->ffn_up_exps     = required_tensorf(m, "blk.%u.ffn_up_exps.weight", il);
+    l->ffn_down_exps   = required_tensorf(m, "blk.%u.ffn_down_exps.weight", il);
+    l->ffn_gate_shexp  = required_tensorf(m, "blk.%u.ffn_gate_shexp.weight", il);
+    l->ffn_up_shexp    = required_tensorf(m, "blk.%u.ffn_up_shexp.weight", il);
+    l->ffn_down_shexp  = required_tensorf(m, "blk.%u.ffn_down_shexp.weight", il);
+}
+
 static void weights_bind_layer(ds4_layer_weights *l, const ds4_model *m, uint32_t il) {
     if (ds4_model_is_qwen4()) {
         weights_bind_qwen4_layer(l, m, il);
+        return;
+    }
+    if (ds4_model_is_minimax3()) {
+        weights_bind_minimax3_layer(l, m, il);
         return;
     }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
@@ -40449,6 +40659,25 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
         return m;
     }
 
+    if (ds4_backend_uses_graph(backend) && ds4_model_is_minimax3()) {
+        /* mirrors mm3_graph_alloc: f16 K/V and an f32 indexer key per token
+         * and layer; transients scale with the prefill chunk */
+        const uint64_t T = prefill_chunk ? prefill_chunk : 1024u;
+        const uint64_t E = DS4_N_EMBD, q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+        const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM, slots = DS4_N_EXPERT_USED + 1u;
+        const uint64_t blocks = ctx / DS4_N_SWA + 1u;
+        m.prefill_cap = (uint32_t)T;
+        m.raw_cap = ctx;
+        m.comp_cap = (uint32_t)blocks;
+        m.raw_bytes = (uint64_t)DS4_N_LAYER * ctx * kv_dim * 2u * sizeof(uint16_t);
+        m.compressed_bytes = (uint64_t)DS4_N_LAYER * ctx * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+        m.scratch_bytes = (T * (4u * E + 3u * q_dim + 2u * kv_dim + 2u * 512u + 128u + 3u * DS4_N_FF_DENSE +
+                                DS4_N_EXPERT + slots * (E + DS4_N_FF_EXP) + DS4_N_INDEXER_HEAD * blocks) +
+                           (uint64_t)DS4_N_EXPERT * T + DS4_N_VOCAB) * sizeof(float);
+        m.total_bytes = m.raw_bytes + m.compressed_bytes + m.scratch_bytes;
+        return m;
+    }
+
     if (ds4_backend_uses_graph(backend)) {
 #ifdef DS4_HAS_DEEPSEEK41_GPU
         if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41)
@@ -43245,6 +43474,7 @@ struct ds4_engine {
     /* Qwen keeps the same idea in its own graph shape; the first session
      * allocates the arena and hands ownership here. */
     struct ds4_qwen4_gpu_graph *qwen4_shared_workspace;
+    struct mm3_stream *mm3_stream;     /* MiniMax SSD streaming expert pool */
     uint32_t qwen4_arena_users;   /* live sessions borrowing the shared workspace */
     /* batched speculative policy: the drafts' measured acceptance and the
      * wall time of a plain and of a speculative batched cycle */
@@ -44137,6 +44367,135 @@ static void bpe_tokenize_text_qwen35(const ds4_vocab *vocab, const char *text, t
     }
 }
 
+#include "ds4_minimax3_unicode.inc"
+
+#define DS4_MINIMAX3_CLASS(name_, cp_) \
+    qwen4_urange_has(ds4_minimax3_##name_##_ranges, \
+                     sizeof(ds4_minimax3_##name_##_ranges) / sizeof(ds4_minimax3_##name_##_ranges[0]), (cp_))
+
+/* (?i:'s|'t|'re|'ve|'m|'ll|'d) at pos: end of the suffix, or pos. */
+static uint64_t minimax3_contraction(const char *s, uint64_t len, uint64_t pos) {
+    if (pos + 1 >= len || s[pos] != '\'') return pos;
+    const uint32_t c1 = ascii_tolower_cp((uint8_t)s[pos + 1]);
+    if (c1 == 's' || c1 == 't' || c1 == 'm' || c1 == 'd') return pos + 2;
+    if (pos + 2 >= len) return pos;
+    const uint32_t c2 = ascii_tolower_cp((uint8_t)s[pos + 2]);
+    if ((c1 == 'r' && c2 == 'e') || (c1 == 'v' && c2 == 'e') || (c1 == 'l' && c2 == 'l')) return pos + 3;
+    return pos;
+}
+
+/* One cased-word alternative at q, U = [Lu Lt Lm Lo M], L = [Ll Lm Lo M]:
+ * second=false is U*L+c?, second=true is U+L*c? (c the contraction).
+ * Lm/Lo/M are in both classes, so for U*L+ the greedy U run backtracks to
+ * its last L member when the char after it is not in L.  Returns the match
+ * end, or 0 when the alternative fails. */
+static uint64_t minimax3_word(const char *s, uint64_t len, uint64_t q, bool second) {
+    uint64_t p = q, last_l = UINT64_MAX;
+    while (p < len) {
+        qwen4_char_info c = qwen4_char_at(s, len, p);
+        if (!c.valid || !DS4_MINIMAX3_CLASS(upper, c.cp)) break;
+        if (DS4_MINIMAX3_CLASS(lower, c.cp)) last_l = p;
+        p = c.next;
+    }
+    qwen4_char_info after = qwen4_char_at(s, len, p);
+    const bool l_after = after.valid && DS4_MINIMAX3_CLASS(lower, after.cp);
+    uint64_t end;
+    if (second) {
+        if (p == q) return 0;
+        end = p;
+    } else if (l_after) {
+        end = p;
+    } else if (last_l != UINT64_MAX) {
+        end = last_l;
+    } else {
+        return 0;
+    }
+    while (end < len) {
+        qwen4_char_info c = qwen4_char_at(s, len, end);
+        if (!c.valid || !DS4_MINIMAX3_CLASS(lower, c.cp)) break;
+        end = c.next;
+    }
+    return minimax3_contraction(s, len, end);
+}
+
+/* MiniMax-M3 pre-tokenization (tokenizer.ggml.pre = "minimax-m2"), the
+ * o200k-style ordered alternation
+ *   [^\r\n\p{L}\p{N}]?U*L+c? | [^\r\n\p{L}\p{N}]?U+L*c? | \p{N}{1,3} |
+ *    ?[^\s\p{L}\p{N}]+[\r\n/]* | \s*[\r\n]+ | \s+(?!\S) | \s+
+ * shortcut: no NFC normalization of the input (tokenizer.json asks for NFC);
+ * add it if decomposed text shows up in prompts. */
+static void bpe_tokenize_text_minimax3(const ds4_vocab *vocab, const char *text, token_vec *out) {
+    const uint64_t len = strlen(text);
+    uint64_t pos = 0;
+    while (pos < len) {
+        const uint64_t start = pos;
+        qwen4_char_info cur = qwen4_char_at(text, len, pos);
+        if (!cur.valid) break;
+
+        /* each word alternative tries its optional prefix first, in order */
+        const bool prefix = cur.cp != '\r' && cur.cp != '\n' && !cur.letter && !cur.number && cur.next < len;
+        uint64_t end = 0;
+        for (int alt = 0; alt < 2 && !end; alt++) {
+            if (prefix) end = minimax3_word(text, len, cur.next, alt);
+            if (!end) end = minimax3_word(text, len, pos, alt);
+        }
+        if (end) {
+            pos = end;
+            bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
+            continue;
+        }
+
+        if (cur.number) {
+            pos = cur.next;
+            for (int n = 1; n < 3 && pos < len; n++) {
+                qwen4_char_info c = qwen4_char_at(text, len, pos);
+                if (!c.valid || !c.number) break;
+                pos = c.next;
+            }
+            bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
+            continue;
+        }
+
+        {
+            uint64_t p = cur.cp == ' ' ? cur.next : pos;
+            qwen4_char_info c = qwen4_char_at(text, len, p);
+            if (c.valid && !c.space && !c.letter && !c.number) {
+                while (p < len) {
+                    c = qwen4_char_at(text, len, p);
+                    if (!c.valid || c.space || c.letter || c.number) break;
+                    p = c.next;
+                }
+                while (p < len && (text[p] == '\r' || text[p] == '\n' || text[p] == '/')) p++;
+                pos = p;
+                bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
+                continue;
+            }
+        }
+
+        if (cur.space) {
+            uint64_t p = pos, last_newline_end = 0, last_ws_start = pos;
+            int nspace = 0;
+            while (p < len) {
+                qwen4_char_info scan = qwen4_char_at(text, len, p);
+                if (!scan.valid || !scan.space) break;
+                last_ws_start = p;
+                if (scan.cp == '\r' || scan.cp == '\n') last_newline_end = scan.next;
+                p = scan.next;
+                nspace++;
+            }
+            if (last_newline_end) pos = last_newline_end;
+            else if (nspace > 1 && p < len) pos = last_ws_start;
+            else pos = p;
+            bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
+            continue;
+        }
+
+        pos = cur.next;
+        if (pos == start) pos = next_utf8_char(text, len, pos);
+        bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
+    }
+}
+
 /*
  * DeepSeek V4 Flash declares tokenizer.ggml.pre = "joyai-llm".  The split
  * below mirrors the JoyAI BPE pre-tokenizer for the cases this model
@@ -44162,6 +44521,10 @@ static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_ve
     }
     if (ds4_model_is_qwen4()) {
         bpe_tokenize_text_qwen35(vocab, text, out);
+        return;
+    }
+    if (ds4_model_is_minimax3()) {
+        bpe_tokenize_text_minimax3(vocab, text, out);
         return;
     }
 
@@ -44310,6 +44673,36 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
         vocab->arg_key_end_id = -1;
         vocab->arg_value_start_id = -1;
         vocab->arg_value_end_id = -1;
+        vocab->dsml_id = -1;
+        return;
+    }
+
+    if (ds4_model_is_minimax3()) {
+        /* ]~b] opens every role block and [e~[ closes it; ]~!b[ (kept in
+         * sop_id) starts the document once.  Thinking uses <mm:think>, which
+         * ds4 spells <think> so every think-aware path (server parsers and
+         * streams, CLI display) handles it unchanged.  The template never
+         * emits its plain <think> tokens; they are renamed out of the way.
+         * Token ids are untouched, so prompts stay template-exact. */
+        static const char *const rename[][2] = {
+            {"<think>", "<|minimax_unused_think|>"}, {"</think>", "<|minimax_unused_think_end|>"},
+            {"<mm:think>", "<think>"}, {"</mm:think>", "</think>"},
+        };
+        for (size_t i = 0; i < sizeof(rename) / sizeof(rename[0]); i++) {
+            const int id = vocab_lookup(vocab, rename[i][0]);
+            vocab->token[id] = (ds4_str){ rename[i][1], strlen(rename[i][1]) };
+            table_put(&vocab->token_to_id, vocab->token[id], id);
+        }
+        vocab->bos_id = vocab_lookup(vocab, "]~b]");
+        vocab->eos_id = vocab_lookup(vocab, "[e~[");
+        vocab->sop_id = vocab_lookup(vocab, "]~!b[");
+        vocab->think_start_id = vocab_lookup(vocab, "<think>");
+        vocab->think_end_id = vocab_lookup(vocab, "</think>");
+        vocab->system_id = vocab->user_id = vocab->assistant_id = vocab->observation_id = -1;
+        vocab->tool_call_start_id = vocab->tool_call_end_id = -1;
+        vocab->tool_response_start_id = vocab->tool_response_end_id = -1;
+        vocab->arg_key_start_id = vocab->arg_key_end_id = -1;
+        vocab->arg_value_start_id = vocab->arg_value_end_id = -1;
         vocab->dsml_id = -1;
         return;
     }
@@ -44467,12 +44860,108 @@ static void qwen4_chat_system(const ds4_vocab *vocab, const char *system, ds4_th
     qwen4_chat_close(vocab, out);
 }
 
+/* MiniMax-M3.1 chat (chat_template.jinja): a root system block with the
+ * fixed identity and thinking instructions, a developer block carrying the
+ * caller's system prompt (or the default identity), then user/ai/tool
+ * blocks, each "]~b]role\n ... [e~[\n".  Thinking is adaptive: the template
+ * adds no prefix, and a disabled turn starts right after </mm:think>.  The
+ * think tokens are spelled <think></think> here (see vocab_load). */
+static const char *DS4_MINIMAX3_ROOT_SYSTEM =
+    "Your model version is MiniMax-M3.1, developed by MiniMax. Knowledge cutoff: January 2026. "
+    "Founded in early 2022, MiniMax is a global AI foundation model company committed to "
+    "advancing the frontiers of AI towards AGI."
+    "\n\n<thinking_instructions>\n"
+    "You have a thinking capability that allows you to reason step by step before responding. "
+    "When thinking is enabled, wrap your reasoning in <think></think> tags before your "
+    "response. When thinking is disabled, begin your response directly after the </think> "
+    "prefix. When thinking is adaptive, decide on your own whether to think for the current turn.\n"
+    "Current thinking mode: adaptive. You are encouraged to think for complex decision-making, "
+    "multi-step reasoning, or when analyzing function/tool results.\n"
+    "</thinking_instructions>"
+    "\n\n<model_id>8bb8149fe</model_id>";
+
+/* reasoning_effort for the root block; HIGH keeps the template default */
+static const char *minimax3_effort(ds4_think_mode mode) {
+    switch (mode) {
+    case DS4_THINK_LOW:    return "low";
+    case DS4_THINK_MEDIUM: return "medium";
+    case DS4_THINK_MAX:    return "max";
+    default:               return NULL;
+    }
+}
+
+static void minimax3_chat_open(const ds4_vocab *vocab, const char *role, token_vec *out) {
+    token_vec_push(out, vocab->bos_id);
+    bpe_tokenize_text(vocab, role, out);
+    bpe_tokenize_text(vocab, "\n", out);
+}
+
+static void minimax3_chat_close(const ds4_vocab *vocab, token_vec *out) {
+    token_vec_push(out, vocab->eos_id);
+    bpe_tokenize_text(vocab, "\n", out);
+}
+
+static void tokenize_rendered_chat_vocab(const ds4_vocab *vocab, const char *text, token_vec *out);
+
+static void minimax3_chat_begin(const ds4_vocab *vocab, token_vec *out) {
+    token_vec_push(out, vocab->sop_id);
+    minimax3_chat_open(vocab, "system", out);
+    tokenize_rendered_chat_vocab(vocab, DS4_MINIMAX3_ROOT_SYSTEM, out);
+}
+
+/* The root block stays open after begin so the effort tag can follow it;
+ * the first later block closes it, and a conversation that brings no system
+ * prompt gets the template's default developer block. */
+static void minimax3_chat_settle(const ds4_vocab *vocab, token_vec *out, bool developer) {
+    int opened = 0;
+    bool closed = false;
+    for (int i = 0; i < out->len; i++) {
+        opened += out->v[i] == vocab->bos_id;
+        closed |= out->v[i] == vocab->eos_id;
+    }
+    if (!closed) minimax3_chat_close(vocab, out);
+    if (opened == 1 && !developer) {
+        minimax3_chat_open(vocab, "developer", out);
+        bpe_tokenize_text(vocab, "You are a helpful assistant.", out);
+        minimax3_chat_close(vocab, out);
+    }
+}
+
+static void minimax3_chat_think_prefix(const ds4_vocab *vocab, ds4_think_mode mode, token_vec *out) {
+    const char *effort = minimax3_effort(mode);
+    if (!effort) return;
+    bpe_tokenize_text(vocab, "\n\n<effort>", out);
+    bpe_tokenize_text(vocab, effort, out);
+    bpe_tokenize_text(vocab, "</effort>", out);
+}
+
+static void minimax3_chat_assistant_prefix(const ds4_vocab *vocab, ds4_think_mode mode, token_vec *out) {
+    minimax3_chat_settle(vocab, out, false);
+    minimax3_chat_open(vocab, "ai", out);
+    if (!ds4_think_mode_enabled(mode)) token_vec_push(out, vocab->think_end_id);
+}
+
 static void encode_chat_prompt(
         const ds4_vocab *vocab,
         const char      *system,
         const char      *prompt,
         ds4_think_mode   think_mode,
         token_vec       *out) {
+    if (ds4_model_is_minimax3()) {
+        minimax3_chat_begin(vocab, out);
+        minimax3_chat_think_prefix(vocab, think_mode, out);
+        minimax3_chat_settle(vocab, out, system && system[0]);
+        if (system && system[0]) {
+            minimax3_chat_open(vocab, "developer", out);
+            bpe_tokenize_text(vocab, system, out);
+            minimax3_chat_close(vocab, out);
+        }
+        minimax3_chat_open(vocab, "user", out);
+        bpe_tokenize_text(vocab, prompt, out);
+        minimax3_chat_close(vocab, out);
+        minimax3_chat_assistant_prefix(vocab, think_mode, out);
+        return;
+    }
     if (ds4_model_is_qwen4()) {
         if (vocab->im_start_id < 0 || vocab->im_end_id < 0 ||
             vocab->think_start_id < 0 || vocab->think_end_id < 0) {
@@ -44524,6 +45013,24 @@ void ds4_tokenize_text(ds4_engine *e, const char *text, ds4_tokens *out) {
 }
 
 static bool special_token_at(const ds4_vocab *vocab, const char *p, int *token, size_t *len) {
+    if (ds4_model_is_minimax3()) {
+        /* Every MiniMax added token (ids 200000 up) matches by its text, as
+         * tokenizer.json marks none of them normalized; they all start with
+         * '<', ']' or '['.  shortcut: linear scan of the 61 ids, add an index
+         * if rendered chats get large. */
+        if (*p != '<' && *p != ']' && *p != '[') return false;
+        size_t best = 0;
+        for (int id = 200000; id < vocab->n_vocab; id++) {
+            const ds4_str t = vocab->token[id];
+            if (t.len > best && t.ptr[0] == *p && strncmp(p, t.ptr, t.len) == 0) {
+                best = t.len;
+                *token = id;
+            }
+        }
+        if (!best) return false;
+        *len = best;
+        return true;
+    }
     struct special {
         const char *text;
         int token;
@@ -44602,6 +45109,10 @@ void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *out
 }
 
 void ds4_chat_begin(ds4_engine *e, ds4_tokens *tokens) {
+    if (ds4_model_is_minimax3()) {
+        minimax3_chat_begin(&e->vocab, tokens);
+        return;
+    }
     chat_push_bos_sequence(&e->vocab, tokens);
 }
 
@@ -44619,6 +45130,10 @@ void ds4_chat_append_max_effort_prefix(ds4_engine *e, ds4_tokens *tokens) {
 }
 
 void ds4_chat_append_think_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode mode) {
+    if (ds4_model_is_minimax3()) {
+        minimax3_chat_think_prefix(&e->vocab, mode, tokens);
+        return;
+    }
     chat_push_think_prefix(&e->vocab, mode, tokens);
 }
 
@@ -44669,6 +45184,31 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
     ds4_vocab *vocab = &e->vocab;
     if (!role) role = "user";
     if (!content) content = "";
+
+    if (ds4_model_is_minimax3()) {
+        const bool developer = !strcmp(role, "system") || !strcmp(role, "developer");
+        minimax3_chat_settle(vocab, tokens, developer);
+        if (!strcmp(role, "tool") || !strcmp(role, "function")) {
+            /* shortcut: one tool block per result; the template merges
+             * consecutive results into one block.  Merge if parallel tool
+             * calls show quality problems. */
+            minimax3_chat_open(vocab, "tool", tokens);
+            tokens->len--;   /* the tool block has no newline before <response> */
+            bpe_tokenize_text(vocab, "\n<response>", tokens);
+            bpe_tokenize_wrapped_payload_text(vocab, content, "</response>", tokens);
+            bpe_tokenize_text(vocab, "</response>", tokens);
+        } else if (!strcmp(role, "assistant")) {
+            minimax3_chat_open(vocab, "ai", tokens);
+            if (strncmp(content, "<think>", 7) != 0 && strncmp(content, "</think>", 8) != 0)
+                token_vec_push(tokens, vocab->think_end_id);
+            tokenize_rendered_chat_vocab(vocab, content, tokens);
+        } else {
+            minimax3_chat_open(vocab, developer ? "developer" : "user", tokens);
+            bpe_tokenize_text(vocab, content, tokens);
+        }
+        minimax3_chat_close(vocab, tokens);
+        return;
+    }
 
     if (ds4_model_is_qwen4()) {
         if (!strcmp(role, "tool") || !strcmp(role, "function")) {
@@ -44736,6 +45276,10 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
 }
 
 void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode think_mode) {
+    if (ds4_model_is_minimax3()) {
+        minimax3_chat_assistant_prefix(&e->vocab, think_mode, tokens);
+        return;
+    }
     if (ds4_model_is_qwen4()) {
         qwen4_chat_assistant_prefix(&e->vocab, think_mode, tokens);
         return;
@@ -60289,6 +60833,811 @@ static int generate_qwen4_metal_argmax(
 
 #endif
 
+#ifdef DS4_HAS_QWEN4_METAL
+/* ===================== MiniMax-M3.1-Flash Metal graph =====================
+ * Plain residual stream: x += attn(rms(x)); x += ffn(rms(x)).  Attention is
+ * MiniMax Sparse Attention over full per-token caches: f16 K/V per KV head
+ * and one f32 indexer key per token, all normed and rotated at append time,
+ * so rewinding is just moving pos back.  The indexer picks 16 blocks of 128
+ * tokens per KV head; with at most 16 visible blocks that is every block, so
+ * short contexts are exact dense attention.  Routed experts run through the
+ * qwen4 MoE kernels with the SwiGLU-OAI activation. */
+
+/* SSD streaming of the routed experts.  Non-routed weights stay mapped from
+ * the GGUF; routed experts live in an explicit resident pool filled with
+ * pread from a page-cache-bypassing descriptor, so the file cache never
+ * competes with the pool.  Each MoE layer reads the router's choice back,
+ * loads the missing experts and runs the unchanged MoE kernels on the pool:
+ *  - decode rows: the selected ids are rewritten to pool slots;
+ *  - prefill chunks: the grouped kernels index experts 0..127 directly, so the
+ *    chunk's experts are gathered in natural order into the pool's last 128
+ *    slots (the layer region), which decode uses as ordinary slots.
+ * Pool slots are evicted least recently used, never from the current layer. */
+enum { MM3_EXPERTS = 128 };              /* checked against the GGUF at create */
+
+typedef struct mm3_stream {
+    int fd;
+    uint32_t n_slots;
+    uint64_t gate_bytes, down_bytes;        /* one expert: gate (= up) and down */
+    uint64_t file_off[DS4_MAX_LAYER][3];    /* gate, up, down tensors in the GGUF */
+    uint8_t *pool;                          /* [gate][up][down] parts of n_slots experts */
+    uint64_t pool_bytes;
+    int32_t *slot;                          /* [layer * N_EXPERT + e] -> slot, -1 */
+    uint32_t *owner;                        /* slot -> layer * N_EXPERT + e */
+    uint64_t *stamp;                        /* slot -> last use */
+    uint32_t n_used;
+    uint64_t clock;
+    uint64_t hits, misses, read_bytes;
+    double read_ms;
+    struct mm3_prefetch *pf;
+} mm3_stream;
+
+typedef struct {
+    uint8_t *dst;
+    const uint8_t *src;                     /* NULL: pread file_off */
+    uint64_t file_off, bytes;
+} mm3_stream_job;
+
+typedef struct {
+    int fd;
+    const mm3_stream_job *jobs;
+    volatile int failed;
+} mm3_stream_batch;
+
+/* Reads go out in chunks so a layer missing one or two experts still keeps
+ * the SSD queue deep; job i of a batch is chunks i * MM3_READ_SPLIT.. */
+enum { MM3_READ_SPLIT = 8 };
+
+static void mm3_stream_job_run(void *ctx, size_t i) {
+    mm3_stream_batch *b = ctx;
+    const mm3_stream_job *j = &b->jobs[i / MM3_READ_SPLIT];
+    /* the last chunk takes the remainder */
+    const uint64_t c = i % MM3_READ_SPLIT, chunk = (j->bytes + MM3_READ_SPLIT - 1) / MM3_READ_SPLIT;
+    const uint64_t beg = c * chunk, end = c + 1 == MM3_READ_SPLIT ? j->bytes : (c + 1) * chunk;
+    if (beg >= j->bytes) return;
+    if (j->src) {
+        memcpy(j->dst + beg, j->src + beg, (size_t)(end - beg));
+        return;
+    }
+    for (uint64_t done = beg; done < end;) {
+        const ssize_t r = pread(b->fd, j->dst + done, (size_t)(end - done), (off_t)(j->file_off + done));
+        if (r > 0) done += (uint64_t)r;
+        else if (r < 0 && errno == EINTR) continue;
+        else { b->failed = 1; return; }
+    }
+}
+
+static bool mm3_stream_run(mm3_stream *s, const mm3_stream_job *jobs, size_t n) {
+    if (n == 0) return true;
+    mm3_stream_batch b = { s->fd, jobs, 0 };
+    dispatch_apply_f(n * MM3_READ_SPLIT, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &b,
+                     mm3_stream_job_run);
+    if (b.failed) fprintf(stderr, "ds4: MiniMax expert read failed: %s\n", strerror(errno));
+    return !b.failed;
+}
+
+/* Decode prefetch: after layer il's reads, the experts that layer il + 1's
+ * router picks on the current residual (a cheap, usually right guess) are
+ * read in the background while the GPU finishes il and runs il + 1's
+ * attention.  Their slots are claimed up front; the next plan waits for the
+ * reads and simply forgets the slots of a failed read. */
+typedef struct mm3_prefetch {
+    dispatch_group_t group;
+    mm3_stream_batch batch;
+    mm3_stream_job jobs[3 * MM3_EXPERTS];
+    size_t nj;
+    uint32_t keys[MM3_EXPERTS], n_keys;      /* layer * N_EXPERT + e being read */
+    bool pending;
+    uint8_t *fresh;                          /* slot -> 1 prefetched, not used yet; 2 still reading */
+    uint64_t issued, used;
+    double wait_ms;                          /* decode time spent waiting on prefetch */
+} mm3_prefetch;
+
+static void mm3_stream_prefetch_run(void *ctx) {
+    mm3_prefetch *pf = ctx;
+    dispatch_apply_f(pf->nj * MM3_READ_SPLIT, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &pf->batch,
+                     mm3_stream_job_run);
+}
+
+/* False when the reads failed: their slots are forgotten, so experts a plan
+ * already counted as arriving are not there. */
+static bool mm3_stream_prefetch_wait(mm3_stream *s) {
+    mm3_prefetch *pf = s->pf;
+    if (!pf || !pf->pending) return true;
+    const double t0 = now_sec();
+    dispatch_group_wait(pf->group, DISPATCH_TIME_FOREVER);
+    pf->wait_ms += (now_sec() - t0) * 1000.0;
+    pf->pending = false;
+    const bool failed = pf->batch.failed;
+    if (failed) fprintf(stderr, "ds4: MiniMax expert prefetch read failed\n");
+    for (uint32_t i = 0; i < pf->n_keys; i++) {
+        const int32_t slot = s->slot[pf->keys[i]];
+        if (slot < 0) continue;
+        if (!failed) {
+            if (pf->fresh[slot] == 2) pf->fresh[slot] = 1;
+            continue;
+        }
+        s->owner[slot] = UINT32_MAX;
+        pf->fresh[slot] = 0;
+        s->slot[pf->keys[i]] = -1;
+    }
+    return !failed;
+}
+
+static void mm3_stream_free(mm3_stream *s) {
+    if (!s) return;
+    if (s->pf) {
+        mm3_stream_prefetch_wait(s);
+        if (s->pf->issued)
+            fprintf(stderr, "ds4: MiniMax expert prefetch: %llu read, %llu used, waited %.1f ms\n",
+                    (unsigned long long)s->pf->issued, (unsigned long long)s->pf->used, s->pf->wait_ms);
+        dispatch_release(s->pf->group);
+        free(s->pf->fresh);
+        free(s->pf);
+    }
+    if (s->hits + s->misses) {
+        fprintf(stderr, "ds4: MiniMax expert cache: %llu hits, %llu misses (%.1f%% hit), "
+                "read %.2f GiB at %.2f GiB/s\n",
+                (unsigned long long)s->hits, (unsigned long long)s->misses,
+                100.0 * (double)s->hits / (double)(s->hits + s->misses),
+                (double)s->read_bytes / 1073741824.0,
+                s->read_ms > 0.0 ? (double)s->read_bytes / 1073741824.0 / (s->read_ms / 1000.0) : 0.0);
+    }
+    if (s->pool) { ds4_gpu_remove_host_map(s->pool); munmap(s->pool, (size_t)s->pool_bytes); }
+    if (s->fd >= 0) close(s->fd);
+    free(s->slot);
+    free(s->owner);
+    free(s->stamp);
+    free(s);
+}
+
+static uint8_t *mm3_stream_host_alloc(uint64_t bytes, uint64_t max_range) {
+    void *p = mmap(NULL, (size_t)bytes, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    if (p == MAP_FAILED) return NULL;
+    if (!ds4_gpu_add_host_map(p, bytes, max_range)) {
+        munmap(p, (size_t)bytes);
+        return NULL;
+    }
+    return p;
+}
+
+static mm3_stream *mm3_stream_create(const ds4_model *m, const ds4_weights *w, const char *path,
+                                     uint32_t n_slots) {
+    mm3_stream *s = xcalloc(1, sizeof(*s));
+    s->fd = -1;
+    if (DS4_N_EXPERT != MM3_EXPERTS) {
+        mm3_stream_free(s);
+        return NULL;
+    }
+    const ds4_layer_weights *l0 = &w->layer[DS4_N_LEADING_DENSE];
+    s->gate_bytes = l0->ffn_gate_exps->bytes / DS4_N_EXPERT;
+    s->down_bytes = l0->ffn_down_exps->bytes / DS4_N_EXPERT;
+    for (uint32_t il = DS4_N_LEADING_DENSE; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        if (l->ffn_gate_exps->bytes != s->gate_bytes * DS4_N_EXPERT ||
+            l->ffn_up_exps->bytes != s->gate_bytes * DS4_N_EXPERT ||
+            l->ffn_down_exps->bytes != s->down_bytes * DS4_N_EXPERT) {
+            fprintf(stderr, "ds4: MiniMax SSD streaming needs one expert size in every layer\n");
+            mm3_stream_free(s);
+            return NULL;
+        }
+        s->file_off[il][0] = l->ffn_gate_exps->abs_offset;
+        s->file_off[il][1] = l->ffn_up_exps->abs_offset;
+        s->file_off[il][2] = l->ffn_down_exps->abs_offset;
+    }
+    /* A prefill chunk can touch every expert of a layer at once: the layer
+     * region adds one layer's worth of slots on top of the cached ones. */
+    const uint32_t max_slots = (DS4_N_LAYER - DS4_N_LEADING_DENSE) * DS4_N_EXPERT;
+    if (n_slots > max_slots) n_slots = max_slots;
+    if (n_slots < DS4_N_EXPERT) {
+        fprintf(stderr, "ds4: MiniMax SSD streaming needs at least %u cached experts (have %u)\n",
+                DS4_N_EXPERT, n_slots);
+        mm3_stream_free(s);
+        return NULL;
+    }
+    n_slots += DS4_N_EXPERT;
+    s->n_slots = n_slots;
+    const uint64_t expert_bytes = 2u * s->gate_bytes + s->down_bytes;
+    const uint64_t page = (uint64_t)getpagesize();
+    s->pool_bytes = ((uint64_t)n_slots * expert_bytes + page - 1u) / page * page;
+    s->fd = open(path, O_RDONLY | O_CLOEXEC);
+    struct stat a, b;
+    if (s->fd < 0 || fstat(s->fd, &a) || fstat(m->fd, &b) || a.st_dev != b.st_dev || a.st_ino != b.st_ino ||
+        fcntl(s->fd, F_NOCACHE, 1) || fcntl(s->fd, F_RDAHEAD, 0)) {
+        fprintf(stderr, "ds4: MiniMax SSD streaming cannot open %s for expert reads\n", path);
+        mm3_stream_free(s);
+        return NULL;
+    }
+    s->pool = mm3_stream_host_alloc(s->pool_bytes, (uint64_t)n_slots * s->down_bytes);
+    s->slot = malloc((size_t)DS4_N_LAYER * DS4_N_EXPERT * sizeof(s->slot[0]));
+    s->owner = malloc((size_t)n_slots * sizeof(s->owner[0]));
+    s->stamp = calloc(n_slots, sizeof(s->stamp[0]));
+    if (!s->pool || !s->slot || !s->owner || !s->stamp) {
+        fprintf(stderr, "ds4: MiniMax SSD streaming could not allocate a %.2f GiB expert pool\n",
+                (double)s->pool_bytes / 1073741824.0);
+        mm3_stream_free(s);
+        return NULL;
+    }
+    s->pf = calloc(1, sizeof(*s->pf));
+    if (s->pf) {
+        s->pf->fresh = calloc(n_slots, 1);
+        s->pf->group = dispatch_group_create();
+        if (!s->pf->fresh || !s->pf->group) {
+            free(s->pf->fresh);
+            free(s->pf);
+            s->pf = NULL;
+        }
+    }
+    for (uint32_t i = 0; i < DS4_N_LAYER * DS4_N_EXPERT; i++) s->slot[i] = -1;
+    for (uint32_t i = 0; i < n_slots; i++) s->owner[i] = UINT32_MAX;
+    fprintf(stderr, "ds4: MiniMax SSD streaming: %u cached experts (%.2f GiB of %.2f GiB routed), "
+            "the last %u of them the prefill layer region\n",
+            n_slots, (double)s->pool_bytes / 1073741824.0,
+            (double)max_slots * (double)expert_bytes / 1073741824.0, DS4_N_EXPERT);
+    return s;
+}
+
+static uint32_t mm3_stream_victim(mm3_stream *s) {
+    if (s->n_used < s->n_slots) return s->n_used++;
+    uint32_t best = UINT32_MAX;
+    for (uint32_t i = 0; i < s->n_slots; i++) {
+        if (s->stamp[i] != s->clock && (best == UINT32_MAX || s->stamp[i] < s->stamp[best])) best = i;
+    }
+    return best;
+}
+
+enum { MM3_HIT = 0, MM3_READ_POOL = 1, MM3_READ_LAYER = 2, MM3_ARRIVING = 3 };
+
+/* Part p (0 gate, 1 up, 2 down) of pool slot `slot`. */
+static uint64_t mm3_part_off(const mm3_stream *s, uint32_t p, uint32_t slot) {
+    const uint64_t part_bytes = p == 2 ? s->down_bytes : s->gate_bytes;
+    return (uint64_t)p * s->n_slots * s->gate_bytes + (uint64_t)slot * part_bytes;
+}
+
+/* First slot of the layer region: prefill gathers expert e into slot first + e. */
+static uint32_t mm3_layer_region(const mm3_stream *s) {
+    return s->n_slots - DS4_N_EXPERT;
+}
+
+/* Plan layer il's experts named in ids[0..n): stamp the hits, give each miss
+ * a pool slot (decode: least recently used, never this layer's) or, for
+ * prefill, a free slot or a direct read into the layer buffer, and queue the
+ * reads.  A prefill chunk walks nearly every expert of every layer in turn, a
+ * cycle larger than the pool that LRU would turn into all misses, so prefill
+ * never evicts. */
+static bool mm3_stream_plan(mm3_stream *s, uint32_t il, const int32_t *ids, uint32_t n, bool gather,
+                            bool overlap, uint32_t *uniq, uint32_t *nu_out, uint8_t *state,
+                            mm3_stream_job *jobs, size_t *nj_out) {
+    uint32_t nu = 0;
+    bool seen[MM3_EXPERTS] = {0};
+    for (uint32_t i = 0; i < n; i++) {
+        if (ids[i] < 0 || ids[i] >= (int32_t)DS4_N_EXPERT) {
+            fprintf(stderr, "ds4: MiniMax router chose expert %d in layer %u\n", ids[i], il);
+            return false;
+        }
+        if (!seen[ids[i]]) { seen[ids[i]] = true; uniq[nu++] = (uint32_t)ids[i]; }
+    }
+    /* overlap: a prefetch may still be reading; its experts come back as
+     * MM3_ARRIVING and the caller waits for it before using them */
+    if (!overlap) mm3_stream_prefetch_wait(s);
+    if (gather) {
+        /* hand the layer region back from the cache */
+        for (uint32_t slot = mm3_layer_region(s); slot < s->n_slots; slot++) {
+            if (s->owner[slot] == UINT32_MAX) continue;
+            s->slot[s->owner[slot]] = -1;
+            s->owner[slot] = UINT32_MAX;
+            if (s->pf) s->pf->fresh[slot] = 0;
+        }
+    }
+    int32_t *row = s->slot + (uint64_t)il * DS4_N_EXPERT;
+    s->clock++;
+    /* stamp the hits first so no victim below is one of this layer's experts */
+    for (uint32_t i = 0; i < nu; i++) {
+        state[uniq[i]] = MM3_HIT;
+        const int32_t slot = row[uniq[i]];
+        if (slot < 0) continue;
+        s->stamp[slot] = s->clock;
+        s->hits++;
+        if (s->pf && s->pf->fresh[slot]) {
+            if (s->pf->fresh[slot] == 2) state[uniq[i]] = MM3_ARRIVING;
+            s->pf->fresh[slot] = 0;
+            s->pf->used++;
+        }
+    }
+    const uint64_t part_bytes[3] = { s->gate_bytes, s->gate_bytes, s->down_bytes };
+    size_t nj = 0;
+    for (uint32_t i = 0; i < nu; i++) {
+        const uint32_t e = uniq[i];
+        if (row[e] >= 0) continue;
+        s->misses++;
+        const uint32_t slot = !gather ? mm3_stream_victim(s) :
+                              s->n_used < mm3_layer_region(s) ? s->n_used++ : UINT32_MAX;
+        if (slot == UINT32_MAX && !gather) return false;
+        state[e] = slot == UINT32_MAX ? MM3_READ_LAYER : MM3_READ_POOL;
+        if (slot != UINT32_MAX) {
+            if (s->owner[slot] != UINT32_MAX) s->slot[s->owner[slot]] = -1;
+            if (s->pf) s->pf->fresh[slot] = 0;
+            s->owner[slot] = il * DS4_N_EXPERT + e;
+            s->stamp[slot] = s->clock;
+            row[e] = (int32_t)slot;
+        }
+        const uint32_t dst = slot == UINT32_MAX ? mm3_layer_region(s) + e : slot;
+        for (uint32_t p = 0; p < 3; p++) {
+            jobs[nj++] = (mm3_stream_job){ s->pool + mm3_part_off(s, p, dst), NULL,
+                                           s->file_off[il][p] + (uint64_t)e * part_bytes[p], part_bytes[p] };
+            s->read_bytes += part_bytes[p];
+        }
+    }
+    *nu_out = nu;
+    *nj_out = nj;
+    return true;
+}
+
+/* Claim least-recently-used slots (never this layer's) for layer il's
+ * guessed experts that are not pooled, and start reading them. */
+static void mm3_stream_prefetch(mm3_stream *s, uint32_t il, const int32_t *ids, uint32_t n) {
+    mm3_prefetch *pf = s->pf;
+    if (!pf || pf->pending || il >= DS4_N_LAYER) return;
+    int32_t *row = s->slot + (uint64_t)il * DS4_N_EXPERT;
+    const uint64_t part_bytes[3] = { s->gate_bytes, s->gate_bytes, s->down_bytes };
+    pf->nj = 0;
+    pf->n_keys = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (ids[i] < 0 || ids[i] >= (int32_t)DS4_N_EXPERT || row[ids[i]] >= 0) continue;
+        const uint32_t slot = mm3_stream_victim(s);
+        if (slot == UINT32_MAX) break;
+        if (s->owner[slot] != UINT32_MAX) s->slot[s->owner[slot]] = -1;
+        s->owner[slot] = il * DS4_N_EXPERT + (uint32_t)ids[i];
+        s->stamp[slot] = s->clock + 1;   /* the next layer's plan must not evict it mid-read */
+        row[ids[i]] = (int32_t)slot;
+        pf->fresh[slot] = 2;
+        pf->keys[pf->n_keys++] = il * DS4_N_EXPERT + (uint32_t)ids[i];
+        for (uint32_t p = 0; p < 3; p++) {
+            pf->jobs[pf->nj++] = (mm3_stream_job){ s->pool + mm3_part_off(s, p, slot), NULL,
+                                                   s->file_off[il][p] + (uint64_t)ids[i] * part_bytes[p], part_bytes[p] };
+            s->read_bytes += part_bytes[p];
+        }
+        pf->issued++;
+    }
+    if (pf->nj == 0) return;
+    pf->batch = (mm3_stream_batch){ s->fd, pf->jobs, 0 };
+    pf->pending = true;
+    dispatch_group_async_f(pf->group, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), pf,
+                           mm3_stream_prefetch_run);
+}
+
+/* Run the planned reads; on failure forget the slots they were filling. */
+static bool mm3_stream_read(mm3_stream *s, uint32_t il, const uint32_t *uniq, uint32_t nu, const uint8_t *state,
+                            const mm3_stream_job *jobs, size_t nj) {
+    const double t0 = now_sec();
+    if (!mm3_stream_run(s, jobs, nj)) {
+        int32_t *row = s->slot + (uint64_t)il * DS4_N_EXPERT;
+        for (uint32_t i = 0; i < nu; i++) {
+            if (state[uniq[i]] != MM3_READ_POOL) continue;
+            s->owner[row[uniq[i]]] = UINT32_MAX;
+            row[uniq[i]] = -1;
+        }
+        return false;
+    }
+    s->read_ms += (now_sec() - t0) * 1000.0;
+    return true;
+}
+
+/* Make layer il's experts available: in the pool for decode and, for prefill,
+ * gathered into the layer region at their own index. */
+static bool mm3_stream_load(mm3_stream *s, uint32_t il, const int32_t *ids, uint32_t n, bool gather) {
+    uint32_t uniq[MM3_EXPERTS], nu = 0;
+    uint8_t state[MM3_EXPERTS];
+    mm3_stream_job jobs[3 * MM3_EXPERTS];
+    size_t nj = 0;
+    if (!mm3_stream_plan(s, il, ids, n, gather, false, uniq, &nu, state, jobs, &nj) ||
+        !mm3_stream_read(s, il, uniq, nu, state, jobs, nj)) {
+        return false;
+    }
+    if (!gather) return true;
+    const uint64_t part_bytes[3] = { s->gate_bytes, s->gate_bytes, s->down_bytes };
+    const int32_t *row = s->slot + (uint64_t)il * DS4_N_EXPERT;
+    nj = 0;
+    for (uint32_t i = 0; i < nu; i++) {
+        const uint32_t e = uniq[i];
+        if (state[e] == MM3_READ_LAYER) continue;
+        for (uint32_t p = 0; p < 3; p++) {
+            jobs[nj++] = (mm3_stream_job){ s->pool + mm3_part_off(s, p, mm3_layer_region(s) + e),
+                                           s->pool + mm3_part_off(s, p, (uint32_t)row[e]), 0, part_bytes[p] };
+        }
+    }
+    return mm3_stream_run(s, jobs, nj);
+}
+
+/* Where one MoE layer reads its routed experts. */
+typedef struct {
+    const void *map;
+    uint64_t size, gate, up, down;
+    uint32_t n_total;
+} mm3_experts;
+
+typedef struct {
+    uint32_t ctx_cap;
+    uint32_t cap_tokens;     /* rows per forward call (the prefill chunk) */
+    uint32_t pos;            /* tokens held in the caches */
+    uint32_t score_stride;   /* indexer blocks per score row */
+    ds4_gpu_tensor *k_cache[DS4_MAX_LAYER];
+    ds4_gpu_tensor *v_cache[DS4_MAX_LAYER];
+    ds4_gpu_tensor *ik_cache[DS4_MAX_LAYER];
+    ds4_gpu_tensor *x, *xn, *blk;
+    ds4_gpu_tensor *qp, *kp, *vp, *iqp, *ikp, *q, *iq, *attn_o, *score, *sel;
+    ds4_gpu_tensor *ff_gate, *ff_up, *ff_mid;
+    ds4_gpu_tensor *router, *selected, *weights, *mid, *part, *lists, *counts;
+    ds4_gpu_tensor *sh_out;
+    ds4_gpu_tensor *slots;   /* one-token pool slot ids, written only by the CPU */  /* one-token routed gate/up, apart from the shared expert's */
+    ds4_gpu_tensor *attn_part;   /* split decode attention partials */
+    ds4_gpu_tensor *pred_xn, *pred_logits, *pred_sel, *pred_w;   /* next layer's router guess */
+    ds4_gpu_tensor *logits;
+    float *host_rows;
+    float rope_freq[32];
+    uint64_t bytes;
+    mm3_stream *stream;      /* engine-owned; NULL when the experts are mapped */
+} ds4_mm3_graph;
+
+static void mm3_graph_free(ds4_mm3_graph *g) {
+    if (!g) return;
+    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+        ds4_gpu_tensor_free(g->k_cache[il]);
+        ds4_gpu_tensor_free(g->v_cache[il]);
+        ds4_gpu_tensor_free(g->ik_cache[il]);
+    }
+    ds4_gpu_tensor *all[] = {
+        g->x, g->xn, g->blk, g->qp, g->kp, g->vp, g->iqp, g->ikp, g->q, g->iq, g->attn_o, g->score, g->sel,
+        g->ff_gate, g->ff_up, g->ff_mid, g->router, g->selected, g->weights, g->mid, g->part, g->lists,
+        g->counts, g->sh_out, g->slots, g->attn_part, g->pred_xn, g->pred_logits, g->pred_sel, g->pred_w, g->logits,
+    };
+    for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++) ds4_gpu_tensor_free(all[i]);
+    free(g->host_rows);
+    memset(g, 0, sizeof(*g));
+}
+
+/* Decode rows at or below this count run experts per (token, slot) with the
+ * shared expert as an extra slot; larger chunks use the expert-grouped GEMMs. */
+#define MM3_MOE_MM_MIN 64u
+/* Rows at or below this count split attention over the block list. */
+#define MM3_ATTN_SPLIT_MAX 4u
+/* Prefetch only the guess's top experts (router order): its 4th pick is
+ * wrong often enough that reading it costs more than it saves. */
+#define MM3_GUESS 3u
+
+static bool mm3_graph_alloc(ds4_mm3_graph *g, uint32_t ctx_cap, uint32_t cap_tokens) {
+    memset(g, 0, sizeof(*g));
+    const uint64_t T = cap_tokens, E = DS4_N_EMBD, D = DS4_N_HEAD_DIM;
+    const uint64_t q_dim = (uint64_t)DS4_N_HEAD * D, kv_dim = (uint64_t)DS4_N_HEAD_KV * D;
+    const uint64_t slots = DS4_N_EXPERT_USED + 1u;
+    g->ctx_cap = ctx_cap;
+    g->cap_tokens = cap_tokens;
+    g->score_stride = ctx_cap / DS4_N_SWA + 1u;
+    for (uint32_t i = 0; i < 32u; i++) {
+        /* float32 inverse frequencies as vLLM builds them */
+        g->rope_freq[i] = i < DS4_N_ROT / 2u ?
+            (float)(1.0 / pow((double)DS4_ROPE_FREQ_BASE, (double)(2u * i) / (double)DS4_N_ROT)) : 0.0f;
+    }
+    bool ok = true;
+#define MM3_ALLOC(field_, bytes_) do { \
+        const uint64_t b_ = (bytes_); \
+        if (ok) { g->field_ = ds4_gpu_tensor_alloc(b_); ok = g->field_ != NULL; g->bytes += b_; } \
+    } while (0)
+    for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
+        MM3_ALLOC(k_cache[il], (uint64_t)ctx_cap * kv_dim * sizeof(uint16_t));
+        MM3_ALLOC(v_cache[il], (uint64_t)ctx_cap * kv_dim * sizeof(uint16_t));
+        MM3_ALLOC(ik_cache[il], (uint64_t)ctx_cap * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+    }
+    MM3_ALLOC(x, T * E * 4u);
+    MM3_ALLOC(xn, T * E * 4u);
+    MM3_ALLOC(blk, T * E * 4u);
+    MM3_ALLOC(qp, T * q_dim * 4u);
+    MM3_ALLOC(kp, T * kv_dim * 4u);
+    MM3_ALLOC(vp, T * kv_dim * 4u);
+    MM3_ALLOC(iqp, T * DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM * 4u);
+    MM3_ALLOC(ikp, T * DS4_N_INDEXER_HEAD_DIM * 4u);
+    MM3_ALLOC(q, T * q_dim * 4u);
+    MM3_ALLOC(iq, T * DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM * 4u);
+    MM3_ALLOC(attn_o, T * q_dim * 4u);
+    MM3_ALLOC(score, T * DS4_N_INDEXER_HEAD * g->score_stride * 4u);
+    MM3_ALLOC(sel, T * DS4_N_INDEXER_HEAD * DS4_N_INDEXER_TOP_K * 4u);
+    MM3_ALLOC(ff_gate, T * DS4_N_FF_DENSE * 4u);
+    MM3_ALLOC(ff_up, T * DS4_N_FF_DENSE * 4u);
+    MM3_ALLOC(ff_mid, T * DS4_N_FF_DENSE * 4u);
+    MM3_ALLOC(router, T * DS4_N_EXPERT * 4u);
+    MM3_ALLOC(selected, T * DS4_N_EXPERT_USED * 4u);
+    MM3_ALLOC(weights, T * DS4_N_EXPERT_USED * 4u);
+    MM3_ALLOC(mid, T * slots * DS4_N_FF_EXP * 4u);
+    MM3_ALLOC(part, T * slots * E * 4u);
+    MM3_ALLOC(lists, (uint64_t)DS4_N_EXPERT * T * 4u);
+    MM3_ALLOC(counts, (uint64_t)DS4_N_EXPERT * 4u);
+    MM3_ALLOC(sh_out, T * E * 4u);
+    MM3_ALLOC(slots, (uint64_t)DS4_N_EXPERT_USED * 4u);
+    MM3_ALLOC(pred_xn, E * 4u);
+    MM3_ALLOC(pred_logits, (uint64_t)DS4_N_EXPERT * 4u);
+    MM3_ALLOC(pred_sel, (uint64_t)DS4_N_EXPERT_USED * 4u);
+    MM3_ALLOC(pred_w, (uint64_t)DS4_N_EXPERT_USED * 4u);
+    MM3_ALLOC(attn_part, (uint64_t)MM3_ATTN_SPLIT_MAX * DS4_N_HEAD * DS4_N_INDEXER_TOP_K * 132u * 4u);
+    MM3_ALLOC(logits, (uint64_t)DS4_N_VOCAB * 4u);
+#undef MM3_ALLOC
+    if (ok) {
+        g->host_rows = malloc(T * E * sizeof(float));
+        ok = g->host_rows != NULL;
+    }
+    if (!ok) {
+        fprintf(stderr, "ds4: MiniMax graph allocation failed (ctx %u, chunk %u)\n", ctx_cap, cap_tokens);
+        mm3_graph_free(g);
+        return false;
+    }
+    ds4_gpu_qwen4_set_moe_act(1u);
+    return true;
+}
+
+static bool mm3_graph_attention(ds4_mm3_graph *g, const ds4_model *m, const ds4_layer_weights *l,
+                                uint32_t il, uint32_t pos0, uint32_t T) {
+    const uint32_t E = DS4_N_EMBD;
+    if (!ds4_gpu_rms_norm_weight_rows_tensor(g->xn, g->x, m->map, m->size, l->attn_norm->abs_offset,
+                                             E, T, DS4_RMS_EPS)) {
+        return false;
+    }
+    /* the five projections of xn are independent: one concurrent section.
+     * Not for 5..32 rows: the Q8 batch matmul then splits k through one
+     * shared partials buffer and a reduce dispatch, which a concurrent
+     * encoder neither orders nor keeps apart across projections. */
+    const bool conc = (T < 5u || T > 32u) && ds4_gpu_concurrent_begin() != 0;
+    const bool proj = qwen4_gemv(g->qp, m, l->attn_q, g->xn, T) &&
+                      qwen4_gemv(g->kp, m, l->attn_k, g->xn, T) &&
+                      qwen4_gemv(g->vp, m, l->attn_v, g->xn, T) &&
+                      qwen4_gemv(g->iqp, m, l->indexer_q_proj, g->xn, T) &&
+                      qwen4_gemv(g->ikp, m, l->indexer_k_proj, g->xn, T);
+    if (conc) ds4_gpu_concurrent_end();
+    return proj &&
+           ds4_gpu_mm3_attn_prep_tensor(g->q, g->k_cache[il], g->v_cache[il], g->iq, g->ik_cache[il],
+                                        g->qp, g->kp, g->vp, g->iqp, g->ikp, m->map, m->size,
+                                        l->attn_q_norm->abs_offset, l->attn_k_norm->abs_offset,
+                                        l->indexer_q_norm->abs_offset, l->indexer_k_norm->abs_offset,
+                                        T, DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_INDEXER_HEAD, pos0, g->ctx_cap,
+                                        g->rope_freq, DS4_RMS_EPS) &&
+           ds4_gpu_mm3_idx_select_tensor(g->sel, g->score, g->iq, g->ik_cache[il], T, pos0,
+                                         DS4_N_INDEXER_HEAD, DS4_N_SWA, DS4_N_INDEXER_TOP_K, g->score_stride) &&
+           ds4_gpu_mm3_attn_tensor(g->attn_o, g->q, g->k_cache[il], g->v_cache[il], g->sel,
+                                   T <= MM3_ATTN_SPLIT_MAX ? g->attn_part : NULL, T,
+                                   DS4_N_HEAD, DS4_N_HEAD_KV, pos0, DS4_N_SWA, DS4_N_INDEXER_TOP_K,
+                                   1.0f / sqrtf((float)DS4_N_HEAD_DIM)) &&
+           qwen4_gemv(g->blk, m, l->attn_output, g->attn_o, T) &&
+           ds4_gpu_add_tensor(g->x, g->x, g->blk, T * E);
+}
+
+/* Load the experts the router just chose and point x at them.  Decode rows
+ * get their ids rewritten to pool slots; prefill chunks read the gathered
+ * layer buffer with natural ids.  Single-token decode overlaps its reads with
+ * GPU work instead (mm3_graph_stream_decode_moe).  shortcut: other decode
+ * batches and prefill wait for their reads; prefetch the next prefill layer
+ * when long-prompt speed matters. */
+static bool mm3_graph_stream_experts(ds4_mm3_graph *g, uint32_t il, uint32_t T, bool gather, mm3_experts *x) {
+    mm3_stream *s = g->stream;
+    const uint32_t n = T * DS4_N_EXPERT_USED;
+    if (!ds4_gpu_end_commands()) return false;
+    int32_t *ids = ds4_gpu_tensor_contents(g->selected);
+    if (!ids || !mm3_stream_load(s, il, ids, n, gather)) return false;
+    if (gather) {
+        const uint32_t r = mm3_layer_region(s);
+        *x = (mm3_experts){ s->pool, s->pool_bytes, mm3_part_off(s, 0, r), mm3_part_off(s, 1, r),
+                            mm3_part_off(s, 2, r), DS4_N_EXPERT };
+    } else {
+        for (uint32_t i = 0; i < n; i++) ids[i] = s->slot[(uint64_t)il * DS4_N_EXPERT + (uint32_t)ids[i]];
+        *x = (mm3_experts){ s->pool, s->pool_bytes, 0, (uint64_t)s->n_slots * s->gate_bytes,
+                            2u * (uint64_t)s->n_slots * s->gate_bytes, s->n_slots };
+    }
+    return glm_graph_begin_commands_if_needed();
+}
+
+/* Stage (0 gate/up with SwiGLU, 1 down) of a one-token decode's routed
+ * slots [s0, s0 + ns), reading the pool. */
+static bool mm3_graph_routed_stage(ds4_mm3_graph *g, const ds4_layer_weights *l, const mm3_experts *x,
+                                   uint32_t stage, uint32_t s0, uint32_t ns) {
+    const uint32_t E = DS4_N_EMBD, F = DS4_N_FF_EXP;
+    ds4_gpu_tensor *sel = ds4_gpu_tensor_view(g->slots, (uint64_t)s0 * 4u, (uint64_t)ns * 4u);
+    ds4_gpu_tensor *mid = ds4_gpu_tensor_view(g->mid, (uint64_t)s0 * F * 4u, (uint64_t)ns * F * 4u);
+    ds4_gpu_tensor *part = ds4_gpu_tensor_view(g->part, (uint64_t)s0 * E * 4u, (uint64_t)ns * E * 4u);
+    bool ok = sel && mid && part;
+    if (ok && stage == 0)
+        ok = ds4_gpu_mm3_moe_gate_up_tensor(mid, g->xn, sel, x->map, x->size, x->gate, x->up,
+                                            l->ffn_gate_exps->type, x->n_total, ns, E, F) != 0;
+    if (ok && stage == 1)
+        ok = ds4_gpu_mm3_moe_down_tensor(part, mid, sel, x->map, x->size, x->down, l->ffn_down_exps->type,
+                                         x->n_total, ns, F, E) != 0;
+    ds4_gpu_tensor_free(sel);
+    ds4_gpu_tensor_free(mid);
+    ds4_gpu_tensor_free(part);
+    return ok;
+}
+
+/* One-token decode MoE with the SSD reads hidden behind GPU work: the shared
+ * expert and the slots whose experts are already pooled are committed first,
+ * the missing experts are read while they run, then the remaining slots and
+ * the reduce follow.  Slots stay in router order, so the reduce sums exactly
+ * as the unsplit path does.  Each pass runs its expert chains side by side in
+ * one concurrent section, stage by stage. */
+static bool mm3_graph_stream_decode_moe(ds4_mm3_graph *g, const ds4_model *m, const ds4_layer_weights *l,
+                                        uint32_t il) {
+    mm3_stream *s = g->stream;
+    const uint32_t E = DS4_N_EMBD, F = DS4_N_FF_EXP, U = DS4_N_EXPERT_USED;
+    /* The router's buffer may still hold a dirty GPU line until its command
+     * buffer completes, so the pool slots go to a buffer only the CPU writes. */
+    int32_t routed[2 * DS4_MAX_EXPERT_USED];   /* this layer's ids, then the next layer's guess */
+    /* the shared expert needs no routing: it runs while the CPU plans */
+    if (!ds4_gpu_mm3_publish(g->selected, g->pred_sel, U) ||
+        !qwen4_gemv(g->ff_gate, m, l->ffn_gate_shexp, g->xn, 1) ||
+        !qwen4_gemv(g->ff_up, m, l->ffn_up_shexp, g->xn, 1) ||
+        !ds4_gpu_mm3_glu_tensor(g->ff_mid, g->ff_gate, g->ff_up, F) ||
+        !qwen4_gemv(g->sh_out, m, l->ffn_down_shexp, g->ff_mid, 1) ||
+        !ds4_gpu_mm3_publish_wait(U, routed)) {
+        return false;
+    }
+    int32_t *ids = ds4_gpu_tensor_contents(g->slots);
+    if (ids) memcpy(ids, routed, U * sizeof(ids[0]));
+    uint32_t uniq[MM3_EXPERTS], nu = 0;
+    uint8_t state[MM3_EXPERTS];
+    mm3_stream_job jobs[3 * MM3_EXPERTS];
+    size_t nj = 0;
+    if (!ids || !mm3_stream_plan(s, il, ids, U, false, true, uniq, &nu, state, jobs, &nj)) return false;
+    bool missing[MM3_EXPERTS] = {0};   /* by slot: expert still being read */
+    for (uint32_t i = 0; i < U; i++) {
+        missing[i] = state[ids[i]] != MM3_HIT;
+        ids[i] = s->slot[(uint64_t)il * DS4_N_EXPERT + (uint32_t)ids[i]];
+    }
+    const mm3_experts x = { s->pool, s->pool_bytes, 0, (uint64_t)s->n_slots * s->gate_bytes,
+                            2u * (uint64_t)s->n_slots * s->gate_bytes, s->n_slots };
+    bool ok = glm_graph_begin_commands_if_needed();
+    for (uint32_t pass = 0; pass < 2 && ok; pass++) {
+        const bool conc = ds4_gpu_concurrent_begin() != 0;
+        for (uint32_t stage = 0; stage < 2 && ok; stage++) {
+            /* contiguous runs of ready (pass 0) or just-read (pass 1) slots */
+            for (uint32_t s0 = 0; s0 < U && ok;) {
+                if (missing[s0] != (pass == 1)) { s0++; continue; }
+                uint32_t s1 = s0 + 1;
+                while (s1 < U && missing[s1] == (pass == 1)) s1++;
+                ok = mm3_graph_routed_stage(g, l, &x, stage, s0, s1 - s0);
+                s0 = s1;
+            }
+            if (conc && stage == 0) ds4_gpu_concurrent_barrier();
+        }
+        if (conc) ds4_gpu_concurrent_end();
+        if (pass != 0 || !ok) continue;
+        bool any_missing = false;
+        for (uint32_t i = 0; i < U; i++) any_missing |= missing[i];
+        if (any_missing) ok = ds4_gpu_flush_commands() != 0;
+        /* this layer's reads run beside the tail of the previous prefetch */
+        if (ok && nj != 0) ok = mm3_stream_read(s, il, uniq, nu, state, jobs, nj);
+        if (ok) ok = mm3_stream_prefetch_wait(s);
+        if (ok && il + 1u < DS4_N_LAYER) {
+            mm3_stream_prefetch(s, il + 1u, routed + U, MM3_GUESS);
+        }
+    }
+    return ok && ds4_gpu_mm3_moe_reduce_tensor(g->x, g->part, g->weights, g->sh_out, 1, U, U, E, 2u);
+}
+
+/* One-token streamed decode: the router of il and the guess for il + 1's
+ * prefetch (the next router on this residual) as two chains side by side in
+ * a concurrent section, then the streamed MoE. */
+static bool mm3_graph_stream_decode_ffn(ds4_mm3_graph *g, const ds4_model *m, const ds4_layer_weights *l,
+                                        uint32_t il) {
+    const uint32_t E = DS4_N_EMBD, U = DS4_N_EXPERT_USED;
+    const ds4_layer_weights *ln = il + 1u < DS4_N_LAYER ? l + 1 : NULL;
+    const bool conc = ds4_gpu_concurrent_begin() != 0;
+    bool ok = ds4_gpu_rms_norm_weight_rows_tensor(g->xn, g->x, m->map, m->size, l->ffn_norm->abs_offset,
+                                                  E, 1, DS4_RMS_EPS) &&
+              (!ln || ds4_gpu_rms_norm_weight_rows_tensor(g->pred_xn, g->x, m->map, m->size,
+                                                          ln->ffn_norm->abs_offset, E, 1, DS4_RMS_EPS));
+    if (conc) ds4_gpu_concurrent_barrier();
+    ok = ok && qwen4_gemv(g->router, m, l->ffn_gate_inp, g->xn, 1) &&
+         (!ln || qwen4_gemv(g->pred_logits, m, ln->ffn_gate_inp, g->pred_xn, 1));
+    if (conc) ds4_gpu_concurrent_barrier();
+    ok = ok && ds4_gpu_mm3_router_tensor(g->selected, g->weights, g->router, m->map, m->size,
+                                         l->ffn_exp_probs_b->abs_offset, 1, DS4_N_EXPERT, U,
+                                         DS4_EXPERT_WEIGHT_SCALE) &&
+         (!ln || ds4_gpu_mm3_router_tensor(g->pred_sel, g->pred_w, g->pred_logits, m->map, m->size,
+                                           ln->ffn_exp_probs_b->abs_offset, 1, DS4_N_EXPERT, U,
+                                           DS4_EXPERT_WEIGHT_SCALE));
+    if (conc) ds4_gpu_concurrent_end();
+    return ok && mm3_graph_stream_decode_moe(g, m, l, il);
+}
+
+static bool mm3_graph_ffn(ds4_mm3_graph *g, const ds4_model *m, const ds4_layer_weights *l,
+                          uint32_t il, uint32_t T) {
+    const uint32_t E = DS4_N_EMBD, F = DS4_N_FF_EXP, U = DS4_N_EXPERT_USED;
+    if (g->stream && T == 1 && il >= DS4_N_LEADING_DENSE) return mm3_graph_stream_decode_ffn(g, m, l, il);
+    if (!ds4_gpu_rms_norm_weight_rows_tensor(g->xn, g->x, m->map, m->size, l->ffn_norm->abs_offset,
+                                             E, T, DS4_RMS_EPS)) {
+        return false;
+    }
+    if (il < DS4_N_LEADING_DENSE) {
+        return qwen4_gemv(g->ff_gate, m, l->ffn_gate, g->xn, T) &&
+               qwen4_gemv(g->ff_up, m, l->ffn_up, g->xn, T) &&
+               ds4_gpu_mm3_glu_tensor(g->ff_mid, g->ff_gate, g->ff_up, T * DS4_N_FF_DENSE) &&
+               qwen4_gemv(g->blk, m, l->ffn_down, g->ff_mid, T) &&
+               ds4_gpu_add_tensor(g->x, g->x, g->blk, T * E);
+    }
+    if (!qwen4_gemv(g->router, m, l->ffn_gate_inp, g->xn, T) ||
+        !ds4_gpu_mm3_router_tensor(g->selected, g->weights, g->router, m->map, m->size,
+                                   l->ffn_exp_probs_b->abs_offset, T, DS4_N_EXPERT, U,
+                                   DS4_EXPERT_WEIGHT_SCALE)) {
+        return false;
+    }
+    const bool mm = T > MM3_MOE_MM_MIN;
+    mm3_experts x = { m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
+                      l->ffn_down_exps->abs_offset, DS4_N_EXPERT };
+    if (g->stream && !mm3_graph_stream_experts(g, il, T, mm, &x)) return false;
+    if (!mm && !g->stream) {
+        return ds4_gpu_qwen4_moe_mid_tensor(g->mid, g->xn, g->selected, x.map, x.size, x.gate, x.up,
+                                            l->ffn_gate_exps->type, x.n_total, T, U, E, F,
+                                            l->ffn_gate_shexp->abs_offset, l->ffn_up_shexp->abs_offset,
+                                            l->ffn_gate_shexp->type) &&
+               ds4_gpu_qwen4_moe_down_tensor(g->part, g->mid, g->selected, x.map, x.size, x.down,
+                                             l->ffn_down_exps->type, x.n_total, T, U, F, E,
+                                             l->ffn_down_shexp->abs_offset, l->ffn_down_shexp->type) &&
+               ds4_gpu_mm3_moe_reduce_tensor(g->x, g->part, g->weights, NULL, T, U, U + 1u, E, 1u);
+    }
+    /* The fused decode kernels read the shared expert from the routed map, so
+     * with streamed experts it runs as dense GEMMs like the prefill path. */
+    const bool routed = mm ?
+        ds4_gpu_qwen4_moe_build_lists_tensor(g->lists, g->counts, g->selected, T, U, x.n_total,
+                                             g->cap_tokens) &&
+        ds4_gpu_qwen4_moe_mm_mid_tensor(g->mid, g->xn, g->lists, g->counts, x.map, x.size, x.gate, x.up,
+                                        l->ffn_gate_exps->type, x.n_total, T, U, U, E, F, g->cap_tokens) &&
+        ds4_gpu_qwen4_moe_mm_down_tensor(g->part, g->mid, g->lists, g->counts, x.map, x.size, x.down,
+                                         l->ffn_down_exps->type, x.n_total, T, U, U, F, E, g->cap_tokens) :
+        ds4_gpu_qwen4_moe_mid_tensor(g->mid, g->xn, g->selected, x.map, x.size, x.gate, x.up,
+                                     l->ffn_gate_exps->type, x.n_total, T, U, E, F, 0, 0, UINT32_MAX) &&
+        ds4_gpu_qwen4_moe_down_tensor(g->part, g->mid, g->selected, x.map, x.size, x.down,
+                                      l->ffn_down_exps->type, x.n_total, T, U, F, E, 0, UINT32_MAX);
+    return routed &&
+           qwen4_gemv(g->ff_gate, m, l->ffn_gate_shexp, g->xn, T) &&
+           qwen4_gemv(g->ff_up, m, l->ffn_up_shexp, g->xn, T) &&
+           ds4_gpu_mm3_glu_tensor(g->ff_mid, g->ff_gate, g->ff_up, T * F) &&
+           qwen4_gemv(g->sh_out, m, l->ffn_down_shexp, g->ff_mid, T) &&
+           ds4_gpu_mm3_moe_reduce_tensor(g->x, g->part, g->weights, g->sh_out, T, U, U, E, 2u);
+}
+
+/* Forward T tokens at g->pos; logits_out (optional) gets the last row. */
+static bool mm3_graph_forward_tokens(ds4_mm3_graph *g, const ds4_model *m, const ds4_weights *w,
+                                     const int *tokens, uint32_t T, float *logits_out) {
+    if (!g || T == 0 || T > g->cap_tokens || g->pos + T > g->ctx_cap) return false;
+    const uint32_t E = DS4_N_EMBD;
+    for (uint32_t t = 0; t < T; t++) {
+        if (tokens[t] < 0 || tokens[t] >= (int)DS4_N_VOCAB) {
+            fprintf(stderr, "ds4: MiniMax token id %d is outside the vocabulary\n", tokens[t]);
+            return false;
+        }
+        qwen4_ref_row(m, w->token_embd, (uint64_t)tokens[t], g->host_rows + (uint64_t)t * E);
+    }
+    if (!ds4_gpu_tensor_write(g->x, 0, g->host_rows, (uint64_t)T * E * sizeof(float))) return false;
+    if (!glm_graph_begin_commands_if_needed()) return false;
+    const uint32_t pos0 = g->pos;
+    bool ok = true;
+    for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        ok = mm3_graph_attention(g, m, l, il, pos0, T) && mm3_graph_ffn(g, m, l, il, T);
+        /* start the GPU on the first layers while the rest is encoded */
+        if (ok && il == 1u) ok = ds4_gpu_flush_commands() != 0;
+    }
+    if (ok && logits_out) {
+        ds4_gpu_tensor *last = ds4_gpu_tensor_view(g->x, (uint64_t)(T - 1u) * E * sizeof(float),
+                                                   (uint64_t)E * sizeof(float));
+        ok = last &&
+             ds4_gpu_rms_norm_weight_rows_tensor(g->xn, last, m->map, m->size, w->output_norm->abs_offset,
+                                                 E, 1, DS4_RMS_EPS) &&
+             qwen4_gemv(g->logits, m, w->output, g->xn, 1);
+        ds4_gpu_tensor_free(last);
+    }
+    if (!ds4_gpu_end_commands()) ok = false;
+    if (ok && logits_out) ok = ds4_gpu_tensor_read(g->logits, 0, logits_out, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+    if (ok) g->pos += T;
+    return ok;
+}
+#endif
+
 #ifndef DS4_NO_GPU
 /* Metal generation entry point.  The model runs as one local whole-graph
  * pipeline: graph prefill followed by graph decode steps.  Streaming PRO may
@@ -61233,6 +62582,9 @@ struct ds4_session {
 #ifdef DS4_HAS_QWEN4_GPU
     ds4_qwen4_gpu_graph qwen4_graph;
     bool qwen4_graph_ready;
+#ifdef DS4_HAS_QWEN4_METAL
+    ds4_mm3_graph *mm3;      /* MiniMax-M3 Metal graph */
+#endif
     int qwen4_slot;   /* -1 when the session holds private recurrent state */
     bool qwen4_rewound;
     float *qwen4_verify_logits;
@@ -62298,6 +63650,10 @@ static bool ds4_session_is_glm(const ds4_session *s) {
 
 static bool ds4_session_is_qwen4(const ds4_session *s) {
     return s && s->engine && ds4_model_is_qwen4();
+}
+
+static bool ds4_session_is_minimax3(const ds4_session *s) {
+    return s && s->engine && ds4_model_is_minimax3();
 }
 
 #ifndef DS4_NO_GPU
@@ -65675,7 +67031,8 @@ static bool ds4_session_greedy_splitkv_replay_exact(
 
 int ds4_session_eval_argmax(ds4_session *s, int token, char *err, size_t errlen) {
     if (!s) return -1;
-    if (ds4_session_is_cpu(s) || ds4_session_is_glm(s) || ds4_session_is_ds41(s)) {
+    if (ds4_session_is_cpu(s) || ds4_session_is_glm(s) || ds4_session_is_ds41(s) ||
+        ds4_session_is_minimax3(s)) {
         if (ds4_session_eval(s, token, err, errlen) != 0) return -1;
         return ds4_session_argmax(s);
     }
@@ -66155,7 +67512,8 @@ int ds4_engine_generate_argmax(
                     ds4_backend_name(e->backend));
             return 1;
         }
-        if (e->multi_tier || DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+        /* MiniMax has no one-shot raw-SWA generator; the session path is its only decode. */
+        if (e->multi_tier || DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 || ds4_model_is_minimax3()) {
             ds4_session *s = NULL;
             char err[256] = {0};
             const double t_prefill0 = now_sec();
@@ -71930,6 +73288,24 @@ static int ds4_engine_open_internal(ds4_engine **out,
             return 1;
         }
     }
+    if (ds4_model_is_minimax3() && !opt->inspect_only) {
+        const bool metal =
+#ifdef DS4_HAS_QWEN4_METAL
+            e->backend == DS4_BACKEND_METAL;
+#else
+            false;
+#endif
+        if (!metal || opt->tp.role != DS4_TP_NONE || opt->distributed.role != DS4_DISTRIBUTED_NONE ||
+            load_slice || opt->dspark || opt->glm_mtp || e->power_percent != 100 ||
+            (opt->mtp_path && opt->mtp_path[0]) || (opt->vision_path && opt->vision_path[0])) {
+            fprintf(stderr, "ds4: MiniMax-M3.1-Flash currently runs on single-host Metal only; "
+                            "tensor/pipeline parallelism, DSpark, MTP, vision and "
+                            "power throttling are not supported yet\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && !opt->inspect_only) {
         const bool supported = (e->backend == DS4_BACKEND_METAL ||
 #if defined(DS4_HAS_DEEPSEEK41_GPU) && !defined(__APPLE__)
@@ -72821,8 +74197,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
                                       weights_have_output_head(&e->weights)));
             ds4_model_map_span_vec spans;
             bool spans_ok = false;
-            if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
-                spans_ok = weights_model_map_decode_static_spans(&e->weights, true, true, &spans);
+            if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 || ds4_model_is_minimax3()) {
+                /* MiniMax embeds on the CPU: its token table stays out of the GPU map */
+                spans_ok = weights_model_map_decode_static_spans(&e->weights, !ds4_model_is_minimax3(),
+                                                                 true, &spans);
             } else if (load_slice) {
                 if (e->ssd_streaming_static_decode_map) {
                     spans_ok = weights_model_map_decode_runtime_slice_spans(
@@ -73006,6 +74384,28 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = NULL;
             return 1;
         }
+#ifdef DS4_HAS_QWEN4_METAL
+        if (e->ssd_streaming && ds4_model_is_minimax3()) {
+            /* The planner reserves two layers of prefill headroom; one becomes
+             * the pool's layer region, the other more cached experts, as does
+             * the token table the planner counted but the GPU never maps. */
+            const ds4_layer_weights *l0 = &e->weights.layer[DS4_N_LEADING_DENSE];
+            const uint64_t expert_bytes = (l0->ffn_gate_exps->bytes + l0->ffn_up_exps->bytes +
+                                           l0->ffn_down_exps->bytes) / DS4_N_EXPERT;
+            const uint64_t spare = (e->ssd_streaming_prefill_headroom_bytes > DS4_N_EXPERT * expert_bytes ?
+                                    e->ssd_streaming_prefill_headroom_bytes - DS4_N_EXPERT * expert_bytes : 0) +
+                                   e->weights.token_embd->bytes;
+            e->mm3_stream = mm3_stream_create(&e->model, &e->weights, opt->model_path,
+                                              e->ssd_streaming_cache_experts + (uint32_t)(spare / expert_bytes));
+            if (!e->mm3_stream) {
+                free(load_offsets);
+                free(load_sizes);
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+        }
+#endif
         if (tp_shard && e->backend == DS4_BACKEND_METAL) {
             model_warm_weights_sharded(&e->model, &e->weights,
                                        tp_shard_rank);
@@ -73263,6 +74663,19 @@ bool ds4_engine_is_glm53(ds4_engine *e) {
 bool ds4_engine_is_qwen4(ds4_engine *e) {
     (void)e;
     return ds4_model_is_qwen4();
+}
+
+bool ds4_engine_is_minimax3(ds4_engine *e) {
+    (void)e;
+    return ds4_model_is_minimax3();
+}
+
+const char *ds4_minimax3_root_system(void) {
+    return DS4_MINIMAX3_ROOT_SYSTEM;
+}
+
+const char *ds4_minimax3_effort(ds4_think_mode mode) {
+    return minimax3_effort(mode);
 }
 
 /* The official template's default effort is xhigh; medium adds no text. */
@@ -74120,6 +75533,10 @@ void ds4_engine_close(ds4_engine *e) {
     if (e->vision_model.map) model_close(&e->vision_model);
     model_close(&e->model);
 #ifndef DS4_NO_GPU
+#ifdef DS4_HAS_QWEN4_METAL
+    mm3_stream_free(e->mm3_stream);
+    e->mm3_stream = NULL;
+#endif
 #ifdef DS4_HAS_QWEN4_GPU
     qwen4_state_pool_free(e);
     if (e->qwen4_shared_workspace) {
@@ -74290,6 +75707,10 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             fprintf(stderr, "ds4: Qwen3.8 sessions require Metal or CUDA\n");
             return 1;
         }
+        if (ds4_model_is_minimax3()) {
+            fprintf(stderr, "ds4: MiniMax-M3 sessions require Metal\n");
+            return 1;
+        }
         if (e->distributed.role == DS4_DISTRIBUTED_COORDINATOR) {
             fprintf(stderr, "ds4: distributed coordinator sessions require the graph backend\n");
             return 1;
@@ -74366,6 +75787,23 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             ds4_session_free(s);
             return 1;
         }
+        *out = s;
+        return 0;
+    }
+#endif
+#ifdef DS4_HAS_QWEN4_METAL
+    if (ds4_model_is_minimax3()) {
+        const uint32_t chunk = e->prefill_chunk ? e->prefill_chunk : 1024u;
+        s->mm3 = xcalloc(1, sizeof(*s->mm3));
+        if (!mm3_graph_alloc(s->mm3, (uint32_t)ctx_size, chunk < (uint32_t)ctx_size ? chunk : (uint32_t)ctx_size)) {
+            free(s->mm3);
+            free(s);
+            return 1;
+        }
+        s->mm3->stream = e->mm3_stream;
+        s->prefill_cap = (uint32_t)ctx_size;
+        s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+        s->sample_probs = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->sample_probs[0]));
         *out = s;
         return 0;
     }
@@ -74780,6 +76218,13 @@ void ds4_session_free(ds4_session *s) {
     }
 #ifndef DS4_NO_GPU
     ds4_session_print_dspark_stats(s);
+#endif
+#ifdef DS4_HAS_QWEN4_METAL
+    if (s->mm3) {
+        mm3_graph_free(s->mm3);
+        free(s->mm3);
+        s->mm3 = NULL;
+    }
 #endif
     ds4_dist_session_free(s->distributed);
     if (ds4_session_is_cpu(s)) {
@@ -76779,6 +78224,48 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                                      err,
                                      errlen);
     }
+#ifdef DS4_HAS_QWEN4_METAL
+    if (ds4_session_is_minimax3(s) && s->mm3) {
+        /* Caches hold plain per-token state: keep the common prefix, and
+         * re-run its last token when nothing new follows so the logits are
+         * the prompt's. */
+        ds4_engine *e = s->engine;
+        ds4_mm3_graph *g = s->mm3;
+        int start = 0;
+        if (s->checkpoint_valid && g->pos == (uint32_t)s->checkpoint.len) {
+            while (start < prompt->len && start < s->checkpoint.len &&
+                   prompt->v[start] == s->checkpoint.v[start]) start++;
+        }
+        if (start == prompt->len && start == s->checkpoint.len && s->checkpoint_valid && start > 0) return 0;
+        if (start == prompt->len && start > 0) start--;
+        if (prompt->len > (int)g->ctx_cap) {
+            snprintf(err, errlen, "prompt of %d tokens exceeds the %u-token context", prompt->len, g->ctx_cap);
+            return 1;
+        }
+        g->pos = (uint32_t)start;
+        s->checkpoint.len = start;
+        s->checkpoint_valid = false;
+        for (int i = start; i < prompt->len;) {
+            if (ds4_session_cancelled(s)) {
+                snprintf(err, errlen, "interrupted");
+                s->checkpoint_valid = false;
+                return DS4_SESSION_SYNC_INTERRUPTED;
+            }
+            uint32_t chunk = (uint32_t)(prompt->len - i);
+            if (chunk > g->cap_tokens) chunk = g->cap_tokens;
+            if (!mm3_graph_forward_tokens(g, &e->model, &e->weights, prompt->v + i, chunk, s->logits)) {
+                snprintf(err, errlen, "MiniMax prefill failed at token %d", i);
+                return 1;
+            }
+            for (uint32_t j = 0; j < chunk; j++) token_vec_push(&s->checkpoint, prompt->v[i + (int)j]);
+            i += (int)chunk;
+            s->checkpoint_valid = true;
+            if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i, prompt->len);
+        }
+        s->checkpoint_valid = prompt->len > 0;
+        return 0;
+    }
+#endif
 #ifdef DS4_HAS_QWEN4_GPU
     if (ds4_session_is_qwen4(s)) {
         ds4_engine *e = s->engine;
@@ -79060,6 +80547,28 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         token_vec_push(&s->checkpoint, token);
         s->checkpoint_valid = true;
         if (rewindable) d->rewind_end = s->ds41_graph.pos;
+        return 0;
+    }
+#endif
+#ifdef DS4_HAS_QWEN4_METAL
+    if (ds4_session_is_minimax3(s)) {
+        ds4_mm3_graph *g = s->mm3;
+        if (!g || g->pos != (uint32_t)s->checkpoint.len) {
+            if (errlen) snprintf(err, errlen, "MiniMax graph is not in sync with the session");
+            return 1;
+        }
+        if (g->pos >= g->ctx_cap) {
+            if (errlen) snprintf(err, errlen, "context is full");
+            return 1;
+        }
+        if (!mm3_graph_forward_tokens(g, &e->model, &e->weights, &token, 1, s->logits)) {
+            if (errlen) snprintf(err, errlen, "MiniMax decode failed");
+            s->checkpoint_valid = false;
+            return 1;
+        }
+        token_vec_push(&s->checkpoint, token);
+        s->checkpoint_valid = true;
+        (void)probe_mtp;
         return 0;
     }
 #endif
@@ -87529,6 +89038,15 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     if (s->checkpoint_valid && ds4_session_is_glm(s)) {
         state_ok = !s->glm_graph.glm53 || ds4_session_glm_mtp_rewind(s, pos);
     }
+#ifdef DS4_HAS_QWEN4_METAL
+    if (s->checkpoint_valid && ds4_session_is_minimax3(s) && s->mm3 && pos > 0) {
+        /* drop the tail and recompute the logits of the last kept token */
+        s->mm3->pos = (uint32_t)pos - 1u;
+        state_ok = mm3_graph_forward_tokens(s->mm3, &s->engine->model, &s->engine->weights,
+                                            &s->checkpoint.v[pos - 1], 1, s->logits);
+        if (!state_ok) s->mm3->pos = 0;
+    }
+#endif
 #endif
     s->checkpoint.len = pos;
     /* DeepSeek compressors cannot be rolled back by truncating their row
