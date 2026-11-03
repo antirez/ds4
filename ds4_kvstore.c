@@ -529,6 +529,33 @@ static bool kv_cache_incoming_supersedes_continued(
     return !strcmp(prefix_sha, e->sha);
 }
 
+/* Index of the checkpoint a load of prompt_text would pick, or -1.  Uses the
+ * entries already in kc; callers refresh first. */
+static int kv_cache_best_text_prefix(const ds4_kvstore *kc,
+                                     const char *prompt_text,
+                                     int model_id, int quant_bits,
+                                     int ctx_size) {
+    const size_t prompt_bytes = strlen(prompt_text);
+    int best = -1;
+    for (int i = 0; i < kc->len; i++) {
+        ds4_kvstore_entry *e = &kc->entry[i];
+        if (e->text_bytes > prompt_bytes || e->text_bytes > SIZE_MAX) continue;
+        if ((int)e->tokens < kc->opt.min_tokens) continue;
+        if (e->model_id != (uint8_t)model_id) continue;
+        if ((uint32_t)ctx_size < e->ctx_size) continue;
+        if (kc->reject_different_quant && e->quant_bits != (uint8_t)quant_bits) continue;
+        if (best >= 0) {
+            ds4_kvstore_entry *b = &kc->entry[best];
+            if (e->text_bytes < b->text_bytes) continue;
+            if (e->text_bytes == b->text_bytes && e->tokens <= b->tokens) continue;
+        }
+        char sha[41];
+        ds4_kvstore_sha1_bytes_hex(prompt_text, (size_t)e->text_bytes, sha);
+        if (!strcmp(sha, e->sha)) best = i;
+    }
+    return best;
+}
+
 static bool kv_cache_reason_is_anchor(uint8_t reason) {
     return reason == DS4_KVSTORE_REASON_COLD ||
            reason == DS4_KVSTORE_REASON_EVICT ||
@@ -564,26 +591,36 @@ double ds4_kvstore_entry_eviction_score(
     return score;
 }
 
-void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
+/* Returns false only when the budget cannot be met without deleting the
+ * checkpoint protected by incoming->protect_text; nothing is evicted then. */
+bool ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
                        uint64_t extra_bytes,
                        const ds4_kvstore_eviction_context *incoming) {
-    if (!kc->enabled || kc->budget_bytes == 0) return;
-    if (extra_bytes > kc->budget_bytes) return;
+    if (!kc->enabled || kc->budget_bytes == 0) return true;
+    if (extra_bytes > kc->budget_bytes) return true;
     kv_cache_refresh(kc);
     const uint64_t now = (uint64_t)time(NULL);
     uint64_t total = 0;
     for (int i = 0; i < kc->len; i++) total += kc->entry[i].file_size;
     const uint64_t target = kc->budget_bytes - extra_bytes;
+    int protect = -1;
+    if (total > target && incoming && incoming->protect_text) {
+        protect = kv_cache_best_text_prefix(kc, incoming->protect_text,
+                                            incoming->model_id,
+                                            incoming->quant_bits,
+                                            (int)incoming->ctx_size);
+        if (protect >= 0 && kc->entry[protect].file_size > target)
+            return false;
+    }
     while (total > target && kc->len > 0) {
-        int victim = 0;
-        double victim_score =
-            ds4_kvstore_entry_eviction_score(&kc->entry[0], live, now,
-                                             incoming);
-        for (int i = 1; i < kc->len; i++) {
+        int victim = -1;
+        double victim_score = 0.0;
+        for (int i = 0; i < kc->len; i++) {
+            if (i == protect) continue;
             double score =
                 ds4_kvstore_entry_eviction_score(&kc->entry[i], live, now,
                                                  incoming);
-            if (score < victim_score ||
+            if (victim < 0 || score < victim_score ||
                 (score == victim_score &&
                  kc->entry[i].last_used < kc->entry[victim].last_used))
             {
@@ -591,6 +628,7 @@ void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
                 victim_score = score;
             }
         }
+        if (victim < 0) return false;
         ds4_kvstore_entry e = kc->entry[victim];
         if (unlink(e.path) == 0) {
             kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
@@ -609,7 +647,9 @@ void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
         memmove(kc->entry + victim, kc->entry + victim + 1,
                 (size_t)(kc->len - victim - 1) * sizeof(kc->entry[0]));
         kc->len--;
+        if (protect > victim) protect--;
     }
+    return true;
 }
 
 bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
@@ -935,6 +975,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                         const char *cache_text_override,
                                         uint8_t cache_text_ext,
                                         const char *cache_text_key,
+                                        const char *protect_text,
                                         const ds4_kvstore_trailer_hooks *hooks,
                                         char *err,
                                         size_t err_len) {
@@ -1054,8 +1095,18 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         .quant_bits = (uint8_t)quant_bits,
         .ctx_size = (uint32_t)ds4_session_ctx(session),
         .reject_different_quant = kc->reject_different_quant,
+        .protect_text = protect_text,
     };
-    ds4_kvstore_evict(kc, live_tokens, est_file_bytes, &incoming);
+    if (!ds4_kvstore_evict(kc, live_tokens, est_file_bytes, &incoming)) {
+        kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                "%s: kv cache skipped tokens=%d reason=%s because making room would evict the checkpoint the next request loads",
+                kv_log_name(kc), store_tokens.len, reason);
+        ds4_session_payload_file_free(&staged);
+        free(text);
+        free(path);
+        ds4_tokens_free(&store_tokens);
+        return false;
+    }
 
     kv_buf tmpb = {0};
     kv_buf_printf(&tmpb, "%s.tmp.%ld", path, (long)getpid());
@@ -1171,7 +1222,7 @@ bool ds4_kvstore_store_live_prefix(ds4_kvstore *kc,
                                    size_t err_len) {
     return ds4_kvstore_store_live_prefix_text(kc, engine, session, tokens,
                                               store_len, reason, NULL, 0, NULL,
-                                              hooks, err, err_len);
+                                              NULL, hooks, err, err_len);
 }
 
 bool ds4_kvstore_maybe_store_continued(ds4_kvstore *kc,
@@ -1196,26 +1247,9 @@ bool ds4_kvstore_maybe_store_continued(ds4_kvstore *kc,
 int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
                                  int model_id, int quant_bits, int ctx_size) {
     if (!prompt_text) return -1;
-    const size_t prompt_bytes = strlen(prompt_text);
     kv_cache_refresh(kc);
-    int best = -1;
-    for (int i = 0; i < kc->len; i++) {
-        ds4_kvstore_entry *e = &kc->entry[i];
-        if (e->text_bytes > prompt_bytes || e->text_bytes > SIZE_MAX) continue;
-        if ((int)e->tokens < kc->opt.min_tokens) continue;
-        if (e->model_id != (uint8_t)model_id) continue;
-        if ((uint32_t)ctx_size < e->ctx_size) continue;
-        if (kc->reject_different_quant && e->quant_bits != (uint8_t)quant_bits) continue;
-        if (best >= 0) {
-            ds4_kvstore_entry *b = &kc->entry[best];
-            if (e->text_bytes < b->text_bytes) continue;
-            if (e->text_bytes == b->text_bytes && e->tokens <= b->tokens) continue;
-        }
-        char sha[41];
-        ds4_kvstore_sha1_bytes_hex(prompt_text, (size_t)e->text_bytes, sha);
-        if (!strcmp(sha, e->sha)) best = i;
-    }
-    return best;
+    return kv_cache_best_text_prefix(kc, prompt_text, model_id, quant_bits,
+                                     ctx_size);
 }
 
 int ds4_kvstore_try_load_text(ds4_kvstore *kc,
