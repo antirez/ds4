@@ -61180,11 +61180,12 @@ static bool qwen4_graph_moe_impl(ds4_qwen4_gpu_graph *g, const ds4_model *m, con
         /* One token with Q2_K down rows: the reduce rides on the down kernel. */
         if (ok && T == 1u && !shared_dense && l->ffn_down_exps->type == DS4_TENSOR_Q2_K &&
             getenv("DS4_QWEN4_NO_DOWN_REDUCE") == NULL) {
-            return ds4_gpu_qwen4_moe_down_reduce_tensor(g->blk, g->mid, g->selected, g->weights, g->sh_gate_logit,
+            ok = ds4_gpu_qwen4_moe_down_reduce_tensor(g->blk, g->mid, g->selected, g->weights, g->sh_gate_logit,
                                                         g->R, g->inj, m->map, m->size, l->ffn_down_exps->abs_offset,
                                                         l->ffn_down_exps->type, DS4_N_EXPERT, DS4_N_EXPERT_USED,
                                                         DS4_N_FF_EXP, DS4_N_EMBD, l->ffn_down_shexp->abs_offset,
                                                         l->ffn_down_shexp->type, DS4_N_HC) != 0;
+            goto done;
         }
 #endif
         ok = ok &&
