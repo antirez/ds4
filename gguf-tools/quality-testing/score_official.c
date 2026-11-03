@@ -29,6 +29,7 @@ static void usage(const char *prog) {
             "[--ssd-streaming-cache-experts N|NGB] "
             "[--ssd-streaming-preload-experts N] "
             "[--dump-first-logits PATH] "
+            "[--dir-steering-file FILE [--dir-steering-attn F] [--dir-steering-ffn F] [--dir-steering-resid F]] "
             "[--max-cases N] "
             "[--continued-prefill N] "
             "[--session-batch N] "
@@ -735,6 +736,9 @@ int main(int argc, char **argv) {
     uint64_t ssd_streaming_cache_bytes = 0;
     uint32_t ssd_streaming_preload_experts = 0;
     const char *first_logits_path = NULL;
+    const char *steering_file = NULL;
+    float steering_attn = 0.0f, steering_ffn = 0.0f, steering_resid = 0.0f;
+    bool steering_scale_set = false;
     int max_cases = 0;
     int continued_prefill = 0;
     int session_count = 1;
@@ -787,6 +791,17 @@ int main(int argc, char **argv) {
             gpu_devices_arg = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--cuda-tensor-parallel")) {
             cuda_tensor_parallel = true;
+        } else if (!strcmp(arg, "--dir-steering-file")) {
+            steering_file = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--dir-steering-attn")) {
+            steering_attn = strtof(need_arg(&i, argc, argv, arg), NULL);
+            steering_scale_set = true;
+        } else if (!strcmp(arg, "--dir-steering-ffn")) {
+            steering_ffn = strtof(need_arg(&i, argc, argv, arg), NULL);
+            steering_scale_set = true;
+        } else if (!strcmp(arg, "--dir-steering-resid")) {
+            steering_resid = strtof(need_arg(&i, argc, argv, arg), NULL);
+            steering_scale_set = true;
         } else if (!strcmp(arg, "--ssd-streaming")) {
             ssd_streaming = true;
         } else if (!strcmp(arg, "--ssd-streaming-cold")) {
@@ -865,6 +880,11 @@ int main(int argc, char **argv) {
         .cuda_tensor_parallel = cuda_tensor_parallel,
         .ssd_streaming = ssd_streaming,
         .ssd_streaming_cold = ssd_streaming_cold,
+        /* as in ds4: a file alone steers the FFN output at scale 1 */
+        .directional_steering_file = steering_file,
+        .directional_steering_attn = steering_attn,
+        .directional_steering_ffn = steering_file && !steering_scale_set ? 1.0f : steering_ffn,
+        .directional_steering_resid = steering_resid,
         .distributed = dist,
         .tp = tp,
     };

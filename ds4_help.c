@@ -233,6 +233,7 @@ static void print_steering(FILE *fp, const help_colors *c) {
     opt(fp, c, "--dir-steering-file FILE", "Load one f32 direction vector per layer.");
     opt(fp, c, "--dir-steering-ffn F", "Apply steering after FFN outputs. Default with file: 1");
     opt(fp, c, "--dir-steering-attn F", "Apply steering after attention outputs. Default: 0");
+    opt(fp, c, "--dir-steering-resid F", "V4.1: steer the residual after each layer (mean of HC copies). Default: 0");
     fputc('\n', fp);
 }
 
