@@ -3079,6 +3079,7 @@ static void test_moe_mm_tiles_exact(arena_t *a, uint32_t down_type) {
     ds4_gpu_tensor_free(glists); ds4_gpu_tensor_free(gsel); ds4_gpu_tensor_free(gx);
 }
 
+#ifdef __APPLE__
 /* Cache-only and dense-prefix preparation must reproduce the outputs they
  * retain from full preparation, including half stores and three-axis RoPE,
  * without touching neighboring cache rows or a skipped indexer query. */
@@ -3290,6 +3291,7 @@ static void test_mtp_project(arena_t *a) {
     require_ok((saved ? setenv(env_name, saved, 1) : unsetenv(env_name)) == 0, "restore EH matvec threshold");
     free(saved);
 }
+#endif
 
 /* A baseline and candidate shader can run this same deterministic fixture in
  * separate processes. RAW16_DUMP writes every mid/down bit, including guards,
@@ -4405,6 +4407,7 @@ int main(void) {
         munmap(arena.base, arena.size);
         return 0;
     }
+#ifdef __APPLE__
     if (run_prep) {
         test_attention_cache_prep(&arena);
         ds4_gpu_cleanup();
@@ -4412,9 +4415,19 @@ int main(void) {
         puts("all Qwen attention preparation kernel tests passed");
         return 0;
     }
+#else
+    if (run_prep) {
+        fputs("Qwen cache-only preparation is a Metal kernel\n", stderr);
+        ds4_gpu_cleanup();
+        munmap(arena.base, arena.size);
+        return 2;
+    }
+#endif
     if (run_mtp) {
+#ifdef __APPLE__
         test_attention_cache_prep(&arena);
         test_mtp_project(&arena);
+#endif
         test_mtp(&arena, 2560u, 4u);
         test_mtp(&arena, 64u, 4u);
         ds4_gpu_cleanup();
@@ -4600,8 +4613,10 @@ int main(void) {
     test_multi_gemv(&arena, 2560, 2);
     test_multi_gemv(&arena, 64, 3);
     printf("mtp\n");
+#ifdef __APPLE__
     test_attention_cache_prep(&arena);
     test_mtp_project(&arena);
+#endif
     test_mtp(&arena, 2560, 4);
     test_mtp(&arena, 64, 4);
     test_hc_norm_reuse(&arena);
