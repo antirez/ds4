@@ -6827,7 +6827,29 @@ static bool parse_generated_message_for_response_for_syntax(server_model_syntax 
                                                            content_out,
                                                            reasoning_out,
                                                            calls);
-    if (parsed_ok) return true;
+    if (parsed_ok) {
+        /* An unterminated reasoning block (no </think>) is routed entirely to
+         * reasoning_content with content emptied.  That is intentional for the
+         * truncation case (finish_reason=length): a cut-off reasoning chain
+         * must not reach clients looking like a finished reply.
+         *
+         * It is wrong for a regular turn end.  When the model emits EOS without
+         * closing </think> (finish_reason=stop), generation completed and the
+         * buffer is whatever the model chose to end with; dropping it deletes
+         * real model output.  Measured on one server, two models: ~10% of reps
+         * returned content="" while reasoning_content held 3k-46k characters of
+         * finished work, with "thinking not closed, ignoring incomplete ...
+         * tool calls in reasoning" as the only diagnostic.  Re-emit that text
+         * as content; reasoning_content is kept for diagnostics. */
+        const char *finish_final = (finish_io && *finish_io) ? *finish_io : "stop";
+        if (strcmp(finish_final, "length") != 0
+                && content_out && *content_out && !**content_out
+                && reasoning_out && *reasoning_out && **reasoning_out) {
+            free(*content_out);
+            *content_out = xstrdup(*reasoning_out);
+        }
+        return true;
+    }
 
     free(*content_out);
     free(*reasoning_out);
@@ -18938,6 +18960,92 @@ static void test_qwen_tool_checkpoint_round_trip(void) {
     tool_calls_free(&calls);
 }
 
+static void test_unterminated_reasoning_content_recovered_on_stop(void) {
+    /* A model that ends the turn without ever closing </think> leaves the
+     * parser with an unterminated reasoning buffer.  Routing it entirely to
+     * reasoning_content and emptying content is right for truncation
+     * (finish_reason=length, tested below) but wrong here: the turn completed,
+     * so the buffer is real output and must reach the client as content. */
+    const char *generated =
+        "<think>\nStufe 1: 26,9% PPV, 670 Alarme.\nStufe 2: 220 Alarme.\n"
+        "Ergebnis: 890 / 29 / 15.025,00 EUR";
+    const char *finish = "stop";
+    char *content = NULL, *reasoning = NULL;
+    char err[128] = {0};
+    tool_calls calls = {0};
+    bool recovered = false;
+    TEST_ASSERT(parse_generated_message_for_response_for_syntax(
+        SERVER_MODEL_SYNTAX_GLM, generated, false, false, true, &finish,
+        err, sizeof(err), &content, &reasoning, &calls, &recovered, NULL));
+    TEST_ASSERT(content && content[0]);             /* recovered, not dropped */
+    TEST_ASSERT(reasoning && reasoning[0]);         /* kept for diagnostics */
+    TEST_ASSERT(!strncmp(content, "\nStufe 1:", 9));/* <think> stripped */
+    TEST_ASSERT(!strcmp(finish, "stop"));
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+}
+
+static void test_unterminated_reasoning_stays_empty_on_length(void) {
+    /* Truncation keeps the pre-existing behaviour: content stays empty so a
+     * cut-off reasoning chain never reaches clients looking like an answer,
+     * and finish_reason keeps saying "length". */
+    const char *generated = "<think>\nnoch am Rechnen, Schritt 7 von 12 ...";
+    const char *finish = "length";
+    char *content = NULL, *reasoning = NULL;
+    char err[128] = {0};
+    tool_calls calls = {0};
+    bool recovered = false;
+    TEST_ASSERT(parse_generated_message_for_response_for_syntax(
+        SERVER_MODEL_SYNTAX_GLM, generated, false, false, true, &finish,
+        err, sizeof(err), &content, &reasoning, &calls, &recovered, NULL));
+    TEST_ASSERT(content && !content[0]);            /* still empty */
+    TEST_ASSERT(reasoning && reasoning[0]);         /* still preserved */
+    TEST_ASSERT(!strcmp(finish, "length"));         /* untouched */
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+}
+
+static void test_unterminated_reasoning_recovered_on_qwen_syntax(void) {
+    /* Same rule on the Qwen parser, which logs its own variant of the
+     * "thinking not closed" warning before emptying content. */
+    const char *generated = "<think>\nOptimierung: Option 1 bei p>0.5 ...";
+    const char *finish = "stop";
+    char *content = NULL, *reasoning = NULL;
+    char err[128] = {0};
+    tool_calls calls = {0};
+    bool recovered = false;
+    TEST_ASSERT(parse_generated_message_for_response_for_syntax(
+        SERVER_MODEL_SYNTAX_QWEN, generated, false, false, true, &finish,
+        err, sizeof(err), &content, &reasoning, &calls, &recovered, NULL));
+    TEST_ASSERT(content && content[0]);
+    TEST_ASSERT(reasoning && reasoning[0]);
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+}
+
+static void test_closed_thinking_split_is_unchanged(void) {
+    /* Regression guard: a properly closed think block still splits into
+     * reasoning + content, and the content is not duplicated into reasoning. */
+    const char *generated = "<think>\nRechnung Schritt 1..3\n</think>\nAntwort: 42";
+    const char *finish = "stop";
+    char *content = NULL, *reasoning = NULL;
+    char err[128] = {0};
+    tool_calls calls = {0};
+    bool recovered = false;
+    TEST_ASSERT(parse_generated_message_for_response_for_syntax(
+        SERVER_MODEL_SYNTAX_GLM, generated, false, false, true, &finish,
+        err, sizeof(err), &content, &reasoning, &calls, &recovered, NULL));
+    TEST_ASSERT(content && strstr(content, "Antwort: 42"));
+    TEST_ASSERT(reasoning && strstr(reasoning, "Rechnung Schritt 1..3"));
+    TEST_ASSERT(!strstr(reasoning, "Antwort: 42"));  /* no duplication */
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+}
+
 static void test_qwen_sampled_tool_text_after_think_renders_exactly(void) {
     /* the model's own whitespace between </think> and its tool call is
      * replayed once, not stacked on the template separator */
@@ -23053,6 +23161,10 @@ static void ds4_server_unit_tests_run(void) {
     test_qwen_literal_tool_end_in_argument();
     test_qwen_string_arguments_follow_schema();
     test_qwen_tool_checkpoint_round_trip();
+    test_unterminated_reasoning_content_recovered_on_stop();
+    test_unterminated_reasoning_stays_empty_on_length();
+    test_unterminated_reasoning_recovered_on_qwen_syntax();
+    test_closed_thinking_split_is_unchanged();
     test_qwen_sampled_tool_text_after_think_renders_exactly();
     test_qwen_parallel_tool_calls_parse_and_replay();
     test_qwen_plain_answer_keeps_trailing_whitespace();
