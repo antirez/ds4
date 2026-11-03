@@ -11422,9 +11422,32 @@ static void kv_cache_discard_failed_disk_entry(server *s, server_slot *slot,
     pthread_mutex_unlock(&s->inference_mu);
 }
 
+/* Smallest continued step for which a long read is cut at its boundaries
+ * (see kv_cache_segment_long_prefill). */
+#define KV_CACHE_SEGMENT_MIN_STEP 16384
+
+/* The interval between continued checkpoints, rounded to the boundary
+ * alignment the store uses (mirrors ds4_kvstore's continued step). */
+static int kv_cache_continued_step_tokens(const server *s) {
+    if (!s || !s->kv.enabled || s->kv.opt.continued_interval_tokens <= 0) return 0;
+    int step = s->kv.opt.continued_interval_tokens;
+    const int align = s->kv.opt.boundary_align_tokens;
+    if (align > 0) {
+        step = ((step + align - 1) / align) * align;
+        if (step <= 0) step = align;
+    }
+    return step;
+}
+
 static void kv_cache_maybe_store_continued(server *s, server_slot *slot) {
     if (!s || !slot) return;
     kv_disk_cache *kc = &s->kv;
+    /* Called from the prefill progress callback, where a sync is still in
+     * flight and the session has no valid checkpoint until it returns: every
+     * such attempt failed ("session has no valid checkpoint to stage") and
+     * logged noise. The boundaries are now reached by segmenting the read
+     * (kv_cache_segment_long_prefill), so only try when a store can work. */
+    if (!ds4_session_checkpoint_valid(slot->session)) return;
     const ds4_tokens *tokens = ds4_session_tokens(slot->session);
     if (!tokens) return;
     const int target = kv_cache_slot_continued_target(s, slot, tokens->len);
@@ -11441,6 +11464,94 @@ static int kv_cache_find_text_prefix(kv_disk_cache *kc, const char *prompt_text,
     return ds4_kvstore_find_text_prefix(kc, prompt_text, 0, quant_bits, ctx_size);
 }
 #endif
+
+static int server_session_sync(server *s, server_slot *slot,
+                               const ds4_tokens *prompt,
+                               char *err, size_t errlen);
+
+/* Continued checkpoints for long reads.
+ *
+ * A continued checkpoint exists so that a long conversation survives a crash
+ * or a restart part-way through, but none ever landed during a long read: the
+ * only attempt was the prefill progress callback, which fires mid-sync, when
+ * the session has no valid checkpoint to stage. So end the read at each
+ * boundary instead -- sync to the boundary, which leaves a complete
+ * checkpoint, store it, and carry on from there -- the same way the cold store
+ * already stops at its anchor. Each segment is an ordinary extension from a
+ * saved checkpoint, the path every cache hit takes.
+ *
+ * Text only: a prefix sync of an image request would need its spans, and image
+ * prompts are short.
+ *
+ * Boundaries are taken strictly below `end` (clamped to the prompt).  The
+ * caller passes the cold-store length first, because a cold prompt syncs to
+ * its cold anchor in one call and, with a large --kv-cache-cold-max-tokens,
+ * that anchor is nearly the whole prompt: segmenting only after the cold sync
+ * would leave the read with no boundary to stop at.
+ *
+ * Returns 0 to continue, nonzero on a failed sync (err set). */
+static int kv_cache_segment_long_prefill(server *s, server_slot *slot,
+                                         const ds4_tokens *prompt, int end,
+                                         char *err, size_t errlen) {
+    const int step = kv_cache_continued_step_tokens(s);
+    if (step <= 0 || !prompt) return 0;
+    if (end > prompt->len) end = prompt->len;
+    /* A V4.1 sweep of 8,192 rows or more takes the decoder-suffix fast path;
+     * cutting a read into shorter pieces loses it on every piece. Measured:
+     * 2,048-token segments made a 5,723-token read 37.5 s -> 50.5 s (+35%),
+     * while 16,384-token segments on a 32,521-token read cost nothing
+     * measurable (88.7 s segmented, 102.0 s not, one run each).
+     *
+     * And not exactly 8,192 either: a sweep is "wide" only when it exceeds the
+     * 8,192-row encoder chunk, so an exactly-8,192-row segment is a narrow
+     * sweep, and the second such sweep in a row failed at layer 39 ("V4.1
+     * layer-major prefill failed") -- from zero and after a disk restore
+     * alike -- then discarded the checkpoint it had resumed from. Every full
+     * segment must be a wide sweep, the path the 16,384 test exercised. So an
+     * interval under 16,384 never segments; the prompt-end store still keeps
+     * a recent checkpoint, and production's 65,536 always does. */
+    if (step < KV_CACHE_SEGMENT_MIN_STEP) return 0;
+    /* Resume point of the next sync: the live prefix this prompt shares, not
+     * the raw session position (a diverged live session would overstate it). */
+    const int pos = ds4_session_common_prefix(slot->session, prompt);
+    int last = slot->continued_last_store_tokens;
+    if (last < pos) last = pos;
+    int t = (last / step + 1) * step;
+    if (t < s->kv.opt.min_tokens) t = ((s->kv.opt.min_tokens + step - 1) / step) * step;
+    for (; t < end; t += step) {
+        ds4_tokens prefix = {0};
+        tokens_copy_prefix(&prefix, prompt, t);
+        const double t0 = now_sec();
+        const int rc = server_session_sync(s, slot, &prefix, err, errlen);
+        ds4_tokens_free(&prefix);
+        if (rc != 0) return rc;
+        if (kv_cache_store_live_prefix(s, slot, prompt, t, "continued")) {
+            kv_cache_slot_note_store(slot, t);
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: continued checkpoint at %d of %d (segment %.1fs)",
+                       t, prompt->len, now_sec() - t0);
+        }
+    }
+    return 0;
+}
+
+/* After a read, keep the newest frontier on disk: if the session has moved a
+ * full interval past its last store, write it at the prompt end, where it has
+ * a valid checkpoint and where the client's next request resumes. Catches the
+ * boundaries crossed during generation, which the next read starts past and so
+ * could never segment at. */
+static void kv_cache_store_prompt_end_continued(server *s, server_slot *slot) {
+    const int step = kv_cache_continued_step_tokens(s);
+    if (step <= 0 || !ds4_session_checkpoint_valid(slot->session)) return;
+    const ds4_tokens *live = ds4_session_tokens(slot->session);
+    if (!live || live->len < s->kv.opt.min_tokens) return;
+    if (live->len - slot->continued_last_store_tokens < step) return;
+    if (kv_cache_store_live_prefix(s, slot, live, live->len, "continued")) {
+        kv_cache_slot_note_store(slot, live->len);
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: continued checkpoint at prompt end %d", live->len);
+    }
+}
 
 static int kv_cache_try_load_text(server *s, server_slot *slot,
                                   const char *prompt_text,
@@ -13738,8 +13849,21 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         cold_store_len = anchor >= s->kv.opt.min_tokens ?
                          anchor : kv_cache_store_len(&s->kv, prompt_for_sync->len);
     }
+    /* Continued checkpoints below the cold anchor.  The cold sync below runs
+     * to its anchor in one call, so its boundaries must be taken first.  Done
+     * before the cold-frontier suppression, which would otherwise mark the
+     * whole span as already stored.  A failed segment sync falls through to
+     * the prompt-sync failure path below. */
+    int prompt_sync_rc = 0;
+    if (!multimodal && s->kv.enabled &&
+        cold_store_len >= s->kv.opt.min_tokens &&
+        cold_store_len < prompt_for_sync->len)
+        prompt_sync_rc = kv_cache_segment_long_prefill(s, slot, prompt_for_sync,
+                                                       cold_store_len,
+                                                       err, sizeof(err));
+
     int suppressed_continued_last = -1;
-    if (cold_store_len >= s->kv.opt.min_tokens) {
+    if (prompt_sync_rc == 0 && cold_store_len >= s->kv.opt.min_tokens) {
         /* A cold checkpoint can land exactly on the continued-checkpoint
          * frontier.  The prefill progress callback would then write the same
          * prefix as "continued" while we are intentionally stopping there to
@@ -13750,7 +13874,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             kv_cache_slot_suppress_continued(s, slot, cold_store_len);
     }
 
-    if (s->kv.enabled &&
+    if (prompt_sync_rc == 0 && s->kv.enabled &&
         cold_store_len >= s->kv.opt.min_tokens &&
         cold_store_len < prompt_for_sync->len)
     {
@@ -13786,7 +13910,11 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         ds4_tokens_free(&prefix);
     }
 
-    int prompt_sync_rc = multimodal ?
+    if (prompt_sync_rc == 0 && !multimodal && s->kv.enabled)
+        prompt_sync_rc = kv_cache_segment_long_prefill(s, slot, prompt_for_sync,
+                                                       prompt_for_sync->len,
+                                                       err, sizeof(err));
+    if (prompt_sync_rc == 0) prompt_sync_rc = multimodal ?
         server_session_sync_multimodal(s, slot, prompt_for_sync,
                                        j->req.images, j->req.image_count,
                                        err, sizeof(err)) :
@@ -13824,7 +13952,10 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     if (!thinking_live_continuation) thinking_live_clear(s, slot);
     ds4_session_set_progress(slot->session, NULL, NULL);
     ds4_session_set_display_progress(slot->session, NULL, NULL);
-    if (!multimodal) kv_cache_maybe_store_continued(s, slot);
+    if (!multimodal) {
+        kv_cache_maybe_store_continued(s, slot);
+        kv_cache_store_prompt_end_continued(s, slot);
+    }
     server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s prompt done %.3fs",
                j->req.kind == REQ_CHAT ? "chat" : "completion",
@@ -16021,6 +16152,12 @@ int main(int argc, char **argv) {
     if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
                       cfg.kv_cache_reject_different_quant, cfg.kv_cache);
+        const int step = kv_cache_continued_step_tokens(&s);
+        if (step > 0 && step < KV_CACHE_SEGMENT_MIN_STEP) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: continued interval %d is below %d; long reads are not segmented, continued checkpoints land only between requests",
+                       step, KV_CACHE_SEGMENT_MIN_STEP);
+        }
     }
     if (s.disable_exact_dsml_tool_replay) {
         server_log(DS4_LOG_DEFAULT,
