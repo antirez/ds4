@@ -58,7 +58,7 @@ def check_shader_mapping(metal):
         calls = re.findall(r'qwen4_moe_mm_mid_impl\s*<([^>]+)>\s*\(([^;]+)\);', body)
         assert len(calls) == 1, marker
         template, arguments = calls[0]
-        assert [part.strip() for part in template.split(',')] == ['NT', scalar, shadow_enabled], marker
+        assert [part.strip() for part in template.split(',')] == ['NT', scalar, shadow_enabled, 'KS'], marker
         expected = ['args', 'gate_base', 'up_base', 'lists', 'counts', 'x',
                     'mid', shadow, 'Ag', 'Au', 'Bs', 'Cs', 'tgpig', 'tid', 'sgitg']
         assert [part.strip() for part in arguments.split(',')] == expected, marker
@@ -68,7 +68,8 @@ def check_shader_mapping(metal):
     # kernel body. Keep all 8/16/32/64-token instances on that implementation.
     down_half = metal.split('#define QWEN4_MOE_MM_DOWN_F16_INSTANCE(NT_)', 1)[1]
     down_half = down_half.split('#undef QWEN4_MOE_MM_DOWN_F16_INSTANCE', 1)[0]
-    assert 'kernel_qwen4_moe_mm_down<NT_, half>(' in down_half
+    assert 'kernel_qwen4_moe_mm_down<NT_, half, 64>(' in down_half
+    assert 'kernel_qwen4_moe_mm_down<4, half, 32>(' in metal
     assert re.findall(r'QWEN4_MOE_MM_DOWN_F16_INSTANCE\((\d+)\)', down_half) == ['1', '2', '4', '8']
 
 
@@ -101,13 +102,18 @@ def check_scanner_negative_controls(metal):
         body = extract(metal, marker)
         reject(body, body.replace('lists, counts, x', 'counts, lists, x', 1), f'{marker}: swapped buffers')
         reject(body, body.replace('Cs, tgpig, tid', 'Cs, uint3(0), tid', 1), f'{marker}: lost grid index')
-        reject(body, body.replace(f'<NT, {scalar}, {shadow_enabled}>', '<NT, float, true>', 1),
+        reject(body, body.replace(f'<NT, {scalar}, {shadow_enabled}, KS>', '<NT, float, true, KS>', 1),
                f'{marker}: wrong template arguments')
+        reject(body, body.replace(f'<NT, {scalar}, {shadow_enabled}, KS>',
+                                  f'<NT, {scalar}, {shadow_enabled}, 64>', 1),
+               f'{marker}: lost staging width')
         wrong_shadow = 'mid_shadow' if shadow == 'nullptr' else 'nullptr'
         reject(body, body.replace(f'mid, {shadow}, Ag', f'mid, {wrong_shadow}, Ag', 1),
                f'{marker}: wrong shadow buffer')
-    reject('kernel_qwen4_moe_mm_down<NT_, half>(', 'kernel_qwen4_moe_mm_down<NT_, float>(',
+    reject('kernel_qwen4_moe_mm_down<NT_, half, 64>(', 'kernel_qwen4_moe_mm_down<NT_, float, 64>(',
            'half down: wrong template')
+    reject('kernel_qwen4_moe_mm_down<4, half, 32>(', 'kernel_qwen4_moe_mm_down<4, half, 64>(',
+           'half down: wrong K32 staging width')
     for nt in (1, 2, 4, 8):
         reject(f'QWEN4_MOE_MM_DOWN_F16_INSTANCE({nt})', '', f'half down: missing NT={nt}')
     return rejected
