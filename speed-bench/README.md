@@ -27,6 +27,27 @@ python3 speed-bench/plot_speed.py speed-bench/m3_max.csv --title "M3 Max t/s"
 The script uses only the Python standard library. By default it writes a file
 next to the CSV using the `_ts.svg` suffix, such as `speed-bench/m3_max_ts.svg`.
 
+### DeepSeek V4.1 Flash streaming slab residency
+
+On macOS 15+, `DS4_METAL_STREAMING_SLAB_RESIDENCY=1` attaches owned expert-cache
+slabs to the existing Metal queue. It is opt-in; disk-backed model views and
+Engram tables are excluded. Memory-pressure relief detaches the set until the
+cache is rebuilt. See [the M2 Ultra investigation](v41_slab_residency_m2_ultra.md).
+
+A model-free reproducer checks every GPU result and toggles queue attachment
+OFF/ON/OFF/ON. The following allocates and locks approximately 104 GiB; run it
+alone on a host with enough available memory:
+
+```sh
+make metal-slab-residency-bench test-metal-slab-residency
+DS4_SLAB_BENCH_ALTERNATE_SMALL=1 ./speed-bench/metal_slab_residency_bench \
+  toggle 26 4096 4080 24 6 > /tmp/slab-residency.csv
+```
+
+Arguments are mode, slab count, allocation MiB per slab, filled/locked MiB per
+slab, iterations per phase and selected slabs per command buffer. Use eight
+slabs instead of 26 for the 32 GiB control. No model file is opened.
+
 ### Metal decode schedule A/B
 
 Build the balanced, same-engine Metal decode comparison with:

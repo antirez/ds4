@@ -1074,6 +1074,7 @@ static id<MTLBuffer> g_stream_expert_cache_gate_addr_buffers[DS4_METAL_STREAM_EX
 static id<MTLBuffer> g_stream_expert_cache_up_addr_buffers[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static id<MTLBuffer> g_stream_expert_cache_down_addr_buffers[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static id<MTLBuffer> g_stream_expert_cache_slabs[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SLABS];
+static id g_stream_slab_residency_set;
 static uint32_t g_stream_expert_cache_slab_start_slot[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SLABS];
 static uint32_t g_stream_expert_cache_slab_slot_count[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SLABS];
 static uint32_t g_stream_expert_cache_slab_slots_used[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SLABS];
@@ -4541,6 +4542,13 @@ void ds4_gpu_print_memory_report(const char *label) {
                     (unsigned long long)g_stream_expert_cache_evictions,
                     (unsigned long long)g_stream_expert_cache_buffer_allocs,
                     (unsigned long long)g_stream_expert_cache_buffer_reuses);
+        }
+        if (g_stream_slab_residency_set) {
+            uint64_t bytes = 0;
+            for (uint32_t i = 0; i < g_stream_expert_cache_slab_count; i++)
+                bytes += [g_stream_expert_cache_slabs[i] length];
+            fprintf(stderr, "ds4:   streaming slab residency: %u slabs, %.2f GiB allocations\n",
+                    g_stream_expert_cache_slab_count, ds4_gpu_gib(bytes));
         }
         if (g_stream_expert_cache_mlock_bytes != 0 ||
             g_stream_expert_cache_mlock_failures != 0) {
@@ -14304,6 +14312,17 @@ static uint64_t ds4_gpu_stream_expert_slab_target_bytes(void) {
     return target;
 }
 
+static void ds4_gpu_stream_slab_residency_clear(void) {
+#if TARGET_OS_OSX
+    if (@available(macOS 15.0, *)) {
+        if (g_stream_slab_residency_set) {
+            [g_queue removeResidencySet:g_stream_slab_residency_set];
+            g_stream_slab_residency_set = nil;
+        }
+    }
+#endif
+}
+
 static id<MTLBuffer> ds4_gpu_stream_expert_alloc_slab_buffer(
         uint64_t  len,
         NSString *label) {
@@ -14323,6 +14342,35 @@ static id<MTLBuffer> ds4_gpu_stream_expert_alloc_slab_buffer(
     }
     buffer.label = label;
     g_stream_expert_cache_buffer_allocs++;
+    if (getenv("DS4_METAL_STREAMING_SLAB_RESIDENCY") &&
+        !g_stream_expert_cache_mlock_relief_applied) {
+#if TARGET_OS_OSX
+        if (@available(macOS 15.0, *)) {
+            /* Register only owned cache slabs, never disk-backed model views.
+             * Keep registration across slot reuse; clear the set with the slab
+             * pool after outstanding GPU work has drained. */
+            if (g_stream_slab_residency_set) {
+                [g_stream_slab_residency_set addAllocation:buffer];
+                [g_stream_slab_residency_set commit];
+            } else {
+                MTLResidencySetDescriptor *desc = [[MTLResidencySetDescriptor alloc] init];
+                desc.label = @"ds4_streaming_expert_slabs";
+                desc.initialCapacity = 64;
+                NSError *error = nil;
+                id<MTLResidencySet> set = [g_device newResidencySetWithDescriptor:desc error:&error];
+                if (!set) {
+                    fprintf(stderr, "ds4: streaming slab residency set failed: %s; using unregistered slab\n",
+                            [[error localizedDescription] UTF8String]);
+                    return buffer;
+                }
+                [set addAllocation:buffer];
+                [set commit];
+                [g_queue addResidencySet:set];
+                g_stream_slab_residency_set = set;
+            }
+        }
+#endif
+    }
     return buffer;
 }
 
@@ -15611,6 +15659,7 @@ static void ds4_gpu_stream_expert_cache_clear_all(int reset_stats) {
     }
     g_stream_expert_cache_bytes = 0;
     g_stream_expert_cache_entry_count = 0;
+    ds4_gpu_stream_slab_residency_clear();
     for (uint32_t i = 0; i < g_stream_expert_cache_slab_count; i++) {
         g_stream_expert_cache_slabs[i] = nil;
         g_stream_expert_cache_slab_start_slot[i] = 0;
@@ -16262,6 +16311,9 @@ static uint32_t ds4_gpu_stream_expert_cache_release_mlock_margin(
 
     if (released == 0) return 0;
     g_stream_expert_cache_mlock_relief_applied = 1;
+    /* Let released slots become reclaimable instead of requesting the whole
+     * pool again on every submission. A cache rebuild can enable residency. */
+    ds4_gpu_stream_slab_residency_clear();
 
     uint32_t cap = g_stream_expert_cache_entry_count;
     const uint32_t locked_after =
