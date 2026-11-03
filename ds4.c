@@ -7349,6 +7349,9 @@ static void deepseek4_vision_weights_bind(
     const bool v41 = DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41;
     const char *revision = v41 ? "df42c109f1defefcbfcedbe7d905718a12266e40" :
                                 "e46e16bf6035c6f317eb2ac7458eb0362926d402";
+    /* V4.1 Flash 1017 (deepseek-ai/DeepSeek-V4.1-Flash-1017) ships its own
+     * encoder with the same layout; either V4.1 revision is accepted. */
+    const char *revision_1017 = "1bae0e1088993b9b82de08f59de5be5a34e42170";
     const uint32_t projection = v41 ? 5120u : 4096u;
     ds4_str arch = {0}, source_revision = {0}, variant = {0};
     if (!model_get_string(m, "general.architecture", &arch) ||
@@ -7356,11 +7359,14 @@ static void deepseek4_vision_weights_bind(
         ds4_die("--vision file is not a DeepSeek V4 vision encoder GGUF");
     }
     if (!model_get_string(m, "general.source.revision", &source_revision) ||
-        !ds4_streq(source_revision, revision) ||
+        !(ds4_streq(source_revision, revision) ||
+          (v41 && ds4_streq(source_revision, revision_1017))) ||
         !model_get_string(m, "deepseek4-vision.checkpoint_variant", &variant) ||
         !ds4_streq(variant, v41 ? "v4.1-flash" : "vision-exp")) {
         ds4_die("DeepSeek vision sidecar does not match the language checkpoint");
     }
+    if (v41) fprintf(stderr, "ds4: V4.1 vision encoder from the %s checkpoint\n",
+                     ds4_streq(source_revision, revision_1017) ? "1017" : "original V4.1");
     const uint32_t expected_tensors = v41 ? 266u : 316u;
     if (m->n_tensors != expected_tensors) {
         fprintf(stderr,
@@ -73023,7 +73029,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
         if (opt->backend == DS4_BACKEND_CUDA && gpu_cfg &&
             gpu_cfg->n_gpus > 1) {
             fprintf(stderr,
-                    "ds4: GLM-5.3 CUDA/ROCm vision currently requires one GPU\n");
+                    "ds4: CUDA/ROCm vision currently requires one GPU\n");
             free(e);
             *out = NULL;
             return 1;
@@ -73115,9 +73121,16 @@ static int ds4_engine_open_internal(ds4_engine **out,
     const bool graph_backend = ds4_backend_uses_graph(opt->backend);
     if (graph_backend) ds4_linux_graph_backend_set_oom_score(opt->backend);
     model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only);
+    /* The V4.1 encoder runs on Metal and on CUDA (not yet checked on ROCm). */
+#ifdef DS4_ROCM_BUILD
+    const bool ds41_vision_backend = e->backend == DS4_BACKEND_METAL;
+#else
+    const bool ds41_vision_backend =
+        e->backend == DS4_BACKEND_METAL || e->backend == DS4_BACKEND_CUDA;
+#endif
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 &&
-        opt->vision_path && opt->vision_path[0] && e->backend != DS4_BACKEND_METAL) {
-        fprintf(stderr, "ds4: V4.1 vision requires Metal\n");
+        opt->vision_path && opt->vision_path[0] && !ds41_vision_backend) {
+        fprintf(stderr, "ds4: V4.1 vision requires Metal or CUDA\n");
         ds4_engine_close(e);
         *out = NULL;
         return 1;
