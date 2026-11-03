@@ -214,7 +214,7 @@ def official_engram(reference_dir, library_path):
     config = json.loads((Path(reference_dir) / "config.json").read_text())["text_config"]
     tokenizer = Tokenizer.from_file(str(Path(reference_dir) / "tokenizer.json"))
     own = engram_layout(config, tokenizer)
-    _, records = metadata(reference_dir, "0" * 40)
+    _, records = metadata(reference_dir, "df42c109f1defefcbfcedbe7d905718a12266e40")
     with tempfile.NamedTemporaryFile() as fp:
         fp.write(b"GGUF" + struct.pack("<IQQ", 3, 0, len(records)) + b"".join(records))
         fp.flush()

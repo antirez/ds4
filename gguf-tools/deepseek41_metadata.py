@@ -19,6 +19,14 @@ from glm53_quantize import (
 # without also unmapping bytes of the preceding resident tensor.
 GGUF_ALIGNMENT = 16384
 
+# Released V4.1 Flash checkpoints by Hugging Face commit: name and source URL.
+CHECKPOINTS = {
+    "df42c109f1defefcbfcedbe7d905718a12266e40":
+        ("DeepSeek V4.1 Flash", "https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash"),
+    "1bae0e1088993b9b82de08f59de5be5a34e42170":
+        ("DeepSeek V4.1 Flash 1017", "https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017"),
+}
+
 
 def array_record(key, kind, values):
     header = pack_string(key) + struct.pack("<IIQ", GGUF_ARRAY, kind, len(values))
@@ -88,6 +96,9 @@ def engram_layout(config, tokenizer):
 def metadata(hf_dir, revision):
     from tokenizers import Tokenizer
 
+    if revision not in CHECKPOINTS:
+        raise ValueError(f"unknown DeepSeek V4.1 source revision: {revision}")
+    name, url = CHECKPOINTS[revision]
     with open(os.path.join(hf_dir, "config.json"), "rb") as fp:
         config = json.load(fp)
     if config["model_type"] != "deepseek_v41":
@@ -108,8 +119,8 @@ def metadata(hf_dir, revision):
     merges = [" ".join(pair) if isinstance(pair, list) else pair for pair in tok["model"]["merges"]]
     records = [
         kv_string("general.architecture", "deepseek41"),
-        kv_string("general.name", "DeepSeek V4.1 Flash"),
-        kv_string("general.source.url", "https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash"),
+        kv_string("general.name", name),
+        kv_string("general.source.url", url),
         kv_string("general.source.revision", revision),
         kv_u32("general.alignment", GGUF_ALIGNMENT),
         kv_string("deepseek41.config", json.dumps(config, sort_keys=True, separators=(",", ":"))),

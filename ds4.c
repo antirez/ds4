@@ -7443,16 +7443,17 @@ static void deepseek4_vision_weights_bind(
         ds4_deepseek4_vision_weights *w,
         const ds4_model *m) {
     const bool v41 = DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41;
-    const char *revision = v41 ? "df42c109f1defefcbfcedbe7d905718a12266e40" :
-                                "e46e16bf6035c6f317eb2ac7458eb0362926d402";
     const uint32_t projection = v41 ? 5120u : 4096u;
     ds4_str arch = {0}, source_revision = {0}, variant = {0};
     if (!model_get_string(m, "general.architecture", &arch) ||
         !ds4_streq(arch, "deepseek4-vision")) {
         ds4_die("--vision file is not a DeepSeek V4 vision encoder GGUF");
     }
+    /* V4.1 has several released checkpoints; engine open pairs the sidecar
+     * with the language GGUF by source revision instead. */
     if (!model_get_string(m, "general.source.revision", &source_revision) ||
-        !ds4_streq(source_revision, revision) ||
+        (!v41 && !ds4_streq(source_revision,
+                            "e46e16bf6035c6f317eb2ac7458eb0362926d402")) ||
         !model_get_string(m, "deepseek4-vision.checkpoint_variant", &variant) ||
         !ds4_streq(variant, v41 ? "v4.1-flash" : "vision-exp")) {
         ds4_die("DeepSeek vision sidecar does not match the language checkpoint");
@@ -74002,8 +74003,15 @@ static int ds4_engine_open_internal(ds4_engine **out,
                                     DS4_DEEPSEEK4_IMAGE;
             e->vision_end_token = DS4_N_VOCAB +
                                   DS4_DEEPSEEK4_IMAGE_END;
-            if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41)
+            if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+                ds4_str language = {0}, vision = {0};
+                if (!model_get_string(&e->model, "general.source.revision", &language) ||
+                    !model_get_string(&e->vision_model, "general.source.revision", &vision) ||
+                    !ds4_str_eq(language, vision)) {
+                    ds4_die("DeepSeek vision sidecar does not match the language checkpoint");
+                }
                 e->vision_start_token = e->vision_image_token = e->vision_end_token = 129264;
+            }
             e->vision_kind = DS4_VISION_DEEPSEEK4;
         }
         e->vision_ready = true;

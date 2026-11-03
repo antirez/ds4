@@ -30,7 +30,7 @@ def check(hf_dir, headers, checker, fixture=None):
     else:
         db = SourceDB(hf_dir, index_validator=lambda _: None, scale_validator=validate_scales)
     validate_scales(db.tensors)
-    config, records = metadata(hf_dir, "layout-test")
+    config, records = metadata(hf_dir, "df42c109f1defefcbfcedbe7d905718a12266e40")
     plan = build_plan(db, config)
     if fixture:
         header = b"GGUF" + struct.pack("<IQQ", 3, len(plan), len(records))
