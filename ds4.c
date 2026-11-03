@@ -74490,6 +74490,22 @@ static int ds4_engine_open_internal(ds4_engine **out,
                 *out = NULL;
                 return 1;
             }
+            /* V4.1 has several released checkpoints that share the same
+             * support layout; pair the drafter with this language model by
+             * source revision the way the vision sidecar is paired. */
+            if (e->dspark_weights.v41) {
+                ds4_str language = {0}, support = {0};
+                if (!model_get_string(&e->model, "general.source.revision", &language) ||
+                    !model_get_string(&e->mtp_model, "general.source.revision", &support) ||
+                    !ds4_str_eq(language, support)) {
+                    fprintf(stderr,
+                            "ds4: DSpark support model does not match the "
+                            "language checkpoint revision\n");
+                    ds4_engine_close(e);
+                    *out = NULL;
+                    return 1;
+                }
+            }
             fprintf(stderr,
                     "ds4: DSpark support model detected: %s "
                     "(stages=%u block=%u markov_rank=%u tensors=%u missing=%u "
