@@ -15058,6 +15058,185 @@ static long content_length(const char *h, size_t n) {
     return 0;
 }
 
+typedef enum {
+    HTTP_TRANSFER_ENCODING_NONE,
+    HTTP_TRANSFER_ENCODING_CHUNKED,
+    HTTP_TRANSFER_ENCODING_UNSUPPORTED,
+} http_transfer_encoding;
+
+static bool has_http_header(const char *h, size_t n,
+                            const char *name, size_t name_len) {
+    const char *p = h, *end = h + n;
+    while (p < end) {
+        const char *line = p;
+        while (p < end && *p != '\n') p++;
+        size_t len = (size_t)(p - line);
+        if (len && line[len - 1] == '\r') len--;
+        if (len > name_len && line[name_len] == ':' &&
+            strncasecmp(line, name, name_len) == 0) return true;
+        if (p < end) p++;
+    }
+    return false;
+}
+
+static http_transfer_encoding parse_transfer_encoding(const char *h, size_t n) {
+    const char *p = h, *end = h + n;
+    const char *name = "transfer-encoding";
+    const size_t name_len = sizeof("transfer-encoding") - 1;
+    bool seen = false;
+    while (p < end) {
+        const char *line = p;
+        while (p < end && *p != '\n') p++;
+        size_t len = (size_t)(p - line);
+        if (len && line[len - 1] == '\r') len--;
+        if (len > name_len && line[name_len] == ':' &&
+            strncasecmp(line, name, name_len) == 0) {
+            /* This server implements exactly one transfer coding: chunked.
+             * Reject repeated fields and coding chains rather than partially
+             * decoding a message whose remaining transfer coding is unknown. */
+            if (seen) return HTTP_TRANSFER_ENCODING_UNSUPPORTED;
+            seen = true;
+            const char *value = line + name_len + 1;
+            const char *value_end = line + len;
+            while (value < value_end && (*value == ' ' || *value == '\t')) value++;
+            while (value_end > value &&
+                   (value_end[-1] == ' ' || value_end[-1] == '\t')) value_end--;
+            if ((size_t)(value_end - value) != 7 ||
+                strncasecmp(value, "chunked", 7) != 0)
+                return HTTP_TRANSFER_ENCODING_UNSUPPORTED;
+        }
+        if (p < end) p++;
+    }
+    return seen ? HTTP_TRANSFER_ENCODING_CHUNKED : HTTP_TRANSFER_ENCODING_NONE;
+}
+
+static bool http_is_token_char(unsigned char c) {
+    if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
+        (c >= 'a' && c <= 'z')) return true;
+    switch (c) {
+        case '!': case '#': case '$': case '%': case '&': case '\'':
+        case '*': case '+': case '-': case '.': case '^': case '_':
+        case '`': case '|': case '~':
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool http_request_header_fields_valid(const char *h, size_t n) {
+    const char *p = h, *end = h + n;
+
+    /* Skip the request line; this check is specifically for field syntax. */
+    while (p < end && *p != '\n') p++;
+    if (p == end) return false;
+    p++;
+
+    for (;;) {
+        const char *line = p;
+        while (p < end && *p != '\n') p++;
+        if (p == end) return false;
+
+        size_t len = (size_t)(p - line);
+        if (len && line[len - 1] == '\r') len--;
+        if (len == 0) return p + 1 == end;
+
+        size_t colon = 0;
+        while (colon < len && line[colon] != ':') colon++;
+        if (colon == 0 || colon == len) return false;
+        for (size_t i = 0; i < colon; i++) {
+            if (!http_is_token_char((unsigned char)line[i])) return false;
+        }
+
+        /* Field values permit HTAB, visible bytes, and obs-text, but no other
+         * controls. In particular, stray CR cannot be hidden before a colon. */
+        for (size_t i = colon + 1; i < len; i++) {
+            unsigned char c = (unsigned char)line[i];
+            if ((c < 0x20 && c != '\t') || c == 0x7f) return false;
+        }
+        p++;
+    }
+}
+
+static void skip_http_bws(const char *s, size_t len, size_t *pos) {
+    while (*pos < len && (s[*pos] == ' ' || s[*pos] == '\t')) (*pos)++;
+}
+
+static bool parse_http_quoted_string(const char *s, size_t len, size_t *pos) {
+    if (*pos >= len || s[*pos] != '"') return false;
+    (*pos)++;
+    while (*pos < len) {
+        unsigned char c = (unsigned char)s[(*pos)++];
+        if (c == '"') return true;
+        if (c == '\\') {
+            if (*pos >= len) return false;
+            c = (unsigned char)s[(*pos)++];
+            if (c == '\t' || c == ' ' || (c >= 0x21 && c <= 0x7e) || c >= 0x80)
+                continue;
+            return false;
+        }
+        if (c == '\t' || c == ' ' || c == '!' ||
+            (c >= '#' && c <= '[') || (c >= ']' && c <= '~') || c >= 0x80)
+            continue;
+        return false;
+    }
+    return false;
+}
+
+static bool parse_chunk_extensions(const char *s, size_t len, size_t *pos) {
+    while (*pos < len) {
+        size_t before_bws = *pos;
+        skip_http_bws(s, len, pos);
+        if (*pos == len) return *pos == before_bws;
+        if (s[*pos] != ';') return false;
+        (*pos)++;
+
+        skip_http_bws(s, len, pos);
+        size_t name_start = *pos;
+        while (*pos < len && http_is_token_char((unsigned char)s[*pos])) (*pos)++;
+        if (*pos == name_start) return false;
+
+        size_t name_end = *pos;
+        skip_http_bws(s, len, pos);
+        if (*pos < len && s[*pos] == '=') {
+            (*pos)++;
+            skip_http_bws(s, len, pos);
+            if (*pos < len && s[*pos] == '"') {
+                if (!parse_http_quoted_string(s, len, pos)) return false;
+            } else {
+                size_t value_start = *pos;
+                while (*pos < len && http_is_token_char((unsigned char)s[*pos])) (*pos)++;
+                if (*pos == value_start) return false;
+            }
+        } else {
+            /* BWS belongs to '=' or the next ';', not the line end. */
+            *pos = name_end;
+        }
+    }
+    return true;
+}
+
+static bool parse_chunk_size_line(const char *line, size_t len,
+                                  size_t max_size, size_t *chunk_size) {
+    size_t pos = 0;
+    size_t value = 0;
+    size_t digits = 0;
+    while (pos < len) {
+        unsigned char c = (unsigned char)line[pos];
+        size_t digit;
+        if (c >= '0' && c <= '9') digit = (size_t)(c - '0');
+        else if (c >= 'a' && c <= 'f') digit = (size_t)(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') digit = (size_t)(c - 'A' + 10);
+        else break;
+        if (value > (max_size - digit) / 16) return false;
+        value = value * 16 + digit;
+        pos++;
+        digits++;
+    }
+    if (digits == 0 || !parse_chunk_extensions(line, len, &pos)) return false;
+    *chunk_size = value;
+    return true;
+}
+
 static bool read_http_request(int fd, http_request *r) {
     buf b = {0};
     ssize_t hend = -1;
@@ -15073,6 +15252,7 @@ static bool read_http_request(int fd, http_request *r) {
         hend = header_end(b.ptr, b.len);
     }
     if (hend < 0) goto fail;
+    if (!http_request_header_fields_valid(b.ptr, (size_t)hend)) goto fail;
 
     char line[512];
     size_t i = 0;
@@ -15086,6 +15266,144 @@ static bool read_http_request(int fd, http_request *r) {
     if (q) *q = '\0';
 
     long clen = content_length(b.ptr, (size_t)hend);
+    http_transfer_encoding transfer_encoding =
+        parse_transfer_encoding(b.ptr, (size_t)hend);
+    bool has_content_length = has_http_header(
+        b.ptr, (size_t)hend, "content-length", sizeof("content-length") - 1);
+    if (transfer_encoding == HTTP_TRANSFER_ENCODING_UNSUPPORTED ||
+        (transfer_encoding == HTTP_TRANSFER_ENCODING_CHUNKED && has_content_length)) {
+        goto fail;
+    }
+    bool chunked = transfer_encoding == HTTP_TRANSFER_ENCODING_CHUNKED;
+
+    if (chunked) {
+        buf decoded = {0};
+        size_t src_pos = (size_t)hend;
+
+        for (;;) {
+            /* Find the end of the chunk size line starting at src_pos */
+            size_t line_end = src_pos;
+            while (line_end < b.len && b.ptr[line_end] != '\n') {
+                line_end++;
+            }
+
+            /* If we don't have a complete line (i.e. \n is not found before b.len) */
+            while (line_end >= b.len) {
+                char tmp[4096];
+                ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
+                if (n < 0 && errno == EINTR) continue;
+                if (n <= 0) {
+                    buf_free(&decoded);
+                    goto fail;
+                }
+                buf_append(&b, tmp, (size_t)n);
+                if (b.len - (size_t)hend > max_body) {
+                    buf_free(&decoded);
+                    goto fail;
+                }
+                /* Re-scan from the previous line_end since b.ptr might have reallocated */
+                while (line_end < b.len && b.ptr[line_end] != '\n') {
+                    line_end++;
+                }
+            }
+
+            /* Parse strict 1*HEXDIG chunk-size syntax and valid extensions. */
+            const char *line_start = b.ptr + src_pos;
+            size_t line_len = line_end - src_pos;
+            size_t chunk_size;
+            if (!line_len || line_start[line_len - 1] != '\r') {
+                buf_free(&decoded);
+                goto fail;
+            }
+            line_len--;
+            if (line_len >= 128 ||
+                !parse_chunk_size_line(line_start, line_len, max_body, &chunk_size)) {
+                buf_free(&decoded);
+                goto fail;
+            }
+            size_t val = chunk_size;
+
+            /* Move src_pos past the chunk size line */
+            src_pos = line_end + 1;
+
+            /* If val == 0, we have finished reading all chunks */
+            if (val == 0) {
+                /* Consume trailer-section lines until we find an empty line */
+                for (;;) {
+                    size_t trailer_end = src_pos;
+                    while (trailer_end < b.len && b.ptr[trailer_end] != '\n') {
+                        trailer_end++;
+                    }
+                    while (trailer_end >= b.len) {
+                        char tmp[4096];
+                        ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
+                        if (n < 0 && errno == EINTR) continue;
+                        if (n <= 0) {
+                            buf_free(&decoded);
+                            goto fail;
+                        }
+                        buf_append(&b, tmp, (size_t)n);
+                        if (b.len - (size_t)hend > max_body) {
+                            buf_free(&decoded);
+                            goto fail;
+                        }
+                        while (trailer_end < b.len && b.ptr[trailer_end] != '\n') {
+                            trailer_end++;
+                        }
+                    }
+                    size_t trailer_len = trailer_end - src_pos;
+                    if (!trailer_len || b.ptr[trailer_end - 1] != '\r') {
+                        buf_free(&decoded);
+                        goto fail;
+                    }
+                    trailer_len--;
+                    src_pos = trailer_end + 1;
+                    if (trailer_len == 0) {
+                        break; /* Empty line found; trailer section is fully consumed */
+                    }
+                }
+
+                /* Rebuild b with header + decoded body */
+                buf nb = {0};
+                buf_append(&nb, b.ptr, (size_t)hend);
+                buf_append(&nb, decoded.ptr, decoded.len);
+                clen = (long)decoded.len;
+                buf_free(&decoded);
+                buf_free(&b);
+                b = nb;
+                goto have_body;
+            }
+
+            /* Each chunk-data payload must be followed by exact CRLF. */
+            while (b.len < src_pos + (size_t)val + 2) {
+                char tmp[4096];
+                ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
+                if (n < 0 && errno == EINTR) continue;
+                if (n <= 0) {
+                    buf_free(&decoded);
+                    goto fail;
+                }
+                buf_append(&b, tmp, (size_t)n);
+                if (b.len - (size_t)hend > max_body) {
+                    buf_free(&decoded);
+                    goto fail;
+                }
+            }
+
+            if (b.ptr[src_pos + (size_t)val] != '\r' ||
+                b.ptr[src_pos + (size_t)val + 1] != '\n') {
+                buf_free(&decoded);
+                goto fail;
+            }
+
+            /* Append the val bytes of chunk data to decoded */
+            buf_append(&decoded, b.ptr + src_pos, (size_t)val);
+
+            /* Move src_pos past the chunk data and its CRLF terminator. */
+            src_pos += (size_t)val + 2;
+        }
+    }
+
     if (clen < 0 || (size_t)clen > max_body) goto fail;
     while (b.len < (size_t)hend + (size_t)clen) {
         char tmp[8192];
@@ -15095,6 +15413,7 @@ static bool read_http_request(int fd, http_request *r) {
         buf_append(&b, tmp, (size_t)n);
     }
 
+have_body:
     r->body_len = (size_t)clen;
     r->body = xmalloc(r->body_len + 1);
     memcpy(r->body, b.ptr + hend, r->body_len);
@@ -22656,6 +22975,314 @@ static void test_http_image_paths_and_urls_are_rejected(void) {
     }
 }
 
+static bool parse_http_test_request(const char *raw, http_request *r) {
+    int sv[2] = {-1, -1};
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return false;
+    size_t len = strlen(raw), sent = 0;
+    while (sent < len) {
+        ssize_t n = write(sv[1], raw + sent, len - sent);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        sent += (size_t)n;
+    }
+    bool ok = sent == len && shutdown(sv[1], SHUT_WR) == 0 &&
+              read_http_request(sv[0], r);
+    close(sv[0]);
+    close(sv[1]);
+    return ok;
+}
+
+typedef struct {
+    int fd;
+    const char *raw;
+    size_t len;
+    bool sent_all;
+} http_fragmented_write_arg;
+
+static void *http_fragmented_write_main(void *arg) {
+    http_fragmented_write_arg *wa = arg;
+    const struct timespec pause = {.tv_sec = 0, .tv_nsec = 100000};
+    size_t sent = 0;
+    while (sent < wa->len) {
+        ssize_t n = write(wa->fd, wa->raw + sent, 1);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return NULL;
+        sent += (size_t)n;
+        struct timespec remaining = pause;
+        while (nanosleep(&remaining, &remaining) != 0 && errno == EINTR) {}
+    }
+    wa->sent_all = shutdown(wa->fd, SHUT_WR) == 0;
+    return NULL;
+}
+
+static bool parse_http_test_request_one_byte_chunks(const char *raw,
+                                                    http_request *r) {
+    int sv[2] = {-1, -1};
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return false;
+    http_fragmented_write_arg wa = {
+        .fd = sv[1], .raw = raw, .len = strlen(raw), .sent_all = false,
+    };
+    pthread_t writer;
+    if (pthread_create(&writer, NULL, http_fragmented_write_main, &wa) != 0) {
+        close(sv[0]);
+        close(sv[1]);
+        return false;
+    }
+    bool parsed = read_http_request(sv[0], r);
+    pthread_join(writer, NULL);
+    close(sv[0]);
+    close(sv[1]);
+    return parsed && wa.sent_all;
+}
+
+static bool http_test_client_rejects_and_closes(const char *raw) {
+    int sv[2] = {-1, -1};
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return false;
+    struct timeval timeout = {.tv_sec = 2, .tv_usec = 0};
+    (void)setsockopt(sv[1], SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+    size_t len = strlen(raw), sent = 0;
+    while (sent < len) {
+        ssize_t n = write(sv[1], raw + sent, len - sent);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        sent += (size_t)n;
+    }
+    if (sent != len || shutdown(sv[1], SHUT_WR) != 0) {
+        close(sv[0]);
+        close(sv[1]);
+        return false;
+    }
+
+    server s = {0};
+    if (pthread_mutex_init(&s.mu, NULL) != 0) {
+        close(sv[0]);
+        close(sv[1]);
+        return false;
+    }
+    if (pthread_cond_init(&s.clients_cv, NULL) != 0) {
+        pthread_mutex_destroy(&s.mu);
+        close(sv[0]);
+        close(sv[1]);
+        return false;
+    }
+    s.clients = 1;
+    client_arg *ca = xmalloc(sizeof(*ca));
+    ca->srv = &s;
+    ca->fd = sv[0];
+    (void)client_main(ca);
+
+    buf response = {0};
+    char tmp[1024];
+    ssize_t n;
+    do {
+        n = read(sv[1], tmp, sizeof(tmp));
+        if (n > 0) buf_append(&response, tmp, (size_t)n);
+    } while (n > 0);
+    bool closed = n == 0;
+    char *reply = buf_take(&response);
+    bool rejected = strstr(reply, "HTTP/1.1 400") != NULL;
+    bool ok = closed && rejected && s.clients == 0;
+    free(reply);
+    close(sv[1]);
+    pthread_cond_destroy(&s.clients_cv);
+    pthread_mutex_destroy(&s.mu);
+    return ok;
+    }
+
+static void test_http_transfer_encoding_accepts_only_supported_single_chunked(void) {
+    const size_t max_body = 64u * 1024u * 1024u;
+    size_t parsed_chunk_size = 0;
+    TEST_ASSERT(parse_chunk_size_line("4000000", 7, max_body,
+                                     &parsed_chunk_size));
+    TEST_ASSERT(parsed_chunk_size == max_body);
+    TEST_ASSERT(!parse_chunk_size_line("4000001", 7, max_body,
+                                      &parsed_chunk_size));
+
+    char size_t_max_hex[2 * sizeof(size_t) + 1];
+    memset(size_t_max_hex, 'F', sizeof(size_t_max_hex) - 1);
+    size_t_max_hex[sizeof(size_t_max_hex) - 1] = '\0';
+    TEST_ASSERT(parse_chunk_size_line(size_t_max_hex,
+                                      sizeof(size_t_max_hex) - 1,
+                                      SIZE_MAX, &parsed_chunk_size));
+    TEST_ASSERT(parsed_chunk_size == SIZE_MAX);
+    char overflowing_hex[sizeof(size_t_max_hex) + 1];
+    memcpy(overflowing_hex, size_t_max_hex, sizeof(size_t_max_hex) - 1);
+    overflowing_hex[sizeof(size_t_max_hex) - 1] = 'F';
+    overflowing_hex[sizeof(size_t_max_hex)] = '\0';
+    TEST_ASSERT(!parse_chunk_size_line(overflowing_hex,
+                                       sizeof(overflowing_hex) - 1,
+                                       SIZE_MAX, &parsed_chunk_size));
+
+    const char *valid =
+        "POST /v1/chat/completions HTTP/1.1\r\n"
+        "Transfer-Encoding: \tChUnKeD \t\r\n\r\n"
+        "2\r\nWi\r\n2; note = \"some;thing\"\r\nki\r\n"
+        "5;note=yes\r\npedia\r\n0\r\nX-Trailer: ignored\r\n\r\n";
+    http_request req = {0};
+    bool parsed = parse_http_test_request(valid, &req);
+    TEST_ASSERT(parsed);
+    if (parsed) {
+        TEST_ASSERT(req.body_len == strlen("Wikipedia"));
+        TEST_ASSERT(memcmp(req.body, "Wikipedia", strlen("Wikipedia")) == 0);
+    }
+    http_request_free(&req);
+
+    const char *content_length_ows =
+        "POST /v1/chat/completions HTTP/1.1\r\n"
+        "Content-Length: \t1\t\r\n\r\nA";
+    memset(&req, 0, sizeof(req));
+    parsed = parse_http_test_request(content_length_ows, &req);
+    TEST_ASSERT(parsed);
+    if (parsed) {
+        TEST_ASSERT(req.body_len == 1);
+        TEST_ASSERT(req.body[0] == 'A');
+    }
+    http_request_free(&req);
+
+    /* Split every byte of the size lines, extensions, payload, data CRLF,
+     * zero chunk, and trailers across independent writes. The parser must not
+     * depend on how recv() groups bytes. */
+    const char *fragmented =
+        "POST /v1/chat/completions HTTP/1.1\r\n"
+        "Transfer-Encoding: chunked\r\n\r\n"
+        "1;note=\"a\\\"b\"\r\nA\r\n"
+        "2;flag=yes\r\nBC\r\n"
+        "0;done\r\nX-Trailer: ignored\r\n\r\n";
+    memset(&req, 0, sizeof(req));
+    parsed = parse_http_test_request_one_byte_chunks(fragmented, &req);
+    TEST_ASSERT(parsed);
+    if (parsed) {
+        TEST_ASSERT(req.body_len == 3);
+        TEST_ASSERT(memcmp(req.body, "ABC", 3) == 0);
+    }
+    http_request_free(&req);
+
+    /* The server is deliberately one-request-per-connection and discards
+     * pipelined bytes. They must not be folded into the decoded request body. */
+    const char *trailing =
+        "POST /v1/chat/completions HTTP/1.1\r\n"
+        "Transfer-Encoding: chunked\r\n\r\n"
+        "1\r\nA\r\n0\r\n\r\n"
+        "GET /v1/models HTTP/1.1\r\n\r\n";
+    memset(&req, 0, sizeof(req));
+    parsed = parse_http_test_request(trailing, &req);
+    TEST_ASSERT(parsed);
+    if (parsed) {
+        TEST_ASSERT(req.body_len == 1);
+        TEST_ASSERT(req.body[0] == 'A');
+    }
+    http_request_free(&req);
+
+    const char *invalid[] = {
+        "GET /not-found HTTP/1.1\r\nContent-Length: 0\r\n"
+        "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        "GET /not-found HTTP/1.1\r\ncontent-length: 0\r\n"
+        "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        "GET /not-found HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n",
+        "GET /not-found HTTP/1.1\r\nTransfer-Encoding: chunked, gzip\r\n\r\n0\r\n\r\n",
+        "GET /not-found HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n",
+        "GET /not-found HTTP/1.1\r\nTransfer-Encoding: chunked\r\n"
+        "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        /* Whitespace before the colon is never OWS in the value: it makes the
+         * field-name invalid and must not hide CL from the TE/CL conflict. */
+        "GET /not-found HTTP/1.1\r\nTransfer-Encoding: chunked\r\n"
+        "Content-Length : 0\r\n\r\n0\r\n\r\n",
+        "GET /not-found HTTP/1.1\r\nContent-Length: 0\r\n"
+        "Transfer-Encoding : chunked\r\n\r\n0\r\n\r\n",
+        "GET /not-found HTTP/1.1\r\nBad Header: value\r\n\r\n",
+        "GET /not-found HTTP/1.1\r\nTransfer-Encoding\t: chunked\r\n\r\n",
+        "GET /not-found HTTP/1.1\r\nContent-Length\001: 0\r\n\r\n",
+        "GET /not-found HTTP/1.1\r\nX-Test: value\001\r\n\r\n",
+        "GET /not-found HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "1\rX\nA\r\n0\r\n\r\n",
+        "GET /not-found HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "1\nA\r\n0\r\n\r\n",
+        "GET /not-found HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "1\r\nA\n0\r\n\r\n",
+        "GET /not-found HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "1\r\nA\rX",
+        "GET /not-found HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "0\r\nX-Trailer: ignored\n\r\n",
+        "GET /not-found HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "+1\r\nA\r\n0\r\n\r\n",
+        "GET /not-found HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "0x1\r\nA\r\n0\r\n\r\n",
+        "GET /not-found HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "1;=broken\r\nA\r\n0\r\n\r\n",
+        "GET /not-found HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "1;note=\"unterminated\r\nA\r\n0\r\n\r\n",
+        "GET /not-found HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF\r\n",
+        "GET /not-found HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "4000001\r\n",
+        "GET /not-found HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "1\r\nA",
+        "GET /not-found HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "0\r",
+        "GET /not-found HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "0\r\nX-Trailer: value\r\n",
+    };
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+        TEST_ASSERT(http_test_client_rejects_and_closes(invalid[i]));
+    }
+}
+
+static void test_http_chunk_extension_whitespace_requires_a_separator(void) {
+    const char *valid[] = {
+        ";flag",
+        " \t; \tflag",
+        ";flag \t= \tyes",
+        ";flag \t; next",
+        ";note=yes \t; flag",
+        ";note=\"a;\\\"b\" \t; flag",
+        ";flag \t= \t\"yes\" \t; next \t= \tok",
+    };
+    const char *invalid[] = {
+        ";flag ", ";flag\t",
+        ";note=yes ", ";note=yes\t",
+        ";note=\"yes\" ", ";note=\"yes\"\t",
+        ";note=yes ;flag ", ";note=yes\t;flag\t",
+        ";note=\"yes\" ;flag ", ";note=\"yes\"\t;flag\t",
+        ";note=\"yes\"next", ";note=yes \"next\"",
+        ";note=\"yes\"=next", ";note=yes\t=next",
+    };
+    /* Exercise both data and last chunks, including the complete client
+     * refusal path: HTTP 400, connection close, and client-count discharge. */
+    for (int last = 0; last < 2; last++) {
+        for (int accepted = 0; accepted < 2; accepted++) {
+            const char **cases = accepted ? valid : invalid;
+            size_t count = accepted ? sizeof(valid) / sizeof(valid[0]) :
+                                      sizeof(invalid) / sizeof(invalid[0]);
+            for (size_t i = 0; i < count; i++) {
+                buf raw = {0};
+                buf_puts(&raw, "GET /not-found HTTP/1.1\r\n"
+                               "Transfer-Encoding: chunked\r\n\r\n");
+                buf_puts(&raw, last ? "0" : "1");
+                buf_puts(&raw, cases[i]);
+                buf_puts(&raw, last ? "\r\n\r\n" : "\r\nA\r\n0\r\n\r\n");
+                http_request req = {0};
+                bool parsed = parse_http_test_request(raw.ptr, &req);
+                TEST_ASSERT(parsed == (accepted != 0));
+                if (parsed && accepted) {
+                    TEST_ASSERT(req.body_len == (last ? 0u : 1u));
+                    if (!last) TEST_ASSERT(req.body[0] == 'A');
+                }
+                http_request_free(&req);
+                if (accepted) {
+                    memset(&req, 0, sizeof(req));
+                    TEST_ASSERT(parse_http_test_request_one_byte_chunks(raw.ptr, &req));
+                    TEST_ASSERT(req.body_len == (last ? 0u : 1u));
+                    http_request_free(&req);
+                } else {
+                    TEST_ASSERT(http_test_client_rejects_and_closes(raw.ptr));
+                }
+                buf_free(&raw);
+            }
+        }
+    }
+}
+
 static void test_anthropic_inline_image_content(void) {
     buf json = {0};
     buf_puts(&json,
@@ -23140,6 +23767,8 @@ static void ds4_server_unit_tests_run(void) {
     test_thinking_canonical_non_thinking_mode_noop();
     test_openai_inline_image_content();
     test_http_image_paths_and_urls_are_rejected();
+    test_http_transfer_encoding_accepts_only_supported_single_chunked();
+    test_http_chunk_extension_whitespace_requires_a_separator();
     test_anthropic_inline_image_content();
     test_responses_inline_image_content();
     test_tool_separator_whitespace_is_not_content();
