@@ -1193,12 +1193,62 @@ bool ds4_kvstore_maybe_store_continued(ds4_kvstore *kc,
     return false;
 }
 
+/* Printable excerpt of a key/prompt window for the divergence log: control
+ * bytes become '.', so a newline or tab shows up as a visible difference. */
+static void kv_excerpt(char *out, size_t out_len, const char *text,
+                       size_t text_len, size_t at) {
+    const size_t before = 24;
+    size_t start = at > before ? at - before : 0;
+    size_t n = 0;
+    for (size_t i = start; i < text_len && n + 1 < out_len; i++) {
+        unsigned char c = (unsigned char)text[i];
+        out[n++] = c < 0x20 || c == 0x7f ? '.' : (char)c;
+    }
+    out[n] = '\0';
+}
+
+/* Diagnostic for a lookup that skipped a longer candidate whose hash did not
+ * match: read that entry's key text and report where it first differs from
+ * the prompt.  This is the one-line answer to "why did my checkpoint not
+ * match after the restart" (issue #1053 asked for exactly this). */
+static void kv_log_longest_rejected(ds4_kvstore *kc, const char *prompt_text,
+                                    const ds4_kvstore_entry *e) {
+    if (!kc->log) return;
+    FILE *fp = fopen(e->path, "rb");
+    if (!fp) return;
+    ds4_kvstore_entry hdr = {0};
+    uint32_t text_bytes = 0;
+    char *text = NULL;
+    if (ds4_kvstore_read_header(fp, &hdr, &text_bytes) && text_bytes > 0 &&
+        text_bytes == e->text_bytes) {
+        text = kv_xmalloc((size_t)text_bytes);
+        if (fread(text, 1, text_bytes, fp) != text_bytes) {
+            free(text);
+            text = NULL;
+        }
+    }
+    fclose(fp);
+    if (!text) return;
+    size_t at = 0;
+    while (at < text_bytes && text[at] == prompt_text[at]) at++;
+    char key_x[72], prompt_x[72];
+    kv_excerpt(key_x, sizeof(key_x), text, text_bytes, at);
+    kv_excerpt(prompt_x, sizeof(prompt_x), prompt_text, strlen(prompt_text), at);
+    kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+            "%s: kv cache lookup skipped longer entry tokens=%u text=%u key=%s "
+            "reason=key-diverges-at-byte=%zu key_text=\"%s\" prompt_text=\"%s\" file=%s",
+            kv_log_name(kc), e->tokens, e->text_bytes,
+            ds4_kvstore_key_kind(e->ext_flags), at, key_x, prompt_x, e->path);
+    free(text);
+}
+
 int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
                                  int model_id, int quant_bits, int ctx_size) {
     if (!prompt_text) return -1;
     const size_t prompt_bytes = strlen(prompt_text);
     kv_cache_refresh(kc);
     int best = -1;
+    int longest_rejected = -1;
     for (int i = 0; i < kc->len; i++) {
         ds4_kvstore_entry *e = &kc->entry[i];
         if (e->text_bytes > prompt_bytes || e->text_bytes > SIZE_MAX) continue;
@@ -1213,7 +1263,20 @@ int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
         }
         char sha[41];
         ds4_kvstore_sha1_bytes_hex(prompt_text, (size_t)e->text_bytes, sha);
-        if (!strcmp(sha, e->sha)) best = i;
+        if (!strcmp(sha, e->sha)) {
+            best = i;
+        } else if (longest_rejected < 0 ||
+                   e->text_bytes > kc->entry[longest_rejected].text_bytes) {
+            longest_rejected = i;
+        }
+    }
+    /* Only a rejected entry longer than the winner is worth explaining: it is
+     * the checkpoint the caller expected to hit.  Entries from unrelated
+     * conversations are shorter than or equal to the hit in practice, and a
+     * cold start with no entries stays silent. */
+    if (longest_rejected >= 0 &&
+        (best < 0 || kc->entry[longest_rejected].text_bytes > kc->entry[best].text_bytes)) {
+        kv_log_longest_rejected(kc, prompt_text, &kc->entry[longest_rejected]);
     }
     return best;
 }
