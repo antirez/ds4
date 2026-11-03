@@ -476,6 +476,21 @@ int ds4_mmq_iq2_xxs_moe_vec(
     int             n_expert_used,
     cudaStream_t    stream);
 
+// IQ1_M routed experts reach the GPU only through this vector path: there is no
+// load_tiles_iq1_m, so the tiled kernels cannot be instantiated for the type.
+// Same contract as ds4_mmq_iq2_xxs_moe_vec above.
+int ds4_mmq_iq1_m_moe_vec(
+    const void    * W,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_f32,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    cudaStream_t    stream);
+
 int ds4_mmq_q4_K_moe_vec(
     const void    * W,
     const float   * X_f32,

@@ -443,6 +443,7 @@ test-rocm:
 	$(MAKE) -B ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test \
 		test-session-state \
 		tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args tests/test_prompt_prefix \
+		tests/test_iq1_m_dequant tests/test_mmq_parity_rocm \
 		ds4 ds4-server ds4-bench ds4-agent \
 		CORE_OBJS="ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o ds4_engram.o $(ROCM_MMQ_OBJS)" \
 		CFLAGS="$(CFLAGS) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD" \
@@ -456,6 +457,8 @@ test-rocm:
 	./tests/test_gpu_args
 	./tests/test_gpu_args_cli.sh
 	./tests/test_prompt_prefix
+	./tests/test_iq1_m_dequant
+	./tests/test_mmq_parity_rocm
 
 ds4: ds4_cli.o ds4_help.o ds4_prompt_prefix.o linenoise.o ds4_gpu_args.o $(CORE_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
@@ -1272,6 +1275,15 @@ tests/test_mxfp4_rocm.o: tests/test_mxfp4_rocm.c ds4_gpu.h
 tests/test_mxfp4_rocm: tests/test_mxfp4_rocm.o ds4_rocm.o ds4_rocm_unavailable.o ds4_image.o $(ROCM_MMQ_OBJS)
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
+# GPU parity for the mmq entry points against the host dequantisers in the
+# same file. Previously cuda/mmq/test/test_mmq_parity.cu had no build rule at
+# all, so nothing checked those kernels numerically on ROCm.
+cuda/mmq/test/test_mmq_parity.rocm.o: cuda/mmq/test/test_mmq_parity.cu cuda/mmq/ds4_mmq.h cuda/mmq/test/iq2_host_tables.h cuda/mmq/test/iq1_host_tables.h cuda/mmq/ggml-common.h
+	$(HIPCC) $(ROCM_MMQ_FLAGS) -c -o $@ $<
+
+tests/test_mmq_parity_rocm: cuda/mmq/test/test_mmq_parity.rocm.o $(ROCM_MMQ_OBJS)
+	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
+
 tests/bench_mxfp4_rocm.o: tests/bench_mxfp4_rocm.c ds4_gpu.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
 
@@ -1315,6 +1327,12 @@ tests/test_sampling.o: tests/test_sampling.c ds4.h
 	$(CC) $(CFLAGS) -fno-finite-math-only -DDS4_TEST_HOOKS -I. -c -o $@ $<
 
 tests/test_sampling: tests/test_sampling.o ds4_cpu_test_hooks.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+tests/test_iq1_m_dequant.o: tests/test_iq1_m_dequant.c
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_iq1_m_dequant: tests/test_iq1_m_dequant.o ds4_cpu_test_hooks.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 tests/test_session_state.o: tests/test_session_state.c ds4.c ds4.h ds4_gpu.h ds4_image.h ds4_tp.h
@@ -1467,6 +1485,7 @@ tests/test_web_recovery: tests/test_web_recovery.c ds4_web.c ds4_web.h
 
 test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test test-session-state test-linux-memory test-engram test-web-recovery \
 	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
+	tests/test_iq1_m_dequant \
 	tests/test_deepseek4_vision_image tests/test_image_decode tests/test_prompt_prefix $(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
 	./ds4-eval --validate-cases
 	./ds4-eval --self-test-extractors
@@ -1477,6 +1496,7 @@ test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test test-session-
 	./tests/test_gpu_args
 	./tests/test_gpu_args_cli.sh
 	./tests/test_prompt_prefix
+	./tests/test_iq1_m_dequant
 	./tests/test_sampling
 	./tests/test_deepseek4_vision_image
 	./tests/test_image_decode

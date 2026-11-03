@@ -1190,6 +1190,17 @@ typedef struct {
     uint8_t qs[QK_MXFP4 / 2];
 } block_mxfp4;
 
+/* 1.75 bpw.  Unlike every other block here there is no leading scale: the f16
+ * superblock scale is split into four nibbles spread across scales[], and the
+ * sub-scales are 3-bit fields at a granularity of 16 values.  See
+ * docs/IQ1_M_ROUTED_EXPERTS.md for the reassembly and why it makes the tiled
+ * MMQ path awkward. */
+typedef struct {
+    uint8_t qs[QK_K / 8];
+    uint8_t qh[QK_K / 16];
+    uint8_t scales[QK_K / 32];
+} block_iq1_m;
+
 #define DS4_STATIC_ASSERT(name, cond) typedef char name[(cond) ? 1 : -1]
 DS4_STATIC_ASSERT(ds4_block_q2_k_size, sizeof(block_q2_K) == 84);
 DS4_STATIC_ASSERT(ds4_block_q4_k_size, sizeof(block_q4_K) == 144);
@@ -1198,6 +1209,7 @@ DS4_STATIC_ASSERT(ds4_block_q6_k_size, sizeof(block_q6_K) == 210);
 DS4_STATIC_ASSERT(ds4_block_q8_k_size, sizeof(block_q8_K) == 292);
 DS4_STATIC_ASSERT(ds4_block_iq2_xxs_size, sizeof(block_iq2_xxs) == 66);
 DS4_STATIC_ASSERT(ds4_block_mxfp4_size, sizeof(block_mxfp4) == 17);
+DS4_STATIC_ASSERT(ds4_block_iq1_m_size, sizeof(block_iq1_m) == 56);
 
 typedef struct {
     uint32_t ctx_size;
@@ -1275,6 +1287,12 @@ static const uint8_t ksigns_iq2xs[128] = {
      96, 225, 226,  99, 228, 101, 102, 231, 232, 105, 106, 235, 108, 237, 238, 111,
     240, 113, 114, 243, 116, 245, 246, 119, 120, 249, 250, 123, 252, 125, 126, 255,
 };
+
+/* IQ1_S/IQ1_M share a 2048-entry codebook. Mirrored from ggml-common.h by
+ * scripts/gen_iq1_grid.py; see the header of the generated file. */
+#include "ds4_iq1_tables.inc"
+
+#define DS4_IQ1M_DELTA 0.125f
 
 static const uint64_t iq2xxs_grid[256] = {
     0x0808080808080808, 0x080808080808082b, 0x0808080808081919, 0x0808080808082b08,
@@ -2461,6 +2479,7 @@ enum {
     DS4_TENSOR_Q8_K     = 15,
     DS4_TENSOR_IQ2_XXS  = 16,
     DS4_TENSOR_I8       = 24,
+    DS4_TENSOR_IQ1_M    = 29,
     DS4_TENSOR_I32      = 26,
     DS4_TENSOR_BF16     = 30,
     DS4_TENSOR_MXFP4    = 39,
@@ -4437,6 +4456,142 @@ static inline float ds4_vec_dot_q5_q6_K_f32(uint32_t type, int n, const uint8_t 
     return 0.0f;
 }
 
+/* Expand one IQ1_M superblock (256 values) to f32.
+ *
+ * IQ1_M is the only block in this file with no leading scale field.  Following
+ * vec_dot_iq1_m_q8_1 (cuda/mmq/vecdotq.cuh:1223), which is the authoritative
+ * layout in this tree: the f16 superblock scale is four nibbles spread across
+ * scales[], the sub-scales are 3-bit at a granularity of 16 values, and the
+ * delta sign is bit 3 of each qh nibble, so one delta per 8 values.  Each
+ * value is then
+ *
+ *     d * (2*k + 1) * (grid[j] + delta)
+ *
+ * for superblock scale d, the 3-bit sub-scale k covering this half of the
+ * 32-value group, and delta of +/-DELTA -- see the note at the delta itself,
+ * which does not match the GPU expression verbatim.  The codebook entries are
+ * uint64 words of eight signed bytes, read through an int8_t pointer exactly as
+ * ggml does, which assumes the little-endian hosts ds4 targets. */
+static void ds4_dequantize_iq1_m_block(const block_iq1_m *x, float *out) {
+    /* scales is uint8_t[8] but is read as four uint16 words. Copy rather than
+     * cast: reading one through a pointer to the other is a strict-aliasing
+     * violation, and this file is built at -O3 -ffast-math. */
+    uint16_t sc[4];
+    memcpy(sc, x->scales, sizeof(sc));
+
+    const uint16_t sbits = (uint16_t)((sc[0] >> 12) | ((sc[1] >> 8) & 0x00F0) |
+                                      ((sc[2] >> 4) & 0x0F00) | (sc[3] & 0xF000));
+    const float d = f16_to_f32(sbits);
+
+    for (int ib = 0; ib < QK_K / 32; ib++) {
+        const int tmp = sc[ib / 2] >> (6 * (ib % 2));
+        const float dl[2] = {
+            d * (float)(2 * ((tmp >> 0) & 0x07) + 1),
+            d * (float)(2 * ((tmp >> 3) & 0x07) + 1),
+        };
+
+        for (int l = 0; l < 4; l++) {
+            const int qhl = x->qh[2 * ib + l / 2] >> (4 * (l % 2));
+            const int8_t *grid =
+                (const int8_t *)(iq1s_grid + (x->qs[4 * ib + l] | ((qhl & 0x07) << 8)));
+            /* Two grid conventions exist and mixing them costs exactly 1.0 per
+             * value.  iq1s_grid_gpu stores {0,1,2} and pairs with a delta of
+             * -1 +/- DELTA, where the -1 is there only to undo that offset.
+             * The CPU table used here stores {-1,0,+1} already, so the delta
+             * is just +/- DELTA.  Entry 1 is 0x00000002 in the GPU table and
+             * 0xffffffffffffff01 in this one, which pins the relation. */
+            const float delta = (qhl & 0x08) ? -DS4_IQ1M_DELTA : DS4_IQ1M_DELTA;
+            for (int j = 0; j < 8; j++) {
+                out[32 * ib + 8 * l + j] = dl[l / 2] * ((float)grid[j] + delta);
+            }
+        }
+    }
+}
+
+/* No caller yet: the routed-expert path uses the q8_K form below. Kept as the
+ * companion of ds4_vec_dot_iq2_xxs_f32 for the f32 reference and trace paths,
+ * which are not wired for IQ1_M. */
+static DS4_MAYBE_UNUSED float ds4_vec_dot_iq1_m_f32(int n, const block_iq1_m *x,
+                                                    const float *y) {
+    const int nb = n / QK_K;
+    float sumf = 0.0f;
+    float blk[QK_K];
+
+    for (int i = 0; i < nb; i++) {
+        ds4_dequantize_iq1_m_block(x + i, blk);
+        const float *yb = y + (uint64_t)i * QK_K;
+        for (int j = 0; j < QK_K; j++) sumf += blk[j] * yb[j];
+    }
+    return sumf;
+}
+
+/* IQ1_M against Q8_K activations, the form the routed-expert matvec workers
+ * need.  Structured the way vec_dot_iq1_m_q8_1 is, because the sub-scale and
+ * the delta live at different granularities and so cannot both be folded into
+ * one accumulator: the 3-bit sub-scale covers 16 values while the delta sign
+ * covers 8.  Splitting
+ *
+ *     sum_j (grid[j] + delta) * q8[j]  ==  sum_j grid[j]*q8[j] + delta*sum_j q8[j]
+ *
+ * keeps the grid part in integers and applies each half's sub-scale once. */
+static void ds4_vec_dot_iq1_m_q8_K(int n, float *s, const block_iq1_m *x,
+                                   const block_q8_K *y) {
+    const int nb = n / QK_K;
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; i++) {
+        uint16_t sc[4];                    /* see the note in the dequantiser */
+        memcpy(sc, x[i].scales, sizeof(sc));
+        const uint16_t sbits = (uint16_t)((sc[0] >> 12) | ((sc[1] >> 8) & 0x00F0) |
+                                          ((sc[2] >> 4) & 0x0F00) | (sc[3] & 0xF000));
+        const float d = f16_to_f32(sbits) * y[i].d;
+        const int8_t *q8 = y[i].qs;
+
+        float partial = 0.0f;
+        for (int ib = 0; ib < QK_K / 32; ib++) {
+            const int tmp = sc[ib / 2] >> (6 * (ib % 2));
+            const int ksub[2] = {
+                2 * ((tmp >> 0) & 0x07) + 1,
+                2 * ((tmp >> 3) & 0x07) + 1,
+            };
+
+            for (int l = 0; l < 4; l++) {
+                const int qhl = x[i].qh[2 * ib + l / 2] >> (4 * (l % 2));
+                const int8_t *grid =
+                    (const int8_t *)(iq1s_grid + (x[i].qs[4 * ib + l] | ((qhl & 0x07) << 8)));
+                const float delta = (qhl & 0x08) ? -DS4_IQ1M_DELTA : DS4_IQ1M_DELTA;
+                const int8_t *q8g = q8 + 32 * ib + 8 * l;
+
+                int isum = 0;
+                int q8sum = 0;
+                for (int j = 0; j < 8; j++) {
+                    isum += grid[j] * q8g[j];
+                    q8sum += q8g[j];
+                }
+                partial += (float)ksub[l / 2] * ((float)isum + delta * (float)q8sum);
+            }
+        }
+        sumf += d * partial;
+    }
+
+    *s = sumf;
+}
+
+#ifdef DS4_TEST_HOOKS
+/* tests/test_iq1_m_dequant.c checks the layout against hand-derived values.
+ * The blocks are passed as void * so the test does not need block_iq1_m or
+ * block_q8_K, which are private to this translation unit. */
+void ds4_test_dequantize_iq1_m_block(const void *block, float *out) {
+    ds4_dequantize_iq1_m_block((const block_iq1_m *)block, out);
+}
+
+float ds4_test_vec_dot_iq1_m_q8_K(int n, const void *x, const void *y) {
+    float s = 0.0f;
+    ds4_vec_dot_iq1_m_q8_K(n, &s, (const block_iq1_m *)x, (const block_q8_K *)y);
+    return s;
+}
+#endif
+
 static float ds4_vec_dot_iq2_xxs_f32(int n, const block_iq2_xxs *x, const float *y) {
     pthread_once(&iq2xxs_signed_grid_once, iq2xxs_signed_grid_init);
 
@@ -5106,6 +5261,12 @@ static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
     case DS4_TENSOR_Q5_K:    return sizeof(block_q5_K);
     case DS4_TENSOR_Q6_K:    return sizeof(block_q6_K);
     case DS4_TENSOR_MXFP4:   return sizeof(block_mxfp4);
+    /* IQ1_M is sized here ahead of being accepted by
+     * tensor_is_routed_expert_type(): the block size is a property of the
+     * format, while admitting the type depends on a tiled MMQ loader that does
+     * not exist yet (see docs/IQ1_M_ROUTED_EXPERTS.md). Keeping the two
+     * separate means the tree never loads a model it cannot then run. */
+    case DS4_TENSOR_IQ1_M:   return sizeof(block_iq1_m);
     default:                 ds4_die("unsupported routed expert tensor type");
     }
     return 0;
@@ -10694,6 +10855,167 @@ static void matvec_q2_k_experts_mid_prequant(
     ds4_parallel_for((uint64_t)n_expert * out_dim0, matvec_q2_k_mid_worker, &ctx);
 }
 
+/* IQ1_M routed experts, CPU path.  Mirrors the Q2_K pair above; the only
+ * difference that matters is the vec_dot, since IQ1_M rows are 56 bytes per
+ * 256 values and carry no per-block scale field of their own.  GSQ-RCO mixes
+ * IQ1_M and IQ2_XXS across roles within one layer, so these run alongside the
+ * IQ2_XXS versions rather than replacing them. */
+typedef struct {
+    float *out;
+    const uint8_t *base[DS4_MAX_EXPERT_USED];
+    const block_q8_K *xq[DS4_MAX_EXPERT_USED];
+    uint64_t in_dim;
+    uint64_t row_bytes[DS4_MAX_EXPERT_USED];
+    int n_expert;
+} matvec_iq1_m_accum_ctx;
+
+static void matvec_iq1_m_accum_worker(void *vctx, uint64_t row0, uint64_t row1) {
+    matvec_iq1_m_accum_ctx *ctx = vctx;
+
+    for (uint64_t row = row0; row < row1; row++) {
+        float acc = 0.0f;
+        for (int i = 0; i < ctx->n_expert; i++) {
+            float v = 0.0f;
+            const block_iq1_m *br =
+                (const block_iq1_m *)(ctx->base[i] + row * ctx->row_bytes[i]);
+            ds4_vec_dot_iq1_m_q8_K((int)ctx->in_dim, &v, br, ctx->xq[i]);
+            acc += v;
+        }
+        ctx->out[row] = acc;
+    }
+}
+
+static void matvec_iq1_m_experts_accum_prequant(
+        float            *out,
+        const ds4_model  *m,
+        const ds4_tensor *w,
+        const block_q8_K *xq,
+        const int        *selected,
+        int               n_expert) {
+    if (w->type != DS4_TENSOR_IQ1_M) ds4_die("expected an IQ1_M expert tensor");
+    if (n_expert < 1 || (uint32_t)n_expert > DS4_N_EXPERT_USED) ds4_die("unexpected routed expert count");
+
+    uint64_t in_dim0 = 0;
+    uint64_t out_dim0 = 0;
+    const uint8_t *base[DS4_MAX_EXPERT_USED];
+    uint64_t row_bytes[DS4_MAX_EXPERT_USED];
+
+    for (int i = 0; i < n_expert; i++) {
+        uint64_t in_dim, out_dim;
+        base[i] = tensor_expert_bytes(m, w, (uint32_t)selected[i], &in_dim, &out_dim, &row_bytes[i]);
+        if (i == 0) {
+            in_dim0 = in_dim;
+            out_dim0 = out_dim;
+        } else if (in_dim != in_dim0 || out_dim != out_dim0) {
+            ds4_die("IQ1_M expert tensors do not share a layout");
+        }
+    }
+    if (in_dim0 % QK_K != 0) ds4_die("IQ1_M expert row is not QK_K aligned");
+
+    const uint64_t n_blocks = in_dim0 / QK_K;
+    matvec_iq1_m_accum_ctx ctx = {
+        .out = out,
+        .in_dim = in_dim0,
+        .n_expert = n_expert,
+    };
+    for (int i = 0; i < n_expert; i++) {
+        ctx.base[i] = base[i];
+        ctx.row_bytes[i] = row_bytes[i];
+        ctx.xq[i] = xq + (uint64_t)i * n_blocks;
+    }
+
+    ds4_parallel_for(out_dim0, matvec_iq1_m_accum_worker, &ctx);
+}
+
+typedef struct {
+    float *mid;
+    const uint8_t *gate_base[DS4_MAX_EXPERT_USED];
+    const uint8_t *up_base[DS4_MAX_EXPERT_USED];
+    const block_q8_K *xq;
+    float expert_weight[DS4_MAX_EXPERT_USED];
+    float clamp;
+    uint64_t in_dim;
+    uint64_t out_dim;
+    uint64_t gate_row_bytes[DS4_MAX_EXPERT_USED];
+    uint64_t up_row_bytes[DS4_MAX_EXPERT_USED];
+    int n_expert;
+} matvec_iq1_m_mid_ctx;
+
+static void matvec_iq1_m_mid_worker(void *vctx, uint64_t row0, uint64_t row1) {
+    matvec_iq1_m_mid_ctx *ctx = vctx;
+
+    for (uint64_t idx = row0; idx < row1; idx++) {
+        const int slot = (int)(idx / ctx->out_dim);
+        const uint64_t row = idx - (uint64_t)slot * ctx->out_dim;
+        float gate = 0.0f;
+        float up = 0.0f;
+
+        const block_iq1_m *gate_row =
+            (const block_iq1_m *)(ctx->gate_base[slot] + row * ctx->gate_row_bytes[slot]);
+        ds4_vec_dot_iq1_m_q8_K((int)ctx->in_dim, &gate, gate_row, ctx->xq);
+
+        const block_iq1_m *up_row =
+            (const block_iq1_m *)(ctx->up_base[slot] + row * ctx->up_row_bytes[slot]);
+        ds4_vec_dot_iq1_m_q8_K((int)ctx->in_dim, &up, up_row, ctx->xq);
+
+        if (ctx->clamp > 1.0e-6f) {
+            if (gate > ctx->clamp) gate = ctx->clamp;
+            if (up > ctx->clamp) up = ctx->clamp;
+            if (up < -ctx->clamp) up = -ctx->clamp;
+        }
+        ctx->mid[idx] = silu(gate) * up * ctx->expert_weight[slot];
+    }
+}
+
+static void matvec_iq1_m_experts_mid_prequant(
+        float            *mid,
+        const ds4_model  *m,
+        const ds4_tensor *gate_w,
+        const ds4_tensor *up_w,
+        const block_q8_K *xq,
+        const int        *selected,
+        const float      *expert_weight,
+        int               n_expert,
+        float             clamp) {
+    if (gate_w->type != DS4_TENSOR_IQ1_M || up_w->type != DS4_TENSOR_IQ1_M) {
+        ds4_die("expected IQ1_M expert tensors");
+    }
+    if (n_expert < 1 || (uint32_t)n_expert > DS4_N_EXPERT_USED) ds4_die("unexpected routed expert count");
+
+    uint64_t in_dim0 = 0;
+    uint64_t out_dim0 = 0;
+    matvec_iq1_m_mid_ctx ctx = {
+        .mid = mid,
+        .xq = xq,
+        .clamp = clamp,
+        .n_expert = n_expert,
+    };
+
+    for (int i = 0; i < n_expert; i++) {
+        uint64_t gate_in_dim, gate_out_dim;
+        uint64_t up_in_dim, up_out_dim;
+        ctx.gate_base[i] = tensor_expert_bytes(m, gate_w, (uint32_t)selected[i],
+                                               &gate_in_dim, &gate_out_dim, &ctx.gate_row_bytes[i]);
+        ctx.up_base[i] = tensor_expert_bytes(m, up_w, (uint32_t)selected[i],
+                                             &up_in_dim, &up_out_dim, &ctx.up_row_bytes[i]);
+        if (gate_in_dim != up_in_dim || gate_out_dim != up_out_dim) {
+            ds4_die("paired IQ1_M expert tensors do not match");
+        }
+        if (i == 0) {
+            in_dim0 = gate_in_dim;
+            out_dim0 = gate_out_dim;
+        } else if (gate_in_dim != in_dim0 || gate_out_dim != out_dim0) {
+            ds4_die("IQ1_M expert tensors do not share a layout");
+        }
+        ctx.expert_weight[i] = expert_weight[i];
+    }
+    if (in_dim0 % QK_K != 0) ds4_die("IQ1_M expert row is not QK_K aligned");
+
+    ctx.in_dim = in_dim0;
+    ctx.out_dim = out_dim0;
+    ds4_parallel_for((uint64_t)n_expert * out_dim0, matvec_iq1_m_mid_worker, &ctx);
+}
+
 typedef struct {
     float *out;
     const uint8_t *base[DS4_MAX_EXPERT_USED];
@@ -11742,6 +12064,9 @@ static void matvec_experts_mid_prequant(
     } else if (gate_w->type == DS4_TENSOR_Q5_K || gate_w->type == DS4_TENSOR_Q6_K) {
         matvec_q5_q6_k_experts_mid_prequant(mid, m, gate_w, up_w, xq,
                                             selected, expert_weight, n_expert, clamp);
+    } else if (gate_w->type == DS4_TENSOR_IQ1_M) {
+        matvec_iq1_m_experts_mid_prequant(mid, m, gate_w, up_w, xq,
+                                          selected, expert_weight, n_expert, clamp);
     } else {
         ds4_die("unsupported gate/up expert tensor type");
     }
@@ -11763,6 +12088,8 @@ static void matvec_experts_down_accum_prequant(
         matvec_q4_k_experts_accum_prequant(out, m, w, xq, selected, n_expert);
     } else if (w->type == DS4_TENSOR_Q5_K || w->type == DS4_TENSOR_Q6_K) {
         matvec_q5_q6_k_experts_accum_prequant(out, m, w, xq, selected, n_expert);
+    } else if (w->type == DS4_TENSOR_IQ1_M) {
+        matvec_iq1_m_experts_accum_prequant(out, m, w, xq, selected, n_expert);
     } else {
         ds4_die("unsupported down expert tensor type");
     }

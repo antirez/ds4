@@ -21,6 +21,7 @@
 
 #include "ds4_mmq.h"
 #include "iq2_host_tables.h"
+#include "iq1_host_tables.h"
 
 // Pull in the block_* struct definitions.  We use the CUDA decl/impl mode
 // so the field paths match what the vendored mmq code uses (anonymous
@@ -309,6 +310,69 @@ void dequantize_row_iq2_xxs_cpu(const block_iq2_xxs * x, float * y, int K) {
                 const uint8_t  signs = iq2_host::ksigns_iq2xs[(aux32[1] >> 7*l) & 127];
                 for (int j = 0; j < 8; ++j) {
                     y[j] = db * grid[j] * (signs & iq2_host::kmask_iq2xs[j] ? -1.f : 1.f);
+                }
+                y += 8;
+            }
+        }
+    }
+}
+
+// --------------------------------------------------------------------------
+// IQ1_M random generator + CPU dequant.
+//
+// Layout (ggml-common.h:423).  Alone among the blocks here it has no leading
+// scale field:
+//   uint8_t qs[QK_K/8];      // codebook index low 8 bits, one byte per 8 values
+//   uint8_t qh[QK_K/16];     // 3 index high bits + delta sign, one nibble per 8
+//   uint8_t scales[QK_K/32]; // 3-bit sub-scales at a granularity of 16 values;
+//                            // the top nibble of each uint16 word is one
+//                            // nibble of the f16 super-block scale
+// Total: 56 bytes per 256-value super-block.
+//
+// The codebook comes from iq1_host_tables.h rather than the __device__ table,
+// and so holds {-1,0,+1} where iq1s_grid_gpu holds {0,1,2}; the delta is
+// correspondingly +/-IQ1M_DELTA rather than -1 +/- IQ1M_DELTA.
+// --------------------------------------------------------------------------
+
+void generate_random_block_iq1_m(block_iq1_m * blk, std::mt19937 & rng) {
+    std::uniform_int_distribution<int> u8(0, 255);
+    std::uniform_int_distribution<int> u12(0, 4095);
+    for (int i = 0; i < QK_K_LOCAL/8;  i++) blk->qs[i] = (uint8_t)u8(rng);
+    for (int i = 0; i < QK_K_LOCAL/16; i++) blk->qh[i] = (uint8_t)u8(rng);
+
+    // Sub-scales reach 2*7+1 = 15, so keep d small enough that dequantised
+    // values stay near unit variance.
+    std::uniform_real_distribution<float> ud(0.02f, 0.08f);
+    const uint16_t h = float_to_fp16(ud(rng));
+    uint16_t sc[4];
+    for (int w = 0; w < 4; w++) {
+        sc[w] = (uint16_t)(u12(rng) | (((h >> (4*w)) & 0xF) << 12));
+    }
+    std::memcpy(blk->scales, sc, sizeof(sc));
+}
+
+void dequantize_row_iq1_m_cpu(const block_iq1_m * x, float * y, int K) {
+    const int nb = K / QK_K_LOCAL;
+    for (int i = 0; i < nb; i++) {
+        uint16_t sc[4];
+        std::memcpy(sc, x[i].scales, sizeof(sc));
+        const uint16_t sbits = (uint16_t)((sc[0] >> 12) | ((sc[1] >> 8) & 0x00F0) |
+                                          ((sc[2] >> 4) & 0x0F00) | (sc[3] & 0xF000));
+        const float d = fp16_to_float(sbits);
+
+        for (int ib = 0; ib < QK_K_LOCAL/32; ++ib) {
+            const int tmp = sc[ib/2] >> (6*(ib%2));
+            const float dl[2] = {
+                d * (float)(2*((tmp >> 0) & 0x07) + 1),
+                d * (float)(2*((tmp >> 3) & 0x07) + 1),
+            };
+            for (int l = 0; l < 4; ++l) {
+                const int qhl = x[i].qh[2*ib + l/2] >> (4*(l%2));
+                const int8_t * grid = (const int8_t *)(iq1_host::iq1s_grid +
+                    (x[i].qs[4*ib + l] | ((qhl & 0x07) << 8)));
+                const float delta = (qhl & 0x08) ? -IQ1M_DELTA : IQ1M_DELTA;
+                for (int j = 0; j < 8; ++j) {
+                    y[j] = dl[l/2] * ((float)grid[j] + delta);
                 }
                 y += 8;
             }
@@ -947,6 +1011,28 @@ bool run_iq2_xxs_moe_vec(int M, int K, int nt, int ne, int nu, uint32_t seed) {
         "IQ2_XXS/MOE_VEC", QK_K_LOCAL, M, K, nt, ne, nu, seed, 0.20f, fn, ds4_mmq_iq2_xxs_moe_vec);
 }
 
+bool run_iq1_m_moe_vec(int M, int K, int nt, int ne, int nu, uint32_t seed) {
+    auto fn = [](block_iq1_m * blk, float * out,
+                 int n_experts, int M, int K, int blocks_per_expert,
+                 std::mt19937 & rng) {
+        const int blocks_per_row = K / QK_K_LOCAL;
+        for (int e = 0; e < n_experts; e++) {
+            block_iq1_m * eblk = blk + (size_t)e * blocks_per_expert;
+            for (int row = 0; row < M; row++) {
+                for (int b = 0; b < blocks_per_row; b++) {
+                    generate_random_block_iq1_m(&eblk[row * blocks_per_row + b], rng);
+                }
+                dequantize_row_iq1_m_cpu(&eblk[row * blocks_per_row],
+                                         out + ((size_t)e * M + row) * K, K);
+            }
+        }
+    };
+    // Looser than IQ2_XXS: at 1.75 bpw the Q8_1 activation quantisation is a
+    // larger share of the result.
+    return run_moe_generic<block_iq1_m>(
+        "IQ1_M/MOE_VEC", QK_K_LOCAL, M, K, nt, ne, nu, seed, 0.30f, fn, ds4_mmq_iq1_m_moe_vec);
+}
+
 bool run_q4_K_moe_vec(int M, int K, int nt, int ne, int nu, uint32_t seed) {
     auto fn = [](block_q4_K * blk, float * out,
                  int n_experts, int M, int K, int blocks_per_expert,
@@ -1261,6 +1347,8 @@ int main(int argc, char ** argv) {
     all_ok &= run_q2_K_moe_vec   (/*M=*/256,  /*K=*/512,  /*nt=*/6,  /*nexp=*/16,  /*nused=*/1, 0xC0FE23);
     all_ok &= run_iq2_xxs_moe_vec(/*M=*/64,   /*K=*/256,  /*nt=*/1,  /*nexp=*/16,  /*nused=*/6, 0xC0FE24);
     all_ok &= run_iq2_xxs_moe_vec(/*M=*/256,  /*K=*/512,  /*nt=*/6,  /*nexp=*/16,  /*nused=*/1, 0xC0FE25);
+    all_ok &= run_iq1_m_moe_vec(/*M=*/64,   /*K=*/256,  /*nt=*/1,  /*nexp=*/16,  /*nused=*/6, 0xC0FE26);
+    all_ok &= run_iq1_m_moe_vec(/*M=*/256,  /*K=*/512,  /*nt=*/6,  /*nexp=*/16,  /*nused=*/1, 0xC0FE27);
     all_ok &= run_q4_K_moe_vec   (/*M=*/64,   /*K=*/256,  /*nt=*/1,  /*nexp=*/16,  /*nused=*/6, 0xC0FE26);
     all_ok &= run_q4_K_moe_vec   (/*M=*/256,  /*K=*/512,  /*nt=*/6,  /*nexp=*/16,  /*nused=*/1, 0xC0FE27);
 
