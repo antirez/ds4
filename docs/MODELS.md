@@ -135,9 +135,10 @@ For images, download the matching encoder and add it to the same command:
 ```
 
 Vision works with SSD streaming, full residency and two-Mac TP. Pass the encoder
-on both TP ranks. CUDA vision runs on one GPU and needs about 0.9 GiB more GPU
-memory for the encoder. Either the original V4.1 encoder or one converted from
-the 1017 checkpoint is accepted. Use `/read image.png` in `ds4`, `view_image` in
+on both TP ranks. CUDA vision runs on one GPU, or on the first GPU when extra
+GPUs hold routed experts (`--gpu-devices`). The encoder needs about 0.9 GiB more
+GPU memory, so 24 GB cards may need a smaller `--ctx`. Either the original V4.1
+encoder or one converted from the 1017 checkpoint is accepted. Use `/read image.png` in `ds4`, `view_image` in
 `ds4-agent`, or the [server image API](SERVER.md#images). V4 Flash vision
 encoders do not work with V4.1. See
 [conversion](../gguf-tools/README.md#convert-deepseek-v41-flash) to build the

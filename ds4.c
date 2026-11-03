@@ -73207,14 +73207,6 @@ static int ds4_engine_open_internal(ds4_engine **out,
         *out = NULL;
         return 1;
 #endif
-        if (opt->backend == DS4_BACKEND_CUDA && gpu_cfg &&
-            gpu_cfg->n_gpus > 1) {
-            fprintf(stderr,
-                    "ds4: CUDA/ROCm vision currently requires one GPU\n");
-            free(e);
-            *out = NULL;
-            return 1;
-        }
     }
     e->prefill_chunk =
         ds4_effective_prefill_chunk(opt->cuda_tensor_parallel,
@@ -73388,6 +73380,16 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = NULL;
             return 1;
         }
+    }
+    /* CUDA/ROCm vision runs on one GPU. V4.1 expert devices qualify: the
+     * graph and the encoder stay on the first device (gpu_cfg is NULL). */
+    if (opt->vision_path && opt->vision_path[0] &&
+        opt->backend == DS4_BACKEND_CUDA && gpu_cfg && gpu_cfg->n_gpus > 1) {
+        fprintf(stderr, "ds4: CUDA/ROCm vision currently requires one GPU "
+                        "(or V4.1 extra GPUs as expert devices)\n");
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
     }
     if (engine_warm_full_model(opt) && DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41)
         model_warm_weights(&e->model);
