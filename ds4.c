@@ -34225,6 +34225,25 @@ static bool metal_graph_use_streaming_decode_prefill(
            n_tokens <= max_tokens;
 }
 
+/* Decode-style prefill reads ordinary token-table rows. Image-conditioned
+ * rows require the batch path, which substitutes the vision embeddings. Keep
+ * this guard even when a caller raises the short-prefill threshold. */
+static bool metal_graph_visual_range_overlaps(
+        const ds4_gpu_graph *g,
+        uint32_t             token_start,
+        uint32_t             token_count) {
+    if (!g || !g->prefill_vision_spans || token_count == 0) return false;
+    const uint64_t range_start = token_start;
+    const uint64_t range_end = range_start + token_count;
+    for (size_t i = 0; i < g->prefill_vision_span_count; i++) {
+        const ds4_vision_span *span = &g->prefill_vision_spans[i];
+        const uint64_t image_start = span->token_start;
+        const uint64_t image_end = image_start + span->embedding.token_count;
+        if (range_start < image_end && image_start < range_end) return true;
+    }
+    return false;
+}
+
 static bool metal_graph_use_streaming_decode_prefill_range(
         const ds4_gpu_graph *g,
         const ds4_weights   *weights,
@@ -34235,6 +34254,7 @@ static bool metal_graph_use_streaming_decode_prefill_range(
      * by default for SSD streaming, while keeping a cold-only escape hatch for
      * strict-vector tests that need canonical layer-major prefill semantics.
      */
+    if (metal_graph_visual_range_overlaps(g, start, n_tokens)) return false;
     if (start == 0) {
         if (glm_graph_env_present(
                     "DS4_ROCM_DISABLE_STREAMING_COLD_DECODE_PREFILL",
