@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # Every commit on main keeps its own result.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  whitespace:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check whitespace
+        # Text fixtures keep their whitespace as data.
+        run: git diff --check "$(git merge-base "origin/${GITHUB_BASE_REF:-main}" HEAD)" HEAD -- ':!*.txt'
+
+  gate:
+    strategy:
+      fail-fast: false
+      matrix:
+        # Runner images are pinned: zero warnings means a new compiler can
+        # fail every PR, so image updates are explicit changes here.
+        os: [macos-26, ubuntu-26.04, ubuntu-26.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build
+        run: tests/ci_gate.sh build
+      - name: Test
+        run: tests/ci_gate.sh test
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: 0.9.27
+          enable-cache: false
+      - name: Compare JPEG decoder with libjpeg
+        run: uv run --no-project --python 3.13 --with numpy==2.5.4 --with pillow==13.0.0 python -m unittest discover -s tests -p test_jpeg_decode.py

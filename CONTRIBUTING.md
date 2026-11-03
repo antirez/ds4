@@ -9,6 +9,21 @@ Do not send PRs affecting one or more inference backends without checking if the
 resulting code is still correct and fast. The only acceptable regression speed
 is when an important correctness bug is fixed and it requires some speed penalty.
 
+## Pull Request Gate
+
+Every pull request runs `.github/workflows/ci.yml`: warning-free builds and the
+tests that need neither a model nor a GPU backend, on macOS and on Linux x64 and
+arm64. To run the same checks locally from a clean tree:
+
+```sh
+make clean
+tests/ci_gate.sh
+```
+
+The gate does not replace the tests below: it covers no inference, GPU kernels,
+speed, SSD streaming or distributed execution. Runner images and Python test
+dependencies are pinned in the workflow, so updating them is an explicit change.
+
 ## Correctness Regression Tests
 
 Build the default backend first:
