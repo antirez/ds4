@@ -3862,13 +3862,6 @@ int ds4_gpu_qwen4_dense_mm_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
         const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t weight_type,
         uint32_t n_tokens, uint32_t in_dim, uint32_t out_rows);
-/* Contiguous prefill uses the same dense kernel without Metal split-K so
- * short chunks retain the prefill reduction order. CUDA keeps its existing
- * dense dispatch. Decode batches and vision use the entry point above. */
-int ds4_gpu_qwen4_dense_mm_prefill_tensor(
-        ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
-        const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t weight_type,
-        uint32_t n_tokens, uint32_t in_dim, uint32_t out_rows);
 int ds4_gpu_qwen4_hc_lo_act_tensor(ds4_gpu_tensor *lo_act, const ds4_gpu_tensor *lo,
                                    uint32_t n_tokens, uint32_t n_hc, uint32_t n_rank);
 int ds4_gpu_qwen4_hc_mix_rows_tensor(ds4_gpu_tensor *mixed, const ds4_gpu_tensor *u, const ds4_gpu_tensor *xn,

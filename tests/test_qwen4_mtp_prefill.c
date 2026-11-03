@@ -128,7 +128,7 @@ static bool reference_mtp_input(ds4_qwen4_gpu_graph *g, const ds4_model *m, cons
         ds4_gpu_tensor_free(R_row);
         ds4_gpu_tensor_free(e_row);
     }
-    if (ok) ok = qwen4_gemv(g, g->mtp_proj, m, l->nextn_eh_proj, g->mtp_cat, T * (hc + 1u));
+    if (ok) ok = qwen4_gemv(g->mtp_proj, m, l->nextn_eh_proj, g->mtp_cat, T * (hc + 1u));
     for (uint32_t t = 0; t < T && ok; t++) {
         ds4_gpu_tensor *proj_row = ds4_gpu_tensor_view(g->mtp_proj, t * proj_bytes, proj_bytes);
         ds4_gpu_tensor *R_row = ds4_gpu_tensor_view(g->mtp_R, t * hc * emb_bytes, hc * emb_bytes);
@@ -171,7 +171,7 @@ static bool reference_mtp_steps(ds4_qwen4_gpu_graph *g, const ds4_model *m, cons
         ok = last && qwen4_graph_hc_mix(g, m, l->nextn_hc_head_norm, l->nextn_hc_head_down, l->nextn_hc_head_up, NULL, 1) &&
              (gathered ? ds4_gpu_qwen4_matmul_q8_0_weights_tensor(g->logits, g->draft_head, (uint32_t)w->output->dim[0],
                                                                   head_rows, g->mixed) != 0
-                       : qwen4_gemv_rows(g, g->logits, m, w->output, g->mixed, 1, head_rows));
+                       : qwen4_gemv_rows(g->logits, m, w->output, g->mixed, 1, head_rows));
     }
     g->R = R_save;
     if (ok && gpu_argmax) ok = ds4_gpu_qwen4_argmax_tensor(g->mtp_argmax, g->mtp_argmax_tmp,
@@ -700,7 +700,6 @@ typedef struct {
     uint32_t last_rows, tail_pos;
     int tail_next;
     bool tail_valid, tail_cached, verify;
-    qwen4_projection_phase phase;
     void *positions;
 } predictor_seed;
 
@@ -754,7 +753,7 @@ static predictor_seed save_predictor(ds4_session *s, uint32_t batch, uint32_t id
     predictor_seed seed = {.state = capture(s, batch), .last_rows = g->mtp_last_rows,
         .tail_pos = g->mtp_tail_pos, .tail_next = g->mtp_tail_next_token,
         .tail_valid = g->mtp_tail_valid, .tail_cached = g->mtp_tail_cached,
-        .verify = g->verify_rows_exact, .phase = g->projection_phase};
+        .verify = g->verify_rows_exact};
     finite_frontier(&seed.state);
     finite_f32("actual trunk rows", seed.state.residual,
                seed.state.residual_bytes / sizeof(float));
@@ -811,7 +810,6 @@ static void restore_predictor(ds4_session *s, const predictor_seed *seed,
     g->mtp_last_rows = seed->last_rows;
     g->mtp_tail_pos = seed->tail_pos; g->mtp_tail_next_token = seed->tail_next;
     g->mtp_tail_valid = seed->tail_valid; g->mtp_tail_cached = seed->tail_cached;
-    g->projection_phase = seed->phase;
     g->verify_rows_exact = probe ? verify : seed->verify;
     ds4_gpu_qwen4_set_verify_rows_exact(g->verify_rows_exact);
 }

@@ -54144,10 +54144,10 @@ static bool qwen4_dense_mm_partials_ensure(uint64_t bytes) {
     return true;
 }
 
-static int qwen4_dense_mm_tensor(
+int ds4_gpu_qwen4_dense_mm_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
         const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t weight_type,
-        uint32_t n_tokens, uint32_t in_dim, uint32_t out_rows, bool allow_split_k) {
+        uint32_t n_tokens, uint32_t in_dim, uint32_t out_rows) {
     const uint32_t row_bytes = weight_type == 0u ? in_dim * 4u : weight_type == 1u ? in_dim * 2u :
                                qwen4_expert_row_bytes(weight_type, in_dim);
     struct { uint32_t n_tokens, in_dim, out_rows, weight_type, row_bytes, n_split, pad1, pad2; } args =
@@ -54174,7 +54174,7 @@ static int qwen4_dense_mm_tensor(
     const uint32_t tiles = (out_rows + 31u) / 32u;
     const uint32_t threadgroups = tiles * ((n_tokens + 31u) / 32u);
     uint32_t n_split = 1u;
-    if (allow_split_k && !ds4_gpu_env_u64("DS4_QWEN4_NO_DENSE_MM_KSPLIT", 0u, 0u, 1u)) {
+    if (!ds4_gpu_env_u64("DS4_QWEN4_NO_DENSE_MM_KSPLIT", 0u, 0u, 1u)) {
         const uint32_t nk = (in_dim + 31u) / 32u;
         const uint32_t target = 128u;
         const uint32_t want = threadgroups >= target ? 1u : (target + threadgroups - 1u) / threadgroups;
@@ -54205,22 +54205,6 @@ static int qwen4_dense_mm_tensor(
     const uint64_t n = (uint64_t)n_tokens * out_rows;
     return qwen4_dispatch(QWEN4_K_DENSE_MM_REDUCE, &args, sizeof(args), br, 2,
                           MTLSizeMake((NSUInteger)((n + 255) / 256), 1, 1), MTLSizeMake(256, 1, 1), 0);
-}
-
-int ds4_gpu_qwen4_dense_mm_tensor(
-        ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
-        const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t weight_type,
-        uint32_t n_tokens, uint32_t in_dim, uint32_t out_rows) {
-    return qwen4_dense_mm_tensor(out, x, model_map, model_size, weight_offset,
-                                weight_type, n_tokens, in_dim, out_rows, true);
-}
-
-int ds4_gpu_qwen4_dense_mm_prefill_tensor(
-        ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
-        const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t weight_type,
-        uint32_t n_tokens, uint32_t in_dim, uint32_t out_rows) {
-    return qwen4_dense_mm_tensor(out, x, model_map, model_size, weight_offset,
-                                weight_type, n_tokens, in_dim, out_rows, false);
 }
 
 /* Decode batch of 8 or 16 rows against a Q8 matrix (kernel_qwen4_batch_mm_q8):

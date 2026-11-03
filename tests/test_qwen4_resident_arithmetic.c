@@ -230,20 +230,15 @@ static void resident_projection_case(const ds4_model *m, const ds4_tensor *w, ui
         resident_need(false, "fixture must detect the old resident prefill policy");
     }
 
-    const char *modes[] = { "resident prefill", "SSD prefill", "resident decode", "SSD decode" };
-    for (unsigned mode = 0; mode < 4; mode++) {
-        ds4_qwen4_gpu_graph g = { .ssd_streaming = (mode & 1u) != 0,
-            .projection_phase = mode < 2 ? QWEN4_PROJECTION_PREFILL : QWEN4_PROJECTION_DECODE };
-        resident_need(ds4_gpu_tensor_fill_f32(out.storage, 17.25f, out.count + 2u * RESIDENT_GUARD), "projection output reset");
-        resident_need(qwen4_gemv_rows(&g, out.view, m, w, x.view, rows, 0), modes[mode]);
-        float *actual = resident_read(out.view, values);
-        resident_equal(mode == 1 ? ssd : base, actual, values, w->name.ptr, modes[mode], rows);
-        resident_guards(&out);
-        free(actual);
-    }
+    resident_need(ds4_gpu_tensor_fill_f32(out.storage, 17.25f, out.count + 2u * RESIDENT_GUARD), "projection output reset");
+    resident_need(qwen4_gemv_rows(out.view, m, w, x.view, rows, 0), "Qwen projection");
+    float *actual = resident_read(out.view, values);
+    resident_equal(base, actual, values, w->name.ptr, "Qwen projection", rows);
+    resident_guards(&out);
+    free(actual);
     resident_input(&x, 197u, true);
     resident_need(resident_weight_hash(m) == weight_hash, "projection weights mutated");
-    fprintf(stderr, "Qwen resident arithmetic: %s T=%u matches resident/SSD prefill and decode references\n", w->name.ptr, rows);
+    fprintf(stderr, "Qwen resident arithmetic: %s T=%u matches the resident reference in every storage mode\n", w->name.ptr, rows);
     free(ssd);
     free(base);
     resident_free(&out);
@@ -291,18 +286,16 @@ static void resident_attention_partition(void) {
     float *matrix = resident_read(whole.view, rows * row);
     resident_need(memcmp(base, matrix + 6u * row, tail * row * sizeof(float)) != 0,
                   "attention fixture must detect scalar/matrix policy drift");
-    const char *modes[] = { "resident prefill", "SSD prefill", "resident decode", "SSD decode" };
-    for (unsigned mode = 0; mode < 4; mode++) {
+    const char *modes[] = { "resident", "SSD" };
+    for (unsigned mode = 0; mode < 2; mode++) {
         g.ssd_streaming = (mode & 1u) != 0;
-        g.projection_phase = mode < 2 ? QWEN4_PROJECTION_PREFILL : QWEN4_PROJECTION_DECODE;
         resident_need(ds4_gpu_tensor_fill_f32(out.storage, 17.25f, out.count + 2u * RESIDENT_GUARD), "attention output reset");
         resident_need(qwen4_graph_attention_dispatch(&g, 0, out.view, qt, gt, tail, 2048u, false, 2048u), modes[mode]);
         float *actual = resident_read(out.view, tail * row);
-        resident_equal(mode == 1 ? matrix + 6u * row : base, actual, tail * row, "dense attention partition", modes[mode], tail);
+        resident_equal(base, actual, tail * row, "dense attention partition", modes[mode], tail);
         resident_guards(&out);
         free(actual);
-        /* A genuinely short parent keeps the original scalar policy even
-         * in SSD mode, unlike a short partition of a large parent. */
+        /* Also check a range which is the entire parent batch. */
         resident_need(qwen4_graph_attention_dispatch(&g, 0, out.view, qt, gt, tail, 2048u, false, tail), "short-parent attention");
         actual = resident_read(out.view, tail * row);
         resident_equal(base, actual, tail * row, "short parent attention", modes[mode], tail);

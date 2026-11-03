@@ -1,6 +1,5 @@
 /* Real-model one-shot/session parity with identical effective prefill chunks.
- * --prefill-reference compares automatic dispatch with the diagnostic
- * SSD legacy, unsplit prefill path, then uses automatic dispatch for both decodes.
+ * --prefill-reference also checks complete logits against resident inference.
  * Usage: test_qwen4_generation MODEL [--ssd-streaming] [--prefill-reference]
  *        [--chunk N --ctx N [--tokens N]]
  * SSD mode bounds the expert cache to 1024 entries. At most two graphs are
@@ -91,13 +90,38 @@ static void generation_case(const char *model, bool streaming, bool prefill_refe
         (int)(2u * cap + 3u) : ctx - GENERATION_STEPS - 1);
     ds4_engine_options opt = {.model_path = model, .backend = DS4_BACKEND_METAL,
         .context_size = ctx, .prefill_chunk = requested, .glm_mtp = false,
-        .ssd_streaming = streaming, .ssd_streaming_cache_experts = streaming ? 1024u : 0u};
+        .ssd_streaming = streaming && !prefill_reference,
+        .ssd_streaming_cache_experts = streaming && !prefill_reference ? 1024u : 0u};
     ds4_engine *engine = NULL;
     generation_need(ds4_engine_open(&engine, &opt) == 0 && ds4_engine_is_qwen4(engine), "open Qwen model");
     ds4_tokens seed = {0}, prompt = {0};
     ds4_tokenize_text(engine, "Continue this counting sequence: one, two, three, four, five, six, seven, eight. ", &seed);
     generation_need(seed.len > 0, "tokenize fixture");
     for (int i = 0; i < length; i++) ds4_tokens_push(&prompt, seed.v[i % seed.len]);
+
+    float *reference = NULL;
+    if (prefill_reference) {
+        ds4_session *resident = NULL;
+        reference = malloc((GENERATION_STEPS + 1u) * (size_t)DS4_N_VOCAB * sizeof(float));
+        generation_need(reference && ds4_session_create(&resident, engine, ctx) == 0, "resident reference");
+        generation_need(ds4_session_sync(resident, &prompt, generation_error, sizeof(generation_error)) == 0,
+                        "resident reference prefill");
+        bool stopped = false;
+        for (int step = 0; step <= GENERATION_STEPS; step++) {
+            generation_need(ds4_session_copy_logits(resident, reference + (size_t)step * DS4_N_VOCAB,
+                            (int)DS4_N_VOCAB) == (int)DS4_N_VOCAB, "resident reference logits");
+            if (step == GENERATION_STEPS) break;
+            const int token = ds4_session_argmax(resident);
+            stopped = stopped || ds4_token_is_stop(engine, token);
+            generation_need(ds4_session_eval(resident, stopped ? seed.v[step % seed.len] : token,
+                            generation_error, sizeof(generation_error)) == 0, "resident reference decode");
+        }
+        ds4_session_free(resident);
+        ds4_engine_close(engine);
+        opt.ssd_streaming = true;
+        opt.ssd_streaming_cache_experts = 1024u;
+        generation_need(ds4_engine_open(&engine, &opt) == 0, "open streamed Qwen model");
+    }
 
     generation_capture one_shot = {.path = "one-shot", .cap = cap, .length = length};
     generation_need(ds4_engine_generate_argmax(engine, &prompt, GENERATION_STEPS, ctx,
@@ -136,15 +160,7 @@ static void generation_case(const char *model, bool streaming, bool prefill_refe
     float *direct_logits = malloc((size_t)DS4_N_VOCAB * sizeof(float));
     float *session_logits = malloc((size_t)DS4_N_VOCAB * sizeof(float));
     generation_need(direct_logits && session_logits, "allocate vocabulary comparisons");
-    /* Match one-shot's omission of intermediate output heads. Session sync
-     * computes each head for its progress/checkpoint contract. The optional
-     * reference disables the two arithmetic changes implicated in prefill
-     * drift independently of the graph's automatic phase dispatch. */
-    if (prefill_reference) {
-        generation_need(setenv("DS4_QWEN4_DENSE_MM_LEGACY", "1", 1) == 0 &&
-                        setenv("DS4_QWEN4_NO_DENSE_MM_KSPLIT", "1", 1) == 0,
-                        "select legacy unsplit reference prefill");
-    }
+    /* Match one-shot generation, which omits intermediate output heads. */
     for (int pos = 0; pos < length;) {
         uint32_t rows = (uint32_t)(length - pos);
         if (rows > direct->cap_tokens) rows = direct->cap_tokens;
@@ -153,18 +169,13 @@ static void generation_case(const char *model, bool streaming, bool prefill_refe
             "direct prefill");
         pos += (int)rows;
     }
-    if (prefill_reference) {
-        generation_need(unsetenv("DS4_QWEN4_DENSE_MM_LEGACY") == 0 &&
-                        unsetenv("DS4_QWEN4_NO_DENSE_MM_KSPLIT") == 0,
-                        "restore automatic dispatch for both decodes");
-    }
-
     int emitted = 0;
     bool stopped = false;
     for (int step = 0; step <= GENERATION_STEPS; step++) {
         generation_need(ds4_session_copy_logits(session, session_logits, (int)DS4_N_VOCAB) == (int)DS4_N_VOCAB,
                         "read complete session vocabulary");
         generation_logits(direct_logits, session_logits, cap, step);
+        if (reference) generation_logits(reference + (size_t)step * DS4_N_VOCAB, session_logits, cap, step);
         generation_need(direct->pos == (uint32_t)ds4_session_pos(session), "matching decode frontier positions");
         if (step == GENERATION_STEPS) break;
         const int token = ds4_session_argmax(session);
@@ -189,7 +200,8 @@ static void generation_case(const char *model, bool streaming, bool prefill_refe
     printf("PASS Qwen generation requested=%u cap=%u ctx=%d prompt=%d chunks=%d tokens=%d: "
            "%d complete vocabulary frontiers bit-exact (%s%s)\n", requested, cap, ctx, length,
            one_shot.calls, emitted, GENERATION_STEPS + 1, streaming ? "SSD" : "resident",
-           prefill_reference ? ", legacy unsplit prefill reference" : "");
+           prefill_reference ? ", resident reference" : "");
+    free(reference);
     free(session_logits); free(direct_logits);
     qwen4_graph_free(direct); free(direct);
     if (streaming) engine->qwen4_session_bytes -= memory.total_bytes;
@@ -225,19 +237,11 @@ int main(int argc, char **argv) {
     }
     if (prefill_reference && !streaming) {
         fputs("Qwen generation: --prefill-reference requires --ssd-streaming; "
-              "resident arithmetic uses the main reference, not SSD legacy unsplit\n", stderr);
+              "it compares against the same model loaded resident\n", stderr);
         return 2;
     }
     if ((chunk == 0) != (ctx == 0)) goto usage;
     if (tokens && (!ctx || tokens > ctx - GENERATION_STEPS - 1)) goto usage;
-    /* An inherited diagnostic override could make both sides take the
-     * reference path and hide an automatic-dispatch regression. */
-    if (prefill_reference && (getenv("DS4_QWEN4_DENSE_MM_LEGACY") ||
-                             getenv("DS4_QWEN4_NO_DENSE_MM_KSPLIT"))) {
-        fputs("Qwen generation: --prefill-reference requires unsetting "
-              "DS4_QWEN4_DENSE_MM_LEGACY and DS4_QWEN4_NO_DENSE_MM_KSPLIT\n", stderr);
-        return 2;
-    }
     const char *env = getenv("DS4_QWEN4_PREFILL_CHUNK");
     char *saved = env ? strdup(env) : NULL;
     generation_need(!env || saved, "save prefill environment");
