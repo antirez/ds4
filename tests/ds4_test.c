@@ -8,6 +8,7 @@
 #include <math.h>
 
 bool ds4_test_dspark_cache_window_crop(void);
+bool ds4_test_dspark_v41_sidecar_naming(void);
 bool ds4_test_dspark_prefix_capture(ds4_engine *engine, const ds4_tokens *prompt);
 
 static ds4_engine *test_engine_fast;
@@ -1266,6 +1267,10 @@ static void test_metal_store_raw_kv_batch_wrap(void) {
 
 static void test_dspark_cache_window_crop(void) {
     TEST_ASSERT(ds4_test_dspark_cache_window_crop());
+}
+
+static void test_dspark_v41_sidecar_naming(void) {
+    TEST_ASSERT(ds4_test_dspark_v41_sidecar_naming());
 }
 
 static void test_metal_q8_0_decode_pair_exact_case(
@@ -7324,6 +7329,7 @@ typedef struct {
 } ds4_test_entry;
 
 static const ds4_test_entry test_entries[] = {
+    {"--dspark-v41-sidecar-naming", "dspark-v41-sidecar-naming", "V4.1 DSpark sidecar GGUF naming/metadata loader controls (synthetic directory-only GGUF)", test_dspark_v41_sidecar_naming},
 #ifndef DS4_NO_GPU
     {"--qwen4-prefill-checkpoints", "qwen4-prefill-checkpoints", "Qwen chunk checkpoints restore matching logits and state", test_qwen_prefill_checkpoints},
     {"--qwen4-restore-reuse", "qwen4-restore-reuse", "Qwen restore discards old verifier state and rejects truncated payloads", test_qwen_restore_reused_session},

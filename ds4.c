@@ -3380,7 +3380,10 @@ static bool support_model_checkpoint_compatible(const ds4_model *m) {
     ds4_str family = {0}, arch = {0};
     const bool has_family = model_get_string(m, "dspark.target_architecture", &family);
     const bool has_arch = model_get_string(m, "general.architecture", &arch);
-    const bool v41 = has_family && ds4_streq(family, "deepseek41") &&
+    /* Newer V4.1 drafters carry only general.architecture =
+     * "deepseek41-dspark" without dspark.target_architecture; the arch string
+     * alone is unambiguous. */
+    const bool v41 = (!has_family || ds4_streq(family, "deepseek41")) &&
                      has_arch && ds4_streq(arch, "deepseek41-dspark");
     if ((DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) != v41 ||
         (has_family && !v41 && !ds4_streq(family, "deepseek4")) ||
@@ -8947,10 +8950,26 @@ static void dspark_weights_bind_optional(
             dspark_bind_tensor(dw, m, final_stage, "hc_head_fn.weight", !dw->v41);
         sw->hc_head_scale =
             dspark_bind_tensor(dw, m, final_stage, "hc_head_scale.weight", !dw->v41);
+        /* Both published V4.1 sidecar naming conventions are accepted: the
+         * converter emits markov_w1/markov_w2; early published artifacts
+         * name the same tensors embed/head. The canonical names win when
+         * present, so a file mixing both stays deterministic. */
+        const char *markov_w1_name = "markov_head.markov_w1.weight";
+        const char *markov_w2_name = "markov_head.markov_w2.weight";
+        if (dw->v41 &&
+            !tensor_by_mtp_stage_suffix(m, final_stage, markov_w1_name) &&
+            tensor_by_mtp_stage_suffix(m, final_stage, "markov_head.embed.weight")) {
+            markov_w1_name = "markov_head.embed.weight";
+        }
+        if (dw->v41 &&
+            !tensor_by_mtp_stage_suffix(m, final_stage, markov_w2_name) &&
+            tensor_by_mtp_stage_suffix(m, final_stage, "markov_head.head.weight")) {
+            markov_w2_name = "markov_head.head.weight";
+        }
         sw->markov_w1 =
-            dspark_bind_tensor(dw, m, final_stage, "markov_head.markov_w1.weight", true);
+            dspark_bind_tensor(dw, m, final_stage, markov_w1_name, true);
         sw->markov_w2 =
-            dspark_bind_tensor(dw, m, final_stage, "markov_head.markov_w2.weight", true);
+            dspark_bind_tensor(dw, m, final_stage, markov_w2_name, true);
         sw->confidence_proj =
             dspark_bind_tensor(dw, m, final_stage, "confidence_head.proj.weight", true);
     }
@@ -29813,6 +29832,229 @@ bool ds4_test_dspark_cache_window_crop(void) {
     }
     return true;
 }
+
+/* Loader-level controls for the published V4.1 sidecar naming conventions.
+ * Builds an in-memory ds4_model (directory + metadata only; the binder,
+ * summary and family check never dereference tensor payload bytes) and
+ * drives the real summary/family/binder path under the real V4.1 shape. */
+static uint8_t ds4_sidecar_map[64 * 1024];
+static ds4_tensor ds4_sidecar_tensors[96];
+static ds4_kv ds4_sidecar_kv[12];
+static uint64_t ds4_sidecar_map_len;
+
+static uint64_t ds4_sidecar_put(const void *data, uint64_t n) {
+    uint64_t at = ds4_sidecar_map_len;
+    memcpy(ds4_sidecar_map + at, data, n);
+    ds4_sidecar_map_len = at + n;
+    return at;
+}
+
+static void ds4_sidecar_meta_str(uint32_t *nkv, const char *k, const char *v) {
+    ds4_kv *kv = &ds4_sidecar_kv[(*nkv)++];
+    kv->key.ptr = k;
+    kv->key.len = strlen(k);
+    kv->type = 8; /* GGUF string */
+    uint8_t buf[8];
+    uint64_t len = strlen(v);
+    memcpy(buf, &len, 8);
+    uint64_t at = ds4_sidecar_put(buf, 8);
+    ds4_sidecar_put(v, len);
+    kv->value_pos = at;
+}
+
+static void ds4_sidecar_meta_u32(uint32_t *nkv, const char *k, uint32_t v) {
+    ds4_kv *kv = &ds4_sidecar_kv[(*nkv)++];
+    kv->key.ptr = k;
+    kv->key.len = strlen(k);
+    kv->type = 4;
+    kv->value_pos = ds4_sidecar_put(&v, 4);
+}
+
+static void ds4_sidecar_meta_u32x3(uint32_t *nkv, const char *k, uint32_t a, uint32_t b, uint32_t c) {
+    ds4_kv *kv = &ds4_sidecar_kv[(*nkv)++];
+    kv->key.ptr = k;
+    kv->key.len = strlen(k);
+    kv->type = 9; /* array */
+    uint8_t buf[12];
+    uint32_t subtype = 4;
+    uint64_t count = 3;
+    memcpy(buf, &subtype, 4);
+    uint64_t at = ds4_sidecar_put(buf, 4);
+    memcpy(buf, &count, 8);
+    ds4_sidecar_put(buf, 8);
+    ds4_sidecar_put(&a, 4); ds4_sidecar_put(&b, 4); ds4_sidecar_put(&c, 4);
+    kv->value_pos = at;
+}
+
+static void ds4_sidecar_tensor(uint32_t *nt, const char *name, uint32_t type,
+                               uint32_t ndim, const uint64_t *dim) {
+    ds4_tensor *t = &ds4_sidecar_tensors[(*nt)++];
+    memset(t, 0, sizeof(*t));
+    t->name.ptr = name;
+    t->name.len = strlen(name);
+    t->type = type;
+    t->ndim = ndim;
+    uint64_t elements = 1;
+    for (uint32_t i = 0; i < ndim; i++) {
+        t->dim[i] = dim[i];
+        elements *= dim[i];
+    }
+    t->elements = elements;
+    t->bytes = elements * 4;
+}
+
+static void ds4_sidecar_block(uint32_t *nt, uint32_t stage) {
+    const uint64_t hc_dim = (uint64_t)DS4_N_EMBD * DS4_N_HC;
+    const uint64_t hc_mix = 2u * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
+    const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint64_t out_low = (uint64_t)DS4_N_OUT_GROUP * DS4_N_LORA_O;
+    const uint64_t experts = 128; /* v41 dspark.n_routed_experts */
+    char name[160];
+#define SIDECAR_TENSOR(fmt, ty, ...) do { \
+        uint64_t d[] = {__VA_ARGS__}; \
+        snprintf(name, sizeof(name), fmt, stage); \
+        ds4_sidecar_tensor(nt, strdup(name), ty,\
+                           (uint32_t)(sizeof(d) / sizeof(d[0])), d); \
+    } while (0)
+    SIDECAR_TENSOR("mtp.%u.hc_attn_fn.weight", DS4_TENSOR_F16, hc_dim, hc_mix);
+    SIDECAR_TENSOR("mtp.%u.hc_attn_scale.weight", DS4_TENSOR_F32, 3);
+    SIDECAR_TENSOR("mtp.%u.hc_attn_base.weight", DS4_TENSOR_F32, hc_mix);
+    SIDECAR_TENSOR("mtp.%u.attn_norm.weight", DS4_TENSOR_F32, DS4_N_EMBD);
+    SIDECAR_TENSOR("mtp.%u.attn_q_a.weight", DS4_TENSOR_Q8_0, DS4_N_EMBD, DS4_N_LORA_Q);
+    SIDECAR_TENSOR("mtp.%u.attn_q_a_norm.weight", DS4_TENSOR_F32, DS4_N_LORA_Q);
+    SIDECAR_TENSOR("mtp.%u.attn_q_b.weight", DS4_TENSOR_Q8_0, DS4_N_LORA_Q, q_dim);
+    SIDECAR_TENSOR("mtp.%u.attn_kv.weight", DS4_TENSOR_Q8_0, DS4_N_EMBD, DS4_N_HEAD_DIM);
+    SIDECAR_TENSOR("mtp.%u.attn_kv_a_norm.weight", DS4_TENSOR_F32, DS4_N_HEAD_DIM);
+    SIDECAR_TENSOR("mtp.%u.attn_sinks.weight", DS4_TENSOR_F32, DS4_N_HEAD);
+    SIDECAR_TENSOR("mtp.%u.attn_output_a.weight", DS4_TENSOR_Q8_0,
+                   (uint64_t)DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP), out_low);
+    SIDECAR_TENSOR("mtp.%u.attn_output_b.weight", DS4_TENSOR_Q8_0, out_low, DS4_N_EMBD);
+    SIDECAR_TENSOR("mtp.%u.hc_ffn_fn.weight", DS4_TENSOR_F16, hc_dim, hc_mix);
+    SIDECAR_TENSOR("mtp.%u.hc_ffn_scale.weight", DS4_TENSOR_F32, 3);
+    SIDECAR_TENSOR("mtp.%u.hc_ffn_base.weight", DS4_TENSOR_F32, hc_mix);
+    SIDECAR_TENSOR("mtp.%u.ffn_norm.weight", DS4_TENSOR_F32, DS4_N_EMBD);
+    SIDECAR_TENSOR("mtp.%u.ffn_gate_inp.weight", DS4_TENSOR_F32, DS4_N_EMBD, experts);
+    SIDECAR_TENSOR("mtp.%u.exp_probs_b.bias", DS4_TENSOR_F32, experts);
+    /* Present in the published artifact; the binder does not require it and
+     * must tolerate the extra directory entry. */
+    SIDECAR_TENSOR("mtp.%u.exp_probs_b_vl.bias", DS4_TENSOR_F32, experts);
+    /* Routed experts must use a routed quant type and share it. */
+    {
+        uint64_t d3[3] = {DS4_N_EMBD, DS4_N_FF_EXP, experts};
+        snprintf(name, sizeof(name), "mtp.%u.ffn_gate_exps.weight", stage);
+        ds4_sidecar_tensor(nt, strdup(name), DS4_TENSOR_MXFP4, 3, d3);
+        snprintf(name, sizeof(name), "mtp.%u.ffn_up_exps.weight", stage);
+        ds4_sidecar_tensor(nt, strdup(name), DS4_TENSOR_MXFP4, 3, d3);
+        d3[0] = DS4_N_FF_EXP; d3[1] = DS4_N_EMBD;
+        snprintf(name, sizeof(name), "mtp.%u.ffn_down_exps.weight", stage);
+        ds4_sidecar_tensor(nt, strdup(name), DS4_TENSOR_MXFP4, 3, d3);
+    }
+    SIDECAR_TENSOR("mtp.%u.ffn_gate_shexp.weight", DS4_TENSOR_Q8_0, DS4_N_EMBD, DS4_N_FF_EXP);
+    SIDECAR_TENSOR("mtp.%u.ffn_up_shexp.weight", DS4_TENSOR_Q8_0, DS4_N_EMBD, DS4_N_FF_EXP);
+    SIDECAR_TENSOR("mtp.%u.ffn_down_shexp.weight", DS4_TENSOR_Q8_0, DS4_N_FF_EXP, DS4_N_EMBD);
+#undef SIDECAR_TENSOR
+}
+
+/* mode: 0 canonical markov_w1/w2, 1 published embed/head alternates,
+ * 2 no markov tensors (refuse), 3 no dspark.target_architecture key,
+ * 4 the ACTUAL artifact combination (no family key + alternates + real
+ * types + real noise id, 81-tensor directory), 5 alternates with wrong
+ * dimensions (refuse), 6 both variants present with wrong-dimension
+ * alternates (canonical must win). */
+static void ds4_test_dspark_sidecar_model(ds4_model *m, int mode) {
+    uint32_t nkv = 0, nt = 0;
+    ds4_sidecar_map_len = 0;
+    ds4_sidecar_meta_str(&nkv, "general.architecture", "deepseek41-dspark");
+    if (mode != 3 && mode != 4) ds4_sidecar_meta_str(&nkv, "dspark.target_architecture", "deepseek41");
+    ds4_sidecar_meta_u32(&nkv, "dspark.block_size", 5);
+    ds4_sidecar_meta_u32(&nkv, "dspark.markov_rank", 256);
+    ds4_sidecar_meta_u32(&nkv, "dspark.noise_token_id", 128799); /* artifact value */
+    ds4_sidecar_meta_u32(&nkv, "dspark.n_routed_experts", 128);
+    ds4_sidecar_meta_u32(&nkv, "dspark.num_experts_per_tok", 3);
+    ds4_sidecar_meta_u32x3(&nkv, "dspark.target_layer_ids", 37, 38, 39);
+    for (uint32_t stage = 0; stage < 3; stage++) ds4_sidecar_block(&nt, stage);
+    uint64_t d[2];
+    d[0] = 3u * DS4_N_EMBD; d[1] = DS4_N_EMBD;
+    ds4_sidecar_tensor(&nt, "mtp.0.main_proj.weight", DS4_TENSOR_Q8_0, 2, d);
+    d[0] = DS4_N_EMBD;
+    ds4_sidecar_tensor(&nt, "mtp.0.main_norm.weight", DS4_TENSOR_F32, 1, d);
+    ds4_sidecar_tensor(&nt, "mtp.2.norm.weight", DS4_TENSOR_F32, 1, d);
+    if (mode != 2) {
+        const bool aliases = mode == 1 || mode == 4 || mode == 5 || mode == 6;
+        d[0] = 256; d[1] = DS4_N_VOCAB;
+        if (!aliases || mode == 6) {
+            ds4_sidecar_tensor(&nt, "mtp.2.markov_head.markov_w1.weight",
+                               DS4_TENSOR_F16, 2, d);
+            ds4_sidecar_tensor(&nt, "mtp.2.markov_head.markov_w2.weight",
+                               DS4_TENSOR_F16, 2, d);
+        }
+        if (aliases) {
+            /* Mode 5 carries wrong alternate dimensions and must refuse;
+             * mode 6 carries wrong-dimension alternates BESIDE correct
+             * canonical tensors and must bind the canonical pair. */
+            uint64_t ad[2] = {256, DS4_N_VOCAB};
+            if (mode == 5 || mode == 6) ad[0] = 255;
+            ds4_sidecar_tensor(&nt, "mtp.2.markov_head.embed.weight",
+                               DS4_TENSOR_F16, 2, ad);
+            ds4_sidecar_tensor(&nt, "mtp.2.markov_head.head.weight",
+                               DS4_TENSOR_F16, 2, ad);
+        }
+    }
+    d[0] = (uint64_t)DS4_N_EMBD + 256; d[1] = 1;
+    ds4_sidecar_tensor(&nt, "mtp.2.confidence_head.proj.weight", DS4_TENSOR_F32, 2, d);
+    memset(m, 0, sizeof(*m));
+    m->map = ds4_sidecar_map;
+    m->size = ds4_sidecar_map_len;
+    m->n_kv = nkv;
+    m->n_tensors = nt;
+    m->kv = ds4_sidecar_kv;
+    m->tensors = ds4_sidecar_tensors;
+}
+
+static int ds4_test_dspark_sidecar_defects(int mode, bool *family_ok,
+                                          uint64_t *n_tensors) {
+    ds4_model m;
+    ds4_test_dspark_sidecar_model(&m, mode);
+    if (n_tensors) *n_tensors = m.n_tensors;
+    ds4_dspark_summary s = model_dspark_summary(&m);
+    bool compat = support_model_checkpoint_compatible(&m);
+    if (family_ok) *family_ok = compat;
+    if (!compat) return -1;
+    ds4_dspark_weights dw;
+    dspark_weights_bind_optional(&dw, &m, &s);
+    return (int)dw.missing_tensors + (int)dw.invalid_tensors +
+           (int)dw.metadata_errors + (dw.v41 ? 0 : 100);
+}
+
+bool ds4_test_dspark_v41_sidecar_naming(void) {
+    const ds4_shape saved = g_ds4_shape;
+    bool family_ok = false;
+    uint64_t actual_tensors = 0;
+    g_ds4_shape = DS4_SHAPE_FLASH41;
+    bool ok =
+        /* Canonical converter naming binds cleanly. */
+        ds4_test_dspark_sidecar_defects(0, &family_ok, NULL) == 0 && family_ok &&
+        /* Published embed/head alternates bind cleanly with this patch. */
+        ds4_test_dspark_sidecar_defects(1, &family_ok, NULL) == 0 && family_ok &&
+        /* Missing markov tensors refuse (missing_tensors > 0). */
+        ds4_test_dspark_sidecar_defects(2, &family_ok, NULL) > 0 && family_ok &&
+        /* Missing family key accepted by this branch (#1299). */
+        ds4_test_dspark_sidecar_defects(3, &family_ok, NULL) == 0 && family_ok &&
+        /* The ACTUAL artifact combination binds cleanly: no family key,
+         * alternate names, real types, real noise id, and exactly the
+         * published 81-tensor directory. */
+        ds4_test_dspark_sidecar_defects(4, &family_ok, &actual_tensors) == 0 &&
+        family_ok && actual_tensors == 81 &&
+        /* Wrong alternate dimensions refuse (invalid_tensors > 0). */
+        ds4_test_dspark_sidecar_defects(5, &family_ok, NULL) > 0 && family_ok &&
+        /* Both variants present with wrong-dimension alternates: the
+         * canonical pair must be chosen (binding the alternates would
+         * trip invalid_tensors). */
+        ds4_test_dspark_sidecar_defects(6, &family_ok, NULL) == 0 && family_ok;
+    g_ds4_shape = saved;
+    return ok;
+}
+
 
 static void metal_graph_dspark_capture_begin(ds4_gpu_graph *g) {
     metal_graph_dspark_capture_row_invalidate(g);
