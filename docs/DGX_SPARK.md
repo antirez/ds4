@@ -38,7 +38,7 @@ Two Sparks can instead keep half the experts each, using
 [network tensor parallelism](DISTRIBUTED.md#tensor-parallelism-between-two-sparks).
 Both need the complete GGUF on their local SSD. Single-host V4.1
 [DSpark](SPECULATIVE_DECODING.md#deepseek-v41-flash-dspark) also works with SSD
-streaming; TP speculation and CUDA vision are not supported for V4.1.
+streaming. TP speculation is not supported for V4.1, and CUDA vision runs on one host.
 The [model guide](MODELS.md#deepseek-v41-flash) covers
 thinking levels and the separate Metal configurations.
 
