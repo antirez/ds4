@@ -482,6 +482,8 @@ int ds4_gpu_stream_expert_cache_prefetch(
         const ds4_gpu_stream_expert_table *current,
         const ds4_gpu_stream_expert_table *next);
 void ds4_gpu_stream_expert_cache_prefetch_finish(bool cancel);
+/* True when the CUDA device has its own memory rather than sharing host RAM. */
+bool ds4_gpu_discrete_memory(void);
 #endif
 /* Reset only the prompt-local eviction heuristic.  The resident SSD expert
  * cache itself is intentionally kept warm across sessions. */

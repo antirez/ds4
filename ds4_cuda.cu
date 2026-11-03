@@ -2159,6 +2159,8 @@ static uint64_t cuda_model_copy_chunk_bytes(void) {
     return mb * 1048576ull;
 }
 
+static void cuda_model_drop_file_pages(uint64_t offset, uint64_t bytes);
+
 static void cuda_model_discard_source_pages(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes) {
 #if defined(POSIX_MADV_DONTNEED)
     if (getenv("DS4_CUDA_KEEP_MODEL_PAGES") != NULL || !model_map || bytes == 0 || offset > model_size) return;
@@ -2169,7 +2171,18 @@ static void cuda_model_discard_source_pages(const void *model_map, uint64_t mode
     const uintptr_t h1 = h0 + bytes;
     const uintptr_t p0 = h0 & ~(uintptr_t)(page_sz - 1u);
     const uintptr_t p1 = (h1 + page_sz - 1u) & ~(uintptr_t)(page_sz - 1u);
+#if defined(__linux__) && defined(MADV_DONTNEED)
+    /* glibc ignores POSIX_MADV_DONTNEED. On Linux, unmap the read-only file
+     * pages from this process, then drop them from the page cache when the
+     * map is the model fd's (it starts at file offset 0), so a VRAM copy does
+     * not also keep the weights in host RAM. */
+    if (p1 > p0) (void)madvise((void *)p0, (size_t)(p1 - p0), MADV_DONTNEED);
+    if (g_model_fd >= 0 && model_map == g_model_fd_host_base) {
+        cuda_model_drop_file_pages(offset, bytes);
+    }
+#else
     if (p1 > p0) (void)posix_madvise((void *)p0, (size_t)(p1 - p0), POSIX_MADV_DONTNEED);
+#endif
 #else
     (void)model_map;
     (void)model_size;
@@ -2611,14 +2624,17 @@ static const char *cuda_model_range_ptr_from_fd(
     return (const char *)dev;
 }
 
+/* Settings that place the weights some other way than a device copy. */
+static int cuda_model_copy_disabled_by_env(void) {
+    return getenv("DS4_CUDA_NO_MODEL_COPY") != NULL ||
+           getenv("DS4_CUDA_DIRECT_MODEL") != NULL ||
+           getenv("DS4_CUDA_WEIGHT_CACHE") != NULL ||
+           getenv("DS4_CUDA_WEIGHT_PRELOAD") != NULL;
+}
+
 static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size) {
     if (!model_map || model_size == 0 || map_offset > model_size || map_size > model_size - map_offset) return 0;
-    if (getenv("DS4_CUDA_NO_MODEL_COPY") != NULL ||
-        getenv("DS4_CUDA_DIRECT_MODEL") != NULL ||
-        getenv("DS4_CUDA_WEIGHT_CACHE") != NULL ||
-        getenv("DS4_CUDA_WEIGHT_PRELOAD") != NULL) {
-        return 0;
-    }
+    if (cuda_model_copy_disabled_by_env()) return 0;
     if (g_model_device_owned || g_model_registered) return 1;
 
     void *dev = NULL;
@@ -2634,49 +2650,57 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
             (double)model_size / 1073741824.0);
 
     const uint64_t chunk = cuda_model_copy_chunk_bytes();
-    void *stage = NULL;
-    err = cudaMallocHost(&stage, (size_t)chunk);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "ds4: CUDA pinned model staging allocation failed: %s\n", cudaGetErrorString(err));
-        (void)cudaFree(dev);
-        (void)cudaGetLastError();
-        return 0;
-    }
-
     if (map_offset > 0) {
-        uint64_t copied_header = 0;
-        while (copied_header < map_offset) {
-            const uint64_t n = (map_offset - copied_header < chunk) ? (map_offset - copied_header) : chunk;
-            memcpy(stage, (const char *)model_map + copied_header, (size_t)n);
-            err = cudaMemcpy((char *)dev + copied_header, stage, (size_t)n, cudaMemcpyHostToDevice);
-            if (err != cudaSuccess) {
-                fprintf(stderr, "ds4: CUDA model header copy failed: %s\n", cudaGetErrorString(err));
-                (void)cudaFreeHost(stage);
-                (void)cudaFree(dev);
-                (void)cudaGetLastError();
-                return 0;
-            }
-            copied_header += n;
-        }
-    }
-
-    uint64_t copied = 0;
-    double last_report = t0;
-    while (copied < map_size) {
-        const uint64_t n = (map_size - copied < chunk) ? (map_size - copied) : chunk;
-        const uint64_t off = map_offset + copied;
-        memcpy(stage, (const char *)model_map + off, (size_t)n);
-        err = cudaMemcpy((char *)dev + off, stage, (size_t)n, cudaMemcpyHostToDevice);
+        err = cudaMemcpy(dev, model_map, (size_t)map_offset, cudaMemcpyHostToDevice);
         if (err != cudaSuccess) {
-            fprintf(stderr, "ds4: CUDA model chunk copy failed at %.2f GiB: %s\n",
-                    (double)copied / 1073741824.0, cudaGetErrorString(err));
-            (void)cudaFreeHost(stage);
+            fprintf(stderr, "ds4: CUDA model header copy failed: %s\n", cudaGetErrorString(err));
             (void)cudaFree(dev);
             (void)cudaGetLastError();
             return 0;
         }
+    }
+
+    /* The tensor body goes through the four pinned staging buffers so the
+     * next read overlaps the previous upload. With the model fd (the usual
+     * case) the reads bypass the page cache via O_DIRECT; otherwise they copy
+     * from the map. */
+    const bool from_fd = g_model_fd >= 0 && model_map == g_model_fd_host_base;
+    const uint64_t stage_bytes = chunk + (g_model_direct_align > 1 ? g_model_direct_align : 1);
+    if (!cuda_model_stage_pool_alloc(stage_bytes)) {
+        (void)cudaFree(dev);
+        return 0;
+    }
+
+    uint64_t copied = 0;
+    uint64_t chunk_idx = 0;
+    double last_report = t0;
+    const char *fail = NULL;
+    while (copied < map_size) {
+        const uint64_t n = (map_size - copied < chunk) ? (map_size - copied) : chunk;
+        const uint64_t off = map_offset + copied;
+        const uint64_t bi = chunk_idx % 4u;
+        if (chunk_idx >= 4u && cudaEventSynchronize(g_model_stage_event[bi]) != cudaSuccess) {
+            fail = "staging wait";
+            break;
+        }
+        const char *payload = (const char *)g_model_stage[bi];
+        if (from_fd) {
+            if (!cuda_model_stage_read(g_model_stage[bi], g_model_stage_bytes, off, n, &payload)) {
+                fail = strerror(errno);
+                break;
+            }
+        } else {
+            memcpy(g_model_stage[bi], (const char *)model_map + off, (size_t)n);
+        }
+        if (cudaMemcpyAsync((char *)dev + off, payload, (size_t)n,
+                            cudaMemcpyHostToDevice, g_model_upload_stream) != cudaSuccess ||
+            cudaEventRecord(g_model_stage_event[bi], g_model_upload_stream) != cudaSuccess) {
+            fail = cudaGetErrorString(cudaGetLastError());
+            break;
+        }
         cuda_model_discard_source_pages(model_map, model_size, off, n);
         copied += n;
+        chunk_idx++;
         const double now = cuda_wall_sec();
         if (getenv("DS4_CUDA_MODEL_COPY_VERBOSE") != NULL && now - last_report >= 2.0) {
             fprintf(stderr, "ds4: CUDA model chunk copy %.2f/%.2f GiB\n",
@@ -2685,8 +2709,18 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
             last_report = now;
         }
     }
+    if (cudaStreamSynchronize(g_model_upload_stream) != cudaSuccess && !fail) {
+        fail = cudaGetErrorString(cudaGetLastError());
+    }
+    if (fail) {
+        fprintf(stderr, "ds4: CUDA model chunk copy failed at %.2f GiB: %s\n",
+                (double)copied / 1073741824.0, fail);
+        (void)cudaStreamSynchronize(g_model_upload_stream);
+        (void)cudaFree(dev);
+        (void)cudaGetLastError();
+        return 0;
+    }
 
-    (void)cudaFreeHost(stage);
     g_model_device_base = (const char *)dev;
     g_model_device_owned = 1;
     g_model_hmm_direct = 0;
@@ -4065,12 +4099,66 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
     return 1;
 }
 
+static int cuda_register_model_map(const void *model_map, uint64_t model_size,
+                                   bool register_all);
+
+static int cuda_current_device_integrated(void) {
+    int device = 0;
+    int integrated = 0;
+    if (cudaGetDevice(&device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, device) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    return integrated;
+}
+
+/* Weight residency for the single-device model map.
+ *
+ * Integrated GPUs (DGX Spark / GB10) share memory with the host, so the map
+ * is pinned and the kernels read it in place. A discrete GPU would read every
+ * pinned weight over PCIe, roughly thirty times slower than VRAM, so there the
+ * weights are copied into device memory instead and the host pages dropped.
+ * DS4_CUDA_COPY_MODEL_CHUNKED requests the copy on an integrated GPU too;
+ * DS4_CUDA_NO_MODEL_COPY and the other settings checked by
+ * cuda_model_copy_disabled_by_env keep the pinned mapping on a discrete one. */
 extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes) {
     (void)max_tensor_bytes;
+    const int integrated = cuda_current_device_integrated();
+    const int want_copy = !g_ssd_streaming_mode && !cuda_model_copy_disabled_by_env() &&
+        (!integrated || getenv("DS4_CUDA_COPY_MODEL_CHUNKED") != NULL);
+    if (want_copy && g_model_device_owned && g_model_host_base &&
+        g_model_host_base != model_map) {
+        /* A second map (an external MTP or DSpark support model) must not
+         * release the resident main model. Its tensors go through the
+         * per-range cache once its fd is set. */
+        return 1;
+    }
+    if (want_copy) {
+        if (!cuda_register_model_map(model_map, model_size, false)) return 0;
+        if (cuda_model_copy_chunked(model_map, model_size, map_offset, map_size)) {
+            fprintf(stderr, "ds4: CUDA weights: %.2f GiB resident in device memory\n",
+                    (double)map_size / 1073741824.0);
+            return 1;
+        }
+        /* Forget the unpinned record so the registration below pins the map. */
+        g_model_host_base = NULL;
+        g_model_registered_size = 0;
+        if (!integrated) {
+            fprintf(stderr,
+                    "ds4: WARNING: the %.2f GiB of weights do not fit in device memory; "
+                    "reading them over PCIe from pinned host memory will be very slow\n",
+                    (double)map_size / 1073741824.0);
+        }
+    }
     if (!ds4_gpu_register_model_map_no_copy(model_map, model_size)) return 0;
-    if (getenv("DS4_CUDA_COPY_MODEL_CHUNKED") != NULL &&
-        !cuda_model_copy_chunked(model_map, model_size, map_offset, map_size)) {
+    if (!g_ssd_streaming_mode && !g_model_registered &&
+        getenv("DS4_CUDA_COPY_MODEL_CHUNKED") != NULL) {
         (void)cuda_model_prefetch_range(model_map, model_size, map_offset, map_size);
+    }
+    if (!integrated && g_model_registered) {
+        fprintf(stderr, "ds4: CUDA weights: %.2f GiB read over PCIe from pinned host memory\n",
+                (double)map_size / 1073741824.0);
     }
     return 1;
 }
@@ -35230,6 +35318,13 @@ extern "C" int ds4_gpu_matmul_quant_tensor(
                 weight_type);
         return 0;
     }
+}
+
+extern "C" bool ds4_gpu_discrete_memory(void) {
+    int dev = 0, integrated = 1;
+    return cudaGetDevice(&dev) == cudaSuccess &&
+        cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev) == cudaSuccess &&
+        !integrated;
 }
 
 extern "C" uint64_t ds4_gpu_recommended_working_set_size(void) {

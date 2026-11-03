@@ -75096,6 +75096,18 @@ static int ds4_engine_open_internal(ds4_engine **out,
         }
         free(load_offsets);
         free(load_sizes);
+#if defined(POSIX_MADV_WILLNEED)
+        /* A discrete GPU copy drops the host pages of the weights, but Qwen
+         * embeds tokens on the host: read token_embd back in the background
+         * so the first prompts do not fault each row in from disk. */
+        if (ds4_model_is_qwen4() && e->weights.token_embd) {
+            const ds4_tensor *t = e->weights.token_embd;
+            const uintptr_t page = (uintptr_t)sysconf(_SC_PAGESIZE);
+            const uintptr_t p0 = (uintptr_t)(e->model.map + t->abs_offset) & ~(page - 1u);
+            const uintptr_t p1 = (uintptr_t)(e->model.map + t->abs_offset + t->bytes);
+            (void)posix_madvise((void *)p0, (size_t)(p1 - p0), POSIX_MADV_WILLNEED);
+        }
+#endif
         /* Also apply explicit optional Q8 preload settings to the runtime
          * support model when loaded. */
         if (support_model_runtime_ready) {

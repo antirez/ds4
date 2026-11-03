@@ -39,6 +39,22 @@ CUDA_HOME ?= $(shell if [ -x /usr/local/cuda/bin/nvcc ]; then \
 	fi)
 NVCC ?= $(CUDA_HOME)/bin/nvcc
 CUDA_ARCH ?=
+# With no arch nvcc builds for its pre-sm_80 default, where the tensor-core
+# kernels compile empty, yet the host still selects them on an sm_80+ GPU.
+# Default to the local GPU, and refuse to build CUDA if that is ambiguous.
+ifeq ($(strip $(CUDA_ARCH)),)
+CUDA_ARCH_DEFAULTED := 1
+override CUDA_ARCH := native
+endif
+# nvcc -arch=native picks plain sm_120/sm_121 on Blackwell, which lacks the
+# block-scaled MMA the vendored MMQ uses. Resolve native to the local compute
+# capability (when all GPUs agree) so it gets the same mapping as sm_120.
+ifeq ($(strip $(CUDA_ARCH)),native)
+CUDA_NATIVE_CC := $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | tr -d ' .' | sort -u)
+ifeq ($(words $(CUDA_NATIVE_CC)),1)
+override CUDA_ARCH := sm_$(CUDA_NATIVE_CC)
+endif
+endif
 ifneq ($(strip $(CUDA_ARCH)),)
 ifneq ($(filter sm_120 sm_120a,$(strip $(CUDA_ARCH))),)
 NVCC_ARCH_FLAGS := -gencode arch=compute_120a,code=sm_120a -DDS4_CUDA_HAVE_MXF4=1
@@ -48,6 +64,10 @@ else
 NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
 
+endif
+# Recursive, so only CUDA recipes trip it; CPU and ROCm builds never expand it.
+ifeq ($(CUDA_ARCH_DEFAULTED)$(CUDA_ARCH),1native)
+NVCC_ARCH_FLAGS = $(error CUDA_ARCH is not set and nvidia-smi reports no single local GPU type; set it, for example CUDA_ARCH=sm_120)
 endif
 NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
 # Vendored llama.cpp mmq prefill tier (cuda/mmq/, see cuda/mmq/VENDOR.md).
@@ -419,7 +439,7 @@ cuda-generic:
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=native
 
 cuda:
-	@if [ -z "$(strip $(CUDA_ARCH))" ]; then \
+	@if [ -n "$(CUDA_ARCH_DEFAULTED)" ]; then \
 		echo "error: specify CUDA_ARCH, for example: make cuda CUDA_ARCH=sm_120"; \
 		echo "       or use make cuda-spark / make cuda-generic"; \
 		exit 2; \
