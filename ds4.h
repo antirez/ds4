@@ -392,6 +392,9 @@ bool ds4_token_is_stop_for_think_mode(ds4_engine *e,
                                       ds4_think_mode mode);
 int ds4_token_user(ds4_engine *e);
 int ds4_token_assistant(ds4_engine *e);
+/* Turn markers: *prefix is -1 when user/assistant are single marker tokens,
+ * or the token that precedes the role name token (ChatML <|im_start|>). */
+void ds4_chat_role_markers(ds4_engine *e, int *prefix, int *user, int *assistant);
 
 /* Tensor-parallel binding: allocates the GPU gate slab, registers it with
  * the transport and arms the per-layer gate machinery.  Call once, after

@@ -46265,6 +46265,29 @@ int ds4_token_assistant(ds4_engine *e) {
     return e->vocab.assistant_id;
 }
 
+static int chat_role_name_token(const ds4_vocab *vocab, const char *role) {
+    token_vec tv = {0};
+    bpe_tokenize_text(vocab, role, &tv);
+    const int id = tv.len == 1 ? tv.v[0] : -1;
+    token_vec_free(&tv);
+    return id;
+}
+
+/* DeepSeek and GLM open a user or assistant turn with one marker token.
+ * ChatML opens it with <|im_start|> followed by the role name, rendered by
+ * qwen4_chat_open(), so for Qwen3.8 *prefix is <|im_start|> and the role
+ * ids are the name tokens that follow it. */
+void ds4_chat_role_markers(ds4_engine *e, int *prefix, int *user, int *assistant) {
+    const ds4_vocab *vocab = &e->vocab;
+    *prefix = -1;
+    *user = vocab->user_id;
+    *assistant = vocab->assistant_id;
+    if (vocab->im_start_id < 0) return;
+    *prefix = vocab->im_start_id;
+    *user = chat_role_name_token(vocab, "user");
+    *assistant = chat_role_name_token(vocab, "assistant");
+}
+
 static inline void argmax_f32_unrolled8_range(
         const float *logits,
         uint32_t     begin,

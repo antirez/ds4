@@ -716,6 +716,7 @@ int ds4_kvstore_store_len(const ds4_kvstore *kc, int tokens) {
 
 int ds4_kvstore_chat_anchor_pos(const ds4_kvstore *kc,
                                 const ds4_tokens *prompt,
+                                int prefix_token_id,
                                 int user_token_id,
                                 int assistant_token_id) {
     if (!prompt || user_token_id < 0 || assistant_token_id < 0) return -1;
@@ -723,10 +724,16 @@ int ds4_kvstore_chat_anchor_pos(const ds4_kvstore *kc,
     /* Cold checkpoints maximize reuse across independent agent sessions.  The
      * stable rendered chat prefix is everything before the user message that
      * asks this specific task.  Some clients put stable user-role scaffolding
-     * first, so use the last user marker before the first assistant marker. */
+     * first, so use the last user marker before the first assistant marker.
+     * With a prefix token (ChatML <|im_start|>) a marker is the prefix
+     * followed by the role token, and the anchor is the prefix. */
     int last_user = -1;
     for (int i = 0; i < prompt->len; i++) {
-        const int token = prompt->v[i];
+        int token = prompt->v[i];
+        if (prefix_token_id >= 0) {
+            if (token != prefix_token_id || i + 1 >= prompt->len) continue;
+            token = prompt->v[i + 1];
+        }
         if (token == assistant_token_id) break;
         if (token == user_token_id) last_user = i;
     }

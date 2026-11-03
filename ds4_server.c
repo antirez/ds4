@@ -11218,9 +11218,11 @@ static int kv_cache_store_len(const kv_disk_cache *kc, int tokens) {
 
 static int kv_cache_chat_anchor_pos(const kv_disk_cache *kc,
                                     const ds4_tokens *prompt,
+                                    int prefix_token_id,
                                     int user_token_id,
                                     int assistant_token_id) {
-    return ds4_kvstore_chat_anchor_pos(kc, prompt, user_token_id, assistant_token_id);
+    return ds4_kvstore_chat_anchor_pos(kc, prompt, prefix_token_id,
+                                       user_token_id, assistant_token_id);
 }
 
 
@@ -13732,9 +13734,10 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         s->kv.opt.cold_max_tokens > 0 &&
         prompt_for_sync->len <= s->kv.opt.cold_max_tokens)
     {
+        int prefix, user, assistant;
+        ds4_chat_role_markers(s->engine, &prefix, &user, &assistant);
         const int anchor = kv_cache_chat_anchor_pos(&s->kv, prompt_for_sync,
-                                                    ds4_token_user(s->engine),
-                                                    ds4_token_assistant(s->engine));
+                                                    prefix, user, assistant);
         cold_store_len = anchor >= s->kv.opt.min_tokens ?
                          anchor : kv_cache_store_len(&s->kv, prompt_for_sync->len);
     }
@@ -21620,7 +21623,7 @@ static void test_kv_cache_chat_anchor_uses_last_user_before_assistant(void) {
     ds4_tokens_push(&codex, user);  /* actual task starts here */
     ds4_tokens_push(&codex, 5);
     ds4_tokens_push(&codex, assistant);
-    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &codex, user, assistant) == 5);
+    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &codex, -1, user, assistant) == 5);
 
     ds4_tokens claude = {0};
     ds4_tokens_push(&claude, 1);
@@ -21630,7 +21633,7 @@ static void test_kv_cache_chat_anchor_uses_last_user_before_assistant(void) {
     ds4_tokens_push(&claude, user); /* system reminder and task share a turn */
     ds4_tokens_push(&claude, 5);
     ds4_tokens_push(&claude, assistant);
-    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &claude, user, assistant) == 4);
+    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &claude, -1, user, assistant) == 4);
 
     ds4_tokens_free(&codex);
     ds4_tokens_free(&claude);
@@ -21653,12 +21656,43 @@ static void test_kv_cache_chat_anchor_ignores_multiturn_tail(void) {
     ds4_tokens_push(&prompt, user);      /* later turn: not a cold anchor */
     ds4_tokens_push(&prompt, 5);
     ds4_tokens_push(&prompt, assistant);
-    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, user, assistant) == 2);
+    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, -1, user, assistant) == 2);
 
     kc.opt.min_tokens = 3;
-    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, user, assistant) == -1);
-    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, -1, assistant) == -1);
-    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, user, -1) == -1);
+    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, -1, user, assistant) == -1);
+    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, -1, -1, assistant) == -1);
+    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, -1, user, -1) == -1);
+
+    ds4_tokens_free(&prompt);
+}
+
+static void test_kv_cache_chat_anchor_chatml_role_names(void) {
+    const int im_start = 9000;
+    const int user = 9001;
+    const int assistant = 9002;
+    kv_disk_cache kc = {0};
+    kc.opt = kv_cache_default_options();
+    kc.opt.min_tokens = 2;
+
+    /* <|im_start|>system ... <|im_start|>user ... <|im_start|>assistant */
+    ds4_tokens prompt = {0};
+    ds4_tokens_push(&prompt, im_start);
+    ds4_tokens_push(&prompt, 1);         /* "system" */
+    ds4_tokens_push(&prompt, 2);
+    ds4_tokens_push(&prompt, user);      /* the word "user" in plain text */
+    ds4_tokens_push(&prompt, im_start);  /* the task starts here */
+    ds4_tokens_push(&prompt, user);
+    ds4_tokens_push(&prompt, assistant); /* the word "assistant" in the task */
+    ds4_tokens_push(&prompt, 3);
+    ds4_tokens_push(&prompt, im_start);
+    ds4_tokens_push(&prompt, assistant); /* stop scanning here */
+    ds4_tokens_push(&prompt, 4);
+    ds4_tokens_push(&prompt, im_start);  /* later turn: not a cold anchor */
+    ds4_tokens_push(&prompt, user);
+    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, im_start, user, assistant) == 4);
+
+    kc.opt.min_tokens = 5;
+    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, im_start, user, assistant) == -1);
 
     ds4_tokens_free(&prompt);
 }
@@ -23170,6 +23204,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_store_len_uses_configured_boundary();
     test_kv_cache_chat_anchor_uses_last_user_before_assistant();
     test_kv_cache_chat_anchor_ignores_multiturn_tail();
+    test_kv_cache_chat_anchor_chatml_role_names();
     test_kv_cache_continued_uses_aligned_frontiers();
     test_kv_cache_cold_store_suppresses_duplicate_continued_boundary();
     test_kv_cache_file_size_must_fit_budget();
