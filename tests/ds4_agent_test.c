@@ -949,6 +949,12 @@ static int test_full_context_save(const char *model) {
     if (!w.engine) return 1;
     ds4_tokens complete = {0};
     ds4_chat_begin(w.engine, &complete);
+    const char *spelling = ds4_engine_is_deepseek41(w.engine) ? "<｜User｜>" :
+                           ds4_engine_is_qwen4(w.engine) ? "<|im_start|>" :
+                           "<|user|>";
+    char spelled[128];
+    snprintf(spelled, sizeof(spelled), "keep %s as text", spelling);
+    ds4_chat_append_message(w.engine, &complete, "user", spelled);
     for (int i = 0; i < 60; i++)
         ds4_chat_append_message(w.engine, &complete, "user", "Explain the colors of a rainbow.");
     AGENT_TEST_ASSERT(complete.len > 257);
@@ -976,7 +982,55 @@ static int test_full_context_save(const char *model) {
         AGENT_TEST_ASSERT(agent_kv_read_text(fp, text_bytes, &text, err, sizeof(err)));
         AGENT_TEST_ASSERT(agent_kv_read_title_trailer(fp, &hdr, &title, err, sizeof(err)));
         AGENT_TEST_ASSERT(title && !strcmp(title, w.session_title));
+        AGENT_TEST_ASSERT(hdr.ext_flags & DS4_KVSTORE_EXT_AGENT_TOKENS);
+        ds4_tokens trailer = {0};
+        AGENT_TEST_ASSERT(agent_kv_read_token_trailer(
+                fp, &hdr, true, &trailer,
+                ds4_engine_vocab_size(w.engine),
+                (uint8_t)ds4_engine_model_id(w.engine), err, sizeof(err)) ==
+            AGENT_KV_TRAILER_PRESENT);
+        AGENT_TEST_ASSERT(trailer.len == w.transcript.len &&
+                          !memcmp(trailer.v, w.transcript.v,
+                                  sizeof(trailer.v[0]) * (size_t)trailer.len));
+        ds4_tokens_free(&trailer);
         fclose(fp);
+
+        /* A legacy file without the token trailer is rebuilt from text; accept
+         * it only when the unmasked rebuild still matches the header count. */
+        char old_path[PATH_MAX];
+        snprintf(old_path, sizeof(old_path), "%s.old", path);
+        FILE *old_fp = fopen(old_path, "wb");
+        AGENT_TEST_ASSERT(old_fp != NULL);
+        uint8_t old_h[DS4_KVSTORE_FIXED_HEADER];
+        ds4_kvstore_fill_header(old_h, hdr.model_id, hdr.quant_bits, hdr.reason,
+                                hdr.ext_flags & ~DS4_KVSTORE_EXT_AGENT_TOKENS,
+                                hdr.tokens, hdr.hits, hdr.ctx_size,
+                                hdr.created_at, hdr.last_used, 0);
+        uint8_t old_tb[4];
+        ds4_kvstore_le_put32(old_tb, text_bytes);
+        const bool old_ok =
+            fwrite(old_h, 1, sizeof(old_h), old_fp) == sizeof(old_h) &&
+            fwrite(old_tb, 1, sizeof(old_tb), old_fp) == sizeof(old_tb) &&
+            fwrite(text, 1, text_bytes, old_fp) == text_bytes &&
+            agent_kv_write_title_trailer(old_fp, w.session_title, err, sizeof(err)) &&
+            fflush(old_fp) == 0;
+        AGENT_TEST_ASSERT(old_ok);
+        fclose(old_fp);
+        ds4_session_free(w.session);
+        w.session = NULL;
+        AGENT_TEST_ASSERT(ds4_session_create(&w.session, w.engine, 512) == 0);
+        ds4_tokens old_restored = {0};
+        agent_kv_session_meta old_meta = {0};
+        char old_err[256] = {0};
+        AGENT_TEST_ASSERT(!agent_kv_load_path(&w, old_path, sha, NULL, 0,
+                                              &old_restored, &old_meta,
+                                              old_err, sizeof(old_err)));
+        AGENT_TEST_ASSERT(strstr(old_err, "no token trailer") != NULL);
+        ds4_tokens_free(&old_restored);
+        agent_kv_session_meta_free(&old_meta);
+        ds4_session_free(w.session); w.session = NULL;
+        unlink(old_path);
+
         size_t expected_len = 0;
         char *expected = ds4_kvstore_render_tokens_text(w.engine, &w.transcript, &expected_len);
         AGENT_TEST_ASSERT(text && expected && text_bytes == expected_len && !strcmp(text, expected));
@@ -999,6 +1053,287 @@ static int test_full_context_save(const char *model) {
         cfg.gen.ctx_size = 256;
         unlink(path); free(path);
     }
+    /* Realistic assistant turn: the agent appends the assistant prefix and
+     * pushes the generated tokens directly (DSML tokens are control tokens),
+     * so use the rendered-chat tokenizer here rather than treating the turn as
+     * one BPE content string. */
+    {
+        ds4_tokens normal = {0};
+        ds4_chat_begin(w.engine, &normal);
+        ds4_chat_append_message(w.engine, &normal, "system", "You are terse.");
+        ds4_chat_append_message(w.engine, &normal, "user", "Read the file.");
+        ds4_chat_append_assistant_prefix(w.engine, &normal, DS4_THINK_NONE);
+        ds4_tokens atext = {0};
+        ds4_tokenize_rendered_chat(w.engine,
+            "Let me inspect it.\n<｜DSML｜tool_calls>\n<｜DSML｜ invoke name=\"read\">\n"
+            "<｜DSML｜ parameter name=\"path\">/tmp/a.txt</parameter>\n"
+            "</｜DSML｜ invoke>\n</｜DSML｜ calls>", &atext);
+        for (int i = 0; i < atext.len; i++) ds4_tokens_push(&normal, atext.v[i]);
+        ds4_tokens_free(&atext);
+        if (agent_tool_syntax_assistant_turn_uses_eos(
+                agent_tool_syntax_for_engine(w.engine)))
+            ds4_tokens_push(&normal, ds4_token_eos(w.engine));
+        ds4_chat_append_message(w.engine, &normal, "tool", "a.txt\nb.txt");
+
+        size_t ntext_len = 0;
+        char *ntext = ds4_kvstore_render_tokens_text(w.engine, &normal, &ntext_len);
+        ds4_tokens nrebuilt = {0};
+        ds4_tokenize_rendered_chat(w.engine, ntext, &nrebuilt);
+        const int same = normal.len == nrebuilt.len &&
+            (normal.len == 0 ||
+             !memcmp(normal.v, nrebuilt.v, sizeof(normal.v[0]) * (size_t)normal.len));
+        fprintf(stderr, "agent normal rebuild live=%d rebuilt=%d equal=%d\n",
+                normal.len, nrebuilt.len, same);
+        AGENT_TEST_ASSERT(same);
+        free(ntext);
+        ds4_tokens_free(&nrebuilt);
+        ds4_tokens_free(&normal);
+    }
+
+    /* Strip the payload from a normal saved session: the header count and
+     * token trailer must survive, and a reload must reproduce the transcript. */
+    {
+        ds4_tokens slice = complete;
+        slice.len = 100;
+        ds4_tokens_copy(&w.transcript, &slice);
+        AGENT_TEST_ASSERT(ds4_session_create(&w.session, w.engine, 256) == 0);
+        cfg.gen.ctx_size = 256;
+        w.session_dirty = true;
+        char strip_err[256] = {0};
+        char strip_sha[41];
+        int strip_tokens = 0;
+        AGENT_TEST_ASSERT(agent_worker_save_session_now(&w, strip_sha, &strip_tokens,
+                                                       strip_err, sizeof(strip_err)));
+        AGENT_TEST_ASSERT(strip_tokens == 100);
+
+        char *strip_path = agent_kv_path_for_sha(dir, strip_sha);
+        FILE *sf = fopen(strip_path, "rb");
+        AGENT_TEST_ASSERT(sf != NULL);
+        ds4_kvstore_entry shdr = {0};
+        uint32_t stext_bytes = 0;
+        char *stext = NULL, *stitle = NULL;
+        AGENT_TEST_ASSERT(ds4_kvstore_read_header(sf, &shdr, &stext_bytes));
+        AGENT_TEST_ASSERT(agent_kv_read_text(sf, stext_bytes, &stext, strip_err, sizeof(strip_err)));
+        AGENT_TEST_ASSERT(agent_kv_read_title_trailer(sf, &shdr, &stitle, strip_err, sizeof(strip_err)));
+        AGENT_TEST_ASSERT(shdr.payload_bytes > 0);
+        AGENT_TEST_ASSERT(shdr.tokens == 100);
+        AGENT_TEST_ASSERT(shdr.ext_flags & DS4_KVSTORE_EXT_AGENT_TOKENS);
+        ds4_tokens strailer = {0};
+        AGENT_TEST_ASSERT(agent_kv_read_token_trailer(
+                sf, &shdr, true, &strailer,
+                ds4_engine_vocab_size(w.engine),
+                (uint8_t)ds4_engine_model_id(w.engine), strip_err, sizeof(strip_err)) ==
+            AGENT_KV_TRAILER_PRESENT);
+        AGENT_TEST_ASSERT(strailer.len == w.transcript.len &&
+                          !memcmp(strailer.v, w.transcript.v,
+                                  sizeof(strailer.v[0]) * (size_t)strailer.len));
+        ds4_tokens_free(&strailer);
+        fclose(sf);
+        free(stext); free(stitle);
+
+        char stripped_sha[41];
+        uint32_t stripped_tokens = 0;
+        AGENT_TEST_ASSERT(agent_worker_strip_session(&w, strip_sha, stripped_sha,
+                                                    &stripped_tokens, strip_err,
+                                                    sizeof(strip_err)));
+        AGENT_TEST_ASSERT(stripped_tokens == 100);
+        AGENT_TEST_ASSERT(!strcmp(stripped_sha, strip_sha));
+
+        sf = fopen(strip_path, "rb");
+        AGENT_TEST_ASSERT(sf != NULL);
+        ds4_kvstore_entry thdr = {0};
+        uint32_t ttext_bytes = 0;
+        char *ttext = NULL, *ttitle = NULL;
+        AGENT_TEST_ASSERT(ds4_kvstore_read_header(sf, &thdr, &ttext_bytes));
+        AGENT_TEST_ASSERT(agent_kv_read_text(sf, ttext_bytes, &ttext, strip_err, sizeof(strip_err)));
+        AGENT_TEST_ASSERT(agent_kv_read_title_trailer(sf, &thdr, &ttitle, strip_err, sizeof(strip_err)));
+        AGENT_TEST_ASSERT(thdr.payload_bytes == 0);
+        AGENT_TEST_ASSERT(thdr.tokens == 100);
+        AGENT_TEST_ASSERT(thdr.ext_flags & DS4_KVSTORE_EXT_AGENT_TOKENS);
+        ds4_tokens ttrailer = {0};
+        AGENT_TEST_ASSERT(agent_kv_read_token_trailer(
+                sf, &thdr, true, &ttrailer,
+                ds4_engine_vocab_size(w.engine),
+                (uint8_t)ds4_engine_model_id(w.engine), strip_err, sizeof(strip_err)) ==
+            AGENT_KV_TRAILER_PRESENT);
+        AGENT_TEST_ASSERT(ttrailer.len == w.transcript.len &&
+                          !memcmp(ttrailer.v, w.transcript.v,
+                                  sizeof(ttrailer.v[0]) * (size_t)ttrailer.len));
+        ds4_tokens_free(&ttrailer);
+        fclose(sf);
+        free(ttext); free(ttitle);
+
+        ds4_session_free(w.session); w.session = NULL;
+        AGENT_TEST_ASSERT(ds4_session_create(&w.session, w.engine, 512) == 0);
+        cfg.gen.ctx_size = 512;
+        ds4_tokens srestored = {0};
+        agent_kv_session_meta smeta = {0};
+        AGENT_TEST_ASSERT(agent_kv_load_path(&w, strip_path, stripped_sha, NULL, 0,
+                                             &srestored, &smeta, strip_err,
+                                             sizeof(strip_err)));
+        AGENT_TEST_ASSERT(agent_tokens_equal(&w.transcript, &srestored));
+        agent_kv_session_meta_free(&smeta);
+        ds4_tokens_free(&srestored);
+        ds4_tokens_free(&w.transcript);
+        ds4_session_free(w.session); w.session = NULL;
+        unlink(strip_path);
+        free(strip_path);
+    }
+
+    /* A file stripped by an older agent keeps the AGENT_TOKENS flag but has
+     * no trailer.  A benign transcript must still load through the legacy
+     * rebuild + count check instead of failing as a truncated trailer. */
+    {
+        ds4_tokens benign = {0};
+        ds4_chat_begin(w.engine, &benign);
+        ds4_chat_append_message(w.engine, &benign, "system", "You are terse.");
+        ds4_chat_append_message(w.engine, &benign, "user", "Say hello.");
+        ds4_chat_append_message(w.engine, &benign, "assistant", "Hello.");
+        ds4_tokens_copy(&w.transcript, &benign);
+        AGENT_TEST_ASSERT(ds4_session_create(&w.session, w.engine, 8) == 0);
+        cfg.gen.ctx_size = 8;
+        w.session_dirty = true;
+        char ben_err[256] = {0}, ben_sha[41];
+        int ben_tokens = 0;
+        AGENT_TEST_ASSERT(agent_worker_save_session_now(&w, ben_sha, &ben_tokens,
+                                                       ben_err, sizeof(ben_err)));
+        AGENT_TEST_ASSERT(ben_tokens == benign.len);
+        char *ben_path = agent_kv_path_for_sha(dir, ben_sha);
+        FILE *bf = fopen(ben_path, "rb");
+        AGENT_TEST_ASSERT(bf != NULL);
+        ds4_kvstore_entry bhdr = {0};
+        uint32_t btext_bytes = 0;
+        char *btext = NULL, *btitle = NULL;
+        AGENT_TEST_ASSERT(ds4_kvstore_read_header(bf, &bhdr, &btext_bytes));
+        AGENT_TEST_ASSERT(agent_kv_read_text(bf, btext_bytes, &btext, ben_err, sizeof(ben_err)));
+        AGENT_TEST_ASSERT(agent_kv_read_title_trailer(bf, &bhdr, &btitle, ben_err, sizeof(ben_err)));
+        AGENT_TEST_ASSERT(bhdr.payload_bytes == 0);
+        fclose(bf);
+        /* Rewrite without the trailer, keeping the stale flag. */
+        bf = fopen(ben_path, "wb");
+        AGENT_TEST_ASSERT(bf != NULL);
+        uint8_t bh[DS4_KVSTORE_FIXED_HEADER];
+        ds4_kvstore_fill_header(bh, bhdr.model_id, bhdr.quant_bits, bhdr.reason,
+                                bhdr.ext_flags, bhdr.tokens, bhdr.hits, bhdr.ctx_size,
+                                bhdr.created_at, bhdr.last_used, 0);
+        uint8_t btb[4];
+        ds4_kvstore_le_put32(btb, btext_bytes);
+        AGENT_TEST_ASSERT(fwrite(bh, 1, sizeof(bh), bf) == sizeof(bh));
+        AGENT_TEST_ASSERT(fwrite(btb, 1, sizeof(btb), bf) == sizeof(btb));
+        AGENT_TEST_ASSERT(fwrite(btext, 1, btext_bytes, bf) == btext_bytes);
+        AGENT_TEST_ASSERT(agent_kv_write_title_trailer(bf, btitle, ben_err, sizeof(ben_err)));
+        AGENT_TEST_ASSERT(fclose(bf) == 0);
+        ds4_session_free(w.session);
+        w.session = NULL;
+        AGENT_TEST_ASSERT(ds4_session_create(&w.session, w.engine, 512) == 0);
+        cfg.gen.ctx_size = 512;
+        ds4_tokens brestored = {0};
+        agent_kv_session_meta bmeta = {0};
+        AGENT_TEST_ASSERT(agent_kv_load_path(&w, ben_path, ben_sha, NULL, 0,
+                                             &brestored, &bmeta, ben_err,
+                                             sizeof(ben_err)));
+        AGENT_TEST_ASSERT(agent_tokens_equal(&w.transcript, &brestored));
+        agent_kv_session_meta_free(&bmeta);
+        ds4_tokens_free(&brestored);
+        /* The stale-flag file can be stripped; the new header must drop the
+         * flag because there is no trailer to preserve. */
+        char stripped_ben_sha[41];
+        uint32_t stripped_ben_tokens = 0;
+        AGENT_TEST_ASSERT(agent_worker_strip_session(
+                &w, ben_sha, stripped_ben_sha, &stripped_ben_tokens,
+                ben_err, sizeof(ben_err)));
+        AGENT_TEST_ASSERT(stripped_ben_tokens == bhdr.tokens);
+        AGENT_TEST_ASSERT(!strcmp(stripped_ben_sha, ben_sha));
+        bf = fopen(ben_path, "rb");
+        AGENT_TEST_ASSERT(bf != NULL);
+        ds4_kvstore_entry shdr2 = {0};
+        uint32_t stext2 = 0;
+        AGENT_TEST_ASSERT(ds4_kvstore_read_header(bf, &shdr2, &stext2));
+        AGENT_TEST_ASSERT(shdr2.payload_bytes == 0);
+        AGENT_TEST_ASSERT(!(shdr2.ext_flags & DS4_KVSTORE_EXT_AGENT_TOKENS));
+        AGENT_TEST_ASSERT(shdr2.tokens == bhdr.tokens);
+        fclose(bf);
+        ds4_session_free(w.session);
+        w.session = NULL;
+        AGENT_TEST_ASSERT(ds4_session_create(&w.session, w.engine, 512) == 0);
+        ds4_tokens srestored2 = {0};
+        agent_kv_session_meta smeta2 = {0};
+        AGENT_TEST_ASSERT(agent_kv_load_path(&w, ben_path, ben_sha, NULL, 0,
+                                             &srestored2, &smeta2, ben_err,
+                                             sizeof(ben_err)));
+        AGENT_TEST_ASSERT(agent_tokens_equal(&w.transcript, &srestored2));
+        agent_kv_session_meta_free(&smeta2);
+        ds4_tokens_free(&srestored2);
+
+        /* A partial trailer and a header without ids are corruption, not a
+         * legacy file; the loader must fail instead of rebuilding. */
+        char corrupt_path[PATH_MAX];
+        snprintf(corrupt_path, sizeof(corrupt_path), "%s.corrupt", ben_path);
+        static const uint8_t zeros8[8] = {0};
+        bf = fopen(corrupt_path, "wb");
+        AGENT_TEST_ASSERT(bf != NULL);
+        uint8_t ch[DS4_KVSTORE_FIXED_HEADER];
+        ds4_kvstore_fill_header(ch, bhdr.model_id, bhdr.quant_bits, bhdr.reason,
+                                bhdr.ext_flags, bhdr.tokens, bhdr.hits, bhdr.ctx_size,
+                                bhdr.created_at, bhdr.last_used, 0);
+        uint8_t ctb[4];
+        ds4_kvstore_le_put32(ctb, btext_bytes);
+        AGENT_TEST_ASSERT(fwrite(ch, 1, sizeof(ch), bf) == sizeof(ch));
+        AGENT_TEST_ASSERT(fwrite(ctb, 1, sizeof(ctb), bf) == sizeof(ctb));
+        AGENT_TEST_ASSERT(fwrite(btext, 1, btext_bytes, bf) == btext_bytes);
+        AGENT_TEST_ASSERT(agent_kv_write_title_trailer(bf, btitle, ben_err, sizeof(ben_err)));
+        AGENT_TEST_ASSERT(fwrite(zeros8, 1, sizeof(zeros8), bf) == sizeof(zeros8));
+        AGENT_TEST_ASSERT(fclose(bf) == 0);
+        ds4_session_free(w.session);
+        w.session = NULL;
+        AGENT_TEST_ASSERT(ds4_session_create(&w.session, w.engine, 512) == 0);
+        ds4_tokens crestore = {0};
+        agent_kv_session_meta cmeta = {0};
+        char cerr[256] = {0};
+        AGENT_TEST_ASSERT(!agent_kv_load_path(&w, corrupt_path, ben_sha, NULL, 0,
+                                              &crestore, &cmeta, cerr,
+                                              sizeof(cerr)));
+        AGENT_TEST_ASSERT(cerr[0] != '\0');
+        ds4_tokens_free(&crestore);
+        agent_kv_session_meta_free(&cmeta);
+
+        bf = fopen(corrupt_path, "wb");
+        AGENT_TEST_ASSERT(bf != NULL);
+        uint8_t th[AGENT_KV_TOKEN_HEADER];
+        ds4_kvstore_le_put32(th, AGENT_KV_TOKEN_MAGIC);
+        ds4_kvstore_le_put32(th + 4, AGENT_KV_TOKEN_VERSION);
+        ds4_kvstore_le_put32(th + 8, bhdr.model_id);
+        ds4_kvstore_le_put32(th + 12, bhdr.tokens);
+        AGENT_TEST_ASSERT(fwrite(ch, 1, sizeof(ch), bf) == sizeof(ch));
+        AGENT_TEST_ASSERT(fwrite(ctb, 1, sizeof(ctb), bf) == sizeof(ctb));
+        AGENT_TEST_ASSERT(fwrite(btext, 1, btext_bytes, bf) == btext_bytes);
+        AGENT_TEST_ASSERT(agent_kv_write_title_trailer(bf, btitle, ben_err, sizeof(ben_err)));
+        AGENT_TEST_ASSERT(fwrite(th, 1, sizeof(th), bf) == sizeof(th));
+        AGENT_TEST_ASSERT(fclose(bf) == 0);
+        ds4_session_free(w.session);
+        w.session = NULL;
+        AGENT_TEST_ASSERT(ds4_session_create(&w.session, w.engine, 512) == 0);
+        ds4_tokens crestore2 = {0};
+        agent_kv_session_meta cmeta2 = {0};
+        char cerr2[256] = {0};
+        AGENT_TEST_ASSERT(!agent_kv_load_path(&w, corrupt_path, ben_sha, NULL, 0,
+                                              &crestore2, &cmeta2, cerr2,
+                                              sizeof(cerr2)));
+        AGENT_TEST_ASSERT(cerr2[0] != '\0');
+        ds4_tokens_free(&crestore2);
+        agent_kv_session_meta_free(&cmeta2);
+        unlink(corrupt_path);
+
+        free(btext);
+        free(btitle);
+        unlink(ben_path);
+        free(ben_path);
+        ds4_tokens_free(&w.transcript);
+        ds4_tokens_free(&benign);
+        ds4_session_free(w.session);
+        w.session = NULL;
+    }
+
     ds4_tokens_free(&complete);
     ds4_engine_close(w.engine);
     free(w.session_title);
@@ -1007,7 +1342,164 @@ static int test_full_context_save(const char *model) {
     return agent_test_failures ? 1 : 0;
 }
 
+/* Model-backed real-session probe: generate actual tokens for a tool-call turn
+ * and a tool-result continuation, save through the agent KV path, then remove
+ * the token trailer/flag and compare the legacy text rebuild.  Prints the
+ * counts instead of asserting the legacy result: the policy decision depends on
+ * whether real sampled tokens are canonical under the rendered text. */
+static int test_real_session_rebuild(const char *model) {
+    ds4_engine_options opt = {.model_path = model, .backend = default_backend(),
+        .context_size = 4096, .power_percent = 100};
+    agent_config cfg = {.gen = {.ctx_size = 4096}, .non_interactive = true};
+    agent_worker w = {.cfg = &cfg, .initialized = true, .user_activity = true,
+        .wake_fd = {-1, -1}, .status = {.state = AGENT_WORKER_IDLE}};
+    pthread_mutex_init(&w.mu, NULL);
+    char dir[] = "/tmp/ds4-agent-real-XXXXXX";
+    AGENT_TEST_ASSERT(mkdtemp(dir) != NULL);
+    w.cache_dir = xstrdup(dir);
+    w.session_title = xstrdup("Real tool session");
+    w.session_created_at = 123456;
+    AGENT_TEST_ASSERT(ds4_engine_open(&w.engine, &opt) == 0);
+    if (!w.engine) return 1;
+    AGENT_TEST_ASSERT(ds4_session_create(&w.session, w.engine, 4096) == 0);
+
+    char workfile[] = "/tmp/ds4-agent-real-tool-XXXXXX";
+    const int wfd = mkstemp(workfile);
+    AGENT_TEST_ASSERT(wfd >= 0);
+    const char workdata[] = "alpha line\nbeta line\n";
+    AGENT_TEST_ASSERT(write(wfd, workdata, sizeof(workdata) - 1) ==
+                      (ssize_t)(sizeof(workdata) - 1));
+    close(wfd);
+
+    ds4_tokens t = {0};
+    ds4_chat_begin(w.engine, &t);
+    agent_append_system_prompt(w.engine, &t, NULL, false);
+    char prompt[512];
+    snprintf(prompt, sizeof(prompt),
+             "You must call the read tool. Read %s and reply with its first line. "
+             "Do not answer from memory.", workfile);
+    ds4_chat_append_message(w.engine, &t, "user", prompt);
+    ds4_chat_append_assistant_prefix(w.engine, &t, DS4_THINK_NONE);
+    char err[256] = {0};
+    AGENT_TEST_ASSERT(agent_worker_sync_tokens(&w, &t, false, err, sizeof(err)) == 0);
+
+    uint64_t rng = 1;
+    int gen1 = 0, gen2 = 0;
+    for (int i = 0; i < 256; i++) {
+        const int tok = ds4_session_sample(w.session, 0.0f, 1, 1.0f, 0.0f, &rng);
+        if (tok < 0 || ds4_token_is_stop(w.engine, tok)) break;
+        ds4_tokens_push(&t, tok);
+        AGENT_TEST_ASSERT(ds4_session_eval(w.session, tok, err, sizeof(err)) == 0);
+        gen1++;
+    }
+    if (agent_tool_syntax_assistant_turn_uses_eos(
+            agent_tool_syntax_for_engine(w.engine)))
+        ds4_tokens_push(&t, ds4_token_eos(w.engine));
+
+    ds4_chat_append_message(w.engine, &t, "tool", "alpha line\nbeta line\n");
+    ds4_chat_append_assistant_prefix(w.engine, &t, DS4_THINK_NONE);
+    AGENT_TEST_ASSERT(agent_worker_sync_tokens(&w, &t, false, err, sizeof(err)) == 0);
+    for (int i = 0; i < 128; i++) {
+        const int tok = ds4_session_sample(w.session, 0.0f, 1, 1.0f, 0.0f, &rng);
+        if (tok < 0 || ds4_token_is_stop(w.engine, tok)) break;
+        ds4_tokens_push(&t, tok);
+        AGENT_TEST_ASSERT(ds4_session_eval(w.session, tok, err, sizeof(err)) == 0);
+        gen2++;
+    }
+    if (agent_tool_syntax_assistant_turn_uses_eos(
+            agent_tool_syntax_for_engine(w.engine)))
+        ds4_tokens_push(&t, ds4_token_eos(w.engine));
+
+    ds4_tokens_copy(&w.transcript, &t);
+    w.session_dirty = true;
+    char sha[41];
+    int saved = 0;
+    AGENT_TEST_ASSERT(agent_worker_save_session_now(&w, sha, &saved, err, sizeof(err)));
+    AGENT_TEST_ASSERT(saved == t.len);
+
+    char *path = agent_kv_path_for_sha(dir, sha);
+    FILE *fp = fopen(path, "rb");
+    AGENT_TEST_ASSERT(fp != NULL);
+    ds4_kvstore_entry hdr = {0};
+    uint32_t text_bytes = 0;
+    char *text = NULL, *title = NULL;
+    AGENT_TEST_ASSERT(ds4_kvstore_read_header(fp, &hdr, &text_bytes));
+    AGENT_TEST_ASSERT(agent_kv_read_text(fp, text_bytes, &text, err, sizeof(err)));
+    AGENT_TEST_ASSERT(agent_kv_read_title_trailer(fp, &hdr, &title, err, sizeof(err)));
+    ds4_tokens trailer = {0};
+    AGENT_TEST_ASSERT(agent_kv_read_token_trailer(
+            fp, &hdr, true, &trailer, ds4_engine_vocab_size(w.engine),
+            (uint8_t)ds4_engine_model_id(w.engine), err, sizeof(err)) ==
+        AGENT_KV_TRAILER_PRESENT);
+    fclose(fp);
+
+    ds4_tokens rebuilt = {0};
+    ds4_tokenize_rendered_chat(w.engine, text, &rebuilt);
+    const int same = t.len == rebuilt.len &&
+        (t.len == 0 || !memcmp(t.v, rebuilt.v, sizeof(t.v[0]) * (size_t)t.len));
+    const char *saved_text = text;
+    const int has_tool = strstr(saved_text, "｜DSML｜") != NULL;
+    fprintf(stderr,
+            "real session gen1=%d gen2=%d tokens=%d trailer=%d rebuilt=%d equal=%d tool=%d\n",
+            gen1, gen2, t.len, trailer.len, rebuilt.len, same, has_tool);
+    AGENT_TEST_ASSERT(same);
+    AGENT_TEST_ASSERT(has_tool);
+
+    /* Legacy view: same text, no trailer, flag cleared, no payload. */
+    char legacy_path[PATH_MAX];
+    snprintf(legacy_path, sizeof(legacy_path), "%s.legacy", path);
+    FILE *lf = fopen(legacy_path, "wb");
+    AGENT_TEST_ASSERT(lf != NULL);
+    uint8_t lh[DS4_KVSTORE_FIXED_HEADER];
+    ds4_kvstore_fill_header(lh, hdr.model_id, hdr.quant_bits, hdr.reason,
+                            hdr.ext_flags & ~DS4_KVSTORE_EXT_AGENT_TOKENS,
+                            hdr.tokens, hdr.hits, hdr.ctx_size,
+                            hdr.created_at, hdr.last_used, 0);
+    uint8_t ltb[4];
+    ds4_kvstore_le_put32(ltb, text_bytes);
+    AGENT_TEST_ASSERT(fwrite(lh, 1, sizeof(lh), lf) == sizeof(lh));
+    AGENT_TEST_ASSERT(fwrite(ltb, 1, sizeof(ltb), lf) == sizeof(ltb));
+    AGENT_TEST_ASSERT(fwrite(text, 1, text_bytes, lf) == text_bytes);
+    AGENT_TEST_ASSERT(agent_kv_write_title_trailer(lf, title, err, sizeof(err)));
+    AGENT_TEST_ASSERT(fclose(lf) == 0);
+
+    ds4_session_free(w.session);
+    w.session = NULL;
+    AGENT_TEST_ASSERT(ds4_session_create(&w.session, w.engine, 4096) == 0);
+    ds4_tokens restored = {0};
+    agent_kv_session_meta meta = {0};
+    char lerr[256] = {0};
+    const bool legacy_ok = agent_kv_load_path(&w, legacy_path, sha, NULL, 0,
+                                              &restored, &meta, lerr,
+                                              sizeof(lerr));
+    fprintf(stderr, "real legacy load=%d restored=%d err=%s\n",
+            legacy_ok, restored.len, lerr);
+    AGENT_TEST_ASSERT(legacy_ok);
+    AGENT_TEST_ASSERT(restored.len == t.len);
+    agent_kv_session_meta_free(&meta);
+    ds4_tokens_free(&restored);
+    ds4_tokens_free(&rebuilt);
+    ds4_tokens_free(&trailer);
+    free(text);
+    free(title);
+    unlink(legacy_path);
+    unlink(path);
+    unlink(workfile);
+    free(path);
+
+    ds4_tokens_free(&t);
+    ds4_tokens_free(&w.transcript);
+    ds4_session_free(w.session);
+    ds4_engine_close(w.engine);
+    free(w.cache_dir);
+    free(w.session_title);
+    pthread_mutex_destroy(&w.mu);
+    rmdir(dir);
+    return agent_test_failures ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
+    if (argc == 3 && !strcmp(argv[1], "--real-session-rebuild")) return test_real_session_rebuild(argv[2]);
     if (argc == 3 && !strcmp(argv[1], "--full-context-save")) return test_full_context_save(argv[2]);
     if (argc == 3 && !strcmp(argv[1], "--think-fixture")) return test_v41_thinking(argv[2]);
     if (argc == 2 && !strcmp(argv[1], "--terminal-driver")) return test_terminal_driver();

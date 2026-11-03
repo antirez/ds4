@@ -4872,6 +4872,179 @@ static bool agent_kv_read_title_trailer(FILE *fp, const ds4_kvstore_entry *hdr,
     return true;
 }
 
+/* Exact token ids for the agent's stripped/TP rebuild path.  The rendered
+ * text alone cannot distinguish a user's control-token spelling from syntax,
+ * so the trailer stores the live token sequence and the loader reuses it. */
+#define AGENT_KV_TOKEN_MAGIC   0x4b4f5441u /* "ATOK" */
+#define AGENT_KV_TOKEN_VERSION 1u
+#define AGENT_KV_TOKEN_HEADER  16u
+
+static bool agent_kv_write_token_trailer(FILE *fp, const ds4_tokens *tokens,
+                                         uint8_t model_id, int vocab_size,
+                                         char *err, size_t err_len) {
+    if (!fp || !tokens || tokens->len < 0 || vocab_size <= 0 ||
+        (uint64_t)tokens->len > UINT32_MAX) {
+        if (err && err_len) snprintf(err, err_len, "invalid agent token trailer");
+        return false;
+    }
+    for (int i = 0; i < tokens->len; i++) {
+        if (tokens->v[i] < 0 || tokens->v[i] >= vocab_size) {
+            if (err && err_len)
+                snprintf(err, err_len, "agent token %d is outside the vocabulary", tokens->v[i]);
+            return false;
+        }
+    }
+    uint8_t head[AGENT_KV_TOKEN_HEADER];
+    ds4_kvstore_le_put32(head, AGENT_KV_TOKEN_MAGIC);
+    ds4_kvstore_le_put32(head + 4, AGENT_KV_TOKEN_VERSION);
+    ds4_kvstore_le_put32(head + 8, model_id);
+    ds4_kvstore_le_put32(head + 12, (uint32_t)tokens->len);
+    if (fwrite(head, 1, sizeof(head), fp) != sizeof(head)) {
+        if (err && err_len) snprintf(err, err_len, "%s", strerror(errno));
+        return false;
+    }
+    if (tokens->len) {
+        uint8_t *ids = xmalloc((size_t)tokens->len * 4u);
+        for (int i = 0; i < tokens->len; i++)
+            ds4_kvstore_le_put32(ids + (size_t)i * 4u, (uint32_t)tokens->v[i]);
+        const bool ok = fwrite(ids, 4, (size_t)tokens->len, fp) == (size_t)tokens->len;
+        const int saved_errno = errno;
+        free(ids);
+        if (!ok) {
+            if (err && err_len)
+                snprintf(err, err_len, "%s",
+                         saved_errno ? strerror(saved_errno) : "failed to write agent token trailer");
+            return false;
+        }
+    }
+    return true;
+}
+
+typedef enum {
+    AGENT_KV_TRAILER_PRESENT = 0,
+    AGENT_KV_TRAILER_ABSENT = 1,
+    AGENT_KV_TRAILER_CORRUPT = 2,
+} agent_kv_trailer_state;
+
+/* Read the token trailer that follows the text, payload and optional title.
+ * Returns ABSENT only when the trailer position is exactly EOF; a partial
+ * header or a short id array is CORRUPT and must not silently fall back to the
+ * legacy text rebuild.  The title reader restores the cursor to the payload
+ * start, so compute the trailer offset from the header and title length, then
+ * restore the payload cursor on every return. */
+static agent_kv_trailer_state agent_kv_read_token_trailer(
+        FILE *fp, const ds4_kvstore_entry *hdr, bool has_title,
+        ds4_tokens *tokens, int vocab_size, uint8_t expected_model_id,
+        char *err, size_t err_len) {
+    off_t payload_pos = ftello(fp);
+    if (payload_pos < 0) {
+        if (err && err_len) snprintf(err, err_len, "%s", strerror(errno));
+        return AGENT_KV_TRAILER_CORRUPT;
+    }
+    if (hdr->payload_bytes > (uint64_t)(LLONG_MAX - payload_pos)) {
+        if (err && err_len) snprintf(err, err_len, "agent token trailer offset overflow");
+        return AGENT_KV_TRAILER_CORRUPT;
+    }
+    off_t trailer_pos = payload_pos + (off_t)hdr->payload_bytes;
+    if (has_title) {
+        uint8_t tb[4];
+        if (fseeko(fp, trailer_pos, SEEK_SET) != 0 ||
+            fread(tb, 1, sizeof(tb), fp) != sizeof(tb)) {
+            if (err && err_len) snprintf(err, err_len, "agent session title trailer is truncated");
+            return AGENT_KV_TRAILER_CORRUPT;
+        }
+        const uint32_t title_bytes = ds4_kvstore_le_get32(tb);
+        if ((uint64_t)title_bytes > (uint64_t)(LLONG_MAX - trailer_pos - 4)) {
+            if (err && err_len) snprintf(err, err_len, "agent session title trailer is too large");
+            return AGENT_KV_TRAILER_CORRUPT;
+        }
+        trailer_pos += 4 + (off_t)title_bytes;
+    }
+    if (fseeko(fp, trailer_pos, SEEK_SET) != 0) {
+        if (err && err_len) snprintf(err, err_len, "%s", strerror(errno));
+        return AGENT_KV_TRAILER_CORRUPT;
+    }
+
+    /* Exactly EOF means a legacy file with a stale flag.  Any byte here means
+     * a trailer was started, so a short header/ids is corruption. */
+    const int first = fgetc(fp);
+    if (first == EOF) {
+        const bool absent = feof(fp) != 0;
+        if (!absent && err && err_len) snprintf(err, err_len, "%s", strerror(errno));
+        if (fseeko(fp, payload_pos, SEEK_SET) != 0) {
+            if (err && err_len) snprintf(err, err_len, "%s", strerror(errno));
+            return AGENT_KV_TRAILER_CORRUPT;
+        }
+        return absent ? AGENT_KV_TRAILER_ABSENT : AGENT_KV_TRAILER_CORRUPT;
+    }
+    if (ungetc(first, fp) == EOF) {
+        if (err && err_len) snprintf(err, err_len, "%s", strerror(errno));
+        fseeko(fp, payload_pos, SEEK_SET);
+        return AGENT_KV_TRAILER_CORRUPT;
+    }
+
+    agent_kv_trailer_state state = AGENT_KV_TRAILER_CORRUPT;
+    uint8_t head[AGENT_KV_TOKEN_HEADER];
+    if (fread(head, 1, sizeof(head), fp) != sizeof(head)) {
+        if (err && err_len) snprintf(err, err_len, "agent token trailer is truncated");
+        goto done;
+    }
+    const uint32_t magic = ds4_kvstore_le_get32(head);
+    const uint32_t version = ds4_kvstore_le_get32(head + 4);
+    const uint32_t model_id = ds4_kvstore_le_get32(head + 8);
+    const uint32_t count = ds4_kvstore_le_get32(head + 12);
+    if (magic != AGENT_KV_TOKEN_MAGIC || version != AGENT_KV_TOKEN_VERSION) {
+        if (err && err_len) snprintf(err, err_len, "agent token trailer is invalid");
+        goto done;
+    }
+    if (model_id != expected_model_id) {
+        if (err && err_len)
+            snprintf(err, err_len, "agent token trailer was written for a different model");
+        goto done;
+    }
+    if (count != hdr->tokens) {
+        if (err && err_len)
+            snprintf(err, err_len, "agent token trailer count does not match the header");
+        goto done;
+    }
+    if (count > (uint32_t)INT_MAX || vocab_size <= 0) {
+        if (err && err_len) snprintf(err, err_len, "agent token trailer is too large");
+        goto done;
+    }
+    tokens->len = 0;
+    if (count == 0) {
+        state = AGENT_KV_TRAILER_PRESENT;
+        goto done;
+    }
+
+    uint8_t *ids = xmalloc((size_t)count * 4u);
+    if (fread(ids, 4, count, fp) != count) {
+        free(ids);
+        if (err && err_len) snprintf(err, err_len, "agent token trailer is truncated");
+        goto done;
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        const uint32_t id = ds4_kvstore_le_get32(ids + (size_t)i * 4u);
+        if (id >= (uint32_t)vocab_size) {
+            free(ids);
+            if (err && err_len)
+                snprintf(err, err_len, "agent token trailer has an out-of-range token");
+            ds4_tokens_free(tokens);
+            goto done;
+        }
+        ds4_tokens_push(tokens, (int)id);
+    }
+    free(ids);
+    state = AGENT_KV_TRAILER_PRESENT;
+
+done:
+    if (fseeko(fp, payload_pos, SEEK_SET) != 0) {
+        if (err && err_len) snprintf(err, err_len, "%s", strerror(errno));
+        state = AGENT_KV_TRAILER_CORRUPT;
+    }
+    return state;
+}
+
 static void agent_kv_identity_sha(const ds4_kvstore_entry *hdr,
                                   const char *text, uint32_t text_bytes,
                                   const char *title,
@@ -4917,6 +5090,19 @@ static bool agent_kv_load_path(agent_worker *w, const char *path,
     bool has_title = ok && (hdr.ext_flags & DS4_KVSTORE_EXT_SESSION_TITLE);
     if (has_title)
         ok = agent_kv_read_title_trailer(fp, &hdr, &title, err, err_len);
+    ds4_tokens saved_tokens = {0};
+    /* A file stripped by an older agent keeps the AGENT_TOKENS flag but has
+     * no trailer.  The reader distinguishes exactly-EOF (legacy) from a
+     * partial/corrupt trailer. */
+    bool has_tokens = ok && (hdr.ext_flags & DS4_KVSTORE_EXT_AGENT_TOKENS);
+    if (has_tokens) {
+        const agent_kv_trailer_state state = agent_kv_read_token_trailer(
+            fp, &hdr, has_title, &saved_tokens,
+            ds4_engine_vocab_size(w->engine),
+            (uint8_t)ds4_engine_model_id(w->engine), err, err_len);
+        if (state == AGENT_KV_TRAILER_ABSENT) has_tokens = false;
+        else if (state == AGENT_KV_TRAILER_CORRUPT) ok = false;
+    }
     uint32_t expected_tokens = hdr.tokens;
     if (ok && hdr.payload_bytes != 0 &&
         hdr.model_id != (uint8_t)ds4_engine_model_id(w->engine))
@@ -4950,14 +5136,30 @@ static bool agent_kv_load_path(agent_worker *w, const char *path,
     char load_err[160] = {0};
     if (ok && agent_kv_payload_requires_rebuild(w, hdr.payload_bytes)) {
         /* A saved payload contains only the leader's graph state. Rebuild from
-         * rendered text under TP so session_sync mirrors the same token prefix
-         * to the worker before either rank resumes decoding. */
+         * the saved token ids under TP so session_sync mirrors the same token
+         * prefix to the worker before either rank resumes decoding.  Older
+         * files have no token trailer: keep the historical text rebuild, but
+         * only accept it when its count matches the header. */
         ds4_tokens rebuilt = {0};
-        ds4_tokenize_rendered_chat(w->engine, text, &rebuilt);
-        expected_tokens = (uint32_t)rebuilt.len;
-        if (agent_worker_sync_tokens(w, &rebuilt, true, err, err_len) != 0) {
-            ds4_session_invalidate(w->session);
-            ok = false;
+        if (has_tokens) {
+            ds4_tokens_copy(&rebuilt, &saved_tokens);
+        } else {
+            ds4_tokenize_rendered_chat(w->engine, text, &rebuilt);
+            if ((uint32_t)rebuilt.len != hdr.tokens) {
+                snprintf(err, err_len,
+                         "saved KV has no token trailer and the rebuilt prompt has "
+                         "%d tokens, expected %u",
+                         rebuilt.len, hdr.tokens);
+                ds4_session_invalidate(w->session);
+                ok = false;
+            }
+        }
+        if (ok) {
+            expected_tokens = (uint32_t)rebuilt.len;
+            if (agent_worker_sync_tokens(w, &rebuilt, true, err, err_len) != 0) {
+                ds4_session_invalidate(w->session);
+                ok = false;
+            }
         }
         ds4_tokens_free(&rebuilt);
     } else if (ok &&
@@ -4968,6 +5170,7 @@ static bool agent_kv_load_path(agent_worker *w, const char *path,
         ds4_session_invalidate(w->session);
         ok = false;
     }
+    ds4_tokens_free(&saved_tokens);
     fclose(fp);
 
     if (ok) {
@@ -5078,10 +5281,12 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
         return false;
     }
 
+    const uint8_t ext_flags =
+        (session_identity ? DS4_KVSTORE_EXT_SESSION_TITLE : 0) |
+        DS4_KVSTORE_EXT_AGENT_TOKENS;
     uint8_t h[DS4_KVSTORE_FIXED_HEADER];
     ds4_kvstore_fill_header(h, (uint8_t)model_id, (uint8_t)quant_bits,
-                            ds4_kvstore_reason_code(reason),
-                            session_identity ? DS4_KVSTORE_EXT_SESSION_TITLE : 0,
+                            ds4_kvstore_reason_code(reason), ext_flags,
                             (uint32_t)tokens->len, 0,
                             (uint32_t)ds4_session_ctx(w->session),
                             created_at, now, payload_bytes);
@@ -5097,6 +5302,9 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
               (!session_identity ||
                agent_kv_write_title_trailer(fp, session_title,
                                             save_err, sizeof(save_err))) &&
+              agent_kv_write_token_trailer(fp, tokens, (uint8_t)model_id,
+                                           ds4_engine_vocab_size(w->engine),
+                                           save_err, sizeof(save_err)) &&
               fflush(fp) == 0;
     int saved_errno = errno;
     if (fclose(fp) != 0) {
@@ -6443,9 +6651,22 @@ static bool agent_worker_strip_session(agent_worker *w, const char *prefix,
               agent_kv_read_text(fp, text_bytes, &text, err, err_len);
     if (ok && (hdr.ext_flags & DS4_KVSTORE_EXT_SESSION_TITLE))
         ok = agent_kv_read_title_trailer(fp, &hdr, &title, err, err_len);
+    ds4_tokens saved_tokens = {0};
+    agent_kv_trailer_state trailer_state = AGENT_KV_TRAILER_ABSENT;
+    if (ok && (hdr.ext_flags & DS4_KVSTORE_EXT_AGENT_TOKENS))
+        trailer_state = agent_kv_read_token_trailer(
+            fp, &hdr,
+            (hdr.ext_flags & DS4_KVSTORE_EXT_SESSION_TITLE) != 0,
+            &saved_tokens, ds4_engine_vocab_size(w->engine),
+            (uint8_t)ds4_engine_model_id(w->engine), err, err_len);
+    if (trailer_state == AGENT_KV_TRAILER_CORRUPT) ok = false;
+    const bool has_tokens = trailer_state == AGENT_KV_TRAILER_PRESENT;
+    const uint8_t stripped_ext_flags = has_tokens ? hdr.ext_flags :
+        (hdr.ext_flags & ~DS4_KVSTORE_EXT_AGENT_TOKENS);
     fclose(fp);
     if (!ok) {
         if (!err[0]) snprintf(err, err_len, "failed to read session");
+        ds4_tokens_free(&saved_tokens);
         free(title);
         free(text);
         free(path);
@@ -6462,10 +6683,9 @@ static bool agent_worker_strip_session(agent_worker *w, const char *prefix,
         return false;
     }
 
-    ds4_tokens stripped_tokens = {0};
-    ds4_tokenize_rendered_chat(w->engine, text, &stripped_tokens);
-    uint32_t stripped_token_count = (uint32_t)stripped_tokens.len;
-    ds4_tokens_free(&stripped_tokens);
+    /* The header already carries the saved token count.  Re-tokenizing the
+     * rendered text here would let a control-token spelling change the count. */
+    const uint32_t stripped_token_count = hdr.tokens;
 
     agent_buf tmpl = {0};
     agent_buf_puts(&tmpl, path);
@@ -6493,9 +6713,9 @@ static bool agent_worker_strip_session(agent_worker *w, const char *prefix,
 
     uint8_t h[DS4_KVSTORE_FIXED_HEADER];
     uint64_t now = (uint64_t)time(NULL);
-    ds4_kvstore_fill_header(h, hdr.model_id, hdr.quant_bits, hdr.reason, hdr.ext_flags,
-                            stripped_token_count, hdr.hits, hdr.ctx_size,
-                            hdr.created_at, now, 0);
+    ds4_kvstore_fill_header(h, hdr.model_id, hdr.quant_bits, hdr.reason,
+                            stripped_ext_flags, stripped_token_count, hdr.hits,
+                            hdr.ctx_size, hdr.created_at, now, 0);
     uint8_t tb[4];
     ds4_kvstore_le_put32(tb, text_bytes);
 
@@ -6505,6 +6725,10 @@ static bool agent_worker_strip_session(agent_worker *w, const char *prefix,
          fwrite(text, 1, text_bytes, fp) == text_bytes &&
          (!(hdr.ext_flags & DS4_KVSTORE_EXT_SESSION_TITLE) ||
           agent_kv_write_title_trailer(fp, title, err, err_len)) &&
+         (!has_tokens ||
+          agent_kv_write_token_trailer(fp, &saved_tokens, hdr.model_id,
+                                       ds4_engine_vocab_size(w->engine),
+                                       err, err_len)) &&
          fflush(fp) == 0;
     int saved_errno = errno;
     if (fclose(fp) != 0) {
@@ -6515,6 +6739,7 @@ static bool agent_worker_strip_session(agent_worker *w, const char *prefix,
         saved_errno = errno;
         ok = false;
     }
+    ds4_tokens_free(&saved_tokens);
     if (!ok) {
         snprintf(err, err_len, "%s",
                  saved_errno ? strerror(saved_errno) : "failed to write stripped session");
