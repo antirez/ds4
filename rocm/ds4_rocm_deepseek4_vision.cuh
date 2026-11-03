@@ -236,7 +236,12 @@ extern "C" int ds4_gpu_attention_visual_mixed_batch_heads_tensor(
     if (!cuda_ok(cudaGetLastError(), "visual attention KV pack launch"))
         return 0;
 
-    const float alpha = rsqrtf((float)head_dim);
+    /* HIP declares rsqrtf() as __device__ only, so this host-side call does not
+     * compile with ROCm (it does with CUDA). alpha is a host float handed to
+     * cublasSgemmStridedBatched by pointer, so it has to be computed on the host:
+     * 1/sqrt(d) is equivalent and, being exact rather than an approximation,
+     * never less precise. */
+    const float alpha = 1.0f / sqrtf((float)head_dim);
     const float beta = 0.0f;
     cublasStatus_t status = cublasSgemmStridedBatched(
             g_cublas, CUBLAS_OP_T, CUBLAS_OP_N,
