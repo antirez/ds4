@@ -24131,7 +24131,7 @@ static bool metal_graph_ported_m5_decode_feature_enabled(
          (pre_m5_disable_env && getenv(pre_m5_disable_env) != NULL))) {
         return false;
     }
-    return pre_m5 || ds4_gpu_device_is_m5_or_m6_apple_silicon();
+    return pre_m5 || ds4_gpu_device_is_m5_apple_silicon();
 #else
     (void)pre_m5_disable_env;
     (void)m5_disable_env;
@@ -24176,7 +24176,7 @@ static bool metal_graph_hc_expand_fusion_eligible(const ds4_gpu_graph *g,
            !g->quality && !g->ssd_streaming && !g->ssd_streaming_cold &&
            !decode_stage_profile &&
            metal_graph_debug_get_config()->prefix == NULL &&
-           ds4_gpu_device_is_m5_or_m6_apple_silicon() &&
+           ds4_gpu_device_is_m5_apple_silicon() &&
            getenv("DS4_METAL_DISABLE_HC_EXPAND_PRODUCER_FUSE") == NULL;
 #else
     (void)g; (void)decode_stage_profile;
@@ -24209,7 +24209,7 @@ static bool metal_graph_encode_decode_layer_phase(
     const bool fuse_attn_inv_rope =
         getenv("DS4_METAL_DISABLE_PRE_M5_ATTN_INV_ROPE_FUSE") == NULL &&
         (ds4_gpu_device_is_pre_m5_apple_silicon() ||
-         ds4_gpu_device_is_m5_or_m6_apple_silicon()) &&
+         ds4_gpu_device_is_m5_apple_silicon()) &&
         ds4_gpu_decode_attn_rope_fuse_available() != 0;
     /* The backend's consumed flag is process-global and remains true after a
      * gathered-attention layer. Track whether this layer actually armed the
@@ -24420,7 +24420,7 @@ static bool metal_graph_encode_decode_layer_phase(
             !metal_graph_use_reference_hc_decode() &&
             getenv("DS4_METAL_DISABLE_PRE_M5_HC_NORM_MIX_FUSE") == NULL &&
             (ds4_gpu_device_is_pre_m5_apple_silicon() ||
-             ds4_gpu_device_is_m5_or_m6_apple_silicon()) &&
+             ds4_gpu_device_is_m5_apple_silicon()) &&
             ds4_gpu_hc_rms_norm_mix_f16_available() != 0;
         if (ok && fuse_hc_norm && !g->hc_expand_pending) {
             const int fused = metal_graph_hc_pre_f32_fused(
@@ -24805,7 +24805,7 @@ static bool metal_graph_encode_decode_layer_phase(
                 phase == METAL_DECODE_LAYER_FULL &&
                 getenv("DS4_METAL_DISABLE_PRE_M5_QKV_NORM_KV_STORE_FUSE") == NULL &&
                 (ds4_gpu_device_is_pre_m5_apple_silicon() ||
-                 ds4_gpu_device_is_m5_or_m6_apple_silicon()) &&
+                 ds4_gpu_device_is_m5_apple_silicon()) &&
                 ds4_gpu_kv_rope_fp8_fuse_available() != 0) {
 #if defined(__APPLE__)
                 {
@@ -25036,7 +25036,7 @@ static bool metal_graph_encode_decode_layer_phase(
             !metal_graph_use_reference_compressor_pair_proj() &&
             getenv("DS4_METAL_DISABLE_PRE_M5_COMPRESSOR_QUAD_STORE") == NULL &&
             (ds4_gpu_device_is_pre_m5_apple_silicon() ||
-             ds4_gpu_device_is_m5_or_m6_apple_silicon()) &&
+             ds4_gpu_device_is_m5_apple_silicon()) &&
             layer->indexer_compressor_kv && layer->indexer_compressor_gate &&
             layer->indexer_compressor_ape &&
             layer->indexer_compressor_kv->type == DS4_TENSOR_F16 &&
@@ -26060,7 +26060,7 @@ static bool metal_graph_encode_decode_layer_phase(
             !metal_graph_use_reference_hc_decode() &&
             getenv("DS4_METAL_DISABLE_PRE_M5_HC_NORM_MIX_FUSE") == NULL &&
             (ds4_gpu_device_is_pre_m5_apple_silicon() ||
-             ds4_gpu_device_is_m5_or_m6_apple_silicon()) &&
+             ds4_gpu_device_is_m5_apple_silicon()) &&
             ds4_gpu_hc_rms_norm_mix_f16_available() != 0;
         if (ok && fuse_hc_norm && !g->hc_expand_pending) {
             const int fused = metal_graph_hc_pre_f32_fused(
@@ -26243,13 +26243,13 @@ static bool metal_graph_encode_decode_layer_phase(
             (!ds4_gpu_device_is_pre_m5_apple_silicon() ||
              getenv("DS4_METAL_DISABLE_PRE_M5_ROUTER_SHARED_FUSE") == NULL) &&
             (ds4_gpu_device_is_pre_m5_apple_silicon() ||
-             ds4_gpu_device_is_m5_or_m6_apple_silicon())) {
+             ds4_gpu_device_is_m5_apple_silicon())) {
 #if defined(__APPLE__)
             const bool fuse_router_project_select =
                 parallel_full_ffn_eligible &&
                 layer->ffn_gate_tid2eid == NULL &&
                 getenv("DS4_METAL_DISABLE_M5_ROUTER_PROJECT_SELECT_FUSE") == NULL &&
-                ds4_gpu_device_is_m5_or_m6_apple_silicon();
+                ds4_gpu_device_is_m5_apple_silicon();
             if (fuse_router_project_select) {
                 const int fused =
                     ds4_gpu_router_project_select_fused_tensor(
@@ -26316,7 +26316,7 @@ static bool metal_graph_encode_decode_layer_phase(
             layer->ffn_gate_tid2eid == NULL &&
             !metal_graph_tp_ablate("router") &&
             getenv("DS4_METAL_DISABLE_M5_ROUTER_PROJECT_SELECT_FUSE") == NULL &&
-            ds4_gpu_device_is_m5_or_m6_apple_silicon()) {
+            ds4_gpu_device_is_m5_apple_silicon()) {
             const int fused = ds4_gpu_router_project_select_fused_tensor(
                     metal_graph_router_logits(g),
                     metal_graph_router_probs(g),
@@ -27207,7 +27207,7 @@ static bool metal_graph_encode_decode_layer_phase(
 #if defined(__APPLE__)
         ok && tp_split_shared &&
         getenv("DS4_METAL_DISABLE_M5_TP_PARALLEL_FFN") == NULL &&
-        ds4_gpu_device_is_m5_or_m6_apple_silicon() &&
+        ds4_gpu_device_is_m5_apple_silicon() &&
         !g->quality && !g->ssd_streaming && !g->ssd_streaming_cold &&
         !decode_stage_profile && !keep_ffn_out &&
         !metal_graph_directional_steering_ffn_enabled(g) &&
@@ -33641,7 +33641,7 @@ static bool metal_graph_encode_layer_ffn_batch(
     const bool tp_batched_backend = true;
 #else
     const bool tp_batched_backend =
-        ds4_gpu_device_is_m5_or_m6_apple_silicon() &&
+        ds4_gpu_device_is_m5_apple_silicon() &&
         getenv("DS4_METAL_DISABLE_TP_BATCH_MOE") == NULL;
 #endif
     const bool tp_batched_moe = tp_split_batch_moe && !g->quality && !g->ssd_streaming &&
@@ -56967,7 +56967,7 @@ static bool glm_graph_forward_indexed_tokens(
             if (n_tokens <= 8u && (glm_decode_ablate_mask() & DS4_GLM_ABLATE_ATTN_OUT)) { /* ablate */ } else
             if (tp_attn_head_split &&
                 !g->quality &&
-                ds4_gpu_device_is_m5_or_m6_apple_silicon() &&
+                ds4_gpu_device_is_m5_apple_silicon() &&
                 n_tokens >= 32u) {
                 const uint64_t k_cnt = g->heads_dim / 2u;
                 const uint32_t sliced_rows = n_tokens & ~31u;
@@ -63190,7 +63190,7 @@ static bool ds4_engine_dspark_seed_batch_enabled(const ds4_engine *e,
      * existing schedule. No sampling decision is changed by this dispatch. */
     return e->backend == DS4_BACKEND_METAL && !e->ssd_streaming &&
            !e->dspark_exact_sampling &&
-           ds4_gpu_device_is_m5_or_m6_apple_silicon() &&
+           ds4_gpu_device_is_m5_apple_silicon() &&
            layer->ffn_gate_exps && layer->ffn_down_exps &&
            ((layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
              layer->ffn_down_exps->type == DS4_TENSOR_Q2_K) ||
