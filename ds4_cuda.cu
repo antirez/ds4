@@ -21148,7 +21148,7 @@ extern "C" int ds4_gpu_directional_steering_project_tensor(
 
     uint32_t nth = 256u;
     while (nth > width && nth > 1u) nth >>= 1;
-    directional_steering_project_kernel<<<rows, nth>>>(
+    directional_steering_project_kernel<<<rows, nth, 0, cuda_decode_stream()>>>(
             (float *)x->ptr,
             (const float *)directions->ptr,
             layer,

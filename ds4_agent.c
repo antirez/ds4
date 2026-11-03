@@ -954,6 +954,9 @@ static agent_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--dir-steering-attn")) {
             c.engine.directional_steering_attn = parse_float_range(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
             steering_scale_set = true;
+        } else if (!strcmp(arg, "--dir-steering-resid")) {
+            c.engine.directional_steering_resid = parse_float_range(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
+            steering_scale_set = true;
         } else {
             fprintf(stderr, "ds4-agent: unknown option: %s\n", arg);
             usage(stderr, NULL);

@@ -119,6 +119,8 @@ decode rows; CUDA network TP currently serves sessions in order.
 [DSpark](SPECULATIVE_DECODING.md#deepseek-v41-flash-dspark) uses a
 separate V4.1 support GGUF and currently requires one host. Pipeline execution
 is not implemented for V4.1; vision needs Metal or CUDA (not ROCm).
+[Directional steering](../dir-steering/README.md#deepseek-v41-flash) needs
+Metal or CUDA on one host.
 
 Scalar, batched and tensor-parallel execution are not numerically identical.
 Q4 batched prefill shows a small probability-score loss on the short official
