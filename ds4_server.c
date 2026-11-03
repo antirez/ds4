@@ -11485,6 +11485,54 @@ static int kv_cache_try_load(server *s, server_slot *slot, const request *req,
                                   req && req->api == API_RESPONSES);
 }
 
+/* Tokens a disk hit could restore for this prompt, found without loading
+ * anything: the same lookup kv_cache_try_load() makes (the longest stored
+ * transcript that is a byte prefix of the prompt text).  Multimodal requests
+ * never take the disk path -- payloads carry no image identity -- so they
+ * report 0.  Caller holds kv_mu. */
+static int kv_cache_disk_best_tokens_locked(kv_disk_cache *kc,
+                                            const char *prompt_text,
+                                            bool multimodal, int model_id,
+                                            int quant_bits, int ctx_size) {
+    if (!kc || !kc->enabled || multimodal || !prompt_text) return 0;
+    if (!ds4_kvstore_quant_bits_supported(quant_bits)) return 0;
+    const int i = ds4_kvstore_find_text_prefix(kc, prompt_text, model_id,
+                                               quant_bits, ctx_size);
+    return i >= 0 ? (int)kc->entry[i].tokens : 0;
+}
+
+/* A live token prefix is materialized without consulting the disk, because
+ * the disk path runs only on a full live miss.  That is right when the live
+ * prefix is most of the prompt, and wrong when the slot holds only a short
+ * stub of it while the disk holds a checkpoint covering far more.  The disk
+ * can only win by more than min_tokens when the prompt extends the live
+ * prefix by more than that, so ordinary continuation turns (a short new
+ * suffix) never pay for the lookup. */
+static bool live_reuse_could_lose_to_disk(int live_tokens, int prompt_tokens,
+                                          int min_tokens) {
+    return prompt_tokens > live_tokens + min_tokens;
+}
+
+static bool live_reuse_yields_to_disk(int live_tokens, int disk_tokens,
+                                      int min_tokens) {
+    return disk_tokens > live_tokens + min_tokens;
+}
+
+static int kv_cache_disk_best_tokens(server *s, server_slot *slot,
+                                     const request *req) {
+    if (!s || !slot || !req || !s->kv.enabled) return 0;
+    const int model_id = ds4_engine_model_id(s->engine);
+    const int quant_bits = ds4_engine_routed_quant_bits(s->engine);
+    const int ctx_size = ds4_session_ctx(slot->session);
+    pthread_mutex_lock(&s->kv_mu);
+    const int best = kv_cache_disk_best_tokens_locked(&s->kv, req->prompt_text,
+                                                      req->image_count != 0,
+                                                      model_id, quant_bits,
+                                                      ctx_size);
+    pthread_mutex_unlock(&s->kv_mu);
+    return best;
+}
+
 /* A text-only suffix tokenizer would turn image markers into literal text.
  * Keep the exact live tokens and splice each new image's already-built token
  * block into the suffix. Historical image positions follow the live frontier,
@@ -11974,6 +12022,13 @@ static int live_prefix_rewind_target(bool backend_can_rewind,
     if (!backend_can_rewind || prompt_len <= 1 || prompt_len >= old_pos) return -1;
     if (common != prompt_len) return -1;
     return prompt_len - 1;
+}
+
+/* True when rewinding a live session of old_pos tokens to rewind_to keeps
+ * less than half of it and the session is large enough to be cached. */
+static bool live_rewind_discards_session(int old_pos, int rewind_to,
+                                         int min_tokens) {
+    return old_pos >= min_tokens && rewind_to >= 0 && rewind_to < old_pos / 2;
 }
 
 static void trace_time(FILE *fp) {
@@ -13533,6 +13588,18 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         prompt_for_sync = &effective_prompt;
         break;
     case REUSE_MEMORY_REWIND: {
+        /* A rewind that throws away most of the live session is an eviction
+         * in all but name, but the evict store runs only on a full miss, so
+         * a short prompt that is a prefix of a long conversation (a retry
+         * from an early turn) destroyed that conversation unsaved.  Persist
+         * it first.  Ordinary regenerations rewind only a short tail and
+         * keep the prefix live; storing the whole session for those would
+         * be churn, hence the half-session threshold. */
+        if (s->kv.enabled &&
+            live_rewind_discards_session(old_pos, reuse.reuse_tokens,
+                                         s->kv.opt.min_tokens)) {
+            kv_cache_store_current(s, slot, "evict");
+        }
         pthread_mutex_lock(&s->inference_mu);
         ds4_session_rewind(slot->session, reuse.reuse_tokens);
         /* Rewinding mutates the session, so re-validate before trusting the
@@ -13564,6 +13631,27 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         break;
     }
     case REUSE_MEMORY_TOKEN:
+        /* A slot holding a short stub of this prompt (a short chat turn whose
+         * conversation was later extended elsewhere, or restarted) matches it
+         * as a token prefix, cached becomes the stub length, and the disk path
+         * -- which runs only when cached == 0 -- never looks, so a prompt the
+         * disk could restore almost entirely is re-prefilled.  Ask the disk
+         * first; if it can restore materially more, treat this as a live miss
+         * (the stub is below min_tokens or is stored by the evict path). */
+        if (live_reuse_could_lose_to_disk(reuse.reuse_tokens,
+                                          j->req.prompt.len,
+                                          s->kv.opt.min_tokens)) {
+            const int disk = kv_cache_disk_best_tokens(s, slot, &j->req);
+            if (live_reuse_yields_to_disk(reuse.reuse_tokens, disk,
+                                          s->kv.opt.min_tokens)) {
+                server_log(DS4_LOG_KVCACHE,
+                           "ds4-server: live token prefix %d skipped; disk cache offers %d tokens",
+                           reuse.reuse_tokens, disk);
+                cached = 0;
+                cache_source = "none";
+                break;
+            }
+        }
         live_materialized = true;
         cache_source = "memory-token";
         break;
@@ -21218,6 +21306,14 @@ static void test_live_prefix_rewind_target(void) {
     TEST_ASSERT(live_prefix_rewind_target(true, 17, 8, 7) == -1);
     TEST_ASSERT(live_prefix_rewind_target(true, 8, 8, 8) == -1);
     TEST_ASSERT(live_prefix_rewind_target(true, 17, 1, 1) == -1);
+
+    /* A retry from an early turn discards most of a long session: persist
+     * it.  A regeneration that drops only the tail does not. */
+    TEST_ASSERT(live_rewind_discards_session(5738, 27, 512));
+    TEST_ASSERT(!live_rewind_discards_session(49826, 48378, 512));
+    TEST_ASSERT(!live_rewind_discards_session(400, 10, 512));
+    TEST_ASSERT(!live_rewind_discards_session(5738, -1, 512));
+    TEST_ASSERT(!live_rewind_discards_session(5738, 2869, 512));
 }
 
 static void test_client_socket_nonblocking_flag(void) {
@@ -21821,6 +21917,56 @@ static void test_kv_cache_lookup_uses_longest_text_prefix(void) {
     unlink(long_path);
     free(short_path);
     free(long_path);
+    rmdir(dir);
+}
+
+static void test_live_token_stub_yields_to_disk(void) {
+    char tmpl[] = "/tmp/ds4-kv-stub-vs-disk-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *stored = "system header, user: long document";
+    test_kv_text_stub_file(dir, stored, KV_REASON_COLD, 4096, 0);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    const int min_tokens = kc.opt.min_tokens;
+    const char *prompt = "system header, user: long document, then more";
+
+    /* The probe-free lookup reports what kv_cache_try_load() would restore. */
+    TEST_ASSERT(kv_cache_disk_best_tokens_locked(&kc, prompt, false, 0, 2, 32768) == 4096);
+    TEST_ASSERT(kv_cache_disk_best_tokens_locked(&kc, "system header, user: other",
+                                                 false, 0, 2, 32768) == 0);
+    /* Multimodal requests never take the disk path, so offer nothing. */
+    TEST_ASSERT(kv_cache_disk_best_tokens_locked(&kc, prompt, true, 0, 2, 32768) == 0);
+    TEST_ASSERT(kv_cache_disk_best_tokens_locked(&kc, prompt, false, 0, 3, 32768) == 0);
+    TEST_ASSERT(kv_cache_disk_best_tokens_locked(&kc, NULL, false, 0, 2, 32768) == 0);
+
+    /* A 30-token live stub of a 5,726-token prompt asks the disk and loses
+     * to a 4,096-token checkpoint; an ordinary continuation turn (live
+     * prefix covering all but a short suffix) never asks. */
+    TEST_ASSERT(live_reuse_could_lose_to_disk(30, 5726, min_tokens));
+    TEST_ASSERT(live_reuse_yields_to_disk(30, 4096, min_tokens));
+    TEST_ASSERT(!live_reuse_could_lose_to_disk(5700, 5726, min_tokens));
+    TEST_ASSERT(!live_reuse_yields_to_disk(30, 0, min_tokens));
+    TEST_ASSERT(!live_reuse_yields_to_disk(4000, 4096, min_tokens));
+    TEST_ASSERT(!live_reuse_yields_to_disk(30, 30 + min_tokens, min_tokens));
+
+    kc.enabled = false;
+    TEST_ASSERT(kv_cache_disk_best_tokens_locked(&kc, prompt, false, 0, 2, 32768) == 0);
+    kc.enabled = true;
+
+    kv_cache_close(&kc);
+    char sha[41];
+    sha1_bytes_hex(stored, strlen(stored), sha);
+    char name[44];
+    snprintf(name, sizeof(name), "%.40s.kv", sha);
+    char *path = path_join(dir, name);
+    unlink(path);
+    free(path);
     rmdir(dir);
 }
 
@@ -23175,6 +23321,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_file_size_must_fit_budget();
     test_sha1_bytes_hex_matches_known_vector();
     test_kv_cache_lookup_uses_longest_text_prefix();
+    test_live_token_stub_yields_to_disk();
     test_kv_cache_lookup_rejects_wrong_model();
     test_kv_cache_lookup_rejects_stale_payload_abi();
     test_kv_cache_eviction_values_fresh_snapshots();
