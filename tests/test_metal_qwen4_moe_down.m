@@ -51,6 +51,16 @@ static NSString *between(NSString *s, NSString *begin, NSString *end) {
     if (b.location<=NSMaxRange(a)) fail(@"invalid source range");
     return [s substringWithRange:NSMakeRange(a.location,b.location-a.location)];
 }
+/* Production kernel definitions close at the start of a line. Copy each
+ * tested entry point independently of any intervening kernels. */
+static NSString *kernel_source(NSString *source, NSString *signature) {
+    NSRange start = [source rangeOfString:signature];
+    if (start.location == NSNotFound) fail(@"production kernel signature missing");
+    NSRange rest = NSMakeRange(NSMaxRange(start), source.length - NSMaxRange(start));
+    NSRange end = [source rangeOfString:@"\n}\n" options:0 range:rest];
+    if (end.location == NSNotFound) fail(@"production kernel definition incomplete");
+    return [source substringWithRange:NSMakeRange(start.location, NSMaxRange(end) - start.location)];
+}
 static NSString *production_source(NSString *repo, NSString *override) {
     NSString *q=read_source(override ?: [repo stringByAppendingPathComponent:@"metal/qwen4.metal"]);
     NSString *m=read_source([repo stringByAppendingPathComponent:@"metal/moe.metal"]);
@@ -59,7 +69,8 @@ static NSString *production_source(NSString *repo, NSString *override) {
     [s appendString:between(m,@"static constant uchar ds4_metal_ksigns_iq2xs[128]",@"#define kmask_iq2xs")];
     [s appendString:between(q,@"constant bool qwen4_expert_addresses ",@"/* --- small multi-output GEMV")];
     [s appendString:between(q,@"constant uint qwen4_mv_type ",@"/* mid[t][s][r] =")];
-    [s appendString:between(q,@"/* part[t][s][r] = down_row",@"/* MXFP4 routed down rows")];
+    [s appendString:kernel_source(q, @"kernel void kernel_qwen4_moe_down(")];
+    [s appendString:kernel_source(q, @"kernel void kernel_qwen4_moe_down_q2k(")];
     return s;
 }
 static uint64_t source_hash(NSString *s) {

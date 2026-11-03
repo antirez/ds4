@@ -2836,9 +2836,12 @@ static inline float qwen4_row_dot(device const char *row, device const float *x,
             const float dmin = (float)(*(device const half *)(blk + 82));
             const uint sc = blk[group];
             const float ds = d * (float)(sc & 0xFu), dm = dmin * (float)(sc >> 4);
-            /* the 8 quant bytes are 4-byte aligned (84-byte blocks) */
-            device const uint *qw = (device const uint *)(blk + 16 + q_base + l);
-            const uint q0 = qw[0] >> shift, q1 = qw[1] >> shift;
+            /* Q2_K requires half-aligned scales. A sliced row can start
+             * two bytes into a word, so read its codes with packed alignment. */
+            device const packed_uchar4 *qw =
+                (device const packed_uchar4 *)(blk + 16 + q_base + l);
+            const uint q0 = as_type<uint>(uchar4(qw[0])) >> shift;
+            const uint q1 = as_type<uint>(uchar4(qw[1])) >> shift;
             device const float *y = x + ib * 256 + group * 16 + l;
             for (uint i = 0; i < 4; i++) acc += (ds * (float)((q0 >> (8u * i)) & 3u) - dm) * y[i];
             for (uint i = 0; i < 4; i++) acc += (ds * (float)((q1 >> (8u * i)) & 3u) - dm) * y[4 + i];
