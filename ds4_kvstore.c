@@ -676,6 +676,25 @@ bool ds4_kvstore_byte_prefix_match(const char *text, size_t text_len,
            (prefix_len == 0 || memcmp(text, prefix, prefix_len) == 0);
 }
 
+size_t ds4_kvstore_text_suffix_offset(const char *cached_text, const char *prompt_text,
+                                      size_t prefix_bytes, uint8_t ext_flags,
+                                      const ds4_tokens *exact_prefix,
+                                      int eos_token, bool is_qwen) {
+    /* Old Qwen tool-visible keys omitted EOS even when the exact payload had
+     * already committed it. Skip only that duplicated incoming boundary. Keys
+     * and payloads without committed EOS retain their original suffix. */
+    const char *end = "</tool_call>", *eos = "<|im_end|>";
+    if (!is_qwen || !(ext_flags & DS4_KVSTORE_EXT_THINKING_VISIBLE) ||
+        !exact_prefix || exact_prefix->len <= 0 || eos_token < 0 ||
+        exact_prefix->v[exact_prefix->len - 1] != eos_token ||
+        strncmp(prompt_text + prefix_bytes, eos, strlen(eos))) return prefix_bytes;
+    size_t n = prefix_bytes;
+    while (n && isspace((unsigned char)cached_text[n - 1])) n--;
+    if (n >= strlen(end) && !memcmp(cached_text + n - strlen(end), end, strlen(end)))
+        return prefix_bytes + strlen(eos);
+    return prefix_bytes;
+}
+
 void ds4_kvstore_tokens_copy_prefix(ds4_tokens *dst, const ds4_tokens *src, int n) {
     dst->len = 0;
     if (!src) return;
@@ -1290,8 +1309,11 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
                  * the exact token history stored in the payload.  Build the
                  * prompt from that exact history and tokenize only the text
                  * suffix after the byte prefix. */
+                size_t suffix_off = ds4_kvstore_text_suffix_offset(
+                    cached_text, prompt_text, text_bytes, hdr.ext_flags,
+                    loaded_tokens, ds4_token_eos(engine), ds4_engine_is_qwen4(engine));
                 ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
-                    engine, loaded_tokens, prompt_text + text_bytes,
+                    engine, loaded_tokens, prompt_text + suffix_off,
                     effective_prompt);
             }
             if (hooks && hooks->load && (hdr.ext_flags & hooks->ext_flag)) {

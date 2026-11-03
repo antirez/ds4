@@ -1116,6 +1116,37 @@ void *raxFind(rax *rax, unsigned char *s, size_t len) {
     return raxGetData(h);
 }
 
+/* Call match for every stored key that is a prefix of s, shortest first.
+ * Walk only the matching path, including terminal keys before compressed
+ * edges and inline leaves. No allocations. The callback must not mutate the
+ * tree; returning zero stops the walk and makes this function return zero. */
+int raxFindPrefixes(rax *rt, const unsigned char *s, size_t len,
+                    int (*match)(void *data, size_t len, void *arg), void *arg) {
+    raxNode *h = rt->head;
+    size_t i = 0;
+    for (;;) {
+        if (h->iskey && !match(raxGetData(h),i,arg)) return 0;
+        if (!h->size || i == len) return 1;
+        size_t j = 0;
+        if (h->iscompr) {
+            if (h->size > len-i || memcmp(h->data,s+i,h->size)) return 1;
+            i += h->size;
+        } else {
+            unsigned char *edge = memchr(h->data,s[i],h->size);
+            if (!edge) return 1;
+            j = edge-h->data;
+            i++;
+        }
+        raxNode **child = raxNodeFirstChildPtr(h)+j;
+        if (raxIsInlineLeaf(h,j)) {
+            void *data;
+            memcpy(&data,child,sizeof(data));
+            return match(data,i,arg) != 0;
+        }
+        memcpy(&h,child,sizeof(h));
+    }
+}
+
 /* Return the memory address where the 'parent' node stores the specified
  * 'child' pointer, so that the caller can update the pointer with another
  * one if needed. The function assumes it will find a match, otherwise the

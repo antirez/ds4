@@ -682,6 +682,11 @@ typedef enum {
 #define DS41_PARAM_START "<｜DSML｜ parameter"
 #define DS41_PARAM_END "</｜DSML｜ parameter>"
 
+/* Qwen3.8 Flash Next and GLM both emit their tool calls inside this pair, so the
+ * renderers and the checkpoint marker scanner share one definition per marker. */
+#define QWEN_TOOL_CALL_START "<tool_call>"
+#define QWEN_TOOL_CALL_END "</tool_call>"
+
 static void random_tool_id(char *dst, size_t dstlen, api_style api) {
     static uint64_t fallback_ctr;
     unsigned char bytes[16];
@@ -3004,14 +3009,14 @@ static void append_glm_tool_calls_text(buf *b, const tool_calls *calls,
         const tool_call *tc = &calls->v[i];
         const tool_schema_order *order =
             tool_schema_orders_find(tool_orders, tc->name);
-        buf_puts(b, "<tool_call>");
+        buf_puts(b, QWEN_TOOL_CALL_START);
         buf_puts(b, tc->name ? tc->name : "");
         if (!append_glm_arguments_from_json(b, tc->arguments, order)) {
             buf_puts(b, "<arg_key>arguments</arg_key><arg_value>");
             append_glm_arg_value_text(b, tc->arguments);
             buf_puts(b, "</arg_value>");
         }
-        buf_puts(b, "</tool_call>");
+        buf_puts(b, QWEN_TOOL_CALL_END);
     }
 }
 
@@ -3027,8 +3032,9 @@ static void append_qwen_tool_calls_text(buf *b, const tool_calls *calls, bool ha
     for (int i = 0; i < calls->len; i++) {
         const tool_call *tc = &calls->v[i];
         const tool_schema_order *order = tool_schema_orders_find(tool_orders, tc->name);
-        if (i == 0) buf_puts(b, has_content ? "\n\n<tool_call>\n<function=" : "<tool_call>\n<function=");
-        else buf_puts(b, "\n<tool_call>\n<function=");
+        if (i == 0) buf_puts(b, has_content ? "\n\n" QWEN_TOOL_CALL_START "\n<function="
+                                        : QWEN_TOOL_CALL_START "\n<function=");
+        else buf_puts(b, "\n" QWEN_TOOL_CALL_START "\n<function=");
         buf_puts(b, tc->name ? tc->name : "");
         buf_puts(b, ">\n");
         json_args args = {0};
@@ -3064,7 +3070,7 @@ static void append_qwen_tool_calls_text(buf *b, const tool_calls *calls, bool ha
             append_glm_tag_body_text(b, tc->arguments, "</parameter>");
             buf_puts(b, "\n</parameter>\n");
         }
-        buf_puts(b, "</function>\n</tool_call>");
+        buf_puts(b, "</function>\n" QWEN_TOOL_CALL_END);
     }
 }
 
@@ -3397,9 +3403,7 @@ static char *render_deepseek41_chat_ordered(const chat_msgs *msgs, int start,
         const chat_msg *m = &msgs->v[i];
         if (role_is_user_like(m->role) || (i > 0 && role_is_system(m->role))) last_user = i;
     }
-    if (live_tail) {
-        buf_puts(&out, "<｜end▁of▁sentence｜>");
-    } else {
+    if (!live_tail) {
         buf_puts(&out, "<｜begin▁of▁sentence｜>");
         if (effort || (tool_schemas && tool_schemas[0])) {
             buf_puts(&out, "<｜System｜>");
@@ -3753,7 +3757,10 @@ done:
  * the assistant call here would duplicate it and destroy cache alignment, so
  * this function starts at the first new item and emits only:
  *
- *   previous EOS, tool results, and the next assistant prefix.
+ *   tool results, and the next assistant prefix.
+ *
+ * The previous EOS is not emitted here: the live session already ends with it,
+ * because generate_job_inner() evaluates the turn's end token into the live KV.
  *
  * This is intentionally independent from req.prompt's already-tokenized suffix:
  * suffix tokenization happens later after the cache decision, using the live
@@ -3763,7 +3770,6 @@ static char *render_deepseek_live_tool_tail(const chat_msgs *msgs, int start,
                                             ds4_think_mode think_mode) {
     const bool think = ds4_think_mode_enabled(think_mode);
     buf out = {0};
-    buf_puts(&out, "<｜end▁of▁sentence｜>");
 
     bool pending_assistant = false;
     bool pending_tool_result = false;
@@ -3849,13 +3855,15 @@ static char *render_glm_live_tool_tail(const chat_msgs *msgs, int start,
     return buf_take(&out);
 }
 
-/* Continue a live session after the model's tool-call turn: its <|im_end|>
- * was the stop token and is not in the KV yet. */
+/* Continue a live session after the model's tool-call turn.  The turn's
+ * <|im_end|> is already the last token of the live session (generate_job_inner()
+ * evaluates it), so the tail starts at the newline that follows it.  Emitting
+ * the end marker here as well would double it. */
 static char *render_qwen_live_tool_tail(const chat_msgs *msgs, int start,
                                         const tool_schema_orders *tool_orders,
                                         ds4_think_mode think_mode) {
     buf out = {0};
-    buf_puts(&out, "<|im_end|>\n");
+    buf_puts(&out, "\n");
     append_qwen_conversation(&out, msgs, start, tool_orders, ds4_think_mode_enabled(think_mode));
     return buf_take(&out);
 }
@@ -3880,6 +3888,31 @@ static DS4_SERVER_MAYBE_UNUSED char *render_live_tool_tail(
         ds4_think_mode think_mode) {
     return render_live_tool_tail_for_syntax(SERVER_MODEL_SYNTAX_DEEPSEEK,
                                             msgs, start, NULL, think_mode);
+}
+
+/* True when render_chat_prompt_text() closes an assistant turn with the model's
+ * end token, so a live session must keep that token to remain an exact token
+ * prefix of the client's replay.  GLM closes assistant messages without one. */
+static bool live_kv_renders_end_token(server_model_syntax syntax) {
+    return syntax != SERVER_MODEL_SYNTAX_GLM;
+}
+
+/* True when the turn that just finished is replayed by the client as a closed
+ * assistant message, i.e. when the renderer's end token belongs in the live KV.
+ * A tool-call turn stops as soon as </tool_call> is parsed and never samples the
+ * token; a stop-token turn sampled it but never fed it back.  A client stop
+ * sequence and an output/context limit close nothing the client can replay. */
+static bool live_kv_turn_needs_end_token(const char *finish, int stop_token,
+                                         int end_token) {
+    if (finish && !strcmp(finish, "tool_calls")) return true;
+    return finish && !strcmp(finish, "stop") && stop_token >= 0 &&
+           end_token >= 0 && stop_token == end_token;
+}
+
+static bool live_kv_boundary_ready(server_model_syntax syntax, bool end_committed) {
+    /* Every published closed-turn key includes EOS for these renderers, even
+     * when parsing promotes a partial decode into a recovered tool call. */
+    return !live_kv_renders_end_token(syntax) || end_committed;
 }
 
 static char *render_request_live_tool_tail(server *s, const request *r,
@@ -5865,7 +5898,7 @@ static const char *find_any_tool_start(const char *s) {
         strstr(s, DS4_TOOL_CALLS_START),
         strstr(s, DS4_TOOL_CALLS_START_SHORT),
         strstr(s, "<tool_calls>"),
-        strstr(s, "<tool_call>"),
+        strstr(s, QWEN_TOOL_CALL_START),
     };
     for (size_t i = 0; i < sizeof(candidates)/sizeof(candidates[0]); i++) {
         if (candidates[i] && (!best || candidates[i] < best)) best = candidates[i];
@@ -5880,7 +5913,7 @@ static const char *find_any_tool_end(const char *s) {
         strstr(s, DS4_TOOL_CALLS_END),
         strstr(s, DS4_TOOL_CALLS_END_SHORT),
         strstr(s, "</tool_calls>"),
-        strstr(s, "</tool_call>"),
+        strstr(s, QWEN_TOOL_CALL_END),
     };
     for (size_t i = 0; i < sizeof(candidates)/sizeof(candidates[0]); i++) {
         if (candidates[i] && (!best || candidates[i] < best)) best = candidates[i];
@@ -9920,13 +9953,15 @@ typedef enum {
 
 typedef struct tool_memory_entry tool_memory_entry;
 
-typedef struct {
+typedef struct tool_memory_block {
     char *dsml;
     size_t len;
+    size_t leading;
     size_t bytes;
     int refs;
     uint64_t seen;
     tool_memory_entry *entries;
+    struct tool_memory_block *same_body_next;
 } tool_memory_block;
 
 struct tool_memory_entry {
@@ -10335,12 +10370,23 @@ static void tool_block_unlink_entry(tool_memory_block *b, tool_memory_entry *e) 
     }
 }
 
+static size_t tool_memory_leading_ws(const char *text, size_t len) {
+    size_t n = 0;
+    while (n < len && isspace((unsigned char)text[n])) n++;
+    return n;
+}
+
 static tool_memory_block *tool_memory_find_block_locked(tool_memory *m,
                                                         const char *dsml,
                                                         size_t len) {
     if (!m->by_block || !dsml || len == 0) return NULL;
-    void *v = raxFind(m->by_block, (unsigned char *)dsml, len);
-    return v == raxNotFound ? NULL : v;
+    size_t leading = tool_memory_leading_ws(dsml, len);
+    void *v = raxFind(m->by_block, (unsigned char *)dsml + leading, len - leading);
+    if (v == raxNotFound) return NULL;
+    for (tool_memory_block *b = v; b; b = b->same_body_next) {
+        if (b->leading == leading && !memcmp(b->dsml, dsml, leading)) return b;
+    }
+    return NULL;
 }
 
 static tool_memory_block *tool_memory_get_block_locked(tool_memory *m,
@@ -10353,8 +10399,16 @@ static tool_memory_block *tool_memory_get_block_locked(tool_memory *m,
     memset(b, 0, sizeof(*b));
     b->dsml = xstrndup(dsml, len);
     b->len = len;
+    b->leading = tool_memory_leading_ws(dsml, len);
     b->bytes = len + 1 + sizeof(*b);
-    if (!raxInsert(m->by_block, (unsigned char *)b->dsml, b->len, b, NULL)) {
+    unsigned char *body = (unsigned char *)b->dsml + b->leading;
+    size_t body_len = b->len - b->leading;
+    void *v = raxFind(m->by_block, body, body_len);
+    if (v != raxNotFound) {
+        tool_memory_block *head = v;
+        b->same_body_next = head->same_body_next;
+        head->same_body_next = b;
+    } else if (!raxInsert(m->by_block, body, body_len, b, NULL)) {
         free(b->dsml);
         free(b);
         die("out of memory");
@@ -10367,8 +10421,20 @@ static void tool_memory_release_block_locked(tool_memory *m, tool_memory_block *
     if (!b) return;
     if (--b->refs > 0) return;
     if (m->by_block) {
-        void *old = NULL;
-        (void)raxRemove(m->by_block, (unsigned char *)b->dsml, b->len, &old);
+        unsigned char *body = (unsigned char *)b->dsml + b->leading;
+        size_t body_len = b->len - b->leading;
+        tool_memory_block *head = raxFind(m->by_block, body, body_len);
+        if (head == b) {
+            if (b->same_body_next) {
+                /* Replacing an existing non-NULL value does not allocate. */
+                raxInsert(m->by_block, body, body_len, b->same_body_next, NULL);
+            } else {
+                raxRemove(m->by_block, body, body_len, NULL);
+            }
+        } else {
+            while (head->same_body_next != b) head = head->same_body_next;
+            head->same_body_next = b->same_body_next;
+        }
     }
     if (m->bytes >= b->bytes) m->bytes -= b->bytes;
     else m->bytes = 0;
@@ -10925,69 +10991,60 @@ static char *path_join(const char *dir, const char *name) {
 
 
 
-static const char *find_next_dsml_tool_block(const char *p, const char **end_out) {
-    struct block_form {
-        const char *start;
-        const char *end;
-    } forms[] = {
-        {"\n\n" DS41_TOOL_CALLS_START, DS41_TOOL_CALLS_END},
-        {DS41_TOOL_CALLS_START, DS41_TOOL_CALLS_END},
-        {"\n\n" DS4_TOOL_CALLS_START, DS4_TOOL_CALLS_END},
-        {DS4_TOOL_CALLS_START, DS4_TOOL_CALLS_END},
-        {"\n\n" DS4_TOOL_CALLS_START_SHORT, DS4_TOOL_CALLS_END_SHORT},
-        {DS4_TOOL_CALLS_START_SHORT, DS4_TOOL_CALLS_END_SHORT},
-        {"\n\n<tool_calls>", "</tool_calls>"},
-        {"<tool_calls>", "</tool_calls>"},
-    };
+typedef struct {
+    uint64_t scan, bytes;
+    uint32_t count;
+    const char *text, *start;
+} kv_tool_map_selection;
 
-    const char *best = NULL;
-    const char *best_end = NULL;
-    for (size_t i = 0; i < sizeof(forms) / sizeof(forms[0]); i++) {
-        const char *s = strstr(p, forms[i].start);
-        if (!s || (best && s >= best)) continue;
-        const char *e = strstr(s, forms[i].end);
-        if (!e) continue;
-        best = s;
-        best_end = e + strlen(forms[i].end);
+static int kv_tool_map_select_block(void *data, size_t len, void *arg) {
+    (void)len;
+    tool_memory_block *head = data;
+    kv_tool_map_selection *sel = arg;
+    const char *body = head->dsml + head->leading;
+    if (find_any_tool_start(body) != body) return 1;
+    for (tool_memory_block *b = head; b; b = b->same_body_next) {
+        if (b->seen == sel->scan || b->leading > (size_t)(sel->start - sel->text)) continue;
+        if (memcmp(sel->start - b->leading, b->dsml, b->leading)) continue;
+        b->seen = sel->scan;
+        for (tool_memory_entry *e = b->entries; e; e = e->block_next) {
+            size_t id_len = strlen(e->id);
+            if (id_len > UINT32_MAX || b->len > UINT32_MAX) continue;
+            if (sel->count == UINT32_MAX ||
+                UINT64_MAX - sel->bytes < 8u ||
+                UINT64_MAX - sel->bytes - 8u < (uint64_t)id_len ||
+                UINT64_MAX - sel->bytes - 8u - (uint64_t)id_len < (uint64_t)b->len)
+                return 0;
+            sel->count++;
+            sel->bytes += 8u + (uint64_t)id_len + (uint64_t)b->len;
+        }
     }
-    if (end_out) *end_out = best_end;
-    return best;
+    return 1;
 }
-
 
 static bool kv_tool_map_measure_locked(server *s, const char *text,
                                        uint32_t *count_out,
                                        uint64_t *bytes_out) {
-    uint32_t count = 0;
-    uint64_t bytes = KV_TOOL_MAP_HEADER;
-    uint64_t scan = ++s->tool_mem.scan_clock;
-    const char *p = text;
-    for (;;) {
-        const char *end = NULL;
-        const char *start = find_next_dsml_tool_block(p, &end);
-        if (!start || !end) break;
-        tool_memory_block *b =
-            tool_memory_find_block_locked(&s->tool_mem, start, (size_t)(end - start));
-        if (b && b->seen != scan) {
-            b->seen = scan;
-            for (tool_memory_entry *e = b->entries; e; e = e->block_next) {
-                size_t id_len = strlen(e->id);
-                size_t dsml_len = b->len;
-                if (id_len > UINT32_MAX || dsml_len > UINT32_MAX) continue;
-                if (count == UINT32_MAX) return false;
-                if (UINT64_MAX - bytes < 8u ||
-                    UINT64_MAX - bytes - 8u < (uint64_t)id_len ||
-                    UINT64_MAX - bytes - 8u - (uint64_t)id_len < (uint64_t)dsml_len)
-                    return false;
-                count++;
-                bytes += 8u + (uint64_t)id_len + (uint64_t)dsml_len;
-            }
+    kv_tool_map_selection sel = {
+        .scan = ++s->tool_mem.scan_clock, .bytes = KV_TOOL_MAP_HEADER, .text = text
+    };
+    if (s->tool_mem.by_block && raxSize(s->tool_mem.by_block)) {
+        size_t text_len = strlen(text);
+        /* The trie indexes bodies without leading whitespace, but each variant
+         * keeps its exact bytes/identity. Probe only '<', then verify the leading
+         * bytes once per match; long blank runs cannot cause quadratic rescans.
+         * Scan inside matches too: literal/outer tags must not hide other ids.
+         * ponytail: overlapping long tool bodies still cost O(markers * prefix);
+         * use streaming multi-pattern matching if that workload matters. */
+        for (const char *p = strchr(text, '<'); p; p = strchr(p + 1, '<')) {
+            sel.start = p;
+            if (!raxFindPrefixes(s->tool_mem.by_block, (const unsigned char *)p,
+                                 text_len - (size_t)(p - text),
+                                 kv_tool_map_select_block, &sel)) return false;
         }
-        p = end;
     }
-    if (count == 0) bytes = 0;
-    if (count_out) *count_out = count;
-    if (bytes_out) *bytes_out = bytes;
+    if (count_out) *count_out = sel.count;
+    if (bytes_out) *bytes_out = sel.count ? sel.bytes : 0;
     return true;
 }
 
@@ -11028,29 +11085,20 @@ static bool kv_tool_map_write(server *s, FILE *fp, const char *text,
     le_put32(h + 4, count);
     ok = fwrite(h, 1, sizeof(h), fp) == sizeof(h);
 
-    uint64_t scan = ++s->tool_mem.scan_clock;
-    const char *p = text;
-    for (;;) {
-        const char *end = NULL;
-        const char *start = find_next_dsml_tool_block(p, &end);
-        if (!start || !end || !ok) break;
-        tool_memory_block *b =
-            tool_memory_find_block_locked(&s->tool_mem, start, (size_t)(end - start));
-        if (b && b->seen != scan) {
-            b->seen = scan;
-            for (tool_memory_entry *e = b->entries; ok && e; e = e->block_next) {
-                size_t id_len = strlen(e->id);
-                size_t dsml_len = b->len;
-                if (id_len > UINT32_MAX || dsml_len > UINT32_MAX) continue;
-                uint8_t lens[8];
-                le_put32(lens, (uint32_t)id_len);
-                le_put32(lens + 4, (uint32_t)dsml_len);
-                ok = fwrite(lens, 1, sizeof(lens), fp) == sizeof(lens) &&
-                     fwrite(e->id, 1, id_len, fp) == id_len &&
-                     fwrite(b->dsml, 1, dsml_len, fp) == dsml_len;
-            }
-        }
-        p = end;
+    /* Reuse the measured selection under the same lock. Every id occurs once
+     * in this list, including multiple ids sharing a whole sampled sequence. */
+    uint64_t scan = s->tool_mem.scan_clock;
+    for (tool_memory_entry *e = s->tool_mem.head; ok && e; e = e->next) {
+        tool_memory_block *b = e->block;
+        if (b->seen != scan) continue;
+        size_t id_len = strlen(e->id), dsml_len = b->len;
+        if (id_len > UINT32_MAX || dsml_len > UINT32_MAX) continue;
+        uint8_t lens[8];
+        le_put32(lens, (uint32_t)id_len);
+        le_put32(lens + 4, (uint32_t)dsml_len);
+        ok = fwrite(lens, 1, sizeof(lens), fp) == sizeof(lens) &&
+             fwrite(e->id, 1, id_len, fp) == id_len &&
+             fwrite(b->dsml, 1, dsml_len, fp) == dsml_len;
     }
     pthread_mutex_unlock(&s->tool_mu);
 
@@ -12948,8 +12996,8 @@ static void remember_thinking_checkpoint(server *s, server_slot *slot,
 }
 
 /* Match clients that omit reasoning, while keeping the exact sampled KV.
- * Tool decoding stops at </tool_call>, BEFORE the assistant end token. Leave
- * <|im_end|> out of the visible key so the next suffix actually evaluates it. */
+ * Post-decode commits EOS even for tool turns. Include it in the visible key
+ * so the next request appends only the new turn, not a second assistant EOS. */
 static char *build_qwen_tool_turn_visible_text(const request *r,
                                                const char *finish,
                                                bool inside_thinking,
@@ -12967,7 +13015,7 @@ static char *build_qwen_tool_turn_visible_text(const request *r,
     char *suffix = build_qwen_assistant_suffix(r, content, NULL, false, calls);
     buf visible = {0};
     buf_puts(&visible, r->prompt_text);
-    buf_append(&visible, suffix, strlen(suffix) - strlen("<|im_end|>"));
+    buf_puts(&visible, suffix);
     free(suffix);
     return buf_take(&visible);
 }
@@ -14290,6 +14338,29 @@ decode_again:
     }
     server_generation_leave(s);
 
+    /* The client replays this assistant turn and render_chat_prompt_text()
+     * closes it with the model's end token.  Without that token in the live KV
+     * the next request's exact token prefix diverges at the turn boundary, so
+     * the exact-prefix tier fails and the request is served from the visible
+     * tiers or, when those no longer match either, from disk checkpoints or a
+     * full re-prefill of the conversation.  One decode step here costs a
+     * sampling interval; omitting it costs a re-prefill of everything after the
+     * last checkpoint that still matches. */
+    const int turn_end_token = ds4_token_eos(s->engine);
+    bool turn_end_committed = false;
+    if (live_kv_renders_end_token(j->req.model_syntax) &&
+        live_kv_turn_needs_end_token(finish, stop_token, turn_end_token) &&
+        !g_stop_requested && !job_cancelled(j))
+    {
+        turn_end_committed = server_eval_token(s, slot, turn_end_token, err, sizeof(err)) == 0;
+        if (!turn_end_committed)
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: turn end token not kept in live KV: %s",
+                       err[0] ? err : "decode failed");
+    }
+    bool frontier_ready = live_kv_boundary_ready(j->req.model_syntax, turn_end_committed) &&
+                          ds4_session_checkpoint_valid(slot->session);
+
     if (job_cancelled(j)) {
         request_live_state_clear(s, slot);
         trace_event(s, trace_id, "cancelled during generation after %d tokens", completion);
@@ -14572,7 +14643,7 @@ decode_again:
                  parsed_reasoning, &parsed_calls, now_sec() - t0);
 
     if (j->req.api == API_RESPONSES) {
-        if (strcmp(final_finish, "error") && strcmp(final_finish, "length")) {
+        if (frontier_ready && strcmp(final_finish, "error") && strcmp(final_finish, "length")) {
             /* Store the post-turn visible transcript plus the live token
              * frontier.  The next Responses request may replay only this
              * visible surface, while the real session also contains hidden
@@ -14594,7 +14665,7 @@ decode_again:
         }
     }
     if (j->req.api == API_ANTHROPIC) {
-        if (parsed_calls.len && strcmp(final_finish, "error") &&
+        if (frontier_ready && parsed_calls.len && strcmp(final_finish, "error") &&
             strcmp(final_finish, "length"))
         {
             anthropic_live_remember(s, slot, &parsed_calls);
@@ -14603,9 +14674,13 @@ decode_again:
         }
     }
 
-    if (j->req.kind == REQ_CHAT && parsed_calls.len &&
-        j->req.api != API_RESPONSES &&
-        should_canonicalize_tool_checkpoint(s, &parsed_calls))
+    /* Never publish a post-EOS mapping when that step failed or was skipped.
+     * Sampled ids/text remain remembered independently of frontier shortcuts. */
+    if (!frontier_ready) {
+        thinking_live_clear(s, slot);
+    } else if (j->req.kind == REQ_CHAT && parsed_calls.len &&
+               j->req.api != API_RESPONSES &&
+               should_canonicalize_tool_checkpoint(s, &parsed_calls))
     {
         /* Chat/completions has no protocol object that binds the next request
          * to this live KV state.  Canonicalize only the fallback tool-call
@@ -18577,11 +18652,14 @@ static void test_qwen_tool_visible_checkpoint_boundary(void) {
             char *next = render_qwen_chat_prompt_text(&msgs, NULL, NULL, r.think_mode);
             TEST_ASSERT(visible && !strncmp(next, visible, strlen(visible)));
             if (visible && !strncmp(next, visible, strlen(visible))) {
-                /* The live frontier ends at the sampled tool block. The new
-                 * suffix must supply exactly the missing assistant boundary. */
+                /* EOS is already committed to live KV. The visible key must
+                 * consume it, so appending this suffix cannot duplicate EOS. */
                 const char *tail = next + strlen(visible);
-                const char *boundary = "<|im_end|>\n<|im_start|>user\n<tool_response>";
+                const char *boundary = "\n<|im_start|>user\n<tool_response>";
                 TEST_ASSERT(!strncmp(tail, boundary, strlen(boundary)));
+                const char *end = "</tool_call><|im_end|>";
+                TEST_ASSERT(strlen(visible) >= strlen(end));
+                TEST_ASSERT(!strcmp(visible + strlen(visible) - strlen(end), end));
             }
             if (thinking) {
                 msgs.v[1].reasoning = xstrdup("hidden reasoning");
@@ -18638,10 +18716,21 @@ static void test_render_qwen_tool_round_trip(void) {
     char *tail = render_live_tool_tail_for_syntax(
         SERVER_MODEL_SYNTAX_QWEN, &msgs, 2, &orders, DS4_THINK_NONE);
     TEST_ASSERT(tail != NULL);
+    /* The turn's <|im_end|> is the last token of the live session, so the tail
+     * continues at the newline after it instead of re-emitting the marker. */
     TEST_ASSERT(!strcmp(tail,
-        "<|im_end|>\n<|im_start|>user\n<tool_response>\nhi\n</tool_response>\n<tool_response>\nsecond\n</tool_response><|im_end|>\n"
+        "\n<|im_start|>user\n<tool_response>\nhi\n</tool_response>\n<tool_response>\nsecond\n</tool_response><|im_end|>\n"
         "<|im_start|>assistant\n<think>\n\n</think>\n\n"));
     free(tail);
+
+    /* Same invariant for the DeepSeek syntax: its live tail opens with the
+     * tool results, not with the end token that is already in the live KV. */
+    char *ds_tail = render_live_tool_tail_for_syntax(
+        SERVER_MODEL_SYNTAX_DEEPSEEK, &msgs, 2, NULL, DS4_THINK_NONE);
+    const char *ds_end = "<｜end▁of▁sentence｜>";
+    TEST_ASSERT(ds_tail != NULL);
+    TEST_ASSERT(strncmp(ds_tail, ds_end, strlen(ds_end)) != 0);
+    free(ds_tail);
     tool_schema_orders_free(&orders);
     chat_msgs_free(&msgs);
 }
@@ -18862,6 +18951,58 @@ static void test_qwen_thinking_visible_text_matches_render(void) {
     }
 }
 
+static void test_legacy_qwen_tool_visible_boundary(void) {
+    const char *legacy = "prompt</tool_call>";
+    const char *next = "prompt</tool_call><|im_end|>\n<|im_start|>user";
+    size_t n = strlen(legacy);
+    int ids[] = {123, 456};
+    ds4_tokens committed = {.v = ids, .len = 2};
+    TEST_ASSERT(ds4_kvstore_text_suffix_offset(
+        legacy, next, n, KV_EXT_THINKING_VISIBLE, &committed, 456, true) == n + 10);
+    /* Old payloads without EOS still need the incoming boundary. */
+    committed.len = 1;
+    TEST_ASSERT(ds4_kvstore_text_suffix_offset(
+        legacy, next, n, KV_EXT_THINKING_VISIBLE, &committed, 456, true) == n);
+    committed.len = 2;
+    TEST_ASSERT(ds4_kvstore_text_suffix_offset(
+        legacy, next, n, 0, &committed, 456, true) == n);
+    TEST_ASSERT(ds4_kvstore_text_suffix_offset(
+        legacy, next, n, KV_EXT_THINKING_VISIBLE, &committed, 456, false) == n);
+    TEST_ASSERT(ds4_kvstore_text_suffix_offset(
+        legacy, "prompt</tool_call>other", n,
+        KV_EXT_THINKING_VISIBLE, &committed, 456, true) == n);
+    const char *current = "prompt</tool_call><|im_end|>";
+    TEST_ASSERT(ds4_kvstore_text_suffix_offset(
+        current, "prompt</tool_call><|im_end|>\nnext", strlen(current),
+        KV_EXT_THINKING_VISIBLE, &committed, 456, true) == strlen(current));
+    const char *spaces = "prompt</tool_call>\n \t";
+    TEST_ASSERT(ds4_kvstore_text_suffix_offset(
+        spaces, "prompt</tool_call>\n \t<|im_end|>\nnext", strlen(spaces),
+        KV_EXT_THINKING_VISIBLE, &committed, 456, true) == strlen(spaces) + 10);
+}
+
+static void test_live_kv_keeps_replayed_turn_end_token(void) {
+    /* A replayed assistant turn must end with the same end token the renderer
+     * writes, or the next request's exact token prefix diverges there. */
+    const int end = 248046;
+    TEST_ASSERT(!live_kv_boundary_ready(SERVER_MODEL_SYNTAX_QWEN, false));
+    TEST_ASSERT(live_kv_boundary_ready(SERVER_MODEL_SYNTAX_QWEN, true));
+    TEST_ASSERT(live_kv_boundary_ready(SERVER_MODEL_SYNTAX_GLM, false));
+    TEST_ASSERT(live_kv_turn_needs_end_token("tool_calls", -1, end));
+    TEST_ASSERT(live_kv_turn_needs_end_token("stop", end, end));
+    /* Thinking control markers and client stop sequences are not the marker. */
+    TEST_ASSERT(!live_kv_turn_needs_end_token("stop", end - 1, end));
+    TEST_ASSERT(!live_kv_turn_needs_end_token("stop", -1, end));
+    TEST_ASSERT(!live_kv_turn_needs_end_token("length", end, end));
+    TEST_ASSERT(!live_kv_turn_needs_end_token("error", -1, end));
+    TEST_ASSERT(!live_kv_turn_needs_end_token(NULL, end, end));
+    /* GLM renders no end token after an assistant message. */
+    TEST_ASSERT(live_kv_renders_end_token(SERVER_MODEL_SYNTAX_QWEN));
+    TEST_ASSERT(live_kv_renders_end_token(SERVER_MODEL_SYNTAX_DEEPSEEK));
+    TEST_ASSERT(live_kv_renders_end_token(SERVER_MODEL_SYNTAX_DEEPSEEK41));
+    TEST_ASSERT(!live_kv_renders_end_token(SERVER_MODEL_SYNTAX_GLM));
+}
+
 static void test_qwen_checkpoint_suffix_matches_render(void) {
     /* prompt_text + checkpoint suffix must equal what the next request renders */
     request r;
@@ -18903,6 +19044,13 @@ static void test_qwen_checkpoint_suffix_matches_render(void) {
     TEST_ASSERT(next && live.ptr && !strncmp(next, live.ptr, live.len));
     TEST_ASSERT(!strcmp(next + live.len, "\n<|im_start|>user\n<tool_response>\na.txt\n</tool_response><|im_end|>\n"
                                          "<|im_start|>assistant\n<think>\n"));
+    /* The live tool tail is exactly that continuation: the checkpoint suffix
+     * ends with <|im_end|> because the live session now ends with it. */
+    char *tail = render_live_tool_tail_for_syntax(
+        SERVER_MODEL_SYNTAX_QWEN, &msgs, 2, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(tail != NULL);
+    TEST_ASSERT(!strcmp(tail, next + live.len));
+    free(tail);
     buf_free(&live);
     free(next);
     free(suffix);
@@ -20150,9 +20298,11 @@ static void test_anthropic_live_tail_renders_tool_results_only(void) {
     TEST_ASSERT(r.anthropic_live_call_ids.len == 1);
     TEST_ASSERT(!strcmp(r.anthropic_live_call_ids.v[0], "toolu_live"));
     TEST_ASSERT(r.anthropic_live_suffix_text != NULL);
+    /* The previous turn's end token is already the last token of the live KV,
+     * so the tail starts at the tool results instead of re-emitting it. */
     TEST_ASSERT(!strncmp(r.anthropic_live_suffix_text,
-                         "<｜end▁of▁sentence｜><｜User｜><tool_result>",
-                         strlen("<｜end▁of▁sentence｜><｜User｜><tool_result>")));
+                         "<｜User｜><tool_result>",
+                         strlen("<｜User｜><tool_result>")));
     TEST_ASSERT(strstr(r.anthropic_live_suffix_text, "/tmp</tool_result>") != NULL);
     TEST_ASSERT(strstr(r.anthropic_live_suffix_text, "<｜Assistant｜><think>") != NULL);
     TEST_ASSERT(strstr(r.anthropic_live_suffix_text, "Bash") == NULL);
@@ -20330,9 +20480,11 @@ static void test_responses_live_tail_renders_tool_outputs_only(void) {
     TEST_ASSERT(r.responses_live_call_ids.len == 1);
     TEST_ASSERT(!strcmp(r.responses_live_call_ids.v[0], "call_live"));
     TEST_ASSERT(r.responses_live_suffix_text != NULL);
+    /* The previous turn's end token is already the last token of the live KV,
+     * so the tail starts at the tool results instead of re-emitting it. */
     TEST_ASSERT(!strncmp(r.responses_live_suffix_text,
-                         "<｜end▁of▁sentence｜><｜User｜><tool_result>",
-                         strlen("<｜end▁of▁sentence｜><｜User｜><tool_result>")));
+                         "<｜User｜><tool_result>",
+                         strlen("<｜User｜><tool_result>")));
     TEST_ASSERT(strstr(r.responses_live_suffix_text, "/tmp</tool_result>") != NULL);
     TEST_ASSERT(strstr(r.responses_live_suffix_text, "<｜Assistant｜><think>") != NULL);
     TEST_ASSERT(strstr(r.responses_live_suffix_text, "exec_command") == NULL);
@@ -22032,6 +22184,433 @@ static void test_kv_tool_map_restores_before_prompt_render(void) {
     rmdir(dir);
 }
 
+/* Trailer eligibility must cover every supported tool syntax. */
+typedef struct {
+    size_t len[4];
+    void *data[4];
+    int count, limit;
+} rax_prefix_test;
+
+static int test_collect_rax_prefix(void *data, size_t len, void *arg) {
+    rax_prefix_test *seen = arg;
+    TEST_ASSERT(seen->count < 4);
+    if (seen->count < 4) {
+        seen->len[seen->count] = len;
+        seen->data[seen->count++] = data;
+    }
+    return !seen->limit || seen->count < seen->limit;
+}
+
+static void test_rax_prefix_walk_for_tool_map(void) {
+    rax *rt = raxNew();
+    TEST_ASSERT(rt != NULL);
+    if (!rt) return;
+    TEST_ASSERT(raxInsert(rt, (unsigned char *)"", 0, NULL, NULL));
+    TEST_ASSERT(raxInsert(rt, (unsigned char *)"a", 1, (void *)1, NULL));
+    TEST_ASSERT(raxInsert(rt, (unsigned char *)"abc", 3, (void *)3, NULL));
+    TEST_ASSERT(raxInsert(rt, (unsigned char *)"abd", 3, (void *)4, NULL));
+    rax_prefix_test seen = {0};
+    TEST_ASSERT(raxFindPrefixes(rt, (const unsigned char *)"abcTAIL", 7,
+                                test_collect_rax_prefix, &seen));
+    TEST_ASSERT(seen.count == 3 && seen.len[0] == 0 && seen.data[0] == NULL);
+    TEST_ASSERT(seen.len[1] == 1 && seen.data[1] == (void *)1);
+    TEST_ASSERT(seen.len[2] == 3 && seen.data[2] == (void *)3);
+    seen = (rax_prefix_test){.limit = 1};
+    TEST_ASSERT(!raxFindPrefixes(rt, (const unsigned char *)"abcTAIL", 7,
+                                 test_collect_rax_prefix, &seen));
+    TEST_ASSERT(seen.count == 1);
+    /* Exercise compressed edges split at the 16-bit node-size boundary. */
+    char *long_key = xmalloc(100001);
+    memset(long_key, 'x', 100000);
+    long_key[100000] = '\0';
+    TEST_ASSERT(raxInsert(rt, (unsigned char *)long_key, 100000, (void *)5, NULL));
+    TEST_ASSERT(raxInsert(rt, (unsigned char *)long_key, 1000, (void *)6, NULL));
+    seen = (rax_prefix_test){0};
+    TEST_ASSERT(raxFindPrefixes(rt, (unsigned char *)long_key, 100000,
+                                test_collect_rax_prefix, &seen));
+    TEST_ASSERT(seen.count == 3 && seen.len[1] == 1000 && seen.len[2] == 100000);
+    seen = (rax_prefix_test){0};
+    TEST_ASSERT(raxFindPrefixes(rt, (unsigned char *)long_key, 999,
+                                test_collect_rax_prefix, &seen));
+    TEST_ASSERT(seen.count == 1);
+    free(long_key);
+    raxFree(rt);
+}
+
+static void test_kv_tool_map_measures_qwen_tool_call_text(void) {
+    const char *qwen =
+        "\n\n" QWEN_TOOL_CALL_START "\n<function=bash>\n"
+        "<parameter=command>\necho qwen\n</parameter>\n"
+        "</function>\n" QWEN_TOOL_CALL_END;
+    const char *glm =
+        QWEN_TOOL_CALL_START "get_weather<arg_key>city</arg_key>"
+        "<arg_value>Paris</arg_value>" QWEN_TOOL_CALL_END;
+    const char *plural = "\n\n<tool_calls>\n{\"name\":\"bash\"}\n</tool_calls>";
+    const char *ds4 = "\n\n" DS4_TOOL_CALLS_START "\n" DS4_TOOL_CALLS_END;
+    const char *ds41 = "\n\n" DS41_TOOL_CALLS_START "\n" DS41_TOOL_CALLS_END;
+    const char *blockless = "no tool blocks in this text";
+
+    server src = {0};
+    pthread_mutex_init(&src.tool_mu, NULL);
+    tool_memory_put(&src, "call_qwen", qwen);
+    tool_memory_put(&src, "call_glm", glm);
+    tool_memory_put(&src, "call_plural", plural);
+    tool_memory_put(&src, "call_ds4", ds4);
+    tool_memory_put(&src, "call_ds41", ds41);
+
+    const struct { const char *what; const char *text; } cases[] = {
+        {"qwen <tool_call>", qwen},
+        {"glm <tool_call>", glm},
+        {"plural <tool_calls>", plural},
+        {"ds4 dsml", ds4},
+        {"ds41 dsml", ds41},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        uint64_t bytes = 0;
+        TEST_ASSERT(kv_tool_map_serialized_size(&src, cases[i].text, &bytes));
+        TEST_ASSERT(bytes > 0);
+    }
+    uint64_t zero = 1;
+    TEST_ASSERT(kv_tool_map_serialized_size(&src, blockless, &zero));
+    TEST_ASSERT(zero == 0);
+
+    /* The singular and plural forms are distinct; preserve legacy trailers. */
+    FILE *fp = tmpfile();
+    TEST_ASSERT(fp != NULL);
+    uint64_t written = 0;
+    TEST_ASSERT(kv_tool_map_write(&src, fp, plural, &written));
+    TEST_ASSERT(written > 0);
+    rewind(fp);
+    server dst = {0};
+    pthread_mutex_init(&dst.tool_mu, NULL);
+    TEST_ASSERT(kv_tool_map_load_from_pos(&dst, fp, NULL) == 1);
+    chat_msgs msgs = {0};
+    chat_msg a = {0};
+    a.role = xstrdup("assistant");
+    tool_call tc = {.id = xstrdup("call_plural"), .name = xstrdup("bash"),
+                    .arguments = xstrdup("{}")};
+    tool_calls_push(&a.calls, tc);
+    chat_msgs_push(&msgs, a);
+    tool_replay_stats stats = {0};
+    tool_memory_attach_to_messages(&dst, &msgs, &stats);
+    TEST_ASSERT(stats.disk == 1);
+    TEST_ASSERT(msgs.v[0].calls.raw_tool_text != NULL);
+    TEST_ASSERT(!strcmp(msgs.v[0].calls.raw_tool_text, plural));
+
+    chat_msgs_free(&msgs);
+    if (fp) fclose(fp);
+
+    tool_memory_free(&src.tool_mem);
+    tool_memory_free(&dst.tool_mem);
+    pthread_mutex_destroy(&src.tool_mu);
+    pthread_mutex_destroy(&dst.tool_mu);
+}
+
+static void test_kv_tool_map_whitespace_variants(void) {
+    const char *body = "<tool_call>\n<function=bash>\n<parameter=command>\necho stable\n"
+                       "</parameter>\n</function>\n</tool_call>";
+    const char *leading[] = {"", "\n", "\n\n", " \n"};
+    server src = {0}, dst = {0};
+    pthread_mutex_init(&src.tool_mu, NULL);
+    pthread_mutex_init(&dst.tool_mu, NULL);
+    chat_msgs msgs = {0};
+    for (int i = 0; i < 4; i++) {
+        buf generated = {0};
+        buf_puts(&generated, leading[i]);
+        buf_puts(&generated, body);
+        char *text = buf_take(&generated), *content = NULL, *reasoning = NULL;
+        tool_calls calls = {0};
+        TEST_ASSERT(parse_generated_message_ex_for_syntax(
+            SERVER_MODEL_SYNTAX_QWEN, text, false, &content, &reasoning, &calls));
+        TEST_ASSERT(calls.len == 1);
+        assign_tool_call_ids(&src, &calls, API_OPENAI);
+        tool_memory_remember(&src, &calls);
+        free(calls.raw_tool_text);
+        calls.raw_tool_text = NULL;
+        chat_msg a = {.role = xstrdup("assistant"), .calls = calls};
+        chat_msgs_push(&msgs, a);
+        free(content); free(reasoning); free(text);
+    }
+    buf checkpoint = {0};
+    buf_puts(&checkpoint, "\n\n");
+    buf_puts(&checkpoint, body);
+    char *text = buf_take(&checkpoint);
+    for (int phase = 0; phase < 2; phase++) {
+        if (phase) {
+            /* Exercise removal of both the body-index head and a non-head
+             * variant. Exact bytes, refs, and shared identities must survive. */
+            const char *other = "<tool_call>\n<function=other>\n</function>\n</tool_call>";
+            tool_memory_put(&src, msgs.v[0].calls.v[0].id, other);
+            tool_memory_put(&src, msgs.v[2].calls.v[0].id, other);
+            tool_memory_free(&dst.tool_mem);
+        }
+        FILE *fp = tmpfile();
+        TEST_ASSERT(fp != NULL);
+        if (!fp) break;
+        uint64_t measured = 0, written = 0;
+        TEST_ASSERT(kv_tool_map_serialized_size(&src, text, &measured));
+        TEST_ASSERT(kv_tool_map_write(&src, fp, text, &written));
+        TEST_ASSERT(measured == written && written == (uint64_t)ftell(fp));
+        rewind(fp);
+        int expected = phase ? 1 : 3;
+        TEST_ASSERT(kv_tool_map_load_from_pos(&dst, fp, NULL) == expected);
+        fclose(fp);
+        for (int i = 0; i < msgs.len; i++) {
+            free(msgs.v[i].calls.raw_tool_text);
+            msgs.v[i].calls.raw_tool_text = NULL;
+        }
+        tool_replay_stats stats = {0};
+        tool_memory_attach_to_messages(&dst, &msgs, &stats);
+        TEST_ASSERT(stats.disk == expected && stats.canonical == 4 - expected);
+        TEST_ASSERT(msgs.v[1].calls.raw_tool_text && msgs.v[1].calls.raw_tool_text[0] == '\n');
+        TEST_ASSERT(msgs.v[3].calls.raw_tool_text == NULL);
+    }
+    free(text);
+    chat_msgs_free(&msgs);
+    tool_memory_free(&src.tool_mem);
+    tool_memory_free(&dst.tool_mem);
+
+    char *padding = xmalloc(1048577);
+    memset(padding, '\n', 1048576);
+    padding[1048576] = '\0';
+    buf raw = {0}, history = {0};
+    buf_append(&raw, padding, 65536);
+    buf_puts(&raw, body);
+    char *sampled = buf_take(&raw);
+    tool_memory_put(&src, "call_long_ws", sampled);
+    buf_puts(&history, padding);
+    buf_puts(&history, body);
+    text = buf_take(&history);
+    double t0 = now_sec();
+    uint64_t bytes = 0;
+    TEST_ASSERT(kv_tool_map_serialized_size(&src, text, &bytes) && bytes > 65536);
+    TEST_ASSERT(kv_tool_map_serialized_size(&src, padding, &bytes) && bytes == 0);
+    fprintf(stderr, "[measure] 1MiB blank run / 64KiB raw leading bytes: %.2f ms\n",
+            (now_sec() - t0) * 1000);
+    free(sampled); free(padding); free(text);
+    tool_memory_free(&src.tool_mem);
+    pthread_mutex_destroy(&src.tool_mu);
+    pthread_mutex_destroy(&dst.tool_mu);
+}
+
+static void test_kv_tool_map_large_sampled_history(void) {
+    server src = {0}, dst = {0};
+    pthread_mutex_init(&src.tool_mu, NULL);
+    pthread_mutex_init(&dst.tool_mu, NULL);
+    /* Fill the existing 100k-id bound; unrelated keys must not multiply scans. */
+    for (int i = 0; i < 99000; i++) {
+        char id[32], block[256];
+        snprintf(id, sizeof(id), "unused_%d", i);
+        snprintf(block, sizeof(block),
+                 "<tool_call>\n<function=lookup>\n<parameter=query>\nunused-%d\n"
+                 "</parameter>\n</function>\n</tool_call>", i);
+        tool_memory_put(&src, id, block);
+    }
+    buf history = {0};
+    chat_msgs msgs = {0};
+    for (int i = 0; i < 500; i++) {
+        buf sampled = {0};
+        buf_printf(&sampled, "\n <tool_call>\n<function=bash>\n<parameter=command>\nrecord-%d\n", i);
+        for (int j = 0; j < 16; j++)
+            buf_puts(&sampled, "# inventory: harbor cargo, weather, dates and routine arrivals\n");
+        buf_puts(&sampled, "printf '</tool_call>'\n</parameter>\n</function>\n</tool_call>\n"
+                           "<tool_call>\n<function=read>\n<parameter=path>\n/tmp/record\n"
+                           "</parameter>\n</function>\n</tool_call>\n \t");
+        char *generated = buf_take(&sampled);
+        tool_calls calls = {0};
+        char *content = NULL, *reasoning = NULL;
+        TEST_ASSERT(parse_generated_message_ex_for_syntax(
+            SERVER_MODEL_SYNTAX_QWEN, generated, false, &content, &reasoning, &calls));
+        TEST_ASSERT(calls.len == 2 && calls.raw_tool_text != NULL);
+        free(content);
+        free(reasoning);
+        assign_tool_call_ids(&src, &calls, API_OPENAI);
+        tool_memory_remember(&src, &calls);
+        if (calls.raw_tool_text) {
+            buf_puts(&history, calls.raw_tool_text);
+            if (i % 37 == 0) buf_puts(&history, calls.raw_tool_text);
+        }
+        free(calls.raw_tool_text);
+        calls.raw_tool_text = NULL;
+        chat_msg a = {.role = xstrdup("assistant"), .calls = calls};
+        chat_msgs_push(&msgs, a);
+        free(generated);
+    }
+    char *text = buf_take(&history);
+    double t0 = now_sec();
+    uint64_t measured = 0, written = 0;
+    TEST_ASSERT(kv_tool_map_serialized_size(&src, text, &measured));
+    double measure_ms = (now_sec() - t0) * 1000;
+    FILE *fp = tmpfile();
+    TEST_ASSERT(fp != NULL);
+    if (fp) {
+        t0 = now_sec();
+        TEST_ASSERT(kv_tool_map_write(&src, fp, text, &written));
+        TEST_ASSERT(measured == written && written == (uint64_t)ftell(fp));
+        double write_ms = (now_sec() - t0) * 1000;
+        rewind(fp);
+        TEST_ASSERT(kv_tool_map_load_from_pos(&dst, fp, NULL) == 1000);
+        tool_replay_stats stats = {0};
+        tool_memory_attach_to_messages(&dst, &msgs, &stats);
+        TEST_ASSERT(stats.disk == 500 && stats.canonical == 0 && stats.missing_ids == 0);
+        fprintf(stderr, "[measure] 100k-id map, 500 sampled two-call spans: text=%zu "
+                "trailer=%llu measure=%.2f ms write=%.2f ms\n", strlen(text),
+                (unsigned long long)written, measure_ms, write_ms);
+        fclose(fp);
+    }
+    free(text);
+    chat_msgs_free(&msgs);
+    tool_memory_free(&src.tool_mem);
+    tool_memory_free(&dst.tool_mem);
+    pthread_mutex_destroy(&src.tool_mu);
+    pthread_mutex_destroy(&dst.tool_mu);
+}
+
+static void kv_tool_map_round_trip_case(server_model_syntax syntax,
+                                        const char *generated, int expected_calls,
+                                        const char *prefix, const char *suffix) {
+    char *content = NULL, *reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message_ex_for_syntax(
+        syntax, generated, false, &content, &reasoning, &calls));
+    TEST_ASSERT(calls.len == expected_calls);
+    free(content);
+    free(reasoning);
+    if (!calls.len || !calls.raw_tool_text) {
+        tool_calls_free(&calls);
+        return;
+    }
+    char tmpl[] = "/tmp/ds4-kv-replay-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) {
+        tool_calls_free(&calls);
+        return;
+    }
+
+    server src = {0}, dst = {0};
+    pthread_mutex_init(&src.tool_mu, NULL);
+    pthread_mutex_init(&dst.tool_mu, NULL);
+    /* Use the sample-time path, including whole multi-call raw spans. */
+    assign_tool_call_ids(&src, &calls, API_OPENAI);
+    tool_memory_remember(&src, &calls);
+    char *raw = xstrdup(calls.raw_tool_text);
+    buf checkpoint = {0};
+    buf_puts(&checkpoint, prefix);
+    buf_puts(&checkpoint, raw);
+    buf_puts(&checkpoint, suffix);
+    char *text = buf_take(&checkpoint);
+
+    char *path = path_join(dir, "4444444444444444444444444444444444444444.kv");
+    uint64_t estimated = 0;
+    TEST_ASSERT(kv_tool_map_serialized_size(&src, text, &estimated));
+    TEST_ASSERT(estimated > 0);
+    FILE *fp = fopen(path, "wb");
+    TEST_ASSERT(fp != NULL);
+    if (fp) {
+        uint8_t h[KV_CACHE_FIXED_HEADER], text_len[4];
+        kv_fill_header(h, 2, KV_REASON_CONTINUED,
+                       estimated ? KV_EXT_TOOL_MAP : 0,
+                       512, 0, 32768, 100, 100, 0);
+        le_put32(text_len, (uint32_t)strlen(text));
+        TEST_ASSERT(fwrite(h, 1, sizeof(h), fp) == sizeof(h));
+        TEST_ASSERT(fwrite(text_len, 1, sizeof(text_len), fp) == sizeof(text_len));
+        TEST_ASSERT(fwrite(text, 1, strlen(text), fp) == strlen(text));
+        long before = ftell(fp);
+        uint64_t written = 0;
+        TEST_ASSERT(kv_tool_map_write(&src, fp, text, &written));
+        TEST_ASSERT(written == estimated);
+        TEST_ASSERT((uint64_t)(ftell(fp) - before) == written);
+        TEST_ASSERT(fclose(fp) == 0);
+    }
+
+    dst.kv.enabled = true;
+    dst.kv.dir = xstrdup(dir);
+    dst.kv.opt = kv_cache_default_options();
+    /* A client replays ids/arguments, not sampled raw bytes. */
+    free(calls.raw_tool_text);
+    calls.raw_tool_text = NULL;
+    chat_msgs msgs = {0};
+    chat_msg a = {.role = xstrdup("assistant"), .calls = calls};
+    chat_msgs_push(&msgs, a);
+    kv_cache_restore_tool_memory_for_messages(&dst, &msgs);
+    tool_replay_stats stats = {0};
+    tool_memory_attach_to_messages(&dst, &msgs, &stats);
+    TEST_ASSERT(stats.disk == 1);
+    TEST_ASSERT(stats.canonical == 0);
+    TEST_ASSERT(stats.missing_ids == 0);
+    TEST_ASSERT(msgs.v[0].calls.raw_tool_text != NULL);
+    if (msgs.v[0].calls.raw_tool_text)
+        TEST_ASSERT(!strcmp(msgs.v[0].calls.raw_tool_text, raw));
+    char *prompt = render_chat_prompt_text_for_syntax(
+        syntax, &msgs, NULL, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(prompt && strstr(prompt, raw));
+
+    free(prompt);
+    free(raw);
+    free(text);
+    chat_msgs_free(&msgs);
+    kv_cache_close(&dst.kv);
+    tool_memory_free(&src.tool_mem);
+    tool_memory_free(&dst.tool_mem);
+    pthread_mutex_destroy(&src.tool_mu);
+    pthread_mutex_destroy(&dst.tool_mu);
+    unlink(path);
+    free(path);
+    rmdir(dir);
+}
+
+static void test_kv_tool_map_restores_qwen_and_glm_ids_before_prompt_render(void) {
+    const char *qwen =
+        "\n\n<tool_call>\n<function=bash>\n"
+        "<parameter=command>\necho exact\n</parameter>\n"
+        "</function>\n</tool_call>";
+    kv_tool_map_round_trip_case(SERVER_MODEL_SYNTAX_QWEN, qwen, 1, "", "");
+    const char *glm =
+        "<tool_call>get_weather<arg_key>city</arg_key>"
+        "<arg_value>Paris</arg_value></tool_call>";
+    kv_tool_map_round_trip_case(SERVER_MODEL_SYNTAX_GLM, glm, 1, "", "");
+
+    const char *two_calls =
+        "\n\n<tool_call>\n<function=bash>\n<parameter=command>\npwd\n"
+        "</parameter>\n</function>\n</tool_call>\n"
+        "<tool_call>\n<function=read>\n<parameter=path>\n/tmp/x\n"
+        "</parameter>\n</function>\n</tool_call>";
+    kv_tool_map_round_trip_case(SERVER_MODEL_SYNTAX_QWEN, two_calls, 2, "", "");
+    kv_tool_map_round_trip_case(SERVER_MODEL_SYNTAX_QWEN, two_calls, 2, two_calls, "");
+    const char *qwen_spaces =
+        "\n <tool_call>\n<function=bash>\n<parameter=command>\npwd\n"
+        "</parameter>\n</function>\n</tool_call>\n \t";
+    kv_tool_map_round_trip_case(SERVER_MODEL_SYNTAX_QWEN, qwen_spaces, 1, "\n\n   ", "tail");
+    const char *qwen_literal =
+        "<tool_call>\n<function=bash>\n<parameter=command>\n"
+        "printf '</tool_call> <tool_call> </function>'\n"
+        "</parameter>\n</function>\n</tool_call>";
+    kv_tool_map_round_trip_case(SERVER_MODEL_SYNTAX_QWEN, qwen_literal, 1, "", "");
+    const char *glm_two =
+        "\n\n<tool_call>get_weather<arg_key>city</arg_key>"
+        "<arg_value>Paris</arg_value></tool_call>\n"
+        "<tool_call>get_weather<arg_key>city</arg_key>"
+        "<arg_value>Oslo</arg_value></tool_call>\n \t";
+    kv_tool_map_round_trip_case(SERVER_MODEL_SYNTAX_GLM, glm_two, 2, "", "tail");
+    const char *glm_literal =
+        "<tool_call>get_weather<arg_key>city</arg_key>"
+        "<arg_value>literal </tool_call> Paris</arg_value></tool_call>";
+    kv_tool_map_round_trip_case(SERVER_MODEL_SYNTAX_GLM, glm_literal, 1, "", "");
+    const char *dsml =
+        "\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"bash\">\n"
+        "<｜DSML｜parameter name=\"command\" string=\"true\">pwd</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+    /* Unknown literal tags must not consume a genuine remembered DSML block. */
+    kv_tool_map_round_trip_case(SERVER_MODEL_SYNTAX_DEEPSEEK, dsml, 1,
+                                "user mentions <tool_call>\n", "\ntool mentions </tool_call>");
+    kv_tool_map_round_trip_case(SERVER_MODEL_SYNTAX_DEEPSEEK, dsml, 1, qwen, glm);
+    const char *xml =
+        "<tool_calls><invoke name=\"bash\"><parameter name=\"command\" string=\"true\">"
+        "pwd</parameter></invoke></tool_calls>";
+    kv_tool_map_round_trip_case(SERVER_MODEL_SYNTAX_DEEPSEEK, xml, 1, "", "");
+}
+
 static void test_kv_cache_eviction_values_fresh_snapshots(void) {
     char tmpl[] = "/tmp/ds4-kv-evict-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -22929,7 +23508,10 @@ static void test_deepseek41_server_tools(void) {
     TEST_ASSERT(parse_messages(&json, &msgs));
     char *full = render_deepseek41_chat(&msgs, 0, NULL, DS4_THINK_HIGH, false);
     char *tail = render_deepseek41_chat(&msgs, 2, NULL, DS4_THINK_HIGH, true);
+    /* The live tail continues after the end token that closes the previous
+     * assistant turn; that token is already in the live KV. */
     const char *boundary = strstr(full, "<｜end▁of▁sentence｜>");
+    if (boundary) boundary += strlen("<｜end▁of▁sentence｜>");
     TEST_ASSERT(boundary && !strcmp(boundary, tail));
     TEST_ASSERT(strstr(tail, "</tool_result>\n\n<tool_result>"));
     TEST_ASSERT(strstr(tail, "<｜System｜>Continue<｜Assistant｜><think>"));
@@ -22955,14 +23537,16 @@ static void test_deepseek41_anthropic_results(void) {
     char *old = render_deepseek_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH);
     char *full = render_deepseek41_chat(&msgs, 0, NULL, DS4_THINK_HIGH, false);
     char *tail = render_deepseek41_chat(&msgs, 2, NULL, DS4_THINK_HIGH, true);
+    /* Same boundary as above, one token later: the end token stays in KV. */
     const char *boundary = strstr(full, "<｜end▁of▁sentence｜>");
+    if (boundary) boundary += strlen("<｜end▁of▁sentence｜>");
     TEST_ASSERT(boundary && !strcmp(boundary, tail));
     TEST_ASSERT(strstr(full, "<tool_result></tool_result>\n\n"
         "literal <tool_result>text</tool_result>\n\n"
         "<tool_result>SECOND &lt;/tool_result> &lt;</tool_result>"));
     free(tail);
     tail = render_deepseek41_chat(&msgs, 4, NULL, DS4_THINK_HIGH, true);
-    TEST_ASSERT(!strcmp(tail, "<｜end▁of▁sentence｜><｜User｜>Continue<｜Assistant｜><think>"));
+    TEST_ASSERT(!strcmp(tail, "<｜User｜>Continue<｜Assistant｜><think>"));
     TEST_ASSERT(!strcmp(source, msgs.v[2].content));
     char *unchanged = render_deepseek_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH);
     TEST_ASSERT(!strcmp(old, unchanged));
@@ -23001,7 +23585,7 @@ static void test_deepseek41_live_result_order(void) {
         else responses_prepare_live_continuation(&s, &r, &msgs);
         const char *tail = anthropic ? r.anthropic_live_suffix_text : r.responses_live_suffix_text;
         TEST_ASSERT(tail && !strcmp(tail,
-            "<｜end▁of▁sentence｜><｜User｜><tool_result>FIRST</tool_result>\n\n"
+            "<｜User｜><tool_result>FIRST</tool_result>\n\n"
             "<tool_result>SECOND</tool_result><｜Assistant｜><think>"));
         live_tool_state_clear_locked(live);
         /* Rendered requests own their bytes even if the slot is replaced. */
@@ -23028,6 +23612,7 @@ static void ds4_server_unit_tests_run(void) {
     test_multimodal_prefill_resume_frontier();
     test_batched_live_continuation_slot_binding();
     test_live_continuation_contract();
+    test_live_kv_keeps_replayed_turn_end_token();
     test_slot_probe_and_routing_scores();
     test_slot_probe_live_state_tiers();
     test_slot_probe_vision_tiers();
@@ -23048,6 +23633,7 @@ static void ds4_server_unit_tests_run(void) {
     test_render_qwen_chat_prompt_text();
     test_render_qwen_tool_round_trip();
     test_qwen_tool_visible_checkpoint_boundary();
+    test_legacy_qwen_tool_visible_boundary();
     test_qwen_decode_tracker_markers();
     test_parse_qwen_tool_call_message();
     test_qwen_literal_tool_end_in_argument();
@@ -23133,6 +23719,11 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_memory_max_ids_prunes_oldest();
     test_kv_tool_map_filters_by_dsml_text();
     test_kv_tool_map_restores_before_prompt_render();
+    test_rax_prefix_walk_for_tool_map();
+    test_kv_tool_map_measures_qwen_tool_call_text();
+    test_kv_tool_map_whitespace_variants();
+    test_kv_tool_map_large_sampled_history();
+    test_kv_tool_map_restores_qwen_and_glm_ids_before_prompt_render();
     test_thinking_checkpoint_canonical_matches_future_prompt();
     test_thinking_canonical_empty_content();
     test_thinking_canonical_multi_turn();

@@ -124,6 +124,11 @@ char *ds4_kvstore_render_tokens_text(ds4_engine *engine,
                                      size_t *out_len);
 bool ds4_kvstore_byte_prefix_match(const char *text, size_t text_len,
                                    const char *prefix, size_t prefix_len);
+/* The cached bytes have already been verified as a prefix of prompt_text. */
+size_t ds4_kvstore_text_suffix_offset(const char *cached_text, const char *prompt_text,
+                                      size_t prefix_bytes, uint8_t ext_flags,
+                                      const ds4_tokens *exact_prefix,
+                                      int eos_token, bool is_qwen);
 void ds4_kvstore_tokens_copy_prefix(ds4_tokens *dst, const ds4_tokens *src, int n);
 void ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
         ds4_engine *engine,
