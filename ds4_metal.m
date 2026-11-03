@@ -51361,7 +51361,7 @@ static bool qwen4_moe_mv_specialize(uint32_t type) {
     const int override = ds4_gpu_env_bool("DS4_QWEN4_MOE_MV_SPECIALIZE");
     return override >= 0 ? override != 0 :
         ((type == 16u || type == 10u || type == 39u) &&
-        (ds4_gpu_device_name_contains("M3 Ultra") || ds4_gpu_device_is_m5_apple_silicon())) ||
+        (ds4_gpu_device_name_contains("M3 Ultra") || ds4_gpu_device_name_contains("Apple M5"))) ||
         (type == 39u && ds4_gpu_device_is_m5_or_m6_apple_silicon());
 }
 

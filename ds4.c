@@ -1026,6 +1026,12 @@ static bool ds4_qwen4_layer_is_nextn(uint32_t il) {
            il + DS4_N_NEXTN_PREDICT >= DS4_N_LAYER;
 }
 
+#if defined(__GNUC__) || defined(__clang__)
+#define DS4_MAYBE_UNUSED __attribute__((unused))
+#else
+#define DS4_MAYBE_UNUSED
+#endif
+
 /* A query needs sparse selection only after its complete four-token blocks
  * exceed the budget. Share this boundary between query preparation and its
  * consumer so a chunk crossing it cannot omit an indexer query. */
@@ -1036,7 +1042,7 @@ static uint32_t qwen4_attention_dense_rows(uint32_t pos0, uint32_t n_tokens, uin
     return n_dense < n_tokens ? (uint32_t)n_dense : n_tokens;
 }
 
-static bool qwen4_attention_needs_index_query(uint32_t pos0, uint32_t n_tokens,
+static DS4_MAYBE_UNUSED bool qwen4_attention_needs_index_query(uint32_t pos0, uint32_t n_tokens,
                                              uint32_t k_blocks, bool mtp, bool cache_only) {
     return !cache_only && n_tokens != 0u &&
            (mtp || qwen4_attention_dense_rows(pos0, n_tokens, k_blocks) < n_tokens);
@@ -1111,11 +1117,6 @@ static ds4_context_memory qwen4_graph_memory_estimate(uint32_t ctx, uint32_t pre
 
 static int g_ds4_lock_fd = -1;
 
-#if defined(__GNUC__) || defined(__clang__)
-#define DS4_MAYBE_UNUSED __attribute__((unused))
-#else
-#define DS4_MAYBE_UNUSED
-#endif
 
 /* This controls prompt-time predictor cache preparation, not speculation.
  * Keep the established predictor history by default; auto is an explicit
@@ -60991,6 +60992,9 @@ static bool qwen4_moe_profile_boundary(bool enabled, double *last, double *elaps
 
 static bool qwen4_graph_moe_impl(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
                                 uint32_t il, uint32_t T, bool last_only) {
+#ifndef DS4_HAS_QWEN4_METAL
+    (void)il;
+#endif
     const bool profile = !g->ssd_streaming && T > 8u && getenv("DS4_QWEN4_MOE_PROFILE") != NULL;
     double elapsed[7] = {0}, last = 0;
     if (!qwen4_moe_profile_boundary(profile, &last, &elapsed[0])) return false;
