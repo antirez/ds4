@@ -15,6 +15,7 @@ With no steering file or zero scales, ds4 follows the normal inference path.
 The file shape depends on the model:
 
 - DeepSeek V4 Flash: `43 x 4096`.
+- DeepSeek V4.1 Flash: `40 x 5120`.
 - GLM 5.3 Flash: `45 x 4096`. The separate MTP predictor layer is omitted.
 - Qwen3.8 Flash Next: `48 x 2560`. FFN steering is applied to each
   hyper-connection branch of the residual; dumps average those branches
@@ -28,6 +29,8 @@ GLM 5.2 steering is not implemented.
 --dir-steering-file FILE   load one f32 direction per normal model layer
 --dir-steering-ffn F       apply steering after FFN outputs; default is 1 when a file is provided
 --dir-steering-attn F      apply steering after attention outputs; default is 0
+--dir-steering-resid F     DeepSeek V4.1 only: apply steering to the residual
+                           streams after each layer; default is 0
 ```
 
 The FFN output is usually the best first target because it is late enough in
@@ -182,6 +185,63 @@ Style control:
 The method is not a fine-tune. It is a low-rank runtime edit, so it works best
 for coarse behavior, topic, or style directions that are consistently present in
 the activation captures.
+
+## DeepSeek V4.1 Flash
+
+V4.1 steering runs on Metal and CUDA on one host: SSD streaming, CUDA expert
+devices, DSpark, and server session batching keep it. Tensor parallelism and
+ROCm refuse a steering file. The DSpark drafter stays unsteered; the steered
+model verifies its drafts.
+
+V4.1 has a third site besides the attention and FFN outputs.
+`--dir-steering-resid` steers the residual after each layer's FFN has been
+folded into the four hyper-connection copies, before the next layer's Engram
+lookup. The mean of the copies is projected and the same correction is
+subtracted from every copy:
+
+```text
+h      = mean over the 4 copies
+copy_c = copy_c - scale * direction[layer] * dot(direction[layer], h)
+```
+
+Unlike the output sites, this also removes what earlier layers accumulated,
+so its scale means something different: the same vector needs its own scale
+at each site. The residual carries the result into the next layer, so the
+scale compounds: each steered layer leaves `1 - scale` of the component.
+Keep it between 0 and 2 (1 removes the component, 2 flips its sign); a scale
+of 8 over 39 layers wrecks the state, and every logit came out 0.
+
+`build_direction.py` has no V4.1 profile because V4.1 cannot capture
+activations yet. A direction made elsewhere can still be used. When it comes
+as a `controlvector` GGUF of directions to project out, convert it:
+
+```sh
+python3 dir-steering/tools/controlvector_to_f32.py direction.gguf \
+  dir-steering/out/v41-direction.f32 --layers 40
+```
+
+The file keeps its layer numbering (`direction.N` is layer N from 0);
+`--offset` moves it. Additive control vectors are a different edit and do not
+convert. Steer the site the direction was calibrated for. GLP files (with
+`glp.*` keys) name it, and the converter prints the matching flags:
+
+| `glp.hook_point` | ds4 flags (alpha from `glp.alpha_default`) |
+|---|---|
+| `residual_stream_post_layer` | `--dir-steering-resid A --dir-steering-ffn 0` |
+| `hc_fold_pre_engram` (spec version 3) | `--dir-steering-resid A --dir-steering-attn A --dir-steering-ffn 0` |
+| `ffn_out_pre_residual` | `--dir-steering-ffn A` |
+| `attn_out_pre_residual` | `--dir-steering-attn A --dir-steering-ffn 0` |
+
+A version 3 fold-site file is calibrated with the attention outputs steered by
+the same vector and scale, so both are set. The converter refuses what ds4
+cannot apply: additive files, more than one direction per layer, and
+per-layer or per-direction scales.
+
+```sh
+./ds4 -m gguf/DeepSeek-V4.1-Flash-1017-IQ2_XXS-Q2_K-imatrix.gguf --ssd-streaming \
+  --dir-steering-file dir-steering/out/v41-direction.f32 \
+  --dir-steering-resid 3.5 --dir-steering-attn 3.5 --dir-steering-ffn 0
+```
 
 ## Qwen3.8 Flash Next
 

@@ -118,7 +118,9 @@ increasing both context and slot count. CUDA Q2 SSD mode batches up to eight
 decode rows; CUDA network TP currently serves sessions in order.
 [DSpark](SPECULATIVE_DECODING.md#deepseek-v41-flash-dspark) uses a
 separate V4.1 support GGUF and currently requires one host. Pipeline execution
-is not implemented for V4.1; vision requires Metal.
+is not implemented for V4.1; vision needs Metal or CUDA (not ROCm).
+[Directional steering](../dir-steering/README.md#deepseek-v41-flash) needs
+Metal or CUDA on one host.
 
 Scalar, batched and tensor-parallel execution are not numerically identical.
 Q4 batched prefill shows a small probability-score loss on the short official
@@ -135,10 +137,14 @@ For images, download the matching encoder and add it to the same command:
 ```
 
 Vision works with SSD streaming, full residency and two-Mac TP. Pass the encoder
-on both TP ranks. Use `/read image.png` in `ds4`, `view_image` in `ds4-agent`,
-or the [server image API](SERVER.md#images). V4 Flash vision encoders do not
-work with V4.1. See [conversion](../gguf-tools/README.md#convert-deepseek-v41-flash)
-to build the GGUFs from safetensors.
+on both TP ranks. CUDA vision runs on one GPU, or on the first GPU when extra
+GPUs hold routed experts (`--gpu-devices`). The encoder needs about 0.9 GiB more
+GPU memory, so 24 GB cards may need a smaller `--ctx`. Either the original V4.1
+encoder or one converted from the 1017 checkpoint is accepted. Use `/read image.png` in `ds4`, `view_image` in
+`ds4-agent`, or the [server image API](SERVER.md#images). V4 Flash vision
+encoders do not work with V4.1. See
+[conversion](../gguf-tools/README.md#convert-deepseek-v41-flash) to build the
+GGUFs from safetensors.
 
 ## Qwen3.8 Flash Next
 

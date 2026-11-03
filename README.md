@@ -209,7 +209,7 @@ The normal sampling defaults are temperature 1, top-p 1, and min-p 0.05;
 For DeepSeek V4, `--power N` trades throughput for lower sustained GPU load.
 The default is 100. V4.1 and GLM currently require `--power 100`.
 
-DeepSeek V4 Flash and GLM 5.3 Flash also support directional steering. Load a
+DeepSeek V4 Flash, V4.1 Flash and GLM 5.3 Flash also support directional steering. Load a
 vector with `--dir-steering-file FILE`; `/steer F` adjusts its scale for
 subsequent tokens in a local CLI or agent session, without rebuilding the
 existing KV cache. See [steering documentation](dir-steering/README.md).

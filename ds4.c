@@ -7349,6 +7349,9 @@ static void deepseek4_vision_weights_bind(
     const bool v41 = DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41;
     const char *revision = v41 ? "df42c109f1defefcbfcedbe7d905718a12266e40" :
                                 "e46e16bf6035c6f317eb2ac7458eb0362926d402";
+    /* V4.1 Flash 1017 (deepseek-ai/DeepSeek-V4.1-Flash-1017) ships its own
+     * encoder with the same layout; either V4.1 revision is accepted. */
+    const char *revision_1017 = "1bae0e1088993b9b82de08f59de5be5a34e42170";
     const uint32_t projection = v41 ? 5120u : 4096u;
     ds4_str arch = {0}, source_revision = {0}, variant = {0};
     if (!model_get_string(m, "general.architecture", &arch) ||
@@ -7356,11 +7359,14 @@ static void deepseek4_vision_weights_bind(
         ds4_die("--vision file is not a DeepSeek V4 vision encoder GGUF");
     }
     if (!model_get_string(m, "general.source.revision", &source_revision) ||
-        !ds4_streq(source_revision, revision) ||
+        !(ds4_streq(source_revision, revision) ||
+          (v41 && ds4_streq(source_revision, revision_1017))) ||
         !model_get_string(m, "deepseek4-vision.checkpoint_variant", &variant) ||
         !ds4_streq(variant, v41 ? "v4.1-flash" : "vision-exp")) {
         ds4_die("DeepSeek vision sidecar does not match the language checkpoint");
     }
+    if (v41) fprintf(stderr, "ds4: V4.1 vision encoder from the %s checkpoint\n",
+                     ds4_streq(source_revision, revision_1017) ? "1017" : "original V4.1");
     const uint32_t expected_tensors = v41 ? 266u : 316u;
     if (m->n_tensors != expected_tensors) {
         fprintf(stderr,
@@ -41011,6 +41017,13 @@ typedef struct {
     ds41_prefill_row carry;
     ds4_gpu_tensor *prefill_tokens;
     ds41_dspark *dspark;
+    /* Directional steering: one direction per layer, n_layer x n_embd F32
+     * (NULL without --dir-steering-file); a zero scale leaves the path unchanged.
+     * steer_fold_dirs holds each direction tiled over the HC copies, / sqrt(n_hc),
+     * for the residual site; steer_layers marks the nonzero directions. */
+    ds4_gpu_tensor *steer_dirs, *steer_fold_dirs;
+    float steer_attn, steer_ffn, steer_resid;
+    uint64_t steer_layers;
 #define DS41_FIELD(name, count) ds4_gpu_tensor *name;
     DS41_SCRATCH(DS41_FIELD)
 #undef DS41_FIELD
@@ -41039,6 +41052,8 @@ static void ds41_graph_free(ds41_gpu_graph *g) {
     ds4_gpu_tensor_free(g->selected_half);
     ds4_gpu_tensor_free(g->route_weights_half);
     ds4_gpu_tensor_free(g->rope_tab);
+    ds4_gpu_tensor_free(g->steer_dirs);
+    ds4_gpu_tensor_free(g->steer_fold_dirs);
     for (uint32_t i = 0; g->rows_view && i < g->prefill_cap; i++) {
 #define DS41_ROW_FREE(name, count) ds4_gpu_tensor_free(g->rows_view[i].name);
         DS41_PREFILL_ROWS(DS41_ROW_FREE)
@@ -41725,6 +41740,133 @@ static bool ds41_hc_mix(ds41_gpu_graph *g, const ds4_model *m,
         ds41_hc_sum(g->x, residual, pre, ffn) && ds41_norm(g->norm, g->x, m, norm);
 }
 
+/* Directional steering, x -= scale * d * dot(d, x), at one of three sites:
+ * - attention and FFN outputs, before they join the residual streams; the
+ *   output then keeps its BF16 boundary. Kernels that fuse the output
+ *   projection with the expand never hold that output, so callers take the
+ *   unfused path while either scale is set.
+ * - the residual after each layer's FFN expand (the HC fold, before the next
+ *   layer's Engram): the mean over the HC copies is projected and the same
+ *   correction is subtracted from every copy. That is a projection of the
+ *   token's whole HC row onto its direction tiled over the copies and scaled
+ *   by 1/sqrt(n_hc), which keeps unit norm, so the row kernel does it. */
+enum { DS41_STEER_ATTN, DS41_STEER_FFN, DS41_STEER_RESID };
+
+static float ds41_steer_scale(const ds41_gpu_graph *g, int site) {
+    return site == DS41_STEER_ATTN ? g->steer_attn :
+        site == DS41_STEER_FFN ? g->steer_ffn : g->steer_resid;
+}
+
+static bool ds41_steer_on(const ds41_gpu_graph *g, bool ffn) {
+    return g->steer_dirs && ds41_steer_scale(g, ffn ? DS41_STEER_FFN : DS41_STEER_ATTN) != 0.0f;
+}
+
+static bool ds41_steer_site(const ds41_gpu_graph *g, ds4_gpu_tensor *x, uint32_t il,
+                            uint32_t rows, int site) {
+    const float scale = ds41_steer_scale(g, site);
+    if (!g->steer_dirs || scale == 0.0f || il >= 64u || !(g->steer_layers >> il & 1u)) return true;
+    const uint32_t width = site == DS41_STEER_RESID ? DS4_N_HC * DS4_N_EMBD : DS4_N_EMBD;
+    return ds4_gpu_directional_steering_project_tensor(x,
+               site == DS41_STEER_RESID ? g->steer_fold_dirs : g->steer_dirs,
+               il, width, rows, scale) != 0 &&
+        ds4_gpu_dsv41_quantize(x, width, rows, DS4_V41_BF16);
+}
+
+static bool ds41_steer(const ds41_gpu_graph *g, ds4_gpu_tensor *x, uint32_t il,
+                       uint32_t rows, bool ffn) {
+    return ds41_steer_site(g, x, il, rows, ffn ? DS41_STEER_FFN : DS41_STEER_ATTN);
+}
+
+/* Batched session rows each keep their own scales: consecutive rows of one
+ * graph and scale share a dispatch. `x` holds one row per graph: n_embd
+ * wide for the sublayer outputs, n_hc x n_embd for the residual. */
+static bool ds41_steer_rows(ds41_gpu_graph *const *graphs, int count, ds4_gpu_tensor *x,
+                            uint32_t il, int site) {
+    const uint64_t row = (uint64_t)(site == DS41_STEER_RESID ? DS4_N_HC : 1u) *
+        DS4_N_EMBD * sizeof(float);
+    bool ok = true;
+    for (int i = 0; ok && i < count;) {
+        const float scale = ds41_steer_scale(graphs[i], site);
+        int j = i + 1;
+        while (j < count && graphs[j]->steer_dirs == graphs[i]->steer_dirs &&
+               ds41_steer_scale(graphs[j], site) == scale) j++;
+        if (graphs[i]->steer_dirs && scale != 0.0f) {
+            ds4_gpu_tensor *v = ds4_gpu_tensor_view(x, (uint64_t)i * row, (uint64_t)(j - i) * row);
+            ok = v && ds41_steer_site(graphs[i], v, il, (uint32_t)(j - i), site);
+            ds4_gpu_tensor_free(v);
+        }
+        i = j;
+    }
+    return ok;
+}
+
+/* Whether any row steers a sublayer output (which disables the fused tails). */
+static bool ds41_steer_any(ds41_gpu_graph *const *graphs, int count) {
+    for (int i = 0; i < count; i++)
+        if (ds41_steer_on(graphs[i], false) || ds41_steer_on(graphs[i], true)) return true;
+    return false;
+}
+
+static bool ds41_steer_resid_any(ds41_gpu_graph *const *graphs, int count) {
+    for (int i = 0; i < count; i++)
+        if (graphs[i]->steer_dirs && graphs[i]->steer_resid != 0.0f) return true;
+    return false;
+}
+
+static bool ds41_graph_load_steering(ds41_gpu_graph *g, const char *path,
+                                     float attn_scale, float ffn_scale, float resid_scale) {
+    if (!path || !path[0]) {
+        if (attn_scale == 0.0f && ffn_scale == 0.0f && resid_scale == 0.0f) return true;
+        fprintf(stderr, "ds4: directional steering needs --dir-steering-file\n");
+        return false;
+    }
+    /* Loaded even at zero scales, so a live /steer can enable it later. */
+    const uint64_t n = (uint64_t)DS4_N_LAYER * DS4_N_EMBD;
+    float *dirs = xmalloc((size_t)n * sizeof(dirs[0]));
+    float *fold = xmalloc((size_t)n * DS4_N_HC * sizeof(fold[0]));
+    bool ok = read_f32_binary_file(path, dirs, n);
+    uint32_t layers = 0;
+    g->steer_layers = 0;
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        const float *d = dirs + (uint64_t)il * DS4_N_EMBD;
+        double norm = 0;
+        for (uint32_t i = 0; i < DS4_N_EMBD; i++) norm += (double)d[i] * d[i];
+        if (norm > 0) {
+            g->steer_layers |= 1ull << il;
+            layers++;
+        }
+        for (uint32_t c = 0; c < DS4_N_HC; c++)
+            for (uint32_t i = 0; i < DS4_N_EMBD; i++)
+                fold[((uint64_t)il * DS4_N_HC + c) * DS4_N_EMBD + i] =
+                    d[i] / sqrtf((float)DS4_N_HC);
+    }
+    if (ok) {
+        g->steer_dirs = ds4_gpu_tensor_alloc(n * sizeof(dirs[0]));
+        g->steer_fold_dirs = ds4_gpu_tensor_alloc(n * DS4_N_HC * sizeof(fold[0]));
+        ok = g->steer_dirs && g->steer_fold_dirs &&
+            ds4_gpu_tensor_write(g->steer_dirs, 0, dirs, n * sizeof(dirs[0])) != 0 &&
+            ds4_gpu_tensor_write(g->steer_fold_dirs, 0, fold, n * DS4_N_HC * sizeof(fold[0])) != 0;
+    }
+    static bool reported;
+    if (ok && !reported) {
+        fprintf(stderr, "ds4: V4.1 directional steering: %s, %u of %u layers, attn=%g ffn=%g resid=%g\n",
+                path, layers, (unsigned)DS4_N_LAYER, (double)attn_scale, (double)ffn_scale,
+                (double)resid_scale);
+        reported = true;
+    }
+    free(dirs);
+    free(fold);
+    if (!ok) {
+        fprintf(stderr, "ds4: failed to load V4.1 directional steering vectors from %s\n", path);
+        return false;
+    }
+    g->steer_attn = attn_scale;
+    g->steer_ffn = ffn_scale;
+    g->steer_resid = resid_scale;
+    g->allocation_bytes += n * (1u + DS4_N_HC) * sizeof(float);
+    return true;
+}
+
 /* rope_il >= 0: the heads still carry their rope; that layer's inverse rope
  * folds into the projection (else it runs first). transformed: the decode
  * reduce already applied it (and the bf16 rounding). */
@@ -41796,11 +41938,13 @@ static bool ds41_attention_output(ds41_gpu_graph *g, const ds4_model *m,
 static bool ds41_attention_expand(ds41_gpu_graph *g, const ds4_model *m,
                                   const ds4_layer_weights *l, int rope_il, bool transformed) {
     if (!ds41_attention_low(g, m, l, rope_il, transformed)) return false;
-    if (l->attn_output_b->type == DS4_TENSOR_Q8_0 && !ds41_expand_fusion_off() &&
+    const bool steer = rope_il >= 0 && ds41_steer_on(g, false);
+    if (!steer && l->attn_output_b->type == DS4_TENSOR_Q8_0 && !ds41_expand_fusion_off() &&
         ds4_gpu_dsv41_matmul_expand_rows(g->after_attn, m->map, m->size, l->attn_output_b->abs_offset,
             l->attn_output_b->dim[0], l->attn_output_b->dim[1], g->low, NULL, g->residual,
             g->attn_split, DS4_N_HC, 1u)) return true;
     return ds41_attention_b(g, m, l, g->block) &&
+        (!steer || ds41_steer(g, g->block, (uint32_t)rope_il, 1, false)) &&
         ds41_hc_expand(g->after_attn, g->block, g->residual, g->attn_split);
 }
 
@@ -42097,6 +42241,60 @@ static bool ds41_balance_shared(const ds41_gpu_graph *g, const ds4_layer_weights
         l->ffn_down_shexp->type == DS4_TENSOR_Q8_0 && ds41_shared_balance_enabled();
 }
 
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+/* V4.1 expert devices. A nonzero tier keeps that layer's routed experts
+ * resident on an extra CUDA device: the router and shared expert stay on the
+ * main device and only the routed rows travel. Sessions run one at a time,
+ * so every graph shares one scratch set per device. */
+typedef struct {
+    ds4_gpu_tensor *x, *selected, *weights, *gate, *up, *mid, *down, *out;
+} ds41_expert_scratch;
+static uint8_t g_ds41_expert_tier[DS4_MAX_LAYER];
+static ds41_expert_scratch g_ds41_expert_scratch[DS4_MAX_GPUS];
+static uint32_t g_ds41_expert_rows;
+
+static bool ds41_expert_moe(const ds4_model *m, const ds4_layer_weights *l, uint32_t il,
+                            ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+                            const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
+                            uint32_t rows) {
+    const int tier = g_ds41_expert_tier[il];
+    const ds41_expert_scratch *r = &g_ds41_expert_scratch[tier];
+    const uint64_t gate_row = routed_expert_row_bytes(l->ffn_gate_exps);
+    const uint64_t down_row = routed_expert_row_bytes(l->ffn_down_exps);
+    bool ok = true;
+    for (uint32_t off = 0; ok && off < rows; off += g_ds41_expert_rows) {
+        const uint32_t n = rows - off < g_ds41_expert_rows ? rows - off : g_ds41_expert_rows;
+        const uint64_t row_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+        const uint64_t pair_bytes = (uint64_t)DS4_N_EXPERT_USED * sizeof(float);
+        ds4_gpu_tensor *xv = ds4_gpu_tensor_view(x, off * row_bytes, n * row_bytes);
+        ds4_gpu_tensor *sv = ds4_gpu_tensor_view(selected, off * pair_bytes, n * pair_bytes);
+        ds4_gpu_tensor *wv = ds4_gpu_tensor_view(weights, off * pair_bytes, n * pair_bytes);
+        ds4_gpu_tensor *ov = ds4_gpu_tensor_view(out, off * row_bytes, n * row_bytes);
+        bool mid_f16 = false;
+        ok = xv && sv && wv && ov &&
+            ds4_gpu_tensor_copy_xdev3_default_dst(r->x, xv, n * row_bytes,
+                r->selected, sv, n * pair_bytes, r->weights, wv, n * pair_bytes) &&
+            ds4_gpu_set_current_device(tier) == 0 &&
+            ds4_gpu_routed_moe_batch_tensor(r->out, r->gate, r->up, r->mid, r->down,
+                m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
+                l->ffn_down_exps->abs_offset, l->ffn_gate_exps->type, l->ffn_down_exps->type,
+                gate_row * DS4_N_FF_EXP, gate_row, down_row * DS4_N_EMBD, down_row,
+                DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD, r->selected, r->weights,
+                DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, r->x,
+                il, n, &mid_f16, true) &&
+            ds4_gpu_tensor_copy_xdev_default(ov, r->out, n * row_bytes);
+        if (ds4_gpu_set_current_device(0) != 0) ok = false;
+        ds4_gpu_tensor_free(xv);
+        ds4_gpu_tensor_free(sv);
+        ds4_gpu_tensor_free(wv);
+        ds4_gpu_tensor_free(ov);
+    }
+    if (!ok) fprintf(stderr, "ds4: V4.1 layer %u routed experts failed on expert device tier %d\n",
+                     il, tier);
+    return ok;
+}
+#endif
+
 /* Decode copies of weights the GGUF widens: model-wide, built at graph
  * allocation, freed with the engine. */
 static struct {
@@ -42289,6 +42487,11 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
     bool routed_ok;
     const ds4_gpu_tensor *selected = g->selected, *weights = g->route_weights;
     uint32_t n_used = DS4_N_EXPERT_USED;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (g_ds41_expert_tier[il]) {
+        routed_ok = ds41_expert_moe(m, l, il, routed, g->norm, g->selected, g->route_weights, 1);
+    } else
+#endif
 #ifndef __APPLE__
     if (g->tp_world == 2) {
         routed_ok = ds4_gpu_routed_moe_batch_owned_tensor(routed, g->gate, g->up, g->mid, g->experts,
@@ -42976,6 +43179,12 @@ static bool ds41_graph_after_moe(ds41_gpu_graph *g, const ds4_model *m,
               ds41_expand_partials(g, g->residual, g->after_attn, g->ffn_split, il, DS4_TP_GATE_FFN) :
               ds41_hc_expand(g->residual, g->block, g->after_attn, g->ffn_split)))
             return false;
+    } else if (ds41_steer_on(g, true)) {
+        /* the unfused tail of the fallback below, with the block output to steer */
+        if (!((!l || g->shared_done || ds41_shared_down(g, m, l)) &&
+              ds4_gpu_add_tensor(g->block, g->routed, g->shared, DS4_N_EMBD) &&
+              ds41_bf16(g->block, DS4_N_EMBD) && ds41_steer(g, g->block, il, 1, true) &&
+              ds41_hc_expand(g->residual, g->block, g->after_attn, g->ffn_split))) return false;
     } else if (!(l && !g->shared_done && l->ffn_down_shexp->type == DS4_TENSOR_Q8_0 && !ds41_expand_fusion_off() &&
                  ds4_gpu_dsv41_matmul_expand_rows(g->residual, m->map, m->size, l->ffn_down_shexp->abs_offset,
                      l->ffn_down_shexp->dim[0], l->ffn_down_shexp->dim[1], g->shared_mid, g->routed,
@@ -42984,7 +43193,8 @@ static bool ds41_graph_after_moe(ds41_gpu_graph *g, const ds4_model *m,
                  ds4_gpu_hc_expand_split_add_bf16_tensor(g->residual, g->routed, g->shared, g->after_attn, g->ffn_split,
                                                          DS4_N_EMBD, DS4_N_HC))) return false;
     g->shared_done = false;
-    return !carry || ds4_gpu_tensor_copy(g->pre, 0, g->ffn_split, 0, DS4_N_HC * sizeof(float));
+    return ds41_steer_site(g, g->residual, il, 1, DS41_STEER_RESID) &&
+        (!carry || ds4_gpu_tensor_copy(g->pre, 0, g->ffn_split, 0, DS4_N_HC * sizeof(float)));
 }
 
 static bool ds41_graph_layer(ds41_gpu_graph *g, const ds4_model *m,
@@ -43140,6 +43350,10 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
             DS4_N_EMBD, count, DS4_N_EXPERT, DS4_N_EXPERT_USED, g->tp_rank, il & 1u)) &&
 #endif
         (
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+        g_ds41_expert_tier[il] ?
+        ds41_expert_moe(m, l, il, b->routed, b->norm, b->selected, b->route_weights, count) :
+#endif
 #ifndef __APPLE__
         g->tp_world == 2 ?
         ds4_gpu_routed_moe_batch_owned_tensor(b->routed, b->gate, b->up, b->mid, b->experts,
@@ -43748,7 +43962,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             /* File-ordered selected reads are the default. Whole-layer
              * prefetch trades unused weight reads for overlap; retain it as
              * an explicit option for other storage/workload combinations. */
-            if (ok && total_count >= 2048u &&
+            if (ok && total_count >= 2048u && !g_ds41_expert_tier[il] &&
                 getenv("DS4_CUDA_ENABLE_SSD_PREFETCH") != NULL) {
                 const ds4_gpu_stream_expert_table current = graph_stream_expert_table_make(m,
                     &w->layer[il], il,
@@ -43944,6 +44158,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                     if (ok) ok = ds41_matmul_batch(g->batch.block, m, l->attn_output_b,
                                                    g->batch.low, count, true);
                 }
+                if (ok) ok = ds41_steer(g, g->batch.block, il, count, false);
                 DS41_STAGE("attention output");
                 if (ok && batch_hc) ok = ds41_after_attention_batch(&active, m, l, count, false);
                 DS41_STAGE("hc/ffn norm");
@@ -43963,9 +44178,11 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                 if (ok && batch_hc) {
                     ok = ds4_gpu_add_tensor(active.block, active.routed, active.shared, count * DS4_N_EMBD) &&
                         ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, count, DS4_V41_BF16) &&
+                        ds41_steer(g, active.block, il, count, true) &&
                         ds4_gpu_hc_expand_split_tensor(active.residual, active.block, active.after_attn,
                             active.ffn_split, DS4_N_EMBD, DS4_N_HC) &&
-                        ds4_gpu_dsv41_quantize(active.residual, DS4_N_EMBD * DS4_N_HC, count, DS4_V41_BF16);
+                        ds4_gpu_dsv41_quantize(active.residual, DS4_N_EMBD * DS4_N_HC, count, DS4_V41_BF16) &&
+                        ds41_steer_site(g, active.residual, il, count, DS41_STEER_RESID);
                 }
                 for (uint32_t t = 0; ok && !batch_hc && t < count; t++) {
 #define DS41_USE_MOE_ROW(name, width) row.name = g->rows_view[t].name;
@@ -44141,6 +44358,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
     }
     if (ok) ok = ds4_gpu_tensor_write(g->prefill_tokens, 0, tokens, rows * sizeof(int));
     const uint32_t flush_layers = ds41_decode_flush_layers();
+    const bool steered = ds41_steer_any(graphs, count);
+    const bool resid_steered = ds41_steer_resid_any(graphs, count);
     uint32_t il = 0;
     for (; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &weights->layer[il];
@@ -44173,7 +44392,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         const bool batch_output = batch_attention && g->tp_world != 2 &&
             l->attn_output_b->type == DS4_TENSOR_Q8_0;
         /* a few single-node rows: the output projections expand straight into the streams */
-        const bool fused_tail = batch_output && !shared_owner &&
+        const bool fused_tail = batch_output && !shared_owner && !steered &&
             l->ffn_down_shexp->type == DS4_TENSOR_Q8_0 && !ds41_expand_fusion_off();
         bool expanded = false;
         if (ok && batch_output) {
@@ -44209,7 +44428,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
                     model->map, model->size, l->attn_output_a->abs_offset,
                     l->attn_output_b->abs_offset, g->batch.heads, rows);
         if (ok && !expanded) ok = ds41_sum_partial_batch(g, active.block, il, DS4_TP_GATE_ATTN, rows) &&
-            ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16);
+            ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16) &&
+            (!steered || ds41_steer_rows(graphs, count, g->batch.block, il, DS41_STEER_ATTN));
         if (ok) ok = ds41_after_attention_batch(&active, model, l, rows, expanded) &&
             ds41_moe_batch(g, model, l, il, rows, shared_owner, !expanded) &&
             (expanded ? ds41_moe_expand_batch(&active, model, l, rows) :
@@ -44217,9 +44437,11 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
                   (uint64_t)rows * DS4_N_EMBD * sizeof(float)) :
                   ds4_gpu_add_tensor(active.block, active.routed, active.shared, rows * DS4_N_EMBD)) &&
               ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16) &&
+              (!steered || ds41_steer_rows(graphs, count, g->batch.block, il, DS41_STEER_FFN)) &&
               ds4_gpu_hc_expand_split_tensor(active.residual, active.block, active.after_attn,
                   active.ffn_split, DS4_N_EMBD, DS4_N_HC) &&
-              ds4_gpu_dsv41_quantize(active.residual, DS4_N_EMBD * DS4_N_HC, rows, DS4_V41_BF16)));
+              ds4_gpu_dsv41_quantize(active.residual, DS4_N_EMBD * DS4_N_HC, rows, DS4_V41_BF16))) &&
+            (!resid_steered || ds41_steer_rows(graphs, count, g->batch.residual, il, DS41_STEER_RESID));
         /* The second Engram upload reuses the first one's input storage. The
          * first flush follows layer 0, which runs while the Engram rows load. */
         if (ok && il == 13) ok = ds4_gpu_end_commands() && ds4_gpu_begin_commands();
@@ -44361,6 +44583,10 @@ typedef enum {
 struct ds4_engine {
     char *model_path;
     uint64_t ds41_session_bytes;
+    /* V4.1 on CUDA: --gpu-devices after the first hold routed experts. */
+    int ds41_main_device;
+    int ds41_expert_devices[DS4_MAX_GPUS];
+    int ds41_expert_device_count;
     ds4_model model;
     ds4_model mtp_model;
     ds4_model vision_model;
@@ -44389,6 +44615,7 @@ struct ds4_engine {
     float *directional_steering_dirs;
     float directional_steering_attn_scale;
     float directional_steering_ffn_scale;
+    float directional_steering_resid_scale;
     int power_percent;
     uint32_t prefill_chunk;
     uint32_t ssd_streaming_cache_experts;
@@ -66319,6 +66546,11 @@ static int ds4_engine_collect_sequential_imatrix(
             fprintf(stderr, "ds4: V4.1 imatrix collection requires a single-host session\n");
             return 1;
         }
+        /* Offloaded layers never fill the main device's routed activations. */
+        if (e->ds41_expert_device_count) {
+            fprintf(stderr, "ds4: V4.1 imatrix collection requires a single GPU\n");
+            return 1;
+        }
         if (ctx_size > 1048576 ||
             !ds41_memory_admit(e, ds4_add_sat_u64(e->ds41_session_bytes,
                 ds41_graph_bytes((uint32_t)ctx_size)), false) ||
@@ -72935,13 +73167,26 @@ static bool ds41_memory_admit_for_host(ds4_engine *e, uint64_t graph_bytes,
     }
     uint64_t weights = g_tp_shard_model_bytes ? g_tp_shard_model_bytes : e->model.size;
     if (e->ssd_streaming && !weights_streaming_non_routed_bytes(&e->weights, &weights)) return false;
-    const uint64_t fixed = ds41_fixed_memory(e, weights, graph_bytes);
+    uint64_t fixed = ds41_fixed_memory(e, weights, graph_bytes);
     uint64_t expert = 0;
     if (e->ssd_streaming && !ds4_streaming_routed_expert_bytes(&e->weights, &expert)) return false;
+    /* The auto cache plan does not see the context.  When the graph leaves no
+     * room for the full prefill reserve, stage one layer of experts at a time
+     * and leave the rest to the decode cache. */
+    const uint64_t headroom = e->ssd_streaming_prefill_headroom_bytes;
+    const uint64_t layer = ds4_mul_sat_u64(expert, DS4_N_EXPERT);
+    if (fit_cache && expert && headroom > layer && ds4_add_sat_u64(fixed, expert) > budget) {
+        fprintf(stderr, "ds4: V4.1 SSD prefill reserve reduced from %.2f to %.2f GiB "
+                        "for context/runtime headroom\n",
+                ds4_bytes_to_gib(headroom), ds4_bytes_to_gib(layer));
+        e->ssd_streaming_prefill_headroom_bytes = layer;
+        fixed = ds41_fixed_memory(e, weights, graph_bytes);
+    }
     if (fixed >= budget || (expert && budget - fixed < expert)) {
         fprintf(stderr, "ds4: V4.1 needs %.2f GiB before the expert cache; safe budget %.2f GiB. "
-                        "Use --ssd-streaming or a smaller context.\n",
-                ds4_bytes_to_gib(fixed), ds4_bytes_to_gib(budget));
+                        "Use %s.\n",
+                ds4_bytes_to_gib(fixed), ds4_bytes_to_gib(budget),
+                e->ssd_streaming ? "a smaller --ctx" : "--ssd-streaming or a smaller context");
         return false;
     }
     if (expert && e->ssd_streaming_cache_experts > (budget - fixed) / expert) {
@@ -72968,6 +73213,102 @@ static bool ds41_memory_admit(ds4_engine *e, uint64_t graph_bytes, bool fit_cach
     return ds41_memory_admit_for_host(e, graph_bytes, fit_cache,
         host, ds4_gpu_recommended_working_set_size());
 }
+
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+static uint64_t ds41_expert_env_u64(const char *name, uint64_t fallback) {
+    const char *s = getenv(name);
+    char *end = NULL;
+    const unsigned long long v = s && s[0] ? strtoull(s, &end, 10) : 0;
+    return end && end != s && *end == '\0' ? (uint64_t)v : fallback;
+}
+
+static void ds41_release_expert_devices(void) {
+    for (int t = 0; t < DS4_MAX_GPUS; t++) {
+        ds41_expert_scratch *r = &g_ds41_expert_scratch[t];
+        ds4_gpu_tensor *tensors[] = {r->x, r->selected, r->weights, r->gate,
+                                     r->up, r->mid, r->down, r->out};
+        for (size_t i = 0; i < sizeof(tensors) / sizeof(tensors[0]); i++)
+            ds4_gpu_tensor_free(tensors[i]);
+        memset(r, 0, sizeof(*r));
+    }
+    memset(g_ds41_expert_tier, 0, sizeof(g_ds41_expert_tier));
+    g_ds41_expert_rows = 0;
+}
+
+/* Fill each expert device with whole routed layers, in layer order, keeping
+ * the routed-row scratch and a kernel workspace reserve free. Layers that do
+ * not fit keep streaming from SSD on the main device. */
+static bool ds41_install_expert_devices(ds4_engine *e) {
+    const ds4_weights *w = &e->weights;
+    if (!ds4_gpu_init_expert_devices(e->ds41_expert_devices, e->ds41_expert_device_count)) {
+        fprintf(stderr, "ds4: V4.1 expert device initialization failed\n");
+        return false;
+    }
+    uint64_t rows = ds41_expert_env_u64("DS4_V41_EXPERT_ROWS", 1024);
+    if (rows < 1) rows = 1;
+    if (rows > 8192) rows = 8192;
+    const uint64_t pairs = rows * DS4_N_EXPERT_USED;
+    const uint64_t sizes[8] = {
+        rows * DS4_N_EMBD * 4, pairs * 4, pairs * 4, pairs * DS4_N_FF_EXP * 4,
+        pairs * DS4_N_FF_EXP * 4, pairs * DS4_N_FF_EXP * 4, pairs * DS4_N_EMBD * 4,
+        rows * DS4_N_EMBD * 4,
+    };
+    uint64_t scratch = 0;
+    for (int i = 0; i < 8; i++) scratch += sizes[i];
+    const uint64_t reserve = scratch +
+        (ds41_expert_env_u64("DS4_V41_EXPERT_RESERVE_MB", 1024) << 20);
+    ds4_tensor_range ranges[3 * DS4_MAX_LAYER];
+    int n_ranges = 0;
+    uint32_t il = 0, placed = 0, routed = 0;
+    for (uint32_t i = 0; i < DS4_N_LAYER; i++) routed += w->layer[i].ffn_gate_exps != NULL;
+    for (int t = 1; t <= e->ds41_expert_device_count; t++) {
+        const uint64_t free_bytes = ds4_gpu_tier_free_vram(t);
+        uint64_t room = free_bytes > reserve ? free_bytes - reserve : 0, bytes = 0;
+        uint32_t first = DS4_N_LAYER, last = 0;
+        for (; il < DS4_N_LAYER; il++) {
+            const ds4_layer_weights *l = &w->layer[il];
+            if (!l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps) continue;
+            const ds4_tensor *exps[3] = {l->ffn_gate_exps, l->ffn_up_exps, l->ffn_down_exps};
+            const uint64_t layer = exps[0]->bytes + exps[1]->bytes + exps[2]->bytes;
+            if (layer > room) break;
+            room -= layer;
+            bytes += layer;
+            for (int k = 0; k < 3; k++)
+                ranges[n_ranges++] = (ds4_tensor_range){exps[k]->abs_offset, exps[k]->bytes, t};
+            g_ds41_expert_tier[il] = (uint8_t)t;
+            if (first == DS4_N_LAYER) first = il;
+            last = il;
+            placed++;
+        }
+        if (first == DS4_N_LAYER) {
+            fprintf(stderr, "ds4: V4.1 expert device %d holds no layers (%.2f GiB free)\n",
+                    e->ds41_expert_devices[t - 1], (double)free_bytes / 1073741824.0);
+            continue;
+        }
+        fprintf(stderr, "ds4: V4.1 expert device %d: layers %u-%u routed experts (%.2f GiB)\n",
+                e->ds41_expert_devices[t - 1], first, last, (double)bytes / 1073741824.0);
+        ds41_expert_scratch *r = &g_ds41_expert_scratch[t];
+        ds4_gpu_tensor **slots[8] = {&r->x, &r->selected, &r->weights, &r->gate,
+                                     &r->up, &r->mid, &r->down, &r->out};
+        for (int i = 0; i < 8; i++) {
+            if (!(*slots[i] = ds4_gpu_tensor_alloc_ptr_on(t, sizes[i]))) {
+                fprintf(stderr, "ds4: V4.1 expert device %d scratch allocation failed\n",
+                        e->ds41_expert_devices[t - 1]);
+                return false;
+            }
+        }
+    }
+    g_ds41_expert_rows = (uint32_t)rows;
+    if (n_ranges && !ds4_gpu_expert_devices_load(ranges, n_ranges, reserve - scratch)) {
+        fprintf(stderr, "ds4: V4.1 expert device load failed\n");
+        return false;
+    }
+    fprintf(stderr, "ds4: V4.1 routed experts: %u of %u layers on expert devices, "
+                    "%u stream from SSD on device %d\n",
+            placed, routed, routed - placed, e->ds41_main_device);
+    return true;
+}
+#endif
 #endif
 
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
@@ -73020,14 +73361,6 @@ static int ds4_engine_open_internal(ds4_engine **out,
         *out = NULL;
         return 1;
 #endif
-        if (opt->backend == DS4_BACKEND_CUDA && gpu_cfg &&
-            gpu_cfg->n_gpus > 1) {
-            fprintf(stderr,
-                    "ds4: GLM-5.3 CUDA/ROCm vision currently requires one GPU\n");
-            free(e);
-            *out = NULL;
-            return 1;
-        }
     }
     e->prefill_chunk =
         ds4_effective_prefill_chunk(opt->cuda_tensor_parallel,
@@ -73063,7 +73396,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
         *out = NULL;
         return 1;
     }
-    if ((opt->directional_steering_attn != 0.0f || opt->directional_steering_ffn != 0.0f) &&
+    if ((opt->directional_steering_attn != 0.0f || opt->directional_steering_ffn != 0.0f ||
+         opt->directional_steering_resid != 0.0f) &&
         (!opt->directional_steering_file || !opt->directional_steering_file[0]))
     {
         fprintf(stderr, "ds4: directional steering needs --dir-steering-file\n");
@@ -73075,6 +73409,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
         e->directional_steering_file = ds4_strdup(opt->directional_steering_file);
         e->directional_steering_attn_scale = opt->directional_steering_attn;
         e->directional_steering_ffn_scale = opt->directional_steering_ffn;
+        e->directional_steering_resid_scale = opt->directional_steering_resid;
     }
     if (opt->n_threads > 0) g_requested_threads = (uint32_t)opt->n_threads;
     e->placement_ctx_hint = opt->placement_ctx_hint;
@@ -73115,14 +73450,28 @@ static int ds4_engine_open_internal(ds4_engine **out,
     const bool graph_backend = ds4_backend_uses_graph(opt->backend);
     if (graph_backend) ds4_linux_graph_backend_set_oom_score(opt->backend);
     model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only);
+    /* The V4.1 encoder runs on Metal and on CUDA (not yet checked on ROCm). */
+#ifdef DS4_ROCM_BUILD
+    const bool ds41_vision_backend = e->backend == DS4_BACKEND_METAL;
+#else
+    const bool ds41_vision_backend =
+        e->backend == DS4_BACKEND_METAL || e->backend == DS4_BACKEND_CUDA;
+#endif
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 &&
-        opt->vision_path && opt->vision_path[0] && e->backend != DS4_BACKEND_METAL) {
-        fprintf(stderr, "ds4: V4.1 vision requires Metal\n");
+        opt->vision_path && opt->vision_path[0] && !ds41_vision_backend) {
+        fprintf(stderr, "ds4: V4.1 vision requires Metal or CUDA\n");
         ds4_engine_close(e);
         *out = NULL;
         return 1;
     }
     config_validate_model(&e->model);
+    /* the model family is known from here on */
+    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41 && opt->directional_steering_resid != 0.0f) {
+        fprintf(stderr, "ds4: --dir-steering-resid is only implemented for DeepSeek V4.1\n");
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
+    }
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
     /* V4.1's model views are read-only to the GPU: untracked by default */
     if (e->backend == DS4_BACKEND_METAL)
@@ -73151,7 +73500,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
         const bool supported = (e->backend == DS4_BACKEND_METAL ||
 #if defined(DS4_HAS_DEEPSEEK41_GPU) && !defined(__APPLE__)
                 (e->backend == DS4_BACKEND_CUDA && !opt->cuda_tensor_parallel &&
-                 (!gpu_cfg || gpu_cfg->n_gpus <= 1)) ||
+                 (!gpu_cfg || gpu_cfg->n_gpus <= 1 ||
+#ifndef DS4_ROCM_BUILD
+                  (opt->tp.role == DS4_TP_NONE && opt->ssd_streaming) ||
+#endif
+                  false)) ||
 #endif
                  false) &&
 #ifdef DS4_ROCM_BUILD
@@ -73160,16 +73513,40 @@ static int ds4_engine_open_internal(ds4_engine **out,
             opt->distributed.role == DS4_DISTRIBUTED_NONE &&
             !load_slice && !opt->glm_mtp &&
             !opt->first_token_test && !opt->metal_graph_test &&
-            (!opt->directional_steering_file || !opt->directional_steering_file[0]) &&
             e->power_percent == 100 && opt->context_size <= 1048576;
         if (!supported) {
-            fprintf(stderr, "ds4: V4.1 requires Metal, single-GPU CUDA or ROCm (network TP on Metal/CUDA); "
-                            "steering and legacy diagnostics "
+            fprintf(stderr, "ds4: V4.1 requires Metal, single-GPU CUDA or ROCm (network TP on Metal/CUDA; "
+                            "extra CUDA expert devices need --ssd-streaming); "
+                            "legacy diagnostics "
                             "are not supported (maximum context 1048576)\n");
             ds4_engine_close(e);
             *out = NULL;
             return 1;
         }
+        /* Steering runs on the single-host graph: TP ranks would each need
+         * it after their partial sums, and ROCm is not checked yet. */
+#ifdef DS4_ROCM_BUILD
+        const bool steer_backend = false;
+#else
+        const bool steer_backend = e->backend == DS4_BACKEND_METAL || e->backend == DS4_BACKEND_CUDA;
+#endif
+        if (opt->directional_steering_file && opt->directional_steering_file[0] &&
+            (!steer_backend || opt->tp.role != DS4_TP_NONE)) {
+            fprintf(stderr, "ds4: V4.1 directional steering needs Metal or CUDA on one host\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+#if defined(DS4_HAS_DEEPSEEK41_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+        /* The graph runs single-GPU on the first device; the others only
+         * hold routed experts, so the rest of startup sees one GPU. */
+        if (e->backend == DS4_BACKEND_CUDA && gpu_cfg && gpu_cfg->n_gpus > 1) {
+            e->ds41_main_device = gpu_cfg->device_indices[0];
+            for (int i = 1; i < gpu_cfg->n_gpus; i++)
+                e->ds41_expert_devices[e->ds41_expert_device_count++] = gpu_cfg->device_indices[i];
+            gpu_cfg = NULL;
+        }
+#endif
         /* The agent may change directory before creating its first session.
          * Engram readers reopen this file and check it against model.fd. */
         e->model_path = realpath(opt->model_path, NULL);
@@ -73179,6 +73556,16 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = NULL;
             return 1;
         }
+    }
+    /* CUDA/ROCm vision runs on one GPU. V4.1 expert devices qualify: the
+     * graph and the encoder stay on the first device (gpu_cfg is NULL). */
+    if (opt->vision_path && opt->vision_path[0] &&
+        opt->backend == DS4_BACKEND_CUDA && gpu_cfg && gpu_cfg->n_gpus > 1) {
+        fprintf(stderr, "ds4: CUDA/ROCm vision currently requires one GPU "
+                        "(or V4.1 extra GPUs as expert devices)\n");
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
     }
     if (engine_warm_full_model(opt) && DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41)
         model_warm_weights(&e->model);
@@ -73821,6 +74208,14 @@ static int ds4_engine_open_internal(ds4_engine **out,
 
         /* Single-tier path (every existing caller). Body is byte-equivalent
          * to pre-multi-GPU CLI main. */
+#if defined(DS4_HAS_DEEPSEEK41_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+        if (e->ds41_expert_device_count) {
+            ds4_gpu_config main_cfg = {0};
+            main_cfg.n_gpus = 1;
+            main_cfg.device_indices[0] = e->ds41_main_device;
+            e->metal_ready = ds4_gpu_init_multi(&main_cfg) != 0;
+        } else
+#endif
         e->metal_ready = ds4_gpu_init() != 0;
         if (!e->metal_ready) {
             fprintf(stderr, "ds4: %s backend unavailable; aborting startup\n",
@@ -74352,6 +74747,13 @@ static int ds4_engine_open_internal(ds4_engine **out,
                 return 1;
             }
         }
+#if defined(DS4_HAS_DEEPSEEK41_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+        if (e->ds41_expert_device_count && !ds41_install_expert_devices(e)) {
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+#endif
         fprintf(stderr, "ds4: %s backend initialized for graph diagnostics\n",
                 ds4_backend_name(e->backend));
     }
@@ -75356,6 +75758,9 @@ void ds4_engine_close(ds4_engine *e) {
         metal_graph_free_prefill_workspace(&e->shared_prefill_workspace);
         e->shared_prefill_workspace_ready = false;
     }
+#if defined(DS4_HAS_DEEPSEEK41_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (e->ds41_expert_device_count) ds41_release_expert_devices();
+#endif
     ds4_gpu_cleanup();
 #endif
     ds4_ssd_memory_lock_release(&e->simulated_memory);
@@ -75562,6 +75967,14 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                 return 1;
             }
             s->ds41_graph.allocation_bytes += UINT64_C(64) << 20;
+        }
+        if (!ds41_graph_load_steering(&s->ds41_graph, e->directional_steering_file,
+                                      e->directional_steering_attn_scale,
+                                      e->directional_steering_ffn_scale,
+                                      e->directional_steering_resid_scale)) {
+            ds41_graph_free(&s->ds41_graph);
+            free(s);
+            return 1;
         }
         if (e->tp.active) {
             s->ds41_graph.tp_world = 2;
@@ -76101,6 +76514,9 @@ float ds4_session_directional_steering_ffn(ds4_session *s) {
     if (!s || !s->engine) return 0.0f;
 #ifndef DS4_NO_GPU
     if (!ds4_session_is_cpu(s)) {
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+        if (s->ds41_graph_ready) return s->ds41_graph.steer_ffn;
+#endif
         return ds4_session_is_glm(s) ?
             s->glm_graph.directional_steering_ffn_scale :
             s->graph.directional_steering_ffn_scale;
@@ -76128,6 +76544,11 @@ int ds4_session_set_directional_steering_ffn(ds4_session *s, float scale) {
             loaded = s->qwen4_graph.steer_dirs != NULL;
         } else
 #endif
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+        if (s->ds41_graph_ready) {
+            loaded = s->ds41_graph.steer_dirs != NULL;
+        } else
+#endif
         if (ds4_session_is_glm(s)) {
             const int tier = glm_graph_directional_steering_tier(
                     &s->glm_graph, s->glm_graph.layer_start);
@@ -76151,6 +76572,12 @@ int ds4_session_set_directional_steering_ffn(ds4_session *s, float scale) {
         if (s->qwen4_graph_ready) {
             s->qwen4_graph.steer_ffn_scale = scale;
             s->glm_mtp_have = 0;
+        } else
+#endif
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+        if (s->ds41_graph_ready) {
+            s->ds41_graph.steer_ffn = scale;
+            ds4_session_dspark_capture_invalidate(s);
         } else
 #endif
         if (ds4_session_is_glm(s)) {

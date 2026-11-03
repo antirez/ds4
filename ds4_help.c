@@ -157,7 +157,9 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     opt(fp, c, "--metal | --cuda | --cpu", "Select the backend explicitly.");
     opt(fp, c, "--backend NAME", "Backend name: metal, cuda, or cpu.");
     opt(fp, c, "--gpu-vram N[,N,...]|auto", "CUDA VRAM budgets per device, in GiB, or auto-detect free VRAM.");
-    opt(fp, c, "--gpu-devices N[,N,...]", "CUDA device indices used by multi-GPU placement.");
+    opt(fp, c, "--gpu-devices N[,N,...]", "CUDA device indices used by multi-GPU placement. "
+        "V4.1 with --ssd-streaming runs on the first device and keeps whole routed-expert "
+        "layers on the others.");
     if (tool != DS4_HELP_EVAL) {
         opt(fp, c, "--cuda-tensor-parallel", "Enable the paired DeepSeek tensor/expert path on an even multi-GPU CUDA placement.");
     }
@@ -231,6 +233,7 @@ static void print_steering(FILE *fp, const help_colors *c) {
     opt(fp, c, "--dir-steering-file FILE", "Load one f32 direction vector per layer.");
     opt(fp, c, "--dir-steering-ffn F", "Apply steering after FFN outputs. Default with file: 1");
     opt(fp, c, "--dir-steering-attn F", "Apply steering after attention outputs. Default: 0");
+    opt(fp, c, "--dir-steering-resid F", "V4.1: steer the residual after each layer (mean of HC copies). Default: 0");
     fputc('\n', fp);
 }
 

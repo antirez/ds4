@@ -325,6 +325,20 @@ typedef struct {
 int ds4_gpu_device_cache_tensors(int device_id,
                                  const ds4_tensor_range *ranges,
                                  int n_ranges);
+
+/* V4.1 expert devices: after a single-device init, add CUDA devices that
+ * hold whole routed-expert layers as logical tiers 1..n. The graph stays
+ * single-tier; tensors allocated on these tiers run the routed MoE there.
+ * Returns 1 on success. */
+int ds4_gpu_init_expert_devices(const int *device_ids, int n);
+
+/* Load routed-expert ranges (target_device = logical expert tier) with one
+ * reader thread per device and register them for per-device weight lookups.
+ * reserve_bytes must stay free on each device afterwards. Returns 1 on
+ * success. */
+int ds4_gpu_expert_devices_load(const ds4_tensor_range *ranges, int n_ranges,
+                                uint64_t reserve_bytes);
+
 int ds4_gpu_register_support_map(const void *map, uint64_t size, uint64_t bias);
 int ds4_gpu_device_cache_support_tensors(int device_id,
                                          int entry_device_id,
