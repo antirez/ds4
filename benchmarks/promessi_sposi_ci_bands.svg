@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="576" viewBox="0 0 1024 576">
+<style>
+text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; }
+.title { font-size: 22px; font-weight: 700; fill: #0f172a; }
+.subtitle { font-size: 13px; font-weight: 500; fill: #64748b; }
+.axis-label { font-size: 13px; font-weight: 600; fill: #334155; }
+.tick { font-size: 11px; font-weight: 500; fill: #64748b; }
+.legend { font-size: 12px; font-weight: 600; fill: #1e293b; }
+.whisker { stroke-linecap: round; }
+</style>
+<rect width="1024" height="576" fill="#ffffff"/>
+<text class="title" x="90" y="36">Context Scaling with 95% Confidence Intervals — promessi_sposi_sweep</text>
+<text class="subtitle" x="90" y="56">DeepSeek-V4-Flash Q2 (80.7 GiB) on RTX 3090 (24 GB VRAM) — Shaded Ribbons = ±t·SE</text>
+<line x1="90" y1="496.00" x2="934" y2="496.00" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="78" y="500.00" text-anchor="end">0</text>
+<line x1="90" y1="392.00" x2="934" y2="392.00" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="78" y="396.00" text-anchor="end">50</text>
+<line x1="90" y1="288.00" x2="934" y2="288.00" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="78" y="292.00" text-anchor="end">100</text>
+<line x1="90" y1="184.00" x2="934" y2="184.00" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="78" y="188.00" text-anchor="end">150</text>
+<line x1="90" y1="80.00" x2="934" y2="80.00" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="78" y="84.00" text-anchor="end">200</text>
+<text class="tick" x="946" y="500.00" text-anchor="start">0</text>
+<text class="tick" x="946" y="396.00" text-anchor="start">2</text>
+<text class="tick" x="946" y="292.00" text-anchor="start">4</text>
+<text class="tick" x="946" y="188.00" text-anchor="start">6</text>
+<text class="tick" x="946" y="84.00" text-anchor="start">8</text>
+<line x1="90.00" y1="80" x2="90.00" y2="496" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="90.00" y="518" text-anchor="middle">0</text>
+<line x1="347.57" y1="80" x2="347.57" y2="496" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="347.57" y="518" text-anchor="middle">5k</text>
+<line x1="605.14" y1="80" x2="605.14" y2="496" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="605.14" y="518" text-anchor="middle">10k</text>
+<line x1="862.71" y1="80" x2="862.71" y2="496" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="862.71" y="518" text-anchor="middle">15k</text>
+<line x1="90" y1="80" x2="90" y2="496" stroke="#334155" stroke-width="1.4"/>
+<line x1="934" y1="80" x2="934" y2="496" stroke="#334155" stroke-width="1.4"/>
+<line x1="90" y1="496" x2="934" y2="496" stroke="#334155" stroke-width="1.4"/>
+<text class="axis-label" x="512.0" y="552" text-anchor="middle">Context Length (Tokens)</text>
+<text class="axis-label" x="24" y="288.0" text-anchor="middle" transform="rotate(-90 24 288.0)">prefill t/s</text>
+<text class="axis-label" x="1000" y="288.0" text-anchor="middle" transform="rotate(90 1000 288.0)">decode steady t/s</text>
+<polygon points="195.50,347.38 301.00,258.71 512.00,255.95 934.00,246.15 934.00,246.15 512.00,255.95 301.00,258.71 195.50,347.38" fill="#9accee" fill-opacity="0.35"/>
+<line class="whisker" x1="195.50" y1="347.38" x2="195.50" y2="347.38" stroke="#0072B2" stroke-width="1.6" opacity="0.75"/>
+<line class="whisker" x1="191.50" y1="347.38" x2="199.50" y2="347.38" stroke="#0072B2" stroke-width="1.6" opacity="0.75"/>
+<line class="whisker" x1="191.50" y1="347.38" x2="199.50" y2="347.38" stroke="#0072B2" stroke-width="1.6" opacity="0.75"/>
+<line class="whisker" x1="301.00" y1="258.71" x2="301.00" y2="258.71" stroke="#0072B2" stroke-width="1.6" opacity="0.75"/>
+<line class="whisker" x1="297.00" y1="258.71" x2="305.00" y2="258.71" stroke="#0072B2" stroke-width="1.6" opacity="0.75"/>
+<line class="whisker" x1="297.00" y1="258.71" x2="305.00" y2="258.71" stroke="#0072B2" stroke-width="1.6" opacity="0.75"/>
+<line class="whisker" x1="512.00" y1="255.95" x2="512.00" y2="255.95" stroke="#0072B2" stroke-width="1.6" opacity="0.75"/>
+<line class="whisker" x1="508.00" y1="255.95" x2="516.00" y2="255.95" stroke="#0072B2" stroke-width="1.6" opacity="0.75"/>
+<line class="whisker" x1="508.00" y1="255.95" x2="516.00" y2="255.95" stroke="#0072B2" stroke-width="1.6" opacity="0.75"/>
+<line class="whisker" x1="934.00" y1="246.15" x2="934.00" y2="246.15" stroke="#0072B2" stroke-width="1.6" opacity="0.75"/>
+<line class="whisker" x1="930.00" y1="246.15" x2="938.00" y2="246.15" stroke="#0072B2" stroke-width="1.6" opacity="0.75"/>
+<line class="whisker" x1="930.00" y1="246.15" x2="938.00" y2="246.15" stroke="#0072B2" stroke-width="1.6" opacity="0.75"/>
+<polyline fill="none" stroke="#0072B2" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round" points="195.50,347.38 301.00,258.71 512.00,255.95 934.00,246.15"/>
+<circle cx="195.50" cy="347.38" r="4.5" fill="#ffffff" stroke="#0072B2" stroke-width="2.5"/>
+<circle cx="301.00" cy="258.71" r="4.5" fill="#ffffff" stroke="#0072B2" stroke-width="2.5"/>
+<circle cx="512.00" cy="255.95" r="4.5" fill="#ffffff" stroke="#0072B2" stroke-width="2.5"/>
+<circle cx="934.00" cy="246.15" r="4.5" fill="#ffffff" stroke="#0072B2" stroke-width="2.5"/>
+<polygon points="195.50,157.48 301.00,149.16 512.00,208.44 934.00,214.16 934.00,214.16 512.00,208.44 301.00,149.16 195.50,157.48" fill="#f8c7a7" fill-opacity="0.35"/>
+<line class="whisker" x1="195.50" y1="157.48" x2="195.50" y2="157.48" stroke="#D55E00" stroke-width="1.6" opacity="0.75"/>
+<line class="whisker" x1="191.50" y1="157.48" x2="199.50" y2="157.48" stroke="#D55E00" stroke-width="1.6" opacity="0.75"/>
+<line class="whisker" x1="191.50" y1="157.48" x2="199.50" y2="157.48" stroke="#D55E00" stroke-width="1.6" opacity="0.75"/>
+<line class="whisker" x1="301.00" y1="149.16" x2="301.00" y2="149.16" stroke="#D55E00" stroke-width="1.6" opacity="0.75"/>
+<line class="whisker" x1="297.00" y1="149.16" x2="305.00" y2="149.16" stroke="#D55E00" stroke-width="1.6" opacity="0.75"/>
+<line class="whisker" x1="297.00" y1="149.16" x2="305.00" y2="149.16" stroke="#D55E00" stroke-width="1.6" opacity="0.75"/>
+<line class="whisker" x1="512.00" y1="208.44" x2="512.00" y2="208.44" stroke="#D55E00" stroke-width="1.6" opacity="0.75"/>
+<line class="whisker" x1="508.00" y1="208.44" x2="516.00" y2="208.44" stroke="#D55E00" stroke-width="1.6" opacity="0.75"/>
+<line class="whisker" x1="508.00" y1="208.44" x2="516.00" y2="208.44" stroke="#D55E00" stroke-width="1.6" opacity="0.75"/>
+<line class="whisker" x1="934.00" y1="214.16" x2="934.00" y2="214.16" stroke="#D55E00" stroke-width="1.6" opacity="0.75"/>
+<line class="whisker" x1="930.00" y1="214.16" x2="938.00" y2="214.16" stroke="#D55E00" stroke-width="1.6" opacity="0.75"/>
+<line class="whisker" x1="930.00" y1="214.16" x2="938.00" y2="214.16" stroke="#D55E00" stroke-width="1.6" opacity="0.75"/>
+<polyline fill="none" stroke="#D55E00" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round" points="195.50,157.48 301.00,149.16 512.00,208.44 934.00,214.16"/>
+<circle cx="195.50" cy="157.48" r="4.5" fill="#ffffff" stroke="#D55E00" stroke-width="2.5"/>
+<circle cx="301.00" cy="149.16" r="4.5" fill="#ffffff" stroke="#D55E00" stroke-width="2.5"/>
+<circle cx="512.00" cy="208.44" r="4.5" fill="#ffffff" stroke="#D55E00" stroke-width="2.5"/>
+<circle cx="934.00" cy="214.16" r="4.5" fill="#ffffff" stroke="#D55E00" stroke-width="2.5"/>
+<rect x="704" y="94" width="230" height="80" rx="6" fill="#ffffff" fill-opacity="0.95" stroke="#cbd5e1" stroke-width="1.2"/>
+<rect x="718" y="108" width="24" height="14" fill="#9accee" fill-opacity="0.5"/>
+<line x1="718" y1="115" x2="742" y2="115" stroke="#0072B2" stroke-width="2.5"/>
+<circle cx="730" cy="115" r="3" fill="#fff" stroke="#0072B2" stroke-width="2"/>
+<text class="legend" x="750" y="119">Prefill Throughput (t/s)</text>
+<rect x="718" y="134" width="24" height="14" fill="#f8c7a7" fill-opacity="0.5"/>
+<line x1="718" y1="141" x2="742" y2="141" stroke="#D55E00" stroke-width="2.5"/>
+<circle cx="730" cy="141" r="3" fill="#fff" stroke="#D55E00" stroke-width="2"/>
+<text class="legend" x="750" y="145">Decode Throughput (t/s)</text>
+</svg>

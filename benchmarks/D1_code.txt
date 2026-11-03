@@ -1,0 +1,1 @@
+Write a complete, thread-safe lock-free ring buffer in C11 for passing fixed-size 64-byte messages between a single producer thread and a single consumer thread using explicit memory_order_acquire and memory_order_release semantics. Explain why memory_order_relaxed is insufficient for the head and tail index updates and provide a minimal benchmark main() function.

@@ -1,0 +1,1 @@
+Consider a sequence of positive integers defined by a_1 = 2, a_2 = 5, and a_{n+2} = 3*a_{n+1} - 2*a_n + 4 for all n >= 1. Find the closed-form expression for a_n as a function of n, verify your formula for n = 1, 2, 3, 4, and determine the remainder when a_{100} is divided by 1000.
