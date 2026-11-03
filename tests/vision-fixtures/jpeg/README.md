@@ -1,4 +1,6 @@
-# Progressive JPEG AC-refinement ZRL fixtures
+# Progressive JPEG fixtures
+
+## AC-refinement ZRL
 
 These images exercise successive-approximation AC refinement (`Ss=1, Se=63,
 Ah=2, Al=1`) with restart markers. The unpatched Iris decoder mishandles ZRL
@@ -14,3 +16,15 @@ Generated with libjpeg-turbo 3.2.0 `cjpeg`. Re-run `./generate.sh` if you have
 | `prog_ac_refine_zrl_420.jpg` | 64x48 YCbCr 4:2:0 | Unpatched `jpeg_load` returns NULL. Patched decode is bit-exact with `djpeg`. |
 
 `make test` covers both through `tests/test_image_decode`.
+
+## Malformed scan headers
+
+This image is hand-built from the reproducer in issue #1292, so `generate.sh`
+does not recreate it: `cjpeg` cannot emit an out-of-range scan. Decoding it must
+fail.
+
+| File | Size | Why it is here |
+| --- | --- | --- |
+| `prog_sos_se_oob.jpg` | 1x1 grayscale | AC scan with `Ss=1, Se=200`. Unpatched decode indexes `jpeg_zigzag[]` past 63 and can write outside the coefficient block. Patched decode rejects the scan. |
+
+`make test` covers it through `tests/test_image_decode`.
