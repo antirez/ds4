@@ -1118,15 +1118,14 @@ static ds4_context_memory qwen4_graph_memory_estimate(uint32_t ctx, uint32_t pre
 static int g_ds4_lock_fd = -1;
 
 
-/* This controls prompt-time predictor cache preparation, not speculation.
- * Keep the established predictor history by default; auto is an explicit
- * streaming-only policy until resident acceptance/wall-time is measured. */
+/* Preparing the draft history costs prefill time. With streamed experts,
+ * a better draft can also save disk reads during generation. */
 static DS4_MAYBE_UNUSED int qwen4_mtp_prefill_resolve(bool mtp_enabled, bool streaming,
                                                     const char *value) {
     if (!mtp_enabled) return 0;
-    if (!value || !value[0] || !strcmp(value, "on") || !strcmp(value, "1")) return 1;
+    if (!value || !value[0] || !strcmp(value, "auto")) return streaming;
+    if (!strcmp(value, "on") || !strcmp(value, "1")) return 1;
     if (!strcmp(value, "off") || !strcmp(value, "0")) return 0;
-    if (!strcmp(value, "auto")) return streaming ? 1 : 0;
     return -1;
 }
 

@@ -125,20 +125,21 @@ describes training this module over multiple steps and using QSA in it.
 These weights are already included in the GGUF; no separate draft model is
 needed.
 
-By default, prompt prefill prepares the predictor's K/V and indexer cache from the
-trunk hidden states and the next prompt token. It skips the predictor's
+With SSD streaming, prompt prefill prepares the predictor's K/V and indexer
+cache from the trunk hidden states and the next prompt token by default. It skips the predictor's
 attention output, MoE and vocabulary head, so this preparation does not
 stream predictor experts from SSD. The final hidden row is retained until
 the actual next token is known. Snapshot restore and speculative rollback
-retain that row too; this costs 40 KiB per row for this model, at most
+retain that row too. This costs 40 KiB per row for this model, at most
 160 KiB including the three verifier snapshots. Qwen payload version 3
 stores the initialized prefix and retained row. Version 2 checkpoints and
 plain checkpoints restore their target state directly. When MTP is enabled
 without a saved predictor tail, the engine replays the saved tokens once
-before continuing. [`DS4_QWEN4_MTP_PREFILL`](QWEN38_FLASH_NEXT.md) can skip historical
-projections or restrict preparation to SSD streaming, while keeping MTP and
-target verification enabled. Skipped rows are initialized to zero; changed
-draft acceptance can offset the prefill saving.
+before continuing. With resident weights, prefill skips historical predictor
+projections and initializes those cache rows to zero. MTP and target
+verification remain enabled. Preparing the full history can improve draft
+acceptance for long generations. Use `DS4_QWEN4_MTP_PREFILL=on` to enable
+it for resident weights too. [Qwen MTP settings](QWEN38_FLASH_NEXT.md)
 
 The cycle drafts one token ahead by default and engages a **second, chained
 draft** (one extra nextn-layer step conditioned on the predictor's own

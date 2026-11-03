@@ -158,31 +158,30 @@ default. The 1024-token example above saves memory on smaller Macs.
 
 Use the same model options with `ds4-agent` or `ds4-server`.
 Add `--mtp` for speculative decoding using the built-in MTP weights.
-`DS4_QWEN4_MTP_PREFILL` controls preparation of the predictor's prompt history:
+`DS4_QWEN4_MTP_PREFILL` controls how prefill prepares the predictor’s prompt history.
 
 | Value | Predictor history for new prompt rows |
 | --- | --- |
-| `on` (default, also `1`) | Prepare it for both resident and SSD streaming runs |
+| `auto` (default) | Prepare it only with SSD streaming |
+| `on` (also `1`) | Prepare it for both resident and SSD streaming runs |
 | `off` (also `0`) | Skip historical projections and initialize those cache rows to zero |
-| `auto` | Prepare it only with SSD streaming |
 
-For example, this opts into streaming-only preparation:
+To prepare the full predictor history when the weights fit in RAM, run
 
 ```sh
-DS4_QWEN4_MTP_PREFILL=auto ./ds4 -m gguf/Qwen3.8-Flash-Next-Q2.gguf --mtp --ctx 8192
+DS4_QWEN4_MTP_PREFILL=on ./ds4 -m gguf/Qwen3.8-Flash-Next-Q2.gguf --mtp --ctx 8192
 ```
 
 Use `on` for resident workloads where the decode
 benefit outweighs the prefill cost, and compare total wall time on your prompts.
 `off` and resident `auto` keep MTP drafts and target verification enabled, but
 the cold predictor history can change drafts and reduce their acceptance rate.
-Zero keys still participate in predictor attention; this is not equivalent to
-the fully prepared history. Target prefill caches and logits are unchanged.
+Zero keys still participate in predictor attention. Target prefill caches and logits are unchanged.
 Decode continues to prepare real predictor rows. Each prefill chunk also
 retains its final row for real preparation at the next boundary, keeping
 checkpoint restore consistent with uninterrupted prefill.
-The setting applies to newly prefilled rows;
-reused or restored checkpoints retain their existing predictor cache contents.
+The setting applies to newly prefilled rows. Reused or restored checkpoints
+retain their existing predictor cache contents.
 Without `--mtp`, this setting has no effect.
 
 `ds4-bench` benchmarks ordinary decoding; it does not accept `--mtp`.

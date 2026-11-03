@@ -1,17 +1,15 @@
 #define DS4_NO_GPU
 #include "../ds4.c"
 
-/* Keep policy coverage independent of model weights and accelerator access.
- * Defaults preserve the existing predictor behavior; only explicit auto
- * changes the choice according to weight residency. */
+/* Exercise all policy choices without model weights or an accelerator. */
 int main(void) {
     const struct {
         const char *value;
         int resident;
         int streaming;
     } cases[] = {
-        {NULL, 1, 1},
-        {"", 1, 1},
+        {NULL, 0, 1},
+        {"", 0, 1},
         {"on", 1, 1},
         {"1", 1, 1},
         {"off", 0, 0},
