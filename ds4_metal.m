@@ -50455,6 +50455,9 @@ enum {
     QWEN4_K_HC_NORM_REUSE_F16,
     QWEN4_K_HC_NORM_REUSE_F32,
     QWEN4_K_HC_NORM_REUSE_Q8,
+    QWEN4_K_HC_COMBINE_NORM_ROWS_F16,
+    QWEN4_K_HC_COMBINE_NORM_ROWS_F32,
+    QWEN4_K_HC_COMBINE_NORM_ROWS_Q8,
     QWEN4_K_HC_GATE_MIX_F16,
     QWEN4_K_HC_GATE_MIX_F16_PF,
     QWEN4_K_HC_GATE_MIX_F32,
@@ -50560,6 +50563,9 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_hc_norm_reuse_f16",
     "kernel_qwen4_hc_norm_reuse_f32",
     "kernel_qwen4_hc_norm_reuse_q8",
+    "kernel_qwen4_hc_combine_norm_rows_f16",
+    "kernel_qwen4_hc_combine_norm_rows_f32",
+    "kernel_qwen4_hc_combine_norm_rows_q8",
     "kernel_qwen4_hc_gate_mix_f16",
     "kernel_qwen4_hc_gate_mix_f16_pf",
     "kernel_qwen4_hc_gate_mix_f32",
@@ -50887,6 +50893,43 @@ int ds4_gpu_qwen4_hc_combine_norm_tensor(
         !qwen4_bind_tensor(&b[7], old_inj, n_hc * DS4_QWEN4_HC_CHUNKS * n_hc * sizeof(float), "combine norm old inject")) return 0;
     return qwen4_dispatch(QWEN4_K_HC_COMBINE_NORM, &args, sizeof(args), b, 8,
         MTLSizeMake(n_hc * DS4_QWEN4_HC_CHUNKS, 1, 1), MTLSizeMake(128, 1, 1), 0);
+}
+
+/* Deferred HC residual write fused into the stream norm: applies the pending
+ * R += 2*sigmoid(inj/hc) * blk in place and norms the combined stream in one
+ * pass (kernel_qwen4_hc_combine_norm_rows).  old_inj and inj_part must be
+ * different buffers; the caller swaps them as the single-token path does. */
+int ds4_gpu_qwen4_hc_combine_norm_rows_tensor(
+        ds4_gpu_tensor *R, ds4_gpu_tensor *xn, ds4_gpu_tensor *inj_part,
+        const ds4_gpu_tensor *blk, const ds4_gpu_tensor *old_inj,
+        const void *model_map, uint64_t model_size, uint64_t gamma_offset, uint64_t inject_offset,
+        uint32_t weight_type, uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc, uint32_t n_inject, float eps) {
+    const uint64_t dim = (uint64_t)n_embd * n_hc;
+    const uint64_t wrow = qwen4_hc_row_bytes(weight_type, dim);
+    struct { uint32_t n_tokens, n_embd, n_hc, n_inject; float eps; uint32_t pad0, pad1, pad2; } args =
+        { n_tokens, n_embd, n_hc, n_inject, eps, 0, 0, 0 };
+    qwen4_bind b[7];
+    if (n_tokens == 0 || n_embd == 0 || n_hc == 0 || n_hc > 8 || n_inject != n_hc || n_inject > 4 ||
+        wrow == 0 || (dim % 32) != 0 ||
+        ds4_gpu_tensor_buffer(R) == ds4_gpu_tensor_buffer(xn) ||
+        ds4_gpu_tensor_buffer(inj_part) == ds4_gpu_tensor_buffer(old_inj) ||
+        !qwen4_bind_tensor(&b[0], R, n_tokens * dim * sizeof(float), "hc combine norm residual") ||
+        !qwen4_bind_weight(&b[1], model_map, model_size, gamma_offset, dim * sizeof(float), "hc norm gamma") ||
+        !qwen4_bind_weight(&b[2], model_map, model_size, inject_offset, (uint64_t)n_inject * wrow, "hc inject") ||
+        !qwen4_bind_tensor(&b[3], xn, n_tokens * dim * sizeof(float), "hc norm output") ||
+        !qwen4_bind_tensor(&b[4], inj_part,
+                           (uint64_t)n_tokens * n_hc * DS4_QWEN4_HC_CHUNKS * n_inject * sizeof(float),
+                           "hc inject partials") ||
+        !qwen4_bind_tensor(&b[5], blk, (uint64_t)n_tokens * n_embd * sizeof(float), "hc branch output") ||
+        !qwen4_bind_tensor(&b[6], old_inj,
+                           (uint64_t)n_tokens * n_hc * DS4_QWEN4_HC_CHUNKS * n_hc * sizeof(float),
+                           "hc pending inject")) {
+        return 0;
+    }
+    const int kernel = qwen4_hc_kernel(weight_type, QWEN4_K_HC_COMBINE_NORM_ROWS_F16,
+                                       QWEN4_K_HC_COMBINE_NORM_ROWS_F32, QWEN4_K_HC_COMBINE_NORM_ROWS_Q8);
+    return qwen4_dispatch(kernel, &args, sizeof(args), b, 7,
+                          MTLSizeMake(n_hc, n_tokens, 1), MTLSizeMake(128, 1, 1), 0);
 }
 
 int ds4_gpu_qwen4_hc_norm_tensor(

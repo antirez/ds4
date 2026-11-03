@@ -2202,6 +2202,21 @@ extern "C" int ds4_gpu_qwen4_hc_combine_norm_tensor(ds4_gpu_tensor *next, const 
            ds4_gpu_qwen4_hc_norm_tensor(xn,inj,next,map,size,go,io,type,T,E,hc,ni,eps);
 }
 
+/* Deferred HC write fused into the stream norm: the single-pass kernel is
+ * Metal-only, so run the eager pair over R in place on the same stream,
+ * byte-identical to what the engine's fallback does when this returns 0.
+ * old_inj and inj_part must be distinct, as the fused kernel shares none. */
+extern "C" int ds4_gpu_qwen4_hc_combine_norm_rows_tensor(ds4_gpu_tensor *R, ds4_gpu_tensor *xn,
+        ds4_gpu_tensor *inj_part, const ds4_gpu_tensor *blk, const ds4_gpu_tensor *old_inj,
+        const void *map, uint64_t size, uint64_t go, uint64_t io, uint32_t type,
+        uint32_t T, uint64_t E, uint32_t hc, uint32_t ni, float eps) {
+    const uint64_t bytes = (uint64_t)T*E*hc*4;
+    if (!qwen4_cuda::tensor(R,bytes) || !qwen4_cuda::tensor(xn,bytes) || R->ptr == xn->ptr ||
+        !old_inj || !inj_part || inj_part->ptr == old_inj->ptr) return 0;
+    return ds4_gpu_qwen4_hc_combine_tensor(R,blk,old_inj,T,E,hc) &&
+           ds4_gpu_qwen4_hc_norm_tensor(xn,inj_part,R,map,size,go,io,type,T,E,hc,ni,eps);
+}
+
 extern "C" int ds4_gpu_qwen4_mtp_stage_tensor(ds4_gpu_tensor *cat, const ds4_gpu_tensor *e,
         const ds4_gpu_tensor *R, const void *map, uint64_t size, uint64_t eo, uint64_t ho,
         uint32_t E, uint32_t hc, float eps) {

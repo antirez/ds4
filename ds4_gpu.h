@@ -3616,6 +3616,14 @@ int ds4_gpu_qwen4_hc_combine_norm_tensor(
         ds4_gpu_tensor *xn, ds4_gpu_tensor *inj_part, const ds4_gpu_tensor *R,
         const void *model_map, uint64_t model_size, uint64_t gamma_offset, uint64_t inject_offset,
         uint32_t weight_type, uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc, uint32_t n_inject, float eps);
+/* Deferred HC write fused into the stream norm: applies the pending
+ * R += 2*sigmoid(inj/hc) * blk in place and norms the combined stream in one
+ * pass.  old_inj and inj_part must be distinct. */
+int ds4_gpu_qwen4_hc_combine_norm_rows_tensor(
+        ds4_gpu_tensor *R, ds4_gpu_tensor *xn, ds4_gpu_tensor *inj_part,
+        const ds4_gpu_tensor *blk, const ds4_gpu_tensor *old_inj,
+        const void *model_map, uint64_t model_size, uint64_t gamma_offset, uint64_t inject_offset,
+        uint32_t weight_type, uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc, uint32_t n_inject, float eps);
 int ds4_gpu_qwen4_q8_pair_tensor(
         ds4_gpu_tensor       *out0,
         ds4_gpu_tensor       *out1,

@@ -2244,6 +2244,74 @@ static void test_hc_norm_reuse_case(arena_t *a, uint32_t type, uint32_t E,
     free(R);
 }
 
+/* Deferred HC write: kernel_qwen4_hc_combine_norm_rows must reproduce the
+ * eager kernel_qwen4_hc_combine followed by kernel_qwen4_hc_norm byte for
+ * byte - the residual after the write, xn and the inject partials. */
+static void test_hc_defer_rows_case(arena_t *a, uint32_t type, uint32_t E, uint32_t hc, uint32_t T) {
+    const uint32_t CH = DS4_QWEN4_HC_CHUNKS, n_inject = hc;
+    const uint64_t dim = (uint64_t)E * hc;
+    const float eps = 1e-6f;
+    require_ok(hc == 4u && n_inject <= 4u && (dim % 32u) == 0u, "HC defer fixture shape");
+    (void)arena_alloc(a, 16u);
+    double *shadow;
+    const uint64_t gamma_off = arena_f32(a, dim, &shadow, 0.5f, 1.5f);
+    free(shadow);
+    const uint64_t inject_off = type == 8u ? arena_q8_0(a, n_inject, dim, &shadow, 0.05f)
+                             : type == 1u ? arena_f16(a, (uint64_t)n_inject * dim, &shadow, 0.05f)
+                                          : arena_f32(a, (uint64_t)n_inject * dim, &shadow, -0.05f, 0.05f);
+    free(shadow);
+    const uint64_t n = (uint64_t)T * dim, blk_n = (uint64_t)T * E;
+    const uint64_t inj_n = (uint64_t)T * hc * CH * n_inject;
+    float *R1 = malloc(n * sizeof(float)), *R2 = malloc(n * sizeof(float));
+    float *blk = malloc(blk_n * sizeof(float)), *inj = malloc(inj_n * sizeof(float));
+    require_ok(R1 && R2 && blk && inj, "HC defer host allocations");
+    for (uint64_t i = 0; i < n; i++) R1[i] = R2[i] = frand() * (i % 5u ? 1.0f : 16.0f);
+    for (uint64_t i = 0; i < blk_n; i++) blk[i] = frand() * 2.0f;
+    for (uint64_t i = 0; i < inj_n; i++) inj[i] = frand();
+    ds4_gpu_tensor *gR1 = upload(R1, n), *gR2 = upload(R2, n);
+    ds4_gpu_tensor *gblk = upload(blk, blk_n), *ginj = upload(inj, inj_n);
+    ds4_gpu_tensor *gxn1 = upload(NULL, n), *gxn2 = upload(NULL, n);
+    ds4_gpu_tensor *ginj1 = upload(NULL, inj_n), *ginj2 = upload(NULL, inj_n);
+    require_ok(gR1 && gR2 && gblk && ginj && gxn1 && gxn2 && ginj1 && ginj2, "HC defer tensors");
+    require_ok(ds4_gpu_qwen4_hc_combine_tensor(gR1, gblk, ginj, T, E, hc) &&
+               ds4_gpu_qwen4_hc_norm_tensor(gxn1, ginj1, gR1, a->base, a->size, gamma_off, inject_off, type,
+                                            T, E, hc, n_inject, eps),
+               "HC defer eager combine + norm");
+    require_ok(ds4_gpu_qwen4_hc_combine_norm_rows_tensor(gR2, gxn2, ginj2, gblk, ginj, a->base, a->size,
+                                                         gamma_off, inject_off, type, T, E, hc, n_inject, eps),
+               "HC defer fused combine-norm");
+    float *r1 = download(gR1, n), *r2 = download(gR2, n);
+    float *x1 = download(gxn1, n), *x2 = download(gxn2, n);
+    float *p1 = download(ginj1, inj_n), *p2 = download(ginj2, inj_n);
+    const bool ok = memcmp(r1, r2, n * sizeof(float)) == 0 &&
+                    memcmp(x1, x2, n * sizeof(float)) == 0 &&
+                    memcmp(p1, p2, inj_n * sizeof(float)) == 0;
+    char name[96];
+    snprintf(name, sizeof(name), "hc defer type=%u E=%u hc=%u T=%u: byte-exact R/xn/inj", type, E, hc, T);
+    require_ok(ok, name);
+    printf("  %-44s ok\n", name);
+    free(r1); free(r2); free(x1); free(x2); free(p1); free(p2);
+    free(R1); free(R2); free(blk); free(inj);
+    ds4_gpu_tensor_free(gR1); ds4_gpu_tensor_free(gR2); ds4_gpu_tensor_free(gblk); ds4_gpu_tensor_free(ginj);
+    ds4_gpu_tensor_free(gxn1); ds4_gpu_tensor_free(gxn2); ds4_gpu_tensor_free(ginj1); ds4_gpu_tensor_free(ginj2);
+}
+
+static void test_hc_defer_rows(arena_t *a) {
+    const uint32_t types[] = {0u, 1u, 8u};
+    const uint32_t shapes[][3] = {
+        {2560u, 4u, 4u},
+        {2560u, 4u, 9u},
+        {2560u, 4u, 256u},
+        {264u, 4u, 3u},
+        {40u, 4u, 5u},
+    };
+    for (uint32_t type = 0; type < sizeof(types) / sizeof(types[0]); type++) {
+        for (uint32_t shape = 0; shape < sizeof(shapes) / sizeof(shapes[0]); shape++) {
+            test_hc_defer_rows_case(a, types[type], shapes[shape][0], shapes[shape][1], shapes[shape][2]);
+        }
+    }
+}
+
 static void test_hc_norm_reuse(arena_t *a) {
     const char *value = getenv("DS4_QWEN4_HC_NORM_REUSE");
     char *saved = value ? strdup(value) : NULL;
@@ -3177,6 +3245,8 @@ static int bench_p_router_f32(void *ud) { bench_ctx *c = ud; return ds4_gpu_matm
 static int bench_p_router_mm(void *ud) { bench_ctx *c = ud; return ds4_gpu_qwen4_dense_mm_tensor(c->t[19], c->t[18], c->a->base, c->a->size, c->off[11], 0u, 256, 2560, 512); }
 static int bench_p_topk(void *ud) { bench_ctx *c = ud; return ds4_gpu_qwen4_router_topk_tensor(c->t[16], c->t[1], c->t[19], c->t[18], c->a->base, c->a->size, c->off[2], 0u, 2560, c->t[17], 256, 512, 10); }
 static int bench_p_hc_norm(void *ud) { bench_ctx *c = ud; return ds4_gpu_qwen4_hc_norm_tensor(c->t[1], c->t[3], c->t[19], c->a->base, c->a->size, c->off[2], c->off[4], 1u, 256, 2560, 4, 4, 1e-6f); }
+static int bench_p_hc_combine256(void *ud) { bench_ctx *c = ud; return ds4_gpu_qwen4_hc_combine_tensor(c->t[19], c->t[18], c->t[3], 256, 2560, 4); }
+static int bench_p_hc_cn_rows(void *ud) { bench_ctx *c = ud; return ds4_gpu_qwen4_hc_combine_norm_rows_tensor(c->t[19], c->t[1], c->t[3], c->t[18], c->t[22], c->a->base, c->a->size, c->off[2], c->off[4], 1u, 256, 2560, 4, 4, 1e-6f); }
 static int bench_p_hc_down_f16(void *ud) { bench_ctx *c = ud; return ds4_gpu_matmul_f16_tensor(c->t[17], c->a->base, c->a->size, c->off[3], 10240, 320, c->t[1], 256); }
 static int bench_p_hc_down_mm(void *ud) { bench_ctx *c = ud; return ds4_gpu_qwen4_dense_mm_tensor(c->t[17], c->t[1], c->a->base, c->a->size, c->off[3], 1u, 256, 10240, 320); }
 static int bench_p_hc_up_f16(void *ud) { bench_ctx *c = ud; return ds4_gpu_matmul_f16_tensor(c->t[1], c->a->base, c->a->size, c->off[5], 320, 10240, c->t[17], 256); }
@@ -3408,6 +3478,8 @@ static void bench_dispatch(arena_t *a) {
     bench_run("router f32 512x2560 T=256 (dense mm)", bench_p_router_mm, &c, 20);
     bench_run("router_topk T=256", bench_p_topk, &c, 20);
     bench_run("hc_norm T=256", bench_p_hc_norm, &c, 20);
+    bench_run("hc_combine T=256", bench_p_hc_combine256, &c, 20);
+    bench_run("hc combine+norm rows T=256", bench_p_hc_cn_rows, &c, 20);
     bench_run("hc down f16 320x10240 T=256 (DS4)", bench_p_hc_down_f16, &c, 20);
     bench_run("hc down f16 320x10240 T=256 (dense mm)", bench_p_hc_down_mm, &c, 20);
     bench_run("hc up f16 10240x320 T=256 (DS4)", bench_p_hc_up_f16, &c, 20);
@@ -3840,6 +3912,7 @@ int main(void) {
     printf("mtp\n");
     test_mtp(&arena, 2560, 4);
     test_mtp(&arena, 64, 4);
+    test_hc_defer_rows(&arena);
     test_hc_norm_reuse(&arena);
     test_gdn_prefill_dispatch();
     printf("all qwen4 kernel tests passed\n");

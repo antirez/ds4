@@ -4738,6 +4738,91 @@ kernel void kernel_qwen4_hc_combine_norm<W>(constant ds4_metal_args_qwen4_hc_nor
         device const float *, device const char *, device float *, device float *, device float *, device const float *, device const float *, uint3, ushort, ushort3, ushort, ushort);
 QWEN4_HC_COMBINE_NORM_INSTANCE(f16, qwen4_w_f16)
 
+/* kernel_qwen4_hc_norm_reuse with the pending HC residual write applied in
+ * place: the combined stream `R + 2*sigmoid(old_inj/hc) * blk` is
+ * materialized into R exactly as kernel_qwen4_hc_combine rounds it, and the
+ * same pass norms it and takes the inject partial dots.  One threadgroup
+ * per (stream, token) owns its R slice, so the read-modify-write is
+ * race-free; old_inj and inj_part must be different buffers (the caller
+ * swaps them as the single-token kernel does).  Bit-identical to the eager
+ * kernel_qwen4_hc_combine followed by kernel_qwen4_hc_norm_reuse. */
+template <typename W>
+kernel void kernel_qwen4_hc_combine_norm_rows(
+        constant ds4_metal_args_qwen4_hc_norm & args,
+        device float       *R,          /* [T][hc*E] read-modify-write */
+        device const float *gamma,      /* [hc*E] */
+        device const char  *w_inject,   /* [n_inject][hc*E] */
+        device float       *xn,         /* [T][hc*E] */
+        device float       *inj_part,   /* [T][hc*chunks][n_inject] */
+        device const float *blk,        /* [T][E] pending branch output */
+        device const float *old_inj,    /* [T][hc*chunks][n_inject] pending partials */
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const uint s = tgpig.x;
+    const uint tok = tgpig.y;
+    if (s >= args.n_hc || tok >= args.n_tokens) return;
+    const uint E = args.n_embd, dim = E * args.n_hc;
+    const uint nth = ntg.x, nsg = nth / 32;
+    threadgroup float red[32];
+    /* This kernel uses 128 threads. Keep each chunk's four SIMD partials
+     * separate so its readers need no barrier before the next chunk writes. */
+    threadgroup float inject_red[QWEN4_HC_CHUNKS][4][4];
+    device float *r = R + ((uint64_t)tok * args.n_hc + s) * E;
+    device const float *b = blk + (uint64_t)tok * E;
+    device const float *g = gamma + s * E;
+    device float *o = xn + ((uint64_t)tok * args.n_hc + s) * E;
+    const W w(w_inject);
+    const float weight = qwen4_hc_inject_weight(
+        old_inj + (uint64_t)tok * args.n_hc * QWEN4_HC_CHUNKS * args.n_hc, args.n_hc, s);
+    float ss = 0.0f;
+    for (uint i = tid; i < E; i += nth) {
+        const float v = r[i] + weight * b[i];
+        r[i] = v;
+        ss += v * v;
+    }
+    ss = simd_sum(ss);
+    if (tiisg == 0) red[sgitg] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float tot = 0.0f;
+    for (uint q = 0; q < nsg; q++) tot += red[q];
+    const float inv = rsqrt(tot / (float)E + args.eps);
+    const uint per = (E + QWEN4_HC_CHUNKS - 1) / QWEN4_HC_CHUNKS;
+    for (uint chunk = 0; chunk < QWEN4_HC_CHUNKS; chunk++) {
+        const uint i0 = chunk * per, i1 = min(E, i0 + per);
+        float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        for (uint i = i0 + tid; i < i1; i += nth) {
+            const float v = r[i] * inv * g[i];
+            o[i] = v;
+            for (uint j = 0; j < 4; j++) {
+                if (j < args.n_inject) acc[j] += w.at((uint64_t)j * dim + s * E + i) * v;
+            }
+        }
+        for (uint j = 0; j < 4; j++) {
+            if (j >= args.n_inject) break;
+            const float a = simd_sum(acc[j]);
+            if (tiisg == 0) inject_red[chunk][j][sgitg] = a;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid < args.n_inject) {
+            float a = 0.0f;
+            for (uint q = 0; q < nsg; q++) a += inject_red[chunk][tid][q];
+            inj_part[((uint64_t)tok * args.n_hc * QWEN4_HC_CHUNKS + s * QWEN4_HC_CHUNKS + chunk) * args.n_inject + tid] = a;
+        }
+    }
+}
+
+#define QWEN4_HC_COMBINE_NORM_ROWS_INSTANCE(SUFFIX, W) \
+template [[host_name("kernel_qwen4_hc_combine_norm_rows_" #SUFFIX)]] \
+kernel void kernel_qwen4_hc_combine_norm_rows<W>(constant ds4_metal_args_qwen4_hc_norm &, device float *, \
+        device const float *, device const char *, device float *, device float *, device const float *, \
+        device const float *, uint3, ushort, ushort3, ushort, ushort);
+QWEN4_HC_COMBINE_NORM_ROWS_INSTANCE(f16, qwen4_w_f16)
+QWEN4_HC_COMBINE_NORM_ROWS_INSTANCE(f32, qwen4_w_f32)
+QWEN4_HC_COMBINE_NORM_ROWS_INSTANCE(q8, qwen4_w_q8)
+
 /* Disjoint output grids retain the standalone Q8 reduction trees. */
 kernel void kernel_qwen4_q8_concat(
     constant ds4_metal_args_mul_mv &a, constant ds4_metal_args_mul_mv &b,
