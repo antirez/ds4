@@ -257,9 +257,9 @@ static const char * cu_get_error_str(CUresult err) {
 #define AMPERE_MMA_AVAILABLE
 #endif // !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
 
-#if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_BLACKWELL && __CUDA_ARCH__ < GGML_CUDA_CC_RUBIN
+#if defined(DS4_CUDA_HAVE_MXF4) && !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_BLACKWELL && __CUDA_ARCH__ < GGML_CUDA_CC_RUBIN
 #    define BLACKWELL_MMA_AVAILABLE
-#endif // !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_BLACKWELL
+#endif
 
 #if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
 #define CP_ASYNC_AVAILABLE
@@ -332,8 +332,13 @@ static bool cp_async_available(const int cc) {
 }
 
 static bool blackwell_mma_available(const int cc) {
+#if defined(DS4_CUDA_HAVE_MXF4)
     return GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_BLACKWELL &&
            ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_RUBIN;
+#else
+    GGML_UNUSED(cc);
+    return false;
+#endif
 }
 
 static constexpr __device__ int ggml_cuda_get_physical_warp_size() {

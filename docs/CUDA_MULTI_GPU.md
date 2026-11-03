@@ -19,6 +19,32 @@ make cuda-generic
 make cuda CUDA_ARCH=sm_89
 ```
 
+For an RTX PRO 6000 Blackwell (compute capability 12.0), use:
+
+```sh
+make cuda CUDA_ARCH=sm_120
+```
+
+The Makefile maps `sm_120`/`sm_120a` to `compute_120a`/`sm_120a` and enables
+native block-scaled FP4 MMA. `sm_121`/`sm_121a` similarly select the Spark
+architecture-specific target. The CUDA toolkit must support the selected target.
+
+`cuda-generic` uses `-arch=native`, which can emit a plain `sm_120` target
+without these architecture-specific instructions. Such builds use the existing
+MXFP4-weight/Q8-activation MMQ path; they must not emit `mma` instructions with
+`.kind::mxf4.block_scale`. No model conversion is needed. Prefer the explicit
+Blackwell target above to retain native FP4 acceleration.
+
+On an SM120 GPU, check both paths with the existing synthetic parity test:
+
+```sh
+make -B test-mxfp4-cuda CUDA_ARCH=native
+make -B test-mxfp4-cuda CUDA_ARCH=sm_120
+```
+
+`-B` rebuilds all MMQ objects so activation packing and kernels use the same
+feature flags. Repeat the application build after switching test targets.
+
 For a GB10 machine use the [DGX Spark](DGX_SPARK.md) target instead.
 
 ## Normal layer placement

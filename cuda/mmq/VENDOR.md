@@ -37,7 +37,7 @@ keeps ds4 self-contained at the cost of a periodic re-sync.
 | `mmvq.cuh`            | `ggml/src/ggml-cuda/mmvq.cuh`                | patched (Step 6): `mul_mat_vec_q_switch_type` proto exposed; ggml-tensor entries gated on `DS4_MMVQ_INCLUDE_GGML_ENTRIES` | ~36 |
 | `mmvq.cu`             | `ggml/src/ggml-cuda/mmvq.cu`                 | patched: `mul_mat_vec_q_switch_type` promoted from `static`; `ggml_cuda_mul_mat_vec_q` + `ggml_cuda_op_mul_mat_vec_q` gated on `DS4_MMVQ_INCLUDE_GGML_ENTRIES` | 1163 |
 | `unary.cuh`           | `ggml/src/ggml-cuda/unary.cuh`               | verbatim (needed by `mmvq.cu` for inline GLU epilogues)                  |   114 |
-| `common.cuh`          | `ggml/src/ggml-cuda/common.cuh`              | verbatim                                                                 |  1489 |
+| `common.cuh`          | `ggml/src/ggml-cuda/common.cuh`              | patched: gate native FP4 device code and host dispatch on `DS4_CUDA_HAVE_MXF4` |  1489 |
 | `ggml-common.h`       | `ggml/src/ggml-common.h`                     | verbatim                                                                 |  1900 |
 | `vendors/cuda.h`      | `ggml/src/ggml-cuda/vendors/cuda.h`          | verbatim                                                                 |    28 |
 | `ggml.h`              | (new)                                        | redirect to `ds4_ggml_stubs.h`                                           |     5 |
@@ -120,6 +120,12 @@ If the new symbols are minor (e.g., new `GGML_CUDA_CC_*` constants), they
 likely come from `common.cuh` which we vendor and don't need any shim
 changes. If they're new `ggml_*` host functions (rare, but possible if
 upstream adds a new helper), extend `ds4_ggml_stubs.h`.
+
+Preserve the `DS4_CUDA_HAVE_MXF4` guards in `common.cuh` when re-syncing.
+Compute capability 12.x alone does not authorize block-scaled MMA in a plain
+`sm_120`/`sm_121` compilation. Both the device feature macro and host
+`blackwell_mma_available()` must honor the build flag; otherwise either PTX
+assembly fails or host activation packing disagrees with the compiled kernel.
 
 ## Testing matrix
 

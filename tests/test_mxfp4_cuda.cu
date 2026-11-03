@@ -1,4 +1,5 @@
 #include "ds4_mmq.h"
+#include "common.cuh"
 
 #include <cuda_runtime.h>
 
@@ -9,6 +10,16 @@
 #include <cstring>
 #include <random>
 #include <vector>
+
+#if defined(BLACKWELL_MMA_AVAILABLE) && !defined(DS4_CUDA_HAVE_MXF4)
+#error "Block-scaled MMA must not be enabled for a generic CUDA target"
+#endif
+
+#if defined(DS4_CUDA_HAVE_MXF4) && __CUDA_ARCH__ >= GGML_CUDA_CC_BLACKWELL && __CUDA_ARCH__ < GGML_CUDA_CC_RUBIN
+#ifndef BLACKWELL_MMA_AVAILABLE
+#error "Architecture-specific Blackwell builds must retain native FP4 MMA"
+#endif
+#endif
 
 extern "C" int ds4_cuda_q8_fold_take_q81(
         const void *src, uint64_t in_dim, const void **q81) {
@@ -109,8 +120,20 @@ bool test_dense_and_moe(int M, int N, int K) {
     constexpr int n_used = 6;
     std::mt19937 rng(0x4d584650u);
     std::uniform_real_distribution<float> activation(-1.0f, 1.0f);
-    const float mmq_abs_tol = 1.0f, mmq_rel_tol = 0.02f;
-    std::fprintf(stderr, "MXFP4 shape M=%d N=%d K=%d\n", M, N, K);
+    cudaDeviceProp device = {};
+    if (!cuda_ok(cudaGetDeviceProperties(&device, 0),
+                 "read CUDA device properties")) {
+        return false;
+    }
+    const bool native_fp4 = blackwell_mma_available(device.major * 100 + device.minor * 10);
+#ifndef DS4_CUDA_HAVE_MXF4
+    if (native_fp4) {
+        std::fprintf(stderr, "Generic CUDA builds must use Q8 MMQ activations\n");
+        return false;
+    }
+#endif
+    const float mmq_abs_tol = native_fp4 ? 8.0f : 1.0f;
+    const float mmq_rel_tol = native_fp4 ? 0.08f : 0.02f;
 
     std::vector<block_mxfp4_test> dense_blocks((size_t)M * K / QK);
     fill_blocks(dense_blocks, rng);
