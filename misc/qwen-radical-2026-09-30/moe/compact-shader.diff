@@ -1,0 +1,32 @@
+--- baseline.metal
++++ compact.metal
+@@ -4193,8 +4193,12 @@
+     static_assert(!PACKED || (NT == 4u && KS == 32u && HALF_SHADOW), "packed MoE geometry");
+     static_assert(KS == 32u || KS == 64u, "supported MoE K staging widths");
+     static_assert((KS * TT / 128u) % 4u == 0u, "B staging uses four-value loads");
+-    const uint2 block = qwen4_moe_mm_block(args, tgpig);
+-    const uint rb = block.x, e = qwen4_moe_mm_expert(args, tgpig.y);
++    // Experimental schedule only. The appended descriptor is (tile << 9)|expert.
++    // It names one existing tile; no dot product or epilogue changes.
++    const bool compact = args.expert_major == 2u;
++    const uint desc = compact ? (uint)lists[(uint64_t)args.n_expert * args.list_cap + tgpig.y] : 0u;
++    const uint2 block = compact ? uint2(tgpig.x, desc >> 9u) : qwen4_moe_mm_block(args, tgpig);
++    const uint rb = block.x, e = compact ? (desc & 511u) : qwen4_moe_mm_expert(args, tgpig.y);
+     if (e >= args.n_expert) return;
+     const uint count = (uint)counts[e];
+     if (!count) return;
+@@ -4430,8 +4434,12 @@
+     static_assert(!PACKED || (NT == 4u && KS == 32u), "packed MoE geometry");
+     static_assert(KS == 32u || KS == 64u, "supported MoE K staging widths");
+     static_assert((KS * TT / 128u) % 4u == 0u, "B staging uses four-value loads");
+-    const uint2 block = qwen4_moe_mm_block(args, tgpig);
+-    const uint rb = block.x, e = qwen4_moe_mm_expert(args, tgpig.y);
++    // Experimental schedule only. The appended descriptor is (tile << 9)|expert.
++    // It names one existing tile; no dot product or epilogue changes.
++    const bool compact = args.expert_major == 2u;
++    const uint desc = compact ? (uint)lists[(uint64_t)args.n_expert * args.list_cap + tgpig.y] : 0u;
++    const uint2 block = compact ? uint2(tgpig.x, desc >> 9u) : qwen4_moe_mm_block(args, tgpig);
++    const uint rb = block.x, e = compact ? (desc & 511u) : qwen4_moe_mm_expert(args, tgpig.y);
+     if (e >= args.n_expert) return;
+     const uint count = (uint)counts[e];
+     if (!count) return;

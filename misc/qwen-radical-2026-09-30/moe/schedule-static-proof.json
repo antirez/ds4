@@ -1,0 +1,7 @@
+{
+  "status": "PASS",
+  "cases": 96,
+  "decoded_tiles": 1375732,
+  "includes_zero_counts_and_T0": true,
+  "proved": "Descriptor encoding, coverage, no duplicate tiles, capacity and exactly one original loop iteration for every tile"
+}

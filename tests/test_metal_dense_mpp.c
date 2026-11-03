@@ -176,8 +176,8 @@ int main(int argc, char **argv) {
     const unsigned types[] = {8, 2, 12};
     for (unsigned i = 0; i < sizeof(types)/sizeof(*types); i++) {
         if (!ds4_gpu_init()) return 1;
-        if (!ds4_gpu_device_is_m5_apple_silicon()) {
-            fprintf(stderr, "dense MPP: skipped (requires M5 tensor cores)\n");
+        if (!ds4_gpu_device_is_m5_or_m6_apple_silicon()) {
+            fprintf(stderr, "dense MPP: skipped (requires M5/M6 tensor cores)\n");
             ds4_gpu_cleanup();
             return 0;
         }

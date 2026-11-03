@@ -1,0 +1,496 @@
+{
+  "scope": "same committed HEAD snapshot with diagnostic dense policies; M1 Max Q4 SSD; not M4 Q2 replication",
+  "runs": [
+    {
+      "name": "rome29",
+      "arm": "head",
+      "seconds": 8.266356041996914,
+      "command": [
+        "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/head/ds4",
+        "-m",
+        "/Users/oppog/Downloads/ds4/gguf/Qwen3.8-Flash-Next-Q4.gguf",
+        "--metal",
+        "--ssd-streaming",
+        "--ctx",
+        "16384",
+        "--prefill-chunk",
+        "2048",
+        "--nothink",
+        "--temp",
+        "0",
+        "--prompt-file",
+        "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/fixtures/rome29.txt",
+        "--dump-logits",
+        "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/dense-ab/rome29-head.json"
+      ],
+      "env": {
+        "DS4_DIAG_TRACE_PREFILL_DENSE": "1"
+      },
+      "prompt_tokens": 29,
+      "argmax": {
+        "id": 8482,
+        "text": "La",
+        "bytes": [
+          76,
+          97
+        ]
+      },
+      "argmax_logit": 23.1857262,
+      "float32_sha256": "fd4b2476ee2fce5cacab2f0287af5df61ad57234a0912c184e4329d26a6a703a"
+    },
+    {
+      "name": "rome29",
+      "arm": "base_dense",
+      "seconds": 6.190781457997218,
+      "command": [
+        "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/head/ds4",
+        "-m",
+        "/Users/oppog/Downloads/ds4/gguf/Qwen3.8-Flash-Next-Q4.gguf",
+        "--metal",
+        "--ssd-streaming",
+        "--ctx",
+        "16384",
+        "--prefill-chunk",
+        "2048",
+        "--nothink",
+        "--temp",
+        "0",
+        "--prompt-file",
+        "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/fixtures/rome29.txt",
+        "--dump-logits",
+        "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/dense-ab/rome29-base_dense.json"
+      ],
+      "env": {
+        "DS4_DIAG_TRACE_PREFILL_DENSE": "1",
+        "DS4_DIAG_BASE_PREFILL_DENSE": "1"
+      },
+      "prompt_tokens": 29,
+      "argmax": {
+        "id": 8482,
+        "text": "La",
+        "bytes": [
+          76,
+          97
+        ]
+      },
+      "argmax_logit": 23.2060318,
+      "float32_sha256": "c9a9cfb8f536494afda788a6e9bb2901c8601867b179c6f24eff1070ee1a69ec"
+    },
+    {
+      "name": "rome29",
+      "arm": "base_split",
+      "seconds": 6.102155666005274,
+      "command": [
+        "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/head/ds4",
+        "-m",
+        "/Users/oppog/Downloads/ds4/gguf/Qwen3.8-Flash-Next-Q4.gguf",
+        "--metal",
+        "--ssd-streaming",
+        "--ctx",
+        "16384",
+        "--prefill-chunk",
+        "2048",
+        "--nothink",
+        "--temp",
+        "0",
+        "--prompt-file",
+        "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/fixtures/rome29.txt",
+        "--dump-logits",
+        "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/dense-ab/rome29-base_split.json"
+      ],
+      "env": {
+        "DS4_DIAG_TRACE_PREFILL_DENSE": "1",
+        "DS4_DIAG_BASE_PREFILL_SPLIT_ONLY": "1"
+      },
+      "prompt_tokens": 29,
+      "argmax": {
+        "id": 8482,
+        "text": "La",
+        "bytes": [
+          76,
+          97
+        ]
+      },
+      "argmax_logit": 23.1932659,
+      "float32_sha256": "a19e17fae15bb78dbd8be08da9122388206fe000be4d43a6201a785df7c933cc"
+    },
+    {
+      "name": "rome29",
+      "arm": "head_repeat",
+      "seconds": 5.812365249999857,
+      "command": [
+        "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/head/ds4",
+        "-m",
+        "/Users/oppog/Downloads/ds4/gguf/Qwen3.8-Flash-Next-Q4.gguf",
+        "--metal",
+        "--ssd-streaming",
+        "--ctx",
+        "16384",
+        "--prefill-chunk",
+        "2048",
+        "--nothink",
+        "--temp",
+        "0",
+        "--prompt-file",
+        "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/fixtures/rome29.txt",
+        "--dump-logits",
+        "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/dense-ab/rome29-head_repeat.json"
+      ],
+      "env": {
+        "DS4_DIAG_TRACE_PREFILL_DENSE": "1"
+      },
+      "prompt_tokens": 29,
+      "argmax": {
+        "id": 8482,
+        "text": "La",
+        "bytes": [
+          76,
+          97
+        ]
+      },
+      "argmax_logit": 23.1857262,
+      "float32_sha256": "fd4b2476ee2fce5cacab2f0287af5df61ad57234a0912c184e4329d26a6a703a"
+    },
+    {
+      "name": "book575",
+      "arm": "head",
+      "seconds": 12.181196209006885,
+      "command": [
+        "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/head/ds4",
+        "-m",
+        "/Users/oppog/Downloads/ds4/gguf/Qwen3.8-Flash-Next-Q4.gguf",
+        "--metal",
+        "--ssd-streaming",
+        "--ctx",
+        "16384",
+        "--prefill-chunk",
+        "2048",
+        "--nothink",
+        "--temp",
+        "0",
+        "--prompt-file",
+        "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/fixtures/book575.txt",
+        "--dump-logits",
+        "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/dense-ab/book575-head.json"
+      ],
+      "env": {
+        "DS4_DIAG_TRACE_PREFILL_DENSE": "1"
+      },
+      "prompt_tokens": 575,
+      "argmax": {
+        "id": 1919,
+        "text": "This",
+        "bytes": [
+          84,
+          104,
+          105,
+          115
+        ]
+      },
+      "argmax_logit": 18.3794632,
+      "float32_sha256": "75f69a4b9426b86c77e98c175b51a57aaae4476ef747b3f42a29caa5082fea62"
+    },
+    {
+      "name": "book575",
+      "arm": "base_dense",
+      "seconds": 12.060219416998734,
+      "command": [
+        "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/head/ds4",
+        "-m",
+        "/Users/oppog/Downloads/ds4/gguf/Qwen3.8-Flash-Next-Q4.gguf",
+        "--metal",
+        "--ssd-streaming",
+        "--ctx",
+        "16384",
+        "--prefill-chunk",
+        "2048",
+        "--nothink",
+        "--temp",
+        "0",
+        "--prompt-file",
+        "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/fixtures/book575.txt",
+        "--dump-logits",
+        "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/dense-ab/book575-base_dense.json"
+      ],
+      "env": {
+        "DS4_DIAG_TRACE_PREFILL_DENSE": "1",
+        "DS4_DIAG_BASE_PREFILL_DENSE": "1"
+      },
+      "prompt_tokens": 575,
+      "argmax": {
+        "id": 1919,
+        "text": "This",
+        "bytes": [
+          84,
+          104,
+          105,
+          115
+        ]
+      },
+      "argmax_logit": 18.5462036,
+      "float32_sha256": "540d24a50a365976aafe07b56f508734abdeae4b51533fbe509e8d343df0b5ca"
+    },
+    {
+      "name": "book575",
+      "arm": "base_split",
+      "seconds": 12.08632129200123,
+      "command": [
+        "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/head/ds4",
+        "-m",
+        "/Users/oppog/Downloads/ds4/gguf/Qwen3.8-Flash-Next-Q4.gguf",
+        "--metal",
+        "--ssd-streaming",
+        "--ctx",
+        "16384",
+        "--prefill-chunk",
+        "2048",
+        "--nothink",
+        "--temp",
+        "0",
+        "--prompt-file",
+        "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/fixtures/book575.txt",
+        "--dump-logits",
+        "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/dense-ab/book575-base_split.json"
+      ],
+      "env": {
+        "DS4_DIAG_TRACE_PREFILL_DENSE": "1",
+        "DS4_DIAG_BASE_PREFILL_SPLIT_ONLY": "1"
+      },
+      "prompt_tokens": 575,
+      "argmax": {
+        "id": 1919,
+        "text": "This",
+        "bytes": [
+          84,
+          104,
+          105,
+          115
+        ]
+      },
+      "argmax_logit": 18.5462036,
+      "float32_sha256": "540d24a50a365976aafe07b56f508734abdeae4b51533fbe509e8d343df0b5ca"
+    },
+    {
+      "name": "book575",
+      "arm": "head_repeat",
+      "seconds": 11.722201832999417,
+      "command": [
+        "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/head/ds4",
+        "-m",
+        "/Users/oppog/Downloads/ds4/gguf/Qwen3.8-Flash-Next-Q4.gguf",
+        "--metal",
+        "--ssd-streaming",
+        "--ctx",
+        "16384",
+        "--prefill-chunk",
+        "2048",
+        "--nothink",
+        "--temp",
+        "0",
+        "--prompt-file",
+        "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/fixtures/book575.txt",
+        "--dump-logits",
+        "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/dense-ab/book575-head_repeat.json"
+      ],
+      "env": {
+        "DS4_DIAG_TRACE_PREFILL_DENSE": "1"
+      },
+      "prompt_tokens": 575,
+      "argmax": {
+        "id": 1919,
+        "text": "This",
+        "bytes": [
+          84,
+          104,
+          105,
+          115
+        ]
+      },
+      "argmax_logit": 18.3794632,
+      "float32_sha256": "75f69a4b9426b86c77e98c175b51a57aaae4476ef747b3f42a29caa5082fea62"
+    },
+    {
+      "name": "book5942",
+      "arm": "head",
+      "seconds": 49.6001816670032,
+      "command": [
+        "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/head/ds4",
+        "-m",
+        "/Users/oppog/Downloads/ds4/gguf/Qwen3.8-Flash-Next-Q4.gguf",
+        "--metal",
+        "--ssd-streaming",
+        "--ctx",
+        "16384",
+        "--prefill-chunk",
+        "2048",
+        "--nothink",
+        "--temp",
+        "0",
+        "--prompt-file",
+        "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/fixtures/book5942.txt",
+        "--dump-logits",
+        "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/dense-ab/book5942-head.json"
+      ],
+      "env": {
+        "DS4_DIAG_TRACE_PREFILL_DENSE": "1"
+      },
+      "prompt_tokens": 5942,
+      "argmax": {
+        "id": 1919,
+        "text": "This",
+        "bytes": [
+          84,
+          104,
+          105,
+          115
+        ]
+      },
+      "argmax_logit": 17.8377876,
+      "float32_sha256": "e4b8c9a3277dcc409d041fe295dff00e81c8bd7515dc0417e722ce39f4f4b7dd"
+    },
+    {
+      "name": "book5942",
+      "arm": "base_split",
+      "seconds": 48.898429250002664,
+      "command": [
+        "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/head/ds4",
+        "-m",
+        "/Users/oppog/Downloads/ds4/gguf/Qwen3.8-Flash-Next-Q4.gguf",
+        "--metal",
+        "--ssd-streaming",
+        "--ctx",
+        "16384",
+        "--prefill-chunk",
+        "2048",
+        "--nothink",
+        "--temp",
+        "0",
+        "--prompt-file",
+        "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/fixtures/book5942.txt",
+        "--dump-logits",
+        "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/dense-ab/book5942-base_split.json"
+      ],
+      "env": {
+        "DS4_DIAG_TRACE_PREFILL_DENSE": "1",
+        "DS4_DIAG_BASE_PREFILL_SPLIT_ONLY": "1"
+      },
+      "prompt_tokens": 5942,
+      "argmax": {
+        "id": 1919,
+        "text": "This",
+        "bytes": [
+          84,
+          104,
+          105,
+          115
+        ]
+      },
+      "argmax_logit": 17.8507767,
+      "float32_sha256": "2c12488eca5aaca0bf5952c7e688369e1378ae1e418f3affcff2e4b7b7ebfe4e"
+    }
+  ],
+  "comparisons": [
+    {
+      "name": "rome29",
+      "arm": "base_dense",
+      "max_abs": 0.18282795000000007,
+      "max_abs_token": 15231,
+      "mean_abs": 0.02030043912467533,
+      "different_float32": 248318,
+      "same_argmax": true,
+      "json_identical": false
+    },
+    {
+      "name": "rome29",
+      "arm": "base_split",
+      "max_abs": 0.0855922699999998,
+      "max_abs_token": 699,
+      "mean_abs": 0.012166364712596835,
+      "different_float32": 248320,
+      "same_argmax": true,
+      "json_identical": false
+    },
+    {
+      "name": "rome29",
+      "arm": "head_repeat",
+      "max_abs": 0.0,
+      "max_abs_token": 0,
+      "mean_abs": 0.0,
+      "different_float32": 0,
+      "same_argmax": true,
+      "json_identical": true
+    },
+    {
+      "name": "book575",
+      "arm": "base_dense",
+      "max_abs": 0.41702342000000003,
+      "max_abs_token": 87689,
+      "mean_abs": 0.05494047133058168,
+      "different_float32": 248320,
+      "same_argmax": true,
+      "json_identical": false
+    },
+    {
+      "name": "book575",
+      "arm": "base_split",
+      "max_abs": 0.41702342000000003,
+      "max_abs_token": 87689,
+      "mean_abs": 0.05494047133058168,
+      "different_float32": 248320,
+      "same_argmax": true,
+      "json_identical": false
+    },
+    {
+      "name": "book575",
+      "arm": "head_repeat",
+      "max_abs": 0.0,
+      "max_abs_token": 0,
+      "mean_abs": 0.0,
+      "different_float32": 0,
+      "same_argmax": true,
+      "json_identical": true
+    },
+    {
+      "name": "book5942",
+      "arm": "base_split",
+      "max_abs": 0.33132218999999985,
+      "max_abs_token": 588,
+      "mean_abs": 0.03841696525507672,
+      "different_float32": 248320,
+      "same_argmax": true,
+      "json_identical": false
+    }
+  ],
+  "source_sha256": {
+    "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/head/ds4": "8e96b07704e89b060a66d7131c895632f729d37b9cdd4f254ed1d6e8442ec9b7",
+    "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/head/ds4.c": "99b883deaf65b7d43fd57967b892401e5fd7845177d248db8d9e140a8a60bd55",
+    "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/head/ds4_metal.m": "539c71eefc61eda43fe9c4574187c79a6c9699a05d03c9bd6cf7a2ce7e5855d4",
+    "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/head/metal/argsort.metal": "a36f9e1ca3a2d8272cb52cece7d3d0624cd45de4b2887446f525e9ec64abd5de",
+    "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/head/metal/bin.metal": "4b537679fe874fa4dea079bbb10634b3feeb2cce9b737bdb602fe6926fbb175a",
+    "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/head/metal/concat.metal": "04fb0fc2a3b51015444e330290b979a56e4cac82aee523afa2b42e361ab23da7",
+    "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/head/metal/cpy.metal": "df8cabe88c33076c16a54cfb88a00133b68ea5cbfc1742ac79608c84d4456cd4",
+    "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/head/metal/deepseek4_vision.metal": "e0908e53ab5b33903408e5723434a59b28fb90a998123a32a794570fdf5a27ea",
+    "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/head/metal/dense.metal": "034cb7a467ea234f4ea869a74b8dd790b5a8bfada06702c7f849934b1da19e1c",
+    "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/head/metal/dsv41.metal": "2000ee67dc2983f931103659ee7596e3619b34db5d7d971db42616a2bcee847c",
+    "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/head/metal/dsv4_hc.metal": "5d1988269671c9cfa9ad09024dd1c04b77559ea3894628e9bfddab44005b80d3",
+    "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/head/metal/dsv4_kv.metal": "65e6e12ac3266fdf72b1e9c69bfbd07ea7324e930a8117b63b651b5016b1b5f6",
+    "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/head/metal/dsv4_misc.metal": "a978211b6f274d863f7ea2bbee9db52d5d3ecf64c1c7642d4c2f353f96249c1c",
+    "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/head/metal/dsv4_rope.metal": "f56cb24a381c27435953d120448bc22c1b2314b151280445246bd28920b4d518",
+    "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/head/metal/flash_attn.metal": "c9ec79daf2063cd9e8c4e8874c123fbf2642c3fb6247b16aa21e1e0e6db92fcc",
+    "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/head/metal/get_rows.metal": "bd3b352a6ffb138ae5e391db97b211f8386d417365eac2caa3730f55a075aa3a",
+    "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/head/metal/glm53_bf16.metal": "27d93dcfe81b09f93ed65cd986aaa0b9c1ca1df7fc43e58c15da533284d50db5",
+    "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/head/metal/glm53_kda.metal": "a695c313e36b76fa260164c6f5a2f3203748cbcff9becc6707e71aa703ed0818",
+    "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/head/metal/glm53_vision.metal": "d20bdf039f9bd9d7b0cab8c6a4fc10bcb3097571a81246dbde1c278e0e9bec7b",
+    "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/head/metal/glu.metal": "59281e30a27cc2eb618800b6e53a57e234f65f1a1e680d6267d9139e1a06b627",
+    "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/head/metal/moe.metal": "b3ae62713a47e54c47959023a0d15c8589198ec6092307dfcf4014f180bc7f42",
+    "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/head/metal/norm.metal": "700bf92792e70a969c1f564c3c0ea7c8c9fe707d51a3537b766a9d336acfddd6",
+    "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/head/metal/qwen4.metal": "770f66bd8915cbea8eba61fb5bcde76f4e5a00979ea51e464d8df00006b388f8",
+    "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/head/metal/qwen4_vision.metal": "b37c7fc2c66131bf5817621920a6b5b30271af21160e7da33edc71e2d5c7fb4b",
+    "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/head/metal/repeat.metal": "2c6142b47a2007d246f5eb6e7395047627bb6dfa02c649311d16620da35007cd",
+    "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/head/metal/set_rows.metal": "25f597bf5f5fb5a3791efc68e3182539727609f09c45750ef9376ed430d7a029",
+    "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/head/metal/softmax.metal": "6eaa6ce78c4b221b3c7fe45647d6eb42f165201992a243d77d04cf2668fb7664",
+    "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/head/metal/sum_rows.metal": "7e1f3ad3f945b1f6f59aa2d8ee5bf464052d989a632c33ea95ce50d3c4fbf0fc",
+    "/Users/oppog/Downloads/ds4/misc/qwen-drift-2026-10-03/head/metal/unary.metal": "4607dbea21501230a193f8a333b1bd543d566f405568a094d6faf2c17cb0c5cf"
+  },
+  "status": "COMPLETE"
+}

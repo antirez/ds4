@@ -1,0 +1,26 @@
+{
+  "ds4.c": {
+    "before_sha256": "d675e21714812f7a6c01d58f3043833c6b018e48aa4583dd82e894f9cff0f1e5",
+    "after_sha256": "4045c6a98af062ef38e8fd2ded0e85e01fba85e0ca1174f07ae43f8a0b780ff1"
+  },
+  "Makefile": {
+    "before_sha256": "d3e611e1a95f7e06cc50125e918ab74791d9f94184c602a68ff2b95415b37f3f",
+    "after_sha256": "17b06206bf0cf87db2f5e7083a4a7e8e786f75b56690612ba7c58d9c6edcf081"
+  },
+  "docs/QWEN38_FLASH_NEXT.md": {
+    "before_sha256": "b834715fa75d0cd3a13f400b9a5b907820b4eb8ca0d9adcb5e7e08364e182ba6",
+    "after_sha256": "763c918ceebfb18b8df56867e4d657433586e401fcea4afc0dc5b03048818f49"
+  },
+  "tests/test_qwen4_generation.c": {
+    "before_sha256": "2fd2203ab384aef143d5e2f44d68994d51d346f24e2a1631e45028fb4acf5d1e",
+    "after_sha256": "1b624026c3ff4ab2c1b2a345b8edb2179744136632ce62427509868fa4b9994a"
+  },
+  "tests/test_qwen4_resident_arithmetic.c": {
+    "before_sha256": null,
+    "after_sha256": "604edfcca9d3bcaa0e6d7dd09b4be84554c1313ebb9067849bf24f29c67f2374"
+  },
+  ".gitignore": {
+    "scope": "one newly ignored test executable",
+    "after_sha256": "7e53ffc572d240d60c73f9d1315c2f1606eefeeadd7878baf907457c1ccf424b"
+  }
+}

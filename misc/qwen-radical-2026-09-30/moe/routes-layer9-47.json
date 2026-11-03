@@ -1,0 +1,42 @@
+{
+  "format": "QWR2, little endian uint32",
+  "source": "misc/qwen-gain5-2026-09-27/root/routes-xl.bin",
+  "source_sha256": "622a763a94237de306562f021eeb7ca47b453c13da7bfb02d8e75e362d0b3745",
+  "raw_bytes": 1314880,
+  "raw_sha256": "522c44dbce52746f5cd818fc61a75513e0224f2c0cd2aacda48765890485a08f",
+  "gzip_bytes": 494910,
+  "gzip_sha256": "075f58cbc4bfa74edeb994420ca6591160ac0f11b0af3dcb894ecc7d2f41a9c4",
+  "records": [
+    {
+      "layer": 9,
+      "bytes": 657440,
+      "sha256": "49483fd4a1083307f948c1ffdee3f5eb2d5767d1a37dee0b8ee443bc1e6cf222",
+      "header": [
+        1364677170,
+        9,
+        8192,
+        512,
+        10,
+        2560,
+        640,
+        81920
+      ]
+    },
+    {
+      "layer": 47,
+      "bytes": 657440,
+      "sha256": "fcac70fc2dff792aa9361b2a65f6e9d293332ccf3bff96f8fa815e669323ac2d",
+      "header": [
+        1364677170,
+        47,
+        8192,
+        512,
+        10,
+        2560,
+        640,
+        81920
+      ]
+    }
+  ],
+  "notes": "Only routing IDs, frequencies and captured GPU pair order; no model weights."
+}

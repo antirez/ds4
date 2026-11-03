@@ -1,0 +1,1 @@
+Scrivi soltanto codice Python, senza spiegazioni. Implementa una funzione breadth_first_search(graph, start) che restituisce l'ordine di visita di un grafo rappresentato da un dizionario di liste. Gestisci cicli, nodi senza archi e vicini assenti dal dizionario. Aggiungi una docstring e almeno sei test con assert, ciascuno con un grafo diverso.

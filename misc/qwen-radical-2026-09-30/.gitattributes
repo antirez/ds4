@@ -1,0 +1,7 @@
+# Preserve captured stdout byte-for-byte, including model-generated indentation.
+model/*/*.out -text -whitespace
+model/*/*.log -text
+# Frozen source hashes and routing fixtures must survive checkout unchanged.
+moe/*.metal -text
+moe/schedule-oracle.m -text
+moe/*.gz -text

@@ -76,8 +76,9 @@ The startup line reports both figures.
 | Metal SSD streaming, V4.1 Flash | Ordered fallback |
 | Metal, GLM 5.2 | Ordered fallback |
 | Metal, GLM 5.3 | Native batching through 2051 visible tokens; ordered fallback afterward |
-| Metal, Qwen3.8 Flash Next | Native batching of the shared work; recurrent state, caches and PLE history stay per session |
+| Metal, Qwen3.8 Flash Next with resident weights | Native batching of the shared work; recurrent state, caches and PLE history stay per session |
 | CUDA, supported multi-GPU Flash TP layout | Native grouped decode and mixed prefill/decode |
+| Metal, Qwen3.8 Flash Next with SSD expert streaming | Ordered fallback with per-session streaming workspaces |
 | Single-GPU CUDA, including Spark | Ordered fallback |
 
 Fallback executes the rows separately. It provides concurrency and scheduling
@@ -89,7 +90,8 @@ Long prefills yield to active decoders in bounded intervals, normally 128
 tokens. `--mixed-prefill-quantum N` changes that interval for testing. While
 nothing is decoding, a V4.1 slot prefills in the engine's own chunk.
 Session-batched serving uses ordinary target decoding, except Qwen3.8 on
-Metal, where `--mtp` also batches speculative decoding. Its
+Metal, where `--mtp` also batches speculative decoding with resident weights
+and uses ordered speculative cycles with SSD expert streaming. Its
 `--mtp-exact-sampling` mode uses ordinary batches for nonzero-temperature
 requests. Other models do not use MTP/DSpark while session batching is active.
 For the eight-L40S example, see [CUDA GPUs](CUDA_MULTI_GPU.md#serve-multiple-users).

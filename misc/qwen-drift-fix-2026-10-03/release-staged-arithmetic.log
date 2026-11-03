@@ -1,0 +1,210 @@
+env -u DS4_METAL_UNRETAINED MTL_DEBUG_LAYER=1 DS4_METAL_MATH_SAFE=0 ./tests/test_qwen4_resident_arithmetic
+2026-10-03 11:52:20.996 test_qwen4_resident_arithmetic[24932:810862] Metal API Validation Enabled
+ds4: Metal device Apple M1 Max, 32.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal model views created in 0.390 ms, residency requested in 0.312 ms, warmup 1.442 ms (mapped 6.25 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 1 overlapping shared buffers
+Qwen resident arithmetic: HC-down F16 T=1 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: HC-down F16 T=3 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: HC-down F16 T=8 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: HC-down F16 T=9 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: HC-down F16 T=29 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: HC-down F16 T=64 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: HC-down F16 T=65 matches resident/SSD prefill and decode references
+ds4: Metal model views created in 0.030 ms, residency requested in 0.226 ms, warmup 0.323 ms (mapped 6.25 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+Qwen resident arithmetic: HC-up F16 T=1 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: HC-up F16 T=3 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: HC-up F16 T=8 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: HC-up F16 T=9 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: HC-up F16 T=29 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: HC-up F16 T=64 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: HC-up F16 T=65 matches resident/SSD prefill and decode references
+ds4: Metal model views created in 0.038 ms, residency requested in 0.476 ms, warmup 0.499 ms (mapped 15.94 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers
+Qwen resident arithmetic: attention Q8 T=1 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: attention Q8 T=3 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: attention Q8 T=4 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: attention Q8 T=5 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: attention Q8 T=8 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: attention Q8 T=9 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: attention Q8 T=16 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: attention Q8 T=17 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: attention Q8 T=29 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: attention Q8 T=32 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: attention Q8 T=33 matches resident/SSD prefill and decode references
+ds4: Metal model views created in 0.025 ms, residency requested in 0.473 ms, warmup 0.580 ms (mapped 0.47 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 4 overlapping shared buffers
+Qwen resident arithmetic: GDN alpha F32 T=1 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: GDN alpha F32 T=3 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: GDN alpha F32 T=8 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: GDN alpha F32 T=9 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: GDN alpha F32 T=29 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: GDN alpha F32 T=575 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: GDN alpha F32 T=1846 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: GDN alpha F32 T=2048 matches resident/SSD prefill and decode references
+ds4: Metal model views created in 0.026 ms, residency requested in 0.502 ms, warmup 0.368 ms (mapped 5.00 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 5 overlapping shared buffers
+Qwen resident arithmetic: router F32 T=29 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: router F32 T=575 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: three-row attention at pos=2048 matches independent range/parent references
+Qwen resident and SSD arithmetic policy tests passed
+env -u DS4_METAL_UNRETAINED MTL_DEBUG_LAYER=1 DS4_METAL_MATH_SAFE=1 ./tests/test_qwen4_resident_arithmetic
+2026-10-03 11:52:26.043 test_qwen4_resident_arithmetic[24945:811034] Metal API Validation Enabled
+ds4: Metal device Apple M1 Max, 32.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: Metal shader library math mode = safe (strict IEEE-754) by DS4_METAL_MATH_SAFE
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=on tensor_matmul=off
+ds4: Metal model views created in 0.042 ms, residency requested in 0.169 ms, warmup 1.129 ms (mapped 6.25 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 1 overlapping shared buffers
+Qwen resident arithmetic: HC-down F16 T=1 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: HC-down F16 T=3 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: HC-down F16 T=8 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: HC-down F16 T=9 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: HC-down F16 T=29 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: HC-down F16 T=64 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: HC-down F16 T=65 matches resident/SSD prefill and decode references
+ds4: Metal model views created in 0.028 ms, residency requested in 0.258 ms, warmup 0.484 ms (mapped 6.25 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+Qwen resident arithmetic: HC-up F16 T=1 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: HC-up F16 T=3 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: HC-up F16 T=8 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: HC-up F16 T=9 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: HC-up F16 T=29 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: HC-up F16 T=64 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: HC-up F16 T=65 matches resident/SSD prefill and decode references
+ds4: Metal model views created in 0.060 ms, residency requested in 0.650 ms, warmup 0.706 ms (mapped 15.94 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers
+Qwen resident arithmetic: attention Q8 T=1 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: attention Q8 T=3 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: attention Q8 T=4 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: attention Q8 T=5 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: attention Q8 T=8 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: attention Q8 T=9 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: attention Q8 T=16 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: attention Q8 T=17 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: attention Q8 T=29 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: attention Q8 T=32 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: attention Q8 T=33 matches resident/SSD prefill and decode references
+ds4: Metal model views created in 0.034 ms, residency requested in 0.743 ms, warmup 0.360 ms (mapped 0.47 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 4 overlapping shared buffers
+Qwen resident arithmetic: GDN alpha F32 T=1 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: GDN alpha F32 T=3 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: GDN alpha F32 T=8 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: GDN alpha F32 T=9 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: GDN alpha F32 T=29 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: GDN alpha F32 T=575 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: GDN alpha F32 T=1846 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: GDN alpha F32 T=2048 matches resident/SSD prefill and decode references
+ds4: Metal model views created in 0.024 ms, residency requested in 0.608 ms, warmup 0.699 ms (mapped 5.00 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 5 overlapping shared buffers
+Qwen resident arithmetic: router F32 T=29 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: router F32 T=575 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: three-row attention at pos=2048 matches independent range/parent references
+Qwen resident and SSD arithmetic policy tests passed
+MTL_DEBUG_LAYER=1 DS4_METAL_UNRETAINED=1 DS4_METAL_MATH_SAFE=0 ./tests/test_qwen4_resident_arithmetic
+2026-10-03 11:52:31.237 test_qwen4_resident_arithmetic[24949:811161] Metal API Validation Enabled
+ds4: Metal device Apple M1 Max, 32.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal model views created in 0.056 ms, residency requested in 0.139 ms, warmup 1.027 ms (mapped 6.25 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 1 overlapping shared buffers
+Qwen resident arithmetic: HC-down F16 T=1 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: HC-down F16 T=3 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: HC-down F16 T=8 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: HC-down F16 T=9 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: HC-down F16 T=29 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: HC-down F16 T=64 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: HC-down F16 T=65 matches resident/SSD prefill and decode references
+ds4: Metal model views created in 0.032 ms, residency requested in 0.252 ms, warmup 0.655 ms (mapped 6.25 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+Qwen resident arithmetic: HC-up F16 T=1 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: HC-up F16 T=3 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: HC-up F16 T=8 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: HC-up F16 T=9 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: HC-up F16 T=29 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: HC-up F16 T=64 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: HC-up F16 T=65 matches resident/SSD prefill and decode references
+ds4: Metal model views created in 0.042 ms, residency requested in 0.659 ms, warmup 1.220 ms (mapped 15.94 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers
+Qwen resident arithmetic: attention Q8 T=1 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: attention Q8 T=3 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: attention Q8 T=4 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: attention Q8 T=5 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: attention Q8 T=8 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: attention Q8 T=9 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: attention Q8 T=16 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: attention Q8 T=17 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: attention Q8 T=29 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: attention Q8 T=32 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: attention Q8 T=33 matches resident/SSD prefill and decode references
+ds4: Metal model views created in 0.038 ms, residency requested in 0.558 ms, warmup 0.996 ms (mapped 0.47 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 4 overlapping shared buffers
+Qwen resident arithmetic: GDN alpha F32 T=1 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: GDN alpha F32 T=3 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: GDN alpha F32 T=8 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: GDN alpha F32 T=9 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: GDN alpha F32 T=29 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: GDN alpha F32 T=575 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: GDN alpha F32 T=1846 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: GDN alpha F32 T=2048 matches resident/SSD prefill and decode references
+ds4: Metal model views created in 0.028 ms, residency requested in 0.549 ms, warmup 0.725 ms (mapped 5.00 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 5 overlapping shared buffers
+Qwen resident arithmetic: router F32 T=29 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: router F32 T=575 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: three-row attention at pos=2048 matches independent range/parent references
+Qwen resident and SSD arithmetic policy tests passed
+MTL_DEBUG_LAYER=1 DS4_METAL_UNRETAINED=1 DS4_METAL_MATH_SAFE=1 ./tests/test_qwen4_resident_arithmetic
+2026-10-03 11:52:32.412 test_qwen4_resident_arithmetic[24950:811205] Metal API Validation Enabled
+ds4: Metal device Apple M1 Max, 32.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: Metal shader library math mode = safe (strict IEEE-754) by DS4_METAL_MATH_SAFE
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=on tensor_matmul=off
+ds4: Metal model views created in 0.052 ms, residency requested in 0.294 ms, warmup 0.998 ms (mapped 6.25 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 1 overlapping shared buffers
+Qwen resident arithmetic: HC-down F16 T=1 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: HC-down F16 T=3 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: HC-down F16 T=8 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: HC-down F16 T=9 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: HC-down F16 T=29 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: HC-down F16 T=64 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: HC-down F16 T=65 matches resident/SSD prefill and decode references
+ds4: Metal model views created in 0.039 ms, residency requested in 0.275 ms, warmup 0.691 ms (mapped 6.25 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+Qwen resident arithmetic: HC-up F16 T=1 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: HC-up F16 T=3 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: HC-up F16 T=8 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: HC-up F16 T=9 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: HC-up F16 T=29 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: HC-up F16 T=64 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: HC-up F16 T=65 matches resident/SSD prefill and decode references
+ds4: Metal model views created in 0.038 ms, residency requested in 0.413 ms, warmup 0.656 ms (mapped 15.94 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers
+Qwen resident arithmetic: attention Q8 T=1 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: attention Q8 T=3 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: attention Q8 T=4 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: attention Q8 T=5 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: attention Q8 T=8 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: attention Q8 T=9 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: attention Q8 T=16 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: attention Q8 T=17 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: attention Q8 T=29 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: attention Q8 T=32 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: attention Q8 T=33 matches resident/SSD prefill and decode references
+ds4: Metal model views created in 0.035 ms, residency requested in 0.630 ms, warmup 0.719 ms (mapped 0.47 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 4 overlapping shared buffers
+Qwen resident arithmetic: GDN alpha F32 T=1 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: GDN alpha F32 T=3 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: GDN alpha F32 T=8 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: GDN alpha F32 T=9 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: GDN alpha F32 T=29 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: GDN alpha F32 T=575 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: GDN alpha F32 T=1846 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: GDN alpha F32 T=2048 matches resident/SSD prefill and decode references
+ds4: Metal model views created in 0.031 ms, residency requested in 0.536 ms, warmup 0.643 ms (mapped 5.00 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 5 overlapping shared buffers
+Qwen resident arithmetic: router F32 T=29 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: router F32 T=575 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: three-row attention at pos=2048 matches independent range/parent references
+Qwen resident and SSD arithmetic policy tests passed

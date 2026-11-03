@@ -1,0 +1,11 @@
+PASS small T1 float/half
+PASS small T7 float/half
+PASS small T9 float/half
+PASS small T30 float/half
+PASS small T33 float/half
+PASS small T67 float/half
+PASS small T131 float/half
+PASS small T201 float/half
+PASS small T439 float/half
+BENCH T=8192 D=2560 E=512 baseline=267.6514 candidate=259.1458 gain=3.28%
+PASS prefill oracle 19 fixtures 545233920 exact FP32 comparisons

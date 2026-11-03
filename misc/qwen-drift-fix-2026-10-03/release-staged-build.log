@@ -1,0 +1,24 @@
+cc -O3 -ffast-math -g -mcpu=native -Wall -Wextra -std=c99 -c -o ds4_cli.o ds4_cli.c
+cc -O3 -ffast-math -g -mcpu=native -Wall -Wextra -std=c99 -c -o ds4_help.o ds4_help.c
+cc -O3 -ffast-math -g -mcpu=native -Wall -Wextra -std=c99 -c -o ds4_prompt_prefix.o ds4_prompt_prefix.c
+cc -O3 -ffast-math -g -mcpu=native -Wall -Wextra -std=c99 -c -o linenoise.o linenoise.c
+cc -O3 -ffast-math -g -mcpu=native -Wall -Wextra -std=c99 -c -o ds4_gpu_args.o ds4_gpu_args.c
+cc -O3 -ffast-math -g -mcpu=native -Wall -Wextra -std=c99 -c -o ds4.o ds4.c
+cc -O3 -ffast-math -g -mcpu=native -Wall -Wextra -std=c99 -c -o ds4_image.o ds4_image.c
+cc -O3 -ffast-math -g -mcpu=native -Wall -Wextra -std=c99 -c -o ds4_distributed.o ds4_distributed.c
+cc -O3 -ffast-math -g -mcpu=native -Wall -Wextra -std=c99 -c -o ds4_tp.o ds4_tp.c
+cc -O3 -ffast-math -g -mcpu=native -Wall -Wextra -std=c99 -c -o ds4_ssd.o ds4_ssd.c
+cc -O3 -ffast-math -g -mcpu=native -Wall -Wextra -fobjc-arc -c -o ds4_metal.o ds4_metal.m
+cc -O3 -ffast-math -g -mcpu=native -Wall -Wextra -std=c99   -c -o ds4_layer_pack.o ds4_layer_pack.c
+cc -O3 -g -mcpu=native -Wall -Wextra -std=c99 -c -o ds4_engram.o ds4_engram.c
+cc -O3 -ffast-math -g -mcpu=native -Wall -Wextra -std=c99 -c -o ds4_server.o ds4_server.c
+cc -O3 -ffast-math -g -mcpu=native -Wall -Wextra -std=c99 -c -o ds4_kvstore.o ds4_kvstore.c
+cc -O3 -ffast-math -g -mcpu=native -Wall -Wextra -std=c99 -c -o rax.o rax.c
+cc -O3 -g -mcpu=native -Wall -Wextra -std=c99 -Wno-unused-function -I. -c -o tests/test_qwen4_resident_arithmetic.o tests/test_qwen4_resident_arithmetic.c
+cc -O3 -g -mcpu=native -Wall -Wextra -std=c99 -Wno-unused-function -I. -c -o tests/test_qwen4_generation.o tests/test_qwen4_generation.c
+cc -O3 -g -mcpu=native -Wall -Wextra -std=c99 -Wno-unused-function -I. -c -o tests/test_qwen4_memory.o tests/test_qwen4_memory.c
+cc -O3 -g -mcpu=native -Wall -Wextra -std=c99 -o tests/test_qwen4_memory tests/test_qwen4_memory.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o -lm -pthread
+cc -O3 -ffast-math -g -mcpu=native -Wall -Wextra -std=c99 -o ds4 ds4_cli.o ds4_help.o ds4_prompt_prefix.o linenoise.o ds4_gpu_args.o ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_metal.o ds4_layer_pack.o ds4_engram.o -lm -pthread -framework Foundation -framework Metal
+cc -O3 -ffast-math -g -mcpu=native -Wall -Wextra -std=c99 -o ds4-server ds4_server.o ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args.o ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_metal.o ds4_layer_pack.o ds4_engram.o -lm -pthread -framework Foundation -framework Metal
+cc -O3 -g -mcpu=native -Wall -Wextra -std=c99 -o tests/test_qwen4_resident_arithmetic tests/test_qwen4_resident_arithmetic.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_metal.o ds4_layer_pack.o ds4_engram.o -lm -pthread -framework Foundation -framework Metal
+cc -O3 -g -mcpu=native -Wall -Wextra -std=c99 -o tests/test_qwen4_generation tests/test_qwen4_generation.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_metal.o ds4_layer_pack.o ds4_engram.o -lm -pthread -framework Foundation -framework Metal

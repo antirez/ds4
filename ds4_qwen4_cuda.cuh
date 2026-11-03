@@ -2046,6 +2046,11 @@ extern "C" int ds4_gpu_qwen4_dense_mm_tensor(ds4_gpu_tensor *out, const ds4_gpu_
                            type, 1, T, 1, 1, K, M, 0, false);
 }
 
+extern "C" int ds4_gpu_qwen4_dense_mm_prefill_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const void *map, uint64_t size, uint64_t off, uint32_t type, uint32_t T, uint32_t K, uint32_t M) {
+    return ds4_gpu_qwen4_dense_mm_tensor(out, x, map, size, off, type, T, K, M);
+}
+
 extern "C" int ds4_gpu_qwen4_matmul_q8_0_tensor(ds4_gpu_tensor *out, const void *map,
         uint64_t size, uint64_t off, uint64_t K, uint64_t M, const ds4_gpu_tensor *x, uint64_t T) {
     if (K > UINT_MAX || M > UINT_MAX || T > UINT_MAX) return 0;

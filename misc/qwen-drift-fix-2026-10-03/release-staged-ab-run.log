@@ -1,0 +1,35 @@
+START resident-logits rome29 base0aa
+DONE resident-logits rome29 base0aa 0.877
+START resident-logits rome29 rootfix
+COMPARE {"series": "resident-logits", "name": "rome29", "reference": "base0aa", "candidate": "rootfix", "json_identical": true, "reference_wall_seconds": 0.8769845830101985, "candidate_wall_seconds": 4.442430957991746, "wall_speedup_percent": -80.258903485432, "different_float32": 0, "same_argmax": true, "max_abs": 0.0, "max_abs_token": 0, "mean_abs": 0.0, "first_different_float32": null, "exact": true}
+DONE resident-logits rome29 rootfix 4.442
+START resident-logits book575 base0aa
+DONE resident-logits book575 base0aa 2.9
+START resident-logits book575 rootfix
+COMPARE {"series": "resident-logits", "name": "book575", "reference": "base0aa", "candidate": "rootfix", "json_identical": true, "reference_wall_seconds": 2.899840250000125, "candidate_wall_seconds": 2.824632499992731, "wall_speedup_percent": 2.6625676086212025, "different_float32": 0, "same_argmax": true, "max_abs": 0.0, "max_abs_token": 0, "mean_abs": 0.0, "first_different_float32": null, "exact": true}
+DONE resident-logits book575 rootfix 2.825
+START resident-logits book5942 base0aa
+DONE resident-logits book5942 base0aa 24.326
+START resident-logits book5942 rootfix
+COMPARE {"series": "resident-logits", "name": "book5942", "reference": "base0aa", "candidate": "rootfix", "json_identical": true, "reference_wall_seconds": 24.326032124998164, "candidate_wall_seconds": 24.160746583002037, "wall_speedup_percent": 0.6841077589564648, "different_float32": 0, "same_argmax": true, "max_abs": 0.0, "max_abs_token": 0, "mean_abs": 0.0, "first_different_float32": null, "exact": true}
+DONE resident-logits book5942 rootfix 24.161
+START resident-greedy rome29 base0aa
+DONE resident-greedy rome29 base0aa 4.176
+START resident-greedy rome29 rootfix
+COMPARE {"series": "resident-greedy", "name": "rome29", "reference": "base0aa", "candidate": "rootfix", "json_identical": true, "reference_wall_seconds": 4.176350416993955, "candidate_wall_seconds": 3.6281642920075683, "wall_speedup_percent": 15.10918692943366, "same_tokens": true, "common_token_prefix": 64, "first_different_step_zero_based": null, "selected_bytes_identical": true, "exact": true}
+DONE resident-greedy rome29 rootfix 3.628
+START resident-greedy book575 base0aa
+DONE resident-greedy book575 base0aa 6.227
+START resident-greedy book575 rootfix
+COMPARE {"series": "resident-greedy", "name": "book575", "reference": "base0aa", "candidate": "rootfix", "json_identical": true, "reference_wall_seconds": 6.227470666010049, "candidate_wall_seconds": 5.658947333009564, "wall_speedup_percent": 10.046450329802425, "same_tokens": true, "common_token_prefix": 64, "first_different_step_zero_based": null, "selected_bytes_identical": true, "exact": true}
+DONE resident-greedy book575 rootfix 5.659
+START ssd-logits rome29 before-fix
+DONE ssd-logits rome29 before-fix 8.396
+START ssd-logits rome29 rootfix
+COMPARE {"series": "ssd-logits", "name": "rome29", "reference": "before-fix", "candidate": "rootfix", "json_identical": true, "reference_wall_seconds": 8.395848832995398, "candidate_wall_seconds": 6.079591542002163, "wall_speedup_percent": 38.0988965293289, "different_float32": 0, "same_argmax": true, "max_abs": 0.0, "max_abs_token": 0, "mean_abs": 0.0, "first_different_float32": null, "exact": true}
+DONE ssd-logits rome29 rootfix 6.08
+START ssd-logits book575 before-fix
+DONE ssd-logits book575 before-fix 12.078
+START ssd-logits book575 rootfix
+COMPARE {"series": "ssd-logits", "name": "book575", "reference": "before-fix", "candidate": "rootfix", "json_identical": true, "reference_wall_seconds": 12.077652332998696, "candidate_wall_seconds": 11.776958749993355, "wall_speedup_percent": 2.5532362759231875, "different_float32": 0, "same_argmax": true, "max_abs": 0.0, "max_abs_token": 0, "mean_abs": 0.0, "first_different_float32": null, "exact": true}
+DONE ssd-logits book575 rootfix 11.777

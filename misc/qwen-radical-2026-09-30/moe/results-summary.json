@@ -1,0 +1,275 @@
+{
+  "status": "PASS",
+  "scope": "resident paired MoE microbenchmarks, synthetic weights and captured real GPU routing, no whole-model evidence",
+  "baseline": "current production M1 SSD K32 NT4, ordinary tile-major0 grid, ascending active IDs",
+  "reference_sha256": "a83bfe82c8fe5215b041ce62a06fb5138d1e42fca3625c8e8581411fe4520609",
+  "small_fast_fp32_comparisons": 20945920,
+  "small_safe_fp32_comparisons": 20945920,
+  "note_raw_field": "Original per-run candidate_gpu_ms historically named field includes measured CPU worklist only in whole-pair compact runs. Here candidate_gpu_samples_ms subtracts that exact recorded overhead; stages were GPU-only.",
+  "results": [
+    {
+      "name": "major-layer9",
+      "variant": "major",
+      "layer": 9,
+      "median_baseline_pair_ms": 267.6514374979888,
+      "median_candidate_pair_plus_cpu_ms": 259.14583333360497,
+      "median_gain_percent": 3.282168983760725,
+      "mean_baseline_ms": 265.1671718740545,
+      "mean_candidate_pair_plus_cpu_ms": 256.9739999980811,
+      "mean_gain_percent": 3.1883271755253517,
+      "cpu_worklist_ms": 0,
+      "cpu_schedule_timing_samples": 1,
+      "baseline_gpu_samples_ms": [
+        247.98662500688806,
+        259.7220000025118,
+        275.58087499346584,
+        236.58774999785237,
+        235.24224999709986,
+        288.9677499915706,
+        290.0627916678786,
+        287.18733333516866
+      ],
+      "candidate_gpu_samples_ms": [
+        240.65787499421276,
+        251.01795833325014,
+        267.2737083339598,
+        234.47149999265093,
+        240.80187499930616,
+        270.0524166721152,
+        276.10320833628066,
+        275.41345832287334
+      ],
+      "candidate_pair_plus_cpu_samples_ms": [
+        240.65787499421276,
+        251.01795833325014,
+        267.2737083339598,
+        234.47149999265093,
+        240.80187499930616,
+        270.0524166721152,
+        276.10320833628066,
+        275.41345832287334
+      ],
+      "block_mean_gains_percent": [
+        3.2608459873721074,
+        2.0774322288938274,
+        2.614387024830833,
+        4.665943914220261
+      ],
+      "descriptor_used_bytes": 11168,
+      "descriptor_capacity_in_fixture_bytes": 524288,
+      "descriptor_capacity_in_fixture_shared_by_both_arms": true,
+      "comparisons_fp32": 545233920,
+      "all_samples_included": true,
+      "conversion_median_ms": {
+        "baseline": 0.4558333384920843,
+        "candidate": 0.457145826658234
+      },
+      "mid_median_ms": {
+        "baseline": 190.69287499587517,
+        "candidate": 177.98931249853922
+      },
+      "down_median_ms": {
+        "baseline": 92.97435417101951,
+        "candidate": 91.98293749795994
+      }
+    },
+    {
+      "name": "compact-layer9",
+      "variant": "compact",
+      "layer": 9,
+      "median_baseline_pair_ms": 246.06464584212517,
+      "median_candidate_pair_plus_cpu_ms": 233.4815000047153,
+      "median_gain_percent": 5.389354547214986,
+      "mean_baseline_ms": 247.8056197924161,
+      "mean_candidate_pair_plus_cpu_ms": 233.5621145828251,
+      "mean_gain_percent": 6.098379968443046,
+      "cpu_worklist_ms": 0.006,
+      "cpu_schedule_timing_samples": 1,
+      "baseline_gpu_samples_ms": [
+        236.79499998979736,
+        253.1495416769758,
+        265.9751666651573,
+        266.9831666717073,
+        238.97975000727456,
+        233.54212500271387,
+        233.83970832219347,
+        253.18050000350922
+      ],
+      "candidate_gpu_samples_ms": [
+        233.5668750019977,
+        233.38412500743289,
+        237.16970832902007,
+        241.01024999981746,
+        228.7286250066245,
+        228.64937499980442,
+        230.02545832423493,
+        235.91449999366887
+      ],
+      "candidate_pair_plus_cpu_samples_ms": [
+        233.5728750019977,
+        233.39012500743289,
+        237.17570832902007,
+        241.01624999981746,
+        228.7346250066245,
+        228.65537499980442,
+        230.03145832423493,
+        235.92049999366887
+      ],
+      "block_mean_gains_percent": [
+        4.92149092259524,
+        11.452801339324491,
+        3.308309102373652,
+        4.521549836136685
+      ],
+      "descriptor_used_bytes": 11168,
+      "descriptor_capacity_in_fixture_bytes": 524288,
+      "descriptor_capacity_in_fixture_shared_by_both_arms": true,
+      "comparisons_fp32": 545233920,
+      "all_samples_included": true,
+      "conversion_median_ms": {
+        "baseline": 0.4558125074254349,
+        "candidate": 0.4554999904939905
+      },
+      "mid_median_ms": {
+        "baseline": 158.30443750019185,
+        "candidate": 149.91489583917428
+      },
+      "down_median_ms": {
+        "baseline": 83.00187499844469,
+        "candidate": 82.51025000208756
+      }
+    },
+    {
+      "name": "heavy-layer9",
+      "variant": "compact-heavy",
+      "layer": 9,
+      "median_baseline_pair_ms": 271.555499995884,
+      "median_candidate_pair_plus_cpu_ms": 250.26866666252212,
+      "median_gain_percent": 8.505592656577488,
+      "mean_baseline_ms": 274.03695312568743,
+      "mean_candidate_pair_plus_cpu_ms": 250.07891666558757,
+      "mean_gain_percent": 9.580190437299919,
+      "cpu_worklist_ms": 0.023,
+      "cpu_schedule_timing_samples": 1,
+      "baseline_gpu_samples_ms": [
+        264.1999583283905,
+        292.187750004814,
+        296.3072916754754,
+        282.2381250007311,
+        252.7259166672593,
+        261.5255833370611,
+        267.60574999207165,
+        275.5052499996964
+      ],
+      "candidate_gpu_samples_ms": [
+        254.2937499965774,
+        252.33925000065938,
+        267.2067916719243,
+        235.49579166865442,
+        251.39995833160356,
+        249.0913749934407,
+        247.1078333328478,
+        243.51258332899306
+      ],
+      "candidate_pair_plus_cpu_samples_ms": [
+        254.31674999657739,
+        252.36225000065937,
+        267.2297916719243,
+        235.51879166865442,
+        251.42295833160355,
+        249.1143749934407,
+        247.1308333328478,
+        243.53558332899306
+      ],
+      "block_mean_gains_percent": [
+        9.810690464029271,
+        15.076488695798162,
+        2.7398888686631206,
+        10.688439548547922
+      ],
+      "descriptor_used_bytes": 11168,
+      "descriptor_capacity_in_fixture_bytes": 524288,
+      "descriptor_capacity_in_fixture_shared_by_both_arms": true,
+      "comparisons_fp32": 545233920,
+      "all_samples_included": true,
+      "conversion_median_ms": {
+        "baseline": 0.45543749729404226,
+        "candidate": 0.45506250171456486
+      },
+      "mid_median_ms": {
+        "baseline": 156.7974999998114,
+        "candidate": 146.98839583434165
+      },
+      "down_median_ms": {
+        "baseline": 85.50735416793032,
+        "candidate": 83.66341666987864
+      }
+    },
+    {
+      "name": "heavy-layer47",
+      "variant": "compact-heavy",
+      "layer": 47,
+      "median_baseline_pair_ms": 248.01027083594818,
+      "median_candidate_pair_plus_cpu_ms": 225.31833333304246,
+      "median_gain_percent": 10.07105687639045,
+      "mean_baseline_ms": 250.8241770829045,
+      "mean_candidate_pair_plus_cpu_ms": 227.5216354162593,
+      "mean_gain_percent": 10.241901445553658,
+      "cpu_worklist_ms": 0.013999999999999999,
+      "cpu_schedule_timing_samples": 1,
+      "baseline_gpu_samples_ms": [
+        241.42599999322556,
+        247.1709583332995,
+        264.36479165568016,
+        260.3941666748142,
+        248.3406666724477,
+        247.67987499944866,
+        250.31175000185613,
+        246.9052083324641
+      ],
+      "candidate_gpu_samples_ms": [
+        224.9641249945853,
+        225.13566666748375,
+        232.87683332455344,
+        235.78874999657273,
+        225.32004165987018,
+        225.01366666983813,
+        225.28862500621472,
+        225.67337501095608
+      ],
+      "candidate_pair_plus_cpu_samples_ms": [
+        224.9781249945853,
+        225.14966666748376,
+        232.89083332455345,
+        235.80274999657274,
+        225.3340416598702,
+        225.02766666983814,
+        225.30262500621473,
+        225.6873750109561
+      ],
+      "block_mean_gains_percent": [
+        8.546276718975964,
+        11.96205303518203,
+        10.138258314972305,
+        10.250107167651024
+      ],
+      "descriptor_used_bytes": 10960,
+      "descriptor_capacity_in_fixture_bytes": 524288,
+      "descriptor_capacity_in_fixture_shared_by_both_arms": true,
+      "comparisons_fp32": 545233920,
+      "all_samples_included": true,
+      "conversion_median_ms": {
+        "baseline": 0.4607708324328996,
+        "candidate": 0.45533332740888
+      },
+      "mid_median_ms": {
+        "baseline": 165.0396458353498,
+        "candidate": 147.15391667414224
+      },
+      "down_median_ms": {
+        "baseline": 83.96879166684812,
+        "candidate": 81.10593749734107
+      }
+    }
+  ]
+}

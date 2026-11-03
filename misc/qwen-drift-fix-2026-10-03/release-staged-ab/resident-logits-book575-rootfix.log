@@ -1,0 +1,12 @@
+ds4: Qwen BF16 n-grams: 0.00 GiB, disk reads only
+ds4: Metal device Apple M1 Max, 32.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal model views created in 0.275 ms, residency requested in 92.046 ms, warmup 1.467 ms (mapped 7574.75 MiB from offset 10.52 MiB)
+ds4: Metal mapped mmaped model as 1 overlapping shared buffers
+ds4: metal backend initialized for graph diagnostics
+ds4: memory: KV 0.48 GiB (raw 0.38 + compressed 0.11) + buffers 1.99 GiB + resident model 7.40 GiB = 9.87 GiB planned
+ds4: memory detail: ctx=16384 prefill_cap=2048 raw_kv_rows=16384 compressed_kv_rows=4097 backend=metal
+ds4: memory: KV 0.48 GiB (raw 0.38 + compressed 0.11) + buffers 1.99 GiB = 2.47 GiB context
+ds4: memory detail: ctx=16384 prefill_cap=2048 raw_kv_rows=16384 compressed_kv_rows=4097 backend=metal
+processing 575 input tokens: 575/575 (100.0%)

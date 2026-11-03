@@ -1,0 +1,6 @@
+{
+  "misc/qwen-radical-2026-09-30/moe/baseline.metal": "a83bfe82c8fe5215b041ce62a06fb5138d1e42fca3625c8e8581411fe4520609",
+  "misc/qwen-radical-2026-09-30/moe/compact.metal": "1c3bef35c3f209092e493adfc8fbe2d3d396ee205896d16bb10be180f9d3e13f",
+  "misc/qwen-radical-2026-09-30/moe/baseline-moe.metal": "b3ae62713a47e54c47959023a0d15c8589198ec6092307dfcf4014f180bc7f42",
+  "misc/qwen-radical-2026-09-30/moe/schedule-oracle.m": "020552b529ca88a3be0b9903ec9647bb77ea7a0d321f789e84093dede56f1912"
+}

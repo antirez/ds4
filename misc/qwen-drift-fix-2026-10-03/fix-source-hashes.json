@@ -1,0 +1,11 @@
+{
+  "ds4.c": "4045c6a98af062ef38e8fd2ded0e85e01fba85e0ca1174f07ae43f8a0b780ff1",
+  "ds4_metal.m": "efd5fd3b72f356d9f8c7127d92ba9d9b1c73166a0cdad3746d3e137336b8089b",
+  "metal/dense.metal": "71f69ce54a6a46ca1d71da509cb2de888171444790930235dc0b460a5c82f00e",
+  "metal/qwen4.metal": "6c4d04d1a647edf48d5d53bd216a0f38a06b80ecf675c7b6f732442e8c3475ae",
+  "tests/test_qwen4_generation.c": "1b624026c3ff4ab2c1b2a345b8edb2179744136632ce62427509868fa4b9994a",
+  "tests/test_qwen4_resident_arithmetic.c": "604edfcca9d3bcaa0e6d7dd09b4be84554c1313ebb9067849bf24f29c67f2374",
+  "Makefile": "17b06206bf0cf87db2f5e7083a4a7e8e786f75b56690612ba7c58d9c6edcf081",
+  "docs/QWEN38_FLASH_NEXT.md": "763c918ceebfb18b8df56867e4d657433586e401fcea4afc0dc5b03048818f49",
+  ".gitignore": "7e53ffc572d240d60c73f9d1315c2f1606eefeeadd7878baf907457c1ccf424b"
+}

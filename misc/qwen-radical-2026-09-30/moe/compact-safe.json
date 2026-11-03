@@ -1,0 +1,23 @@
+{
+  "active_order" : "ascending expert IDs, matching production SSD",
+  "baseline_fnv1a64" : "0e0e1488f5f07d8b",
+  "baseline_source" : "misc\/qwen-radical-2026-09-30\/moe\/baseline.metal",
+  "benchmarks" : [
+
+  ],
+  "bit_exact_float_comparisons" : 20945920,
+  "candidate_fnv1a64" : "7b042fc1bda299df",
+  "candidate_source" : "misc\/qwen-radical-2026-09-30\/moe\/compact.metal",
+  "compact_work_count" : 143,
+  "compile_only" : false,
+  "device" : "Apple M1 Max",
+  "fixtures" : 18,
+  "output_stride" : 10,
+  "routing_file" : "synthetic",
+  "routing_layer" : 0,
+  "routing_order" : "CPU ascending pair IDs",
+  "safe_math" : true,
+  "schedule" : "compact",
+  "status" : "PASS",
+  "worklist_cpu_ms" : 0.002
+}

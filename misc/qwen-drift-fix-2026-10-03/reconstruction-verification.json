@@ -1,0 +1,18 @@
+{
+  "status": "PASS",
+  "base_commit": "0aaea5a238fb41a35106a551e73c8409dfb751ac",
+  "before_commit": "575369b19d8754f7eff69b9fdaa9a4c3684b825a",
+  "manifest_sha256": "c654d601d546842a9efc176f311d3e185b586e4092334052fcb205883a8f9ac2",
+  "pending_patch_sha256": "a9b73d2fe19ef4457156900d343ebb025bf1777e04b8d3ffe9c6f4de0e3d74cd",
+  "source_counts": {
+    "base0aa": 89,
+    "before-fix": 91
+  },
+  "patched_files": [
+    "Makefile",
+    "ds4_metal.m",
+    "metal/dense.metal",
+    "metal/qwen4.metal"
+  ],
+  "built_or_executed": false
+}

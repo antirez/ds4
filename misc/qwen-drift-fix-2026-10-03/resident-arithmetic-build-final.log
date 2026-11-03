@@ -1,0 +1,2 @@
+cc -O3 -g -mcpu=native -Wall -Wextra -std=c99 -Wno-unused-function -I. -c -o tests/test_qwen4_resident_arithmetic.o tests/test_qwen4_resident_arithmetic.c
+cc -O3 -g -mcpu=native -Wall -Wextra -std=c99 -o tests/test_qwen4_resident_arithmetic tests/test_qwen4_resident_arithmetic.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_metal.o ds4_layer_pack.o ds4_engram.o -lm -pthread -framework Foundation -framework Metal

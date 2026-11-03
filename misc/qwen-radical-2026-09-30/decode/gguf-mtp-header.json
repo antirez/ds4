@@ -1,0 +1,300 @@
+{
+  "path": "/Users/oppog/Downloads/ds4/gguf/Qwen3.8-Flash-Next-Q4.gguf",
+  "file_bytes": 177280286720,
+  "mtime_ns": 1790427400057481236,
+  "version": 3,
+  "tensor_count": 1256,
+  "metadata_count": 58,
+  "header_bytes_read": 11025109,
+  "meta": {
+    "general.architecture": "qwen4exp",
+    "general.name": "Qwen3.8-Flash-Next Q40Routed (converted fast-pack)",
+    "general.alignment": 32,
+    "qwen4exp.block_count": 49,
+    "qwen4exp.nextn_predict_layers": 1
+  },
+  "predictor_tensor_count": 32,
+  "predictor_tensors": [
+    {
+      "name": "blk.48.hc_attn_norm.weight",
+      "dims": [
+        10240
+      ],
+      "type": 0,
+      "offset": 73360657920
+    },
+    {
+      "name": "blk.48.hc_attn_down.weight",
+      "dims": [
+        10240,
+        320
+      ],
+      "type": 1,
+      "offset": 73360698880
+    },
+    {
+      "name": "blk.48.hc_attn_up.weight",
+      "dims": [
+        320,
+        10240
+      ],
+      "type": 1,
+      "offset": 73367252480
+    },
+    {
+      "name": "blk.48.hc_attn_inject.weight",
+      "dims": [
+        10240,
+        4
+      ],
+      "type": 1,
+      "offset": 73373806080
+    },
+    {
+      "name": "blk.48.hc_ffn_norm.weight",
+      "dims": [
+        10240
+      ],
+      "type": 0,
+      "offset": 73373888000
+    },
+    {
+      "name": "blk.48.hc_ffn_down.weight",
+      "dims": [
+        10240,
+        320
+      ],
+      "type": 1,
+      "offset": 73373928960
+    },
+    {
+      "name": "blk.48.hc_ffn_up.weight",
+      "dims": [
+        320,
+        10240
+      ],
+      "type": 1,
+      "offset": 73380482560
+    },
+    {
+      "name": "blk.48.hc_ffn_inject.weight",
+      "dims": [
+        10240,
+        4
+      ],
+      "type": 1,
+      "offset": 73387036160
+    },
+    {
+      "name": "blk.48.attn_q.weight",
+      "dims": [
+        2560,
+        12288
+      ],
+      "type": 8,
+      "offset": 73387118080
+    },
+    {
+      "name": "blk.48.attn_k.weight",
+      "dims": [
+        2560,
+        512
+      ],
+      "type": 8,
+      "offset": 73420541440
+    },
+    {
+      "name": "blk.48.attn_v.weight",
+      "dims": [
+        2560,
+        512
+      ],
+      "type": 8,
+      "offset": 73421934080
+    },
+    {
+      "name": "blk.48.attn_output.weight",
+      "dims": [
+        6144,
+        2560
+      ],
+      "type": 8,
+      "offset": 73423326720
+    },
+    {
+      "name": "blk.48.attn_q_norm.weight",
+      "dims": [
+        256
+      ],
+      "type": 0,
+      "offset": 73440038400
+    },
+    {
+      "name": "blk.48.attn_k_norm.weight",
+      "dims": [
+        256
+      ],
+      "type": 0,
+      "offset": 73440039424
+    },
+    {
+      "name": "blk.48.indexer.q_proj.weight",
+      "dims": [
+        2560,
+        512
+      ],
+      "type": 8,
+      "offset": 73440040448
+    },
+    {
+      "name": "blk.48.indexer.k_proj.weight",
+      "dims": [
+        2560,
+        128
+      ],
+      "type": 8,
+      "offset": 73441433088
+    },
+    {
+      "name": "blk.48.indexer.q_norm.weight",
+      "dims": [
+        128
+      ],
+      "type": 0,
+      "offset": 73441781248
+    },
+    {
+      "name": "blk.48.indexer.k_norm.weight",
+      "dims": [
+        128
+      ],
+      "type": 0,
+      "offset": 73441781760
+    },
+    {
+      "name": "blk.48.ffn_gate_inp.weight",
+      "dims": [
+        2560,
+        512
+      ],
+      "type": 0,
+      "offset": 73441782272
+    },
+    {
+      "name": "blk.48.ffn_gate_exps.weight",
+      "dims": [
+        2560,
+        640,
+        512
+      ],
+      "type": 12,
+      "offset": 73447025152
+    },
+    {
+      "name": "blk.48.ffn_up_exps.weight",
+      "dims": [
+        2560,
+        640,
+        512
+      ],
+      "type": 12,
+      "offset": 73918884352
+    },
+    {
+      "name": "blk.48.ffn_down_exps.weight",
+      "dims": [
+        640,
+        2560,
+        512
+      ],
+      "type": 39,
+      "offset": 74390743552
+    },
+    {
+      "name": "blk.48.ffn_gate_shexp.weight",
+      "dims": [
+        2560,
+        640
+      ],
+      "type": 8,
+      "offset": 74836388352
+    },
+    {
+      "name": "blk.48.ffn_up_shexp.weight",
+      "dims": [
+        2560,
+        640
+      ],
+      "type": 8,
+      "offset": 74838129152
+    },
+    {
+      "name": "blk.48.ffn_down_shexp.weight",
+      "dims": [
+        640,
+        2560
+      ],
+      "type": 8,
+      "offset": 74839869952
+    },
+    {
+      "name": "blk.48.ffn_gate_inp_shexp.weight",
+      "dims": [
+        2560
+      ],
+      "type": 0,
+      "offset": 74841610752
+    },
+    {
+      "name": "blk.48.nextn.eh_proj.weight",
+      "dims": [
+        5120,
+        2560
+      ],
+      "type": 8,
+      "offset": 74841620992
+    },
+    {
+      "name": "blk.48.nextn.enorm.weight",
+      "dims": [
+        2560
+      ],
+      "type": 0,
+      "offset": 74855547392
+    },
+    {
+      "name": "blk.48.nextn.hnorm.weight",
+      "dims": [
+        10240
+      ],
+      "type": 0,
+      "offset": 74855557632
+    },
+    {
+      "name": "blk.48.nextn.hc_head_norm.weight",
+      "dims": [
+        10240
+      ],
+      "type": 0,
+      "offset": 74855598592
+    },
+    {
+      "name": "blk.48.nextn.hc_head_down.weight",
+      "dims": [
+        10240,
+        320
+      ],
+      "type": 1,
+      "offset": 74855639552
+    },
+    {
+      "name": "blk.48.nextn.hc_head_up.weight",
+      "dims": [
+        320,
+        10240
+      ],
+      "type": 1,
+      "offset": 74862193152
+    }
+  ]
+}

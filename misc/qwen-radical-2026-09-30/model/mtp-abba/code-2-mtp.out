@@ -1,0 +1,21 @@
+```python
+from collections import deque
+
+
+def breadth_first_search(graph, start):
+    """
+    Perform Breadth-First Search (BFS) on a graph represented as an adjacency list dictionary.
+    
+    Args:
+        graph (dict): A dictionary where keys are nodes and values are lists of neighboring nodes.
+        start: The starting node for BFS traversal.
+        
+    Returns:
+        list: The order of visited nodes during BFS traversal.
+    """
+    if start not in graph:
+        return []
+    
+    visited = set()
+    order = []
+    queue = deque([

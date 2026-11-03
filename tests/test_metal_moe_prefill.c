@@ -442,7 +442,7 @@ int main(int argc, char **argv) {
     free(model);
     if (ok) {
         ok = ds4_gpu_init();
-        if (ok && ds4_gpu_device_is_m5_apple_silicon()) ok = check_static_batch(false);
+        if (ok && ds4_gpu_device_is_m5_or_m6_apple_silicon()) ok = check_static_batch(false);
         ds4_gpu_cleanup();
     }
     return ok ? 0 : 1;

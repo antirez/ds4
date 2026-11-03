@@ -1,0 +1,9 @@
+2026-10-03 11:31:09.526 resident-negative[23418:783464] Metal API Validation Enabled
+ds4: Metal device Apple M1 Max, 32.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal model views created in 0.393 ms, residency requested in 0.392 ms, warmup 2.199 ms (mapped 6.25 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 1 overlapping shared buffers
+Qwen resident arithmetic: HC-down F16 T=1 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: HC-down F16 T=3 matches resident/SSD prefill and decode references
+Qwen resident arithmetic: HC-down F16 resident prefill T=8: 2418/2560 bits differ, max_error=5.7220459e-06, first=0 expected=-4.00293827 actual=-4.00293541

@@ -1,0 +1,35 @@
+--- a/ds4.c
++++ b/ds4.c
+@@ -58239,7 +58239,8 @@
+      * for short prompt tails. Float-operand F16/Q8 tiles and split-K belong
+      * to decode batches; selecting them only by row count moves prompt logits.
+      * The legacy switch remains a diagnostic control for decode batches. */
+-    const bool prefill = g->projection_phase == QWEN4_PROJECTION_PREFILL;
++    const bool prefill = g->projection_phase == QWEN4_PROJECTION_PREFILL &&
++        getenv("DS4_DIAG_BASE_PREFILL_DENSE") == NULL;
+     const bool legacy = getenv("DS4_QWEN4_DENSE_MM_LEGACY") != NULL;
+     const bool f16_batch = !prefill && !legacy && n_tok > 3u && w->type == DS4_TENSOR_F16 &&
+         n_tok <= 64u && (out_dim <= 512u || n_tok > 8u);
+--- a/ds4_metal.m
++++ b/ds4_metal.m
+@@ -51501,7 +51501,8 @@
+     const uint32_t tiles = (out_rows + 31u) / 32u;
+     const uint32_t threadgroups = tiles * ((n_tokens + 31u) / 32u);
+     uint32_t n_split = 1u;
+-    if (allow_split_k && !ds4_gpu_env_u64("DS4_QWEN4_NO_DENSE_MM_KSPLIT", 0u, 0u, 1u)) {
++    if ((allow_split_k || getenv("DS4_DIAG_BASE_PREFILL_SPLIT_ONLY") != NULL) &&
++        !ds4_gpu_env_u64("DS4_QWEN4_NO_DENSE_MM_KSPLIT", 0u, 0u, 1u)) {
+         const uint32_t nk = (in_dim + 31u) / 32u;
+         const uint32_t target = 128u;
+         const uint32_t want = threadgroups >= target ? 1u : (target + threadgroups - 1u) / threadgroups;
+@@ -51509,6 +51510,10 @@
+         if (n_split > 64u) n_split = 64u;
+     }
+     args.n_split = n_split;
++    if (getenv("DS4_DIAG_TRACE_PREFILL_DENSE") != NULL) {
++        fprintf(stderr, "DRIFT_DENSE T=%u K=%u N=%u type=%u splits=%u allow=%u\n",
++                n_tokens, in_dim, out_rows, weight_type, n_split, allow_split_k ? 1u : 0u);
++    }
+     if (n_split <= 1u) {
+         return qwen4_dispatch(QWEN4_K_DENSE_MM, &args, sizeof(args), b, 3,
+                               MTLSizeMake(tiles, (n_tokens + 31) / 32, 1), MTLSizeMake(128, 1, 1), 0);

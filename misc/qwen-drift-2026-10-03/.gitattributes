@@ -1,0 +1,9 @@
+# Preserve raw numerical captures and logs across checkout.
+dense-ab/*.json -text -diff linguist-generated=true
+greedy-ab/*.json -text -diff linguist-generated=true
+dense-ab/*.log -text linguist-generated=true
+greedy-ab/*.log -text linguist-generated=true
+fixtures/*.txt -text
+fixtures.json -text -diff
+snapshot-source-sha256.json -text
+diagnostic.patch -text

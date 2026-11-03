@@ -7,8 +7,9 @@ SSD streaming keeps a bounded cache of routed experts and reads missing
 experts from the GGUF. It trades speed for capacity; it does not remove the
 memory needed for other weights, activations, scratch, and the context.
 
-Metal supports streaming for DeepSeek and GLM. CUDA has streaming paths too,
-and ROCm supports GLM 5.2/5.3 streaming. Do not infer support for every model
+Metal supports streaming for DeepSeek, GLM and [Qwen3.8](QWEN38_FLASH_NEXT.md).
+CUDA has streaming paths too, and ROCm supports GLM 5.2/5.3 streaming.
+Do not infer support for every model
 and tensor layout from the existence of the flag.
 
 ## Start with the automatic budget

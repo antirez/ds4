@@ -1,0 +1,13 @@
+{
+  "head": "575369b19d8754f7eff69b9fdaa9a4c3684b825a",
+  "status": " M .gitignore\n M Makefile\n M docs/QWEN38_FLASH_NEXT.md\n M ds4_metal.m\n M gguf-tools/README.md\n M metal/dense.metal\n M metal/qwen4.metal\n M tests/qwen4_ssd_pread_probe.h\n M tests/test_qwen4_kernels.c\n M tests/test_qwen4_ssd_experts.c\n?? gguf-tools/qwen4_requantize_attention.py\n?? tests/qwen4_gain5_ssd_probe.h\n?? tests/qwen4_prefill_bundle_probe.h\n?? tests/qwen4_prefill_opt_probe.h\n?? tests/test_deepseek41_q4_attention\n?? tests/test_deepseek41_q4_bf16\n?? tests/test_metal_qwen4_q4_attention\n?? tests/test_qwen4_gain5_ssd.m\n?? tests/test_qwen4_prefill_bundle.m\n?? tests/test_qwen4_prefill_opt_host.c\n?? tests/test_qwen4_prefill_opt_ssd.c\n?? tests/test_qwen4_requantize_attention.py\n",
+  "sha256": {
+    "ds4.c": "d675e21714812f7a6c01d58f3043833c6b018e48aa4583dd82e894f9cff0f1e5",
+    "ds4_metal.m": "efd5fd3b72f356d9f8c7127d92ba9d9b1c73166a0cdad3746d3e137336b8089b",
+    "metal/qwen4.metal": "6c4d04d1a647edf48d5d53bd216a0f38a06b80ecf675c7b6f732442e8c3475ae",
+    "metal/dense.metal": "71f69ce54a6a46ca1d71da509cb2de888171444790930235dc0b460a5c82f00e",
+    "Makefile": "d3e611e1a95f7e06cc50125e918ab74791d9f94184c602a68ff2b95415b37f3f",
+    "docs/QWEN38_FLASH_NEXT.md": "b834715fa75d0cd3a13f400b9a5b907820b4eb8ca0d9adcb5e7e08364e182ba6",
+    "tests/test_qwen4_generation.c": "2fd2203ab384aef143d5e2f44d68994d51d346f24e2a1631e45028fb4acf5d1e"
+  }
+}

@@ -1,0 +1,48 @@
+ds4: Qwen BF16 n-grams: 95.37 GiB, disk reads only
+ds4: Metal device Apple M1 Max, 32.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal SSD streaming mode enabled; full model residency and warmup are skipped
+ds4: Qwen SSD: 6.32 GiB static weights, 9.22 GiB graph reserve, 2.59 GiB staging, 1908 cached experts (4.82 GiB)
+ds4: Metal SSD static weights locked 6.32 GiB; pageable 0.00 GiB
+ds4: SSD streaming initial metal model map (50 spans, 6.32 GiB tensor span)
+ds4: metal backend initialized for graph diagnostics
+ds4: memory: KV 1.04 GiB (raw 0.81 + compressed 0.23) + buffers 8.18 GiB + resident model 6.32 GiB + expert cache 4.82 GiB + prefill expert reserve 2.59 GiB = 22.96 GiB planned
+ds4: memory detail: ctx=32768 prefill_cap=8192 raw_kv_rows=32768 compressed_kv_rows=8193 backend=metal
+ds4: memory: KV 1.04 GiB (raw 0.81 + compressed 0.23) + buffers 8.18 GiB = 9.22 GiB context
+ds4: memory detail: ctx=32768 prefill_cap=8192 raw_kv_rows=32768 compressed_kv_rows=8193 backend=metal
+processing 102 input tokens: 102/102 (100.0%)
+ds4: prefill: 15.72 t/s, generation: 6.10 t/s
+ds4: Qwen3.8 mtp: 50 verify cycles, 48 first drafts accepted (96.0%)
+ds4: Metal memory at cleanup: runtime 0.00 GiB + streaming experts 4.82 GiB = 4.82 GiB tracked live
+ds4:   runtime tensors live 0.00 MiB peak 7056.17 MiB
+ds4:   macOS task memory footprint 10.96 GiB, resident 8.76 GiB, virtual 482.11 GiB
+ds4:   mmap model wrapper creations 50 buffers 6.32 GiB cumulative, 1.91 GiB max (not copied)
+ds4:   streaming expert cache budget=1908 experts entries=1908 expert=2.59 MiB target=4.82 GiB live=4.82 GiB, hits=82550 misses=34540 hit_rate=0.705 wraps=103620 evictions=32632 buffer_allocs=2 buffer_reuses=32632 evict_dontneed=0.00 GiB miss_willneed=0.00 GiB miss_pread=87.29 GiB pread_ms=18348.091
+ds4:   streaming expert buffer mlock locked=4.83 GiB failed=0.00 GiB failures=0 time=154.083 ms
+ds4:   streaming cache aging tokens=51 first_layer=0 decay_token=49
+ds4:   streaming expert timing total selected_calls=2541 read_avg=2.743 ms sync_avg=2.741 ms copy_avg=0.002 ms bind_avg=7.501 ms read_total=6970.608 ms sync_total=6965.131 ms copy_total=5.477 ms bind_total=19059.100 ms split_layers=6766 resident_experts_avg=5.53 missing_experts_avg=4.47 resident_submit_avg=0.021 ms missing_bind_avg=1.975 ms resident_submit_total=141.283 ms missing_bind_total=13362.167 ms missing_load_avg=0.000 ms missing_slot_avg=0.000 ms missing_prune_avg=0.000 ms missing_addr_avg=0.000 ms missing_wait_avg=0.000 ms missing_wait_total=0.000 ms load_calls=2523 load_prepare_avg=0.248 ms load_pread_avg=7.272 ms load_install_avg=0.015 ms prepare_batch_reuse_calls=0 prepare_batch_reuse_avg=0.000 ms prepare_batch_reuse_total=0.000 ms prepare_buffer_calls=34540 prepare_buffer_avg=0.014 ms prepare_buffer_total=473.545 ms prepare_task_experts=34540 prepare_task_avg=0.000 ms prepare_task_total=0.935 ms reuse_scan_calls=2514 reuse_scan_entries_avg=40960.0 reuse_scan_avg=0.118 ms reuse_scan_total=296.604 ms reuse_clear_total=18.928 ms readahead_calls=0 readahead_avg=0.000 ms readahead_total=0.000 ms readahead_gib=0.00 cache_all_resident=0 cache_all_missing=0 cache_mixed=0 cache_resident_avg=0.00 cache_missing_avg=0.00
+ds4:   streaming expert timing delta selected_calls=2541 read_avg=2.743 ms sync_avg=2.741 ms copy_avg=0.002 ms bind_avg=7.501 ms read_total=6970.608 ms sync_total=6965.131 ms copy_total=5.477 ms bind_total=19059.100 ms split_layers=6766 resident_experts_avg=5.53 missing_experts_avg=4.47 resident_submit_avg=0.021 ms missing_bind_avg=1.975 ms resident_submit_total=141.283 ms missing_bind_total=13362.167 ms missing_load_avg=0.000 ms missing_slot_avg=0.000 ms missing_prune_avg=0.000 ms missing_addr_avg=0.000 ms missing_wait_avg=0.000 ms missing_wait_total=0.000 ms load_calls=2523 load_prepare_avg=0.248 ms load_pread_avg=7.272 ms load_install_avg=0.015 ms prepare_batch_reuse_calls=0 prepare_batch_reuse_avg=0.000 ms prepare_batch_reuse_total=0.000 ms prepare_buffer_calls=34540 prepare_buffer_avg=0.014 ms prepare_buffer_total=473.545 ms prepare_task_experts=34540 prepare_task_avg=0.000 ms prepare_task_total=0.935 ms reuse_scan_calls=2514 reuse_scan_entries_avg=40960.0 reuse_scan_avg=0.118 ms reuse_scan_total=296.604 ms reuse_clear_total=18.928 ms readahead_calls=0 readahead_avg=0.000 ms readahead_total=0.000 ms readahead_gib=0.00 cache_all_resident=0 cache_all_missing=0 cache_mixed=0 cache_resident_avg=0.00 cache_missing_avg=0.00
+ds4:   model residency requests 0 (ssd-streaming)
+ds4:   device Apple M1 Max, Metal 4 runtime yes, family yes, MTL4 queue yes, tensor API disabled, neural accelerators not detected
+ds4:   accelerated Metal path disabled (tensor API unavailable)
+ds4:   device Apple M1 Max, Metal 4 runtime yes, family yes, MTL4 queue yes, tensor API disabled, neural accelerators not detected
+ds4:   scratch 0.00 MiB (flash mask 0.00, pad 0.00, tmp 0.00, blk 0.00, ring 0.00, kv 0.00, compressor 0.00, router 0.00, indexer 0.00, moe 0.00, f16 0.00, raw-store 0.00)
+       28.93 real         1.25 user        26.94 sys
+         17675747328  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             1136674  page reclaims
+                 732  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+               84572  voluntary context switches
+              298676  involuntary context switches
+         73866270947  instructions retired
+         84424024624  cycles elapsed
+         12669271400  peak memory footprint

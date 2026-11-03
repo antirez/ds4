@@ -1,0 +1,9 @@
+{
+  "status": "PASS",
+  "destination": "/Users/oppog/Downloads/ds4/misc/qwen-drift-fix-2026-10-03/reconstructed-check",
+  "source_counts": {
+    "base0aa": 89,
+    "before-fix": 91
+  },
+  "built_or_executed": false
+}

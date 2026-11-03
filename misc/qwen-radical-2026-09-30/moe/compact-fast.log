@@ -1,0 +1,10 @@
+PASS small T1 float/half
+PASS small T7 float/half
+PASS small T9 float/half
+PASS small T30 float/half
+PASS small T33 float/half
+PASS small T67 float/half
+PASS small T131 float/half
+PASS small T201 float/half
+PASS small T439 float/half
+PASS prefill oracle 18 fixtures 20945920 exact FP32 comparisons

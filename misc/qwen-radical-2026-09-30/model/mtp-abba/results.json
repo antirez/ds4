@@ -1,0 +1,409 @@
+{
+  "kind": "embedded MTP versus plain, same session CLI path and capacity",
+  "order": "0110",
+  "env": {
+    "DS4_CLI_FORCE_SESSION": "1",
+    "DS4_METAL_STREAMING_EXPERT_TIMING_SUMMARY": "1",
+    "DS4_DIAG_QWEN4_GAIN5": "0",
+    "DS4_DIAG_QWEN4_PREFILL_BUNDLE": "0"
+  },
+  "source_sha256": {
+    "/Users/oppog/Downloads/ds4/ds4.c": "d675e21714812f7a6c01d58f3043833c6b018e48aa4583dd82e894f9cff0f1e5",
+    "/Users/oppog/Downloads/ds4/ds4_metal.m": "e5eb52e4f416918774477501e204bf53c1066685113aa52c9d1680720f6b55ec",
+    "/Users/oppog/Downloads/ds4/metal/qwen4.metal": "a83bfe82c8fe5215b041ce62a06fb5138d1e42fca3625c8e8581411fe4520609",
+    "/Users/oppog/Downloads/ds4/metal/dense.metal": "cafbaa41bacc53ba86db3d750340b117d531827aaf7c9b7f382f6d0be12ca7ef",
+    "/Users/oppog/Downloads/ds4/ds4": "fba1f64b536fab1c9beb5c7010e9f4aa637cfb3c04da51b04b144d47153b5bb2"
+  },
+  "runs": [
+    {
+      "tag": "rome-1-plain",
+      "case": "rome",
+      "variant": 0,
+      "command": [
+        "/Users/oppog/Downloads/ds4/ds4",
+        "-m",
+        "/Users/oppog/Downloads/ds4/gguf/Qwen3.8-Flash-Next-Q4.gguf",
+        "--metal",
+        "--ssd-streaming",
+        "--ctx",
+        "32768",
+        "--prefill-chunk",
+        "8192",
+        "--nothink",
+        "--temp",
+        "0",
+        "-n",
+        "128",
+        "--prompt-file",
+        "/Users/oppog/Downloads/ds4/misc/qwen-cost-analysis-2026-09-27/prompt-rome.txt"
+      ],
+      "exit_code": 0,
+      "wall_s": 33.29667087500275,
+      "stdout_sha256": "3ff57f4e6182c974ce42f4c7b9752c850404d82b07b053446987f3be30276b7b",
+      "same_output": true,
+      "prefill_tps": 6.09,
+      "decode_tps": 4.92,
+      "cache": {
+        "capacity": 1908,
+        "hits": 51447,
+        "misses": 24393,
+        "pread_gib_rounded": 61.65
+      },
+      "mtp": null,
+      "peak_footprint_bytes": 12355058856
+    },
+    {
+      "tag": "rome-2-mtp",
+      "case": "rome",
+      "variant": 1,
+      "command": [
+        "/Users/oppog/Downloads/ds4/ds4",
+        "-m",
+        "/Users/oppog/Downloads/ds4/gguf/Qwen3.8-Flash-Next-Q4.gguf",
+        "--metal",
+        "--ssd-streaming",
+        "--ctx",
+        "32768",
+        "--prefill-chunk",
+        "8192",
+        "--nothink",
+        "--temp",
+        "0",
+        "-n",
+        "128",
+        "--prompt-file",
+        "/Users/oppog/Downloads/ds4/misc/qwen-cost-analysis-2026-09-27/prompt-rome.txt",
+        "--mtp-timing"
+      ],
+      "exit_code": 0,
+      "wall_s": 27.871666416991502,
+      "stdout_sha256": "3ff57f4e6182c974ce42f4c7b9752c850404d82b07b053446987f3be30276b7b",
+      "same_output": true,
+      "prefill_tps": 7.5,
+      "decode_tps": 5.8,
+      "cache": {
+        "capacity": 1908,
+        "hits": 58903,
+        "misses": 26847,
+        "pread_gib_rounded": 67.85
+      },
+      "mtp": {
+        "cycles": 69,
+        "first_accepted": 56,
+        "acceptance_pct": 81.2
+      },
+      "peak_footprint_bytes": 12666830208
+    },
+    {
+      "tag": "rome-3-mtp",
+      "case": "rome",
+      "variant": 1,
+      "command": [
+        "/Users/oppog/Downloads/ds4/ds4",
+        "-m",
+        "/Users/oppog/Downloads/ds4/gguf/Qwen3.8-Flash-Next-Q4.gguf",
+        "--metal",
+        "--ssd-streaming",
+        "--ctx",
+        "32768",
+        "--prefill-chunk",
+        "8192",
+        "--nothink",
+        "--temp",
+        "0",
+        "-n",
+        "128",
+        "--prompt-file",
+        "/Users/oppog/Downloads/ds4/misc/qwen-cost-analysis-2026-09-27/prompt-rome.txt",
+        "--mtp-timing"
+      ],
+      "exit_code": 0,
+      "wall_s": 27.22737895800674,
+      "stdout_sha256": "3ff57f4e6182c974ce42f4c7b9752c850404d82b07b053446987f3be30276b7b",
+      "same_output": true,
+      "prefill_tps": 7.74,
+      "decode_tps": 5.93,
+      "cache": {
+        "capacity": 1908,
+        "hits": 58903,
+        "misses": 26847,
+        "pread_gib_rounded": 67.85
+      },
+      "mtp": {
+        "cycles": 69,
+        "first_accepted": 56,
+        "acceptance_pct": 81.2
+      },
+      "peak_footprint_bytes": 12667321704
+    },
+    {
+      "tag": "rome-4-plain",
+      "case": "rome",
+      "variant": 0,
+      "command": [
+        "/Users/oppog/Downloads/ds4/ds4",
+        "-m",
+        "/Users/oppog/Downloads/ds4/gguf/Qwen3.8-Flash-Next-Q4.gguf",
+        "--metal",
+        "--ssd-streaming",
+        "--ctx",
+        "32768",
+        "--prefill-chunk",
+        "8192",
+        "--nothink",
+        "--temp",
+        "0",
+        "-n",
+        "128",
+        "--prompt-file",
+        "/Users/oppog/Downloads/ds4/misc/qwen-cost-analysis-2026-09-27/prompt-rome.txt"
+      ],
+      "exit_code": 0,
+      "wall_s": 31.707111333002103,
+      "stdout_sha256": "3ff57f4e6182c974ce42f4c7b9752c850404d82b07b053446987f3be30276b7b",
+      "same_output": true,
+      "prefill_tps": 7.66,
+      "decode_tps": 4.9,
+      "cache": {
+        "capacity": 1908,
+        "hits": 51447,
+        "misses": 24393,
+        "pread_gib_rounded": 61.65
+      },
+      "mtp": null,
+      "peak_footprint_bytes": 12353928384
+    },
+    {
+      "tag": "code-1-plain",
+      "case": "code",
+      "variant": 0,
+      "command": [
+        "/Users/oppog/Downloads/ds4/ds4",
+        "-m",
+        "/Users/oppog/Downloads/ds4/gguf/Qwen3.8-Flash-Next-Q4.gguf",
+        "--metal",
+        "--ssd-streaming",
+        "--ctx",
+        "32768",
+        "--prefill-chunk",
+        "8192",
+        "--nothink",
+        "--temp",
+        "0",
+        "-n",
+        "128",
+        "--prompt-file",
+        "/Users/oppog/Downloads/ds4/misc/qwen-radical-2026-09-30/model/prompt-code.txt"
+      ],
+      "exit_code": 0,
+      "wall_s": 32.61982604100194,
+      "stdout_sha256": "8ca2d15451b2608b6e771cb8c0ca2fb40b77bf598267fe9a561f91425f11d738",
+      "same_output": true,
+      "prefill_tps": 15.63,
+      "decode_tps": 5.21,
+      "cache": {
+        "capacity": 1908,
+        "hits": 78467,
+        "misses": 31453,
+        "pread_gib_rounded": 79.49
+      },
+      "mtp": null,
+      "peak_footprint_bytes": 12359187600
+    },
+    {
+      "tag": "code-2-mtp",
+      "case": "code",
+      "variant": 1,
+      "command": [
+        "/Users/oppog/Downloads/ds4/ds4",
+        "-m",
+        "/Users/oppog/Downloads/ds4/gguf/Qwen3.8-Flash-Next-Q4.gguf",
+        "--metal",
+        "--ssd-streaming",
+        "--ctx",
+        "32768",
+        "--prefill-chunk",
+        "8192",
+        "--nothink",
+        "--temp",
+        "0",
+        "-n",
+        "128",
+        "--prompt-file",
+        "/Users/oppog/Downloads/ds4/misc/qwen-radical-2026-09-30/model/prompt-code.txt",
+        "--mtp-timing"
+      ],
+      "exit_code": 0,
+      "wall_s": 28.32674816699,
+      "stdout_sha256": "8ca2d15451b2608b6e771cb8c0ca2fb40b77bf598267fe9a561f91425f11d738",
+      "same_output": true,
+      "prefill_tps": 15.76,
+      "decode_tps": 6.25,
+      "cache": {
+        "capacity": 1908,
+        "hits": 82550,
+        "misses": 34540,
+        "pread_gib_rounded": 87.29
+      },
+      "mtp": {
+        "cycles": 50,
+        "first_accepted": 48,
+        "acceptance_pct": 96.0
+      },
+      "peak_footprint_bytes": 12669107560
+    },
+    {
+      "tag": "code-3-mtp",
+      "case": "code",
+      "variant": 1,
+      "command": [
+        "/Users/oppog/Downloads/ds4/ds4",
+        "-m",
+        "/Users/oppog/Downloads/ds4/gguf/Qwen3.8-Flash-Next-Q4.gguf",
+        "--metal",
+        "--ssd-streaming",
+        "--ctx",
+        "32768",
+        "--prefill-chunk",
+        "8192",
+        "--nothink",
+        "--temp",
+        "0",
+        "-n",
+        "128",
+        "--prompt-file",
+        "/Users/oppog/Downloads/ds4/misc/qwen-radical-2026-09-30/model/prompt-code.txt",
+        "--mtp-timing"
+      ],
+      "exit_code": 0,
+      "wall_s": 28.940523416997166,
+      "stdout_sha256": "8ca2d15451b2608b6e771cb8c0ca2fb40b77bf598267fe9a561f91425f11d738",
+      "same_output": true,
+      "prefill_tps": 15.72,
+      "decode_tps": 6.1,
+      "cache": {
+        "capacity": 1908,
+        "hits": 82550,
+        "misses": 34540,
+        "pread_gib_rounded": 87.29
+      },
+      "mtp": {
+        "cycles": 50,
+        "first_accepted": 48,
+        "acceptance_pct": 96.0
+      },
+      "peak_footprint_bytes": 12669271400
+    },
+    {
+      "tag": "code-4-plain",
+      "case": "code",
+      "variant": 0,
+      "command": [
+        "/Users/oppog/Downloads/ds4/ds4",
+        "-m",
+        "/Users/oppog/Downloads/ds4/gguf/Qwen3.8-Flash-Next-Q4.gguf",
+        "--metal",
+        "--ssd-streaming",
+        "--ctx",
+        "32768",
+        "--prefill-chunk",
+        "8192",
+        "--nothink",
+        "--temp",
+        "0",
+        "-n",
+        "128",
+        "--prompt-file",
+        "/Users/oppog/Downloads/ds4/misc/qwen-radical-2026-09-30/model/prompt-code.txt"
+      ],
+      "exit_code": 0,
+      "wall_s": 35.02306300000055,
+      "stdout_sha256": "8ca2d15451b2608b6e771cb8c0ca2fb40b77bf598267fe9a561f91425f11d738",
+      "same_output": true,
+      "prefill_tps": 15.66,
+      "decode_tps": 4.75,
+      "cache": {
+        "capacity": 1908,
+        "hits": 78467,
+        "misses": 31453,
+        "pread_gib_rounded": 79.49
+      },
+      "mtp": null,
+      "peak_footprint_bytes": 12357369024
+    }
+  ],
+  "summary": {
+    "rome": {
+      "prefill": {
+        "harmonic_tps": {
+          "0": 6.785367272727273,
+          "1": 7.618110236220472
+        },
+        "gain_pct": 12.2726291742568,
+        "samples": {
+          "0": [
+            6.09,
+            7.66
+          ],
+          "1": [
+            7.5,
+            7.74
+          ]
+        }
+      },
+      "decode": {
+        "harmonic_tps": {
+          "0": 4.909979633401222,
+          "1": 5.864279624893435
+        },
+        "gain_pct": 19.43592566047272,
+        "samples": {
+          "0": [
+            4.92,
+            4.9
+          ],
+          "1": [
+            5.8,
+            5.93
+          ]
+        }
+      }
+    },
+    "code": {
+      "prefill": {
+        "harmonic_tps": {
+          "0": 15.644985618408437,
+          "1": 15.739974587039393
+        },
+        "gain_pct": 0.6071528024876427,
+        "samples": {
+          "0": [
+            15.63,
+            15.66
+          ],
+          "1": [
+            15.76,
+            15.72
+          ]
+        }
+      },
+      "decode": {
+        "harmonic_tps": {
+          "0": 4.969377510040161,
+          "1": 6.174089068825911
+        },
+        "gain_pct": 24.242705577343294,
+        "samples": {
+          "0": [
+            5.21,
+            4.75
+          ],
+          "1": [
+            6.25,
+            6.1
+          ]
+        }
+      }
+    }
+  }
+}
