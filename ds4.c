@@ -43423,6 +43423,23 @@ static bool ds41_tp_batch_enabled(const ds41_gpu_graph *g) {
         !getenv("DS4_METAL_DISABLE_V41_BATCH_HC"));
 }
 
+/* CUDA network TP (two GB10 over RoCE): a layer-major prefill sweep costs
+ * about 1.8 s fixed plus ~4 ms per row, while the 8-row short path costs about
+ * 50 ms per row. The break-even is ~40 rows, not 256: measured with V4.1 Q2 at
+ * ctx 32768, 206 rows took 10.2 s on the short path and 277 rows 2.3 s
+ * layer-major; a 2288-row prompt spent 12 s on its 240-row tail alone.
+ * DS4_CUDA_V41_TP_LAYER_PREFILL_MIN (2..256) overrides the threshold; both TP
+ * ranks must use the same value, since each rank chunks the prompt itself. */
+static DS4_MAYBE_UNUSED uint32_t ds41_cuda_tp_layer_prefill_min(void) {
+    static uint32_t cached;
+    if (!cached) {
+        const char *s = getenv("DS4_CUDA_V41_TP_LAYER_PREFILL_MIN");
+        const long v = s ? strtol(s, NULL, 10) : 0;
+        cached = v >= 2 && v <= 256 ? (uint32_t)v : 32u;
+    }
+    return cached;
+}
+
 static uint32_t ds41_prefill_count(const ds41_gpu_graph *g, uint32_t remaining) {
     /* TP batches use the bulk protocol; row-gate ablations stay token-major. */
     if (!ds41_tp_batch_enabled(g) || g->imatrix ||
@@ -43431,6 +43448,9 @@ static uint32_t ds41_prefill_count(const ds41_gpu_graph *g, uint32_t remaining) 
 #ifdef __APPLE__
     minimum = g->tp_world == 2 &&
         !getenv("DS4_METAL_DISABLE_V41_TP_SMALL_PREFILL") ? 32u : 256u;
+#endif
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (g->tp_world == 2) minimum = ds41_cuda_tp_layer_prefill_min();
 #endif
     /* Resident appends do not pay for an SSD layer sweep. In particular,
      * the server's 128-token mixed quantum must not become scalar prefill. */
@@ -44153,7 +44173,11 @@ static bool ds41_cuda_row_batch_supported(const ds41_gpu_graph *g, const ds4_wei
 
 static uint32_t ds41_short_prefill_count(const ds41_gpu_graph *g, const ds4_weights *w,
                                         uint32_t remaining) {
-    if (remaining < 2u || remaining >= 256u ||
+    uint32_t short_max = 256u;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (g->tp_world == 2) short_max = ds41_cuda_tp_layer_prefill_min();
+#endif
+    if (remaining < 2u || remaining >= short_max ||
         getenv("DS4_METAL_DISABLE_V41_LAYER_PREFILL") || !ds41_cuda_row_batch_supported(g, w))
         return 0;
     if (g->tp_world == 2 && (!ds41_tp_batch_enabled(g) ||
