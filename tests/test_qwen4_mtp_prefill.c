@@ -461,20 +461,30 @@ static void check_payload_modes(ds4_session *live, ds4_session *reference,
     for (unsigned i = 0; i < n; i++) free_frontier(frames + i);
     ds4_session_snapshot_free(&plain);
 
-    /* The old tag cannot describe the deferred final row. Reject it before
-     * any tensor writes instead of interpreting its high-water mark as KV. */
-    ds4_session_snapshot old = {.len = snapshot->len, .cap = snapshot->len};
+    /* A real V2 payload stored the predictor row count, but neither the
+     * tail flag nor its hidden row. The target tensors follow immediately. */
+    const size_t cut = (DS4_SESSION_PAYLOAD_U32_FIELDS + (size_t)prefix->len +
+                        DS4_N_VOCAB + 1u) * sizeof(uint32_t);
+    const size_t removed = sizeof(uint32_t) + (size_t)DS4_N_EMBD * DS4_N_HC * sizeof(float);
+    uint32_t flag;
+    need(cut + removed < snapshot->len, "V3 tail bounds");
+    memcpy(&flag, snapshot->ptr + cut, sizeof(flag));
+    need(flag == 1u, "V3 snapshot has a predictor tail");
+    ds4_session_snapshot old = {.len = snapshot->len - removed, .cap = snapshot->len - removed};
     old.ptr = malloc((size_t)old.len);
-    need(old.ptr != NULL, "old payload allocation");
-    memcpy(old.ptr, snapshot->ptr, (size_t)old.len);
-    uint32_t tag = 0;
-    memcpy(&tag, old.ptr + 12u * sizeof(uint32_t), sizeof(tag));
-    need(tag == DS4_QWEN4_PAYLOAD_TAG, "payload family tag location");
-    tag = 0x51573802u;
+    need(old.ptr != NULL, "V2 payload allocation");
+    memcpy(old.ptr, snapshot->ptr, cut);
+    memcpy(old.ptr + cut, snapshot->ptr + cut + removed, (size_t)old.len - cut);
+    const uint32_t tag = DS4_QWEN4_PAYLOAD_V2;
     memcpy(old.ptr + 12u * sizeof(uint32_t), &tag, sizeof(tag));
-    need(ds4_session_load_snapshot(live, &old, error, sizeof(error)) != 0,
-         "reject legacy nextn payload without a retained row");
-    error[0] = '\0';
+    need(ds4_session_load_snapshot(live, &old, error, sizeof(error)) == 0 &&
+         ds4_session_load_snapshot(reference, snapshot, error, sizeof(error)) == 0,
+         "load V2 target checkpoint");
+    exact("V2 saved target logits", live->logits, reference->logits, (size_t)DS4_N_VOCAB * sizeof(float));
+    need(!live->qwen4_graph.mtp_tail_valid && live->qwen4_graph.mtp_pos == 0, "V2 predictor needs replay");
+    const unsigned old_frames = reference_sync(reference, prefix, 0, frames);
+    checked_sync(live, prefix, frames, old_frames);
+    for (unsigned i = 0; i < old_frames; i++) free_frontier(frames + i);
     ds4_session_snapshot_free(&old);
     puts("PASS MTP on/off payload compatibility, prefix replay and legacy-tag rejection");
 }

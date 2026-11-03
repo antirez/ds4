@@ -132,8 +132,10 @@ stream predictor experts from SSD. The final hidden row is retained until
 the actual next token is known. Snapshot restore and speculative rollback
 retain that row too; this costs 40 KiB per row for this model, at most
 160 KiB including the three verifier snapshots. Qwen payload version 3
-stores the initialized prefix and retained row; older Qwen checkpoints must
-be rebuilt. [`DS4_QWEN4_MTP_PREFILL`](QWEN38_FLASH_NEXT.md) can skip historical
+stores the initialized prefix and retained row. Version 2 checkpoints and
+plain checkpoints restore their target state directly. When MTP is enabled
+without a saved predictor tail, the engine replays the saved tokens once
+before continuing. [`DS4_QWEN4_MTP_PREFILL`](QWEN38_FLASH_NEXT.md) can skip historical
 projections or restrict preparation to SSD streaming, while keeping MTP and
 target verification enabled. Skipped rows are initialized to zero; changed
 draft acceptance can offset the prefill saving.

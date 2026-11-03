@@ -65512,6 +65512,7 @@ int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
  * family tag so a DeepSeek payload is never read as a Qwen one. */
 /* v3 stores the initialized MTP prefix (prepared or cold) and its pending
  * trunk row. Restoring a prefix preserves its actual cache contents. */
+#define DS4_QWEN4_PAYLOAD_V2  0x51573802u
 #define DS4_QWEN4_PAYLOAD_TAG 0x51573803u
 
 static uint64_t qwen4_payload_lin_state_bytes(void) {
@@ -65647,7 +65648,8 @@ static int qwen4_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *
     }
     ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
     const uint32_t rows = h[7];
-    if (h[12] != DS4_QWEN4_PAYLOAD_TAG || h[8] != DS4_N_LAYER || h[9] != DS4_N_HEAD_DIM ||
+    const bool legacy = h[12] == DS4_QWEN4_PAYLOAD_V2;
+    if ((!legacy && h[12] != DS4_QWEN4_PAYLOAD_TAG) || h[8] != DS4_N_LAYER || h[9] != DS4_N_HEAD_DIM ||
         h[10] != DS4_N_INDEXER_HEAD_DIM || h[11] != DS4_N_VOCAB || h[6] != DS4_N_EMBD * DS4_N_HC) {
         payload_set_err(err, errlen, "KV checkpoint was written by a different model family or shape");
         return 1;
@@ -65690,9 +65692,15 @@ static int qwen4_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *
     }
     uint32_t mtp_rows = 0, tail = 0;
     int rc = payload_read_u32(fp, &mtp_rows, remaining, err, errlen);
-    if (!rc) rc = payload_read_u32(fp, &tail, remaining, err, errlen);
-    if (!rc && (tail > 1u || (tail ? (!rows || mtp_rows != rows - 1u || !g->mtp_tail_R) : mtp_rows != 0u))) {
+    if (!rc && !legacy) rc = payload_read_u32(fp, &tail, remaining, err, errlen);
+    if (!rc && (mtp_rows > rows || tail > 1u ||
+                (tail && (!rows || mtp_rows != rows - 1u || !g->mtp_tail_R)) ||
+                (!tail && !legacy && mtp_rows != 0u))) {
         payload_set_err(err, errlen, "KV checkpoint predictor prefix or pending row is invalid");
+        rc = 1;
+    }
+    if (!rc && *remaining != qwen4_payload_tensor_bytes(rows, mtp_rows, tail != 0) - 2u * sizeof(uint32_t)) {
+        payload_set_err(err, errlen, "Qwen3.8 checkpoint tensor lengths do not match its layout");
         rc = 1;
     }
     uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
@@ -65748,7 +65756,9 @@ static int qwen4_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *
         return 1;
     }
     g->pos = rows;
-    g->mtp_pos = mtp_rows;
+    /* V2 lacks the pending trunk row. An MTP-enabled session rebuilds its
+     * predictor on first use, just as it does for a plain V3 checkpoint. */
+    g->mtp_pos = legacy ? 0u : mtp_rows;
     g->mtp_tail_valid = tail != 0;
     g->mtp_tail_pos = rows ? rows - 1u : 0u;
     g->mtp_tail_cached = false;
