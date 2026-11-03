@@ -236,7 +236,7 @@ extern "C" int ds4_gpu_attention_visual_mixed_batch_heads_tensor(
     if (!cuda_ok(cudaGetLastError(), "visual attention KV pack launch"))
         return 0;
 
-    const float alpha = rsqrtf((float)head_dim);
+    const float alpha = 1.0f / sqrtf((float)head_dim);
     const float beta = 0.0f;
     cublasStatus_t status = cublasSgemmStridedBatched(
             g_cublas, CUBLAS_OP_T, CUBLAS_OP_N,

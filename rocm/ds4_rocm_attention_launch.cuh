@@ -1308,7 +1308,8 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                 if (g_dspark_verify_mode && !g_glm_model && !g_quality_mode &&
                     n_tokens >= 2u && n_tokens <= 6u &&
                     rank == 1024u && group_dim == 4096u && n_groups == 8u &&
-                    g_rocblas_f16_solution_set == DS4_ROCBLAS_F16_SOLUTIONS_5_6_8D1AE90E &&
+                    (g_rocblas_f16_solution_set == DS4_ROCBLAS_F16_SOLUTIONS_5_6_8D1AE90E ||
+                     g_rocblas_f16_solution_set == DS4_ROCBLAS_F16_SOLUTIONS_5_7_39D8D603) &&
                     ds4_rocm_is_gfx1151() &&
                     hipblaslt_dspark_attention_a(low_h, out_a_f16, heads_h, n_tokens)) {
                     st = CUBLAS_STATUS_SUCCESS;
@@ -1361,10 +1362,16 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                     }
                     st = (cublasStatus_t)-1;
 #ifdef __HIP_PLATFORM_AMD__
-                    if (n_tokens >= 5u && n_tokens <= 6u &&
+                    /* 5.6 measured -401 for widths 5-6 only; on 5.7, -626 is
+                     * about 1.23x faster than the default for widths 2-6. */
+                    const rocblas_int b_solution =
+                        g_rocblas_f16_solution_set == DS4_ROCBLAS_F16_SOLUTIONS_5_6_8D1AE90E &&
+                                n_tokens >= 5u && n_tokens <= 6u ? -401 :
+                        g_rocblas_f16_solution_set == DS4_ROCBLAS_F16_SOLUTIONS_5_7_39D8D603 &&
+                                n_tokens >= 2u && n_tokens <= 6u ? -626 : 0;
+                    if (b_solution != 0 &&
                         out_b_f16_t != NULL && out_dim == 4096u && low_dim == 8192u &&
                         g_rocblas_ready &&
-                        g_rocblas_f16_solution_set == DS4_ROCBLAS_F16_SOLUTIONS_5_6_8D1AE90E &&
                         !__atomic_load_n(&g_rocblas_attention_b_solution_disabled,
                                          __ATOMIC_RELAXED) &&
                         ds4_rocm_gfx1151_flag("DS4_ROCM_F16_Q4_SOLUTIONS")) {
@@ -1391,7 +1398,7 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                                 (rocblas_int)out_dim,
                                 rocblas_datatype_f32_r,
                                 rocblas_gemm_algo_solution_index,
-                                (rocblas_int)-401,
+                                b_solution,
                                 0u);
                         if (rst == rocblas_status_success) {
                             st = CUBLAS_STATUS_SUCCESS;

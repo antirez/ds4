@@ -26,6 +26,9 @@ enum {
     DS4_ROCBLAS_F16_SOLUTIONS_NONE = 0,
     DS4_ROCBLAS_F16_SOLUTIONS_5_5_CD957402,
     DS4_ROCBLAS_F16_SOLUTIONS_5_6_8D1AE90E,
+    /* ROCm 10.1: no rocBLAS solution indices are qualified for this build;
+     * it only enables the hipBLASLt prefill selections. */
+    DS4_ROCBLAS_F16_SOLUTIONS_5_7_39D8D603,
 };
 static int g_rocblas_f16_solution_set;
 static int g_rocblas_f16_solutions_disabled;
@@ -5844,6 +5847,8 @@ extern "C" int ds4_gpu_init(void) {
                 g_rocblas_f16_solution_set = DS4_ROCBLAS_F16_SOLUTIONS_5_5_CD957402;
             } else if (strcmp(version, "5.6.0.8d1ae90e") == 0) {
                 g_rocblas_f16_solution_set = DS4_ROCBLAS_F16_SOLUTIONS_5_6_8D1AE90E;
+            } else if (strcmp(version, "5.7.0.39d8d603") == 0) {
+                g_rocblas_f16_solution_set = DS4_ROCBLAS_F16_SOLUTIONS_5_7_39D8D603;
             }
         }
         __atomic_store_n(&g_rocblas_f16_solutions_disabled, 0, __ATOMIC_RELAXED);

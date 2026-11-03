@@ -743,6 +743,12 @@ __device__ static float quarter_warp_sum_f32(float v, uint32_t lane8) {
     return v;
 }
 
+__device__ __forceinline__ static float dev_div_f32_exact(float num, float den) {
+    double d = (double)den;
+    __asm__ volatile("" : "+v"(d));
+    return (float)((double)num / d);
+}
+
 __global__ static void q8_K_quantize_kernel(cuda_block_q8_K *out, const float *x, uint32_t in_dim, uint32_t n_rows) {
     uint32_t b = blockIdx.x;
     uint32_t row = blockIdx.y;
@@ -774,7 +780,7 @@ __global__ static void q8_K_quantize_kernel(cuda_block_q8_K *out, const float *x
     }
     if (tid == 0) {
         maxv_s = val_part[0];
-        iscale_s = -127.0f / maxv_s;
+        iscale_s = dev_div_f32_exact(-127.0f, maxv_s);
     }
     __syncthreads();
     if (tid < CUDA_QK_K) {
@@ -789,7 +795,7 @@ __global__ static void q8_K_quantize_kernel(cuda_block_q8_K *out, const float *x
         for (int i = 0; i < 16; i++) sum += yb->qs[tid * 16 + i];
         yb->bsums[tid] = (int16_t)sum;
     }
-    if (tid == 0) yb->d = 1.0f / iscale_s;
+    if (tid == 0) yb->d = dev_div_f32_exact(1.0f, iscale_s);
 }
 
 __global__ static DS4_ROCM_UNUSED void moe_gate_up_mid_kernel(

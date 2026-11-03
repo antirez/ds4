@@ -6,7 +6,16 @@
 
 static hipblasLtHandle_t g_hipblaslt;
 static int g_hipblaslt_ready;
-/* Zero is unchecked, one version-matched, minus one disabled until cleanup. */
+/* hipBLASLt builds with measured gfx1151 prefill selections. Lt algorithm
+ * indices are build-specific: 8d1ae90e (ROCm 10.0) and 39d8d603 (ROCm 10.1)
+ * both report version 100401, but the same index names different kernels. */
+enum {
+    DS4_HIPBLASLT_UNKNOWN = 0,
+    DS4_HIPBLASLT_8D1AE90E,
+    DS4_HIPBLASLT_39D8D603,
+};
+/* Zero is unchecked, positive the matched DS4_HIPBLASLT_* build, minus one
+ * disabled until cleanup. */
 static int g_hipblaslt_prefill_state;
 struct cuda_hipblaslt_gemm_plan {
     uint32_t out_dim;
@@ -165,19 +174,37 @@ static int hipblaslt_gemm_tn_f16_out_f16(
                         label ? label : "gemm");
 }
 
-/* gfx1151 prefill selections for hipBLASLt 100401 / 8d1ae90e.
- * These are Lt algorithm indices; other library revisions retain the fallback. */
+/* gfx1151 prefill selections for hipBLASLt 100401 builds; other builds
+ * retain the fallback. On 39d8d603, 2540 and 2542 are the HSS WMMA kernels
+ * with MT32x32x32 and MT96x96x32 tiles; its default heuristic picks a
+ * non-SAV MT32x32x64 kernel that runs at a quarter of their speed here.
+ * DS4_HIPBLASLT_UNKNOWN asks whether any build has a selection. */
 static int hipblaslt_prefill_solution_index(
-        uint32_t out_dim, uint32_t n_tok, uint32_t in_dim) {
+        uint32_t out_dim, uint32_t n_tok, uint32_t in_dim, int build) {
+    const int rocm101 = build == DS4_HIPBLASLT_39D8D603;
     if (n_tok != 2048u && n_tok != 4096u) return -1;
-    if (out_dim == 24u && in_dim == 16384u) return 2537;
-    if (out_dim == 8192u && in_dim == 1024u) return 2539;
+    if (out_dim == 4096u && in_dim == 2048u)
+        return rocm101 || build == DS4_HIPBLASLT_UNKNOWN ? 2542 : -1;
+    if (out_dim == 24u && in_dim == 16384u) return rocm101 ? 2540 : 2537;
+    if (out_dim == 8192u && in_dim == 1024u) return rocm101 ? 2542 : 2539;
     if (in_dim == 4096u &&
         (out_dim == 64u || out_dim == 256u ||
          out_dim == 512u || out_dim == 1024u)) {
-        return out_dim == 64u && n_tok == 2048u ? 2537 : 2539;
+        if (out_dim == 64u && n_tok == 2048u) return rocm101 ? 2540 : 2537;
+        return rocm101 ? 2542 : 2539;
     }
     return -1;
+}
+
+static int hipblaslt_build(void) {
+    int version = 0;
+    char revision[128] = {0};
+    if (!hipblaslt_ok(hipblasLtGetVersion(g_hipblaslt, &version), "prefill version") ||
+        !hipblaslt_ok(hipblasLtGetGitRevision(g_hipblaslt, revision), "prefill revision") ||
+        version != 100401) return DS4_HIPBLASLT_UNKNOWN;
+    if (strcmp(revision, "8d1ae90e") == 0) return DS4_HIPBLASLT_8D1AE90E;
+    if (strcmp(revision, "39d8d603") == 0) return DS4_HIPBLASLT_39D8D603;
+    return DS4_HIPBLASLT_UNKNOWN;
 }
 
 /* The caller restricts this path to gfx1151 DS4 with quality mode off;
@@ -185,20 +212,18 @@ static int hipblaslt_prefill_solution_index(
 static int hipblaslt_gemm_tn_f16_out_f32_prefill(
         float *out, const __half *w, const __half *x,
         uint32_t out_dim, uint32_t n_tok, uint32_t in_dim) {
-    const int solution_index = hipblaslt_prefill_solution_index(out_dim, n_tok, in_dim);
-    if (solution_index < 0 || !g_hipblaslt_ready || !out || !w || !x ||
+    if (hipblaslt_prefill_solution_index(out_dim, n_tok, in_dim, DS4_HIPBLASLT_UNKNOWN) < 0 ||
+        !g_hipblaslt_ready || !out || !w || !x ||
         __atomic_load_n(&g_hipblaslt_prefill_state, __ATOMIC_RELAXED) < 0) return 0;
     if (__atomic_load_n(&g_hipblaslt_prefill_state, __ATOMIC_RELAXED) == 0) {
-        int version = 0;
-        char revision[128] = {0};
-        if (!hipblaslt_ok(hipblasLtGetVersion(g_hipblaslt, &version), "prefill version") ||
-            !hipblaslt_ok(hipblasLtGetGitRevision(g_hipblaslt, revision), "prefill revision") ||
-            version != 100401 || strcmp(revision, "8d1ae90e") != 0) {
-            __atomic_store_n(&g_hipblaslt_prefill_state, -1, __ATOMIC_RELAXED);
-            return 0;
-        }
-        __atomic_store_n(&g_hipblaslt_prefill_state, 1, __ATOMIC_RELAXED);
+        const int build = hipblaslt_build();
+        __atomic_store_n(&g_hipblaslt_prefill_state,
+                         build == DS4_HIPBLASLT_UNKNOWN ? -1 : build, __ATOMIC_RELAXED);
+        if (build == DS4_HIPBLASLT_UNKNOWN) return 0;
     }
+    const int solution_index = hipblaslt_prefill_solution_index(out_dim, n_tok, in_dim,
+            __atomic_load_n(&g_hipblaslt_prefill_state, __ATOMIC_RELAXED));
+    if (solution_index < 0) return 0;
     cuda_hipblaslt_gemm_plan *p = hipblaslt_gemm_plan_get(
             out_dim, n_tok, in_dim, "prefill F16/F32", HIP_R_32F, solution_index);
     if (p) {
@@ -214,7 +239,10 @@ static int hipblaslt_gemm_tn_f16_out_f32_prefill(
 }
 
 /* Experimental DSpark attention A: five fixed-width plans, independent of
- * the prefill cache and its failure state. C/D contain eight interleaved groups. */
+ * the prefill cache and its failure state. C/D contain eight interleaved groups.
+ * The state is zero unchecked, the matched DS4_HIPBLASLT_* build, or minus one
+ * disabled until cleanup. 2379 is measured on 8d1ae90e; on 39d8d603, 2432 is
+ * about 2.6x faster than the rocBLAS strided-batched fallback for widths 2-6. */
 static int g_hipblaslt_dspark_a_state;
 static cuda_hipblaslt_gemm_plan g_hipblaslt_dspark_a_plans[5];
 
@@ -237,19 +265,20 @@ static int hipblaslt_dspark_attention_a(
         __half *out, const __half *w, const __half *x, uint32_t n_tok) {
     if (n_tok < 2u || n_tok > 6u || !out || !w || !x ||
         !g_hipblaslt_ready || !g_cublas_ready ||
-        g_rocblas_f16_solution_set != DS4_ROCBLAS_F16_SOLUTIONS_5_6_8D1AE90E ||
         __atomic_load_n(&g_hipblaslt_dspark_a_state, __ATOMIC_RELAXED) < 0) return 0;
     if (__atomic_load_n(&g_hipblaslt_dspark_a_state, __ATOMIC_RELAXED) == 0) {
-        int version = 0;
-        char revision[128] = {0};
-        if (!hipblaslt_ok(hipblasLtGetVersion(g_hipblaslt, &version), "DSpark A version") ||
-            !hipblaslt_ok(hipblasLtGetGitRevision(g_hipblaslt, revision), "DSpark A revision") ||
-            version != 100401 || strcmp(revision, "8d1ae90e") != 0) {
-            __atomic_store_n(&g_hipblaslt_dspark_a_state, -1, __ATOMIC_RELAXED);
-            return 0;
-        }
-        __atomic_store_n(&g_hipblaslt_dspark_a_state, 1, __ATOMIC_RELAXED);
+        /* rocBLAS and hipBLASLt must come from the same ROCm release. */
+        const int build = hipblaslt_build();
+        const int matched =
+            (build == DS4_HIPBLASLT_8D1AE90E &&
+             g_rocblas_f16_solution_set == DS4_ROCBLAS_F16_SOLUTIONS_5_6_8D1AE90E) ||
+            (build == DS4_HIPBLASLT_39D8D603 &&
+             g_rocblas_f16_solution_set == DS4_ROCBLAS_F16_SOLUTIONS_5_7_39D8D603);
+        __atomic_store_n(&g_hipblaslt_dspark_a_state, matched ? build : -1, __ATOMIC_RELAXED);
+        if (!matched) return 0;
     }
+    const int solution_index =
+        __atomic_load_n(&g_hipblaslt_dspark_a_state, __ATOMIC_RELAXED) == DS4_HIPBLASLT_39D8D603 ? 2432 : 2379;
     cuda_hipblaslt_gemm_plan &p = g_hipblaslt_dspark_a_plans[n_tok - 2u];
     const float alpha = 1.0f, beta = 0.0f;
     if (!p.desc) {
@@ -282,12 +311,12 @@ static int hipblaslt_dspark_attention_a(
                         "DSpark A stride");
             }
             if (!layouts_ok) break;
-            std::vector<int> indices{2379};
+            std::vector<int> indices{solution_index};
             std::vector<hipblasLtMatmulHeuristicResult_t> algorithms;
             if (!hipblaslt_ok(hipblaslt_ext::getAlgosFromIndex(g_hipblaslt, indices, algorithms),
                               "DSpark A fixed index")) break;
             if (algorithms.size() != 1 || algorithms[0].state != HIPBLAS_STATUS_SUCCESS ||
-                hipblaslt_ext::getIndexFromAlgo(algorithms[0].algo) != 2379) break;
+                hipblaslt_ext::getIndexFromAlgo(algorithms[0].algo) != solution_index) break;
             size_t workspace = 0;
             if (!hipblaslt_ok(hipblaslt_ext::matmulIsAlgoSupported(g_hipblaslt, p.desc,
                     &alpha, p.a_desc, p.b_desc, &beta, p.c_desc, p.d_desc,

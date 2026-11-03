@@ -316,6 +316,16 @@ static int cuda_matmul_q8_0_tensor_f16_gemm(
         matmul_f16_tinym24_wmma_kernel<<<32u, 256u>>>((float *)out->ptr, w_f16, xh);
         return cuda_ok(cudaGetLastError(), "q8 f16 tinym24 wmma launch");
     }
+#ifdef __HIP_PLATFORM_AMD__
+    /* ROCm 10.1's rocBLAS picks a generic non-WMMA kernel for these
+     * products; use the measured hipBLASLt prefill selection instead. */
+    if ((n_tok == 2048u || n_tok == 4096u) &&
+        !g_glm_model && !g_quality_mode &&
+        g_rocblas_f16_solution_set == DS4_ROCBLAS_F16_SOLUTIONS_5_7_39D8D603 &&
+        ds4_rocm_is_gfx1151() &&
+        hipblaslt_gemm_tn_f16_out_f32_prefill((float *)out->ptr, w_f16, xh,
+                (uint32_t)out_dim, (uint32_t)n_tok, (uint32_t)in_dim)) return 1;
+#endif
     const float alpha = 1.0f;
     const float beta = 0.0f;
     cublasStatus_t st = cublasGemmEx(g_cublas,
@@ -1030,9 +1040,10 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
 #ifdef __HIP_PLATFORM_AMD__
         if ((n_tok == 2048u || n_tok == 4096u) &&
             hipblaslt_prefill_solution_index((uint32_t)out_dim, (uint32_t)n_tok,
-                                            (uint32_t)in_dim) >= 0 &&
+                                            (uint32_t)in_dim, DS4_HIPBLASLT_UNKNOWN) >= 0 &&
             !g_glm_model && !g_quality_mode &&
-            g_rocblas_f16_solution_set == DS4_ROCBLAS_F16_SOLUTIONS_5_6_8D1AE90E &&
+            (g_rocblas_f16_solution_set == DS4_ROCBLAS_F16_SOLUTIONS_5_6_8D1AE90E ||
+             g_rocblas_f16_solution_set == DS4_ROCBLAS_F16_SOLUTIONS_5_7_39D8D603) &&
             ds4_rocm_is_gfx1151()) {
             if (hipblaslt_gemm_tn_f16_out_f32_prefill((float *)out->ptr, w, xh,
                         (uint32_t)out_dim, (uint32_t)n_tok, (uint32_t)in_dim)) return 1;
@@ -1077,6 +1088,8 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
             g_rocblas_f16_solution_set != DS4_ROCBLAS_F16_SOLUTIONS_NONE &&
             !__atomic_load_n(&g_rocblas_f16_solutions_disabled, __ATOMIC_RELAXED) &&
             ds4_rocm_gfx1151_flag("DS4_ROCM_F16_Q4_SOLUTIONS")) {
+            /* 5.7.0.39d8d603: -340 and -339 are 1.5-2.6x faster than the
+             * default for widths 2-6 on gfx1151, with matching accuracy. */
             int32_t solution = 0;
             if (in_dim == 4096u &&
                 (out_dim == 64u || out_dim == 256u ||
@@ -1085,11 +1098,15 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
                     DS4_ROCBLAS_F16_SOLUTIONS_5_5_CD957402) solution = -217;
                 if (g_rocblas_f16_solution_set ==
                     DS4_ROCBLAS_F16_SOLUTIONS_5_6_8D1AE90E) solution = -50;
+                if (g_rocblas_f16_solution_set ==
+                    DS4_ROCBLAS_F16_SOLUTIONS_5_7_39D8D603) solution = -340;
             } else if (in_dim == 1024u && out_dim == 8192u) {
                 if (g_rocblas_f16_solution_set ==
                     DS4_ROCBLAS_F16_SOLUTIONS_5_5_CD957402) solution = -216;
                 if (g_rocblas_f16_solution_set ==
                     DS4_ROCBLAS_F16_SOLUTIONS_5_6_8D1AE90E) solution = -49;
+                if (g_rocblas_f16_solution_set ==
+                    DS4_ROCBLAS_F16_SOLUTIONS_5_7_39D8D603) solution = -339;
             }
             if (solution != 0) {
                 const rocblas_status rst = rocblas_gemm_ex(
