@@ -206,7 +206,10 @@ copy_c = copy_c - scale * direction[layer] * dot(direction[layer], h)
 
 Unlike the output sites, this also removes what earlier layers accumulated,
 so its scale means something different: the same vector needs its own scale
-at each site.
+at each site. The residual carries the result into the next layer, so the
+scale compounds: each steered layer leaves `1 - scale` of the component.
+Keep it between 0 and 2 (1 removes the component, 2 flips its sign); a scale
+of 8 over 39 layers wrecks the state, and every logit came out 0.
 
 `build_direction.py` has no V4.1 profile because V4.1 cannot capture
 activations yet. A direction made elsewhere can still be used. When it comes
