@@ -31124,6 +31124,266 @@ static bool metal_graph_compressor_prefill_chunk(const ds4_gpu_graph *g,
            (pos0 % ratio) == 0u && (n_tokens % ratio) == 0u;
 }
 
+/* Tokens of a chunk that can take the batched compressor replay: the whole
+ * chunk when it is aligned (metal_graph_compressor_prefill_chunk), else the
+ * largest aligned head. A ragged tail chunk that runs the row-update
+ * fallback for every token pays about five tiny dispatches per layer per
+ * token, almost all of it fixed launch overhead; batching its aligned head
+ * leaves only the ragged remainder (< ratio tokens, which can never emit a
+ * pooled row) for the row updates. Returns 0 when batching is disabled or
+ * the chunk does not start on a window boundary. */
+static uint32_t metal_graph_compressor_prefill_batched_tokens(
+        const ds4_gpu_graph *g,
+        uint32_t ratio,
+        uint32_t pos0,
+        uint32_t n_tokens) {
+    if (getenv("DS4_CUDA_NO_COMPRESSOR_PREFILL_BATCH") != NULL ||
+        g->spec_capture_prefixes ||
+        (pos0 % ratio) != 0u) {
+        return 0u;
+    }
+    return (n_tokens / ratio) * ratio;
+}
+
+/* Replay-batch the aligned token range [pos0, pos0 + batched) of the
+ * attention compressor: the shared body of the aligned-chunk branch and of
+ * the aligned-head prelude the ragged-chunk row-update fallback runs first.
+ * comp_counts is filled for the whole chunk (n_tokens rows). */
+static bool metal_graph_attn_compressor_replay_range(
+        ds4_gpu_graph *g,
+        const ds4_model *model,
+        const ds4_layer_weights *layer,
+        uint32_t il,
+        uint32_t ratio,
+        uint32_t pos0,
+        uint32_t batched,
+        uint32_t n_tokens,
+        bool compressed,
+        bool ok,
+        float freq_base,
+        float freq_scale,
+        float ext_factor,
+        float attn_factor,
+        uint32_t *comp_counts) {
+    const uint32_t coff = ratio == 4u ? 2u : 1u;
+    const uint32_t comp_width = coff * DS4_N_HEAD_DIM;
+    const uint32_t comp_before = g->layer_n_comp[il];
+    const uint32_t comp_chunk = batched / ratio;
+    if (comp_before + comp_chunk > g->layer_comp_cap[il]) {
+        fprintf(stderr, "ds4: Metal graph compressed KV cache capacity exceeded at layer %u\n", il);
+        ok = false;
+    }
+    if (ok && DS4_GPU_ATTN_COMP_CACHE_F16 && comp_chunk > g->attn_comp_stage_cap) {
+        fprintf(stderr, "ds4: Metal graph compressed KV staging capacity exceeded at layer %u\n", il);
+        ok = false;
+    }
+    ds4_gpu_tensor *attn_comp_target =
+        ok ? metal_graph_attn_comp_prefill_target(g, il, comp_before, comp_chunk) : NULL;
+    if (ok && !attn_comp_target) ok = false;
+    if (ok && ratio == 4) {
+        ok = ds4_gpu_compressor_prefill_ratio4_replay_tensor(
+                attn_comp_target,
+                g->layer_attn_state_kv[il],
+                g->layer_attn_state_score[il],
+                metal_graph_batch_comp_kv(g),
+                metal_graph_batch_comp_sc(g),
+                model->map,
+                model->size,
+                layer->attn_compressor_ape->abs_offset,
+                layer->attn_compressor_ape->type,
+                layer->attn_compressor_norm->abs_offset,
+                layer->attn_compressor_norm->type,
+                DS4_N_HEAD_DIM,
+                pos0,
+                batched,
+                DS4_N_ROT,
+                compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                true,
+                freq_base,
+                freq_scale,
+                ext_factor,
+                attn_factor,
+                DS4_ROPE_YARN_BETA_FAST,
+                DS4_ROPE_YARN_BETA_SLOW,
+                DS4_RMS_EPS) != 0;
+    } else if (ok) {
+        ok = ds4_gpu_compressor_prefill_tensor(
+                attn_comp_target,
+                g->layer_attn_state_kv[il],
+                g->layer_attn_state_score[il],
+                metal_graph_batch_comp_kv(g),
+                metal_graph_batch_comp_sc(g),
+                model->map,
+                model->size,
+                layer->attn_compressor_ape->abs_offset,
+                layer->attn_compressor_ape->type,
+                layer->attn_compressor_norm->abs_offset,
+                layer->attn_compressor_norm->type,
+                DS4_N_HEAD_DIM,
+                ratio,
+                pos0,
+                batched,
+                DS4_N_ROT,
+                compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                true,
+                freq_base,
+                freq_scale,
+                ext_factor,
+                attn_factor,
+                DS4_ROPE_YARN_BETA_FAST,
+                DS4_ROPE_YARN_BETA_SLOW,
+                DS4_RMS_EPS) != 0;
+    }
+    if (ok && comp_chunk != 0) {
+        ok = metal_graph_commit_attn_comp_stage(g, il, comp_before, comp_chunk);
+    }
+    if (ok && ratio == 4) {
+        ok = metal_graph_refresh_ratio4_compressor_state(g,
+                                                         model,
+                                                         g->layer_attn_state_kv[il],
+                                                         g->layer_attn_state_score[il],
+                                                         layer->attn_compressor_kv,
+                                                         layer->attn_compressor_gate,
+                                                         layer->attn_compressor_ape,
+                                                         DS4_N_HEAD_DIM,
+                                                         comp_width,
+                                                         pos0,
+                                                         batched);
+    }
+    if (ok) {
+        g->layer_n_comp[il] = comp_before + comp_chunk;
+        if (comp_counts) {
+            for (uint32_t t = 0; t < n_tokens; t++) {
+                comp_counts[t] = (pos0 + t + 1u) / ratio;
+            }
+        }
+        metal_graph_debug_dump_tensor("KVcompress",
+                                      attn_comp_target,
+                                      (uint64_t)comp_chunk * DS4_N_HEAD_DIM,
+                                      il,
+                                      pos0);
+        metal_graph_debug_dump_tensor("attn_state_kv",
+                                      g->layer_attn_state_kv[il],
+                                      (uint64_t)comp_width * coff * ratio,
+                                      il,
+                                      pos0);
+        metal_graph_debug_dump_tensor("attn_state_score",
+                                      g->layer_attn_state_score[il],
+                                      (uint64_t)comp_width * coff * ratio,
+                                      il,
+                                      pos0);
+    }
+    metal_graph_attn_comp_prefill_target_free(attn_comp_target);
+    return ok;
+}
+
+/* The indexer-compressor counterpart of
+ * metal_graph_attn_compressor_replay_range(). index_counts is filled for
+ * the whole chunk (n_tokens rows). */
+static bool metal_graph_indexer_compressor_replay_range(
+        ds4_gpu_graph *g,
+        const ds4_model *model,
+        const ds4_layer_weights *layer,
+        uint32_t il,
+        uint32_t ratio,
+        uint32_t pos0,
+        uint32_t batched,
+        uint32_t n_tokens,
+        bool compressed,
+        bool ok,
+        float freq_base,
+        float freq_scale,
+        float ext_factor,
+        float attn_factor,
+        uint32_t *index_counts) {
+    const uint32_t coff = ratio == 4u ? 2u : 1u;
+    const uint32_t index_width = coff * DS4_N_INDEXER_HEAD_DIM;
+    const uint32_t index_before = g->layer_n_index_comp[il];
+    const uint32_t index_chunk = batched / ratio;
+    if (index_before + index_chunk > g->layer_comp_cap[il]) {
+        fprintf(stderr, "ds4: Metal graph indexer compressed KV cache capacity exceeded at layer %u\n", il);
+        ok = false;
+    }
+    ds4_gpu_tensor *index_view = NULL;
+    if (ok) {
+        index_view = ds4_gpu_tensor_view(
+                g->layer_index_comp_cache[il],
+                (uint64_t)index_before * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
+                (uint64_t)index_chunk * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+        ok = index_view != NULL;
+    }
+    if (ok) {
+        ok = ds4_gpu_compressor_prefill_ratio4_replay_tensor(
+                index_view,
+                g->layer_index_state_kv[il],
+                g->layer_index_state_score[il],
+                metal_graph_batch_comp_kv(g),
+                metal_graph_batch_comp_sc(g),
+                model->map,
+                model->size,
+                layer->indexer_compressor_ape->abs_offset,
+                layer->indexer_compressor_ape->type,
+                layer->indexer_compressor_norm->abs_offset,
+                layer->indexer_compressor_norm->type,
+                DS4_N_INDEXER_HEAD_DIM,
+                pos0,
+                batched,
+                DS4_N_ROT,
+                compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                false,
+                freq_base,
+                freq_scale,
+                ext_factor,
+                attn_factor,
+                DS4_ROPE_YARN_BETA_FAST,
+                DS4_ROPE_YARN_BETA_SLOW,
+                DS4_RMS_EPS) != 0;
+    }
+    if (ok && index_chunk != 0) {
+        ok = ds4_gpu_dsv4_indexer_qat_tensor(index_view,
+                                              index_chunk,
+                                              DS4_N_INDEXER_HEAD_DIM) != 0;
+    }
+    if (ok) {
+        ok = metal_graph_refresh_ratio4_compressor_state(g,
+                                                         model,
+                                                         g->layer_index_state_kv[il],
+                                                         g->layer_index_state_score[il],
+                                                         layer->indexer_compressor_kv,
+                                                         layer->indexer_compressor_gate,
+                                                         layer->indexer_compressor_ape,
+                                                         DS4_N_INDEXER_HEAD_DIM,
+                                                         index_width,
+                                                         pos0,
+                                                         batched);
+    }
+    if (ok) {
+        g->layer_n_index_comp[il] = index_before + index_chunk;
+        if (index_counts) {
+            for (uint32_t t = 0; t < n_tokens; t++) {
+                index_counts[t] = (pos0 + t + 1u) / ratio;
+            }
+        }
+        metal_graph_debug_dump_tensor("indexer_KVcompress",
+                                      index_view,
+                                      (uint64_t)index_chunk * DS4_N_INDEXER_HEAD_DIM,
+                                      il,
+                                      pos0);
+        metal_graph_debug_dump_tensor("indexer_state_kv",
+                                      g->layer_index_state_kv[il],
+                                      (uint64_t)index_width * coff * ratio,
+                                      il,
+                                      pos0);
+        metal_graph_debug_dump_tensor("indexer_state_score",
+                                      g->layer_index_state_score[il],
+                                      (uint64_t)index_width * coff * ratio,
+                                      il,
+                                      pos0);
+    }
+    ds4_gpu_tensor_free(index_view);
+    return ok;
+}
+
 /* Compressor KV and gate projections of the attention norm into the batch
  * compressor buffers shared by the attention and indexer compressors. */
 static bool metal_graph_compressor_project(ds4_gpu_graph *g,
@@ -31962,113 +32222,12 @@ static bool metal_graph_encode_layer_attention_batch(
             if (side_state) {
                 /* Updated on the side stream after the attention norm. */
             } else if (aligned_chunk) {
-                const uint32_t comp_before = g->layer_n_comp[il];
-                const uint32_t comp_chunk = n_tokens / ratio;
-                if (comp_before + comp_chunk > g->layer_comp_cap[il]) {
-                    fprintf(stderr, "ds4: Metal graph compressed KV cache capacity exceeded at layer %u\n", il);
-                    ok = false;
-                }
-                if (ok && DS4_GPU_ATTN_COMP_CACHE_F16 && comp_chunk > g->attn_comp_stage_cap) {
-                    fprintf(stderr, "ds4: Metal graph compressed KV staging capacity exceeded at layer %u\n", il);
-                    ok = false;
-                }
-                ds4_gpu_tensor *attn_comp_target =
-                    ok ? metal_graph_attn_comp_prefill_target(g, il, comp_before, comp_chunk) : NULL;
-                if (ok && !attn_comp_target) ok = false;
-                if (ok && ratio == 4) {
-                    ok = ds4_gpu_compressor_prefill_ratio4_replay_tensor(
-                            attn_comp_target,
-                            g->layer_attn_state_kv[il],
-                            g->layer_attn_state_score[il],
-                            metal_graph_batch_comp_kv(g),
-                            metal_graph_batch_comp_sc(g),
-                            model->map,
-                            model->size,
-                            layer->attn_compressor_ape->abs_offset,
-                            layer->attn_compressor_ape->type,
-                            layer->attn_compressor_norm->abs_offset,
-                            layer->attn_compressor_norm->type,
-                            DS4_N_HEAD_DIM,
-                            pos0,
-                            n_tokens,
-                            DS4_N_ROT,
-                            compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
-                            true,
-                            freq_base,
-                            freq_scale,
-                            ext_factor,
-                            attn_factor,
-                            DS4_ROPE_YARN_BETA_FAST,
-                            DS4_ROPE_YARN_BETA_SLOW,
-                            DS4_RMS_EPS) != 0;
-                } else if (ok) {
-                    ok = ds4_gpu_compressor_prefill_tensor(
-                            attn_comp_target,
-                            g->layer_attn_state_kv[il],
-                            g->layer_attn_state_score[il],
-                            metal_graph_batch_comp_kv(g),
-                            metal_graph_batch_comp_sc(g),
-                            model->map,
-                            model->size,
-                            layer->attn_compressor_ape->abs_offset,
-                            layer->attn_compressor_ape->type,
-                            layer->attn_compressor_norm->abs_offset,
-                            layer->attn_compressor_norm->type,
-                            DS4_N_HEAD_DIM,
-                            ratio,
-                            pos0,
-                            n_tokens,
-                            DS4_N_ROT,
-                            compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
-                            true,
-                            freq_base,
-                            freq_scale,
-                            ext_factor,
-                            attn_factor,
-                            DS4_ROPE_YARN_BETA_FAST,
-                            DS4_ROPE_YARN_BETA_SLOW,
-                            DS4_RMS_EPS) != 0;
-                }
-                if (ok && comp_chunk != 0) {
-                    ok = metal_graph_commit_attn_comp_stage(g, il, comp_before, comp_chunk);
-                }
-                if (ok && ratio == 4) {
-                    ok = metal_graph_refresh_ratio4_compressor_state(g,
-                                                                     model,
-                                                                     g->layer_attn_state_kv[il],
-                                                                     g->layer_attn_state_score[il],
-                                                                     layer->attn_compressor_kv,
-                                                                     layer->attn_compressor_gate,
-                                                                     layer->attn_compressor_ape,
-                                                                     DS4_N_HEAD_DIM,
-                                                                     comp_width,
-                                                                     pos0,
-                                                                     n_tokens);
-                }
-                if (ok) {
-                    g->layer_n_comp[il] = comp_before + comp_chunk;
-                    if (comp_counts) {
-                        for (uint32_t t = 0; t < n_tokens; t++) {
-                            comp_counts[t] = (pos0 + t + 1u) / ratio;
-                        }
-                    }
-                    metal_graph_debug_dump_tensor("KVcompress",
-                                                  attn_comp_target,
-                                                  (uint64_t)comp_chunk * DS4_N_HEAD_DIM,
-                                                  il,
-                                                  pos0);
-                    metal_graph_debug_dump_tensor("attn_state_kv",
-                                                  g->layer_attn_state_kv[il],
-                                                  (uint64_t)comp_width * coff * ratio,
-                                                  il,
-                                                  pos0);
-                    metal_graph_debug_dump_tensor("attn_state_score",
-                                                  g->layer_attn_state_score[il],
-                                                  (uint64_t)comp_width * coff * ratio,
-                                                  il,
-                                                  pos0);
-                }
-                metal_graph_attn_comp_prefill_target_free(attn_comp_target);
+                ok = metal_graph_attn_compressor_replay_range(g, model, layer, il,
+                                                               ratio, pos0, n_tokens, n_tokens,
+                                                               compressed, ok,
+                                                               freq_base, freq_scale,
+                                                               ext_factor, attn_factor,
+                                                               comp_counts);
             } else if (metal_graph_compressor_rows_batch_ok(ratio, n_tokens,
                                                             layer->attn_compressor_ape,
                                                             layer->attn_compressor_norm)) {
@@ -32078,7 +32237,23 @@ static bool metal_graph_encode_layer_attention_batch(
                                                             ext_factor, attn_factor,
                                                             comp_counts);
             } else {
-                for (uint32_t t = 0; ok && t < n_tokens; t++) {
+                /*
+                 * Ragged tail chunk: replay-batch the aligned head first
+                 * (metal_graph_compressor_prefill_batched_tokens) and leave
+                 * only the ragged remainder (< ratio tokens, which can never
+                 * emit a pooled row) for the row updates below.
+                 */
+                const uint32_t batched_tokens =
+                    metal_graph_compressor_prefill_batched_tokens(g, ratio, pos0, n_tokens);
+                if (batched_tokens != 0u) {
+                    ok = metal_graph_attn_compressor_replay_range(g, model, layer, il,
+                                                                   ratio, pos0, batched_tokens, n_tokens,
+                                                                   compressed, ok,
+                                                                   freq_base, freq_scale,
+                                                                   ext_factor, attn_factor,
+                                                                   comp_counts);
+                }
+                for (uint32_t t = batched_tokens; ok && t < n_tokens; t++) {
                     const uint32_t pos = pos0 + t;
                     const bool emit = ((pos + 1u) % ratio) == 0u;
                     if (emit && g->layer_n_comp[il] >= g->layer_comp_cap[il]) {
@@ -32283,89 +32458,12 @@ static bool metal_graph_encode_layer_attention_batch(
                 if (side_state) {
                     /* Updated on the side stream after the attention norm. */
                 } else if (aligned_chunk) {
-                    const uint32_t index_before = g->layer_n_index_comp[il];
-                    const uint32_t index_chunk = n_tokens / ratio;
-                    if (index_before + index_chunk > g->layer_comp_cap[il]) {
-                        fprintf(stderr, "ds4: Metal graph indexer compressed KV cache capacity exceeded at layer %u\n", il);
-                        ok = false;
-                    }
-                    ds4_gpu_tensor *index_view = NULL;
-                    if (ok) {
-                        index_view = ds4_gpu_tensor_view(
-                                g->layer_index_comp_cache[il],
-                                (uint64_t)index_before * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
-                                (uint64_t)index_chunk * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
-                        ok = index_view != NULL;
-                    }
-                    if (ok) {
-                        ok = ds4_gpu_compressor_prefill_ratio4_replay_tensor(
-                                index_view,
-                                g->layer_index_state_kv[il],
-                                g->layer_index_state_score[il],
-                                metal_graph_batch_comp_kv(g),
-                                metal_graph_batch_comp_sc(g),
-                                model->map,
-                                model->size,
-                                layer->indexer_compressor_ape->abs_offset,
-                                layer->indexer_compressor_ape->type,
-                                layer->indexer_compressor_norm->abs_offset,
-                                layer->indexer_compressor_norm->type,
-                                DS4_N_INDEXER_HEAD_DIM,
-                                pos0,
-                                n_tokens,
-                                DS4_N_ROT,
-                                compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
-                                false,
-                                freq_base,
-                                freq_scale,
-                                ext_factor,
-                                attn_factor,
-                                DS4_ROPE_YARN_BETA_FAST,
-                                DS4_ROPE_YARN_BETA_SLOW,
-                                DS4_RMS_EPS) != 0;
-                    }
-                    if (ok && index_chunk != 0) {
-                        ok = ds4_gpu_dsv4_indexer_qat_tensor(index_view,
-                                                              index_chunk,
-                                                              DS4_N_INDEXER_HEAD_DIM) != 0;
-                    }
-                    if (ok) {
-                        ok = metal_graph_refresh_ratio4_compressor_state(g,
-                                                                         model,
-                                                                         g->layer_index_state_kv[il],
-                                                                         g->layer_index_state_score[il],
-                                                                         layer->indexer_compressor_kv,
-                                                                         layer->indexer_compressor_gate,
-                                                                         layer->indexer_compressor_ape,
-                                                                         DS4_N_INDEXER_HEAD_DIM,
-                                                                         index_width,
-                                                                         pos0,
-                                                                         n_tokens);
-                    }
-                    if (ok) {
-                        g->layer_n_index_comp[il] = index_before + index_chunk;
-                        if (index_counts) {
-                            for (uint32_t t = 0; t < n_tokens; t++) {
-                                index_counts[t] = (pos0 + t + 1u) / ratio;
-                            }
-                        }
-                        metal_graph_debug_dump_tensor("indexer_KVcompress",
-                                                      index_view,
-                                                      (uint64_t)index_chunk * DS4_N_INDEXER_HEAD_DIM,
-                                                      il,
-                                                      pos0);
-                        metal_graph_debug_dump_tensor("indexer_state_kv",
-                                                      g->layer_index_state_kv[il],
-                                                      (uint64_t)index_width * coff * ratio,
-                                                      il,
-                                                      pos0);
-                        metal_graph_debug_dump_tensor("indexer_state_score",
-                                                      g->layer_index_state_score[il],
-                                                      (uint64_t)index_width * coff * ratio,
-                                                      il,
-                                                      pos0);
-                    }
-                    ds4_gpu_tensor_free(index_view);
+                    ok = metal_graph_indexer_compressor_replay_range(g, model, layer, il,
+                                                                     ratio, pos0, n_tokens, n_tokens,
+                                                                     compressed, ok,
+                                                                     freq_base, freq_scale,
+                                                                     ext_factor, attn_factor,
+                                                                     index_counts);
                 } else if (metal_graph_compressor_rows_batch_ok(ratio, n_tokens,
                                                                 layer->indexer_compressor_ape,
                                                                 layer->indexer_compressor_norm)) {
@@ -32375,7 +32473,19 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                  ext_factor, attn_factor,
                                                                  index_counts);
                 } else {
-                    for (uint32_t t = 0; ok && t < n_tokens; t++) {
+                    /* Same aligned-head batching as the attention compressor
+                     * above; only the ragged remainder runs row by row. */
+                    const uint32_t batched_tokens =
+                        metal_graph_compressor_prefill_batched_tokens(g, ratio, pos0, n_tokens);
+                    if (batched_tokens != 0u) {
+                        ok = metal_graph_indexer_compressor_replay_range(g, model, layer, il,
+                                                                         ratio, pos0, batched_tokens, n_tokens,
+                                                                         compressed, ok,
+                                                                         freq_base, freq_scale,
+                                                                         ext_factor, attn_factor,
+                                                                         index_counts);
+                    }
+                    for (uint32_t t = batched_tokens; ok && t < n_tokens; t++) {
                         const uint32_t pos = pos0 + t;
                         const bool emit = ((pos + 1u) % ratio) == 0u;
                         if (emit && g->layer_n_index_comp[il] >= g->layer_comp_cap[il]) {
