@@ -70,6 +70,19 @@ includes planned and already resident sessions; a request can still be refused
 when its mandatory allocations cannot fit. Disabling the memory guard is not
 a remedy for insufficient RAM.
 
+GLM 5.3 Flash Q2 (IQ2_XXS gate/up, Q2_K down, eight experts) streams its
+routed experts on Metal through the IQ2 address table and the expert cache.
+When the whole file fits as a static decode map and no cache size was given,
+Metal keeps that map instead, because it is faster. Passing
+`--ssd-streaming-cache-experts`, or a machine where that map does not fit,
+selects the bounded cache, and the routed experts then stay within it.
+Prefill uses the same cache: cached experts are not read again, a layer's
+uncached experts are read one layer ahead, and the prompt leaves its experts
+cached for the generation that follows. `DS4_METAL_DISABLE_GLM_STREAMING_PREFILL_CACHE=1`
+returns to full-layer reads. Metal tensor parallelism does not use this path.
+`make test-metal-iq2-q2k-stream-cache` checks decode at six and eight experts,
+and prefill batches at eight, against zeroed mapped weights.
+
 Leave expert preloading enabled for normal use. `--ssd-streaming-cold` and
 `--ssd-streaming-preload-experts N` are mainly useful for controlled measurements.
 See [benchmarking](PERFORMANCE.md) and the [release QA guide](../QA_BEFORE_RELEASES.md).
