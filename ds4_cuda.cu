@@ -22455,6 +22455,154 @@ __global__ static void moe_gate_up_mid_decode_lut_qwarp32_kernel(
     }
 }
 
+/* IQ2_XXS sign bytes without a table: cuda_ksigns_iq2xs[i] is i with its
+ * parity in bit 7. t0/t1 hold 0x01 in each byte of the low/high grid word
+ * whose weight is negative. Grid bytes are 0x08, 0x19 or 0x2b, so
+ * (g ^ t * 0xff) + t negates them without carries: the bytes of
+ * __vsub4(g ^ m, m), which sm_86 emulates with several instructions. */
+__device__ __forceinline__ static void dev_iq2_sign_bytes(uint32_t idx, uint32_t *t0, uint32_t *t1) {
+    const uint32_t s = idx | ((__popc(idx) & 1u) << 7);
+    *t0 = ((s & 0xfu) * 0x00204081u) & 0x01010101u;
+    *t1 = ((s >> 4) * 0x00204081u) & 0x01010101u;
+}
+
+/* The 66-byte block as 33 halfwords, from 17 aligned words. The block is
+ * 2-byte aligned; when it starts on a word boundary the last word reaches 2
+ * bytes into the next block, never past the aligned word holding its end. */
+__device__ __forceinline__ static void dev_load_iq2_xxs_h33(const cuda_block_iq2_xxs *x, uint16_t h[33]) {
+    const uintptr_t a = (uintptr_t)x;
+    const uint32_t *p = (const uint32_t *)(a & ~(uintptr_t)3);
+    const uint32_t sh = (uint32_t)(a & 2u) * 8u;
+    uint32_t w[18];
+    #pragma unroll
+    for (int i = 0; i < 17; i++) w[i] = p[i];
+    w[17] = 0;
+    #pragma unroll
+    for (int i = 0; i < 17; i++) {
+        const uint32_t v = __funnelshift_r(w[i], w[i + 1], sh);
+        h[2 * i] = (uint16_t)v;
+        if (2 * i + 1 < 33) h[2 * i + 1] = (uint16_t)(v >> 16);
+    }
+}
+
+/* One IQ2_XXS block dot added to acc. The rounding is spelled out to match
+ * what moe_gate_up_mid_decode_lut_qwarp32_kernel compiles to: gate adds the
+ * rounded product, up fuses it (FMA). */
+template <bool FUSED>
+__device__ __forceinline__ static float dev_iq2_xxs_acc(float acc, const uint16_t h[33],
+                                                        const cuda_block_q8_K *y, const uint64_t *grid) {
+    const float xd = dev_f16_to_f32(h[0]);
+    const int8_t *q8 = y->qs;
+    int32_t bsum = 0;
+    #pragma unroll
+    for (int ib32 = 0; ib32 < CUDA_QK_K / 32; ib32++) {
+        const uint32_t aux0 = (uint32_t)h[1 + 4 * ib32] | ((uint32_t)h[2 + 4 * ib32] << 16);
+        const uint32_t aux1 = (uint32_t)h[3 + 4 * ib32] | ((uint32_t)h[4 + 4 * ib32] << 16);
+        int32_t sumi = 0;
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            const uint64_t g = grid[(aux0 >> (8 * k)) & 0xffu];
+            uint32_t t0, t1;
+            dev_iq2_sign_bytes((aux1 >> (7 * k)) & 127u, &t0, &t1);
+            const int32_t w0 = (int32_t)(((uint32_t)g ^ (t0 * 0xffu)) + t0);
+            const int32_t w1 = (int32_t)(((uint32_t)(g >> 32) ^ (t1 * 0xffu)) + t1);
+            sumi = __dp4a(w0, *(const int32_t *)(q8 + ib32 * 32 + 8 * k + 0), sumi);
+            sumi = __dp4a(w1, *(const int32_t *)(q8 + ib32 * 32 + 8 * k + 4), sumi);
+        }
+        bsum += sumi * (int32_t)(2u * (aux1 >> 28) + 1u);
+    }
+    const float sc = __fmul_rn(__fmul_rn(0.125f, xd), y->d);
+    return FUSED ? __fmaf_rn(sc, (float)bsum, acc) : __fadd_rn(acc, __fmul_rn(sc, (float)bsum));
+}
+
+/* moe_gate_up_mid_decode_lut_qwarp32_kernel with the same result bits, about
+ * 3x faster on sm_86 (V4.1: 195 -> 63 us per 6-expert decode call). Four
+ * lanes per row, 64 rows per 256-thread block, so each lane takes 5 of a
+ * V4.1 row's 20 blocks where eight lanes split them 3/2. Lane j keeps two
+ * chains, over blocks j, j+8, j+16.. and j+4, j+12..: the partial sums of
+ * lanes j and j+4 of the 8-lane kernel, whose first shuffle step adds them.
+ * Needs xq_blocks <= 32. */
+#define MOE_DECODE_IQ2_R4_ROWS 64u
+__global__ static void moe_gate_up_mid_decode_iq2_r4_kernel(
+        float *gate_out,
+        float *up_out,
+        float *mid_out,
+        const char *gate_base,
+        const char *up_base,
+        const cuda_block_q8_K *xq,
+        const int32_t *selected,
+        const float *weights,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint32_t xq_blocks,
+        uint32_t expert_mid_dim,
+        uint32_t n_expert,
+        uint32_t write_aux,
+        float clamp) {
+    const uint32_t lane = threadIdx.x & 3u;
+    const uint32_t row_lane = threadIdx.x >> 2u;
+    const uint32_t pair = blockIdx.y;
+    const uint32_t tok = pair / n_expert;
+    const uint32_t slot = pair - tok * n_expert;
+    const int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
+    if (expert_i < 0) {
+        for (uint32_t i = threadIdx.x; i < MOE_DECODE_IQ2_R4_ROWS; i += blockDim.x) {
+            const uint32_t row = blockIdx.x * MOE_DECODE_IQ2_R4_ROWS + i;
+            if (row >= expert_mid_dim) continue;
+            const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
+            if (write_aux) gate_out[off] = up_out[off] = 0.0f;
+            mid_out[off] = 0.0f;
+        }
+        return;
+    }
+    const uint32_t expert = (uint32_t)expert_i;
+    const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
+    __shared__ cuda_block_q8_K sxq[32];
+    __shared__ uint64_t s_iq2_grid[256];
+    const uint32_t words = xq_blocks * sizeof(cuda_block_q8_K) / sizeof(uint32_t);
+    for (uint32_t i = threadIdx.x; i < words; i += blockDim.x)
+        ((uint32_t *)sxq)[i] = ((const uint32_t *)xqb)[i];
+    for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
+    __syncthreads();
+    const uint32_t row = blockIdx.x * MOE_DECODE_IQ2_R4_ROWS + row_lane;
+    if (row >= expert_mid_dim) return;
+    const cuda_block_iq2_xxs *gr = (const cuda_block_iq2_xxs *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+    const cuda_block_iq2_xxs *ur = (const cuda_block_iq2_xxs *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+    float gate_a = 0.0f, gate_b = 0.0f, up_a = 0.0f, up_b = 0.0f;
+    for (uint32_t b = lane; b < xq_blocks; b += 4u) {
+        uint16_t gh[33], uh[33];
+        dev_load_iq2_xxs_h33(gr + b, gh);
+        dev_load_iq2_xxs_h33(ur + b, uh);
+        if (b & 4u) {
+            gate_b = dev_iq2_xxs_acc<false>(gate_b, gh, sxq + b, s_iq2_grid);
+            up_b = dev_iq2_xxs_acc<true>(up_b, uh, sxq + b, s_iq2_grid);
+        } else {
+            gate_a = dev_iq2_xxs_acc<false>(gate_a, gh, sxq + b, s_iq2_grid);
+            up_a = dev_iq2_xxs_acc<true>(up_a, uh, sxq + b, s_iq2_grid);
+        }
+    }
+    float gate = gate_a + gate_b;
+    float up = up_a + up_b;
+    const uint32_t mask = 0xfu << (threadIdx.x & 28u);
+    gate += __shfl_down_sync(mask, gate, 2, 4);
+    up += __shfl_down_sync(mask, up, 2, 4);
+    gate += __shfl_down_sync(mask, gate, 1, 4);
+    up += __shfl_down_sync(mask, up, 1, 4);
+    if (lane == 0) {
+        if (clamp > 1.0e-6f) {
+            if (gate > clamp) gate = clamp;
+            if (up > clamp) up = clamp;
+            if (up < -clamp) up = -clamp;
+        }
+        const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
+        if (write_aux) {
+            gate_out[off] = gate;
+            up_out[off] = up;
+        }
+        mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
+    }
+}
+
 __global__ static void moe_gate_up_mid_decode_lut_owned_qwarp32_kernel(
         float *gate_out,
         float *up_out,
@@ -27493,6 +27641,26 @@ static int routed_moe_launch(
                             write_gate_up,
                             clamp);
                     }
+                } else if (use_decode_lut_gate && xq_blocks <= 32u &&
+                           getenv("DS4_CUDA_MOE_NO_DECODE_IQ2_R4") == NULL) {
+                    const dim3 rgrid((expert_mid_dim + MOE_DECODE_IQ2_R4_ROWS - 1u) / MOE_DECODE_IQ2_R4_ROWS,
+                                     n_tokens * n_expert, 1);
+                    moe_gate_up_mid_decode_iq2_r4_kernel<<<rgrid, 256, 0, cuda_decode_stream()>>>(
+                        (float *)gate->ptr,
+                        (float *)up->ptr,
+                        (float *)mid->ptr,
+                        gate_w,
+                        up_w,
+                        xq,
+                        (const int32_t *)selected->ptr,
+                        (const float *)weights->ptr,
+                        gate_expert_bytes,
+                        gate_row_bytes,
+                        xq_blocks,
+                        expert_mid_dim,
+                        n_expert,
+                        write_gate_up,
+                        clamp);
                 } else if (use_decode_lut_gate) {
                     moe_gate_up_mid_decode_lut_qwarp32_kernel<<<qgrid, 256, 0, cuda_decode_stream()>>>(
                         (float *)gate->ptr,
