@@ -370,7 +370,7 @@ static void print_kv_cache(FILE *fp, const help_colors *c) {
     opt(fp, c, "--kv-disk-dir DIR", "Enable disk KV checkpoints in DIR.");
     opt(fp, c, "--kv-disk-space-mb N", "Disk budget. Default when enabled: 4096");
     opt(fp, c, "--kv-cache-min-tokens N", "Do not save/load checkpoints shorter than N. Default: 512");
-    opt(fp, c, "--kv-cache-cold-max-tokens N", "Save cold first prompts up to N tokens. 0 disables. Default: 30000");
+    opt(fp, c, "--kv-cache-cold-max-tokens N", "Save a cold prompt prefix up to N tokens, including longer prompts. 0 disables. Default: 30000");
     opt(fp, c, "--kv-cache-continued-interval-tokens N", "Save aligned continued frontiers. 0 disables. Default: 10000");
     opt(fp, c, "--kv-cache-boundary-trim-tokens N", "Trim tail tokens for cold boundary saves. Default: 32");
     opt(fp, c, "--kv-cache-boundary-align-tokens N", "Align cold boundary saves to this multiple. Default: 2048");

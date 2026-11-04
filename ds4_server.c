@@ -11223,6 +11223,24 @@ static int kv_cache_chat_anchor_pos(const kv_disk_cache *kc,
     return ds4_kvstore_chat_anchor_pos(kc, prompt, user_token_id, assistant_token_id);
 }
 
+/* Preserve a bounded cold graph snapshot for long client prompts too. */
+static int kv_cache_cold_store_target(const kv_disk_cache *kc,
+                                      const ds4_tokens *prompt,
+                                      int user_token_id,
+                                      int assistant_token_id) {
+    if (!kc->enabled || !prompt ||
+        prompt->len < kc->opt.min_tokens ||
+        kc->opt.cold_max_tokens < kc->opt.min_tokens ||
+        kc->opt.cold_max_tokens <= 0) return 0;
+    const int anchor = kv_cache_chat_anchor_pos(kc, prompt,
+                                               user_token_id, assistant_token_id);
+    if (anchor >= kc->opt.min_tokens && anchor <= kc->opt.cold_max_tokens)
+        return anchor;
+    const int bounded = prompt->len < kc->opt.cold_max_tokens ?
+                        prompt->len : kc->opt.cold_max_tokens;
+    return kv_cache_store_len(kc, bounded);
+}
+
 
 static int kv_cache_continued_store_target(const kv_disk_cache *kc, int live_tokens) {
     return ds4_kvstore_continued_store_target(kc, live_tokens);
@@ -13726,17 +13744,10 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     ds4_session_set_display_progress(slot->session, server_progress_cb, &progress);
 
     int cold_store_len = 0;
-    if (!multimodal && cached == 0 &&
-        s->kv.enabled &&
-        prompt_for_sync->len >= s->kv.opt.min_tokens &&
-        s->kv.opt.cold_max_tokens > 0 &&
-        prompt_for_sync->len <= s->kv.opt.cold_max_tokens)
-    {
-        const int anchor = kv_cache_chat_anchor_pos(&s->kv, prompt_for_sync,
-                                                    ds4_token_user(s->engine),
-                                                    ds4_token_assistant(s->engine));
-        cold_store_len = anchor >= s->kv.opt.min_tokens ?
-                         anchor : kv_cache_store_len(&s->kv, prompt_for_sync->len);
+    if (!multimodal && cached == 0) {
+        cold_store_len = kv_cache_cold_store_target(&s->kv, prompt_for_sync,
+                                                   ds4_token_user(s->engine),
+                                                   ds4_token_assistant(s->engine));
     }
     int suppressed_continued_last = -1;
     if (cold_store_len >= s->kv.opt.min_tokens) {
@@ -21663,6 +21674,52 @@ static void test_kv_cache_chat_anchor_ignores_multiturn_tail(void) {
     ds4_tokens_free(&prompt);
 }
 
+static void test_kv_cache_cold_target_bounds_long_qwen_prompts(void) {
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.opt = kv_cache_default_options();
+    ds4_tokens prompt = {0};
+    for (int i = 0; i < 34618; i++) ds4_tokens_push(&prompt, 1);
+    /* Qwen has no single-token user/assistant IDs. SAM's next request
+     * diverges around 29k; the cold snapshot must precede that point. */
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, &prompt, -1, -1) == 28672);
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, &prompt, -1, -1) < 29086);
+    kc.opt.cold_max_tokens = 0;
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, &prompt, -1, -1) == 0);
+    kc.opt.cold_max_tokens = kc.opt.min_tokens - 1;
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, &prompt, -1, -1) == 0);
+    kc.opt = kv_cache_default_options();
+    kc.enabled = false;
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, &prompt, -1, -1) == 0);
+    kc.enabled = true;
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, NULL, -1, -1) == 0);
+    prompt.len = kc.opt.min_tokens - 1;
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, &prompt, -1, -1) == 0);
+    prompt.len = 8000;
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, &prompt, -1, -1) ==
+                kv_cache_store_len(&kc, prompt.len));
+    prompt.len = 34618;
+    ds4_tokens_free(&prompt);
+}
+
+static void test_kv_cache_cold_target_preserves_only_bounded_chat_anchor(void) {
+    const int user = 9001, assistant = 9002;
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.opt = kv_cache_default_options();
+    ds4_tokens prompt = {0};
+    for (int i = 0; i < 34000; i++) ds4_tokens_push(&prompt, 1);
+    prompt.v[12000] = user;
+    prompt.v[33000] = assistant;
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, &prompt, user, assistant) == 12000);
+    prompt.v[31000] = user;
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, &prompt, user, assistant) == 28672);
+    kc.opt.boundary_align_tokens = 0;
+    kc.opt.boundary_trim_tokens = 0;
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, &prompt, user, assistant) == 30000);
+    ds4_tokens_free(&prompt);
+}
+
 static void test_kv_cache_continued_uses_aligned_frontiers(void) {
     kv_disk_cache kc = {0};
     kc.enabled = true;
@@ -23170,6 +23227,8 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_store_len_uses_configured_boundary();
     test_kv_cache_chat_anchor_uses_last_user_before_assistant();
     test_kv_cache_chat_anchor_ignores_multiturn_tail();
+    test_kv_cache_cold_target_bounds_long_qwen_prompts();
+    test_kv_cache_cold_target_preserves_only_bounded_chat_anchor();
     test_kv_cache_continued_uses_aligned_frontiers();
     test_kv_cache_cold_store_suppresses_duplicate_continued_boundary();
     test_kv_cache_file_size_must_fit_budget();
