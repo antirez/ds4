@@ -3525,6 +3525,16 @@ typedef struct {
 /* Encode row-major normalized 14x14 RGB patches. The output is the natural
  * row-major 3x3-aligned grid; N-layout permutation and sentinels are applied
  * by the prompt layer once the image's token position is known. */
+/* Test hook: one DeepSeek ViT attention pass (rows x 16 heads x 64, f32) through
+ * the flash kernel, or the scalar reference kernel when scalar != 0. */
+int ds4_gpu_test_deepseek4_vision_attention(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        uint32_t              rows,
+        int                   scalar);
+
 int ds4_gpu_deepseek4_vision_encode(
         float                              *out,
         const float                        *patches,

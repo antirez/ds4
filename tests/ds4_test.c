@@ -5243,6 +5243,67 @@ static void test_metal_router_weights_batch_exact(void) {
 }
 #endif
 
+/* DeepSeek ViT attention: the tiled flash kernel against the scalar reference
+ * kernel on identical q/k/v, across row counts that are not multiples of the
+ * 128-row query tile or the 32-row key tile, plus a peaked-softmax case. */
+static void test_metal_deepseek4_vision_flash_attention(void) {
+    static const uint32_t row_cases[] = {1, 31, 128, 129, 777, 4100};
+    static const float magnitude[] = {2.0f, 2.0f, 2.0f, 2.0f, 2.0f, 12.0f};
+    uint32_t seed = 0x9e3779b9u;
+    for (size_t c = 0; c < sizeof(row_cases) / sizeof(row_cases[0]); c++) {
+        const uint32_t rows = row_cases[c];
+        const uint64_t n = (uint64_t)rows * 1024u;
+        float *host = malloc((size_t)n * 3u * sizeof(float));
+        float *fa = malloc((size_t)n * sizeof(float));
+        float *fb = malloc((size_t)n * sizeof(float));
+        ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(n * sizeof(float));
+        ds4_gpu_tensor *k = ds4_gpu_tensor_alloc(n * sizeof(float));
+        ds4_gpu_tensor *v = ds4_gpu_tensor_alloc(n * sizeof(float));
+        ds4_gpu_tensor *flash = ds4_gpu_tensor_alloc(n * sizeof(float));
+        ds4_gpu_tensor *ref = ds4_gpu_tensor_alloc(n * sizeof(float));
+        const bool allocated = host && fa && fb && q && k && v && flash && ref;
+        TEST_ASSERT(allocated);
+        if (allocated) {
+            for (uint64_t i = 0; i < n * 3u; i++) {
+                seed = seed * 1664525u + 1013904223u;
+                float x = ((float)(seed >> 8) / 16777216.0f * 2.0f - 1.0f) * magnitude[c];
+                uint32_t bits;
+                memcpy(&bits, &x, sizeof(bits));
+                bits &= 0xffff0000u;              /* bf16-rounded, as the encoder's activations */
+                memcpy(&x, &bits, sizeof(bits));
+                host[i] = x;
+            }
+            TEST_ASSERT(ds4_gpu_tensor_write(q, 0, host, n * sizeof(float)) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_write(k, 0, host + n, n * sizeof(float)) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_write(v, 0, host + 2u * n, n * sizeof(float)) != 0);
+            TEST_ASSERT(ds4_gpu_test_deepseek4_vision_attention(flash, q, k, v, rows, 0) != 0);
+            TEST_ASSERT(ds4_gpu_test_deepseek4_vision_attention(ref, q, k, v, rows, 1) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_read(flash, 0, fa, n * sizeof(float)) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_read(ref, 0, fb, n * sizeof(float)) != 0);
+            double max_abs = 0, max_ref = 0, sse = 0, ssr = 0;
+            bool finite = true;
+            for (uint64_t i = 0; i < n; i++) {
+                if (!isfinite(fa[i])) finite = false;
+                const double d = fabs((double)fa[i] - fb[i]);
+                if (d > max_abs) max_abs = d;
+                if (fabs(fb[i]) > max_ref) max_ref = fabs(fb[i]);
+                sse += d * d;
+                ssr += (double)fb[i] * fb[i];
+            }
+            const double rel_rms = sqrt(sse / (ssr > 0 ? ssr : 1));
+            if (getenv("DS4_TEST_VERBOSE"))
+                fprintf(stderr, "ds4-test: vision flash attention rows=%u max_abs=%.3g max_ref=%.3g rel_rms=%.3g\n",
+                        rows, max_abs, max_ref, rel_rms);
+            TEST_ASSERT(finite);
+            TEST_ASSERT(rel_rms < 1e-4);
+            TEST_ASSERT(max_abs <= 1e-4 * (max_ref > 1 ? max_ref : 1));
+        }
+        ds4_gpu_tensor_free(q); ds4_gpu_tensor_free(k); ds4_gpu_tensor_free(v);
+        ds4_gpu_tensor_free(flash); ds4_gpu_tensor_free(ref);
+        free(host); free(fa); free(fb);
+    }
+}
+
 static void test_metal_kernel_group(void) {
     test_metal_f16_matvec_fast_nr0_4();
     test_metal_f16_prefill_matmul();
@@ -5262,6 +5323,7 @@ static void test_metal_kernel_group(void) {
     test_metal_gathered_kv_stage_exact();
     test_metal_contiguous_compressed_f16_attention_exact();
     test_metal_compressed_selection_causality();
+    test_metal_deepseek4_vision_flash_attention();
     test_metal_persistent_zero_attention_mask_exact();
     test_metal_zero_prefix_prefill_mask_cache_exact();
     test_metal_hc_split_weighted_sum_norm_batch_exact();

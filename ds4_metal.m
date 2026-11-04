@@ -48875,6 +48875,67 @@ static int glm53_vision_dispatch_attention(
     return ds4_gpu_finish_command_buffer(cb, owned, "GLM-5.3 vision attention");
 }
 
+typedef struct {
+    uint32_t rows;
+    float scale;
+} deepseek4_vision_flash_attn_args;
+
+/* DeepSeek ViT attention through the tiled flash kernel. The scalar kernel
+ * above re-reads every key and value from device memory per (row, head) and
+ * was ~94% of encoder time (10.0 of 10.6 s for an 8.4k-patch image).
+ * DS4_VISION_SCALAR_ATTN=1 selects the scalar kernel for comparison. */
+static int deepseek4_vision_dispatch_attention_kind(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        uint32_t              rows,
+        bool                  scalar) {
+    id<MTLComputePipelineState> pipeline = scalar ? nil :
+            ds4_gpu_get_pipeline("kernel_deepseek4_vision_flash_attn");
+    if (!pipeline) return glm53_vision_dispatch_attention(out, q, k, v, rows);
+    deepseek4_vision_flash_attn_args args = { rows, 0.125f };   /* 1/sqrt(64) */
+    int owned = 0;
+    id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+    id<MTLComputeCommandEncoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
+    if (!enc) return 0;
+    [enc setComputePipelineState:pipeline];
+    [enc setBytes:&args length:sizeof(args) atIndex:0];
+    [enc setBuffer:ds4_gpu_tensor_buffer(q)
+            offset:ds4_gpu_tensor_offset(q) atIndex:1];
+    [enc setBuffer:ds4_gpu_tensor_buffer(k)
+            offset:ds4_gpu_tensor_offset(k) atIndex:2];
+    [enc setBuffer:ds4_gpu_tensor_buffer(v)
+            offset:ds4_gpu_tensor_offset(v) atIndex:3];
+    [enc setBuffer:ds4_gpu_tensor_buffer(out)
+            offset:ds4_gpu_tensor_offset(out) atIndex:4];
+    [enc dispatchThreadgroups:MTLSizeMake((rows + 127u) / 128u, 16u, 1)
+         threadsPerThreadgroup:MTLSizeMake(512u, 1, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return ds4_gpu_finish_command_buffer(cb, owned, "DeepSeek vision flash attention");
+}
+
+static int deepseek4_vision_dispatch_attention(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        uint32_t              rows) {
+    static int scalar = -1;
+    if (scalar < 0) scalar = getenv("DS4_VISION_SCALAR_ATTN") != NULL;
+    return deepseek4_vision_dispatch_attention_kind(out, q, k, v, rows, scalar != 0);
+}
+
+int ds4_gpu_test_deepseek4_vision_attention(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        uint32_t              rows,
+        int                   scalar) {
+    return deepseek4_vision_dispatch_attention_kind(out, q, k, v, rows, scalar != 0);
+}
+
 static int glm53_vision_dispatch_swiglu_bias(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *gate,
@@ -49411,7 +49472,7 @@ int ds4_gpu_deepseek4_vision_encode(
                 "block0_k", k, row1024);
         if (ok && il == 0u) ok = deepseek4_vision_debug_dump(
                 "block0_v", v, row1024);
-        if (ok) ok = glm53_vision_dispatch_attention(attn, q, k, v, rows);
+        if (ok) ok = deepseek4_vision_dispatch_attention(attn, q, k, v, rows);
         if (ok) ok = deepseek4_vision_dispatch_round(attn, 1024u, rows);
         if (ok && il == 0u) ok = deepseek4_vision_debug_dump(
                 "block0_attention", attn, row1024);
