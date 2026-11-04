@@ -2502,6 +2502,7 @@ typedef struct ds4_model {
 
     int ngram_fd;
     const ds4_tensor *ngram_tensor;
+    char *path;
 } ds4_model;
 
 static uint64_t scalar_value_size(uint32_t type) {
@@ -2728,6 +2729,7 @@ static void model_close(ds4_model *m) {
     if (m->ngram_tensor && m->ngram_fd >= 0) close(m->ngram_fd);
     free(m->kv);
     free(m->tensors);
+    free(m->path);
     if (m->map) munmap((void *)m->map, (size_t)m->size);
     if (m->fd >= 0) close(m->fd);
     memset(m, 0, sizeof(*m));
@@ -2795,6 +2797,13 @@ static void parse_metadata(ds4_model *m, ds4_cursor *c) {
 
 /* Read the tensor directory and convert relative GGUF offsets to absolute
  * mmap offsets.  Tensor bytes are still never copied here. */
+static int tensor_name_cmp(const void *a, const void *b) {
+    const ds4_tensor *ta = *(const ds4_tensor *const *)a;
+    const ds4_tensor *tb = *(const ds4_tensor *const *)b;
+    if (ta->name.len != tb->name.len) return ta->name.len < tb->name.len ? -1 : 1;
+    return memcmp(ta->name.ptr, tb->name.ptr, ta->name.len);
+}
+
 static void parse_tensors(ds4_model *m, ds4_cursor *c) {
     /* As in parse_metadata: each tensor directory entry needs at least one byte
      * in the file, so reject a count larger than the bytes remaining before the
@@ -2830,6 +2839,22 @@ static void parse_tensors(ds4_model *m, ds4_cursor *c) {
                 "ds4: warning: tensor %.*s has unsupported GGUF type %u\n",
                 (int)t->name.len, t->name.ptr, t->type);
         }
+    }
+
+    /* Lookups are first-match, so a repeated name would silently bind one
+     * weight to two roles. Refuse the file instead. */
+    if (m->n_tensors > 1) {
+        const ds4_tensor **sorted = malloc((size_t)m->n_tensors * sizeof(*sorted));
+        if (!sorted) ds4_die("out of memory while checking tensor names");
+        for (uint64_t i = 0; i < m->n_tensors; i++) sorted[i] = &m->tensors[i];
+        qsort(sorted, (size_t)m->n_tensors, sizeof(*sorted), tensor_name_cmp);
+        for (uint64_t i = 1; i < m->n_tensors; i++) {
+            if (tensor_name_cmp(&sorted[i - 1], &sorted[i]) != 0) continue;
+            fprintf(stderr, "ds4: duplicate tensor name in %s: %.*s\n",
+                    m->path, (int)sorted[i]->name.len, sorted[i]->name.ptr);
+            exit(1);
+        }
+        free(sorted);
     }
 
     m->tensor_data_pos = align_up(c->pos, m->alignment);
@@ -2953,6 +2978,7 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
     memset(m, 0, sizeof(*m));
     m->fd = -1;
     m->ngram_fd = -1;
+    m->path = ds4_strdup(path);
 
     int fd = open(path, O_RDONLY);
     if (fd == -1) ds4_die_errno("cannot open model", path);
@@ -4917,7 +4943,8 @@ static bool required_bool(const ds4_model *m, const char *key) {
 static ds4_tensor *required_tensor(const ds4_model *m, const char *name) {
     ds4_tensor *t = model_find_tensor(m, name);
     if (!t) {
-        fprintf(stderr, "ds4: required tensor is missing: %s\n", name);
+        fprintf(stderr, "ds4: required tensor is missing from %s: %s\n",
+                m->path ? m->path : "model", name);
         exit(1);
     }
     return t;

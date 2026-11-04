@@ -107,6 +107,46 @@ static int run_fixture(int bad_layout) {
     return 0;
 }
 
+/* A header whose tensor directory repeats a name must be refused, and a
+ * missing required tensor must name the file it was expected in. */
+static void run_refusal(int duplicate) {
+    char path[] = "/tmp/ds41-gguf.XXXXXX";
+    int fd = mkstemp(path);
+    assert(fd >= 0);
+    FILE *fp = fdopen(fd, "w+b");
+    assert(fp);
+    put32(fp, DS4_GGUF_MAGIC); put32(fp, 3); put64(fp, 2); put64(fp, 2);
+    string_kv(fp, "general.architecture", "deepseek4");
+    putstr(fp, "general.alignment"); put32(fp, GGUF_VALUE_UINT32); put32(fp, 32);
+    tensor(fp, "test.weight", DS4_TENSOR_F32, 16, 1, 0);
+    tensor(fp, duplicate ? "test.weight" : "other.weight", DS4_TENSOR_F32, 16, 1, 64);
+    assert(fflush(fp) == 0 && ftruncate(fd, ftell(fp) + 4096) == 0);
+    int err[2];
+    assert(pipe(err) == 0);
+    pid_t pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) {
+        dup2(err[1], STDERR_FILENO);
+        ds4_model m;
+        model_open(&m, path, false, false);
+        if (duplicate) _exit(0);
+        required_tensor(&m, "blk.0.absent.weight");
+        _exit(0);
+    }
+    close(err[1]);
+    char message[512] = "";
+    ssize_t n = read(err[0], message, sizeof(message) - 1);
+    assert(n >= 0);
+    close(err[0]);
+    int status;
+    assert(waitpid(pid, &status, 0) == pid);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) != 0);
+    assert(strstr(message, duplicate ? "duplicate tensor name" : "required tensor is missing"));
+    assert(strstr(message, duplicate ? "test.weight" : "blk.0.absent.weight"));
+    assert(strstr(message, path));
+    assert(fclose(fp) == 0 && unlink(path) == 0);
+}
+
 static void check_model_layout(const char *path) {
     ds4_model m;
     model_open(&m, path, false, false);
@@ -143,5 +183,8 @@ int main(int argc, char **argv) {
     run_fixture(0);
     run_fixture(1);
     puts("V4.1 disk-only GGUF extent: PASS");
+    run_refusal(1);
+    run_refusal(0);
+    puts("GGUF tensor directory refusals: PASS");
     return 0;
 }
