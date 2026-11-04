@@ -11591,7 +11591,8 @@ static bool build_live_prompt_suffix(server *s, server_slot *slot,
  * ========================================================================= */
 
 static int live_prefix_rewind_target(bool backend_can_rewind,
-                                     int old_pos, int prompt_len, int common);
+                                     int old_pos, int prompt_len, int common,
+                                     bool *full_prefix);
 
 typedef enum {
     REUSE_NONE = 0,
@@ -11609,6 +11610,7 @@ typedef struct {
     int reuse_tokens;   /* live tokens reusable; 0 iff REUSE_NONE */
     size_t suffix_off;  /* text tiers: byte offset of the new suffix text */
     int matched_ids;    /* tool-output tiers: number of bound call ids */
+    bool full_prefix;   /* REUSE_MEMORY_REWIND: the whole prompt was cached */
 } slot_reuse;
 
 static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
@@ -11695,11 +11697,18 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
     const int common = ds4_session_common_prefix(slot->session, &req->prompt);
     const bool token_image_prefix = ds4_session_vision_prefix_matches(
         slot->session, req->images, req->image_count);
+    /* The gate is ds4_engine_can_rewind(), not a hard-coded family test: the
+     * rollback capability belongs to the engine, so admitting another backend
+     * is a change in one predicate rather than in this probe.  Upstream's
+     * shared probe is what made the operand swappable. */
+    bool rewind_full_prefix = false;
     const int rewind_to = live_prefix_rewind_target(
-        ds4_engine_is_glm_dsa(s->engine), live_pos, req->prompt.len, common);
+        ds4_engine_can_rewind(s->engine), live_pos, req->prompt.len, common,
+        &rewind_full_prefix);
     if (rewind_to >= 0 && token_image_prefix) {
         pr.kind = REUSE_MEMORY_REWIND;
         pr.reuse_tokens = rewind_to;
+        pr.full_prefix = rewind_full_prefix;
         return pr;
     }
     if (common == live_pos && req->prompt.len >= live_pos && token_image_prefix) {
@@ -11969,11 +11978,19 @@ static void trace_write_cache_diag(
     }
 }
 
+/* Return the rewind target, or -1 when no live rewind applies.  *full_prefix
+ * reports that the whole prompt is already cached, so the caller is handing the
+ * final prompt token back to the sampler. */
 static int live_prefix_rewind_target(bool backend_can_rewind,
-                                     int old_pos, int prompt_len, int common) {
-    if (!backend_can_rewind || prompt_len <= 1 || prompt_len >= old_pos) return -1;
-    if (common != prompt_len) return -1;
-    return prompt_len - 1;
+                                     int old_pos, int prompt_len, int common,
+                                     bool *full_prefix) {
+    if (full_prefix) *full_prefix = false;
+    if (!backend_can_rewind || common <= 1 || common >= old_pos) return -1;
+    if (common == prompt_len) {
+        if (full_prefix) *full_prefix = true;
+        return prompt_len - 1;
+    }
+    return common;
 }
 
 static void trace_time(FILE *fp) {
@@ -13553,12 +13570,15 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             cache_source = "memory-rewind";
             cache_diag.rewind_to = reuse.reuse_tokens;
             server_log(DS4_LOG_KVCACHE,
-                       "ds4-server: rewound GLM live prefix from %d to %d; final prompt token will be reevaluated",
-                       old_pos, reuse.reuse_tokens);
+                       "ds4-server: rewound live prefix from %d to %d; %s",
+                       old_pos, reuse.reuse_tokens,
+                       reuse.full_prefix ?
+                           "final prompt token will be reevaluated" :
+                           "suffix tokens will be evaluated");
         } else {
             cached = 0;
             server_log(DS4_LOG_KVCACHE,
-                       "ds4-server: GLM live prefix rewind from %d to %d requires rebuild",
+                       "ds4-server: live prefix rewind from %d to %d requires rebuild",
                        old_pos, reuse.reuse_tokens);
         }
         break;
@@ -21212,12 +21232,17 @@ static void test_model_metadata_reports_modalities(void) {
 }
 
 static void test_live_prefix_rewind_target(void) {
-    TEST_ASSERT(live_prefix_rewind_target(true, 17, 8, 8) == 7);
-    TEST_ASSERT(live_prefix_rewind_target(true, 49826, 48379, 48379) == 48378);
-    TEST_ASSERT(live_prefix_rewind_target(false, 17, 8, 8) == -1);
-    TEST_ASSERT(live_prefix_rewind_target(true, 17, 8, 7) == -1);
-    TEST_ASSERT(live_prefix_rewind_target(true, 8, 8, 8) == -1);
-    TEST_ASSERT(live_prefix_rewind_target(true, 17, 1, 1) == -1);
+    bool full = false;
+    TEST_ASSERT(live_prefix_rewind_target(true, 17, 8, 8, &full) == 7 && full);
+    TEST_ASSERT(live_prefix_rewind_target(true, 49826, 48379, 48379, &full) == 48378 && full);
+    TEST_ASSERT(live_prefix_rewind_target(false, 17, 8, 8, &full) == -1 && !full);
+    TEST_ASSERT(live_prefix_rewind_target(true, 17, 8, 7, &full) == 7 && !full);
+    TEST_ASSERT(live_prefix_rewind_target(true, 165755, 4977, 4973, &full) == 4973 && !full);
+    TEST_ASSERT(live_prefix_rewind_target(true, 8, 8, 8, &full) == -1 && !full);
+    TEST_ASSERT(live_prefix_rewind_target(true, 17, 1, 1, &full) == -1 && !full);
+    /* The out-parameter is optional: callers that only need the target pass NULL. */
+    TEST_ASSERT(live_prefix_rewind_target(true, 17, 8, 8, NULL) == 7);
+    TEST_ASSERT(live_prefix_rewind_target(false, 17, 8, 8, NULL) == -1);
 }
 
 static void test_client_socket_nonblocking_flag(void) {
