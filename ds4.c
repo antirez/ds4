@@ -44701,6 +44701,21 @@ void ds4_chat_begin(ds4_engine *e, ds4_tokens *tokens) {
     chat_push_bos_sequence(&e->vocab, tokens);
 }
 
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+static int ds4_k3_encode_chat(k3_tokenizer *tokenizer, const char *system,
+                              const char *prompt, ds4_think_mode think_mode,
+                              k3_tokens *tokens, char *err, size_t errcap) {
+    const bool think = ds4_think_mode_enabled(think_mode);
+    if (think && !k3_tokenizer_append_thinking_effort(tokenizer,
+            think_mode == DS4_THINK_MAX ? "max" : "high", tokens, err, errcap)) return 0;
+    if (system && system[0] &&
+        !k3_tokenizer_append_message(tokenizer, "system", system, tokens, err, errcap)) return 0;
+    return k3_tokenizer_append_message(tokenizer, "user", prompt ? prompt : "",
+                                       tokens, err, errcap) &&
+           k3_tokenizer_append_assistant_prefix(tokenizer, think, tokens, err, errcap);
+}
+#endif
+
 void ds4_encode_chat_prompt(
         ds4_engine *e,
         const char *system,
@@ -44711,29 +44726,9 @@ void ds4_encode_chat_prompt(
     if (e && e->is_k3) {
         k3_tokens result = {0};
         char err[256] = {0};
-        int ok = 1;
         pthread_mutex_lock(&e->k3_tokenizer_mutex);
-        if (ds4_think_mode_enabled(think_mode)) {
-            ok = k3_tokenizer_append_thinking_effort(
-                e->k3_tokenizer,
-                think_mode == DS4_THINK_MAX ? "max" : "high",
-                &result, err, sizeof(err));
-        }
-        if (ok && system && system[0]) {
-            ok = k3_tokenizer_append_message(
-                e->k3_tokenizer, "system", system,
-                &result, err, sizeof(err));
-        }
-        if (ok) {
-            ok = k3_tokenizer_append_message(
-                e->k3_tokenizer, "user", prompt ? prompt : "",
-                &result, err, sizeof(err));
-        }
-        if (ok) {
-            ok = k3_tokenizer_append_assistant_prefix(
-                e->k3_tokenizer, ds4_think_mode_enabled(think_mode),
-                &result, err, sizeof(err));
-        }
+        const int ok = ds4_k3_encode_chat(e->k3_tokenizer, system, prompt, think_mode,
+                                          &result, err, sizeof(err));
         pthread_mutex_unlock(&e->k3_tokenizer_mutex);
         ds4_k3_tokens_commit(&result, out, ok, err);
         return;
@@ -65445,38 +65440,36 @@ void ds4_engine_dump_tokens(ds4_engine *e, const ds4_tokens *tokens) {
     dump_tokens(&e->vocab, tokens);
 }
 
-int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *fp) {
-    if (ds4_model_path_is_k3(model_path)) {
+static int ds4_dump_k3_tokenization(const char *path, const char *system,
+                                    const char *text, ds4_think_mode think_mode,
+                                    bool chat, FILE *fp) {
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
-        k3_tokenizer *tokenizer = NULL;
-        k3_tokens tokens = {0};
-        char err[256] = {0};
-        if (!fp) fp = stdout;
-        const int ok =
-            k3_tokenizer_open(
-                &tokenizer, model_path, err, sizeof(err)) &&
-            k3_tokenizer_encode_rendered(
-                tokenizer, text ? text : "", &tokens, err, sizeof(err));
-        if (!ok) {
-            fprintf(stderr, "ds4: Kimi K3 tokenizer: %s\n",
-                    err[0] ? err : "tokenization failed");
-            k3_tokens_free(&tokens);
-            k3_tokenizer_close(tokenizer);
-            return 1;
-        }
-        dump_k3_tokens_fp(
-            fp, tokenizer, tokens.data, tokens.count);
-        k3_tokens_free(&tokens);
-        k3_tokenizer_close(tokenizer);
-        return ferror(fp) ? 1 : 0;
-#else
-        (void)text;
-        (void)fp;
-        fprintf(stderr,
-                "ds4: this build does not include the Apple Metal Kimi K3 backend\n");
-        return 1;
-#endif
+    k3_tokenizer *tokenizer = NULL;
+    k3_tokens tokens = {0};
+    char err[256] = {0};
+    if (!fp) fp = stdout;
+    int ok = k3_tokenizer_open(&tokenizer, path, err, sizeof(err));
+    if (ok) {
+        ok = chat ? ds4_k3_encode_chat(tokenizer, system, text, think_mode,
+                                      &tokens, err, sizeof(err))
+                  : k3_tokenizer_encode_rendered(tokenizer, text ? text : "",
+                                                 &tokens, err, sizeof(err));
     }
+    if (ok) dump_k3_tokens_fp(fp, tokenizer, tokens.data, tokens.count);
+    else fprintf(stderr, "ds4: Kimi K3 tokenizer: %s\n", err[0] ? err : "tokenization failed");
+    k3_tokens_free(&tokens);
+    k3_tokenizer_close(tokenizer);
+    return !ok || ferror(fp);
+#else
+    (void)path; (void)system; (void)text; (void)think_mode; (void)chat; (void)fp;
+    fprintf(stderr, "ds4: this build does not include the Apple Metal Kimi K3 backend\n");
+    return 1;
+#endif
+}
+
+int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *fp) {
+    if (ds4_model_path_is_k3(model_path))
+        return ds4_dump_k3_tokenization(model_path, NULL, text, DS4_THINK_NONE, false, fp);
 
     ds4_model model;
     ds4_vocab vocab;
@@ -65501,6 +65494,14 @@ int ds4_dump_chat_tokenization(const char *model_path,
                                ds4_think_mode think_mode,
                                int ctx_size,
                                FILE *fp) {
+    if (ds4_model_path_is_k3(model_path)) {
+        if (ds4_think_mode_level(think_mode) >= 0) {
+            fprintf(stderr, "ds4: --think-level requires a DeepSeek V4.1 model\n");
+            return 2;
+        }
+        return ds4_dump_k3_tokenization(model_path, system, prompt,
+                                        ds4_think_mode_for_context(think_mode, ctx_size), true, fp);
+    }
     ds4_model model;
     ds4_vocab vocab;
     token_vec tokens = {0};
