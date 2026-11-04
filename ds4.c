@@ -63010,6 +63010,7 @@ struct ds4_session {
     ds4_dist_session *distributed;
     uint64_t tp_session_id;
     uint64_t glm_reserved_graph_bytes;
+    bool test_backend_stale;  /* unit-test seam: force prefix_reusable()=false */
 #ifndef DS4_NO_GPU
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     ds41_gpu_graph ds41_graph;
@@ -65350,13 +65351,23 @@ static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
 static uint64_t qwen4_payload_tensor_bytes(uint32_t rows, uint32_t mtp_rows, bool tail);
 #endif
 
+bool ds4_session_prefix_reusable(ds4_session *s) {
+    if (!s || !s->checkpoint_valid || s->test_backend_stale) return false;
+#ifdef DS4_HAS_QWEN4_GPU
+    if (!s->distributed && ds4_session_is_qwen4(s)) {
+        return s->qwen4_graph_ready && !s->qwen4_rewound &&
+               s->qwen4_graph.pos == (uint32_t)s->checkpoint.len;
+    }
+#endif
+    return true;
+}
+
 uint64_t ds4_session_payload_bytes(ds4_session *s) {
     if (s && !s->distributed && ds4_session_is_qwen4(s)) {
 #ifndef DS4_HAS_QWEN4_GPU
         return 0;
 #else
-        if (!s->qwen4_graph_ready || !s->checkpoint_valid) return 0;
-        if (s->qwen4_rewound || s->qwen4_graph.pos != (uint32_t)s->checkpoint.len) return 0;
+        if (!ds4_session_prefix_reusable(s)) return 0;
         uint64_t bytes = (uint64_t)DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
         bytes += (uint64_t)s->checkpoint.len * sizeof(uint32_t);
         bytes += (uint64_t)DS4_N_VOCAB * sizeof(float);
@@ -89691,6 +89702,10 @@ ds4_session *ds4_session_new_test_checkpoint(const int *tokens, int n) {
     for (int i = 0; i < n; i++) token_vec_push(&s->checkpoint, tokens[i]);
     s->checkpoint_valid = true;
     return s;
+}
+
+void ds4_session_set_test_backend_stale(ds4_session *s, bool stale) {
+    if (s) s->test_backend_stale = stale;
 }
 
 void ds4_session_free_test_checkpoint(ds4_session *s) {

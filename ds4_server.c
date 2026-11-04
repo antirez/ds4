@@ -11611,11 +11611,33 @@ typedef struct {
     int matched_ids;    /* tool-output tiers: number of bound call ids */
 } slot_reuse;
 
+/* True for Responses/Anthropic requests that carry only tool outputs and can
+ * be served solely from the slot's live tool state. */
+static bool request_requires_live_tool_state(const request *req) {
+    if (!req) return false;
+    if (req->api == API_ANTHROPIC) return req->anthropic_requires_live_tool_state;
+    if (req->api == API_RESPONSES) return req->responses_requires_live_tool_state;
+    return false;
+}
+
 static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
                                           const request *req) {
     slot_reuse pr = { REUSE_NONE, 0, 0, 0 };
     if (!s || !slot || !slot->session || !req) return pr;
     if (!ds4_session_checkpoint_valid(slot->session)) return pr;
+    /* A backend rewind can reset recurrent state while the token checkpoint
+     * stays valid (e.g. Qwen3.8 verify rewinds).  Such a checkpoint cannot be
+     * continued from: the next sync would silently rebuild the whole prefix
+     * while the server reports a hit.  Treat it as a miss so the request can
+     * use the disk cache or a cold prefill with honest accounting.
+     *
+     * Exception: an explicit tool-output-only continuation has no replayable
+     * history and no disk key, so a miss would turn into a 409.  Its effective
+     * prompt is rebuilt from the full checkpoint tokens, so the sync replay is
+     * still correct (only slower), and the progress log reports the rebuild. */
+    if (!ds4_session_prefix_reusable(slot->session) &&
+        !request_requires_live_tool_state(req))
+        return pr;
     const ds4_tokens *live = ds4_session_tokens(slot->session);
     if (!live || live->len <= 0) return pr;
     const int live_pos = live->len;
@@ -11763,9 +11785,7 @@ static slot_reuse slot_probe_reuse(server *s, server_slot *slot,
  * context-free prompt built from the tool outputs alone. */
 static bool live_continuation_unavailable(const request *req, bool materialized) {
     if (!req || materialized) return false;
-    if (req->api == API_ANTHROPIC) return req->anthropic_requires_live_tool_state;
-    if (req->api == API_RESPONSES) return req->responses_requires_live_tool_state;
-    return false;
+    return request_requires_live_tool_state(req);
 }
 
 /* Refresh the cached rendered text of the slot's checkpoint.  Called by the
@@ -11810,6 +11830,7 @@ static void slot_refresh_live_text(server *s, server_slot *slot) {
 
 typedef struct {
     bool valid;
+    bool backend_stale;
     int old_pos;
     int prompt_len;
     int common;
@@ -11856,6 +11877,7 @@ static void trace_cache_capture(
 static const char *trace_cache_miss_reason(const trace_cache_diag *d) {
     if (!d || !d->valid) return "unknown";
     if (d->old_pos == 0) return "no-live-checkpoint";
+    if (d->backend_stale) return "backend-state-reset";
     if (d->rewind_to >= 0) return "live-prefix-rewind";
     if (d->common != d->old_pos) return "token-mismatch";
     if (d->prompt_len < d->old_pos) return "incoming-prompt-shorter-than-live-checkpoint";
@@ -11863,7 +11885,7 @@ static const char *trace_cache_miss_reason(const trace_cache_diag *d) {
 }
 
 static bool trace_cache_memory_reusable(const trace_cache_diag *d) {
-    return d && d->valid &&
+    return d && d->valid && !d->backend_stale &&
            (d->rewind_to >= 0 ||
             (d->old_pos > 0 && d->common == d->old_pos &&
              d->prompt_len >= d->old_pos));
@@ -12122,6 +12144,11 @@ typedef struct {
     double t0;
     double last_t;
     int last_current;
+    int last_display_current;
+    /* Latched on the first chunk that lands below the cached frontier: the
+     * backend is rebuilding the prefix, so every later chunk (including the
+     * ones past cached_tokens) is reported against the full prompt. */
+    bool rebuilt;
     bool seen;
     /* SSE keepalive during long prefill: send HTTP/SSE headers ahead of
      * generation and emit a `:` comment line every few seconds so HTTP/TCP
@@ -12692,6 +12719,45 @@ static void log_tool_calls_summary(const char *ctx, const tool_calls *calls,
     buf_free(&names);
 }
 
+/* Map engine progress onto the range shown in the prefill log.
+ *
+ * `current` arrives in the engine's own coordinate system: absolute prompt
+ * positions for most backends.  When it starts below `cached_tokens` the
+ * backend is rebuilding a prefix the server counted as cached (e.g. a Qwen3.8
+ * recurrent graph reset by a rewind), so report that replay against the whole
+ * prompt instead of clamping every chunk to 0.  The displayed value doubles as
+ * the duplicate key so a replayed prefix prints one line per real chunk.
+ *
+ * The rebuild is latched on the first chunk below the frontier: the chunk that
+ * finally crosses `cached_tokens` must keep the full-prompt range instead of
+ * collapsing to a misleading `16/16` with a tiny average. */
+static void prefill_progress_display(server_prefill_progress *p,
+                                     int current, int total,
+                                     int *display_current,
+                                     int *display_total) {
+    const int suffix = p->prompt_tokens - p->cached_tokens;
+    int start = p->cached_tokens;
+    if (start < 0 || start > p->prompt_tokens) start = 0;
+    int span = p->prompt_tokens - start;
+    if (suffix > 0 && total == suffix) {
+        /* The engine already reports suffix-relative coordinates. */
+        start = 0;
+        span = total;
+    } else {
+        if (current < start) p->rebuilt = true;
+        if (p->rebuilt || span <= 0) {
+            /* No suffix to subtract, or the engine restarted at position 0. */
+            start = 0;
+            span = p->prompt_tokens > total ? p->prompt_tokens : total;
+        }
+    }
+    int shown = current - start;
+    if (shown < 0) shown = 0;
+    if (shown > span) shown = span;
+    *display_current = shown;
+    *display_total = span;
+}
+
 static void server_progress_cb(void *ud, const char *event, int current, int total) {
     server_prefill_progress *p = ud;
     if (!p || !event || job_cancelled(p->request_job)) return;
@@ -12728,22 +12794,16 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     }
     if (is_display) return;
     double elapsed = now - p->t0;
-    if (p->seen && current == p->last_current) {
+    int display_current = 0;
+    int display_total = 0;
+    prefill_progress_display(p, current, total, &display_current,
+                             &display_total);
+    if (p->seen && display_current == p->last_display_current) {
         if (p->srv && p->slot && current > p->cached_tokens) {
             kv_cache_maybe_store_continued(p->srv, p->slot);
         }
         return;
     }
-    int display_start = p->cached_tokens;
-    if (display_start < 0 || display_start > p->prompt_tokens) display_start = 0;
-    int display_total = p->prompt_tokens - display_start;
-    if (display_total <= 0) {
-        display_start = 0;
-        display_total = p->prompt_tokens > total ? p->prompt_tokens : total;
-    }
-    int display_current = current - display_start;
-    if (display_current < 0) display_current = 0;
-    if (display_current > display_total) display_current = display_total;
     double pct = display_total > 0 ? 100.0 * (double)display_current / (double)display_total : 100.0;
     double avg_tps = elapsed > 0.0 ? (double)display_current / elapsed : 0.0;
     int interval_tokens = p->seen ? current - p->last_current : 0;
@@ -12751,6 +12811,7 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     double interval_s = p->seen ? now - p->last_t : 0.0;
     double chunk_tps = interval_s > 0.0 ? (double)interval_tokens / interval_s : 0.0;
     p->last_current = current;
+    p->last_display_current = display_current;
     p->last_t = now;
     p->seen = true;
     char flags[64];
@@ -13435,6 +13496,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     trace_cache_diag cache_diag = {0};
     trace_cache_capture(&cache_diag, ds4_session_tokens(slot->session),
                         &j->req.prompt, old_pos, common);
+    cache_diag.backend_stale = ds4_session_checkpoint_valid(slot->session) &&
+                               !ds4_session_prefix_reusable(slot->session);
     ds4_tokens effective_prompt = {0};
     const ds4_tokens *prompt_for_sync = &j->req.prompt;
     const bool responses_protocol = j->req.api == API_RESPONSES;
@@ -21299,6 +21362,159 @@ static void test_cancelled_progress_callback_is_inert(void) {
     test_cancel_job_destroy(&j);
 }
 
+static void test_prefill_progress_display_ranges(void) {
+    int cur = 0;
+    int tot = 0;
+
+    /* Live hit: progress is relative to the cached suffix. */
+    server_prefill_progress hit = {
+        .prompt_tokens = 100,
+        .cached_tokens = 90,
+    };
+    prefill_progress_display(&hit, 90, 100, &cur, &tot);
+    TEST_ASSERT(cur == 0 && tot == 10);
+    prefill_progress_display(&hit, 95, 100, &cur, &tot);
+    TEST_ASSERT(cur == 5 && tot == 10);
+    prefill_progress_display(&hit, 100, 100, &cur, &tot);
+    TEST_ASSERT(cur == 10 && tot == 10);
+
+    /* Backend rebuilt from position 0: show the whole prompt, not 0/10. */
+    prefill_progress_display(&hit, 8, 100, &cur, &tot);
+    TEST_ASSERT(cur == 8 && tot == 100);
+    prefill_progress_display(&hit, 64, 100, &cur, &tot);
+    TEST_ASSERT(cur == 64 && tot == 100);
+
+    /* Suffix-relative engine coordinates (some GLM paths). */
+    prefill_progress_display(&hit, 4, 10, &cur, &tot);
+    TEST_ASSERT(cur == 4 && tot == 10);
+
+    /* Cold prompt. */
+    server_prefill_progress cold = {
+        .prompt_tokens = 100,
+        .cached_tokens = 0,
+    };
+    prefill_progress_display(&cold, 30, 100, &cur, &tot);
+    TEST_ASSERT(cur == 30 && tot == 100);
+
+    /* Cached prefix equals the prompt: fall back to the engine total. */
+    server_prefill_progress full = {
+        .prompt_tokens = 100,
+        .cached_tokens = 100,
+    };
+    prefill_progress_display(&full, 0, 100, &cur, &tot);
+    TEST_ASSERT(cur == 0 && tot == 100);
+}
+
+static void test_prefill_progress_rebuild_latches_full_prompt(void) {
+    int cur = 0;
+    int tot = 0;
+    /* Issue #1114 shape: the server counted 132806 cached tokens but the
+     * engine replays the whole 132822-token prompt in 8192-token chunks.  The
+     * chunk that crosses the cached frontier must stay on the full-prompt
+     * range instead of collapsing to 16/16. */
+    server_prefill_progress p = {
+        .prompt_tokens = 132822,
+        .cached_tokens = 132806,
+    };
+    prefill_progress_display(&p, 8192, 132822, &cur, &tot);
+    TEST_ASSERT(cur == 8192 && tot == 132822);
+    prefill_progress_display(&p, 131072, 132822, &cur, &tot);
+    TEST_ASSERT(cur == 131072 && tot == 132822);
+    prefill_progress_display(&p, 132822, 132822, &cur, &tot);
+    TEST_ASSERT(cur == 132822 && tot == 132822);
+
+    /* A genuine live hit never latches. */
+    server_prefill_progress hit = {
+        .prompt_tokens = 132822,
+        .cached_tokens = 132806,
+    };
+    prefill_progress_display(&hit, 132815, 132822, &cur, &tot);
+    TEST_ASSERT(cur == 9 && tot == 16);
+    TEST_ASSERT(!hit.rebuilt);
+}
+
+static void test_slot_probe_backend_stale(void) {
+    server s = {0};
+    int ckpt_tok[10];
+    for (int i = 0; i < 10; i++) ckpt_tok[i] = i + 1;
+
+    /* Plain token-prefix hit: a reset backend turns it into a miss. */
+    {
+        server_slot slot = {0};
+        slot.session = ds4_session_new_test_checkpoint(ckpt_tok, 10);
+        request req = {0};
+        for (int i = 0; i < 10; i++) ds4_tokens_push(&req.prompt, ckpt_tok[i]);
+        ds4_tokens_push(&req.prompt, 11);
+        TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &req).kind ==
+                    REUSE_MEMORY_TOKEN);
+        ds4_session_set_test_backend_stale(slot.session, true);
+        TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &req).kind ==
+                    REUSE_NONE);
+        ds4_tokens_free(&req.prompt);
+        ds4_session_free_test_checkpoint(slot.session);
+    }
+
+    /* A tool-output-only continuation has no other source: it must keep its
+     * live tier (the sync replays the full effective prompt) rather than
+     * turn into a 409. */
+    {
+        server_slot slot = {0};
+        slot.session = ds4_session_new_test_checkpoint(ckpt_tok, 10);
+        ds4_session_set_test_backend_stale(slot.session, true);
+        slot.anthropic_live.valid = true;
+        slot.anthropic_live.live_tokens = 10;
+        id_list_push_unique(&slot.anthropic_live.call_ids, "toolu-1");
+        job j = {0};
+        j.req.api = API_ANTHROPIC;
+        j.req.anthropic_requires_live_tool_state = true;
+        j.req.anthropic_live_suffix_text = xstrdup(" result");
+        id_list_push_unique(&j.req.anthropic_live_call_ids, "toolu-1");
+        ds4_tokens_push(&j.req.prompt, 999);
+        slot_reuse pr = slot_probe_reuse_locked(&s, &slot, &j.req);
+        TEST_ASSERT(pr.kind == REUSE_ANTHROPIC_TOOL_OUTPUT);
+        TEST_ASSERT(pr.reuse_tokens == 10);
+        live_tool_state_free(&slot.anthropic_live);
+        ds4_session_free_test_checkpoint(slot.session);
+        request_free(&j.req);
+    }
+}
+
+static void test_progress_callback_logs_each_replay_chunk(void) {
+    job j;
+    test_cancel_job_init(&j);
+    server_prefill_progress replay = {
+        .request_job = &j,
+        .t0 = now_sec(),
+        .prompt_tokens = 100,
+        .cached_tokens = 90,
+    };
+    /* A replay chunk below the cached frontier must not be suppressed as a
+     * duplicate: it now advances the displayed full-prompt progress. */
+    server_progress_cb(&replay, "prefill_chunk", 8, 100);
+    TEST_ASSERT(replay.seen);
+    TEST_ASSERT(replay.last_display_current == 8);
+    server_progress_cb(&replay, "prefill_chunk", 16, 100);
+    TEST_ASSERT(replay.last_display_current == 16);
+
+    /* Clamped display states are deduplicated. */
+    server_prefill_progress clamp = {
+        .request_job = &j,
+        .t0 = now_sec(),
+        .prompt_tokens = 100,
+        .cached_tokens = 90,
+    };
+    server_progress_cb(&clamp, "prefill_chunk", 95, 100);
+    TEST_ASSERT(clamp.seen);
+    TEST_ASSERT(clamp.last_display_current == 5);
+    server_progress_cb(&clamp, "prefill_chunk", 105, 100);
+    TEST_ASSERT(clamp.last_display_current == 10);
+    const double logged_t = clamp.last_t;
+    server_progress_cb(&clamp, "prefill_chunk", 115, 100);
+    TEST_ASSERT(clamp.last_t == logged_t);
+    TEST_ASSERT(clamp.last_current == 105);
+    test_cancel_job_destroy(&j);
+}
+
 static void test_cancel_server_init(server *s) {
     memset(s, 0, sizeof(*s));
     pthread_mutex_init(&s->mu, NULL);
@@ -23158,6 +23374,10 @@ static void ds4_server_unit_tests_run(void) {
     test_client_socket_nonblocking_flag();
     test_client_disconnect_probe();
     test_cancelled_progress_callback_is_inert();
+    test_prefill_progress_display_ranges();
+    test_prefill_progress_rebuild_latches_full_prompt();
+    test_slot_probe_backend_stale();
+    test_progress_callback_logs_each_replay_chunk();
     test_waiting_job_cancels_on_client_close();
     test_cancel_unlinks_queued_jobs();
     test_cancel_detaches_assigned_job();
