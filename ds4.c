@@ -2391,6 +2391,7 @@ static const gguf_type_info gguf_types[] = {
     [29] = {"iq1_m",  256,  56},
     [30] = {"bf16",     1,   2},
     [39] = {"mxfp4",   32,  17},
+    [40] = {"nvfp4",   64,  36},
 };
 
 enum {
@@ -2400,6 +2401,7 @@ enum {
     DS4_TENSOR_Q4_1     = 3,
     DS4_TENSOR_Q8_0     = 8,
     DS4_TENSOR_Q2_K     = 10,
+    DS4_TENSOR_Q3_K     = 11,
     DS4_TENSOR_Q4_K     = 12,
     DS4_TENSOR_Q5_K     = 13,
     DS4_TENSOR_Q6_K     = 14,
@@ -2409,6 +2411,7 @@ enum {
     DS4_TENSOR_I32      = 26,
     DS4_TENSOR_BF16     = 30,
     DS4_TENSOR_MXFP4    = 39,
+    DS4_TENSOR_NVFP4    = 40,
 };
 
 typedef struct {
@@ -4705,6 +4708,11 @@ typedef struct {
     ds4_tensor *ffn_gate_exps;
     ds4_tensor *ffn_up_exps;
     ds4_tensor *ffn_down_exps;
+    /* Standard MiniMax GGUFs retain the source NVFP4 global scale for every
+     * routed expert even when the weight itself is requantized. */
+    ds4_tensor *ffn_gate_exps_scale;
+    ds4_tensor *ffn_up_exps_scale;
+    ds4_tensor *ffn_down_exps_scale;
     ds4_tensor *ffn_gate_shexp;
     ds4_tensor *ffn_up_shexp;
     ds4_tensor *ffn_down_shexp;
@@ -5035,10 +5043,12 @@ static bool tensor_is_routed_expert_type(uint32_t type) {
     return type == DS4_TENSOR_Q8_0 ||
            type == DS4_TENSOR_IQ2_XXS ||
            type == DS4_TENSOR_Q2_K ||
+           type == DS4_TENSOR_Q3_K ||
            type == DS4_TENSOR_Q4_K ||
            type == DS4_TENSOR_Q5_K ||
            type == DS4_TENSOR_Q6_K ||
-           type == DS4_TENSOR_MXFP4;
+           type == DS4_TENSOR_MXFP4 ||
+           type == DS4_TENSOR_NVFP4;
 }
 
 static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
@@ -5046,10 +5056,12 @@ static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
     case DS4_TENSOR_Q8_0:    return 34;
     case DS4_TENSOR_IQ2_XXS: return sizeof(block_iq2_xxs);
     case DS4_TENSOR_Q2_K:    return sizeof(block_q2_K);
+    case DS4_TENSOR_Q3_K:    return 110;
     case DS4_TENSOR_Q4_K:    return sizeof(block_q4_K);
     case DS4_TENSOR_Q5_K:    return sizeof(block_q5_K);
     case DS4_TENSOR_Q6_K:    return sizeof(block_q6_K);
     case DS4_TENSOR_MXFP4:   return sizeof(block_mxfp4);
+    case DS4_TENSOR_NVFP4:   return 36;
     default:                 ds4_die("unsupported routed expert tensor type");
     }
     return 0;
@@ -5739,6 +5751,17 @@ static void weights_validate_minimax3_layout(
         tensor_expect_qwen4_expert_layout(l->ffn_gate_exps, E, DS4_N_FF_EXP, DS4_N_EXPERT);
         tensor_expect_qwen4_expert_layout(l->ffn_up_exps, E, DS4_N_FF_EXP, DS4_N_EXPERT);
         tensor_expect_qwen4_expert_layout(l->ffn_down_exps, DS4_N_FF_EXP, E, DS4_N_EXPERT);
+        const bool any_scale = l->ffn_gate_exps_scale || l->ffn_up_exps_scale || l->ffn_down_exps_scale;
+        if (any_scale &&
+            (!l->ffn_gate_exps_scale || !l->ffn_up_exps_scale || !l->ffn_down_exps_scale)) {
+            fprintf(stderr, "ds4: MiniMax routed expert scales are incomplete in layer %u\n", il);
+            exit(1);
+        }
+        if (any_scale) {
+            tensor_expect_layout(l->ffn_gate_exps_scale, DS4_TENSOR_F32, 1, DS4_N_EXPERT, 0, 0);
+            tensor_expect_layout(l->ffn_up_exps_scale, DS4_TENSOR_F32, 1, DS4_N_EXPERT, 0, 0);
+            tensor_expect_layout(l->ffn_down_exps_scale, DS4_TENSOR_F32, 1, DS4_N_EXPERT, 0, 0);
+        }
         tensor_expect_qwen4_dense_layout(l->ffn_gate_shexp, 2, E, DS4_N_FF_EXP, 0);
         tensor_expect_qwen4_dense_layout(l->ffn_up_shexp, 2, E, DS4_N_FF_EXP, 0);
         tensor_expect_qwen4_dense_layout(l->ffn_down_shexp, 2, DS4_N_FF_EXP, E, 0);
@@ -7295,7 +7318,12 @@ static void config_validate_minimax3_model(const ds4_model *m) {
     } while (0)
     MM3_U32("block_count", DS4_N_LAYER);
     MM3_U32("embedding_length", DS4_N_EMBD);
-    MM3_U32("vocab_size", DS4_N_VOCAB);
+    /* llama.cpp's standard MiniMax GGUF omits vocab_size; the tokenizer table
+     * and embedding/output shapes provide the same strict checks below. */
+    snprintf(key, sizeof(key), "%s.vocab_size", a);
+    uint64_t compat_u64 = DS4_N_VOCAB;
+    if (model_get_u64_compat(m, key, &compat_u64))
+        config_expect_u32("vocab_size", (uint32_t)compat_u64, DS4_N_VOCAB);
     MM3_U32("feed_forward_length", DS4_N_FF_DENSE);
     MM3_U32("expert_feed_forward_length", DS4_N_FF_EXP);
     MM3_U32("expert_count", DS4_N_EXPERT);
@@ -7303,8 +7331,17 @@ static void config_validate_minimax3_model(const ds4_model *m) {
     MM3_U32("expert_shared_count", DS4_N_EXPERT_SHARED);
     MM3_U32("leading_dense_block_count", DS4_N_LEADING_DENSE);
     MM3_F32("expert_weights_scale", DS4_EXPERT_WEIGHT_SCALE);
-    MM3_F32("swiglu_alpha", 1.702f);   /* the Metal SwiGLU-OAI kernels fix both constants */
-    MM3_F32("swiglu_limit", DS4_SWIGLU_CLAMP_EXP);
+    /* These architecture constants are not emitted by llama.cpp GGUFs.  The
+     * Metal SwiGLU-OAI kernels fix both values and converted ds4 files still
+     * validate them when present. */
+    snprintf(key, sizeof(key), "%s.swiglu_alpha", a);
+    float compat_f32 = 1.702f;
+    if (model_get_f32_compat(m, key, &compat_f32))
+        config_expect_f32("swiglu_alpha", compat_f32, 1.702f);
+    snprintf(key, sizeof(key), "%s.swiglu_limit", a);
+    compat_f32 = DS4_SWIGLU_CLAMP_EXP;
+    if (model_get_f32_compat(m, key, &compat_f32))
+        config_expect_f32("swiglu_limit", compat_f32, DS4_SWIGLU_CLAMP_EXP);
     MM3_U32("attention.head_count", DS4_N_HEAD);
     MM3_U32("attention.head_count_kv", DS4_N_HEAD_KV);
     MM3_U32("attention.key_length", DS4_N_HEAD_DIM);
@@ -7313,10 +7350,31 @@ static void config_validate_minimax3_model(const ds4_model *m) {
     MM3_F32("rope.freq_base", DS4_ROPE_FREQ_BASE);
     MM3_U32("attention.indexer.head_count", DS4_N_INDEXER_HEAD);
     MM3_U32("attention.indexer.key_length", DS4_N_INDEXER_HEAD_DIM);
-    MM3_U32("attention.sparse.block_size", DS4_N_SWA);
-    MM3_U32("attention.sparse.top_k_blocks", DS4_N_INDEXER_TOP_K);
-    MM3_U32("attention.sparse.init_blocks", 0);
-    MM3_U32("attention.sparse.local_blocks", 1);
+    /* The upstream converter used attention.sparse.*, while llama.cpp uses
+     * the architecture registry's attention.indexer.* spellings. */
+#define MM3_U32_ALIAS(label_, primary_, alias_, expected_) do { \
+        uint64_t value_ = 0; \
+        if (!model_get_u64_compat(m, primary_, &value_) && \
+            !model_get_u64_compat(m, alias_, &value_)) { \
+            fprintf(stderr, "ds4: required metadata key is missing: %s (or %s)\n", primary_, alias_); \
+            exit(1); \
+        } \
+        config_expect_u32(label_, (uint32_t)value_, expected_); \
+    } while (0)
+    MM3_U32_ALIAS("attention sparse block_size",
+                   "minimax-m3.attention.sparse.block_size",
+                   "minimax-m3.attention.indexer.block_size", DS4_N_SWA);
+    MM3_U32_ALIAS("attention sparse top_k",
+                   "minimax-m3.attention.sparse.top_k_blocks",
+                   "minimax-m3.attention.indexer.top_k", DS4_N_INDEXER_TOP_K);
+    snprintf(key, sizeof(key), "%s.attention.sparse.init_blocks", a);
+    compat_u64 = 0;
+    if (model_get_u64_compat(m, key, &compat_u64))
+        config_expect_u32("attention sparse init_blocks", (uint32_t)compat_u64, 0);
+    MM3_U32_ALIAS("attention sparse local_blocks",
+                   "minimax-m3.attention.sparse.local_blocks",
+                   "minimax-m3.attention.indexer.local_blocks", 1);
+#undef MM3_U32_ALIAS
 #undef MM3_U32
 #undef MM3_F32
     snprintf(key, sizeof(key), "%s.attention.layer_norm_rms_epsilon", a);
@@ -8026,6 +8084,9 @@ static void weights_bind_minimax3_layer(ds4_layer_weights *l, const ds4_model *m
     l->ffn_gate_exps   = required_tensorf(m, "blk.%u.ffn_gate_exps.weight", il);
     l->ffn_up_exps     = required_tensorf(m, "blk.%u.ffn_up_exps.weight", il);
     l->ffn_down_exps   = required_tensorf(m, "blk.%u.ffn_down_exps.weight", il);
+    l->ffn_gate_exps_scale = tensor_by_namef(m, "blk.%u.ffn_gate_exps.scale", il);
+    l->ffn_up_exps_scale   = tensor_by_namef(m, "blk.%u.ffn_up_exps.scale", il);
+    l->ffn_down_exps_scale = tensor_by_namef(m, "blk.%u.ffn_down_exps.scale", il);
     l->ffn_gate_shexp  = required_tensorf(m, "blk.%u.ffn_gate_shexp.weight", il);
     l->ffn_up_shexp    = required_tensorf(m, "blk.%u.ffn_up_shexp.weight", il);
     l->ffn_down_shexp  = required_tensorf(m, "blk.%u.ffn_down_shexp.weight", il);
@@ -61339,21 +61400,36 @@ static bool mm3_graph_attention(ds4_mm3_graph *g, const ds4_model *m, const ds4_
                       qwen4_gemv(g->iqp, m, l->indexer_q_proj, g->xn, T) &&
                       qwen4_gemv(g->ikp, m, l->indexer_k_proj, g->xn, T);
     if (conc) ds4_gpu_concurrent_end();
-    return proj &&
-           ds4_gpu_mm3_attn_prep_tensor(g->q, g->k_cache[il], g->v_cache[il], g->iq, g->ik_cache[il],
+    if (!proj) {
+        fprintf(stderr, "ds4: MiniMax layer %u attention projection failed\n", il);
+        return false;
+    }
+    if (!ds4_gpu_mm3_attn_prep_tensor(g->q, g->k_cache[il], g->v_cache[il], g->iq, g->ik_cache[il],
                                         g->qp, g->kp, g->vp, g->iqp, g->ikp, m->map, m->size,
                                         l->attn_q_norm->abs_offset, l->attn_k_norm->abs_offset,
                                         l->indexer_q_norm->abs_offset, l->indexer_k_norm->abs_offset,
                                         T, DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_INDEXER_HEAD, pos0, g->ctx_cap,
-                                        g->rope_freq, DS4_RMS_EPS) &&
-           ds4_gpu_mm3_idx_select_tensor(g->sel, g->score, g->iq, g->ik_cache[il], T, pos0,
-                                         DS4_N_INDEXER_HEAD, DS4_N_SWA, DS4_N_INDEXER_TOP_K, g->score_stride) &&
-           ds4_gpu_mm3_attn_tensor(g->attn_o, g->q, g->k_cache[il], g->v_cache[il], g->sel,
+                                        g->rope_freq, DS4_RMS_EPS)) {
+        fprintf(stderr, "ds4: MiniMax layer %u attention preparation failed\n", il);
+        return false;
+    }
+    if (!ds4_gpu_mm3_idx_select_tensor(g->sel, g->score, g->iq, g->ik_cache[il], T, pos0,
+                                       DS4_N_INDEXER_HEAD, DS4_N_SWA, DS4_N_INDEXER_TOP_K, g->score_stride)) {
+        fprintf(stderr, "ds4: MiniMax layer %u index selection failed\n", il);
+        return false;
+    }
+    if (!ds4_gpu_mm3_attn_tensor(g->attn_o, g->q, g->k_cache[il], g->v_cache[il], g->sel,
                                    T <= MM3_ATTN_SPLIT_MAX ? g->attn_part : NULL, T,
                                    DS4_N_HEAD, DS4_N_HEAD_KV, pos0, DS4_N_SWA, DS4_N_INDEXER_TOP_K,
-                                   1.0f / sqrtf((float)DS4_N_HEAD_DIM)) &&
-           qwen4_gemv(g->blk, m, l->attn_output, g->attn_o, T) &&
-           ds4_gpu_add_tensor(g->x, g->x, g->blk, T * E);
+                                   1.0f / sqrtf((float)DS4_N_HEAD_DIM))) {
+        fprintf(stderr, "ds4: MiniMax layer %u sparse attention failed\n", il);
+        return false;
+    }
+    if (!qwen4_gemv(g->blk, m, l->attn_output, g->attn_o, T)) {
+        fprintf(stderr, "ds4: MiniMax layer %u attention output projection failed\n", il);
+        return false;
+    }
+    return ds4_gpu_add_tensor(g->x, g->x, g->blk, T * E) != 0;
 }
 
 /* Load the experts the router just chose and point x at them.  Decode rows
@@ -61566,7 +61642,9 @@ static bool mm3_graph_forward_tokens(ds4_mm3_graph *g, const ds4_model *m, const
     bool ok = true;
     for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
         const ds4_layer_weights *l = &w->layer[il];
-        ok = mm3_graph_attention(g, m, l, il, pos0, T) && mm3_graph_ffn(g, m, l, il, T);
+        ok = mm3_graph_attention(g, m, l, il, pos0, T);
+        if (ok) ok = mm3_graph_ffn(g, m, l, il, T);
+        if (!ok) fprintf(stderr, "ds4: MiniMax graph stopped in layer %u\n", il);
         /* start the GPU on the first layers while the rest is encoded */
         if (ok && il == 1u) ok = ds4_gpu_flush_commands() != 0;
     }
