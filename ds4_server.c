@@ -682,6 +682,12 @@ typedef enum {
 #define DS41_PARAM_START "<｜DSML｜ parameter"
 #define DS41_PARAM_END "</｜DSML｜ parameter>"
 
+/* A stop token inside an open tool call is invalid output: the block has to
+ * close before the turn can end. Decoding overrides it, but the override is
+ * bounded so a model that keeps insisting on ending there still terminates
+ * instead of spending the whole output budget. */
+#define DS4_TOOL_CALL_STOP_SUPPRESS_LIMIT 24
+
 static void random_tool_id(char *dst, size_t dstlen, api_style api) {
     static uint64_t fallback_ctr;
     unsigned char bytes[16];
@@ -13938,6 +13944,7 @@ decode_again:
     bool saw_tool_end = false;
     bool saw_orphan_tool_end = false;
     bool client_stop = false;
+    int tool_stop_suppressed = 0;
     size_t tool_scan_from = 0;
     int next_tool_progress = 128;
     int next_decode_log = 50;
@@ -13962,6 +13969,10 @@ decode_again:
         dsml_decode_state dsml_state = j->req.kind == REQ_CHAT && j->req.has_tools ?
             dsml_tracker.decode : DSML_DECODE_OUTSIDE;
         const bool in_tool_call = dsml_decode_state_is_tool(dsml_state);
+        /* The turn cannot end while a tool call is still open: the block has
+         * no executable meaning until its closing marker arrives. */
+        const bool open_tool_call = j->req.kind == REQ_CHAT && j->req.has_tools &&
+                                    saw_tool_start && !saw_tool_end;
         if (!(j->req.kind == REQ_CHAT && j->req.has_tools && (saw_tool_start || in_tool_call))) {
             if (!multimodal) kv_cache_maybe_store_continued(s, slot);
         }
@@ -13999,10 +14010,31 @@ decode_again:
         if (ds4_token_is_stop_for_think_mode(s->engine,
                                              token,
                                              j->req.think_mode)) {
-            finish = "stop";
-            stop_detail = "stop token";
-            stop_token = token;
-            break;
+            int forced = -1;
+            if (open_tool_call &&
+                tool_stop_suppressed < DS4_TOOL_CALL_STOP_SUPPRESS_LIMIT) {
+                forced = ds4_session_argmax_ignoring_eos(slot->session,
+                                                         j->req.think_mode);
+            }
+            if (forced < 0) {
+                finish = "stop";
+                stop_detail = "stop token";
+                stop_token = token;
+                break;
+            }
+            if (!tool_stop_suppressed) {
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: chat ctx=%s%s%s stop token inside open tool call after %d generated tokens; decoding to its close",
+                           ctx_span,
+                           req_flags[0] ? " " : "",
+                           req_flags,
+                           completion);
+                trace_event(s, trace_id,
+                            "suppressed stop token inside open tool call after %d generated tokens",
+                            completion);
+            }
+            tool_stop_suppressed++;
+            token = forced;
         }
 
         int toks[17];
@@ -14064,6 +14096,14 @@ decode_again:
             if (ds4_token_is_stop_for_think_mode(s->engine,
                                                  token,
                                                  j->req.think_mode)) {
+                if (open_tool_call && ti > 0 &&
+                    tool_stop_suppressed < DS4_TOOL_CALL_STOP_SUPPRESS_LIMIT) {
+                    /* Drop this draft and everything after it. The rewind
+                     * below re-evaluates the last kept token, so the next
+                     * sample sees fresh logits and can exclude stop tokens. */
+                    resample = true;
+                    break;
+                }
                 finish = "stop";
                 stop_detail = "stop token";
                 stop_token = token;
@@ -14309,10 +14349,15 @@ decode_again:
     if (j->req.kind == REQ_CHAT && j->req.has_tools &&
         saw_tool_start && !saw_tool_end && strcmp(finish, "error") != 0)
     {
+        const size_t tail_keep = 160;
+        const size_t tail_off = text.len > tail_keep ? text.len - tail_keep : 0;
         server_log(DS4_LOG_WARNING,
-                   "ds4-server: incomplete %s tool call: stop=%s token=%d generated=%d limit=%d room=%d",
+                   "ds4-server: incomplete %s tool call: stop=%s token=%d generated=%d limit=%d room=%d suppressed=%d tail: %.*s",
                    j->req.model_syntax == SERVER_MODEL_SYNTAX_GLM ? "GLM" : "DeepSeek",
-                   stop_detail, stop_token, completion, max_tokens, room);
+                   stop_detail, stop_token, completion, max_tokens, room,
+                   tool_stop_suppressed,
+                   (int)(text.ptr ? text.len - tail_off : 0),
+                   text.ptr ? text.ptr + tail_off : "");
         trace_event(s, trace_id, "incomplete tool call: stop=%s token=%d generated=%d limit=%d room=%d",
                     stop_detail, stop_token, completion, max_tokens, room);
     }
