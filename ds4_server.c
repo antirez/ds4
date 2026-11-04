@@ -21792,8 +21792,14 @@ static void test_kv_cache_lookup_uses_longest_text_prefix(void) {
 
     const char *short_text = "transcript prefix";
     const char *long_text = "transcript prefix with sampled token bytes";
+    /* Longer than the match but not a prefix, and a match in between: the
+     * single running hash must finalize correctly at every length. */
+    const char *other_text = "transcript prefix with sampled token bytes and another tail";
+    const char *mid_text = "transcript prefix with";
     test_kv_text_stub_file(dir, short_text, KV_REASON_COLD, 512, 0);
     test_kv_text_stub_file(dir, long_text, KV_REASON_COLD, 768, 0);
+    test_kv_text_stub_file(dir, other_text, KV_REASON_COLD, 900, 0);
+    test_kv_text_stub_file(dir, mid_text, KV_REASON_COLD, 600, 0);
 
     kv_disk_cache kc = {0};
     kc.enabled = true;
@@ -21807,20 +21813,19 @@ static void test_kv_cache_lookup_uses_longest_text_prefix(void) {
     TEST_ASSERT(idx >= 0 && kc.entry[idx].tokens == 768);
     TEST_ASSERT(idx >= 0 && kc.entry[idx].text_bytes == strlen(long_text));
     TEST_ASSERT(kv_cache_find_text_prefix(&kc, "transcript prefiX", 2, 32768) < 0);
+    idx = kv_cache_find_text_prefix(&kc, "transcript prefix with sampled", 2, 32768);
+    TEST_ASSERT(idx >= 0 && kc.entry[idx].text_bytes == strlen(mid_text));
 
     kv_cache_close(&kc);
-    char short_sha[41], long_sha[41];
-    sha1_bytes_hex(short_text, strlen(short_text), short_sha);
-    sha1_bytes_hex(long_text, strlen(long_text), long_sha);
-    char short_name[44], long_name[44];
-    snprintf(short_name, sizeof(short_name), "%.40s.kv", short_sha);
-    snprintf(long_name, sizeof(long_name), "%.40s.kv", long_sha);
-    char *short_path = path_join(dir, short_name);
-    char *long_path = path_join(dir, long_name);
-    unlink(short_path);
-    unlink(long_path);
-    free(short_path);
-    free(long_path);
+    const char *texts[] = {short_text, long_text, other_text, mid_text};
+    for (size_t i = 0; i < sizeof(texts) / sizeof(texts[0]); i++) {
+        char sha[41], name[44];
+        sha1_bytes_hex(texts[i], strlen(texts[i]), sha);
+        snprintf(name, sizeof(name), "%.40s.kv", sha);
+        char *path = path_join(dir, name);
+        unlink(path);
+        free(path);
+    }
     rmdir(dir);
 }
 

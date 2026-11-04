@@ -1193,28 +1193,61 @@ bool ds4_kvstore_maybe_store_continued(ds4_kvstore *kc,
     return false;
 }
 
+typedef struct {
+    uint64_t bytes;
+    int idx;
+} kv_text_candidate;
+
+static int kv_text_candidate_cmp(const void *a, const void *b) {
+    const kv_text_candidate *x = a, *y = b;
+    if (x->bytes != y->bytes) return x->bytes < y->bytes ? -1 : 1;
+    return x->idx - y->idx;
+}
+
+/* Find the entry whose text is the longest prefix of prompt_text (more tokens
+ * on ties, then the earlier entry).  Candidates are hashed in order of text
+ * length with one running SHA-1, finalizing a copy at each length, so the
+ * prompt is read once however many checkpoints the directory holds. */
 int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
                                  int model_id, int quant_bits, int ctx_size) {
     if (!prompt_text) return -1;
     const size_t prompt_bytes = strlen(prompt_text);
     kv_cache_refresh(kc);
-    int best = -1;
+    kv_text_candidate *cand = kv_xmalloc((size_t)(kc->len ? kc->len : 1) * sizeof(cand[0]));
+    int n = 0;
     for (int i = 0; i < kc->len; i++) {
         ds4_kvstore_entry *e = &kc->entry[i];
-        if (e->text_bytes > prompt_bytes || e->text_bytes > SIZE_MAX) continue;
+        if (e->text_bytes > prompt_bytes) continue;
         if ((int)e->tokens < kc->opt.min_tokens) continue;
         if (e->model_id != (uint8_t)model_id) continue;
         if ((uint32_t)ctx_size < e->ctx_size) continue;
         if (kc->reject_different_quant && e->quant_bits != (uint8_t)quant_bits) continue;
-        if (best >= 0) {
-            ds4_kvstore_entry *b = &kc->entry[best];
-            if (e->text_bytes < b->text_bytes) continue;
-            if (e->text_bytes == b->text_bytes && e->tokens <= b->tokens) continue;
-        }
-        char sha[41];
-        ds4_kvstore_sha1_bytes_hex(prompt_text, (size_t)e->text_bytes, sha);
-        if (!strcmp(sha, e->sha)) best = i;
+        cand[n++] = (kv_text_candidate){ e->text_bytes, i };
     }
+    qsort(cand, (size_t)n, sizeof(cand[0]), kv_text_candidate_cmp);
+
+    int best = -1;
+    sha1_ctx running;
+    sha1_init(&running);
+    uint64_t hashed = 0;
+    char sha[41] = {0};
+    for (int k = 0; k < n; k++) {
+        const ds4_kvstore_entry *e = &kc->entry[cand[k].idx];
+        if (k == 0 || cand[k].bytes != hashed) {
+            sha1_update(&running, prompt_text + hashed, (size_t)(cand[k].bytes - hashed));
+            hashed = cand[k].bytes;
+            sha1_ctx done = running;
+            uint8_t digest[20];
+            sha1_final(&done, digest);
+            hex20(digest, sha);
+        }
+        if (strcmp(sha, e->sha)) continue;
+        /* Ascending length order: a match is at least as long as best. */
+        if (best >= 0 && e->text_bytes == kc->entry[best].text_bytes &&
+            e->tokens <= kc->entry[best].tokens) continue;
+        best = cand[k].idx;
+    }
+    free(cand);
     return best;
 }
 
