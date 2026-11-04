@@ -35,6 +35,28 @@ __device__ __forceinline__ static int32_t dot_i8_block(const int8_t *a, const in
     return dot;
 }
 
+/*
+ * One Q8_0 decode term, rounded the same way by the standalone and the paired
+ * decode kernels.  The paired kernels must match two standalone dispatches bit
+ * for bit (tests/ds4_test.c, paired Q8_0 exactness), but -ffast-math lets the
+ * compiler reassociate the three-way product differently in each kernel: on
+ * gfx1151 the standalone prequant kernel computed (scale * dot) * xscale and the
+ * paired one scale * (xscale * dot).  The empty asm pins the first product and
+ * fmaf() fixes the accumulation, in the order the standalone kernels already
+ * used, so their results do not change.
+ */
+__device__ __forceinline__ static float q8_0_preq_term_acc(float acc, float scale, int32_t dot, float xscale) {
+    float sd = scale * (float)dot;
+    asm volatile("" : "+v"(sd));
+    return __builtin_fmaf(sd, xscale, acc);
+}
+
+__device__ __forceinline__ static float q8_0_f32_term_acc(float acc, float d, int8_t q, float x) {
+    float dq = (float)q * d;
+    asm volatile("" : "+v"(dq));
+    return __builtin_fmaf(dq, x, acc);
+}
+
 __global__ static void quantize_q8_0_f32_kernel(
         int8_t *xq,
         float *xscale,
@@ -153,7 +175,7 @@ __global__ static void matmul_q8_0_preq_rows_w32_kernel(
         const int8_t *qs = (const int8_t *)(wr + b * 34u + 2u);
         const int8_t *xqb = xq + b * 32u;
         const int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
-        acc += __half2float(*scale_h) * xscale[b] * (float)dot;
+        acc = q8_0_preq_term_acc(acc, __half2float(*scale_h), dot, xscale[b]);
     }
     acc = warp_sum_f32(acc);
     if (lane == 0u) out[row] = acc;
@@ -187,13 +209,13 @@ __global__ static void matmul_q8_0_pair_preq_warp8_kernel(
             const __half *scale_h = (const __half *)(wr0 + b * 34);
             const int8_t *qs = (const int8_t *)(wr0 + b * 34 + 2);
             int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
-            acc0 += __half2float(*scale_h) * xs * (float)dot;
+            acc0 = q8_0_preq_term_acc(acc0, __half2float(*scale_h), dot, xs);
         }
         if (wr1) {
             const __half *scale_h = (const __half *)(wr1 + b * 34);
             const int8_t *qs = (const int8_t *)(wr1 + b * 34 + 2);
             int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
-            acc1 += __half2float(*scale_h) * xs * (float)dot;
+            acc1 = q8_0_preq_term_acc(acc1, __half2float(*scale_h), dot, xs);
         }
     }
     acc0 = warp_sum_f32(acc0);
@@ -335,7 +357,7 @@ __global__ static void matmul_q8_0_f32_warp8_kernel(
             const unsigned char *blk = wr + b * 34u;
             const float d = q8_0_scale_broadcast_w32(blk);
             const int8_t q = ((const int8_t *)(blk + 2u))[lane];
-            acc += d * (float)q * x[i];
+            acc = q8_0_f32_term_acc(acc, d, q, x[i]);
         }
     }
     acc = warp_sum_f32(acc);
@@ -366,7 +388,7 @@ __global__ static void matmul_q8_0_f32_sharedx_warp_rows_w32_kernel(
         const unsigned char *blk = wr + (uint64_t)b * 34u;
         const float d = q8_0_scale_broadcast_w32(blk);
         const int8_t q = ((const int8_t *)(blk + 2u))[lane];
-        acc += d * (float)q * shx[(b << 5u) + lane];
+        acc = q8_0_f32_term_acc(acc, d, q, shx[(b << 5u) + lane]);
     }
     acc = warp_sum_f32(acc);
     if (lane == 0u) out[row] = acc;
@@ -753,13 +775,13 @@ __global__ static void matmul_q8_0_pair_f32_warp8_kernel(
                 const unsigned char *blk = wr0 + b * 34u;
                 const float d = q8_0_scale_broadcast_w32(blk);
                 const int8_t q = ((const int8_t *)(blk + 2u))[lane];
-                acc0 += d * (float)q * x[i];
+                acc0 = q8_0_f32_term_acc(acc0, d, q, x[i]);
             }
             if (wr1) {
                 const unsigned char *blk = wr1 + b * 34u;
                 const float d = q8_0_scale_broadcast_w32(blk);
                 const int8_t q = ((const int8_t *)(blk + 2u))[lane];
-                acc1 += d * (float)q * x[i];
+                acc1 = q8_0_f32_term_acc(acc1, d, q, x[i]);
             }
         }
     }
@@ -802,13 +824,13 @@ __global__ static void matmul_q8_0_pair_f32_sharedx_warp_rows_w32_kernel(
             const unsigned char *blk = wr0 + (uint64_t)b * 34u;
             const float d = q8_0_scale_broadcast_w32(blk);
             const int8_t q = ((const int8_t *)(blk + 2u))[lane];
-            acc0 += d * (float)q * xv;
+            acc0 = q8_0_f32_term_acc(acc0, d, q, xv);
         }
         if (wr1) {
             const unsigned char *blk = wr1 + (uint64_t)b * 34u;
             const float d = q8_0_scale_broadcast_w32(blk);
             const int8_t q = ((const int8_t *)(blk + 2u))[lane];
-            acc1 += d * (float)q * xv;
+            acc1 = q8_0_f32_term_acc(acc1, d, q, xv);
         }
     }
     acc0 = warp_sum_f32(acc0);
