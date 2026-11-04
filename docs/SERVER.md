@@ -24,6 +24,7 @@ relative runtime files such as Metal kernels can be found.
 | Endpoint | Use |
 | --- | --- |
 | `GET /v1/models` | Loaded model information |
+| `GET /v1/status` | Live inference status for monitoring (prefill/decode) |
 | `POST /v1/chat/completions` | OpenAI-style chat |
 | `POST /v1/responses` | Responses-style requests and continuations |
 | `POST /v1/completions` | Text completions |
@@ -50,6 +51,45 @@ For DeepSeek, thinking is on by default. `reasoning_effort=max` selects Think
 Max only with sufficient context; otherwise it falls back to normal thinking.
 `xhigh` maps to normal thinking, not Think Max. Use `think:false`, a disabled
 thinking object, or a non-thinking model alias for direct answers.
+
+## Live status
+
+```sh
+curl http://127.0.0.1:8000/v1/status
+```
+
+Returns a read-only snapshot of what the server is doing right now, intended
+for external monitors (the bundled `menubar/ds4_menubar.py` reads it once a
+second). Prefill progress excludes cached prefix tokens, so `current/total`
+counts the tokens actually being computed in this request.
+
+```json
+{
+  "model": "glm-5.3-flash",
+  "slots": 2,
+  "batched": false,
+  "state": "generating",
+  "waiting": 0,
+  "prefilling": [],
+  "decoding": [
+    {"slot": 0, "tokens": 180, "tps": 61.2, "avg_tps": 59.8, "elapsed": 3.10}
+  ],
+  "totals": {
+    "requests": 12,
+    "prefill_tokens": 40960,
+    "decode_tokens": 2400,
+    "avg_prefill_tps": 819.2,
+    "avg_decode_tps": 60.0
+  }
+}
+```
+
+`state` is `prefilling` while any slot is prefilling, otherwise `generating`
+while any slot is decoding, otherwise `queued` when requests are waiting
+(`waiting` > 0), otherwise `idle`. `prefilling` and `decoding` list every
+active slot with its live interval speed (`tps`) and running average
+(`avg_tps` for decoding). `totals` accumulates requests that reached decode;
+`model` is omitted when no model is loaded.
 
 ## Multiple sessions
 

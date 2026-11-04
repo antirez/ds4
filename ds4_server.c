@@ -38,6 +38,7 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -10026,6 +10027,23 @@ typedef struct {
     bool token_text_disk_key;
 } visible_live_state;
 
+/* Live status phases for GET /v1/status. Both are plain data guarded by
+ * srv->stats_mu; phase structs are copied under that lock, never nested. */
+typedef struct {
+    bool active;
+    int current;      /* display-current: cached prefix excluded */
+    int total;        /* display-total */
+    double tps;       /* live interval speed; display events keep the last */
+    double t0;        /* phase start, seconds via now_sec() */
+} server_stats_prefill_phase;
+
+typedef struct {
+    bool active;
+    int tokens;       /* last reported completion count */
+    double tps;       /* live interval speed */
+    double t0;        /* decode start, seconds via now_sec() */
+} server_stats_decode_phase;
+
 struct server_slot {
     server *srv;
     int id;
@@ -10033,6 +10051,8 @@ struct server_slot {
     live_tool_state responses_live;
     live_tool_state anthropic_live;
     visible_live_state thinking_live;
+    server_stats_prefill_phase stats_prefill;
+    server_stats_decode_phase stats_decode;
     int continued_last_store_tokens;
     /* Wall time of the last completed job on this slot, stamped by the slot
      * worker; drives the staleness tiers in job_slot_score(). */
@@ -10196,6 +10216,16 @@ struct server {
     FILE *trace;
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
+    /* Live status snapshot (GET /v1/status). Update paths take only
+     * stats_mu; the snapshot builder takes stats_mu and then s->mu in
+     * separate critical sections. Totals count requests that reached
+     * decode; prefill failures are not averaged into them. */
+    pthread_mutex_t stats_mu;
+    uint64_t stats_requests;
+    uint64_t stats_prefill_tokens;
+    uint64_t stats_decode_tokens;
+    double stats_prefill_time_s;
+    double stats_decode_time_s;
 };
 
 static void server_inference_lock(server *s) {
@@ -10249,6 +10279,158 @@ static bool job_cancelled(void *ud) {
     pthread_mutex_unlock(&j->mu);
     return cancelled;
 }
+
+
+
+static void server_stats_prefill_update(server *s, server_slot *slot,
+                                        int current, int total, double tps,
+                                        double t0) {
+    if (!s || !slot) return;
+    pthread_mutex_lock(&s->stats_mu);
+    slot->stats_prefill.active = true;
+    slot->stats_prefill.current = current;
+    slot->stats_prefill.total = total;
+    if (tps > 0.0) slot->stats_prefill.tps = tps;
+    slot->stats_prefill.t0 = t0;
+    pthread_mutex_unlock(&s->stats_mu);
+}
+
+static void server_stats_decode_start(server *s, server_slot *slot, double t0) {
+    if (!s || !slot) return;
+    pthread_mutex_lock(&s->stats_mu);
+    slot->stats_prefill.active = false;
+    slot->stats_decode.active = true;
+    slot->stats_decode.tokens = 0;
+    slot->stats_decode.tps = 0.0;
+    slot->stats_decode.t0 = t0;
+    pthread_mutex_unlock(&s->stats_mu);
+}
+
+static void server_stats_decode_update(server *s, server_slot *slot,
+                                       int tokens, double tps, double t0) {
+    if (!s || !slot) return;
+    pthread_mutex_lock(&s->stats_mu);
+    slot->stats_decode.active = true;
+    slot->stats_decode.tokens = tokens;
+    if (tps > 0.0) slot->stats_decode.tps = tps;
+    slot->stats_decode.t0 = t0;
+    pthread_mutex_unlock(&s->stats_mu);
+}
+
+static void server_stats_slot_clear(server *s, server_slot *slot) {
+    if (!s || !slot) return;
+    pthread_mutex_lock(&s->stats_mu);
+    server_stats_prefill_phase cleared_prefill = {0};
+    server_stats_decode_phase cleared_decode = {0};
+    slot->stats_prefill = cleared_prefill;
+    slot->stats_decode = cleared_decode;
+    pthread_mutex_unlock(&s->stats_mu);
+}
+
+static void server_stats_totals_add(server *s, uint64_t prefill_tokens,
+                                    uint64_t decode_tokens,
+                                    double prefill_s, double decode_s) {
+    if (!s) return;
+    pthread_mutex_lock(&s->stats_mu);
+    s->stats_requests++;
+    s->stats_prefill_tokens += prefill_tokens;
+    s->stats_decode_tokens += decode_tokens;
+    s->stats_prefill_time_s += prefill_s > 0.0 ? prefill_s : 0.0;
+    s->stats_decode_time_s += decode_s > 0.0 ? decode_s : 0.0;
+    pthread_mutex_unlock(&s->stats_mu);
+}
+
+/* Snapshot builder for GET /v1/status. Copies the phases under stats_mu,
+ * counts the undispatched queue under s->mu, then renders. */
+static void server_status_json(server *s, buf *b) {
+    if (!s || !b) return;
+    const int slot_count = s->slot_count > 0 ? s->slot_count : 0;
+    server_stats_prefill_phase *prefill = NULL;
+    server_stats_decode_phase *decode = NULL;
+    uint64_t requests = 0;
+    uint64_t prefill_tokens = 0;
+    uint64_t decode_tokens = 0;
+    double prefill_time = 0.0;
+    double decode_time = 0.0;
+    if (slot_count > 0) {
+        prefill = xmalloc((size_t)slot_count * sizeof(*prefill));
+        decode = xmalloc((size_t)slot_count * sizeof(*decode));
+        pthread_mutex_lock(&s->stats_mu);
+        for (int i = 0; i < slot_count; i++) {
+            prefill[i] = s->slots[i].stats_prefill;
+            decode[i] = s->slots[i].stats_decode;
+        }
+        requests = s->stats_requests;
+        prefill_tokens = s->stats_prefill_tokens;
+        decode_tokens = s->stats_decode_tokens;
+        prefill_time = s->stats_prefill_time_s;
+        decode_time = s->stats_decode_time_s;
+        pthread_mutex_unlock(&s->stats_mu);
+    }
+    int waiting = 0;
+    pthread_mutex_lock(&s->mu);
+    for (job *j = s->head; j; j = j->next) waiting++;
+    pthread_mutex_unlock(&s->mu);
+
+    bool any_prefill = false, any_decode = false;
+    for (int i = 0; i < slot_count; i++) {
+        any_prefill |= prefill[i].active;
+        any_decode |= decode[i].active;
+    }
+    const char *state = any_prefill ? "prefilling" :
+                        any_decode ? "generating" :
+                        waiting > 0 ? "queued" : "idle";
+
+    buf_puts(b, "{");
+    if (s->engine) {
+        buf_puts(b, "\"model\":");
+        json_escape(b, server_model_id_from_engine(s->engine));
+        buf_putc(b, ',');
+    }
+    buf_printf(b, "\"slots\":%d,\"batched\":%s,\"state\":\"%s\",\"waiting\":%d,",
+               slot_count, s->batched_mode ? "true" : "false", state, waiting);
+
+    buf_puts(b, "\"prefilling\":[");
+    bool first = true;
+    for (int i = 0; i < slot_count; i++) {
+        if (!prefill[i].active) continue;
+        if (!first) buf_putc(b, ',');
+        first = false;
+        buf_printf(b,
+            "{\"slot\":%d,\"current\":%d,\"total\":%d,\"tps\":%.1f,"
+            "\"elapsed\":%.2f}",
+            i, prefill[i].current, prefill[i].total, prefill[i].tps,
+            now_sec() > prefill[i].t0 && prefill[i].t0 > 0.0 ?
+                now_sec() - prefill[i].t0 : 0.0);
+    }
+    buf_puts(b, "],\"decoding\":[");
+    first = true;
+    for (int i = 0; i < slot_count; i++) {
+        if (!decode[i].active) continue;
+        if (!first) buf_putc(b, ',');
+        first = false;
+        double elapsed = decode[i].t0 > 0.0 && now_sec() > decode[i].t0 ?
+                         now_sec() - decode[i].t0 : 0.0;
+        double avg = elapsed > 0.0 ?
+                     (double)decode[i].tokens / elapsed : 0.0;
+        buf_printf(b,
+            "{\"slot\":%d,\"tokens\":%d,\"tps\":%.1f,\"avg_tps\":%.1f,"
+            "\"elapsed\":%.2f}",
+            i, decode[i].tokens, decode[i].tps, avg, elapsed);
+    }
+    buf_puts(b, "],\"totals\":{");
+    buf_printf(b,
+        "\"requests\":%llu,\"prefill_tokens\":%llu,\"decode_tokens\":%llu,"
+        "\"avg_prefill_tps\":%.1f,\"avg_decode_tps\":%.1f}}",
+        (unsigned long long)requests,
+        (unsigned long long)prefill_tokens,
+        (unsigned long long)decode_tokens,
+        prefill_time > 0.0 ? (double)prefill_tokens / prefill_time : 0.0,
+        decode_time > 0.0 ? (double)decode_tokens / decode_time : 0.0);
+    free(prefill);
+    free(decode);
+}
+
 
 static void job_mark_cancelled(job *j) {
     if (!j) return;
@@ -12726,14 +12908,6 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
             }
         }
     }
-    if (is_display) return;
-    double elapsed = now - p->t0;
-    if (p->seen && current == p->last_current) {
-        if (p->srv && p->slot && current > p->cached_tokens) {
-            kv_cache_maybe_store_continued(p->srv, p->slot);
-        }
-        return;
-    }
     int display_start = p->cached_tokens;
     if (display_start < 0 || display_start > p->prompt_tokens) display_start = 0;
     int display_total = p->prompt_tokens - display_start;
@@ -12744,6 +12918,24 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     int display_current = current - display_start;
     if (display_current < 0) display_current = 0;
     if (display_current > display_total) display_current = display_total;
+    /* Live status feed: chunk events refine the interval speed; display
+     * events (which return below) carry coarse numbers without wiping it. */
+    if (p->srv && p->slot) {
+        double live_tps = is_chunk && p->seen && now > p->last_t &&
+                          current > p->last_current ?
+                          (double)(current - p->last_current) /
+                          (now - p->last_t) : 0.0;
+        server_stats_prefill_update(p->srv, p->slot, display_current,
+                                    display_total, live_tps, p->t0);
+    }
+    if (is_display) return;
+    double elapsed = now - p->t0;
+    if (p->seen && current == p->last_current) {
+        if (p->srv && p->slot && current > p->cached_tokens) {
+            kv_cache_maybe_store_continued(p->srv, p->slot);
+        }
+        return;
+    }
     double pct = display_total > 0 ? 100.0 * (double)display_current / (double)display_total : 100.0;
     double avg_tps = elapsed > 0.0 ? (double)display_current / elapsed : 0.0;
     int interval_tokens = p->seen ? current - p->last_current : 0;
@@ -13919,6 +14111,9 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
 
     bool dsml_recovery_attempted = false;
     int recovery_completion = 0;
+    /* Wall time of the first decode frontier: recovery re-entries reset
+     * decode_t0, so the prefill duration must be captured once. */
+    double prefill_elapsed_s = 0.0;
     uint64_t rng = j->req.seed;
     if (!rng && !random_bytes(&rng, sizeof(rng))) {
         rng = ((uint64_t)time(NULL) << 32) ^ (uint64_t)(uintptr_t)j;
@@ -13945,6 +14140,8 @@ decode_again:
     int stop_token = -1;
     trace_event(s, trace_id, "prefill done; decode_max=%d ctx_room=%d", max_tokens, room);
     const double decode_t0 = now_sec();
+    if (prefill_elapsed_s <= 0.0) prefill_elapsed_s = decode_t0 - t0;
+    server_stats_decode_start(s, slot, decode_t0);
     double last_decode_log_t = decode_t0;
     int last_decode_log_completion = 0;
     thinking_state thinking = thinking_state_from_prompt(&j->req);
@@ -14228,6 +14425,12 @@ decode_again:
             }
 
             if (completion >= next_decode_log) {
+                server_stats_decode_update(s, slot, completion,
+                    now_sec() > last_decode_log_t &&
+                    completion > last_decode_log_completion ?
+                    (double)(completion - last_decode_log_completion) /
+                    (now_sec() - last_decode_log_t) : 0.0,
+                    decode_t0);
                 log_decode_progress(j->req.kind, prompt_tokens, completion,
                                     responses_protocol,
                                     j->req.has_tools,
@@ -14397,6 +14600,12 @@ decode_again:
     }
 
     if (completion > last_decode_log_completion) {
+        server_stats_decode_update(s, slot, completion,
+            now_sec() > last_decode_log_t &&
+            completion > last_decode_log_completion ?
+            (double)(completion - last_decode_log_completion) /
+            (now_sec() - last_decode_log_t) : 0.0,
+            decode_t0);
         log_decode_progress(j->req.kind, prompt_tokens, completion,
                             responses_protocol,
                             j->req.has_tools,
@@ -14566,6 +14775,9 @@ decode_again:
                            responses_protocol);
 
     completion += recovery_completion;
+    server_stats_totals_add(s, (uint64_t)j->req.cache_write_tokens,
+                            (uint64_t)completion, prefill_elapsed_s,
+                            now_sec() - decode_t0);
     trace_finish(s, trace_id, &j->req, final_finish, completion,
                  saw_tool_start, saw_tool_end,
                  parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
@@ -14780,6 +14992,10 @@ static void generate_job(server *s, server_slot *slot, job *j) {
 
     ds4_session_set_cancel(slot->session, job_cancelled, j);
     if (!job_cancelled(j)) generate_job_inner(s, slot, j);
+    /* Clear both live phases whatever the inner path did: early error
+     * returns never reach the decode frontier, and a stale phase would
+     * keep the menubar showing prefill forever. */
+    server_stats_slot_clear(s, slot);
     ds4_session_set_cancel(slot->session, NULL, NULL);
 
     pthread_mutex_lock(&s->model_mu);
@@ -15328,6 +15544,16 @@ static void *client_main(void *arg) {
         http_request_free(&hr);
         goto done;
     }
+    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/status")) {
+        buf status = {0};
+        server_status_json(s, &status);
+        buf_putc(&status, '\n');
+        (void)http_response(fd, s->enable_cors, 200, "application/json",
+                            status.ptr);
+        buf_free(&status);
+        http_request_free(&hr);
+        goto done;
+    }
     const char *model_path_prefix = "/v1/models/";
     const size_t model_path_prefix_len = strlen(model_path_prefix);
     if (!strcmp(hr.method, "GET") &&
@@ -15429,6 +15655,73 @@ static int listen_on(const char *host, int port) {
     return fd;
 }
 
+/* --menubar: spawn the macOS menu bar sidecar (menubar/ds4_menubar.py) as
+ * a companion process, found in the working directory like the Metal
+ * kernels (--chdir also works).  Best-effort: without python3 or PyObjC
+ * the server prints a hint and runs unchanged.  The sidecar watches
+ * --parent and exits when the server goes away; menubar_sidecar_stop()
+ * also terminates it on shutdown so the icon disappears with the server. */
+#define MENUBAR_SIDECAR_SCRIPT "menubar/ds4_menubar.py"
+
+static pid_t menubar_sidecar_spawn(int port) {
+    if (access(MENUBAR_SIDECAR_SCRIPT, R_OK) != 0) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: --menubar skipped: %s not readable; run from the ds4 repo directory or pass --chdir",
+                   MENUBAR_SIDECAR_SCRIPT);
+        return -1;
+    }
+    const pid_t parent = getpid();
+    pid_t pid = fork();
+    if (pid < 0) {
+        server_log(DS4_LOG_DEFAULT, "ds4-server: --menubar fork failed: %s",
+                   strerror(errno));
+        return -1;
+    }
+    if (pid == 0) {
+        char port_arg[16], parent_arg[16];
+        snprintf(port_arg, sizeof(port_arg), "%d", port);
+        snprintf(parent_arg, sizeof(parent_arg), "%d", (int)parent);
+        if (!getenv("DS4_MENUBAR_DEBUG")) {
+            int devnull = open("/dev/null", O_WRONLY);
+            if (devnull >= 0) {
+                dup2(devnull, STDOUT_FILENO);
+                dup2(devnull, STDERR_FILENO);
+                if (devnull > STDERR_FILENO) close(devnull);
+            }
+        }
+        execlp("python3", "python3", MENUBAR_SIDECAR_SCRIPT,
+               "--port", port_arg, "--parent", parent_arg, (char *)NULL);
+        _exit(127);
+    }
+    /* Catch an immediate child death (missing python3 or PyObjC, or a
+     * previous sidecar still holding the PID file) so the hint surfaces in
+     * the server log instead of leaving the user staring at a menu bar
+     * with no icon. */
+    usleep(300000);
+    int status = 0;
+    if (waitpid(pid, &status, WNOHANG) == pid) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: --menubar sidecar exited immediately; check python3 and PyObjC (pip install pyobjc-framework-Cocoa), or an existing instance (menubar/README.md)");
+        return -1;
+    }
+    server_log(DS4_LOG_DEFAULT, "ds4-server: menubar sidecar spawned pid=%d",
+               (int)pid);
+    return pid;
+}
+
+static void menubar_sidecar_stop(pid_t pid) {
+    if (pid <= 0) return;
+    int status = 0;
+    if (waitpid(pid, &status, WNOHANG) == pid) return;
+    kill(pid, SIGTERM);
+    for (int i = 0; i < 10; i++) {
+        usleep(100000);
+        if (waitpid(pid, &status, WNOHANG) == pid) return;
+    }
+    kill(pid, SIGKILL);
+    waitpid(pid, &status, 0);
+}
+
 static void configure_client_socket(int fd) {
     struct timeval tv;
     tv.tv_sec = DS4_SERVER_IO_TIMEOUT_SEC;
@@ -15464,6 +15757,7 @@ typedef struct {
     bool enable_cors;
     int batched_sessions;
     int mixed_prefill_quantum;
+    bool menubar;
 } server_config;
 
 static int parse_int_arg(const char *s, const char *opt) {
@@ -15558,6 +15852,7 @@ static void server_close_resources(server *s) {
     pthread_mutex_destroy(&s->inference_mu);
     pthread_mutex_destroy(&s->model_mu);
     pthread_mutex_destroy(&s->trace_mu);
+    pthread_mutex_destroy(&s->stats_mu);
     pthread_cond_destroy(&s->model_cv);
     pthread_cond_destroy(&s->clients_cv);
     pthread_cond_destroy(&s->cv);
@@ -15701,6 +15996,10 @@ static server_config parse_options(int argc, char **argv) {
             c.port = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--cors")) {
             c.enable_cors = true;
+        } else if (!strcmp(arg, "--menubar")) {
+            c.menubar = true;
+        } else if (!strcmp(arg, "--no-menubar")) {
+            c.menubar = false;
         } else if (!strcmp(arg, "--trace")) {
             c.trace_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--batched-session")) {
@@ -16004,6 +16303,7 @@ int main(int argc, char **argv) {
     pthread_mutex_init(&s.model_mu, NULL);
     pthread_cond_init(&s.model_cv, NULL);
     pthread_mutex_init(&s.trace_mu, NULL);
+    pthread_mutex_init(&s.stats_mu, NULL);
 
     for (int i = 0; i < slot_count; i++) {
         server_slot *slot = &s.slots[i];
@@ -16102,6 +16402,8 @@ int main(int argc, char **argv) {
     g_listen_fd = lfd;
     server_log(DS4_LOG_DEFAULT, "ds4-server: listening on http://%s:%d", cfg.host, cfg.port);
 
+    pid_t menubar_pid = cfg.menubar ? menubar_sidecar_spawn(cfg.port) : -1;
+
     while (!g_stop_requested) {
         int fd = accept(lfd, NULL, NULL);
         if (fd < 0) {
@@ -16138,6 +16440,7 @@ int main(int argc, char **argv) {
         close(lfd);
         g_listen_fd = -1;
     }
+    menubar_sidecar_stop(menubar_pid);
 
     server_log(DS4_LOG_DEFAULT, "ds4-server: shutdown requested, draining requests");
     server_request_worker_stop(&s);
@@ -16223,6 +16526,18 @@ static void test_mixed_prefill_quantum_option(void) {
     TEST_ASSERT(server_prefill_quantum_for(&s, true) == 2048);
     s.mixed_prefill_quantum = defaults.mixed_prefill_quantum;
     TEST_ASSERT(server_prefill_quantum_for(&s, true) == 128);
+}
+
+static void test_menubar_option(void) {
+    char *default_argv[] = {"ds4-server"};
+    TEST_ASSERT(parse_options(1, default_argv).menubar == false);
+
+    char *on_argv[] = {"ds4-server", "--menubar"};
+    TEST_ASSERT(parse_options(2, on_argv).menubar == true);
+
+    /* Last flag wins, so an alias or wrapper can undo the default. */
+    char *off_argv[] = {"ds4-server", "--menubar", "--no-menubar"};
+    TEST_ASSERT(parse_options(3, off_argv).menubar == false);
 }
 
 /* Reuse-aware slot routing: the probe must recognize every way a request
@@ -23014,7 +23329,185 @@ static void test_deepseek41_live_result_order(void) {
     pthread_mutex_destroy(&s.tool_mu);
 }
 
+
+static void test_server_status_json_idle_snapshot(void) {
+    server s = {0};
+    server_slot slots[2] = {0};
+    s.slots = slots;
+    s.slot_count = 2;
+    pthread_mutex_init(&s.mu, NULL);
+    pthread_mutex_init(&s.stats_mu, NULL);
+
+    buf b = {0};
+    server_status_json(&s, &b);
+    TEST_ASSERT(b.ptr != NULL);
+    /* Full-string equality: catches brace imbalance that substring checks
+     * would miss (this contract is parsed by external JSON clients). */
+    TEST_ASSERT(strcmp(b.ptr,
+        "{\"slots\":2,\"batched\":false,\"state\":\"idle\",\"waiting\":0,"
+        "\"prefilling\":[],\"decoding\":[],"
+        "\"totals\":{\"requests\":0,\"prefill_tokens\":0,\"decode_tokens\":0,"
+        "\"avg_prefill_tps\":0.0,\"avg_decode_tps\":0.0}}") == 0);
+    buf_free(&b);
+
+    s.batched_mode = true;
+    buf c = {0};
+    server_status_json(&s, &c);
+    TEST_ASSERT(strstr(c.ptr, "\"batched\":true") != NULL);
+    buf_free(&c);
+
+    pthread_mutex_destroy(&s.mu);
+    pthread_mutex_destroy(&s.stats_mu);
+}
+
+static void test_server_status_json_active_phases(void) {
+    server s = {0};
+    server_slot slots[2] = {0};
+    s.slots = slots;
+    s.slot_count = 2;
+    pthread_mutex_init(&s.mu, NULL);
+    pthread_mutex_init(&s.stats_mu, NULL);
+
+    /* Prefill in flight on slot 0: display semantics exclude the cached
+     * prefix, and the live tps is the latest reported interval. */
+    server_stats_prefill_update(&s, &slots[0], 512, 4096, 812.0,
+                                now_sec() - 0.5);
+    buf b = {0};
+    server_status_json(&s, &b);
+    TEST_ASSERT(strstr(b.ptr, "\"state\":\"prefilling\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr,
+        "\"prefilling\":[{\"slot\":0,\"current\":512,\"total\":4096,"
+        "\"tps\":812.0,\"elapsed\":") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"decoding\":[]") != NULL);
+    buf_free(&b);
+
+    /* Display-only events carry coarse numbers and must not wipe the live
+     * interval speed recorded by the previous chunk event. */
+    server_stats_prefill_update(&s, &slots[0], 600, 4096, 0.0,
+                                now_sec() - 0.5);
+    buf c = {0};
+    server_status_json(&s, &c);
+    TEST_ASSERT(strstr(c.ptr, "\"current\":600") != NULL);
+    TEST_ASSERT(strstr(c.ptr, "\"tps\":812.0") != NULL);
+    buf_free(&c);
+
+    /* Decode starts after prefill: the prefill phase clears and the decode
+     * phase reports tokens, live interval tps, and the running average. */
+    server_stats_decode_start(&s, &slots[0], now_sec() - 3.0);
+    server_stats_decode_update(&s, &slots[0], 180, 61.2, now_sec() - 3.0);
+    buf d = {0};
+    server_status_json(&s, &d);
+    TEST_ASSERT(strstr(d.ptr, "\"state\":\"generating\"") != NULL);
+    TEST_ASSERT(strstr(d.ptr, "\"prefilling\":[]") != NULL);
+    TEST_ASSERT(strstr(d.ptr,
+        "\"decoding\":[{\"slot\":0,\"tokens\":180,\"tps\":61.2,"
+        "\"avg_tps\":") != NULL);
+    buf_free(&d);
+
+    /* Mixed: an active prefill outranks an active decode, matching the
+     * menubar priority order. */
+    server_stats_prefill_update(&s, &slots[1], 100, 200, 400.0,
+                                now_sec() - 0.1);
+    buf e = {0};
+    server_status_json(&s, &e);
+    TEST_ASSERT(strstr(e.ptr, "\"state\":\"prefilling\"") != NULL);
+    TEST_ASSERT(strstr(e.ptr,
+        "\"decoding\":[{\"slot\":0,\"tokens\":180,\"tps\":61.2,\"avg_tps\":") != NULL);
+    buf_free(&e);
+
+    /* Cleared phases fall back to idle. */
+    server_stats_slot_clear(&s, &slots[0]);
+    server_stats_slot_clear(&s, &slots[1]);
+    buf f = {0};
+    server_status_json(&s, &f);
+    TEST_ASSERT(strstr(f.ptr, "\"state\":\"idle\"") != NULL);
+    TEST_ASSERT(strstr(f.ptr, "\"prefilling\":[]") != NULL);
+    TEST_ASSERT(strstr(f.ptr, "\"decoding\":[]") != NULL);
+    buf_free(&f);
+
+    pthread_mutex_destroy(&s.mu);
+    pthread_mutex_destroy(&s.stats_mu);
+}
+
+static void test_server_status_waiting_queue_state(void) {
+    server s = {0};
+    server_slot slots[2] = {0};
+    s.slots = slots;
+    s.slot_count = 2;
+    pthread_mutex_init(&s.mu, NULL);
+    pthread_mutex_init(&s.stats_mu, NULL);
+
+    job j1, j2;
+    memset(&j1, 0, sizeof(j1));
+    memset(&j2, 0, sizeof(j2));
+    j1.next = &j2;
+    s.head = &j1;
+    s.tail = &j2;
+
+    buf b = {0};
+    server_status_json(&s, &b);
+    TEST_ASSERT(strstr(b.ptr, "\"waiting\":2") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"state\":\"queued\"") != NULL);
+    buf_free(&b);
+
+    /* Queued outranks idle but loses to live phases. */
+    server_stats_decode_start(&s, &slots[0], now_sec());
+    buf c = {0};
+    server_status_json(&s, &c);
+    TEST_ASSERT(strstr(c.ptr, "\"state\":\"generating\"") != NULL);
+    TEST_ASSERT(strstr(c.ptr, "\"waiting\":2") != NULL);
+    buf_free(&c);
+
+    s.head = NULL;
+    s.tail = NULL;
+
+    pthread_mutex_destroy(&s.mu);
+    pthread_mutex_destroy(&s.stats_mu);
+}
+
+static void test_server_status_totals_accumulation(void) {
+    server s = {0};
+    server_slot slots[2] = {0};
+    s.slots = slots;
+    s.slot_count = 2;
+    pthread_mutex_init(&s.mu, NULL);
+    pthread_mutex_init(&s.stats_mu, NULL);
+
+    server_stats_totals_add(&s, 20480, 1200, 25.0, 20.0);
+    server_stats_totals_add(&s, 1024, 600, 2.0, 10.0);
+
+    buf b = {0};
+    server_status_json(&s, &b);
+    /* Cumulative averages over both adds: prefill 21504/27 = 796.4,
+     * decode 1800/30 = 60.0. Full-string equality keeps the whole contract
+     * (including brace balance) under test. */
+    TEST_ASSERT(strcmp(b.ptr,
+        "{\"slots\":2,\"batched\":false,\"state\":\"idle\",\"waiting\":0,"
+        "\"prefilling\":[],\"decoding\":[],"
+        "\"totals\":{\"requests\":2,\"prefill_tokens\":21504,"
+        "\"decode_tokens\":1800,\"avg_prefill_tps\":796.4,"
+        "\"avg_decode_tps\":60.0}}") == 0);
+    buf_free(&b);
+
+    /* Zero-time windows keep the averages at zero instead of dividing. */
+    server_stats_totals_add(&s, 100, 100, 0.0, 0.0);
+    buf c = {0};
+    server_status_json(&s, &c);
+    /* 21604/27 = 800.1, 1900/30 = 63.3: zero-time windows add tokens
+     * without extending the time base. */
+    TEST_ASSERT(strstr(c.ptr, "\"avg_prefill_tps\":800.1") != NULL);
+    TEST_ASSERT(strstr(c.ptr, "\"avg_decode_tps\":63.3") != NULL);
+    buf_free(&c);
+
+    pthread_mutex_destroy(&s.mu);
+    pthread_mutex_destroy(&s.stats_mu);
+}
+
 static void ds4_server_unit_tests_run(void) {
+    test_server_status_json_idle_snapshot();
+    test_server_status_json_active_phases();
+    test_server_status_waiting_queue_state();
+    test_server_status_totals_accumulation();
     test_deepseek41_server_stream();
     test_deepseek41_server_tools();
     test_deepseek41_anthropic_results();
@@ -23025,6 +23518,7 @@ static void ds4_server_unit_tests_run(void) {
     test_server_image_embedding_cache();
     test_batched_prefill_round_robin();
     test_mixed_prefill_quantum_option();
+    test_menubar_option();
     test_multimodal_prefill_resume_frontier();
     test_batched_live_continuation_slot_binding();
     test_live_continuation_contract();
