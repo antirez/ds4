@@ -813,11 +813,56 @@ static void test_dspark_tp_split_reserve(void) {
     g_ds4_shape = saved_shape;
 }
 
+/* A text-only tool conversation has no image state on either side, so the
+ * vision checks have nothing to compare.  The terminal rewind invalidates the
+ * KV checkpoint, and the client's following request carries only the tool
+ * output -- which is the shape that must still be served.  Gate these on
+ * checkpoint_valid and the continuation is refused with a 409 even though the
+ * history it replays is correct. */
+static void test_text_only_continuation_after_rewind(void) {
+    ds4_engine e = { .backend = DS4_BACKEND_CPU };
+    ds4_session *s = calloc(1, sizeof(*s));
+    assert(s);
+    s->engine = &e;
+    s->ctx_size = 1024;
+    for (int i = 0; i < 260; i++) ds4_tokens_push(&s->checkpoint, i);
+    s->checkpoint_valid = true;
+    assert(s->checkpoint_image_count == 0);
+    assert(ds4_session_rebase_vision_state(s, NULL, 0));
+    assert(ds4_session_vision_prefix_matches(s, NULL, 0));
+
+    ds4_session_rewind(s, 128);
+    assert(!s->checkpoint_valid);
+    assert(s->checkpoint_image_count == 0);
+    assert(ds4_session_rebase_vision_state(s, NULL, 0));
+    assert(ds4_session_vision_prefix_matches(s, NULL, 0));
+
+    /* The zero-image shortcut must not weaken the guard: a checkpoint that does
+     * hold an image still refuses a request that supplies none. */
+    ds4_vision_identity stored = {
+        .token_start = 200, .token_count = 4, .fingerprint = {7}};
+    s->checkpoint_images = &stored;
+    s->checkpoint_image_count = 1;
+    assert(!ds4_session_rebase_vision_state(s, NULL, 0));
+    assert(!ds4_session_vision_prefix_matches(s, NULL, 0));
+
+    /* ...and a request that supplies one is still gated on the checkpoint. */
+    ds4_vision_span span = {
+        .token_start = 0, .embedding = {.token_count = 4, .fingerprint = {7}}};
+    assert(!ds4_session_rebase_vision_state(s, &span, 1));
+    assert(!ds4_session_vision_prefix_matches(s, &span, 1));
+
+    s->checkpoint_images = NULL;
+    s->checkpoint_image_count = 0;
+    ds4_session_free(s);
+}
+
 int main(void) {
     test_dspark_tp_verify_flags();
     test_dspark_tp_split_reserve();
     test_vision_prefix();
     test_vision_fingerprint_prefix();
+    test_text_only_continuation_after_rewind();
     test_rewind();
     test_session_memory();
     test_payload_tokens();

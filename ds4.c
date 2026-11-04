@@ -78467,8 +78467,16 @@ bool ds4_session_vision_prefix_matches(
         const ds4_vision_span *images,
         size_t                 image_count) {
     if (!s || (image_count != 0 && !images)) return false;
-    if (!s->checkpoint_valid) return false;
     if (s->checkpoint_image_count > image_count) return false;
+    /* Neither side carries an image, so there is no vision state to compare and
+     * nothing to read out of the checkpoint.  Answer before the checkpoint_valid
+     * gate: that flag reports that the KV checkpoint cannot be rolled back,
+     * which is not a reason to reject a text-only continuation.  A rewind over a
+     * tool conversation produces exactly this session -- text only, checkpoint
+     * invalidated -- and the continuation must still be served, so the gate
+     * would otherwise turn a correct history into a 409. */
+    if (image_count == 0) return true;
+    if (!s->checkpoint_valid) return false;
     for (size_t i = 0; i < s->checkpoint_image_count; i++) {
         const ds4_vision_identity *old = &s->checkpoint_images[i];
         const ds4_vision_span *current = &images[i];
@@ -78512,8 +78520,13 @@ bool ds4_session_vision_fingerprint_prefix_matches(
 
 bool ds4_session_rebase_vision_state(const ds4_session *s,
                                      ds4_vision_span *images, size_t image_count) {
-    if (!s || !s->checkpoint_valid || (image_count && !images) ||
+    if (!s || (image_count && !images) ||
         image_count != s->checkpoint_image_count) return false;
+    /* Nothing to rebase when neither side has an image; see the note in
+     * ds4_session_vision_prefix_matches for why checkpoint_valid must not
+     * reject this case. */
+    if (image_count == 0) return true;
+    if (!s->checkpoint_valid) return false;
     for (size_t i = 0; i < image_count; i++) {
         if (images[i].embedding.token_count != s->checkpoint_images[i].token_count ||
             memcmp(images[i].embedding.fingerprint, s->checkpoint_images[i].fingerprint,
