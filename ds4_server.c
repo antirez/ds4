@@ -5795,11 +5795,43 @@ static bool send_all(int fd, const void *p, size_t n) {
     return true;
 }
 
-static void json_escape(buf *b, const char *s) {
-    buf_putc(b, '"');
-    for (; *s; s++) {
-        unsigned char c = (unsigned char)*s;
-        if (c == '"' || c == '\\') {
+/* Scan one UTF-8 character at s[0..n) and return how many bytes it uses.
+ * *valid is false for an ill-formed or truncated sequence; the returned
+ * length is then its maximal ill-formed subpart (Unicode 3.9), which callers
+ * replace with a single U+FFFD, like Python and browsers do. */
+static size_t utf8_scan_char(const unsigned char *s, size_t n, bool *valid) {
+    size_t len = (size_t)utf8_expected_len(s[0]);
+    unsigned char lo = 0x80, hi = 0xbf;
+    if (s[0] == 0xe0) lo = 0xa0;        /* overlong */
+    else if (s[0] == 0xed) hi = 0x9f;   /* UTF-16 surrogate */
+    else if (s[0] == 0xf0) lo = 0x90;   /* overlong */
+    else if (s[0] == 0xf4) hi = 0x8f;   /* above U+10FFFF */
+
+    *valid = len > 1 || s[0] < 0x80;
+    for (size_t i = 1; i < len; i++) {
+        if (i >= n || s[i] < lo || s[i] > hi) {
+            *valid = false;
+            return i;
+        }
+        lo = 0x80;
+        hi = 0xbf;
+    }
+    return len;
+}
+
+/* Model tokens are raw bytes and may not be valid UTF-8: max_tokens can cut a
+ * character in half, and a model can emit stray bytes.  JSON must be valid
+ * UTF-8, so ill-formed sequences become U+FFFD; valid text is copied as is. */
+static void json_escape_fragment_n(buf *b, const char *s, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c >= 0x80) {
+            bool valid;
+            size_t len = utf8_scan_char((const unsigned char *)s + i, n - i, &valid);
+            if (valid) buf_append(b, s + i, len);
+            else buf_puts(b, "\xef\xbf\xbd");
+            i += len - 1;
+        } else if (c == '"' || c == '\\') {
             buf_putc(b, '\\');
             buf_putc(b, (char)c);
         } else if (c == '\n') {
@@ -5814,6 +5846,11 @@ static void json_escape(buf *b, const char *s) {
             buf_putc(b, (char)c);
         }
     }
+}
+
+static void json_escape(buf *b, const char *s) {
+    buf_putc(b, '"');
+    json_escape_fragment_n(b, s, strlen(s));
     buf_putc(b, '"');
 }
 
@@ -5821,26 +5858,6 @@ static void json_escape_n(buf *b, const char *s, size_t n) {
     char *tmp = xstrndup(s ? s : "", n);
     json_escape(b, tmp);
     free(tmp);
-}
-
-static void json_escape_fragment_n(buf *b, const char *s, size_t n) {
-    for (size_t i = 0; i < n; i++) {
-        unsigned char c = (unsigned char)s[i];
-        if (c == '"' || c == '\\') {
-            buf_putc(b, '\\');
-            buf_putc(b, (char)c);
-        } else if (c == '\n') {
-            buf_puts(b, "\\n");
-        } else if (c == '\r') {
-            buf_puts(b, "\\r");
-        } else if (c == '\t') {
-            buf_puts(b, "\\t");
-        } else if (c < 0x20) {
-            buf_printf(b, "\\u%04x", (unsigned)c);
-        } else {
-            buf_putc(b, (char)c);
-        }
-    }
 }
 
 #define DS4_DSML "｜DSML｜"
@@ -21114,6 +21131,28 @@ static void test_json_string_handles_surrogates(void) {
     free(s);
 }
 
+static void test_json_escape_replaces_invalid_utf8(void) {
+#define RP "\xef\xbf\xbd"
+    static const struct { const char *in, *want; } cases[] = {
+        {"caff\xc3\xa8 \xe2\x82\xac \xf0\x9f\x9a\xa9", /* valid: unchanged */
+         "\"caff\xc3\xa8 \xe2\x82\xac \xf0\x9f\x9a\xa9\""},
+        {"cut \xe2\x80", "\"cut " RP "\""},         /* max_tokens mid-char */
+        {"a\xe2(b", "\"a" RP "(b\""},               /* lead, no continuation */
+        {"\x80\xbf", "\"" RP RP "\""},              /* stray continuations */
+        {"\xc0\xaf", "\"" RP RP "\""},              /* overlong */
+        {"\xed\xa0\x80", "\"" RP RP RP "\""},       /* UTF-16 surrogate */
+        {"\xf4\x90\x80\x80", "\"" RP RP RP RP "\""}, /* above U+10FFFF */
+        {"\xf0\x9f\x9a", "\"" RP "\""},             /* truncated 4-byte */
+    };
+#undef RP
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        buf b = {0};
+        json_escape(&b, cases[i].in);
+        TEST_ASSERT(b.ptr && !strcmp(b.ptr, cases[i].want));
+        buf_free(&b);
+    }
+}
+
 static void test_json_int_handles_non_finite_values(void) {
     const char *p = "NaN";
     int value = -1;
@@ -23150,6 +23189,7 @@ static void ds4_server_unit_tests_run(void) {
     test_request_parsers_reject_malformed_duplicate_owned_fields();
     test_json_parser_handles_tool_heavy_requests();
     test_json_string_handles_surrogates();
+    test_json_escape_replaces_invalid_utf8();
     test_json_int_handles_non_finite_values();
     test_tool_history_validation_handles_large_replays();
     test_model_metadata_clamps_completion_to_context();
