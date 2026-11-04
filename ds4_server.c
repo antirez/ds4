@@ -18240,6 +18240,117 @@ static void test_reasoning_effort_mapping(void) {
                                            (int)ds4_think_max_min_context()) == DS4_THINK_MAX);
 }
 
+/* Think mode a request resolves to.  kind 0 is OpenAI reasoning_effort, 1 is
+ * chat_template_kwargs, 2 is Anthropic output_config (plus an optional
+ * thinking control), 3 is Responses reasoning.  Mirrors the request parsers. */
+static ds4_think_mode glm_effort_request_mode(int kind, const char *json,
+                                              const char *thinking_json) {
+    bool enabled = true;
+    bool got_thinking = false;
+    ds4_think_mode effort = DS4_THINK_HIGH;
+    const char *p = json;
+    bool ok = true;
+    if (thinking_json) {
+        const char *t = thinking_json;
+        ok = parse_thinking_control_value(&t, &enabled);
+    }
+    if (ok && kind == 0) ok = parse_reasoning_effort_value(&p, &effort);
+    if (ok && kind == 1) ok = parse_chat_template_kwargs(&p, &enabled, &got_thinking, &effort);
+    if (ok && kind == 2) ok = parse_output_config_effort(&p, &effort);
+    if (ok && kind == 3) {
+        bool summary = false, seen = false;
+        ok = parse_responses_reasoning(&p, &effort, &summary, &seen);
+        if (ok && seen && effort == DS4_THINK_NONE) enabled = false;
+    }
+    TEST_ASSERT(ok);
+    return ds4_think_mode_for_context(think_mode_from_enabled(enabled, effort),
+                                      (int)ds4_think_max_min_context());
+}
+
+static void test_glm_reasoning_effort_levels(void) {
+    const ds4_think_mode modes[] = {DS4_THINK_LOW, DS4_THINK_MEDIUM, DS4_THINK_HIGH,
+                                    DS4_THINK_MAX, DS4_THINK_NONE};
+    /* Templates that accept low (GLM 5.3): low and high render as such; ds4 keeps medium at high. */
+    const char *glm53[] = {"Reasoning Effort: Low", "Reasoning Effort: High",
+                           "Reasoning Effort: High", "Reasoning Effort: Max", NULL};
+    /* Templates without low (GLM 5.2): low and medium share the high text. */
+    const char *glm52[] = {"Reasoning Effort: High", "Reasoning Effort: High",
+                           "Reasoning Effort: High", "Reasoning Effort: Max", NULL};
+    for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); i++) {
+        const char *a = ds4_glm_reasoning_effort_text_for_template(true, modes[i]);
+        const char *b = ds4_glm_reasoning_effort_text_for_template(false, modes[i]);
+        TEST_ASSERT(glm53[i] ? a && !strcmp(a, glm53[i]) : a == NULL);
+        TEST_ASSERT(glm52[i] ? b && !strcmp(b, glm52[i]) : b == NULL);
+    }
+    /* With no GLM model loaded the model-wide lookup takes the 5.2 mapping. */
+    TEST_ASSERT(!strcmp(ds4_glm_reasoning_effort_text(DS4_THINK_LOW), "Reasoning Effort: High"));
+
+    /* Every request form that names an effort, with a low-capable template. */
+    const struct { int kind; const char *json; const char *thinking; const char *text; } cases[] = {
+        {0, "\"low\"",     NULL, "Reasoning Effort: Low"},
+        {0, "\"minimal\"", NULL, "Reasoning Effort: Low"},
+        {0, "\"medium\"",  NULL, "Reasoning Effort: High"},
+        {0, "\"high\"",    NULL, "Reasoning Effort: High"},
+        {0, "\"xhigh\"",   NULL, "Reasoning Effort: High"},
+        {0, "\"max\"",     NULL, "Reasoning Effort: Max"},
+        {0, "null",        NULL, "Reasoning Effort: High"},
+        {0, "\"none\"",    NULL, NULL},
+        {1, "{\"reasoning_effort\":\"low\"}",    NULL, "Reasoning Effort: Low"},
+        {1, "{\"reasoning_effort\":\"medium\"}", NULL, "Reasoning Effort: High"},
+        {1, "{\"enable_thinking\":false,\"reasoning_effort\":\"low\"}", NULL, NULL},
+        {2, "{\"effort\":\"low\"}",    NULL, "Reasoning Effort: Low"},
+        {2, "{\"effort\":\"medium\"}", NULL, "Reasoning Effort: High"},
+        {2, "{\"effort\":\"high\"}",   NULL, "Reasoning Effort: High"},
+        {2, "{\"effort\":\"max\"}",    NULL, "Reasoning Effort: Max"},
+        {2, "{}", "{\"type\":\"enabled\",\"budget_tokens\":1024}", "Reasoning Effort: High"},
+        {2, "{\"effort\":\"low\"}", "{\"type\":\"disabled\"}", NULL},
+        {3, "{\"effort\":\"low\"}",    NULL, "Reasoning Effort: Low"},
+        {3, "{\"effort\":\"medium\"}", NULL, "Reasoning Effort: High"},
+        {3, "{\"effort\":\"none\"}",   NULL, NULL},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const ds4_think_mode mode =
+            glm_effort_request_mode(cases[i].kind, cases[i].json, cases[i].thinking);
+        const char *text = ds4_glm_reasoning_effort_text_for_template(true, mode);
+        TEST_ASSERT(cases[i].text ? text && !strcmp(text, cases[i].text) : text == NULL);
+    }
+}
+
+/* The opening lines of the official GLM chat templates: zai-org/GLM-5.3 (Full)
+ * and the GLM 5.3 Flash GGUF, which share them, and zai-org/GLM-5.2. */
+static void test_glm_template_low_effort_detection(void) {
+    const char *glm53 =
+        "[gMASK]<sop>\n"
+        "{%- set effective_reasoning_effort = reasoning_effort if reasoning_effort is defined and reasoning_effort in ['low', 'high'] else 'max' -%}\n"
+        "{%- if effective_reasoning_effort is not none -%}<|system|>Reasoning Effort: {{ effective_reasoning_effort | capitalize }}{%- endif -%}\n";
+    const char *glm52 =
+        "[gMASK]<sop>\n"
+        "{%- set effective_reasoning_effort = 'high' if reasoning_effort is defined and reasoning_effort == 'high' else 'max' -%}\n"
+        "{%- if (enable_thinking is not defined or enable_thinking) and effective_reasoning_effort is not none -%}<|system|>Reasoning Effort: {{ effective_reasoning_effort | capitalize }}{%- endif -%}\n";
+    TEST_ASSERT(ds4_glm_template_has_low_effort(glm53, strlen(glm53)));
+    TEST_ASSERT(!ds4_glm_template_has_low_effort(glm52, strlen(glm52)));
+    /* A 'low' outside the effort statement does not count. */
+    const char *other = "{%- set effective_reasoning_effort = 'high' -%}{{ 'low' }}";
+    TEST_ASSERT(!ds4_glm_template_has_low_effort(other, strlen(other)));
+    /* Double quotes work; 'lower' is not 'low'. */
+    const char *dq = "{%- set effective_reasoning_effort = x in [\"low\", \"high\"] -%}";
+    TEST_ASSERT(ds4_glm_template_has_low_effort(dq, strlen(dq)));
+    const char *lower = "{%- set effective_reasoning_effort = x in ['lower'] -%}";
+    TEST_ASSERT(!ds4_glm_template_has_low_effort(lower, strlen(lower)));
+    /* Only the given length is read, and a missing or empty template falls back. */
+    TEST_ASSERT(!ds4_glm_template_has_low_effort(glm53, 40));
+    TEST_ASSERT(!ds4_glm_template_has_low_effort(glm53, 0));
+    TEST_ASSERT(!ds4_glm_template_has_low_effort(NULL, 0));
+    TEST_ASSERT(!ds4_glm_template_has_low_effort("", 0));
+    /* Detected from the template, a low request renders Low only for 5.3. */
+    TEST_ASSERT(!strcmp(ds4_glm_reasoning_effort_text_for_template(
+        ds4_glm_template_has_low_effort(glm53, strlen(glm53)), DS4_THINK_LOW),
+        "Reasoning Effort: Low"));
+    TEST_ASSERT(!strcmp(ds4_glm_reasoning_effort_text_for_template(
+        ds4_glm_template_has_low_effort(glm52, strlen(glm52)), DS4_THINK_LOW),
+        "Reasoning Effort: High"));
+}
+
 static void test_model_alias_thinking_controls(void) {
     TEST_ASSERT(model_alias_disables_thinking("deepseek-chat"));
     TEST_ASSERT(model_alias_disables_thinking("glm-5.2-chat"));
@@ -23036,6 +23147,8 @@ static void ds4_server_unit_tests_run(void) {
     test_request_defaults_use_min_p_filtering();
     test_chat_ignore_eos_contract();
     test_reasoning_effort_mapping();
+    test_glm_reasoning_effort_levels();
+    test_glm_template_low_effort_detection();
     test_model_alias_thinking_controls();
     test_api_thinking_controls_parse();
     test_render_think_max_prompt_prefix();

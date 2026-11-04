@@ -7249,8 +7249,41 @@ static void config_validate_qwen4_model(const ds4_model *m) {
     }
 }
 
+/* Whether the loaded GLM model's chat template renders a requested low effort
+ * as "Low".  GLM 5.3 (Flash and Full) does; GLM 5.2 folds everything but high
+ * into Max, so ds4 keeps its original mapping for it.  Decided once at load. */
+static bool g_ds4_glm_template_low_effort;
+
+/* The effort line comes from a template statement of the form
+ * `set effective_reasoning_effort = ... in ['low', 'high'] ...`.  Low is
+ * supported when that one statement names 'low'.  A missing or unrecognised
+ * template is not. */
+bool ds4_glm_template_has_low_effort(const char *tmpl, size_t len) {
+    static const char key[] = "set effective_reasoning_effort";
+    if (!tmpl) return false;
+    const size_t klen = sizeof(key) - 1;
+    for (size_t i = 0; i + klen <= len; i++) {
+        if (memcmp(tmpl + i, key, klen) != 0) continue;
+        for (size_t j = i + klen; j + 1 < len && !(tmpl[j] == '%' && tmpl[j + 1] == '}'); j++) {
+            if (j + 5 <= len &&
+                (tmpl[j] == '\'' || tmpl[j] == '"') &&
+                !memcmp(tmpl + j + 1, "low", 3) && tmpl[j + 4] == tmpl[j]) return true;
+        }
+        return false;
+    }
+    return false;
+}
+
+static void glm_note_chat_template(const ds4_model *m) {
+    ds4_str tmpl = {0};
+    g_ds4_glm_template_low_effort =
+        model_get_string(m, "tokenizer.chat_template", &tmpl) &&
+        ds4_glm_template_has_low_effort(tmpl.ptr, (size_t)tmpl.len);
+}
+
 static void config_validate_model(const ds4_model *m) {
     g_ds4_flash_vision_exp = false;
+    g_ds4_glm_template_low_effort = false;
     ds4_str arch = {0};
     if (model_get_string(m, "general.architecture", &arch)) {
         if (ds4_streq(arch, "deepseek41")) {
@@ -7259,10 +7292,12 @@ static void config_validate_model(const ds4_model *m) {
         }
         if (ds4_streq(arch, "glm-dsa")) {
             config_validate_glm_dsa_model(m);
+            glm_note_chat_template(m);
             return;
         }
         if (ds4_streq(arch, "glm5-next")) {
             config_validate_glm53_model(m);
+            glm_note_chat_template(m);
             return;
         }
         if (ds4_streq(arch, "qwen4exp")) {
@@ -45735,15 +45770,21 @@ static void chat_push_bos_sequence(const ds4_vocab *vocab, token_vec *out) {
         token_vec_push(out, vocab->sop_id);
 }
 
-const char *ds4_glm_reasoning_effort_text(ds4_think_mode mode) {
+/* A template that accepts low renders it as such.  Without one (GLM 5.2), low
+ * keeps sharing the high text. */
+const char *ds4_glm_reasoning_effort_text_for_template(bool low_effort, ds4_think_mode mode) {
     switch (mode) {
-    case DS4_THINK_LOW:
+    case DS4_THINK_LOW:  return low_effort ? "Reasoning Effort: Low" : "Reasoning Effort: High";
     case DS4_THINK_MEDIUM:
     case DS4_THINK_HIGH: return "Reasoning Effort: High";
     case DS4_THINK_MAX:  return "Reasoning Effort: Max";
     case DS4_THINK_NONE: return NULL;
     }
     return NULL;
+}
+
+const char *ds4_glm_reasoning_effort_text(ds4_think_mode mode) {
+    return ds4_glm_reasoning_effort_text_for_template(g_ds4_glm_template_low_effort, mode);
 }
 
 const char *ds4_deepseek41_reasoning_effort_text(ds4_think_mode mode) {

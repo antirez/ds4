@@ -50,6 +50,11 @@ For DeepSeek, thinking is on by default. `reasoning_effort=max` selects Think
 Max only with sufficient context; otherwise it falls back to normal thinking.
 `xhigh` maps to normal thinking, not Think Max. Use `think:false`, a disabled
 thinking object, or a non-thinking model alias for direct answers.
+For GLM 5.3 (Flash and Full), `reasoning_effort=low` (or `minimal`) renders
+`Reasoning Effort: Low` as its chat template does; `max` renders Max, with the
+same context requirement, and every other level renders High. ds4 checks the
+GGUF's embedded chat template for low support when it loads the model, so GLM 5.2,
+whose template has no low, keeps rendering low as High.
 
 ## Multiple sessions
 
