@@ -1389,23 +1389,48 @@ __global__ static void dequant_q8_0_to_f32_kernel(
     out[gid] = scale * (float)q;
 }
 
+// Tiled transpose: each block dequantizes a 64-row x 64-column tile of the
+// Q8_0 matrix into LDS, reading along the Q8_0 rows, then writes it out along
+// the rows of the transposed matrix.  Indexing the output per element instead
+// sends neighbouring threads out_dim * 2 bytes apart, which leaves every
+// write uncoalesced.  Launch with blockDim.x = 256, gridDim.x covering out_dim
+// and gridDim.y covering in_dim in steps of DS4_Q8_F16_T_TILE (64).
 __global__ static void dequant_q8_0_to_f16_transpose_kernel(
         __half *out,
         const unsigned char *w,
         uint64_t in_dim,
         uint64_t out_dim,
         uint64_t blocks) {
-    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    const uint64_t n = in_dim * out_dim;
-    if (gid >= n) return;
-    const uint64_t row = gid / in_dim;
-    const uint64_t i = gid - row * in_dim;
-    const uint64_t b = i / 32u;
-    const uint64_t j = i - b * 32u;
-    const unsigned char *blk = w + (row * blocks + b) * 34u;
-    const __half scale = *(const __half *)blk;
-    const int8_t q = *(const int8_t *)(blk + 2u + j);
-    out[i * out_dim + row] = __hmul(scale, __float2half((float)q));
+    // One __half2 of padding moves each tile column to a different LDS bank.
+    __shared__ __half tile[DS4_Q8_F16_T_TILE][DS4_Q8_F16_T_TILE + 2u];
+    const uint32_t tx = threadIdx.x % DS4_Q8_F16_T_TILE;
+    const uint32_t ty = threadIdx.x / DS4_Q8_F16_T_TILE;
+    const uint32_t ny = blockDim.x / DS4_Q8_F16_T_TILE;
+    const uint64_t row0 = (uint64_t)blockIdx.x * DS4_Q8_F16_T_TILE;
+    const uint64_t i0 = (uint64_t)blockIdx.y * DS4_Q8_F16_T_TILE;
+
+    const uint64_t i = i0 + tx;
+    if (i < in_dim) {
+        const uint64_t b = i / 32u;
+        const uint64_t j = i - b * 32u;
+        for (uint32_t r = ty; r < DS4_Q8_F16_T_TILE; r += ny) {
+            const uint64_t row = row0 + r;
+            if (row >= out_dim) break;
+            const unsigned char *blk = w + (row * blocks + b) * 34u;
+            const __half scale = *(const __half *)blk;
+            const int8_t q = *(const int8_t *)(blk + 2u + j);
+            tile[tx][r] = __hmul(scale, __float2half((float)q));
+        }
+    }
+    __syncthreads();
+
+    const uint64_t row = row0 + tx;
+    if (row >= out_dim) return;
+    for (uint32_t c = ty; c < DS4_Q8_F16_T_TILE; c += ny) {
+        const uint64_t oi = i0 + c;
+        if (oi >= in_dim) break;
+        out[oi * out_dim + row] = tile[c][tx];
+    }
 }
 
 __global__ static void grouped_q8_0_a_preq_warp8_kernel(
