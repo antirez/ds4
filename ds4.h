@@ -492,7 +492,21 @@ int ds4_session_argmax_ignoring_eos(ds4_session *s,
 int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
                       int top_k, float top_p, float min_p, uint64_t *rng);
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
+/* Constrained sampling returns -1 when no allowed finite logit remains. */
+int ds4_session_sample_masked(ds4_session *s, float temperature, int top_k,
+                              float top_p, float min_p,
+                              const uint32_t *allow_mask,
+                              size_t allow_mask_words,
+                              const uint32_t *deny_mask,
+                              size_t deny_mask_words,
+                              uint64_t *rng);
 #ifdef DS4_TEST_HOOKS
+int ds4_test_sample_logits_masked(const float *logits, uint32_t n_vocab,
+                                  float temperature, int top_k,
+                                  float top_p, float min_p,
+                                  const uint32_t *allow_mask, size_t allow_words,
+                                  const uint32_t *deny_mask, size_t deny_words,
+                                  uint64_t *rng, float *prob_scratch);
 /* Teacher-force a V4.1 verification block, returning logits after each token. */
 int ds4_test_ds41_verify_tokens(ds4_session *s, const int *tokens, int count,
                                 float *logits, char *err, size_t errlen);

@@ -17,6 +17,18 @@ make ds4_test ds4_agent_test test-session-state
 ./ds4_agent_test
 ```
 
+Structured-output checks use small synthetic vocabularies and do not load a
+model. They cover matcher/cache lifetimes and concurrent matcher creation:
+
+```sh
+make LLGUIDANCE=1 test-llguidance
+python3 tests/test_llguidance_build.py --llguidance-dir .deps/llguidance
+```
+
+The build check uses a temporary directory to verify enabled/disabled switches,
+checkout changes, and unchanged builds. `tests/test_sampling` also covers
+constrained sampling, including empty masks and nonfinite logits.
+
 On Metal, small GPU tensor tests are available without loading a full GGUF:
 
 ```sh
