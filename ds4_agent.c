@@ -2258,7 +2258,18 @@ static void agent_qwen_tool_parse(agent_dsml_parser *p) {
         if (!p->current.name) {
             if (!agent_bytes_starts_with(cur, end, fn_open)) {
                 if (agent_bytes_partial_prefix_at(cur, end, fn_open)) return;
-                agent_dsml_set_error(p, "expected <function=...> in Qwen tool call");
+                /* Name the confusion, not just the expectation. The parser
+                 * decides here after as few as two bytes ("<p"), so the tag
+                 * that arrived cannot be quoted without waiting for bytes
+                 * whose verdict is already known -- and a stream ending in
+                 * that wait would swallow the stanza. Stating where the tool
+                 * name belongs is enough: the observed slip is a stanza that
+                 * opens <parameter=NAME> and still closes </function>, and a
+                 * message that only restates the expected shape reads as a
+                 * description of what the model believes it already wrote. */
+                agent_dsml_set_error(p,
+                    "expected <function=...> in Qwen tool call: the tool name "
+                    "goes in <function=NAME>, not <parameter=NAME>");
                 return;
             }
             const char *name_start = cur + sizeof(fn_open) - 1;
@@ -7645,6 +7656,22 @@ static void test_agent_qwen_tool_parser_two_calls_and_error(void) {
     agent_dsml_finish(&q);
     AGENT_TEST_ASSERT(q.state == AGENT_DSML_ERROR);
     agent_dsml_parser_free(&q);
+
+    /* The observed slip: the stanza opens <parameter=NAME> where
+     * <function=NAME> belongs, while still closing </function>. The model
+     * cannot act on a message that only restates the expected shape, so the
+     * diagnostic must say where the tool name belongs. */
+    const char *swapped =
+        "<tool_call>\n<parameter=bash>\n<parameter=command>\nls\n</parameter>\n</function>\n</tool_call>";
+    agent_dsml_parser r = {
+        .syntax = AGENT_TOOL_SYNTAX_QWEN,
+        .state = AGENT_DSML_SEARCH,
+    };
+    agent_dsml_feed(&r, swapped, strlen(swapped));
+    agent_dsml_finish(&r);
+    AGENT_TEST_ASSERT(r.state == AGENT_DSML_ERROR);
+    AGENT_TEST_ASSERT(strstr(r.error, "not <parameter=NAME>") != NULL);
+    agent_dsml_parser_free(&r);
 }
 
 static void test_agent_qwen_stream_tool_call_chunked(void) {
