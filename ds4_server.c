@@ -7209,6 +7209,23 @@ typedef struct {
     openai_tool_stream tool;
 } openai_stream;
 
+/* A tool-enabled thinking model may keep reasoning past its first </think>
+ * and close a second time.  We hold the tentative answer for at most this
+ * many bytes so a short stray draft (or a </think> split across generated
+ * tokens) can still be rerouted to reasoning_content.  Past this window the
+ * text is treated as the answer and streamed, so ordinary responses keep
+ * flushing content incrementally instead of stalling until generation ends.
+ *
+ * This is a heuristic, not a guarantee: there is no reliable way to tell a
+ * genuine second reasoning pass from ordinary answer text that happens to
+ * be followed by something marker-shaped, so we bound the wait instead of
+ * holding indefinitely. 32 bytes covers the escaped-draft case reported in
+ * #678 with margin; a stray draft longer than that would stream as if it
+ * were the real answer. Raise this only with a concrete counter-example,
+ * since every byte added here is also a byte every tool-enabled answer
+ * risks waiting on. */
+#define SECOND_REASONING_GUARD_BYTES 32
+
 static bool stream_needs_second_reasoning_guard(const request *r) {
     return ds4_think_mode_enabled(r->think_mode) && r->has_tools &&
            r->model_syntax != SERVER_MODEL_SYNTAX_QWEN;
@@ -8112,7 +8129,8 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
                 if (limit > st->emit_pos) st->sent_reasoning = true;
                 st->emit_pos = limit + strlen("</think>");
                 st->guard_second_reasoning = false;
-            } else if (!tool && !final) {
+            } else if (!tool && !final &&
+                       raw_len - st->emit_pos <= SECOND_REASONING_GUARD_BYTES) {
                 return true;
             } else {
                 st->guard_second_reasoning = false;
@@ -9747,7 +9765,8 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
                 if (!anthropic_sse_close_block_live(fd, id, st)) return false;
                 st->emit_pos = limit + strlen("</think>");
                 st->guard_second_reasoning = false;
-            } else if (!tool && !final) {
+            } else if (!tool && !final &&
+                       raw_len - st->emit_pos <= SECOND_REASONING_GUARD_BYTES) {
                 return true;
             } else {
                 st->guard_second_reasoning = false;
@@ -17584,6 +17603,111 @@ static void test_openai_qwen_tool_stream_sends_answer_before_finish(void) {
     close(sv[1]);
 }
 
+static void test_openai_tools_stream_content_is_incremental(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_HIGH;
+    r.has_tools = true;
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+
+    /* With tools enabled the answer must keep flowing as its own content
+     * deltas.  A regression held every byte until the final flush, so the
+     * client saw the whole answer appear at once after reasoning ended. */
+    const char *raw1 = "<think>reasoning</think>First part of a long answer ";
+    const char *raw2 =
+        "<think>reasoning</think>First part of a long answer that keeps going ";
+    const char *raw3 =
+        "<think>reasoning</think>First part of a long answer that keeps going "
+        "and only ends here";
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_incremental",
+                                         &st, raw1, strlen(raw1), false));
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_incremental",
+                                         &st, raw2, strlen(raw2), false));
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_incremental",
+                                         &st, raw3, strlen(raw3), false));
+    TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_incremental", &st,
+                                       raw3, strlen(raw3), NULL, "stop", 5, 20));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    TEST_ASSERT(strstr(out, "\"reasoning_content\":\"reasoning\"") != NULL);
+    int content_deltas = 0;
+    for (const char *p = out; (p = strstr(p, "\"delta\":{\"content\":")) != NULL; p++) {
+        content_deltas++;
+    }
+    TEST_ASSERT(content_deltas >= 2);
+    TEST_ASSERT(strstr(out, "\"content\":\"First part of a long answer") != NULL);
+    TEST_ASSERT(strstr(out, "data: [DONE]") != NULL);
+
+    free(out);
+    openai_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+/* Anthropic counterpart of test_openai_tools_stream_content_is_incremental:
+ * the guard applies to anthropic_sse_stream_update too, so a DeepSeek/GLM
+ * answer placed before a tool call must keep streaming as its own
+ * text_delta events on this API as well, not just on OpenAI-compatible
+ * streams. Regression: before bounding the wait to
+ * SECOND_REASONING_GUARD_BYTES, this API held every byte until finish. */
+static void test_anthropic_tools_stream_content_is_incremental(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_ANTHROPIC;
+    r.stream = true;
+    r.think_mode = DS4_THINK_HIGH;
+    r.has_tools = true;
+
+    anthropic_stream st;
+    TEST_ASSERT(anthropic_sse_start_live(sv[0], &r, "msg_incremental", 7, &st));
+
+    const char *raw1 = "<think>reasoning</think>First part of a long answer ";
+    const char *raw2 =
+        "<think>reasoning</think>First part of a long answer that keeps going ";
+    const char *raw3 =
+        "<think>reasoning</think>First part of a long answer that keeps going "
+        "and only ends here";
+    TEST_ASSERT(anthropic_sse_stream_update(sv[0], NULL, &r, "msg_incremental",
+                                            &st, raw1, strlen(raw1), false));
+    TEST_ASSERT(anthropic_sse_stream_update(sv[0], NULL, &r, "msg_incremental",
+                                            &st, raw2, strlen(raw2), false));
+    TEST_ASSERT(anthropic_sse_stream_update(sv[0], NULL, &r, "msg_incremental",
+                                            &st, raw3, strlen(raw3), false));
+    TEST_ASSERT(anthropic_sse_finish_live(sv[0], NULL, &r, "msg_incremental", &st,
+                                          raw3, strlen(raw3), NULL, "end_turn", 20));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    TEST_ASSERT(strstr(out, "\"type\":\"thinking_delta\"") != NULL);
+    int text_deltas = 0;
+    for (const char *p = out; (p = strstr(p, "\"type\":\"text_delta\"")) != NULL; p++) {
+        text_deltas++;
+    }
+    TEST_ASSERT(text_deltas >= 2);
+    TEST_ASSERT(strstr(out, "\"text\":\"First part of a long answer") != NULL);
+    TEST_ASSERT(strstr(out, "event: message_stop") != NULL);
+
+    free(out);
+    anthropic_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
 static void test_openai_stream_usage_reports_cache_details(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -23087,6 +23211,8 @@ static void ds4_server_unit_tests_run(void) {
     test_openai_stream_reroutes_second_reasoning_pass();
     test_openai_qwen_tool_stream_sends_answer_before_finish();
     test_qwen_stream_split_reasoning_close();
+    test_openai_tools_stream_content_is_incremental();
+    test_anthropic_tools_stream_content_is_incremental();
     test_openai_stream_usage_reports_cache_details();
     test_responses_usage_reports_cache_details();
     test_openai_chat_stream_splits_reasoning_without_tools();
