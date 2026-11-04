@@ -53457,7 +53457,8 @@ int k3_gpu_mla_decode(
                 offset:ds4_gpu_tensor_offset(partial_stats) atIndex:2];
         [enc setBuffer:ds4_gpu_tensor_buffer(q_latent)
                 offset:ds4_gpu_tensor_offset(q_latent) atIndex:3];
-        [enc setThreadgroupMemoryLength:sizeof(float) * 2u atIndex:0];
+        /* The kernel uses two floats. Metal requires 16-byte allocations. */
+        [enc setThreadgroupMemoryLength:16u atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(n_heads, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
 
