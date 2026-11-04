@@ -2433,8 +2433,8 @@ static const gguf_type_info gguf_types[] = {
     [16] = {"iq2_xxs",256,  66},
     [17] = {"iq2_xs", 256,  74},
     [18] = {"iq3_xxs",256,  98},
-    [19] = {"iq1_s",  256, 110},
-    [20] = {"iq4_nl", 256,  50},
+    [19] = {"iq1_s",  256,  50},
+    [20] = {"iq4_nl",  32,  18},
     [21] = {"iq3_s",  256, 110},
     [22] = {"iq2_s",  256,  82},
     [23] = {"iq4_xs", 256, 136},
@@ -2583,6 +2583,50 @@ static bool tensor_nbytes(uint32_t type, uint64_t elements, uint64_t *bytes) {
     uint64_t blocks = (elements + info->block_elems - 1) / info->block_elems;
     if (blocks > UINT64_MAX / info->block_bytes) return false;
     *bytes = blocks * info->block_bytes;
+    return true;
+}
+
+/* Block geometry of the quantized types, spelled out from ggml's block
+ * structs, so a wrong table entry cannot hide behind the models that never
+ * use the type. */
+bool ds4_test_gguf_type_sizes(void) {
+    static const struct { uint32_t type, elems, bytes; } want[] = {
+        { 2,   32, 2 + 16},                                   /* q4_0 */
+        { 3,   32, 2 + 2 + 16},                               /* q4_1 */
+        { 6,   32, 2 + 4 + 16},                               /* q5_0 */
+        { 7,   32, 2 + 2 + 4 + 16},                           /* q5_1 */
+        { 8,   32, 2 + 32},                                   /* q8_0 */
+        {10, QK_K, 2 + 2 + QK_K/16 + QK_K/4},                 /* q2_k */
+        {11, QK_K, 2 + QK_K/4 + QK_K/8 + 12},                 /* q3_k */
+        {12, QK_K, 2 + 2 + QK_K/2 + 12},                      /* q4_k */
+        {13, QK_K, 2 + 2 + QK_K/2 + QK_K/8 + 12},             /* q5_k */
+        {14, QK_K, 2 + QK_K/2 + QK_K/4 + QK_K/16},            /* q6_k */
+        {15, QK_K, 4 + QK_K + QK_K/8},                        /* q8_k */
+        {16, QK_K, 2 + QK_K/4},                               /* iq2_xxs */
+        {17, QK_K, 2 + QK_K/4 + QK_K/32},                     /* iq2_xs */
+        {18, QK_K, 2 + QK_K/4 + QK_K/8},                      /* iq3_xxs */
+        {19, QK_K, 2 + QK_K/8 + QK_K/16},                     /* iq1_s */
+        {20,   32, 2 + 16},                                   /* iq4_nl */
+        {21, QK_K, 2 + QK_K/4 + QK_K/8 + QK_K/32 + 4},        /* iq3_s */
+        {22, QK_K, 2 + QK_K/4 + QK_K/16},                     /* iq2_s */
+        {23, QK_K, 2 + 2 + QK_K/2 + QK_K/64},                 /* iq4_xs */
+        {29, QK_K, QK_K/8 + QK_K/16 + QK_K/32},               /* iq1_m */
+        {39,   32, 1 + 16},                                   /* mxfp4 */
+    };
+    for (size_t i = 0; i < sizeof(want) / sizeof(want[0]); i++) {
+        const gguf_type_info *info = tensor_type(want[i].type);
+        uint64_t bytes = 0;
+        if (!info || info->block_elems != want[i].elems ||
+            info->block_bytes != want[i].bytes ||
+            !tensor_nbytes(want[i].type, 4ull * want[i].elems, &bytes) ||
+            bytes != 4ull * want[i].bytes)
+        {
+            fprintf(stderr, "gguf type %u (%s): table says %u values in %u bytes, ggml %u in %u\n",
+                    want[i].type, info ? info->name : "?", info ? info->block_elems : 0,
+                    info ? info->block_bytes : 0, want[i].elems, want[i].bytes);
+            return false;
+        }
+    }
     return true;
 }
 

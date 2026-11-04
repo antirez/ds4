@@ -8,6 +8,7 @@
 #include <math.h>
 
 bool ds4_test_dspark_cache_window_crop(void);
+bool ds4_test_gguf_type_sizes(void);
 bool ds4_test_dspark_prefix_capture(ds4_engine *engine, const ds4_tokens *prompt);
 
 static ds4_engine *test_engine_fast;
@@ -1262,6 +1263,10 @@ static void test_metal_store_raw_kv_batch_wrap(void) {
 
     ds4_gpu_tensor_free(kv);
     ds4_gpu_tensor_free(raw);
+}
+
+static void test_gguf_type_sizes(void) {
+    TEST_ASSERT(ds4_test_gguf_type_sizes());
 }
 
 static void test_dspark_cache_window_crop(void) {
@@ -7344,6 +7349,7 @@ static const ds4_test_entry test_entries[] = {
     {"--mtp-verify-depth", "mtp-verify-depth", "MTP speculative verify commits autoregressive-identical tokens at draft depth > 2", test_mtp_verify_depth},
     {"--dspark-verify-depth", "dspark-verify-depth", "DSpark speculative verify commits autoregressive-identical tokens at draft depth > 2", test_dspark_verify_depth},
 #endif
+    {"--gguf-types", "gguf-types", "GGUF quant block sizes match ggml's block structs", test_gguf_type_sizes},
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };
 
