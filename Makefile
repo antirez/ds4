@@ -191,6 +191,13 @@ test-k3-gguf: ds4 tests/test_k3_gguf tests/test_k3_tokenizer tests/test_k3_gguf_
 	@./ds4 -m "$(K3_GGUF)" --dump-tokens -p x | grep -q '^[[:space:]]*87  x$$'
 	./tests/test_k3_gguf_metal_map "$(K3_GGUF)"
 	./tests/test_k3_gguf_slice "$(K3_GGUF)"
+	@set -e; dir=$$(mktemp -d); trap 'rm -rf "$$dir"' EXIT; \
+	for prediction in 0 1; do \
+	    K3_TEST_STATIC=1 K3_TEST_LAYER=10 K3_TEST_STREAM_LAYERS=4 K3_TEST_STEPS=3 \
+	    K3_ROUTE_PREDICT=$$prediction K3_TEST_DUMP="$$dir/$$prediction" \
+	    ./tests/test_k3_gguf_slice "$(K3_GGUF)"; \
+	done; \
+	cmp "$$dir/0" "$$dir/1"
 
 test-k3-gguf-source: tests/test_k3_gguf
 	./tests/test_k3_gguf "$(K3_GGUF)" "$(K3_MODEL)"

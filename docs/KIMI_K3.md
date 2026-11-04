@@ -20,6 +20,14 @@ fit, then uses the remaining safe budget for an expert cache. With less free
 memory it keeps only some layers' non-routed weights resident. This is automatic;
 no cache or residency flags are needed.
 
+During single-token GGUF decoding, the runtime uses the next layer’s router
+and the current hidden state to predict four likely experts. While Metal
+runs the current layer, macOS reads ahead from the GGUF for guesses that
+are missing from the expert cache. The next layer’s actual router then
+selects all 16 experts. A wrong guess only costs I/O. The runtime skips
+prediction across an AttnRes block boundary or when the next layer’s static
+weights are on disk. Set `K3_ROUTE_PREDICT=0` to benchmark without lookahead.
+
 Routed gate/up weights use IQ2_XXS and routed down weights use Q2_K.
 Shared experts remain MXFP4, latent up projections use Q8_0, and attention,
 embeddings, the output head, routers, and norms retain higher precision.

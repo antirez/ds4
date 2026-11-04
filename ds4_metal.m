@@ -13640,14 +13640,8 @@ static int ds4_gpu_stream_expert_readahead_enabled(void) {
            getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_READAHEAD") == NULL;
 }
 
-static void ds4_gpu_stream_expert_readahead_range(uint64_t offset, uint64_t len) {
-    if (!ds4_gpu_stream_expert_readahead_enabled() || g_model_fd < 0 || len == 0) {
-        return;
-    }
-
+static void ds4_gpu_advise_file_range(int fd, uint64_t offset, uint64_t len) {
 #if defined(F_RDADVISE)
-    const int timing = ds4_gpu_stream_expert_timing_summary_enabled();
-    const double t0 = timing ? ds4_gpu_now_ms() : 0.0;
     uint64_t pos = offset;
     uint64_t rem = len;
     while (rem > 0) {
@@ -13658,11 +13652,27 @@ static void ds4_gpu_stream_expert_readahead_range(uint64_t offset, uint64_t len)
         struct radvisory ra;
         ra.ra_offset = (off_t)pos;
         ra.ra_count = (int)chunk64;
-        (void)fcntl(g_model_fd, F_RDADVISE, &ra);
+        (void)fcntl(fd, F_RDADVISE, &ra);
 
         pos += chunk64;
         rem -= chunk64;
     }
+#else
+    (void)fd;
+    (void)offset;
+    (void)len;
+#endif
+}
+
+static void ds4_gpu_stream_expert_readahead_range(uint64_t offset, uint64_t len) {
+    if (!ds4_gpu_stream_expert_readahead_enabled() || g_model_fd < 0 || len == 0) {
+        return;
+    }
+
+#if defined(F_RDADVISE)
+    const int timing = ds4_gpu_stream_expert_timing_summary_enabled();
+    const double t0 = timing ? ds4_gpu_now_ms() : 0.0;
+    ds4_gpu_advise_file_range(g_model_fd, offset, len);
     if (timing) {
         g_stream_expert_timing_readahead_calls++;
         g_stream_expert_timing_readahead_bytes += len;
@@ -16983,6 +16993,55 @@ static int ds4_gpu_stream_expert_pending_load_matches(
         if (p->selected_ids[i] != selected_ids[i]) return 0;
     }
     return 1;
+}
+
+void k3_gpu_hint_experts(const ds4_gpu_stream_expert_table *table,
+                         const int32_t *ids, uint32_t count) {
+    if (!ds4_gpu_stream_expert_readahead_enabled() || !table->model_map ||
+        table->layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER ||
+        table->n_total_expert > DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT) return;
+    if (count > DS4_METAL_MAX_ROUTED_EXPERT_USED) return;
+    struct {
+        uint32_t n;
+        uint32_t ids[DS4_METAL_MAX_ROUTED_EXPERT_USED];
+    } cold = {0};
+    for (uint32_t i = 0; i < count; i++) {
+        const uint32_t e = (uint32_t)ids[i];
+        if (e >= table->n_total_expert) continue;
+        const uint64_t gate = table->gate_offset + e * table->gate_expert_bytes;
+        const uint64_t up = table->up_offset + e * table->gate_expert_bytes;
+        const uint64_t down = table->down_offset + e * table->down_expert_bytes;
+        if (ds4_gpu_stream_expert_cache_entry_matches(&g_stream_expert_cache[table->layer][e],
+                table->model_map, table->model_size, gate, up, down,
+                table->gate_expert_bytes, table->down_expert_bytes)) continue;
+        cold.ids[cold.n++] = e;
+    }
+    if (!cold.n) return;
+
+    /* An old hint can be dropped. Do not queue it behind another forecast,
+     * and keep only a private descriptor and offsets after the session exits. */
+    static dispatch_semaphore_t idle;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ idle = dispatch_semaphore_create(1); });
+    if (dispatch_semaphore_wait(idle, DISPATCH_TIME_NOW) != 0) return;
+    const int fd = fcntl(g_model_fd, F_DUPFD_CLOEXEC, 0);
+    if (fd < 0) {
+        dispatch_semaphore_signal(idle);
+        return;
+    }
+    const uint64_t gate_base = table->gate_offset, up_base = table->up_offset;
+    const uint64_t down_base = table->down_offset;
+    const uint64_t gate_bytes = table->gate_expert_bytes, down_bytes = table->down_expert_bytes;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        for (uint32_t i = 0; i < cold.n; i++) {
+            const uint32_t e = cold.ids[i];
+            ds4_gpu_advise_file_range(fd, gate_base + e * gate_bytes, gate_bytes);
+            ds4_gpu_advise_file_range(fd, up_base + e * gate_bytes, gate_bytes);
+            ds4_gpu_advise_file_range(fd, down_base + e * down_bytes, down_bytes);
+        }
+        close(fd);
+        dispatch_semaphore_signal(idle);
+    });
 }
 
 int ds4_gpu_stream_expert_cache_begin_selected_load(

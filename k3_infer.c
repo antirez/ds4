@@ -230,6 +230,7 @@ struct k3_context {
     int q8_static;
     int gguf_resident;
     int gguf_static_resident;
+    uint32_t gguf_lookahead_experts;
     uint8_t gguf_static_layers[K3_N_LAYER];
     int gguf_prefill_hotness;
     int gguf_readahead_done;
@@ -1379,10 +1380,12 @@ static int map_gguf_layer_spans(const k3_context *ctx,
         errcap);
 }
 
-static int begin_gguf_selected_experts(
+static int prepare_gguf_selected_experts(
         k3_context *ctx,
         const k3_layer *layer,
         const int32_t *ids,
+        uint32_t count,
+        bool hint,
         char *err,
         size_t errcap) {
     if (!ctx || !layer || !layer->shard) return 0;
@@ -1392,7 +1395,7 @@ static int begin_gguf_selected_experts(
                   layer->index);
         return 0;
     }
-    for (uint32_t i = 0; i < K3_N_EXPERT_USED; i++) {
+    for (uint32_t i = 0; i < count; i++) {
         if (ids[i] < 0 || ids[i] >= K3_N_EXPERT) {
             set_error(err, errcap,
                       "K3 layer %u selected invalid expert %d",
@@ -1425,9 +1428,13 @@ static int begin_gguf_selected_experts(
         .gate_expert_bytes = stacks[0]->size / K3_N_EXPERT,
         .down_expert_bytes = stacks[2]->size / K3_N_EXPERT,
     };
+    if (hint) {
+        k3_gpu_hint_experts(&table, ids, count);
+        return 1;
+    }
     if (!table.model_map ||
         !ds4_gpu_stream_expert_cache_begin_selected_load(
-            &table, ids, K3_N_EXPERT_USED)) {
+            &table, ids, count)) {
         set_error(err, errcap,
                   "K3 layer %u selected expert staging failed", layer->index);
         return 0;
@@ -3391,6 +3398,54 @@ static uint64_t source_offset(
     return tensor->offset - source->bias;
 }
 
+static int encode_route_prediction(k3_context *ctx, const k3_layer *next,
+                                   const k3_weight_source *source) {
+    const uint32_t valid_blocks =
+        (next->index + K3_ATTN_RES_BLOCK - 1u) / K3_ATTN_RES_BLOCK;
+    /*
+     * Prefix and all saved blocks are current here. Approximate the next
+     * ffn_in with the next layer's exact AttnRes mixture, omitting only the
+     * current FFN delta and the next attention delta. attn_in is dead after
+     * the current attention and will be overwritten by the next layer.
+     */
+    return k3_gpu_attn_res(
+            ctx->scratch.attn_in,
+            ctx->scratch.prefix,
+            NULL,
+            ctx->scratch.blocks,
+            source->base,
+            source->size,
+            source_offset(source, next->mlp_res_norm),
+            source_offset(source, next->mlp_res_proj),
+            source_offset(source, next->post_attention_norm),
+            K3_N_EMBD,
+            1u,
+            K3_ATTN_RES_BLOCKS,
+            valid_blocks,
+            -1,
+            1,
+            K3_RMS_EPS,
+            K3_RMS_EPS) &&
+        matmul(
+            ctx->scratch.predicted_router_logits,
+            next->router,
+            ctx->scratch.attn_in,
+            K3_N_EMBD,
+            K3_N_EXPERT,
+            1u,
+            source) &&
+        k3_gpu_router_topk(
+            ctx->scratch.predicted_ids,
+            ctx->scratch.predicted_weights,
+            ctx->scratch.predicted_router_logits,
+            source->base,
+            source->size,
+            source_offset(source, next->router_bias),
+            1u,
+            K3_N_EXPERT,
+            K3_N_EXPERT_USED);
+}
+
 static int predict_next_route(k3_context *ctx,
                               const k3_layer *layer,
                               uint32_t rows,
@@ -3416,51 +3471,8 @@ static int predict_next_route(k3_context *ctx,
         .size = slot->capacity,
         .bias = next->static_offset,
     };
-    const uint32_t valid_blocks =
-        (next_index + K3_ATTN_RES_BLOCK - 1u) / K3_ATTN_RES_BLOCK;
     uint64_t ready = 0;
-    /*
-     * Prefix and all saved blocks are current here. Approximate the next
-     * ffn_in with the next layer's exact AttnRes mixture, omitting only the
-     * current FFN delta and the next attention delta. attn_in is dead after
-     * the current attention and will be overwritten by the next layer.
-     */
-    if (!k3_gpu_attn_res(
-            ctx->scratch.attn_in,
-            ctx->scratch.prefix,
-            NULL,
-            ctx->scratch.blocks,
-            source.base,
-            source.size,
-            source_offset(&source, next->mlp_res_norm),
-            source_offset(&source, next->mlp_res_proj),
-            source_offset(&source, next->post_attention_norm),
-            K3_N_EMBD,
-            1u,
-            K3_ATTN_RES_BLOCKS,
-            valid_blocks,
-            -1,
-            1,
-            K3_RMS_EPS,
-            K3_RMS_EPS) ||
-        !matmul(
-            ctx->scratch.predicted_router_logits,
-            next->router,
-            ctx->scratch.attn_in,
-            K3_N_EMBD,
-            K3_N_EXPERT,
-            1u,
-            &source) ||
-        !k3_gpu_router_topk(
-            ctx->scratch.predicted_ids,
-            ctx->scratch.predicted_weights,
-            ctx->scratch.predicted_router_logits,
-            source.base,
-            source.size,
-            source_offset(&source, next->router_bias),
-            1u,
-            K3_N_EXPERT,
-            K3_N_EXPERT_USED) ||
+    if (!encode_route_prediction(ctx, next, &source) ||
         !ds4_gpu_signal_selected_readback_ready(&ready) ||
         !ds4_gpu_commit_and_wait_selected_readback(
             ready, "K3 speculative router readback")) {
@@ -4066,6 +4078,22 @@ static int run_moe_ffn(k3_context *ctx,
 
     const int needs_router_readback =
         !ctx->model->gguf || !ctx->gguf_resident;
+    const k3_layer *forecast = NULL;
+    const uint32_t next = layer->index + 1u;
+    if (ctx->gguf_lookahead_experts && !ctx->gguf_resident && rows == 1u &&
+        next <= ctx->layer_end && ctx->gguf_static_layers[next] &&
+        next % K3_ATTN_RES_BLOCK != 0u) {
+        /* At a block boundary the next attention output replaces the prefix. */
+        forecast = ctx->layers[next];
+        const k3_weight_source next_source = {
+            .base = k3_st_map_base(ctx->globals.shard),
+            .size = k3_st_file_size(ctx->globals.shard),
+        };
+        if (!encode_route_prediction(ctx, forecast, &next_source)) {
+            set_error(err, errcap, "K3 layer %u route prediction failed", next);
+            return 0;
+        }
+    }
     uint64_t router_event = 0;
     if ((needs_router_readback &&
          !ds4_gpu_signal_selected_readback_ready(&router_event)) ||
@@ -4085,7 +4113,8 @@ static int run_moe_ffn(k3_context *ctx,
         const int32_t *ready_ids = NULL;
         if (!ctx->gguf_resident && rows == 1u) {
             ready_ids = ds4_gpu_tensor_contents(s->selected_ids);
-            if (!begin_gguf_selected_experts(ctx, layer, ready_ids, err, errcap)) return 0;
+            if (!prepare_gguf_selected_experts(
+                    ctx, layer, ready_ids, K3_N_EXPERT_USED, false, err, errcap)) return 0;
             /* The router event has now finished the preceding layer's expert
              * work. The current static projections only touch pinned spans.
              * Register the new expert views while their reads are in flight. */
@@ -4234,6 +4263,17 @@ static int run_moe_ffn(k3_context *ctx,
                       "K3 layer %u GGUF routed MoE failed",
                       layer->index);
             return 0;
+        }
+        if (forecast) {
+            /* Submit this layer before starting I/O for the next one. The
+             * actual router will still select and weight all sixteen experts. */
+            if (!ds4_gpu_flush_commands()) {
+                set_error(err, errcap, "K3 layer %u Metal submission failed", layer->index);
+                return 0;
+            }
+            const int32_t *guess = ds4_gpu_tensor_contents(s->predicted_ids);
+            (void)prepare_gguf_selected_experts(ctx, forecast, guess,
+                                              ctx->gguf_lookahead_experts, true, NULL, 0);
         }
         return 1;
     }
@@ -5322,6 +5362,10 @@ int k3_context_create(k3_context **out,
         k3_context_destroy(ctx);
         return 0;
     }
+    const char *predict = getenv("K3_ROUTE_PREDICT");
+    if (ctx->model->gguf && (!predict || strcmp(predict, "0") != 0)) {
+        ctx->gguf_lookahead_experts = 4;
+    }
     const uint64_t resident_budget = want_q8_static
         ? 0 : resident_static_budget(ds4_gpu_tensor_allocated_bytes());
     if (!try_pin_resident_gguf(
@@ -5556,6 +5600,7 @@ int k3_context_clone(k3_context **out,
     ctx->pinned_static = owner->pinned_static;
     ctx->q8_static = owner->q8_static;
     ctx->gguf_resident = owner->gguf_resident;
+    ctx->gguf_lookahead_experts = owner->gguf_lookahead_experts;
     ctx->gguf_static_resident = owner->gguf_static_resident;
     memcpy(ctx->gguf_static_layers, owner->gguf_static_layers,
            sizeof(ctx->gguf_static_layers));

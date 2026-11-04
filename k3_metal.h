@@ -77,6 +77,9 @@ int k3_gpu_pin_static_maps(
         const void * const *maps,
         const uint64_t     *sizes,
         uint32_t            count);
+void k3_gpu_hint_experts(const ds4_gpu_stream_expert_table *table,
+                         const int32_t *ids, uint32_t count);
+
 int k3_gpu_pin_model_spans(
         const void     *model_map,
         uint64_t        model_size,
