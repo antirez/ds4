@@ -642,6 +642,9 @@ static id<MTLComputePipelineState> g_glm_q6_k_down_f32_pipeline;
 static id<MTLComputePipelineState> g_dsv4_router_weights_batch_pipeline;
 static id<MTLComputePipelineState> g_dsv4_hc_expand4_pipeline;
 static NSMutableDictionary<NSString *, id<MTLComputePipelineState>> *g_pipeline_cache;
+/* g_pipeline_cache is not thread-safe.  Keep-alive threads use this copy,
+ * resolved on the starting thread before pthread_create. */
+static id<MTLComputePipelineState> g_keepalive_pipeline;
 
 enum {
     DS4_METAL_DECODE_PIPELINE_FAST_CACHE_SLOTS = 64,
@@ -1767,6 +1770,14 @@ static uint64_t ds4_gpu_effective_model_max_tensor_bytes(uint64_t map_size, uint
 }
 
 static id<MTLComputePipelineState> ds4_gpu_get_pipeline(const char *function_name);
+
+static int ds4_gpu_resolve_keepalive_pipeline(void) {
+    if (!g_keepalive_pipeline) {
+        g_keepalive_pipeline = ds4_gpu_get_pipeline("kernel_dsv4_tp_keepalive");
+    }
+    return g_keepalive_pipeline != nil;
+}
+
 static int ds4_gpu_warm_model_views(void);
 static double ds4_gpu_gib(uint64_t bytes);
 
@@ -10820,8 +10831,7 @@ static void *ds4_gpu_tp_keepalive_thread(void *arg) {
      * (~1.7x) suggest decode runs well below max clocks. More TGs raise
      * apparent utilization without eating memory bandwidth. */
     uint32_t ka_tgs = ds4_gpu_tp_keepalive_tgs_from_env();
-    id<MTLComputePipelineState> pipeline =
-        ds4_gpu_get_pipeline("kernel_dsv4_tp_keepalive");
+    id<MTLComputePipelineState> pipeline = g_keepalive_pipeline;
     if (!pipeline) {
         fprintf(stderr, "ds4: TP keep-alive pipeline missing\n");
         return NULL;
@@ -11234,6 +11244,7 @@ int ds4_gpu_tp_init(uint32_t rank,
         g_tp_keepalive_buffer = [g_device newBufferWithLength:(NSUInteger)ka_tgs * 256u * sizeof(float)
                                                       options:MTLResourceStorageModeShared];
         if (g_tp_keepalive_queue && g_tp_keepalive_buffer &&
+            ds4_gpu_resolve_keepalive_pipeline() &&
             pthread_create(&g_tp_keepalive_thread, NULL,
                            ds4_gpu_tp_keepalive_thread, NULL) == 0) {
             g_tp_keepalive_running = 1;
@@ -11749,7 +11760,7 @@ static volatile int g_queue_keepalive_stop;
 
 static void *ds4_gpu_queue_keepalive_thread(void *arg) {
     (void)arg;
-    id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_dsv4_tp_keepalive");
+    id<MTLComputePipelineState> pipeline = g_keepalive_pipeline;
     id<MTLBuffer> scratch = [g_device newBufferWithLength:256u * sizeof(float)
                                                   options:MTLResourceStorageModeShared];
     if (!pipeline || !scratch) return NULL;
@@ -11776,6 +11787,7 @@ static void *ds4_gpu_queue_keepalive_thread(void *arg) {
 static void ds4_gpu_queue_keepalive_start(void) {
     if (g_queue_keepalive_running) return;
     if (getenv("DS4_METAL_DISABLE_QUEUE_KEEPALIVE")) return;
+    if (!ds4_gpu_resolve_keepalive_pipeline()) return;
     g_queue_keepalive_stop = 0;
     if (pthread_create(&g_queue_keepalive_thread, NULL, ds4_gpu_queue_keepalive_thread, NULL) == 0)
         g_queue_keepalive_running = 1;
@@ -12296,6 +12308,7 @@ void ds4_gpu_cleanup(void) {
         ds4_gpu_model_views_clear();
         [g_pipeline_cache removeAllObjects];
         g_pipeline_cache = nil;
+        if (!g_tp_keepalive_running) g_keepalive_pipeline = nil;
         [g_q4_expert_layer_residency_cache removeAllObjects];
         g_q4_expert_layer_residency_cache = nil;
         [g_q4_expert_table_cache removeAllObjects];
