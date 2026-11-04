@@ -251,6 +251,7 @@ DGX Spark results, comparison conditions, and benchmark commands.
 - [Models and vision](docs/MODELS.md): Flash, PRO, GLM, Qwen, and matching encoders.
 - [Qwen3.8 Flash Next](docs/QWEN38_FLASH_NEXT.md): model setup, MTP, vision, and validation.
 - [SSD streaming](docs/SSD_STREAMING.md): run larger than RAM and size the cache.
+- [Expert hotlist and locality profile](docs/EXPERT_HOTLIST.md): record routed experts and seed the streaming cache.
 - [Inference across machines](docs/DISTRIBUTED.md): two-Mac TP/RDMA and layer pipelines.
 - [Speculative decoding](docs/SPECULATIVE_DECODING.md): DSpark, GLM and Qwen MTP, and sampling.
 - [Serving](docs/SERVER.md): APIs, images, batching, and disk KV caches.

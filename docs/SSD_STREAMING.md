@@ -72,6 +72,8 @@ a remedy for insufficient RAM.
 
 Leave expert preloading enabled for normal use. `--ssd-streaming-cold` and
 `--ssd-streaming-preload-experts N` are mainly useful for controlled measurements.
+The preload list can be replaced with one recorded from your own workload; see
+[expert hotlist and locality profile](EXPERT_HOTLIST.md) for the file format.
 See [benchmarking](PERFORMANCE.md) and the [release QA guide](../QA_BEFORE_RELEASES.md).
 
 ## CUDA expert reads
