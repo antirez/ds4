@@ -940,6 +940,19 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                         size_t err_len) {
     if (!kc->enabled) return false;
     if (!tokens || store_len < kc->opt.min_tokens) return false;
+    /* Store targets can be reached before the session has captured a
+     * checkpoint: a continued frontier is crossed by an ordinary prefill or
+     * decode step, and the graph state only becomes checkpointable at the
+     * next drain.  Staging cannot succeed there, so check first and return
+     * quietly -- otherwise every attempt renders the prompt text, hashes it
+     * and reports a staging failure for a routine transient state. */
+    /* Store targets can be reached before the session has captured a
+     * checkpoint: a continued frontier is crossed by an ordinary prefill or
+     * decode step, and the graph state only becomes checkpointable at the
+     * next drain.  Staging cannot succeed there, so check first and return
+     * quietly -- otherwise every attempt renders the prompt text, hashes it
+     * and reports a staging failure for a routine transient state. */
+    if (!ds4_session_checkpoint_valid(session)) return false;
     const int original_len = tokens->len;
 
     ds4_tokens store_tokens = {0};
