@@ -6345,11 +6345,122 @@ static void trim_const_span(const char **start, const char **end) {
     while (*end > *start && isspace((unsigned char)(*end)[-1])) (*end)--;
 }
 
+/* The request JSON reader accepts strtod extensions and control characters.
+ * Before emitting model text as raw JSON, also enforce JSON's lexical rules,
+ * including inside containers. Keep this local to GLM type recovery. */
+static bool glm_json_literal_valid(const char *value) {
+    const char *end = value;
+    if (!json_skip_value(&end)) return false;
+    json_ws(&end);
+    if (*end) return false;
+    for (const char *p = value; *p; ) {
+        if (strchr(" \t\r\n{}[],:", *p)) {
+            p++;
+        } else if (*p == '"') {
+            const char *start = p;
+            char *s = NULL;
+            if (!json_string(&p, &s)) return false;
+            free(s);
+            while (start < p)
+                if ((unsigned char)*start++ < 0x20) return false;
+        } else if (json_lit(&p, "true") || json_lit(&p, "false") ||
+                   json_lit(&p, "null")) {
+            continue;
+        } else {
+            if (*p == '-') p++;
+            if (*p == '0') p++;
+            else {
+                if (*p < '1' || *p > '9') return false;
+                while (*p >= '0' && *p <= '9') p++;
+            }
+            if (*p == '.') {
+                p++;
+                if (*p < '0' || *p > '9') return false;
+                while (*p >= '0' && *p <= '9') p++;
+            }
+            if (*p == 'e' || *p == 'E') {
+                p++;
+                if (*p == '+' || *p == '-') p++;
+                if (*p < '0' || *p > '9') return false;
+                while (*p >= '0' && *p <= '9') p++;
+            }
+            if (*p && !strchr(" \t\r\n,]}", *p)) return false;
+        }
+    }
+    return true;
+}
+
+enum {
+    GLM_ARG_INTEGER = 1, GLM_ARG_NUMBER = 2, GLM_ARG_BOOLEAN = 4,
+    GLM_ARG_NULL = 8, GLM_ARG_ARRAY = 16, GLM_ARG_OBJECT = 32,
+    GLM_ARG_TEXT = 64
+};
+
+static unsigned glm_arg_type(const char *type) {
+    if (!strcmp(type, "integer")) return GLM_ARG_INTEGER;
+    if (!strcmp(type, "number")) return GLM_ARG_INTEGER | GLM_ARG_NUMBER;
+    if (!strcmp(type, "boolean")) return GLM_ARG_BOOLEAN;
+    if (!strcmp(type, "null")) return GLM_ARG_NULL;
+    if (!strcmp(type, "array")) return GLM_ARG_ARRAY;
+    if (!strcmp(type, "object")) return GLM_ARG_OBJECT;
+    return GLM_ARG_TEXT; /* Unknown types, like strings, cannot disambiguate. */
+}
+
+/* GLM has no per-value string flag. Only a declared, matching non-string
+ * type can disambiguate JSON from text; absent schemas must stay strings.
+ * This recovers types, not schema constraints or recursively coerced values. */
+static bool glm_arg_is_json(const tool_schema_orders *orders, const char *name,
+                            const char *key, const char *value) {
+    const tool_schema_order *order = tool_schema_orders_find(orders, name);
+    if (!order) return false;
+    unsigned types = 0;
+    for (int i = 0; i < order->len; i++) {
+        if (strcmp(order->prop[i], key)) continue;
+        json_args schema = {0};
+        if (json_args_parse(order->prop_schema[i], &schema)) {
+            int j = json_args_find_unused(&schema, "type");
+            if (j >= 0 && schema.v[j].is_string) {
+                types = glm_arg_type(schema.v[j].value);
+            } else if (j >= 0) {
+                const char *p = schema.v[j].value;
+                json_ws(&p);
+                if (*p == '[') {
+                    p++;
+                    for (;;) {
+                        char *type = NULL;
+                        if (!json_string(&p, &type)) { types = GLM_ARG_TEXT; break; }
+                        types |= glm_arg_type(type);
+                        free(type);
+                        json_ws(&p);
+                        if (*p != ',') break;
+                        p++;
+                    }
+                    if (*p != ']') types = GLM_ARG_TEXT;
+                }
+            }
+        }
+        json_args_free(&schema);
+        break;
+    }
+    if (!types || (types & GLM_ARG_TEXT)) return false;
+    const char *p = value;
+    json_ws(&p);
+    unsigned kind = 0;
+    if (*p == '[') kind = GLM_ARG_ARRAY;
+    else if (*p == '{') kind = GLM_ARG_OBJECT;
+    else if (*p == 't' || *p == 'f') kind = GLM_ARG_BOOLEAN;
+    else if (*p == 'n') kind = GLM_ARG_NULL;
+    else if (*p == '-' || (*p >= '0' && *p <= '9'))
+        kind = strpbrk(p, ".eE") ? GLM_ARG_NUMBER : GLM_ARG_INTEGER;
+    return (types & kind) && glm_json_literal_valid(value);
+}
+
 static bool parse_glm_generated_message_ex(const char *text,
                                            bool require_thinking_closed,
                                            char **content_out,
                                            char **reasoning_out,
-                                           tool_calls *calls) {
+                                           tool_calls *calls,
+                                           const tool_schema_orders *orders) {
     static const char tool_start[] = "<tool_call>";
     static const char tool_end[] = "</tool_call>";
     static const char arg_key_start[] = "<arg_key>";
@@ -6452,7 +6563,8 @@ static bool parse_glm_generated_message_ex(const char *text,
             char *raw_value = xstrndup(p, (size_t)(value_end - p));
             char *value = xstrdup(raw_value);
             ds4_tool_text_unescape(value, arg_value_end);
-            tool_call_json_args_add(&args, key, value, "true");
+            tool_call_json_args_add(&args, key, value,
+                glm_arg_is_json(orders, name, key, value) ? "false" : "true");
             free(key);
             free(raw_value);
             free(value);
@@ -6699,7 +6811,7 @@ static bool parse_generated_message_ex_for_syntax(server_model_syntax syntax,
     if (syntax == SERVER_MODEL_SYNTAX_GLM) {
         return parse_glm_generated_message_ex(text, require_thinking_closed,
                                               content_out, reasoning_out,
-                                              calls);
+                                              calls, NULL);
     }
     if (syntax == SERVER_MODEL_SYNTAX_QWEN) {
         return parse_qwen_generated_message_ex(text, require_thinking_closed,
@@ -6821,6 +6933,9 @@ static bool parse_generated_message_for_response_for_syntax(server_model_syntax 
     bool parsed_ok = syntax == SERVER_MODEL_SYNTAX_QWEN ?
         parse_qwen_generated_message_ex(text, require_thinking_closed,
                                          content_out, reasoning_out, calls, orders) :
+        syntax == SERVER_MODEL_SYNTAX_GLM ?
+        parse_glm_generated_message_ex(text, require_thinking_closed,
+                                        content_out, reasoning_out, calls, orders) :
         parse_generated_message_ex_for_syntax(syntax,
                                                            text ? text : "",
                                                            require_thinking_closed,
@@ -17862,7 +17977,9 @@ static void test_openai_glm_tool_stream_suppresses_raw_tool_call(void) {
     r.think_mode = DS4_THINK_NONE;
     r.has_tools = true;
     r.model_syntax = SERVER_MODEL_SYNTAX_GLM;
-    r.tool_orders = make_bash_order();
+    tool_schema_orders_add_json(&r.tool_orders,
+        "{\"name\":\"bash\",\"parameters\":{\"type\":\"object\",\"properties\":{"
+        "\"command\":{\"type\":\"string\"},\"timeout\":{\"type\":\"integer\"}}}}");
 
     TEST_ASSERT(sse_chunk(sv[0], &r, "chatcmpl_glm_tool", NULL, NULL));
 
@@ -17872,6 +17989,7 @@ static void test_openai_glm_tool_stream_suppresses_raw_tool_call(void) {
         "Before.\n\n"
         "<tool_call>bash"
         "<arg_key>command</arg_key><arg_value>pwd</arg_value>"
+        "<arg_key>timeout</arg_key><arg_value>10</arg_value>"
         "</tool_call>";
     TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_glm_tool", &st,
                                          raw, strlen(raw), false));
@@ -17879,10 +17997,16 @@ static void test_openai_glm_tool_stream_suppresses_raw_tool_call(void) {
     char *parsed_content = NULL;
     char *parsed_reasoning = NULL;
     tool_calls calls = {0};
-    TEST_ASSERT(parse_generated_message_ex_for_syntax(
-        SERVER_MODEL_SYNTAX_GLM, raw, false,
-        &parsed_content, &parsed_reasoning, &calls));
+    const char *finish = "tool_calls";
+    bool recovered = false;
+    TEST_ASSERT(parse_generated_message_for_response_for_syntax(
+        SERVER_MODEL_SYNTAX_GLM, raw, true, true, false, &finish,
+        NULL, 0, &parsed_content, &parsed_reasoning, &calls, &recovered,
+        &r.tool_orders));
     TEST_ASSERT(calls.len == 1);
+    if (calls.len == 1)
+        TEST_ASSERT(!strcmp(calls.v[0].arguments,
+                            "{\"command\": \"pwd\", \"timeout\": 10}"));
     TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_glm_tool", &st,
                                        raw, strlen(raw), &calls,
                                        "tool_calls", 10, 4));
@@ -17895,6 +18019,7 @@ static void test_openai_glm_tool_stream_suppresses_raw_tool_call(void) {
     TEST_ASSERT(strstr(out, "\"name\":\"bash\"") != NULL);
     TEST_ASSERT(strstr(out, "\\\"command\\\":") != NULL);
     TEST_ASSERT(strstr(out, "\\\"pwd\\\"") != NULL);
+    TEST_ASSERT(strstr(out, "\\\"timeout\\\":10") != NULL);
     TEST_ASSERT(strstr(out, "<tool_call>") == NULL);
     TEST_ASSERT(strstr(out, "<arg_key>") == NULL);
 
@@ -19326,6 +19451,138 @@ static void test_parse_short_dsml_and_canonical_suffix(void) {
     free(reasoning);
     tool_calls_free(&calls);
     request_free(&r);
+}
+
+static void test_glm_schema_request_formats(void) {
+    const char *tools[] = {
+        "[{\"type\":\"function\",\"function\":{\"name\":\"report\",\"parameters\":{"
+        "\"properties\":{\"value\":{\"type\":\"integer\"}}}}}]",
+        "[{\"type\":\"function\",\"name\":\"report\",\"parameters\":{"
+        "\"properties\":{\"value\":{\"type\":\"integer\"}}}}]",
+        "[{\"name\":\"report\",\"input_schema\":{"
+        "\"properties\":{\"value\":{\"type\":\"integer\"}}}}]"
+    };
+    const char *raw = "<tool_call>report<arg_key>value</arg_key>"
+                      "<arg_value>10</arg_value>"
+                      "<arg_key>unknown</arg_key><arg_value>10</arg_value></tool_call>"
+                      "<tool_call>unknown<arg_key>value</arg_key>"
+                      "<arg_value>10</arg_value></tool_call>";
+    for (size_t i = 0; i < sizeof(tools) / sizeof(tools[0]); i++) {
+        const char *p = tools[i];
+        char *schemas = NULL;
+        tool_schema_orders orders = {0};
+        TEST_ASSERT(parse_tools_value(&p, &schemas, &orders));
+        for (int with_schema = 0; with_schema < 2; with_schema++) {
+            char *content = NULL, *reasoning = NULL;
+            tool_calls calls = {0};
+            const char *finish = "tool_calls";
+            bool recovered = false;
+            TEST_ASSERT(parse_generated_message_for_response_for_syntax(
+                SERVER_MODEL_SYNTAX_GLM, raw, true, true, false, &finish,
+                NULL, 0, &content, &reasoning, &calls, &recovered,
+                with_schema ? &orders : NULL));
+            TEST_ASSERT(calls.len == 2);
+            if (calls.len == 2) {
+                TEST_ASSERT(!strcmp(calls.v[0].arguments, with_schema ?
+                    "{\"value\": 10, \"unknown\": \"10\"}" :
+                    "{\"value\": \"10\", \"unknown\": \"10\"}"));
+                TEST_ASSERT(!strcmp(calls.v[1].arguments, "{\"value\": \"10\"}"));
+            }
+            TEST_ASSERT(!recovered);
+            free(content);
+            free(reasoning);
+            tool_calls_free(&calls);
+        }
+        free(schemas);
+        tool_schema_orders_free(&orders);
+    }
+}
+
+static void test_glm_schema_typed_arguments(void) {
+    const struct { const char *schema, *value, *expected; } cases[] = {
+        {"{\"type\":\"array\"}", "[1, true, {\"x\":null}]", "[1,true,{\"x\":null}]"},
+        {"{\"type\":\"object\"}", "{\"nested\": [1,false]}", "{\"nested\":[1,false]}"},
+        {"{\"type\":\"integer\"}", "9007199254740993", "9007199254740993"},
+        {"{\"type\":\"integer\"}", "-40", "-40"},
+        {"{\"type\":\"number\"}", " -1.25e+3 ", "-1.25e+3"},
+        {"{\"type\":\"boolean\"}", "true", "true"},
+        {"{\"type\":\"boolean\"}", "false", "false"},
+        {"{\"type\":\"null\"}", "null", "null"},
+        {"{\"type\":\"number\"}", "01", "\"01\""},
+        {"{\"type\":\"number\"}", "+1", "\"+1\""},
+        {"{\"type\":\"number\"}", "0x10", "\"0x10\""},
+        {"{\"type\":\"number\"}", "1.", "\"1.\""},
+        {"{\"type\":\"number\"}", "NaN", "\"NaN\""},
+        {"{\"type\":\"number\"}", "Infinity", "\"Infinity\""},
+        {"{\"type\":\"number\"}", "-Infinity", "\"-Infinity\""},
+        {"{\"type\":\"number\"}", "1e", "\"1e\""},
+        {"{\"type\":\"number\"}", "1 2", "\"1 2\""},
+        {"{\"type\":\"integer\"}", "1.5", "\"1.5\""},
+        {"{\"type\":\"integer\"}", "true", "\"true\""},
+        {"{\"type\":\"array\"}", "[NaN]", "\"[NaN]\""},
+        {"{\"type\":\"array\"}", "[01]", "\"[01]\""},
+        {"{\"type\":\"array\"}", "[1,]", "\"[1,]\""},
+        {"{\"type\":\"array\"}", "[] trailing", "\"[] trailing\""},
+        {"{\"type\":\"array\"}", "[\"line\nbreak\"]", "\"[\\\"line\\nbreak\\\"]\""},
+        {"{\"type\":\"array\"}", "[\v1]", "\"[\\u000b1]\""},
+        {"{\"type\":\"object\"}", "{\"x\":Infinity}", "\"{\\\"x\\\":Infinity}\""},
+        {"{\"type\":\"object\"}", "{\"x\":1,}", "\"{\\\"x\\\":1,}\""},
+        {"{\"type\":\"boolean\"}", "True", "\"True\""},
+        {"{\"type\":\"boolean\"}", "1", "\"1\""},
+        {"{\"type\":\"null\"}", "false", "\"false\""},
+        {"{\"type\":\"string\"}", "true", "\"true\""},
+        {"{\"type\":\"string\"}", "42", "\"42\""},
+        {"{\"type\":\"string\"}", "null", "\"null\""},
+        {"{\"type\":\"string\"}", "[1,2]", "\"[1,2]\""},
+        {"{\"type\":\"string\"}", "{\"x\":1}", "\"{\\\"x\\\":1}\""},
+        {"{\"type\":\"string\"}", "  x\ny  ", "\"  x\\ny  \""},
+        {"{\"type\":\"string\"}", "001", "\"001\""},
+        {"{\"type\":\"string\"}", "\"quoted\"", "\"\\\"quoted\\\"\""},
+        {"{\"type\":[\"integer\",\"null\"]}", "10", "10"},
+        {"{\"type\":[\"null\",\"integer\"]}", "null", "null"},
+        {"{\"type\":[\"array\",\"object\"]}", "{}", "{}"},
+        {"{\"type\":[\"integer\",\"string\"]}", "10", "\"10\""},
+        {"{\"type\":[\"null\",\"string\"]}", "null", "\"null\""},
+        {"{\"type\":[\"unknown\",\"integer\"]}", "10", "\"10\""},
+        {"{\"type\":[]}", "10", "\"10\""},
+        {"{}", "42", "\"42\""},
+        {"{\"type\":\"unknown\"}", "42", "\"42\""},
+        {"{\"$ref\":\"#/$defs/value\"}", "42", "\"42\""},
+        {"{\"anyOf\":[{\"type\":\"integer\"},{\"type\":\"string\"}]}", "42", "\"42\""},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        tool_schema_orders orders = {0};
+        buf schema = {0}, raw = {0}, expected = {0};
+        buf_printf(&schema, "{\"name\":\"report\",\"parameters\":{\"type\":\"object\","
+                   "\"properties\":{\"value\":%s}}}", cases[i].schema);
+        tool_schema_orders_add_json(&orders, schema.ptr);
+        buf_printf(&raw, "<tool_call>report<arg_key>value</arg_key>"
+                   "<arg_value>%s</arg_value></tool_call>", cases[i].value);
+        buf_printf(&expected, "{\"value\": %s}", cases[i].expected);
+        char *content = NULL, *reasoning = NULL;
+        tool_calls calls = {0};
+        const char *finish = "tool_calls";
+        bool recovered = false;
+        TEST_ASSERT(parse_generated_message_for_response_for_syntax(
+            SERVER_MODEL_SYNTAX_GLM, raw.ptr, true, true, false, &finish,
+            NULL, 0, &content, &reasoning, &calls, &recovered, &orders));
+        TEST_ASSERT(calls.len == 1);
+        if (calls.len == 1) {
+            if (strcmp(calls.v[0].arguments, expected.ptr))
+                fprintf(stderr, "GLM case %zu: got %s, expected %s\n",
+                        i, calls.v[0].arguments, expected.ptr);
+            TEST_ASSERT(!strcmp(calls.v[0].arguments, expected.ptr));
+            TEST_ASSERT(!strcmp(calls.raw_tool_text, raw.ptr));
+        }
+        TEST_ASSERT(!recovered);
+        free(content);
+        free(reasoning);
+        tool_calls_free(&calls);
+        tool_schema_orders_free(&orders);
+        buf_free(&schema);
+        buf_free(&raw);
+        buf_free(&expected);
+    }
 }
 
 static void test_parse_glm_tool_call_message(void) {
@@ -23099,6 +23356,8 @@ static void ds4_server_unit_tests_run(void) {
     test_openai_tool_stream_handles_multiple_calls();
     test_streaming_holds_partial_utf8();
     test_parse_short_dsml_and_canonical_suffix();
+    test_glm_schema_request_formats();
+    test_glm_schema_typed_arguments();
     test_parse_glm_tool_call_message();
     test_dsml_parser_recovers_loose_nested_parameters();
     test_dsml_repair_produces_parseable_calls();
