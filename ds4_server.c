@@ -10004,6 +10004,10 @@ typedef struct {
      * Anthropic currently uses only the call-id side of the state. */
     char *visible_text;
     size_t visible_len;
+    /* Final answers can replay an emitted summary or omit it. Both keys bind
+     * the same frontier and image offsets: images precede the answer suffix. */
+    char *visible_reasoning_text;
+    size_t visible_reasoning_len;
     visible_image_key images;
     /* Tool-call ids generated at the same live frontier. A following tool
      * result for these ids is a direct protocol continuation and should not
@@ -10469,6 +10473,9 @@ static void live_tool_state_clear_locked(live_tool_state *st) {
     free(st->visible_text);
     st->visible_text = NULL;
     st->visible_len = 0;
+    free(st->visible_reasoning_text);
+    st->visible_reasoning_text = NULL;
+    st->visible_reasoning_len = 0;
     memset(&st->images, 0, sizeof(st->images));
     st->valid = false;
     st->live_tokens = 0;
@@ -10522,14 +10529,20 @@ static void thinking_live_remember(server *s, server_slot *slot,
 
 static void responses_live_remember(server *s, server_slot *slot,
                                     const char *visible_text,
+                                    const char *visible_reasoning_text,
                                     const tool_calls *calls, const request *req) {
     if (!s || !slot || !visible_text || !visible_text[0]) return;
     visible_image_key images;
     char *key = visible_prompt_key(req, visible_text, &images);
+    visible_image_key reasoning_images;
+    char *reasoning_key = visible_reasoning_text ?
+        visible_prompt_key(req, visible_reasoning_text, &reasoning_images) : NULL;
     pthread_mutex_lock(&s->tool_mu);
     live_tool_state_clear_locked(&slot->responses_live);
     slot->responses_live.visible_text = key;
     slot->responses_live.visible_len = key ? strlen(key) : 0;
+    slot->responses_live.visible_reasoning_text = reasoning_key;
+    slot->responses_live.visible_reasoning_len = reasoning_key ? strlen(reasoning_key) : 0;
     slot->responses_live.images = images;
     if (calls) {
         for (int i = 0; i < calls->len; i++) {
@@ -11647,22 +11660,21 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
         char *vkey = visible_prompt_key(req, ptext, &vimages);
         if (vkey) {
             size_t vlen = strlen(vkey);
-            bool ok = slot->responses_live.valid &&
-                      slot->responses_live.live_tokens == live_pos &&
-                      slot->responses_live.visible_text &&
-                      slot->responses_live.visible_len < vlen &&
-                      visible_image_prefix_matches(&vimages,
-                          &slot->responses_live.images,
-                          slot->responses_live.visible_len) &&
-                      byte_prefix_match(vkey, vlen,
-                          slot->responses_live.visible_text,
-                          slot->responses_live.visible_len);
-            if (ok) {
-                pr.kind = REUSE_RESPONSES_VISIBLE;
-                pr.reuse_tokens = live_pos;
-                pr.suffix_off = slot->responses_live.visible_len;
-                free(vkey);
-                return pr;
+            const live_tool_state *st = &slot->responses_live;
+            const char *keys[] = {st->visible_text, st->visible_reasoning_text};
+            const size_t lens[] = {st->visible_len, st->visible_reasoning_len};
+            if (st->valid && st->live_tokens == live_pos) {
+                for (size_t i = 0; i < 2; i++) {
+                    if (keys[i] && lens[i] < vlen &&
+                        visible_image_prefix_matches(&vimages, &st->images, lens[i]) &&
+                        byte_prefix_match(vkey, vlen, keys[i], lens[i])) {
+                        pr.kind = REUSE_RESPONSES_VISIBLE;
+                        pr.reuse_tokens = live_pos;
+                        pr.suffix_off = lens[i];
+                        free(vkey);
+                        return pr;
+                    }
+                }
             }
             free(vkey);
         }
@@ -12812,6 +12824,13 @@ static char *build_qwen_assistant_suffix(const request *r, const char *content,
     }
     buf body = {0};
     append_trimmed_text(&body, content);
+    if (body.len > 0 && (!calls || calls->len == 0)) {
+        /* Match append_qwen_assistant_message(): plain replies keep their
+         * trailing whitespace when the client replays the sampled answer. */
+        const char *end = content + strlen(content);
+        while (end > content && isspace((unsigned char)end[-1])) end--;
+        buf_append(&body, end, strlen(end));
+    }
     buf_puts(&suffix, body.ptr ? body.ptr : "");
     append_qwen_tool_calls_text(&suffix, calls, body.len > 0, r ? &r->tool_orders : NULL);
     buf_free(&body);
@@ -12851,14 +12870,10 @@ static char *build_responses_visible_assistant_suffix(const request *r,
                                            r && r->reasoning_summary_emit && calls && calls->len > 0, calls);
     }
     buf suffix = {0};
-    /* This suffix mirrors what a Responses client can replay, not necessarily
-     * every token in KV.  Hidden reasoning stays live in the session unless the
-     * next client replay is expected to include it.  In practice, pi replays
-     * reasoning summaries for tool-call turns, but not for final assistant
-     * answers; Codex currently requests no summaries at all.  So only include
-     * reasoning in the remembered visible prefix when this assistant turn ended
-     * in tool calls.  A client that does replay final-answer reasoning will not
-     * match this visible shortcut and can still use exact token-prefix replay. */
+    /* Keep the final-answer surface that omits reasoning. Qwen Responses
+     * also remembers the emitted-summary surface at the same live frontier;
+     * clients such as Pi replay it even after a final answer. Tool-call turns
+     * retain their existing reasoning replay contract. */
     if (r && ds4_think_mode_enabled(r->think_mode)) {
         if (r->reasoning_summary_emit && calls && calls->len > 0) {
             buf_puts(&suffix, reasoning ? reasoning : "");
@@ -12872,6 +12887,33 @@ static char *build_responses_visible_assistant_suffix(const request *r,
         buf_puts(&suffix, "<｜end▁of▁sentence｜>");
     }
     return buf_take(&suffix);
+}
+
+static void responses_live_remember_turn(server *s, server_slot *slot,
+                                         const request *r, const char *content,
+                                         const char *reasoning,
+                                         const tool_calls *calls) {
+    char *suffix = build_responses_visible_assistant_suffix(r, content,
+                                                            reasoning, calls);
+    buf visible = {0};
+    buf_puts(&visible, r->prompt_text ? r->prompt_text : "");
+    buf_puts(&visible, suffix ? suffix : "");
+    buf with_reasoning = {0};
+    if (r->model_syntax == SERVER_MODEL_SYNTAX_QWEN &&
+        ds4_think_mode_enabled(r->think_mode) && r->reasoning_summary_emit &&
+        reasoning && reasoning[0] && (!calls || calls->len == 0)) {
+        char *reasoning_suffix = build_qwen_assistant_suffix(r, content,
+                                                            reasoning, true, calls);
+        buf_puts(&with_reasoning, r->prompt_text ? r->prompt_text : "");
+        buf_puts(&with_reasoning, reasoning_suffix);
+        free(reasoning_suffix);
+        if (!strcmp(with_reasoning.ptr, visible.ptr)) buf_free(&with_reasoning);
+    }
+    responses_live_remember(s, slot, visible.ptr ? visible.ptr : "",
+                            with_reasoning.ptr, calls && calls->len ? calls : NULL, r);
+    buf_free(&with_reasoning);
+    buf_free(&visible);
+    free(suffix);
 }
 
 /* Clients can omit old assistant reasoning from later prompts, including Qwen
@@ -14577,18 +14619,9 @@ decode_again:
              * frontier.  The next Responses request may replay only this
              * visible surface, while the real session also contains hidden
              * reasoning and exact sampled tool-call bytes. */
-            char *visible_suffix =
-                build_responses_visible_assistant_suffix(&j->req,
-                    parsed_content ? parsed_content : "",
-                    parsed_reasoning,
-                    &parsed_calls);
-            buf visible = {0};
-            buf_puts(&visible, j->req.prompt_text ? j->req.prompt_text : "");
-            buf_puts(&visible, visible_suffix ? visible_suffix : "");
-            responses_live_remember(s, slot, visible.ptr ? visible.ptr : "",
-                                    parsed_calls.len ? &parsed_calls : NULL, &j->req);
-            buf_free(&visible);
-            free(visible_suffix);
+            responses_live_remember_turn(s, slot, &j->req,
+                parsed_content ? parsed_content : "", parsed_reasoning,
+                &parsed_calls);
         } else {
             responses_live_clear(s, slot);
         }
@@ -20484,6 +20517,97 @@ static void test_responses_visible_suffix_matches_client_replay(void) {
     request_free(&r);
 }
 
+/* Parse and render both final-answer replay forms with retained images.
+ * Divergent checkpoint tokens and image token positions force the visible tier,
+ * as after a successful tool-output-ID continuation in the live reproduction. */
+static void test_qwen_responses_final_replay_visible_frontier(void) {
+    server s = {0};
+    pthread_mutex_init(&s.tool_mu, NULL);
+    const int tokens[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+    server_slot slot = {0};
+    slot.session = ds4_session_new_test_checkpoint(tokens, 10);
+    ds4_vision_span old_image = {.token_start = 2,
+        .embedding = {.token_count = 2, .fingerprint = {7}}};
+    ds4_session_set_test_images(slot.session, &old_image, 1);
+
+    for (int emit_summary = 0; emit_summary < 2; emit_summary++) {
+        for (int trailing_ws = 0; trailing_ws < 2; trailing_ws++) {
+            const char *answer = trailing_ws ? "\n\n5 \n" : "\n\n5";
+            const char *reasoning = "consider the image\n";
+            request r;
+            request_init(&r, REQ_CHAT, 128);
+            r.api = API_RESPONSES;
+            r.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
+            r.think_mode = DS4_THINK_MEDIUM;
+            r.reasoning_summary_emit = emit_summary;
+            r.images = calloc(1, sizeof(*r.images));
+            r.images[0] = old_image;
+            r.image_count = 1;
+            r.image_markers = xmalloc(sizeof(*r.image_markers));
+            snprintf(r.image_markers[0], sizeof(r.image_markers[0]), "<M-OLD>");
+            const char *p = "[{\"role\":\"user\",\"content\":\"See <M-OLD>\"}]";
+            chat_msgs msgs = {0};
+            TEST_ASSERT(parse_responses_input(&p, &msgs, NULL, NULL));
+            r.prompt_text = render_qwen_chat_prompt_text(&msgs, NULL, NULL, r.think_mode);
+            chat_msgs_free(&msgs);
+            responses_live_remember_turn(&s, &slot, &r, answer, reasoning, NULL);
+            TEST_ASSERT((slot.responses_live.visible_reasoning_text != NULL) == !!emit_summary);
+
+            for (int preserve_summary = 0; preserve_summary < 2; preserve_summary++) {
+                buf input = {0};
+                buf_puts(&input, "[{\"role\":\"user\",\"content\":\"See <M-NEW>\"},");
+                if (preserve_summary) {
+                    buf_puts(&input, "{\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":");
+                    json_escape(&input, reasoning);
+                    buf_puts(&input, "}]},");
+                }
+                buf_puts(&input, "{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":");
+                json_escape(&input, answer);
+                buf_puts(&input, "}]},{\"role\":\"user\",\"content\":\"Continue.\"}]");
+                p = input.ptr;
+                TEST_ASSERT(parse_responses_input(&p, &msgs, NULL, NULL));
+                request next;
+                request_init(&next, REQ_CHAT, 128);
+                next.api = API_RESPONSES;
+                next.prompt_text = render_qwen_chat_prompt_text(&msgs, NULL, NULL, r.think_mode);
+                next.images = calloc(1, sizeof(*next.images));
+                next.images[0] = old_image;
+                next.images[0].token_start++;  /* drift, not changed image pixels */
+                next.image_count = 1;
+                next.image_markers = xmalloc(sizeof(*next.image_markers));
+                snprintf(next.image_markers[0], sizeof(next.image_markers[0]), "<M-NEW>");
+                ds4_tokens_push(&next.prompt, 999);
+                TEST_ASSERT(!ds4_session_vision_prefix_matches(slot.session, next.images, 1));
+                slot_reuse pr = slot_probe_reuse_locked(&s, &slot, &next);
+                bool should_reuse = emit_summary || !preserve_summary;
+                TEST_ASSERT(pr.kind == (should_reuse ? REUSE_RESPONSES_VISIBLE : REUSE_NONE));
+                if (pr.kind == REUSE_RESPONSES_VISIBLE) {
+                    TEST_ASSERT(pr.reuse_tokens == 10);
+                    const char *tail = "\n<|im_start|>user\nContinue.";
+                    TEST_ASSERT(!strncmp(next.prompt_text + pr.suffix_off, tail, strlen(tail)));
+                    next.images[0].embedding.fingerprint[0] = 8;
+                    TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &next).kind == REUSE_NONE);
+                    next.images[0].embedding.fingerprint[0] = 7;
+                    slot.responses_live.live_tokens = 9;
+                    TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &next).kind == REUSE_NONE);
+                    slot.responses_live.live_tokens = 10;
+                }
+                request_free(&next);
+                chat_msgs_free(&msgs);
+                buf_free(&input);
+            }
+            request_free(&r);
+        }
+    }
+    responses_live_clear(&s, &slot);
+    TEST_ASSERT(!slot.responses_live.valid && !slot.responses_live.visible_text);
+    TEST_ASSERT(!slot.responses_live.visible_reasoning_text &&
+                slot.responses_live.visible_reasoning_len == 0);
+    live_tool_state_free(&slot.responses_live);
+    ds4_session_free_test_checkpoint(slot.session);
+    pthread_mutex_destroy(&s.tool_mu);
+}
+
 static void test_exact_dsml_tool_replay_can_be_disabled(void) {
     const char *dsml =
         "\n\n<｜DSML｜tool_calls>\n"
@@ -23124,6 +23248,7 @@ static void ds4_server_unit_tests_run(void) {
     test_responses_tool_output_id_validation();
     test_responses_stateless_tool_replay_requires_reasoning();
     test_responses_visible_suffix_matches_client_replay();
+    test_qwen_responses_final_replay_visible_frontier();
     test_exact_dsml_tool_replay_can_be_disabled();
     test_dsml_decode_state_separates_structure_and_payload();
     test_decode_tracker_split_parameter_close();

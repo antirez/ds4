@@ -22,8 +22,11 @@ Sections:
   tool-409  A tool-result-only continuation has no replayable history, so when
             its live frontier cannot be rebuilt the server must answer 409
             instead of generating from a context-free prompt.
+  responses-final  Qwen streaming tool/result/final-answer replay with six
+                   retained images. Checks final reasoning preserved, omitted,
+                   or not requested (--reasoning-replay). Needs one idle slot.
 
-Both sections are real-model checks; they assert on usage counters (cached
+These sections are real-model checks; they assert on usage counters (cached
 tokens), the server log, and HTTP status, not on generated text quality.
 """
 
@@ -32,6 +35,7 @@ import base64
 import json
 from pathlib import Path
 import re
+import time
 import urllib.error
 import urllib.request
 
@@ -244,16 +248,124 @@ def tool_409_section(args):
           "unreconstructable and reuse it otherwise", flush=True)
 
 
+def responses_final_section(args):
+    """Replay the Responses wire shape used by Pi without an SDK dependency.
+
+    A tool result adds four images to the first two, then a completed final
+    answer is followed by a user turn with no new images. Tool-ID reuse can
+    leave canonical token/image offsets different from the sampled live KV;
+    final reasoning replay must still match the Responses-visible frontier.
+    """
+    tools = [{"type": "function", "name": "bg_status",
+              "description": "Check a background task.", "strict": False,
+              "parameters": {"type": "object", "properties": {
+                  "taskId": {"type": "string"}}, "required": ["taskId"],
+                  "additionalProperties": False}}]
+    history = [{"role": "developer", "content":
+                "Respond briefly. When explicitly asked to check a task, call "
+                "bg_status. After a completed task result, give a brief final "
+                "answer. Read images only when asked."},
+               {"role": "user", "content": [
+                   {"type": "input_text", "text": "Check task demo with bg_status."},
+                   image_part("text.png", "responses"),
+                   image_part("spatial.png", "responses")]}]
+    previous_input = []
+    frontier = 0
+
+    def run(label):
+        nonlocal previous_input, frontier
+        serialized = [json.dumps(item, sort_keys=True) for item in history]
+        assert serialized[:len(previous_input)] == previous_input, \
+            label + ": preceding input changed"
+        previous_input = serialized
+        reasoning = {"effort": "medium"}
+        if args.reasoning_replay != "summary-off":
+            reasoning["summary"] = "auto"
+        body = {"model": args.model, "input": history, "tools": tools,
+                "reasoning": reasoning, "stream": True, "store": False,
+                "temperature": 0, "max_output_tokens": 4096}
+        request = urllib.request.Request(
+            args.url.rstrip("/") + "/v1/responses",
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"})
+        started = time.monotonic()
+        first_delta = None
+        reply = None
+        with urllib.request.urlopen(request, timeout=300) as stream:
+            for raw in stream:
+                if not raw.startswith(b"data:"):
+                    continue
+                data = raw[5:].strip()
+                if data == b"[DONE]":
+                    continue
+                event = json.loads(data)
+                kind = event.get("type", "")
+                if first_delta is None and kind.endswith(".delta"):
+                    first_delta = time.monotonic() - started
+                assert kind not in ("error", "response.failed"), event
+                if kind in ("response.completed", "response.incomplete"):
+                    reply = event["response"]
+        assert reply and reply.get("status") == "completed", (label, reply)
+        usage = reply["usage"]
+        cached = usage.get("input_tokens_details", {}).get("cached_tokens", 0)
+        print(json.dumps({"mode": args.reasoning_replay, "turn": label,
+                          "input_items": len(history), "cached_tokens": cached,
+                          "input_tokens": usage["input_tokens"],
+                          "evaluated_tokens": usage["input_tokens"] - cached,
+                          "first_delta_seconds": first_delta,
+                          "wall_seconds": time.monotonic() - started}), flush=True)
+        assert cached >= frontier, (label, "lost live frontier", cached, frontier)
+        frontier = usage["input_tokens"] + usage["output_tokens"]
+        return reply["output"]
+
+    first = run("tool-call-with-images")
+    calls = [item for item in first if item.get("type") == "function_call"]
+    assert len(calls) == 1 and calls[0]["name"] == "bg_status", first
+    history.extend(first)
+    # Synthetic tool result: no background task is launched or executed.
+    history.append({"type": "function_call_output", "call_id": calls[0]["call_id"],
+                    "output": [{"type": "input_text", "text":
+                                "Task demo completed successfully. Give a brief final answer now."}]
+                    + [image_part(name, "responses") for name in
+                       ("text.png", "spatial.png", "text.png", "spatial.png")]})
+    final = run("tool-result-to-final")
+    assert any(item.get("type") == "message" for item in final), final
+    assert not any(item.get("type") == "function_call" for item in final), final
+    if args.reasoning_replay != "summary-off":
+        assert any(item.get("type") == "reasoning" and item.get("summary")
+                   for item in final), "final answer did not emit a reasoning summary"
+    if args.reasoning_replay == "omit":
+        final = [item for item in final if item.get("type") != "reasoning"]
+    history.extend(final)
+    history.append({"role": "user", "content": [{"type": "input_text", "text":
+                    "Continue the active /goal until completion or a genuine blocker. "
+                    "Current goal #9: Check task demo with bg_status.\n\n[goal-continuation:9]"}]})
+    log_offset = args.log.stat().st_size if args.log else 0
+    run("continue-after-final")
+    if args.log:
+        with args.log.open("rb") as log:
+            log.seek(log_offset)
+            lines = log.read().decode(errors="replace")
+        assert re.search(r"responses live continuation .*match=visible-prefix", lines), \
+            "final continuation did not use the Responses-visible live tier: " + lines[-2000:]
+    print("PASS: final-answer replay retains six image prefixes (" +
+          args.reasoning_replay + ")", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", default="http://127.0.0.1:8080")
     parser.add_argument("--model", default="deepseek-v4-flash")
-    parser.add_argument("--section", choices=["eviction", "tool-409"], required=True)
+    parser.add_argument("--section", choices=["eviction", "tool-409", "responses-final"], required=True)
+    parser.add_argument("--reasoning-replay", choices=["preserve", "omit", "summary-off"],
+                        default="preserve", help="Responses final-answer replay mode")
     parser.add_argument("--log", type=Path,
-                        help="server stderr log, for the eviction assertions")
+                        help="server log, for eviction or Responses-visible tier assertions")
     args = parser.parse_args()
     if args.section == "eviction":
         eviction_section(args)
+    elif args.section == "responses-final":
+        responses_final_section(args)
     else:
         tool_409_section(args)
 
