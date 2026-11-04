@@ -18,6 +18,12 @@ Provide PR including your numbers if your hardware was not already tested.
 Call the benchmark csv file something like `m3_max.csv` or alike, so that
 it is clear what hardware was used for the benchmark.
 
+On a Strix Halo / ROCm box, `speed-bench/bench-strix-halo.sh` wraps the sweep
+above: it captures the environment (ROCm version, gfx target, GTT totals, kernel
+and boot cmdline, commit, binary hash), refuses to measure unless the box is
+otherwise idle, then writes the CSV plus a `.meta.json` and, optionally, an
+eval run (`--eval-suite`, defaulting to the fast `hard-smoke`).
+
 To generate an SVG graph from a CSV file:
 
 ```
