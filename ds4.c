@@ -7441,7 +7441,8 @@ static uint64_t deepseek4_vision_required_offset(
 
 static void deepseek4_vision_weights_bind(
         ds4_deepseek4_vision_weights *w,
-        const ds4_model *m) {
+        const ds4_model *m,
+        const ds4_model *language) {
     const bool v41 = DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41;
     const char *revision = v41 ? "df42c109f1defefcbfcedbe7d905718a12266e40" :
                                 "e46e16bf6035c6f317eb2ac7458eb0362926d402";
@@ -7451,8 +7452,28 @@ static void deepseek4_vision_weights_bind(
         !ds4_streq(arch, "deepseek4-vision")) {
         ds4_die("--vision file is not a DeepSeek V4 vision encoder GGUF");
     }
-    if (!model_get_string(m, "general.source.revision", &source_revision) ||
-        !ds4_streq(source_revision, revision) ||
+    /* The encoder must come from the language GGUF's own checkpoint: V4.1
+     * releases ship new vision weights (1017 changed every vision tensor), so
+     * a sidecar from another revision loads but encodes images for the wrong
+     * model. Match the language model's recorded revision; fall back to the
+     * pinned release only when the language GGUF records none. */
+    ds4_str language_revision = {0};
+    const bool language_has_revision = v41 && language &&
+        model_get_string(language, "general.source.revision", &language_revision);
+    if (!model_get_string(m, "general.source.revision", &source_revision)) {
+        ds4_die("DeepSeek vision sidecar does not record its source revision");
+    }
+    if (language_has_revision &&
+        (source_revision.len != language_revision.len ||
+         memcmp(source_revision.ptr, language_revision.ptr, source_revision.len) != 0)) {
+        fprintf(stderr, "ds4: vision sidecar revision %.*s, language model revision %.*s\n",
+                (int)source_revision.len, (const char *)source_revision.ptr,
+                (int)language_revision.len, (const char *)language_revision.ptr);
+        ds4_die("DeepSeek vision sidecar was converted from a different checkpoint; "
+                "convert it with gguf-tools/deepseek41_vision.py --source-revision "
+                "matching the language GGUF");
+    }
+    if ((!language_has_revision && !ds4_streq(source_revision, revision)) ||
         !model_get_string(m, "deepseek4-vision.checkpoint_variant", &variant) ||
         !ds4_streq(variant, v41 ? "v4.1-flash" : "vision-exp")) {
         ds4_die("DeepSeek vision sidecar does not match the language checkpoint");
@@ -73995,7 +74016,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
             e->vision_kind = DS4_VISION_QWEN4;
         } else {
             deepseek4_vision_weights_bind(
-                    &e->deepseek4_vision_weights, &e->vision_model);
+                    &e->deepseek4_vision_weights, &e->vision_model, &e->model);
             e->vision_start_token = DS4_N_VOCAB +
                                     DS4_DEEPSEEK4_IMAGE_START;
             e->vision_image_token = DS4_N_VOCAB +

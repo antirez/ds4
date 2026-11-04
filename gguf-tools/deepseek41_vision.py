@@ -3,10 +3,15 @@
 
 All 266 tensors remain BF16, byte for byte. Visual router biases are already
 part of the language GGUF produced by deepseek41_quantize.py.
+
+The sidecar records the source revision it was converted from; ds4 requires it
+to match the revision recorded by the language GGUF it is loaded with, so
+convert both from the same checkpoint and pass the same --source-revision.
 """
 
 import argparse
 import json
+import re
 from pathlib import Path
 import sys
 
@@ -72,7 +77,7 @@ def build_plan(db):
     return plan
 
 
-def sidecar_metadata(hf_dir):
+def sidecar_metadata(hf_dir, revision=SOURCE_REVISION, url=SOURCE_URL):
     config = json.loads((Path(hf_dir) / "config.json").read_text())
     if config.get("model_type") != "deepseek_v41" or config.get("image_token_id") != 129264:
         raise ValueError("expected the DeepSeek V4.1 Flash checkpoint")
@@ -91,8 +96,8 @@ def sidecar_metadata(hf_dir):
         kv_string("general.architecture", prefix),
         kv_string("general.name", "DeepSeek V4.1 Flash Vision Encoder"),
         kv_u32("general.alignment", GGUF_ALIGNMENT),
-        kv_string("general.source.url", SOURCE_URL),
-        kv_string("general.source.revision", SOURCE_REVISION),
+        kv_string("general.source.url", url),
+        kv_string("general.source.revision", revision),
         kv_string(f"{prefix}.checkpoint_variant", "v4.1-flash"),
         kv_f32(f"{prefix}.rope.freq_base", 10000),
         kv_f32(f"{prefix}.attention.layer_norm_rms_epsilon", 1e-6),
@@ -117,10 +122,15 @@ def main():
     output.add_argument("--dry-run", action="store_true")
     parser.add_argument("--verify-payload", action="store_true")
     parser.add_argument("--expected-sha256")
+    parser.add_argument("--source-revision", default=SOURCE_REVISION,
+                        help="checkpoint revision; must match the language GGUF")
+    parser.add_argument("--source-url", default=SOURCE_URL)
     args = parser.parse_args()
+    if not re.fullmatch(r"[0-9a-f]{40}", args.source_revision):
+        parser.error("source revision must be a full commit hash")
     if (args.verify_payload or args.expected_sha256) and not args.validate:
         parser.error("--verify-payload and --expected-sha256 require --validate")
-    records = sidecar_metadata(args.hf)
+    records = sidecar_metadata(args.hf, args.source_revision, args.source_url)
     db = SourceDB(args.hf, validate_inventory, lambda _: None)
     try:
         plan = build_plan(db)
