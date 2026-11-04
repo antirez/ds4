@@ -37488,7 +37488,9 @@ struct ds4_glm_gpu_graph;
 static bool imatrix_collect_glm_one(
         ds4_imatrix_collector      *c,
         struct ds4_glm_gpu_graph   *g,
-        uint32_t                    il);
+        uint32_t                    il,
+        const ds4_gpu_tensor       *ffn_norm,
+        const ds4_gpu_tensor       *ffn_mid);
 
 static bool imatrix_collector_init(ds4_imatrix_collector *c, uint32_t cap_tokens, const char *dataset_path) {
     memset(c, 0, sizeof(*c));
@@ -37527,33 +37529,13 @@ static float *imatrix_down_ptr(ds4_imatrix_collector *c, uint32_t il, uint32_t e
     return c->down_sum2 + ((size_t)il * DS4_N_EXPERT + expert) * DS4_N_FF_EXP;
 }
 
-static bool imatrix_collect_tensor_batch(
+/* Accumulate one layer from the host copies already in c->ffn_norm_buf,
+ * c->routed_mid_buf (or c->routed_mid_f16_buf) and c->selected_buf. */
+static void imatrix_accumulate_host_batch(
         ds4_imatrix_collector *c,
-        ds4_gpu_tensor        *ffn_norm,
-        ds4_gpu_tensor        *routed_mid,
-        ds4_gpu_tensor        *router_selected,
         bool                   routed_mid_is_f16,
         uint32_t               il,
         uint32_t               n_tokens) {
-    if (!c || n_tokens == 0) return true;
-    if (!ffn_norm || !routed_mid || !router_selected ||
-        n_tokens > c->cap_tokens) return false;
-
-    const uint64_t norm_bytes = (uint64_t)n_tokens * DS4_N_EMBD * sizeof(float);
-    const uint64_t mid_elems = (uint64_t)n_tokens * DS4_N_EXPERT_USED * DS4_N_FF_EXP;
-    const uint64_t mid_bytes = mid_elems *
-        (routed_mid_is_f16 ? sizeof(uint16_t) : sizeof(float));
-    const uint64_t sel_bytes = (uint64_t)n_tokens * DS4_N_EXPERT_USED * sizeof(int);
-    void *mid_dst = routed_mid_is_f16
-        ? (void *)c->routed_mid_f16_buf
-        : (void *)c->routed_mid_buf;
-    if (ds4_gpu_tensor_read(ffn_norm, 0, c->ffn_norm_buf, norm_bytes) == 0 ||
-        ds4_gpu_tensor_read(routed_mid, 0, mid_dst, mid_bytes) == 0 ||
-        ds4_gpu_tensor_read(router_selected, 0, c->selected_buf, sel_bytes) == 0)
-    {
-        return false;
-    }
-
     for (uint32_t t = 0; t < n_tokens; t++) {
         const float *x = c->ffn_norm_buf + (size_t)t * DS4_N_EMBD;
         for (uint32_t i = 0; i < DS4_N_EMBD; i++) c->sq_tmp[i] = x[i] * x[i];
@@ -37584,6 +37566,35 @@ static bool imatrix_collect_tensor_batch(
     }
     c->observed_tokens += n_tokens;
     c->chunks++;
+}
+
+static bool imatrix_collect_tensor_batch(
+        ds4_imatrix_collector *c,
+        const ds4_gpu_tensor  *ffn_norm,
+        const ds4_gpu_tensor  *routed_mid,
+        const ds4_gpu_tensor  *router_selected,
+        bool                   routed_mid_is_f16,
+        uint32_t               il,
+        uint32_t               n_tokens) {
+    if (!c || n_tokens == 0) return true;
+    if (!ffn_norm || !routed_mid || !router_selected ||
+        n_tokens > c->cap_tokens) return false;
+
+    const uint64_t norm_bytes = (uint64_t)n_tokens * DS4_N_EMBD * sizeof(float);
+    const uint64_t mid_elems = (uint64_t)n_tokens * DS4_N_EXPERT_USED * DS4_N_FF_EXP;
+    const uint64_t mid_bytes = mid_elems *
+        (routed_mid_is_f16 ? sizeof(uint16_t) : sizeof(float));
+    const uint64_t sel_bytes = (uint64_t)n_tokens * DS4_N_EXPERT_USED * sizeof(int);
+    void *mid_dst = routed_mid_is_f16
+        ? (void *)c->routed_mid_f16_buf
+        : (void *)c->routed_mid_buf;
+    if (ds4_gpu_tensor_read(ffn_norm, 0, c->ffn_norm_buf, norm_bytes) == 0 ||
+        ds4_gpu_tensor_read(routed_mid, 0, mid_dst, mid_bytes) == 0 ||
+        ds4_gpu_tensor_read(router_selected, 0, c->selected_buf, sel_bytes) == 0)
+    {
+        return false;
+    }
+    imatrix_accumulate_host_batch(c, routed_mid_is_f16, il, n_tokens);
     return true;
 }
 
@@ -37726,11 +37737,15 @@ static void imatrix_collector_report_coverage(
     uint32_t max_samples = 0;
     uint32_t under_four = 0;
     uint32_t under_eight = 0;
+    uint64_t min_routes = UINT64_MAX;
+    uint64_t max_routes = 0;
     if (layer_limit > DS4_N_LAYER) layer_limit = DS4_N_LAYER;
     for (uint32_t il = 0; il < layer_limit; il++) {
         if (!weights->layer[il].ffn_gate_exps) continue;
         uint32_t layer_covered = 0;
+        uint64_t layer_routes = 0;
         for (uint32_t expert = 0; expert < DS4_N_EXPERT; expert++) {
+            layer_routes += c->gate_up_count[il][expert];
             uint32_t samples = c->gate_up_count[il][expert];
             if (c->down_count[il][expert] < samples) {
                 samples = c->down_count[il][expert];
@@ -37744,6 +37759,8 @@ static void imatrix_collector_report_coverage(
             if (samples < 8) under_eight++;
         }
         layers++;
+        if (layer_routes < min_routes) min_routes = layer_routes;
+        if (layer_routes > max_routes) max_routes = layer_routes;
         covered += layer_covered;
         possible += DS4_N_EXPERT;
         if (layer_covered < min_layer) min_layer = layer_covered;
@@ -37752,6 +37769,7 @@ static void imatrix_collector_report_coverage(
     if (layers == 0) {
         min_layer = 0;
         min_samples = 0;
+        min_routes = 0;
     }
     fprintf(stderr,
             "ds4: imatrix expert coverage %u/%u (%.2f%%), "
@@ -37766,6 +37784,10 @@ static void imatrix_collector_report_coverage(
             max_samples,
             under_four,
             under_eight);
+    fprintf(stderr,
+            "ds4: imatrix routes per sparse layer min=%llu max=%llu\n",
+            (unsigned long long)min_routes,
+            (unsigned long long)max_routes);
     if (under_eight != 0) {
         uint32_t shown = 0;
         fprintf(stderr, "ds4: imatrix expert slots under 8 samples:");
@@ -47444,6 +47466,10 @@ typedef struct ds4_glm_gpu_graph {
     bool generic_routed_moe;
     bool glm53;
     ds4_imatrix_collector *imatrix;
+    /* imatrix: per-layer GPU copies of the routed-MoE inputs, encoded in
+     * stream order and drained on the host once the token has completed. */
+    ds4_gpu_tensor *imatrix_stage;
+    bool imatrix_staged[DS4_MAX_LAYER];
     ds4_gpu_tensor *directional_steering_dirs_by_tier[DS4_MAX_GPUS];
     float directional_steering_attn_scale;
     float directional_steering_ffn_scale;
@@ -47579,15 +47605,65 @@ static bool glm_graph_apply_directional_steering_ffn(
 static bool imatrix_collect_glm_one(
         ds4_imatrix_collector    *c,
         struct ds4_glm_gpu_graph *g,
-        uint32_t                  il) {
-    if (!g || il >= DS4_N_LAYER) return false;
-    return imatrix_collect_tensor_batch(c,
-                                        g->ffn_norm,
-                                        g->ffn_mid,
-                                        g->router_selected,
-                                        false,
-                                        il,
-                                        1);
+        uint32_t                  il,
+        const ds4_gpu_tensor     *ffn_norm,
+        const ds4_gpu_tensor     *ffn_mid) {
+    if (!c || !g || !ffn_norm || !ffn_mid || il >= DS4_N_LAYER) return false;
+    /* The routed dispatch above is only encoded, and ffn_norm, ffn_mid and
+     * router_selected are scratch tensors that every sparse layer reuses.  A
+     * host read here would see stale data (ds4_gpu_tensor_read() does not wait
+     * for queued work), so snapshot them on the GPU in stream order and let
+     * imatrix_collect_glm_token() accumulate after the token completes. */
+    const uint64_t norm_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+    const uint64_t mid_bytes = (uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(float);
+    const uint64_t sel_bytes = (uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t);
+    const uint64_t stride = norm_bytes + mid_bytes + sel_bytes;
+    if (!g->imatrix_stage) {
+        g->imatrix_stage = ds4_gpu_tensor_alloc((uint64_t)DS4_N_LAYER * stride);
+        if (!g->imatrix_stage) return false;
+    }
+    const uint64_t off = (uint64_t)il * stride;
+    if (!ds4_gpu_commands_active() && ds4_gpu_begin_commands() == 0) return false;
+    if (ds4_gpu_tensor_copy(g->imatrix_stage, off, ffn_norm, 0, norm_bytes) == 0 ||
+        ds4_gpu_tensor_copy(g->imatrix_stage, off + norm_bytes,
+                            ffn_mid, 0, mid_bytes) == 0 ||
+        ds4_gpu_tensor_copy(g->imatrix_stage, off + norm_bytes + mid_bytes,
+                            g->router_selected, 0, sel_bytes) == 0) {
+        return false;
+    }
+    g->imatrix_staged[il] = true;
+    return true;
+}
+
+/* Called after glm_graph_forward_token(): accumulate every layer staged by
+ * imatrix_collect_glm_one() for that token. */
+static bool imatrix_collect_glm_token(
+        ds4_imatrix_collector    *c,
+        struct ds4_glm_gpu_graph *g) {
+    if (!c || !g) return false;
+    if (ds4_gpu_synchronize() == 0) return false;
+    const uint64_t norm_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+    const uint64_t mid_bytes = (uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(float);
+    const uint64_t sel_bytes = (uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t);
+    const uint64_t stride = norm_bytes + mid_bytes + sel_bytes;
+    bool ok = true;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (!g->imatrix_staged[il]) continue;
+        g->imatrix_staged[il] = false;
+        const uint64_t off = (uint64_t)il * stride;
+        if (!ok ||
+            ds4_gpu_tensor_read(g->imatrix_stage, off,
+                                c->ffn_norm_buf, norm_bytes) == 0 ||
+            ds4_gpu_tensor_read(g->imatrix_stage, off + norm_bytes,
+                                c->routed_mid_buf, mid_bytes) == 0 ||
+            ds4_gpu_tensor_read(g->imatrix_stage, off + norm_bytes + mid_bytes,
+                                c->selected_buf, sel_bytes) == 0) {
+            ok = false;
+            continue;
+        }
+        imatrix_accumulate_host_batch(c, false, il, 1);
+    }
+    return ok;
 }
 
 static bool glm_graph_reset_kda_state(ds4_glm_gpu_graph *g) {
@@ -49308,6 +49384,7 @@ static void glm_graph_free(ds4_glm_gpu_graph *g) {
     ds4_gpu_tensor_free(g->output_norm);
     ds4_gpu_tensor_free(g->router_weights);
     ds4_gpu_tensor_free(g->router_selected);
+    ds4_gpu_tensor_free(g->imatrix_stage);
     ds4_gpu_tensor_free(g->router_probs);
     ds4_gpu_tensor_free(g->router_logits);
     ds4_gpu_tensor_free(g->ffn_sum);
@@ -51479,7 +51556,7 @@ static bool glm_graph_encode_sparse_ffn_one(
     }
     if (ok && g->imatrix &&
         !(glm_decode_ablate_mask() & DS4_GLM_ABLATE_ROUTED)) {
-        ok = imatrix_collect_glm_one(g->imatrix, g, il);
+        ok = imatrix_collect_glm_one(g->imatrix, g, il, ffn_norm, ffn_mid);
     }
     if (ok && tp_split_ffn) {
         ok = ds4_gpu_tp_gate_encode(il, DS4_TP_GATE_FFN) != 0;
@@ -66999,6 +67076,7 @@ static int ds4_engine_collect_sequential_imatrix(
     bool sample_target_reached = false;
     char *cursor = dataset;
     const char *marker_lit = "===== DS4_IMATRIX_PROMPT";
+    const double t_start = now_sec();
     while (ok && *cursor) {
         char *start = cursor;
         char *marker = imatrix_find_marker(dataset, cursor, marker_lit);
@@ -67045,6 +67123,7 @@ static int ds4_engine_collect_sequential_imatrix(
                                                  NULL,
                                                  NULL,
                                                  false);
+                    if (ok && !v41) ok = imatrix_collect_glm_token(&collector, &g);
                     if (ok && ((pos + 1) % 16 == 0 || pos + 1 == prompt.len)) {
                         fprintf(stderr, "ds4: %s imatrix prompt %d: %d/%d tokens\r",
                                 name, prompts_done + 1, pos + 1, prompt.len);
@@ -67084,6 +67163,7 @@ static int ds4_engine_collect_sequential_imatrix(
         if (max_tokens > 0 && tokens_done >= max_tokens) break;
     }
     fputc('\n', stderr);
+    const double elapsed = now_sec() - t_start;
 
     g.imatrix = NULL;
     if (tokens_done == 0) {
@@ -67108,11 +67188,13 @@ static int ds4_engine_collect_sequential_imatrix(
     if (ok) {
         fprintf(stderr,
                 "ds4: wrote %s imatrix %s from %d prompts, %d tokens, "
-                "%llu routes\n",
+                "%llu routes (%.1f s, %.2f tokens/s)\n",
                 name, output_path,
                 prompts_done,
                 tokens_done,
-                (unsigned long long)collector.observed_routes);
+                (unsigned long long)collector.observed_routes,
+                elapsed,
+                elapsed > 0.0 ? (double)tokens_done / elapsed : 0.0);
     }
     imatrix_collector_free(&collector);
     glm_graph_free(&g);
