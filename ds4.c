@@ -80150,6 +80150,11 @@ int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p
                               top_p, min_p, rng, s->sample_probs);
 }
 
+/* Exclude one token from the next sample/argmax of this session. */
+void ds4_session_mask_token(ds4_session *s, int id) {
+    if (s && s->logits && id >= 0 && id < (int)DS4_N_VOCAB) s->logits[id] = DS4_NEG_INF;
+}
+
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
     if (!s || !out || k <= 0) return 0;
     if (k > (int)DS4_N_VOCAB) k = (int)DS4_N_VOCAB;
