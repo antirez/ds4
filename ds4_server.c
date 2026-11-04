@@ -10043,6 +10043,12 @@ struct server_slot {
     char *live_text;
     size_t live_text_len;
     int live_text_pos;              /* checkpoint.len at render time; 0 = stale */
+    /* --image-prefix-snapshot: the session state at the chat anchor (the text
+     * before the last user message) of the last image request, so stateless
+     * image requests sharing a system prompt restore it instead of a full
+     * prefill.  image_prefix_tokens.len == 0 means no snapshot. */
+    ds4_session_snapshot image_prefix_snap;
+    ds4_tokens image_prefix_tokens;
 
     job *assigned;
     job *running;
@@ -10172,6 +10178,7 @@ struct server {
     tool_memory tool_mem;
     server_image_cache image_cache; /* Protected by inference_mu. */
     bool disable_exact_dsml_tool_replay;
+    bool image_prefix_snapshot;
     bool enable_cors;
     pthread_mutex_t tool_mu;
     pthread_mutex_t kv_mu;
@@ -13409,6 +13416,115 @@ static void *decode_worker_main(void *arg) {
     return NULL;
 }
 
+/* --image-prefix-snapshot.  Stateless image requests (one photo per request
+ * behind a long fixed system prompt) never reuse KV: the live gate refuses a
+ * slot whose image differs, the recurrent state cannot rewind to the text
+ * before the image, and disk checkpoints are disabled for multimodal
+ * requests.  Keep one in-memory snapshot per slot of the session at the chat
+ * anchor -- everything before the last user message, the same boundary the
+ * disk cache uses for cold text prompts -- and restore it when the next image
+ * request renders the identical prefix.  The snapshot is taken from a
+ * text-only sync, so it carries no image state. */
+/* Position of the snapshot boundary: the last message-start marker before
+ * the first image token, or 0 when there is none at or past min_tokens.
+ * With role tokens (DeepSeek) that is the last user marker, and the scan
+ * stops at the first assistant marker like the disk cache's chat anchor.
+ * ChatML (Qwen) has no dedicated role tokens: every message opens with
+ * <|im_start|>, so the boundary is the last one before the image. */
+static int image_prefix_anchor_pos(const ds4_tokens *prompt,
+                                   uint32_t first_image,
+                                   int user, int assistant, int im_start,
+                                   int min_tokens) {
+    if (!prompt) return 0;
+    int anchor = -1;
+    for (int i = 0; i < prompt->len && (uint32_t)i < first_image; i++) {
+        const int token = prompt->v[i];
+        if (user >= 0) {
+            if (token == assistant) break;
+            if (token == user) anchor = i;
+        } else if (im_start >= 0 && token == im_start) {
+            anchor = i;
+        }
+    }
+    if (anchor < min_tokens || anchor >= prompt->len) return 0;
+    return anchor;
+}
+
+static int image_prefix_anchor(server *s, const request *req) {
+    if (!s || !req || !req->image_count || !req->images) return 0;
+    uint32_t first_image = UINT32_MAX;
+    for (size_t i = 0; i < req->image_count; i++) {
+        if (req->images[i].token_start < first_image)
+            first_image = req->images[i].token_start;
+    }
+    const int min_tokens = s->kv.opt.min_tokens > 0 ? s->kv.opt.min_tokens : 512;
+    return image_prefix_anchor_pos(&req->prompt, first_image,
+                                   ds4_token_user(s->engine),
+                                   ds4_token_assistant(s->engine),
+                                   ds4_token_im_start(s->engine),
+                                   min_tokens);
+}
+
+static void image_prefix_drop(server_slot *slot) {
+    slot->image_prefix_tokens.len = 0;
+    slot->image_prefix_snap.len = 0;
+}
+
+static int image_prefix_try_restore(server *s, server_slot *slot,
+                                    const ds4_tokens *prompt, int anchor) {
+    if (anchor <= 0 || slot->image_prefix_tokens.len != anchor ||
+        slot->image_prefix_snap.len == 0 || prompt->len < anchor ||
+        memcmp(slot->image_prefix_tokens.v, prompt->v,
+               (size_t)anchor * sizeof(prompt->v[0])) != 0) return 0;
+    char err[160] = {0};
+    const double t0 = now_sec();
+    pthread_mutex_lock(&s->inference_mu);
+    ds4_session_invalidate(slot->session);
+    int rc = ds4_session_load_snapshot(slot->session, &slot->image_prefix_snap,
+                                       err, sizeof(err));
+    const int pos = rc == 0 ? ds4_session_pos(slot->session) : -1;
+    const bool ok = rc == 0 && pos == anchor &&
+                    !ds4_session_has_vision_state(slot->session);
+    if (!ok) ds4_session_invalidate(slot->session);
+    pthread_mutex_unlock(&s->inference_mu);
+    if (!ok) {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: image prefix snapshot restore failed tokens=%d pos=%d: %s",
+                   anchor, pos, err[0] ? err : "state mismatch");
+        image_prefix_drop(slot);
+        return 0;
+    }
+    server_log(DS4_LOG_KVCACHE,
+               "ds4-server: image prefix snapshot restored tokens=%d load=%.1f ms",
+               anchor, (now_sec() - t0) * 1000.0);
+    return anchor;
+}
+
+static void image_prefix_save(server *s, server_slot *slot,
+                              const ds4_tokens *prompt, int anchor) {
+    char err[160] = {0};
+    const double t0 = now_sec();
+    pthread_mutex_lock(&s->inference_mu);
+    const bool ok = ds4_session_pos(slot->session) == anchor &&
+                    !ds4_session_has_vision_state(slot->session) &&
+                    ds4_session_save_snapshot(slot->session,
+                                              &slot->image_prefix_snap,
+                                              err, sizeof(err)) == 0;
+    pthread_mutex_unlock(&s->inference_mu);
+    if (!ok) {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: image prefix snapshot not saved tokens=%d: %s",
+                   anchor, err[0] ? err : "session not at the anchor");
+        image_prefix_drop(slot);
+        return;
+    }
+    tokens_copy_prefix(&slot->image_prefix_tokens, prompt, anchor);
+    server_log(DS4_LOG_KVCACHE,
+               "ds4-server: image prefix snapshot saved tokens=%d size=%.2f MiB save=%.1f ms",
+               anchor, (double)slot->image_prefix_snap.len / (1024.0 * 1024.0),
+               (now_sec() - t0) * 1000.0);
+}
+
 /* Execute one request on the worker-owned session.
  *
  * Clients resend full prompts as text.  The worker first tries the old exact
@@ -13640,6 +13756,18 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             prompt_for_sync = &effective_prompt;
         }
     }
+    int image_prefix_store_len = 0;
+    if (multimodal && cached == 0 && s->image_prefix_snapshot) {
+        const int anchor = image_prefix_anchor(s, &j->req);
+        const int restored = image_prefix_try_restore(s, slot, &j->req.prompt,
+                                                      anchor);
+        if (restored > 0) {
+            cached = restored;
+            cache_source = "image-prefix";
+        } else {
+            image_prefix_store_len = anchor;
+        }
+    }
     const bool responses_reasoning_state_preserved =
         cached > 0 &&
         ((!strcmp(cache_source, "responses-visible") ||
@@ -13783,6 +13911,40 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                                              cold_store_len);
             suppressed_continued_last = -1;
         }
+        ds4_tokens_free(&prefix);
+    }
+
+    if (image_prefix_store_len > 0 && cached == 0 &&
+        image_prefix_store_len < prompt_for_sync->len)
+    {
+        /* Prefill the text before the last user message on its own, snapshot
+         * it, then let the multimodal sync resume from that frontier.  Drop
+         * stale image state first so the text sync cannot mistake the old
+         * image-conditioned rows for a reusable prefix. */
+        pthread_mutex_lock(&s->inference_mu);
+        if (ds4_session_has_vision_state(slot->session))
+            ds4_session_invalidate(slot->session);
+        pthread_mutex_unlock(&s->inference_mu);
+        ds4_tokens prefix = {0};
+        tokens_copy_prefix(&prefix, prompt_for_sync, image_prefix_store_len);
+        const int prefix_rc = server_session_sync(s, slot, &prefix, err, sizeof(err));
+        if (prefix_rc != 0) {
+            ds4_tokens_free(&prefix);
+            ds4_tokens_free(&effective_prompt);
+            ds4_session_set_progress(slot->session, NULL, NULL);
+            ds4_session_set_display_progress(slot->session, NULL, NULL);
+            free(disk_cache_path);
+            image_prefix_drop(slot);
+            if (job_cancelled(j)) {
+                request_live_state_clear(s, slot);
+                trace_event(s, trace_id, "cancelled during prefill");
+                return;
+            }
+            trace_event(s, trace_id, "prefill failed: %s", err);
+            send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
+            return;
+        }
+        image_prefix_save(s, slot, &prefix, image_prefix_store_len);
         ds4_tokens_free(&prefix);
     }
 
@@ -15460,6 +15622,7 @@ typedef struct {
     kv_cache_options kv_cache;
     bool kv_cache_reject_different_quant;
     bool disable_exact_dsml_tool_replay;
+    bool image_prefix_snapshot;
     int tool_memory_max_ids;
     bool enable_cors;
     int batched_sessions;
@@ -15549,6 +15712,8 @@ static void server_close_resources(server *s) {
         live_tool_state_free(&slot->anthropic_live);
         visible_live_free(&slot->thinking_live);
         free(slot->live_text);
+        ds4_session_snapshot_free(&slot->image_prefix_snap);
+        ds4_tokens_free(&slot->image_prefix_tokens);
         if (slot->session) ds4_session_free(slot->session);
     }
     free(s->slot_threads);
@@ -15726,6 +15891,8 @@ static server_config parse_options(int argc, char **argv) {
             c.kv_cache_reject_different_quant = true;
         } else if (!strcmp(arg, "--disable-exact-dsml-tool-replay")) {
             c.disable_exact_dsml_tool_replay = true;
+        } else if (!strcmp(arg, "--image-prefix-snapshot")) {
+            c.image_prefix_snapshot = true;
         } else if (!strcmp(arg, "--tool-memory-max-ids")) {
             c.tool_memory_max_ids = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--quality")) {
@@ -15982,6 +16149,7 @@ int main(int argc, char **argv) {
     s.last_prefill_slot = slot_count - 1;
     s.default_tokens = cfg.default_tokens;
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
+    s.image_prefix_snapshot = cfg.image_prefix_snapshot;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
     s.slots = xmalloc((size_t)slot_count * sizeof(*s.slots));
@@ -21663,6 +21831,72 @@ static void test_kv_cache_chat_anchor_ignores_multiturn_tail(void) {
     ds4_tokens_free(&prompt);
 }
 
+static void test_image_prefix_anchor_chatml_uses_last_im_start_before_image(void) {
+    const int im_start = 9003;
+    ds4_tokens prompt = {0};
+    ds4_tokens_push(&prompt, im_start); /* system */
+    ds4_tokens_push(&prompt, 1);
+    ds4_tokens_push(&prompt, 2);
+    ds4_tokens_push(&prompt, 3);
+    ds4_tokens_push(&prompt, im_start); /* user message holding the image */
+    ds4_tokens_push(&prompt, 4);
+    ds4_tokens_push(&prompt, 5);        /* first image token */
+    ds4_tokens_push(&prompt, 6);
+    ds4_tokens_push(&prompt, im_start); /* after the image: not a boundary */
+    ds4_tokens_push(&prompt, 7);
+    TEST_ASSERT(image_prefix_anchor_pos(&prompt, 6, -1, -1, im_start, 4) == 4);
+    TEST_ASSERT(image_prefix_anchor_pos(&prompt, 6, -1, -1, im_start, 5) == 0);
+    /* An image inside the system message leaves no prefix to snapshot. */
+    TEST_ASSERT(image_prefix_anchor_pos(&prompt, 4, -1, -1, im_start, 0) == 0);
+    /* The boundary is the marker itself, so an image right after it works. */
+    TEST_ASSERT(image_prefix_anchor_pos(&prompt, 5, -1, -1, im_start, 1) == 4);
+    ds4_tokens_free(&prompt);
+}
+
+static void test_image_prefix_anchor_role_tokens_use_last_user(void) {
+    const int user = 9001;
+    const int assistant = 9002;
+    const int im_start = 9003;
+    ds4_tokens prompt = {0};
+    ds4_tokens_push(&prompt, 1);         /* BOS / system */
+    ds4_tokens_push(&prompt, 2);
+    ds4_tokens_push(&prompt, user);      /* scaffolding user item */
+    ds4_tokens_push(&prompt, 3);
+    ds4_tokens_push(&prompt, im_start);  /* ignored when role tokens exist */
+    ds4_tokens_push(&prompt, user);      /* message holding the image */
+    ds4_tokens_push(&prompt, 4);
+    ds4_tokens_push(&prompt, 5);         /* first image token */
+    ds4_tokens_push(&prompt, assistant);
+    TEST_ASSERT(image_prefix_anchor_pos(&prompt, 7, user, assistant, im_start, 2) == 5);
+    TEST_ASSERT(image_prefix_anchor_pos(&prompt, 7, user, assistant, -1, 2) == 5);
+
+    /* The scan stops at the first assistant marker, as the disk cache does. */
+    ds4_tokens multi = {0};
+    ds4_tokens_push(&multi, 1);
+    ds4_tokens_push(&multi, 2);
+    ds4_tokens_push(&multi, user);       /* first task */
+    ds4_tokens_push(&multi, 3);
+    ds4_tokens_push(&multi, assistant);
+    ds4_tokens_push(&multi, 4);
+    ds4_tokens_push(&multi, user);       /* later turn with the image */
+    ds4_tokens_push(&multi, 5);
+    TEST_ASSERT(image_prefix_anchor_pos(&multi, 7, user, assistant, -1, 2) == 2);
+    TEST_ASSERT(image_prefix_anchor_pos(&multi, 7, user, assistant, -1, 3) == 0);
+
+    ds4_tokens_free(&prompt);
+    ds4_tokens_free(&multi);
+}
+
+static void test_image_prefix_anchor_without_marker_is_zero(void) {
+    ds4_tokens prompt = {0};
+    for (int i = 1; i <= 8; i++) ds4_tokens_push(&prompt, i);
+    TEST_ASSERT(image_prefix_anchor_pos(&prompt, 6, 9001, 9002, 9003, 0) == 0);
+    TEST_ASSERT(image_prefix_anchor_pos(&prompt, 6, -1, -1, 9003, 0) == 0);
+    TEST_ASSERT(image_prefix_anchor_pos(&prompt, 6, -1, -1, -1, 0) == 0);
+    TEST_ASSERT(image_prefix_anchor_pos(NULL, 6, -1, -1, 9003, 0) == 0);
+    ds4_tokens_free(&prompt);
+}
+
 static void test_kv_cache_continued_uses_aligned_frontiers(void) {
     kv_disk_cache kc = {0};
     kc.enabled = true;
@@ -23170,6 +23404,9 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_store_len_uses_configured_boundary();
     test_kv_cache_chat_anchor_uses_last_user_before_assistant();
     test_kv_cache_chat_anchor_ignores_multiturn_tail();
+    test_image_prefix_anchor_chatml_uses_last_im_start_before_image();
+    test_image_prefix_anchor_role_tokens_use_last_user();
+    test_image_prefix_anchor_without_marker_is_zero();
     test_kv_cache_continued_uses_aligned_frontiers();
     test_kv_cache_cold_store_suppresses_duplicate_continued_boundary();
     test_kv_cache_file_size_must_fit_budget();

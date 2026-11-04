@@ -46265,6 +46265,10 @@ int ds4_token_assistant(ds4_engine *e) {
     return e->vocab.assistant_id;
 }
 
+int ds4_token_im_start(ds4_engine *e) {
+    return e->vocab.im_start_id;
+}
+
 static inline void argmax_f32_unrolled8_range(
         const float *logits,
         uint32_t     begin,

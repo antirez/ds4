@@ -392,6 +392,7 @@ bool ds4_token_is_stop_for_think_mode(ds4_engine *e,
                                       ds4_think_mode mode);
 int ds4_token_user(ds4_engine *e);
 int ds4_token_assistant(ds4_engine *e);
+int ds4_token_im_start(ds4_engine *e); /* -1 unless ChatML (Qwen) */
 
 /* Tensor-parallel binding: allocates the GPU gate slab, registers it with
  * the transport and arms the per-layer gate machinery.  Call once, after
