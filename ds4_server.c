@@ -14388,9 +14388,25 @@ decode_again:
                 snprintf(err, sizeof(err), "invalid tool call recovery failed: %s",
                          recovery_err[0] ? recovery_err : "unknown error");
             } else {
-                finish = "error";
-                snprintf(err, sizeof(err), "unterminated tool call (%s; token=%d, generated=%d, limit=%d)",
-                         stop_detail, stop_token, completion, max_tokens);
+                /* An envelope the model opened and never closed is a model
+                 * output shape, not a server fault, and not an executable
+                 * call.  Leave finish alone so the parse-failure recovery
+                 * below handles this the same way it handles an envelope it
+                 * cannot execute: setting finish = "error" here makes the
+                 * parser refuse to recover (it skips recovery when finish is
+                 * already "error"), which is right for a genuine fault and
+                 * wrong for this one.  Faults keep their error - the
+                 * enclosing guard excludes finish == "error" and "length",
+                 * and the continuation route above still handles a failed
+                 * session append. */
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: chat ctx=%s%s%s unterminated tool call; deferring to parse-failure recovery (%s; token=%d, generated=%d, limit=%d)",
+                           ctx_span,
+                           req_flags[0] ? " " : "",
+                           req_flags,
+                           stop_detail, stop_token, completion, max_tokens);
+                trace_event(s, trace_id,
+                            "unterminated tool call; deferring to parse-failure recovery");
             }
         }
         buf_free(&repaired);
@@ -19707,6 +19723,47 @@ static void test_incomplete_tool_call_keeps_stop_reason(void) {
     }
 }
 
+/* The generator no longer labels an opened-but-never-closed envelope as
+ * finish == "error" (that made this parser refuse to recover, and every API
+ * shape rendered the turn as a server fault: finish_reason "error",
+ * status "failed", or — on Anthropic — a silent end_turn).  With the
+ * generator's new shape, finish stays NULL and the same input follows the
+ * parse-failure recovery: recovered == true, no executable calls, raw text
+ * kept as the assistant fallback. */
+static void test_unterminated_envelope_recovers_when_finish_unset(void) {
+    const char *raw =
+        DS4_TOOL_CALLS_START DS4_INVOKE_START " name=\"write\">"
+        DS4_PARAM_START " name=\"content\" string=\"true\">unfinished";
+    /* (a) The old generator shape: error pre-set blocks recovery — this is
+     *     precisely what the change stops producing. */
+    const char *old_finish = "error";
+    char *content = NULL, *reasoning = NULL;
+    char err[128] = {0};
+    tool_calls calls = {0};
+    bool recovered = false;
+    TEST_ASSERT(!parse_generated_message_for_response_for_syntax(
+        SERVER_MODEL_SYNTAX_DEEPSEEK, raw, true, true, false,
+        &old_finish, err, sizeof(err),
+        &content, &reasoning, &calls, &recovered, NULL));
+    TEST_ASSERT(!recovered);
+    TEST_ASSERT(old_finish && !strcmp(old_finish, "error"));
+    free(content); content = NULL;
+    tool_calls_free(&calls); memset(&calls, 0, sizeof(calls));
+    /* (b) The new generator shape: finish left unset, recovery runs. */
+    const char *new_finish = NULL;
+    recovered = false;
+    TEST_ASSERT(!parse_generated_message_for_response_for_syntax(
+        SERVER_MODEL_SYNTAX_DEEPSEEK, raw, true, true, false,
+        &new_finish, err, sizeof(err),
+        &content, &reasoning, &calls, &recovered, NULL));
+    TEST_ASSERT(recovered && calls.len == 0);
+    TEST_ASSERT(new_finish && !strcmp(new_finish, "stop"));
+    TEST_ASSERT(content && !strcmp(content, raw));
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+}
+
 static void test_invalid_qwen_tool_error_suffix(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
@@ -23107,6 +23164,7 @@ static void ds4_server_unit_tests_run(void) {
     test_invalid_glm_tool_error_suffix();
     test_tool_recovery_output_budget();
     test_incomplete_tool_call_keeps_stop_reason();
+    test_unterminated_envelope_recovers_when_finish_unset();
     test_invalid_qwen_tool_error_suffix();
     test_thinking_dsml_is_not_executable_before_think_close();
     test_thinking_dsml_after_think_close_is_executable();
