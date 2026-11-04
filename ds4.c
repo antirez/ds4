@@ -43789,6 +43789,19 @@ static uint32_t ds41_encoder_chunk_cap(const ds41_gpu_graph *g, uint32_t count) 
     return g->prefill_cap;
 }
 
+#ifndef __APPLE__
+static bool ds41_embed_tokens(ds4_gpu_tensor *out, ds4_gpu_tensor *scratch,
+                               const ds4_gpu_tensor *tokens, const ds4_model *m,
+                               const ds4_tensor *weight, uint32_t count) {
+    if (weight->type == DS4_TENSOR_F16)
+        return ds4_gpu_embed_tokens_hc_tensor(out, tokens, m->map, m->size,
+            weight->abs_offset, DS4_N_VOCAB, count, DS4_N_EMBD, DS4_N_HC);
+    return ds4_gpu_embed_tokens_quant_tensor(scratch, tokens, m->map, m->size,
+            weight->abs_offset, weight->type, DS4_N_VOCAB, count, DS4_N_EMBD) &&
+        ds4_gpu_repeat_hc_rows_tensor(out, scratch, count, DS4_N_EMBD, DS4_N_HC);
+}
+#endif
+
 /* Process rows in causal order within each layer. Selection/candidate rows
  * travel down the stack with their token, while only source layers append KV.
  * A failed partial chunk cannot be snapshotted: its layers have different
@@ -43989,9 +44002,8 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                         for (uint32_t t = 0; t < count; t++) pre[t * DS4_N_HC] = 1;
                         ok = ds4_gpu_tensor_write(g->batch.pre, 0, pre,
                             (uint64_t)count * DS4_N_HC * sizeof(float)) &&
-                            ds4_gpu_embed_tokens_hc_tensor(g->batch.residual, g->prefill_tokens,
-                                m->map, m->size, w->token_embd->abs_offset,
-                                DS4_N_VOCAB, count, DS4_N_EMBD, DS4_N_HC);
+                            ds41_embed_tokens(g->batch.residual, g->batch.x,
+                                g->prefill_tokens, m, w->token_embd, count);
                         free(pre);
                     }
                 } else

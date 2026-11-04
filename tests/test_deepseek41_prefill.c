@@ -126,6 +126,77 @@ done:
     return rc;
 }
 
+#ifndef __APPLE__
+static int check_embedding(void) {
+    enum { VOCAB = 17, DIM = 256, HC = 4, ROWS = 5 };
+    int rc = 1;
+    const uint64_t f16_offset = 64;
+    const uint64_t q8_offset = f16_offset + VOCAB * DIM * 2u;
+    const long page = sysconf(_SC_PAGESIZE);
+    const uint64_t size = align_up(q8_offset + VOCAB * (DIM / 32) * 34u, page);
+    uint8_t *model = MAP_FAILED;
+    ds4_gpu_tensor *tokens = NULL, *scratch = NULL, *out = NULL;
+    const int32_t ids[ROWS] = {3, 0, 16, 7, 1};
+    float actual[ROWS * HC * DIM + 1];
+    CHECK(page > 0);
+    model = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    CHECK(model != MAP_FAILED);
+    for (unsigned row = 0; row < VOCAB; row++) for (unsigned k = 0; k < DIM; k++) {
+        const _Float16 value = (row * 32 + k % 16) / 16.0f;
+        memcpy(model + f16_offset + ((uint64_t)row * DIM + k) * 2u, &value, 2);
+        uint8_t *block = model + q8_offset + ((uint64_t)row * (DIM / 32) + k / 32) * 34u;
+        const uint16_t scale = 0x3800; /* 0.5 */
+        memcpy(block, &scale, 2);
+        block[2 + k % 32] = (uint8_t)(int8_t)((int)((row * 17 + k) % 127) - 63);
+    }
+    g_ds4_shape = DS4_SHAPE_FLASH41;
+    g_ds4_shape.n_vocab = VOCAB;
+    g_ds4_shape.n_embd = DIM;
+    g_ds4_shape.n_hc = HC;
+    CHECK(ds4_gpu_init());
+    /* This tiny fixture should not depend on host-registration support. */
+    CHECK(setenv("DS4_CUDA_COPY_MODEL", "1", 1) == 0);
+    CHECK(ds4_gpu_set_model_map(model, size));
+    tokens = ds4_gpu_tensor_alloc(sizeof(ids));
+    scratch = ds4_gpu_tensor_alloc(ROWS * DIM * sizeof(float));
+    out = ds4_gpu_tensor_alloc(sizeof(actual));
+    CHECK(tokens && scratch && out && ds4_gpu_tensor_write(tokens, 0, ids, sizeof(ids)));
+    const ds4_model m = {.map = model, .size = size};
+    const unsigned counts[] = {1, 3, ROWS};
+    for (unsigned kind = 0; kind < 2; kind++) {
+        const ds4_tensor weight = {.type = kind ? DS4_TENSOR_Q8_0 : DS4_TENSOR_F16,
+            .ndim = 2, .dim = {DIM, VOCAB}, .abs_offset = kind ? q8_offset : f16_offset};
+        for (unsigned c = 0; c < sizeof(counts) / sizeof(*counts); c++) {
+            const unsigned count = counts[c], values = count * HC * DIM;
+            const float canary = 12345;
+            CHECK(ds4_gpu_tensor_write(out, values * sizeof(float), &canary, sizeof(canary)));
+            CHECK(ds4_gpu_begin_commands());
+            CHECK(ds41_embed_tokens(out, scratch, tokens, &m, &weight, count));
+            CHECK(ds4_gpu_end_commands());
+            CHECK(ds4_gpu_tensor_read(out, 0, actual, (values + 1) * sizeof(float)));
+            CHECK(actual[values] == canary);
+            for (unsigned r = 0; r < count; r++) for (unsigned h = 0; h < HC; h++)
+                for (unsigned k = 0; k < DIM; k++) {
+                    const float expected = kind ?
+                        ((int)((ids[r] * 17u + k) % 127u) - 63) * 0.5f :
+                        (ids[r] * 32u + k % 16u) / 16.0f;
+                    CHECK(actual[(r * HC + h) * DIM + k] == expected);
+                }
+            printf("V4.1 %s prefill embedding rows=%u: exact PASS\n",
+                kind ? "Q8_0" : "F16", count);
+        }
+    }
+    rc = 0;
+done:
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(scratch);
+    ds4_gpu_tensor_free(tokens);
+    ds4_gpu_cleanup();
+    if (model != MAP_FAILED) munmap(model, size);
+    return rc;
+}
+#endif
+
 typedef struct {
     ds4_session *session;
     int target, current, frontier;
@@ -405,6 +476,9 @@ done:
 
 int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--dispatch")) return check_dispatch();
+#ifndef __APPLE__
+    if (argc == 2 && !strcmp(argv[1], "--embedding")) return check_embedding();
+#endif
     if (argc == 3) return check_mixed(argv[1], argv[2], NULL, false, PREFILL_METAL);
     if (argc == 4 && !strcmp(argv[1], "--resident"))
         return check_mixed(argv[2], argv[3], NULL, true, PREFILL_METAL);
@@ -427,7 +501,11 @@ int main(int argc, char **argv) {
             !strcmp(argv[1], "--tensor-parallel-cuda-small") ? PREFILL_CUDA_SMALL :
             !strcmp(argv[1], "--tensor-parallel-cuda") ? PREFILL_CUDA : PREFILL_METAL);
     }
-    fprintf(stderr, "usage: %s --dispatch | MODEL LONG_PROMPT_FILE | "
+    fprintf(stderr, "usage: %s --dispatch | "
+#ifndef __APPLE__
+        "--embedding | "
+#endif
+        "MODEL LONG_PROMPT_FILE | "
         "--resident MODEL LONG_PROMPT_FILE | --cuda[-small|-long|-deferred] MODEL LONG_PROMPT_FILE | "
         "--tensor-parallel[-cuda[-small]] MODEL LONG_PROMPT_FILE LISTEN_HOST PORT RDMA_DEVICE GID\n", argv[0]);
     return 2;
