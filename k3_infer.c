@@ -1382,11 +1382,10 @@ static int map_gguf_layer_spans(const k3_context *ctx,
 static int begin_gguf_selected_experts(
         k3_context *ctx,
         const k3_layer *layer,
+        const int32_t *ids,
         char *err,
         size_t errcap) {
     if (!ctx || !layer || !layer->shard) return 0;
-    const int32_t *ids =
-        ds4_gpu_tensor_contents(ctx->scratch.selected_ids);
     if (!ids) {
         set_error(err, errcap,
                   "K3 layer %u selected experts are unavailable",
@@ -4083,9 +4082,15 @@ static int run_moe_ffn(k3_context *ctx,
     if (ctx->model->gguf) {
         /* Batched prefill already reads unique experts in parallel below.
          * Serial read advice here duplicates I/O and delays those reads. */
-        if (!ctx->gguf_resident && rows == 1u &&
-            !begin_gguf_selected_experts(ctx, layer, err, errcap)) {
-            return 0;
+        const int32_t *ready_ids = NULL;
+        if (!ctx->gguf_resident && rows == 1u) {
+            ready_ids = ds4_gpu_tensor_contents(s->selected_ids);
+            if (!begin_gguf_selected_experts(ctx, layer, ready_ids, err, errcap)) return 0;
+            /* The router event has now finished the preceding layer's expert
+             * work. The current static projections only touch pinned spans.
+             * Register the new expert views while their reads are in flight. */
+            if (ctx->gguf_static_layers[layer->index] &&
+                !map_gguf_layer_spans(ctx, layer, 0, err, errcap)) return 0;
         }
         const k3_st_tensor *gate_weights = layer->expert_gate;
         const k3_st_tensor *up_weights = layer->expert_up;
@@ -4186,7 +4191,7 @@ static int run_moe_ffn(k3_context *ctx,
                   K3_N_EXPERT_USED,
                   s->routed_latent,
                   layer->index,
-                  ctx->gguf_resident)
+                  ctx->gguf_resident, ready_ids)
             : ds4_gpu_k3_routed_moe_batch_tensor(
                   s->routed_sum,
                   s->expert_gate,
@@ -4995,6 +5000,10 @@ static int evaluate(k3_context *ctx,
             i < ctx->layer_end &&
             (ctx->q8_static ||
              ctx->resident_static_slots[i + 1u].data != NULL);
+        const bool pinned_decode = ctx->model->gguf && !ctx->gguf_resident &&
+            rows == 1u && ctx->gguf_static_layers[i];
+        const bool join_next_router = pinned_decode && i < ctx->layer_end &&
+            ctx->gguf_static_layers[i + 1u];
         const int pipeline_commands =
             i < ctx->layer_end &&
             (ctx->gguf_resident ||
@@ -5029,7 +5038,7 @@ static int evaluate(k3_context *ctx,
                   .bias = 0,
               };
         const int mapped =
-            ctx->gguf_resident
+            ctx->gguf_resident || pinned_decode
             ? 1
             : ctx->model->gguf
             ? map_gguf_layer_spans(
@@ -5061,9 +5070,9 @@ static int evaluate(k3_context *ctx,
                     : NULL,
                 err,
                 errcap) ||
-            !(pipeline_commands
+            (!join_next_router && !(pipeline_commands
                 ? ds4_gpu_flush_commands()
-                : ds4_gpu_end_commands())) {
+                : ds4_gpu_end_commands()))) {
             if (ds4_gpu_commands_active()) (void)ds4_gpu_synchronize();
             if (ds4_gpu_release_model_views()) {
                 if (ctx->model->gguf || !use_static_slot) {
@@ -5076,7 +5085,7 @@ static int evaluate(k3_context *ctx,
             output_prefetch_discard(&output_prefetch);
             return 0;
         }
-        if (!pipeline_commands && !ds4_gpu_release_model_views()) {
+        if (!join_next_router && !pipeline_commands && !ds4_gpu_release_model_views()) {
             set_error(err, errcap,
                       "K3 layer %u Metal view release failed", i);
             static_load_cancel(&static_load);

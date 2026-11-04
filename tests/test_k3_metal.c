@@ -768,7 +768,7 @@ int main(void) {
         GGUF_MOE_EXPERTS,
         gguf_moe_x,
         1u,
-        true), "GGUF K3 routed MoE reference");
+        true, NULL), "GGUF K3 routed MoE reference");
     float gguf_moe_gate_values[GGUF_MOE_EXPERTS * GGUF_MOE_DIM];
     float gguf_moe_up_values[GGUF_MOE_EXPERTS * GGUF_MOE_DIM];
     float gguf_moe_mid_values[GGUF_MOE_EXPERTS * GGUF_MOE_DIM];
@@ -844,7 +844,7 @@ int main(void) {
         GGUF_MOE_EXPERTS,
         gguf_moe_x,
         1u,
-        true), "GGUF K3 routed MoE fused");
+        true, NULL), "GGUF K3 routed MoE fused");
     float gguf_moe_fused_mid[GGUF_MOE_EXPERTS * GGUF_MOE_DIM];
     require_ok(ds4_gpu_tensor_read(
         gguf_moe_mid, 0,

@@ -2964,7 +2964,8 @@ int ds4_gpu_k3_routed_moe_one_tensor(
         uint32_t                n_expert,
         const ds4_gpu_tensor *x,
         uint32_t                layer_index,
-        bool                    force_resident);
+        bool                    force_resident,
+        const int32_t          *ready_ids);
 
 int ds4_gpu_k3_routed_moe_batch_tensor(
         ds4_gpu_tensor       *out,

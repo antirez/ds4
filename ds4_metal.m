@@ -41081,7 +41081,8 @@ static int ds4_gpu_routed_moe_one_tensor_impl(
         bool                    force_resident,
         uint32_t                activation_kind,
         float                   activation_beta,
-        float                   activation_linear_beta) {
+        float                   activation_linear_beta,
+        const int32_t          *ready_ids) {
     BOOL parallel_ffn_scope
         __attribute__((cleanup(ds4_gpu_parallel_ffn_scope_cleanup))) =
             g_parallel_q8_pending;
@@ -42189,6 +42190,9 @@ static int ds4_gpu_routed_moe_one_tensor_impl(
                     selected_id_source = "override";
                     selected_exec_ids_from_host = true;
                     g_routed_moe_selected_override_n = 0;
+                } else if (ready_ids) {
+                    memcpy(selected_ids, ready_ids, n_expert * sizeof(*selected_ids));
+                    selected_id_source = "router";
                 } else if (use_stream_expert_cache &&
                            ds4_gpu_glm_stream_selected_prefetch_take(
                                model_map, model_size, layer_index,
@@ -43773,7 +43777,7 @@ int ds4_gpu_routed_moe_one_tensor(
         expert_in_dim, expert_mid_dim, out_dim,
         selected, weights, n_total_expert, n_expert, clamp,
         x, add_in, layer_index, force_resident,
-        0u, 0.0f, 0.0f);
+        0u, 0.0f, 0.0f, NULL);
 }
 
 int ds4_gpu_k3_routed_moe_one_tensor(
@@ -43800,7 +43804,8 @@ int ds4_gpu_k3_routed_moe_one_tensor(
         uint32_t                n_expert,
         const ds4_gpu_tensor *x,
         uint32_t                layer_index,
-        bool                    force_resident) {
+        bool                    force_resident,
+        const int32_t          *ready_ids) {
     return ds4_gpu_routed_moe_one_tensor_impl(
         out, gate, up, mid, experts, model_map, model_size,
         gate_offset, up_offset, down_offset,
@@ -43810,7 +43815,7 @@ int ds4_gpu_k3_routed_moe_one_tensor(
         expert_in_dim, expert_mid_dim, out_dim,
         selected, weights, n_total_expert, n_expert, 0.0f,
         x, NULL, layer_index, force_resident,
-        1u, 4.0f, 25.0f);
+        1u, 4.0f, 25.0f, ready_ids);
 }
 
 static int ds4_gpu_routed_moe_batch_tensor_impl(
@@ -44005,7 +44010,7 @@ static int ds4_gpu_routed_moe_batch_tensor_impl(
                                              force_resident,
                                              activation_kind,
                                              activation_beta,
-                                             activation_linear_beta);
+                                             activation_linear_beta, NULL);
     }
 
     @autoreleasepool {
