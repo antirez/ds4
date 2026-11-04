@@ -146,6 +146,7 @@ Sessions are stored in `~/.ds4/kvcache`:
 | `/save` | Save the current session |
 | `/list` | List saved sessions |
 | `/switch <sha>` | Resume a session |
+| `/fork [title]` | Save the current session as the parent and continue from the same live KV state as a new session (idle prompt only; default title adds ` (fork)`) |
 | `/del <sha>` | Delete a saved session |
 | `/strip <sha>` | Keep text and title, removing the large KV payload |
 
