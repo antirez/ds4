@@ -11539,7 +11539,8 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
 }
 
 /* -------------------------------------------------------------------------
- * DS4_ATTN_TOKENTILE: token-tile HMMA indexed attention (opt-in).
+ * DS4_ATTN_TOKENTILE: token-tile HMMA indexed attention. Taken by default when the
+ * launch guard below matches; DS4_CUDA_NO_WINDOW_ATTENTION turns it off.
  * Ported from the pass-12 standalone prototype with fixed STAGE_ROWS=32.
  * Four-token tiles reduce the selected-row union while eight heads keep the
  * 32-row MMA shape full.
