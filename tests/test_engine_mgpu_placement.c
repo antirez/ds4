@@ -85,6 +85,8 @@ size_t ds4_test_compute_glm_entry_bytes_sum_with_sessions(
 uint64_t ds4_test_glm_memory_guard_default_budget(uint64_t host_bytes,
                                                    uint64_t model_bytes,
                                                    bool glm53);
+uint64_t ds4_test_glm_memory_guard_live_cap(uint64_t host_bytes,
+                                            uint64_t wired_bytes);
 int ds4_test_glm_memory_guard_disabled(void);
 int ds4_test_qwen4_placement(uint64_t budget, int sessions,
                               size_t *weights, size_t *runtime);
@@ -567,6 +569,17 @@ static void test_glm_memory_guard_budget(void) {
     CHECK(ds4_test_glm_memory_guard_default_budget(
                   256ull * gib, 178ull * gib, false) == 224ull * gib,
           "larger-host budget is model-variant independent");
+
+    CHECK(ds4_test_glm_memory_guard_live_cap(128ull * gib, 5ull * gib) >
+                  110ull * gib,
+          "idle host wiring does not tighten the GLM-5.3 resident budget");
+    CHECK(ds4_test_glm_memory_guard_live_cap(128ull * gib, 100ull * gib) ==
+                  20ull * gib,
+          "memory wired by another runtime comes out of the budget");
+    CHECK(ds4_test_glm_memory_guard_live_cap(128ull * gib, 124ull * gib) == 0,
+          "headroom beyond wired memory saturates at zero");
+    CHECK(ds4_test_glm_memory_guard_live_cap(128ull * gib, UINT64_MAX) == 0,
+          "wired byte overflow saturates at zero");
 
     char *old_guard = save_env_value("DS4_GLM_MEMORY_GUARD");
     unsetenv("DS4_GLM_MEMORY_GUARD");

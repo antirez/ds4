@@ -35,6 +35,7 @@
 #include <sys/stat.h>
 #if defined(__APPLE__)
 #include <dispatch/dispatch.h>
+#include <mach/mach.h>
 #include <sys/sysctl.h>
 #endif
 #include <stdarg.h>
@@ -47207,6 +47208,42 @@ static double glm_graph_bytes_to_gib(uint64_t bytes) {
 static uint64_t g_glm_rocm_guard_available_baseline;
 #endif
 
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+/* System-wide wired bytes when the engine opened, before its own buffers.
+ * Other processes' Metal allocations are wired and cannot be reclaimed, so
+ * a model loaded in another runtime must come out of this engine's budget:
+ * wiring past physical RAM starves watchdogd and panics the host. */
+static uint64_t g_glm_metal_guard_wired_baseline;
+
+static bool ds4_darwin_wired_bytes(uint64_t *out) {
+    const mach_port_t host = mach_host_self();
+    vm_size_t page = 0;
+    vm_statistics64_data_t vm;
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    const bool ok =
+        host_page_size(host, &page) == KERN_SUCCESS && page != 0 &&
+        host_statistics64(host, HOST_VM_INFO64, (host_info64_t)&vm,
+                          &count) == KERN_SUCCESS;
+    mach_port_deallocate(mach_task_self(), host);
+    if (!ok) return false;
+    *out = (uint64_t)vm.wire_count * (uint64_t)page;
+    return true;
+}
+#endif
+
+/* OS headroom kept free beyond memory already wired at engine open. An idle
+ * 128 GB host wires about 4-5 GiB, so this cap stays above the resident-Q2
+ * budget unless another process is holding a model. */
+#define GLM_GRAPH_LIVE_WIRED_HEADROOM_BYTES (8ull * 1024ull * 1024ull * 1024ull)
+
+static uint64_t glm_graph_memory_guard_live_cap_bytes(
+        uint64_t host_bytes,
+        uint64_t wired_bytes) {
+    const uint64_t held = wired_bytes > UINT64_MAX - GLM_GRAPH_LIVE_WIRED_HEADROOM_BYTES ?
+        UINT64_MAX : wired_bytes + GLM_GRAPH_LIVE_WIRED_HEADROOM_BYTES;
+    return host_bytes > held ? host_bytes - held : 0;
+}
+
 static bool glm_graph_memory_guard_disabled(void) {
     const char *env = getenv("DS4_GLM_MEMORY_GUARD");
     if (!env || !env[0]) return false;
@@ -47762,11 +47799,21 @@ static bool glm_graph_memory_guard_budget(
                              default_reserve_gib,
                              0.0,
                              1024.0);
-    const uint64_t budget = glm_graph_memory_guard_budget_bytes(
+    uint64_t budget = glm_graph_memory_guard_budget_bytes(
             budget_base,
             glm_graph_wired_limit_bytes(),
             fraction,
             reserve_gib);
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    /* Applied after the wired-limit grant: raising the GPU limit does not
+     * free memory another process has already wired. */
+    const uint64_t host_bytes = glm_graph_host_memory_bytes();
+    if (host_bytes != 0 && g_glm_metal_guard_wired_baseline != 0) {
+        const uint64_t live_cap = glm_graph_memory_guard_live_cap_bytes(
+                host_bytes, g_glm_metal_guard_wired_baseline);
+        if (live_cap < budget) budget = live_cap;
+    }
+#endif
 
     if (budget_base_out) *budget_base_out = budget_base;
     if (budget_out) *budget_out = budget;
@@ -47948,6 +47995,14 @@ static bool glm_graph_memory_guard_for_compact_cap(
             fraction,
             reserve_gib,
             glm_graph_bytes_to_gib(transient_extra_bytes));
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (g_glm_metal_guard_wired_baseline != 0) {
+        fprintf(stderr,
+                "ds4:   memory already wired at startup: %.2f GiB; another "
+                "model runtime (LM Studio, llama-server) may be holding it\n",
+                glm_graph_bytes_to_gib(g_glm_metal_guard_wired_baseline));
+    }
+#endif
     fprintf(stderr,
             "ds4:   set DS4_GLM_MEMORY_GUARD=0 to bypass, use a smaller --ctx, "
             "tensor parallelism, or SSD streaming\n");
@@ -73038,6 +73093,12 @@ uint64_t ds4_test_glm_memory_guard_default_budget(
             host_bytes, 0, 0.99, reserve_gib);
 }
 
+uint64_t ds4_test_glm_memory_guard_live_cap(
+        uint64_t host_bytes,
+        uint64_t wired_bytes) {
+    return glm_graph_memory_guard_live_cap_bytes(host_bytes, wired_bytes);
+}
+
 int ds4_test_glm_memory_guard_disabled(void) {
     return glm_graph_memory_guard_disabled() ? 1 : 0;
 }
@@ -73756,6 +73817,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
 #if defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
     g_glm_rocm_guard_available_baseline = 0;
     (void)ds4_linux_nonmovable_memory(&g_glm_rocm_guard_available_baseline);
+#endif
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    g_glm_metal_guard_wired_baseline = 0;
+    (void)ds4_darwin_wired_bytes(&g_glm_metal_guard_wired_baseline);
 #endif
     e->model.fd = -1;
     e->mtp_model.fd = -1;
