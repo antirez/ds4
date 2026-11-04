@@ -312,6 +312,23 @@ extern "C" size_t ds4_mmq_q81_scratch_bytes(void) {
     return g_q81_scratch_bytes;
 }
 
+// Test hook (tests/test_iq2_signs_rocm.c through ds4_gpu_test_iq2_xxs_signs):
+// iq2_grid_signed4 for every (grid index, sign index) pair, written as
+// words[2 * (grid_idx * 128 + sign_idx) + {0, 1}] (device pointer).
+static __global__ void ds4_mmq_iq2_grid_signed4_test_kernel(int32_t * words) {
+    const int gi = blockIdx.x;
+    const int si = threadIdx.x;
+    const uint2 grid_pos = ((const uint2 *) iq2xxs_grid)[gi];
+    const uint32_t signs = unpack_ksigns((uint8_t) si);
+    words[2 * (gi * 128 + si) + 0] = iq2_grid_signed4(grid_pos.x, signs & 0x08040201);
+    words[2 * (gi * 128 + si) + 1] = iq2_grid_signed4(grid_pos.y, signs & 0x80402010);
+}
+
+extern "C" int ds4_mmq_test_iq2_grid_signed4(int32_t * words) {
+    ds4_mmq_iq2_grid_signed4_test_kernel<<<256, 128>>>(words);
+    return cudaGetLastError() == cudaSuccess ? 0 : 1;
+}
+
 extern "C" int ds4_mmq_init(int device) {
     if (device < 0) {
         fprintf(stderr, "ds4_mmq_init: invalid device %d\n", device);
@@ -2976,12 +2993,10 @@ __global__ void iq2_xxs_aligned_moe_vec_kernel(
             const uint2 grid_pos = ((const uint2 *)iq2xxs_grid)[aux8[k0 / 2]];
             const uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
 
-            const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-            const int grid0  = __vsub4(grid_pos.x ^ signs0, signs0);
+            const int grid0  = iq2_grid_signed4(grid_pos.x, signs & 0x08040201);
             sumi = ggml_cuda_dp4a(grid0, u[k0 + 0], sumi);
 
-            const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-            const int grid1  = __vsub4(grid_pos.y ^ signs1, signs1);
+            const int grid1  = iq2_grid_signed4(grid_pos.y, signs & 0x80402010);
             sumi = ggml_cuda_dp4a(grid1, u[k0 + 1], sumi);
         }
         const int ls = aux32 >> 27 | 1;
@@ -3039,12 +3054,10 @@ __global__ void iq2_xxs_aligned_moe_pair_vec_kernel(
             const uint2 grid_pos = ((const uint2 *)iq2xxs_grid)[aux8[k0 / 2]];
             const uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
 
-            const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-            const int grid0  = __vsub4(grid_pos.x ^ signs0, signs0);
+            const int grid0  = iq2_grid_signed4(grid_pos.x, signs & 0x08040201);
             sumi = ggml_cuda_dp4a(grid0, u[k0 + 0], sumi);
 
-            const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-            const int grid1  = __vsub4(grid_pos.y ^ signs1, signs1);
+            const int grid1  = iq2_grid_signed4(grid_pos.y, signs & 0x80402010);
             sumi = ggml_cuda_dp4a(grid1, u[k0 + 1], sumi);
         }
         const int ls = aux32 >> 27 | 1;
@@ -3110,21 +3123,17 @@ __global__ void iq2_xxs_aligned_moe_gate_up_mid_kernel(
             {
                 const uint2 grid_pos = ((const uint2 *)iq2xxs_grid)[aux8g[k0 / 2]];
                 const uint32_t signs = unpack_ksigns(cwg.y >> (7 * k0 / 2));
-                const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-                const int grid0  = __vsub4(grid_pos.x ^ signs0, signs0);
+                const int grid0  = iq2_grid_signed4(grid_pos.x, signs & 0x08040201);
                 sumi_g = ggml_cuda_dp4a(grid0, u[k0 + 0], sumi_g);
-                const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-                const int grid1  = __vsub4(grid_pos.y ^ signs1, signs1);
+                const int grid1  = iq2_grid_signed4(grid_pos.y, signs & 0x80402010);
                 sumi_g = ggml_cuda_dp4a(grid1, u[k0 + 1], sumi_g);
             }
             {
                 const uint2 grid_pos = ((const uint2 *)iq2xxs_grid)[aux8u[k0 / 2]];
                 const uint32_t signs = unpack_ksigns(cwu.y >> (7 * k0 / 2));
-                const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-                const int grid0  = __vsub4(grid_pos.x ^ signs0, signs0);
+                const int grid0  = iq2_grid_signed4(grid_pos.x, signs & 0x08040201);
                 sumi_u = ggml_cuda_dp4a(grid0, u[k0 + 0], sumi_u);
-                const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-                const int grid1  = __vsub4(grid_pos.y ^ signs1, signs1);
+                const int grid1  = iq2_grid_signed4(grid_pos.y, signs & 0x80402010);
                 sumi_u = ggml_cuda_dp4a(grid1, u[k0 + 1], sumi_u);
             }
         }
@@ -3237,18 +3246,14 @@ __global__ void iq2_xxs_aligned_moe_gate_up_mid_dedup_kernel(
             {
                 const uint2 grid_pos = ((const uint2 *)iq2xxs_grid)[aux8g[k0 / 2]];
                 const uint32_t signs = unpack_ksigns(cwg.y >> (7 * k0 / 2));
-                const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-                g0g = __vsub4(grid_pos.x ^ signs0, signs0);
-                const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-                g1g = __vsub4(grid_pos.y ^ signs1, signs1);
+                g0g = iq2_grid_signed4(grid_pos.x, signs & 0x08040201);
+                g1g = iq2_grid_signed4(grid_pos.y, signs & 0x80402010);
             }
             {
                 const uint2 grid_pos = ((const uint2 *)iq2xxs_grid)[aux8u[k0 / 2]];
                 const uint32_t signs = unpack_ksigns(cwu.y >> (7 * k0 / 2));
-                const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-                g0u = __vsub4(grid_pos.x ^ signs0, signs0);
-                const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-                g1u = __vsub4(grid_pos.y ^ signs1, signs1);
+                g0u = iq2_grid_signed4(grid_pos.x, signs & 0x08040201);
+                g1u = iq2_grid_signed4(grid_pos.y, signs & 0x80402010);
             }
 #pragma unroll
             for (int m = 0; m < MAXM; m++) {

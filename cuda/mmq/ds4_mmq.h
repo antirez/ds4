@@ -32,6 +32,11 @@ extern "C" {
 //   device: CUDA device ordinal (0 for the primary GPU).
 // Returns 0 on success.
 int ds4_mmq_init(int device);
+
+// Test hook: iq2_grid_signed4 (vecdotq.cuh) for every IQ2_XXS (grid index,
+// sign index) pair.  words is a device pointer to 256 * 128 * 2 int32 values,
+// words[2 * (grid_idx * 128 + sign_idx) + half].  Returns 0 on success.
+int ds4_mmq_test_iq2_grid_signed4(int32_t *words);
 void ds4_mmq_set_aligned_q81_scratch(void *ptr, size_t bytes);
 
 // Query whether ds4_mmq is willing to handle a given matmul. Returns
