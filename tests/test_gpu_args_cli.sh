@@ -76,6 +76,69 @@ for i in "${!BINS[@]}"; do
             "tensor-parallel-token-prefill" "$LOG"
         assert_not_grep "$name --help distributed omits old --tp spellings" "--tp-" "$LOG"
     fi
+    if [ "$name" = "ds4-server" ]; then
+        "$bin" --help thinking > "$LOG" 2>&1 || true
+        assert_grep "$name --help thinking mentions --preserved-thinking" \
+            "--preserved-thinking BOOL" "$LOG"
+        assert_not_grep "$name --help thinking omits --disable-preserved-thinking" \
+            "--disable-preserved-thinking" "$LOG"
+        assert_not_grep "$name --help thinking omits --enable-preserved-thinking" \
+            "--enable-preserved-thinking" "$LOG"
+        assert_grep "$name --help thinking mentions --reasoning-effort" \
+            "--reasoning-effort LEVEL" "$LOG"
+        assert_grep "$name --help thinking mentions --thinking" \
+            "--thinking BOOL" "$LOG"
+
+        "$bin" --help api > "$LOG" 2>&1 || true
+        assert_grep "$name --help api mentions --temp" "--temp" "$LOG"
+        assert_grep "$name --help api mentions --top-p" "--top-p" "$LOG"
+        assert_grep "$name --help api mentions --top-k" "--top-k" "$LOG"
+        assert_grep "$name --help api mentions --min-p" "--min-p" "$LOG"
+
+        "$bin" --reasoning-effort high --thinking true --temp 0.7 \
+            --top-p 0.9 --top-k 40 --min-p 0.05 -m /dev/null > "$LOG" 2>&1
+        rc=$?
+        if [ $rc -ne 0 ] &&
+           grep -qE "model file is too small|another ds4 process is already running" "$LOG" &&
+           ! grep -q "unknown option" "$LOG"; then
+            ok "ds4-server startup default options reach model loading"
+        else
+            fail "ds4-server startup default options rejected in option parsing"
+            head -10 "$LOG" | sed 's/^/    /'
+        fi
+
+        "$bin" --reasoning-effort invalid -m /dev/null > "$LOG" 2>&1
+        rc=$?
+        if [ $rc -eq 2 ] && grep -q "invalid value for --reasoning-effort" "$LOG"; then
+            ok "ds4-server rejects invalid --reasoning-effort"
+        else
+            fail "ds4-server did not reject invalid --reasoning-effort"
+        fi
+
+        "$bin" --temperature 0.7 -m /dev/null > "$LOG" 2>&1
+        rc=$?
+        if [ $rc -ne 0 ] && grep -q "unknown option" "$LOG"; then
+            ok "ds4-server rejects --temperature (keeps only --temp)"
+        else
+            fail "ds4-server accepted --temperature"
+        fi
+
+        "$bin" --think -m /dev/null > "$LOG" 2>&1
+        rc=$?
+        if [ $rc -ne 0 ] && grep -q "unknown option" "$LOG"; then
+            ok "ds4-server rejects --think (keeps only --thinking)"
+        else
+            fail "ds4-server accepted --think"
+        fi
+
+        "$bin" --nothink -m /dev/null > "$LOG" 2>&1
+        rc=$?
+        if [ $rc -ne 0 ] && grep -q "unknown option" "$LOG"; then
+            ok "ds4-server rejects --nothink (keeps only --thinking)"
+        else
+            fail "ds4-server accepted --nothink"
+        fi
+    fi
 done
 
 if [ -x ./ds4-eval ]; then
@@ -196,6 +259,33 @@ for i in 0 1 3; do
         fail "$name retained provisional --dspark-exact-sampling"
     fi
 done
+
+# ds4-server --preserved-thinking option checks
+if [ -x ./ds4-server ]; then
+    ./ds4-server --preserved-thinking false -m /dev/null > "$LOG" 2>&1
+    rc=$?
+    if [ $rc -ne 0 ] && ! grep -q "unknown option" "$LOG" && ! grep -q "invalid boolean value" "$LOG"; then
+        ok "ds4-server parses --preserved-thinking false"
+    else
+        fail "ds4-server rejected --preserved-thinking false in option parsing"
+    fi
+
+    ./ds4-server --preserved-thinking invalid -m /dev/null > "$LOG" 2>&1
+    rc=$?
+    if [ $rc -eq 2 ] && grep -q "invalid boolean value for --preserved-thinking" "$LOG"; then
+        ok "ds4-server rejects invalid --preserved-thinking value"
+    else
+        fail "ds4-server did not reject invalid --preserved-thinking value"
+    fi
+
+    ./ds4-server --disable-preserved-thinking -m /dev/null > "$LOG" 2>&1
+    rc=$?
+    if [ $rc -ne 0 ] && grep -q "unknown option" "$LOG"; then
+        ok "ds4-server rejects obsolete --disable-preserved-thinking"
+    else
+        fail "ds4-server retained obsolete --disable-preserved-thinking"
+    fi
+fi
 
 # 2: parser error on syntactically invalid value. For ds4-bench, we
 # also pass --prompt-file /dev/null so it doesn't exit on the

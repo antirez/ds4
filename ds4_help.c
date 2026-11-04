@@ -350,6 +350,10 @@ static void print_server_api(FILE *fp, const help_colors *c) {
     opt(fp, c, "--trace FILE", "Write prompts, cache decisions, output, and tool calls.");
     opt(fp, c, "--batched-session N", "Keep N resident sessions and batch decode-ready requests.");
     opt(fp, c, "--mixed-prefill-quantum N", "Prefill chunk while generations are active. Default: 128; GLM-5.3 minimum: 1024");
+    opt(fp, c, "--temp F", "Default sampling temperature (0.0..100.0). Overridden by request.");
+    opt(fp, c, "--top-p F", "Default nucleus sampling probability (0.0..1.0). Overridden by request.");
+    opt(fp, c, "--top-k N", "Default top-k candidate limit (>= 0). Overridden by request.");
+    opt(fp, c, "--min-p F", "Default min-p filtering threshold (0.0..1.0). Overridden by request.");
     para(fp, c, "Endpoints: /v1/chat/completions, /v1/responses, /v1/completions, and /v1/messages.");
     para(fp, c, "Model endpoint aliases include deepseek-v4-flash and deepseek-v4-pro; both serve the loaded GGUF.");
     fputc('\n', fp);
@@ -362,6 +366,10 @@ static void print_server_thinking(FILE *fp, const help_colors *c) {
     para(fp, c, "Think Max requires --ctx >= 393216; smaller contexts use high.");
     para(fp, c, "thinking={type:disabled}, think=false, or model=deepseek-chat selects non-thinking mode.");
     para(fp, c, "In thinking mode, client sampling knobs are ignored like the official API.");
+    para(fp, c, "For multi-turn chat (e.g. Qwen coding agents), pass chat_template_kwargs.preserve_thinking=false or start ds4-server with --preserved-thinking false to strip past reasoning from prompts.");
+    opt(fp, c, "--reasoning-effort LEVEL", "Default reasoning effort (none|low|medium|high|max or 1..100). Default: engine specific");
+    opt(fp, c, "--thinking BOOL", "Default thinking mode (true|false). Default: true");
+    opt(fp, c, "--preserved-thinking BOOL", "Default multi-turn chat prompts to preserve past reasoning tags. Default: true");
     fputc('\n', fp);
 }
 

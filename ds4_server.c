@@ -794,6 +794,8 @@ static void id_list_free(stop_list *ids);
 static bool responses_live_has_call_id(server *s, const char *id);
 static bool anthropic_live_has_call_id(server *s, const char *id);
 static stop_list live_tool_call_order(server *s, api_style api, const stop_list *ids);
+static ds4_think_mode server_default_reasoning_effort(const server *s, ds4_engine *e);
+static bool server_default_thinking_enabled(const server *s);
 
 typedef struct {
     req_kind kind;
@@ -829,6 +831,7 @@ typedef struct {
     ds4_think_mode think_mode;
     bool has_tools;
     bool prompt_preserves_reasoning;
+    bool preserve_thinking;
     /* For /v1/responses: emit reasoning_summary_* events / fields only when the
      * client opted in via reasoning.summary. Other APIs leave this false; the
      * field is ignored on those code paths. */
@@ -857,6 +860,9 @@ typedef struct {
     char *anthropic_live_suffix_text;
     tool_replay_stats tool_replay;
 } request;
+
+static void request_apply_defaults(request *r, ds4_engine *e, const server *s);
+static bool server_default_preserve_thinking(const server *s);
 
 static void tool_call_free(tool_call *tc) {
     free(tc->id);
@@ -993,6 +999,7 @@ static void request_init(request *r, req_kind kind, int max_tokens) {
     r->top_p = DS4_DEFAULT_TOP_P;
     r->min_p = DS4_DEFAULT_MIN_P;
     r->think_mode = DS4_THINK_HIGH;
+    r->preserve_thinking = true;
 }
 
 static bool parse_ignore_eos_value(const char **p, request *r) {
@@ -1006,6 +1013,10 @@ static bool request_validate_ignore_eos(const request *r,
     snprintf(err, errlen,
              "ignore_eos requires an explicit temperature of 0");
     return false;
+}
+
+static ds4_think_mode default_reasoning_effort_for_engine(ds4_engine *e) {
+    return ds4_engine_is_qwen4(e) ? DS4_THINK_LOW : DS4_THINK_HIGH;
 }
 
 static void request_free(request *r) {
@@ -1111,10 +1122,10 @@ static bool parse_thinking_control_value(const char **p, bool *thinking_enabled)
     return true;
 }
 
-/* chat_template_kwargs as the Qwen3.8 model card documents them: enable_thinking
- * and reasoning_effort are applied, other keys are ignored */
+/* chat_template_kwargs as the Qwen3.8 model card documents them: enable_thinking,
+ * reasoning_effort, and preserve_thinking are applied, other keys are ignored */
 static bool parse_chat_template_kwargs(const char **p, bool *thinking_enabled, bool *got_thinking,
-                                       ds4_think_mode *effort) {
+                                       ds4_think_mode *effort, bool *preserve_thinking) {
     json_ws(p);
     if (json_lit(p, "null")) return true;
     if (**p != '{') return json_skip_value(p);
@@ -1136,6 +1147,8 @@ static bool parse_chat_template_kwargs(const char **p, bool *thinking_enabled, b
             if (ok) *got_thinking = true;
         } else if (!strcmp(key, "reasoning_effort")) {
             ok = parse_reasoning_effort_value(p, effort);
+        } else if (!strcmp(key, "preserve_thinking")) {
+            ok = json_bool(p, preserve_thinking);
         } else {
             ok = json_skip_value(p);
         }
@@ -3103,6 +3116,14 @@ static bool chat_history_uses_tool_context(const chat_msgs *msgs,
     return false;
 }
 
+static bool request_prompt_preserves_reasoning(server_model_syntax syntax,
+                                               bool preserve_thinking,
+                                               const chat_msgs *msgs,
+                                               const char *tool_schemas) {
+    if (syntax == SERVER_MODEL_SYNTAX_QWEN) return preserve_thinking;
+    return chat_history_uses_tool_context(msgs, tool_schemas);
+}
+
 static char *render_deepseek_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
                                               const tool_schema_orders *tool_orders,
                                               ds4_think_mode think_mode) {
@@ -3184,7 +3205,9 @@ static char *render_deepseek_chat_prompt_text(const chat_msgs *msgs, const char 
 }
 
 static bool text_starts_with_think_tag(const char *s) {
-    return s && (!strncmp(s, "<think>", 7) || !strncmp(s, "</think>", 8));
+    if (!s) return false;
+    while (*s && isspace((unsigned char)*s)) s++;
+    return !strncmp(s, "<think>", 7) || !strncmp(s, "</think>", 8);
 }
 
 static void append_trimmed_text(buf *out, const char *text) {
@@ -3522,10 +3545,32 @@ static void append_qwen_tool_result_message(buf *b, const chat_msg *m) {
     append_qwen_tool_response(b, content, strlen(content));
 }
 
+static const char *strip_think_tags(const char *s) {
+    if (!s) return "";
+    const char *p = s;
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (!strncmp(p, "<think>", 7)) {
+        const char *end = strstr(p + 7, "</think>");
+        if (end) {
+            p = end + 8;
+            while (*p && (*p == '\n' || *p == '\r')) p++;
+            return p;
+        }
+        return "";
+    }
+    return s;
+}
+
 static void append_qwen_assistant_message(buf *out, const chat_msg *m,
-                                          const tool_schema_orders *tool_orders) {
-    const char *content = m && m->content ? m->content : "";
+                                          const tool_schema_orders *tool_orders,
+                                          bool preserve_thinking) {
+    const char *raw_content = m && m->content ? m->content : "";
     const char *reasoning = m && m->reasoning ? m->reasoning : "";
+    const char *content = raw_content;
+    if (!preserve_thinking) {
+        reasoning = "";
+        content = strip_think_tags(raw_content);
+    }
     const bool has_calls = m && m->calls.len > 0;
     buf body = {0};
     append_trimmed_text(&body, content);
@@ -3560,7 +3605,8 @@ static void append_qwen_generation_prompt(buf *out, bool think) {
 }
 
 static void append_qwen_conversation(buf *out, const chat_msgs *msgs, int start,
-                                     const tool_schema_orders *tool_orders, bool think) {
+                                     const tool_schema_orders *tool_orders, bool think,
+                                     bool preserve_thinking) {
     bool pending_assistant = false;
     bool tool_open = false;
     for (int i = start; msgs && i < msgs->len; i++) {
@@ -3583,7 +3629,7 @@ static void append_qwen_conversation(buf *out, const chat_msgs *msgs, int start,
             buf_puts(out, "<|im_end|>\n");
             pending_assistant = true;
         } else if (!strcmp(m->role, "assistant")) {
-            append_qwen_assistant_message(out, m, tool_orders);
+            append_qwen_assistant_message(out, m, tool_orders, preserve_thinking);
             pending_assistant = false;
         }
     }
@@ -3591,10 +3637,11 @@ static void append_qwen_conversation(buf *out, const chat_msgs *msgs, int start,
     if (pending_assistant) append_qwen_generation_prompt(out, think);
 }
 
-static char *render_qwen_chat_prompt_text(const chat_msgs *msgs,
-                                          const char *tool_schemas,
-                                          const tool_schema_orders *tool_orders,
-                                          ds4_think_mode think_mode) {
+static char *render_qwen_chat_prompt_text_ex(const chat_msgs *msgs,
+                                              const char *tool_schemas,
+                                              const tool_schema_orders *tool_orders,
+                                              ds4_think_mode think_mode,
+                                              bool preserve_thinking) {
     const bool think = ds4_think_mode_enabled(think_mode);
     const char *effort = think ? ds4_qwen4_reasoning_effort_text(think_mode) : NULL;
     const bool have_tools = tool_schemas && tool_schemas[0];
@@ -3625,15 +3672,24 @@ static char *render_qwen_chat_prompt_text(const chat_msgs *msgs,
         buf_puts(&out, "<|im_end|>\n");
     }
     buf_free(&system);
-    append_qwen_conversation(&out, msgs, 0, tool_orders, think);
+    append_qwen_conversation(&out, msgs, 0, tool_orders, think, preserve_thinking);
     return buf_take(&out);
 }
 
-static char *render_chat_prompt_text_for_syntax(server_model_syntax syntax,
-                                                const chat_msgs *msgs,
-                                                const char *tool_schemas,
-                                                const tool_schema_orders *tool_orders,
-                                                ds4_think_mode think_mode) {
+DS4_SERVER_MAYBE_UNUSED
+static char *render_qwen_chat_prompt_text(const chat_msgs *msgs,
+                                          const char *tool_schemas,
+                                          const tool_schema_orders *tool_orders,
+                                          ds4_think_mode think_mode) {
+    return render_qwen_chat_prompt_text_ex(msgs, tool_schemas, tool_orders, think_mode, true);
+}
+
+static char *render_chat_prompt_text_for_syntax_ex(server_model_syntax syntax,
+                                                   const chat_msgs *msgs,
+                                                   const char *tool_schemas,
+                                                   const tool_schema_orders *tool_orders,
+                                                   ds4_think_mode think_mode,
+                                                   bool preserve_thinking) {
     if (syntax == SERVER_MODEL_SYNTAX_GLM) {
         return render_glm_chat_prompt_text(msgs, tool_schemas,
                                            tool_orders, think_mode);
@@ -3641,10 +3697,20 @@ static char *render_chat_prompt_text_for_syntax(server_model_syntax syntax,
     if (syntax == SERVER_MODEL_SYNTAX_DEEPSEEK41)
         return render_deepseek41_chat(msgs, 0, tool_schemas, think_mode, false);
     if (syntax == SERVER_MODEL_SYNTAX_QWEN) {
-        return render_qwen_chat_prompt_text(msgs, tool_schemas, tool_orders, think_mode);
+        return render_qwen_chat_prompt_text_ex(msgs, tool_schemas, tool_orders, think_mode, preserve_thinking);
     }
     return render_deepseek_chat_prompt_text(msgs, tool_schemas,
                                             tool_orders, think_mode);
+}
+
+static char *render_chat_prompt_text_for_syntax(server_model_syntax syntax,
+                                                const chat_msgs *msgs,
+                                                const char *tool_schemas,
+                                                const tool_schema_orders *tool_orders,
+                                                ds4_think_mode think_mode) {
+    return render_chat_prompt_text_for_syntax_ex(syntax, msgs, tool_schemas,
+                                                tool_orders, think_mode,
+                                                true);
 }
 
 static DS4_SERVER_MAYBE_UNUSED char *render_chat_prompt_text(
@@ -3853,26 +3919,35 @@ static char *render_glm_live_tool_tail(const chat_msgs *msgs, int start,
  * was the stop token and is not in the KV yet. */
 static char *render_qwen_live_tool_tail(const chat_msgs *msgs, int start,
                                         const tool_schema_orders *tool_orders,
-                                        ds4_think_mode think_mode) {
+                                        ds4_think_mode think_mode,
+                                        bool preserve_thinking) {
     buf out = {0};
     buf_puts(&out, "<|im_end|>\n");
-    append_qwen_conversation(&out, msgs, start, tool_orders, ds4_think_mode_enabled(think_mode));
+    append_qwen_conversation(&out, msgs, start, tool_orders, ds4_think_mode_enabled(think_mode), preserve_thinking);
     return buf_take(&out);
 }
 
-static char *render_live_tool_tail_for_syntax(server_model_syntax syntax,
-                                              const chat_msgs *msgs, int start,
-                                              const tool_schema_orders *tool_orders,
-                                              ds4_think_mode think_mode) {
+static char *render_live_tool_tail_for_syntax_ex(server_model_syntax syntax,
+                                                 const chat_msgs *msgs, int start,
+                                                 const tool_schema_orders *tool_orders,
+                                                 ds4_think_mode think_mode,
+                                                 bool preserve_thinking) {
     if (syntax == SERVER_MODEL_SYNTAX_GLM) {
         return render_glm_live_tool_tail(msgs, start, tool_orders, think_mode);
     }
     if (syntax == SERVER_MODEL_SYNTAX_DEEPSEEK41)
         return render_deepseek41_chat(msgs, start, NULL, think_mode, true);
     if (syntax == SERVER_MODEL_SYNTAX_QWEN) {
-        return render_qwen_live_tool_tail(msgs, start, tool_orders, think_mode);
+        return render_qwen_live_tool_tail(msgs, start, tool_orders, think_mode, preserve_thinking);
     }
     return render_deepseek_live_tool_tail(msgs, start, think_mode);
+}
+
+static char *render_live_tool_tail_for_syntax(server_model_syntax syntax,
+                                              const chat_msgs *msgs, int start,
+                                              const tool_schema_orders *tool_orders,
+                                              ds4_think_mode think_mode) {
+    return render_live_tool_tail_for_syntax_ex(syntax, msgs, start, tool_orders, think_mode, true);
 }
 
 static DS4_SERVER_MAYBE_UNUSED char *render_live_tool_tail(
@@ -3886,8 +3961,9 @@ static char *render_request_live_tool_tail(server *s, const request *r,
                                            const chat_msgs *msgs, int start,
                                            const stop_list *ids) {
     if (r->model_syntax != SERVER_MODEL_SYNTAX_DEEPSEEK41)
-        return render_live_tool_tail_for_syntax(r->model_syntax, msgs, start,
-                                                 &r->tool_orders, r->think_mode);
+        return render_live_tool_tail_for_syntax_ex(r->model_syntax, msgs, start,
+                                                 &r->tool_orders, r->think_mode,
+                                                 r->preserve_thinking);
     /* Output-only requests omit the assistant message which declares order.
      * Copy the remembered order under its mutex, never borrow mutable IDs. */
     stop_list order = live_tool_call_order(s, r->api, ids);
@@ -4124,8 +4200,9 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     bool got_messages = false;
     bool tool_choice_none = false;
     bool got_thinking = false;
-    bool thinking_enabled = true;
-    ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
+    bool thinking_enabled = server_default_thinking_enabled(s);
+    ds4_think_mode reasoning_effort = server_default_reasoning_effort(s, e);
+    bool preserve_thinking = server_default_preserve_thinking(s);
     chat_msgs msgs = {0};
     char *tool_schemas = NULL;
 
@@ -4245,7 +4322,13 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                 goto bad;
             }
         } else if (!strcmp(key, "chat_template_kwargs")) {
-            if (!parse_chat_template_kwargs(&p, &thinking_enabled, &got_thinking, &reasoning_effort)) {
+            if (!parse_chat_template_kwargs(&p, &thinking_enabled, &got_thinking, &reasoning_effort,
+                                            &preserve_thinking)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "preserve_thinking")) {
+            if (!json_bool(&p, &preserve_thinking)) {
                 free(key);
                 goto bad;
             }
@@ -4291,11 +4374,13 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
+    request_apply_defaults(r, e, s);
+    r->preserve_thinking = preserve_thinking;
     r->prompt_preserves_reasoning =
-        chat_history_uses_tool_context(&msgs, active_tool_schemas);
-    r->prompt_text = render_chat_prompt_text_for_syntax(
+        request_prompt_preserves_reasoning(r->model_syntax, r->preserve_thinking, &msgs, active_tool_schemas);
+    r->prompt_text = render_chat_prompt_text_for_syntax_ex(
         r->model_syntax, &msgs, active_tool_schemas,
-        &r->tool_orders, r->think_mode);
+        &r->tool_orders, r->think_mode, r->preserve_thinking);
     if (!request_tokenize_multimodal_prompt(e, s, r, &msgs, err, errlen)) {
         chat_msgs_free(&msgs);
         free(tool_schemas);
@@ -4322,8 +4407,8 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     bool got_messages = false;
     bool tool_choice_none = false;
     bool got_thinking = false;
-    bool thinking_enabled = true;
-    ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
+    bool thinking_enabled = server_default_thinking_enabled(s);
+    ds4_think_mode reasoning_effort = server_default_reasoning_effort(s, e);
     chat_msgs msgs = {0};
     char *system = NULL;
     char *tool_schemas = NULL;
@@ -4518,11 +4603,12 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
     anthropic_prepare_live_continuation(s, r, &msgs);
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
+    request_apply_defaults(r, e, s);
     r->prompt_preserves_reasoning =
-        chat_history_uses_tool_context(&msgs, active_tool_schemas);
-    r->prompt_text = render_chat_prompt_text_for_syntax(
+        request_prompt_preserves_reasoning(r->model_syntax, r->preserve_thinking, &msgs, active_tool_schemas);
+    r->prompt_text = render_chat_prompt_text_for_syntax_ex(
         r->model_syntax, &msgs, active_tool_schemas,
-        &r->tool_orders, r->think_mode);
+        &r->tool_orders, r->think_mode, r->preserve_thinking);
     if (!request_tokenize_multimodal_prompt(e, s, r, &msgs, err, errlen)) {
         chat_msgs_free(&msgs);
         free(system);
@@ -5311,8 +5397,8 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     bool got_input = false;
     bool tool_choice_none = false;
     bool got_thinking = false;
-    bool thinking_enabled = true;
-    ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
+    bool thinking_enabled = server_default_thinking_enabled(s);
+    ds4_think_mode reasoning_effort = server_default_reasoning_effort(s, e);
     chat_msgs msgs = {0};
     buf loaded_tool_schemas = {0};
     char *instructions = NULL;
@@ -5547,12 +5633,13 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     }
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
+    request_apply_defaults(r, e, s);
     r->prompt_preserves_reasoning =
-        chat_history_uses_tool_context(&msgs, active_tool_schemas);
+        request_prompt_preserves_reasoning(r->model_syntax, r->preserve_thinking, &msgs, active_tool_schemas);
     responses_prepare_live_continuation(s, r, &msgs);
-    r->prompt_text = render_chat_prompt_text_for_syntax(
+    r->prompt_text = render_chat_prompt_text_for_syntax_ex(
         r->model_syntax, &msgs, active_tool_schemas,
-        &r->tool_orders, r->think_mode);
+        &r->tool_orders, r->think_mode, r->preserve_thinking);
     if (!request_tokenize_multimodal_prompt(e, s, r, &msgs, err, errlen)) {
         chat_msgs_free(&msgs);
         buf_free(&combined_tool_schemas);
@@ -5608,15 +5695,15 @@ static bool parse_prompt(const char **p, char **out) {
     return true;
 }
 
-static bool parse_completion_request(ds4_engine *e, const char *body, int def_tokens,
+static bool parse_completion_request(ds4_engine *e, server *s, const char *body, int def_tokens,
                                      int ctx_size, request *r, char *err, size_t errlen) {
     request_init(r, REQ_COMPLETION, def_tokens);
     r->model_syntax = server_model_syntax_for_engine(e);
     const char *p = body;
     char *prompt = NULL;
     bool got_thinking = false;
-    bool thinking_enabled = true;
-    ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
+    bool thinking_enabled = server_default_thinking_enabled(s);
+    ds4_think_mode reasoning_effort = server_default_reasoning_effort(s, e);
 
     json_ws(&p);
     if (*p != '{') goto bad;
@@ -5739,6 +5826,7 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    request_apply_defaults(r, e, s);
     chat_msgs msgs = {0};
     chat_msg sys = {0};
     sys.role = xstrdup("system");
@@ -5749,8 +5837,8 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
     user_msg.content = prompt;
     prompt = NULL;
     chat_msgs_push(&msgs, user_msg);
-    r->prompt_text = render_chat_prompt_text_for_syntax(
-        r->model_syntax, &msgs, NULL, NULL, r->think_mode);
+    r->prompt_text = render_chat_prompt_text_for_syntax_ex(
+        r->model_syntax, &msgs, NULL, NULL, r->think_mode, r->preserve_thinking);
     ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
     free(prompt);
@@ -10196,7 +10284,61 @@ struct server {
     FILE *trace;
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
+    ds4_think_mode default_reasoning_effort;
+    bool default_reasoning_effort_set;
+    bool default_thinking_enabled;
+    bool default_thinking_enabled_set;
+    bool default_preserve_thinking;
+    bool default_preserve_thinking_set;
+    float default_temperature;
+    bool default_temperature_set;
+    float default_top_p;
+    bool default_top_p_set;
+    int default_top_k;
+    bool default_top_k_set;
+    float default_min_p;
+    bool default_min_p_set;
 };
+
+static ds4_think_mode server_default_reasoning_effort(const server *s, ds4_engine *e) {
+    if (s && s->default_reasoning_effort_set) return s->default_reasoning_effort;
+    return default_reasoning_effort_for_engine(e);
+}
+
+static bool server_default_thinking_enabled(const server *s) {
+    if (s && s->default_thinking_enabled_set) return s->default_thinking_enabled;
+    return true;
+}
+
+static bool server_default_preserve_thinking(const server *s) {
+    if (s && s->default_preserve_thinking_set) return s->default_preserve_thinking;
+    return true;
+}
+
+static void request_apply_defaults(request *r, ds4_engine *e, const server *s) {
+    if (s) {
+        if (s->default_preserve_thinking_set) {
+            r->preserve_thinking = s->default_preserve_thinking;
+        }
+        if (!r->temperature_set && s->default_temperature_set) {
+            r->temperature = s->default_temperature;
+        }
+        if (!r->top_p_set && s->default_top_p_set) {
+            r->top_p = s->default_top_p;
+        }
+        if (!r->top_k_set && s->default_top_k_set) {
+            r->top_k = s->default_top_k;
+        }
+        if (!r->min_p_set && s->default_min_p_set) {
+            r->min_p = s->default_min_p;
+        }
+    }
+    if (ds4_engine_is_qwen4(e)) {
+        if (!r->temperature_set && !(s && s->default_temperature_set)) r->temperature = 0.7f;
+        if (!r->top_p_set && !(s && s->default_top_p_set)) r->top_p = 0.95f;
+        if (!r->top_k_set && !(s && s->default_top_k_set)) r->top_k = 20;
+    }
+}
 
 static void server_inference_lock(server *s) {
     pthread_mutex_lock(&s->inference_mu);
@@ -13969,16 +14111,6 @@ decode_again:
         int top_k = j->req.top_k;
         float top_p = j->req.top_p;
         float min_p = j->req.min_p;
-        if (ds4_think_mode_enabled(j->req.think_mode)) {
-            /* Thinking keeps the fixed DeepSeek-style sampling defaults, but
-             * only for knobs the client left out: an explicit request value
-             * (e.g. temperature 0 from a benchmark harness) must win, or the
-             * same greedy request returns different text on every call. */
-            if (!j->req.temperature_set) temperature = DS4_DEFAULT_TEMPERATURE;
-            if (!j->req.top_k_set) top_k = 0;
-            if (!j->req.top_p_set) top_p = DS4_DEFAULT_TOP_P;
-            if (!j->req.min_p_set) min_p = DS4_DEFAULT_MIN_P;
-        }
         const bool greedy_tool_syntax = !thinking.inside && in_tool_call &&
             !dsml_decode_state_uses_payload_sampling(dsml_state);
         const float payload_temperature = temperature;
@@ -15353,7 +15485,7 @@ static void *client_main(void *arg) {
         ok = parse_responses_request(s->engine, s, hr.body, s->default_tokens,
                                      ctx_size, &req, err, sizeof(err));
     } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/completions")) {
-        ok = parse_completion_request(s->engine, hr.body, s->default_tokens,
+        ok = parse_completion_request(s->engine, s, hr.body, s->default_tokens,
                                       ctx_size, &req, err, sizeof(err));
     } else {
         http_error(fd, s->enable_cors, 404, "unknown endpoint");
@@ -15464,6 +15596,20 @@ typedef struct {
     bool enable_cors;
     int batched_sessions;
     int mixed_prefill_quantum;
+    ds4_think_mode default_reasoning_effort;
+    bool default_reasoning_effort_set;
+    bool default_thinking_enabled;
+    bool default_thinking_enabled_set;
+    bool default_preserve_thinking;
+    bool default_preserve_thinking_set;
+    float default_temperature;
+    bool default_temperature_set;
+    float default_top_p;
+    bool default_top_p_set;
+    int default_top_k;
+    bool default_top_k_set;
+    float default_min_p;
+    bool default_min_p_set;
 } server_config;
 
 static int parse_int_arg(const char *s, const char *opt) {
@@ -15494,6 +15640,13 @@ static float parse_float_arg(const char *s, const char *opt, float minv, float m
         exit(2);
     }
     return v;
+}
+
+static bool parse_bool_arg(const char *s, const char *opt) {
+    if (!strcmp(s, "1") || !strcasecmp(s, "true") || !strcasecmp(s, "yes")) return true;
+    if (!strcmp(s, "0") || !strcasecmp(s, "false") || !strcasecmp(s, "no")) return false;
+    server_log(DS4_LOG_DEFAULT, "ds4-server: invalid boolean value for %s: %s (expected true/false, 1/0)", opt, s);
+    exit(2);
 }
 
 static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
@@ -15701,6 +15854,34 @@ static server_config parse_options(int argc, char **argv) {
             c.port = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--cors")) {
             c.enable_cors = true;
+        } else if (!strcmp(arg, "--preserve-thinking") || !strcmp(arg, "--preserved-thinking")) {
+            c.default_preserve_thinking = parse_bool_arg(need_arg(&i, argc, argv, arg), arg);
+            c.default_preserve_thinking_set = true;
+        } else if (!strcmp(arg, "--reasoning-effort")) {
+            const char *val = need_arg(&i, argc, argv, arg);
+            if (!parse_reasoning_effort_name(val, &c.default_reasoning_effort) &&
+                !ds4_think_mode_parse_level(val, &c.default_reasoning_effort)) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: invalid value for %s: %s (expected none/low/medium/high/max or 1..100)",
+                           arg, val);
+                exit(2);
+            }
+            c.default_reasoning_effort_set = true;
+        } else if (!strcmp(arg, "--thinking")) {
+            c.default_thinking_enabled = parse_bool_arg(need_arg(&i, argc, argv, arg), arg);
+            c.default_thinking_enabled_set = true;
+        } else if (!strcmp(arg, "--temp")) {
+            c.default_temperature = parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 100.0f);
+            c.default_temperature_set = true;
+        } else if (!strcmp(arg, "--top-p")) {
+            c.default_top_p = parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
+            c.default_top_p_set = true;
+        } else if (!strcmp(arg, "--top-k")) {
+            c.default_top_k = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+            c.default_top_k_set = true;
+        } else if (!strcmp(arg, "--min-p")) {
+            c.default_min_p = parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
+            c.default_min_p_set = true;
         } else if (!strcmp(arg, "--trace")) {
             c.trace_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--batched-session")) {
@@ -15984,6 +16165,20 @@ int main(int argc, char **argv) {
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
+    s.default_reasoning_effort = cfg.default_reasoning_effort;
+    s.default_reasoning_effort_set = cfg.default_reasoning_effort_set;
+    s.default_thinking_enabled = cfg.default_thinking_enabled;
+    s.default_thinking_enabled_set = cfg.default_thinking_enabled_set;
+    s.default_preserve_thinking = cfg.default_preserve_thinking;
+    s.default_preserve_thinking_set = cfg.default_preserve_thinking_set;
+    s.default_temperature = cfg.default_temperature;
+    s.default_temperature_set = cfg.default_temperature_set;
+    s.default_top_p = cfg.default_top_p;
+    s.default_top_p_set = cfg.default_top_p_set;
+    s.default_top_k = cfg.default_top_k;
+    s.default_top_k_set = cfg.default_top_k_set;
+    s.default_min_p = cfg.default_min_p;
+    s.default_min_p_set = cfg.default_min_p_set;
     s.slots = xmalloc((size_t)slot_count * sizeof(*s.slots));
     memset(s.slots, 0, (size_t)slot_count * sizeof(*s.slots));
     if (s.batched_mode) {
@@ -18507,11 +18702,15 @@ static void test_render_qwen_chat_prompt_text(void) {
 static void test_qwen_reasoning_effort_levels(void) {
     bool enabled = true, got = false;
     ds4_think_mode mode = DS4_THINK_HIGH;
+    bool preserve = false;
     const char *kwargs = "{\"enable_thinking\": false, \"reasoning_effort\": \"low\", \"preserve_thinking\": true}";
-    TEST_ASSERT(parse_chat_template_kwargs(&kwargs, &enabled, &got, &mode));
-    TEST_ASSERT(!enabled && got && mode == DS4_THINK_LOW);
+    TEST_ASSERT(parse_chat_template_kwargs(&kwargs, &enabled, &got, &mode, &preserve));
+    TEST_ASSERT(!enabled && got && mode == DS4_THINK_LOW && preserve);
+    kwargs = "{\"preserve_thinking\": false}";
+    TEST_ASSERT(parse_chat_template_kwargs(&kwargs, &enabled, &got, &mode, &preserve));
+    TEST_ASSERT(!preserve);
     kwargs = "null";
-    TEST_ASSERT(parse_chat_template_kwargs(&kwargs, &enabled, &got, &mode));
+    TEST_ASSERT(parse_chat_template_kwargs(&kwargs, &enabled, &got, &mode, &preserve));
     TEST_ASSERT(!enabled && mode == DS4_THINK_LOW);
 
     chat_msgs msgs = {0};
@@ -18955,7 +19154,7 @@ static void test_qwen_sampled_tool_text_after_think_renders_exactly(void) {
     buf_puts(&expected, block);
     buf_puts(&expected, "<|im_end|>\n");
     buf out = {0};
-    append_qwen_assistant_message(&out, &asst, NULL);
+    append_qwen_assistant_message(&out, &asst, NULL, true);
     TEST_ASSERT(out.ptr && !strcmp(out.ptr, expected.ptr));
     buf_free(&out);
     buf_free(&expected);
@@ -18970,7 +19169,7 @@ static void test_qwen_sampled_tool_text_after_think_renders_exactly(void) {
     buf_puts(&expected, "<|im_start|>assistant\n<think>\n\n</think>\n\n");
     buf_puts(&expected, block);
     buf_puts(&expected, "<|im_end|>\n");
-    append_qwen_assistant_message(&out, &plain, NULL);
+    append_qwen_assistant_message(&out, &plain, NULL, false);
     TEST_ASSERT(out.ptr && !strcmp(out.ptr, expected.ptr));
     buf_free(&out);
     buf_free(&expected);
@@ -19006,7 +19205,7 @@ static void test_qwen_plain_answer_keeps_trailing_whitespace(void) {
     plain.role = xstrdup("assistant");
     plain.content = xstrdup("Done.\n");
     buf out = {0};
-    append_qwen_assistant_message(&out, &plain, NULL);
+    append_qwen_assistant_message(&out, &plain, NULL, false);
     TEST_ASSERT(out.ptr && !strcmp(out.ptr, "<|im_start|>assistant\n<think>\n\n</think>\n\nDone.\n<|im_end|>\n"));
     buf_free(&out);
     chat_msg_free(&plain);
@@ -19018,12 +19217,202 @@ static void test_qwen_plain_answer_keeps_trailing_whitespace(void) {
     tc.name = xstrdup("bash");
     tc.arguments = xstrdup("{\"command\": \"ls\"}");
     tool_calls_push(&with_call.calls, tc);
-    append_qwen_assistant_message(&out, &with_call, NULL);
+    append_qwen_assistant_message(&out, &with_call, NULL, false);
     TEST_ASSERT(out.ptr && !strcmp(out.ptr,
         "<|im_start|>assistant\n<think>\n\n</think>\n\nLook:\n\n<tool_call>\n<function=bash>\n"
         "<parameter=command>\nls\n</parameter>\n</function>\n</tool_call><|im_end|>\n"));
     buf_free(&out);
     chat_msg_free(&with_call);
+}
+
+static void test_qwen_preserve_thinking(void) {
+    /* Test server_default_preserve_thinking defaults and server configuration */
+    server s_def = {0};
+    TEST_ASSERT(server_default_preserve_thinking(&s_def) == true);
+    s_def.default_preserve_thinking = false;
+    s_def.default_preserve_thinking_set = true;
+    TEST_ASSERT(server_default_preserve_thinking(&s_def) == false);
+
+    /* Test CLI option parsing */
+    char *argv_false[] = {"ds4-server", "--preserve-thinking", "false"};
+    server_config cfg_false = parse_options(3, argv_false);
+    TEST_ASSERT(cfg_false.default_preserve_thinking_set && cfg_false.default_preserve_thinking == false);
+
+    char *argv_true[] = {"ds4-server", "--preserve-thinking", "true"};
+    server_config cfg_true = parse_options(3, argv_true);
+    TEST_ASSERT(cfg_true.default_preserve_thinking_set && cfg_true.default_preserve_thinking == true);
+
+    char *argv_alias0[] = {"ds4-server", "--preserved-thinking", "0"};
+    server_config cfg_alias0 = parse_options(3, argv_alias0);
+    TEST_ASSERT(cfg_alias0.default_preserve_thinking_set && cfg_alias0.default_preserve_thinking == false);
+
+    char *argv_alias_yes[] = {"ds4-server", "--preserved-thinking", "yes"};
+    server_config cfg_alias_yes = parse_options(3, argv_alias_yes);
+    TEST_ASSERT(cfg_alias_yes.default_preserve_thinking_set && cfg_alias_yes.default_preserve_thinking == true);
+
+    chat_msgs msgs = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("first question");
+    chat_msgs_push(&msgs, user);
+
+    chat_msg asst = {0};
+    asst.role = xstrdup("assistant");
+    asst.content = xstrdup("first answer");
+    asst.reasoning = xstrdup("historical reasoning tokens that should not be preserved");
+    chat_msgs_push(&msgs, asst);
+
+    chat_msg user2 = {0};
+    user2.role = xstrdup("user");
+    user2.content = xstrdup("second question");
+    chat_msgs_push(&msgs, user2);
+
+    /* When preserve_thinking is true: past reasoning is preserved in prompt */
+    char *prompt_preserved = render_chat_prompt_text_for_syntax_ex(
+        SERVER_MODEL_SYNTAX_QWEN, &msgs, NULL, NULL, DS4_THINK_LOW, true);
+    TEST_ASSERT(prompt_preserved != NULL);
+    TEST_ASSERT(strstr(prompt_preserved, "historical reasoning tokens that should not be preserved") != NULL);
+    free(prompt_preserved);
+
+    /* When preserve_thinking is false: past reasoning is STRIPPED from prompt */
+    char *prompt_stripped = render_chat_prompt_text_for_syntax_ex(
+        SERVER_MODEL_SYNTAX_QWEN, &msgs, NULL, NULL, DS4_THINK_LOW, false);
+    TEST_ASSERT(prompt_stripped != NULL);
+    TEST_ASSERT(strstr(prompt_stripped, "historical reasoning tokens that should not be preserved") == NULL);
+    TEST_ASSERT(strstr(prompt_stripped, "first answer") != NULL);
+    TEST_ASSERT(strstr(prompt_stripped, "second question") != NULL);
+    free(prompt_stripped);
+
+    chat_msgs_free(&msgs);
+
+    /* Test embedded <think> tags in content are stripped when preserve_thinking is false */
+    chat_msg asst_embedded = {0};
+    asst_embedded.role = xstrdup("assistant");
+    asst_embedded.content = xstrdup("<think>\ninline thoughts\n</think>\nanswer without tags");
+    chat_msgs msgs2 = {0};
+    chat_msgs_push(&msgs2, asst_embedded);
+    char *prompt_no_preserve = render_chat_prompt_text_for_syntax_ex(
+        SERVER_MODEL_SYNTAX_QWEN, &msgs2, NULL, NULL, DS4_THINK_LOW, false);
+    TEST_ASSERT(prompt_no_preserve != NULL);
+    TEST_ASSERT(strstr(prompt_no_preserve, "inline thoughts") == NULL);
+    TEST_ASSERT(strstr(prompt_no_preserve, "answer without tags") != NULL);
+    free(prompt_no_preserve);
+    chat_msgs_free(&msgs2);
+
+    /* Test unclosed <think> tag is stripped when preserve_thinking is false */
+    chat_msg asst_unclosed = {0};
+    asst_unclosed.role = xstrdup("assistant");
+    asst_unclosed.content = xstrdup("<think>\nunclosed thoughts without close tag");
+    chat_msgs msgs3 = {0};
+    chat_msgs_push(&msgs3, asst_unclosed);
+    char *prompt_unclosed = render_chat_prompt_text_for_syntax_ex(
+        SERVER_MODEL_SYNTAX_QWEN, &msgs3, NULL, NULL, DS4_THINK_LOW, false);
+    TEST_ASSERT(prompt_unclosed != NULL);
+    TEST_ASSERT(strstr(prompt_unclosed, "unclosed thoughts") == NULL);
+    free(prompt_unclosed);
+    chat_msgs_free(&msgs3);
+
+    /* Test leading whitespace before <think> does not produce duplicate <think> blocks */
+    chat_msg asst_ws = {0};
+    asst_ws.role = xstrdup("assistant");
+    asst_ws.content = xstrdup("   \n<think>\ninline thoughts\n</think>\nanswer");
+    chat_msgs msgs4 = {0};
+    chat_msgs_push(&msgs4, asst_ws);
+    char *prompt_ws = render_chat_prompt_text_for_syntax_ex(
+        SERVER_MODEL_SYNTAX_QWEN, &msgs4, NULL, NULL, DS4_THINK_LOW, true);
+    TEST_ASSERT(prompt_ws != NULL);
+    TEST_ASSERT(strstr(prompt_ws, "<think>\n\n</think>") == NULL);
+    TEST_ASSERT(strstr(prompt_ws, "answer") != NULL);
+    free(prompt_ws);
+    chat_msgs_free(&msgs4);
+
+    /* Test request_prompt_preserves_reasoning logic */
+    chat_msgs msgs_tools = {0};
+    chat_msg asst_tool = {0};
+    asst_tool.role = xstrdup("assistant");
+    tool_call tc = {0};
+    tc.name = xstrdup("bash");
+    tc.arguments = xstrdup("{}");
+    tool_calls_push(&asst_tool.calls, tc);
+    chat_msgs_push(&msgs_tools, asst_tool);
+
+    /* DeepSeek preserves reasoning when tools exist regardless of preserve_thinking */
+    TEST_ASSERT(request_prompt_preserves_reasoning(SERVER_MODEL_SYNTAX_DEEPSEEK, true, &msgs_tools, NULL) == true);
+    TEST_ASSERT(request_prompt_preserves_reasoning(SERVER_MODEL_SYNTAX_DEEPSEEK, false, &msgs_tools, NULL) == true);
+
+    /* Qwen preserves reasoning strictly according to preserve_thinking */
+    TEST_ASSERT(request_prompt_preserves_reasoning(SERVER_MODEL_SYNTAX_QWEN, true, &msgs_tools, NULL) == true);
+    TEST_ASSERT(request_prompt_preserves_reasoning(SERVER_MODEL_SYNTAX_QWEN, false, &msgs_tools, NULL) == false);
+
+    chat_msgs_free(&msgs_tools);
+}
+
+static void test_server_startup_defaults(void) {
+    /* Test CLI option parsing for server startup defaults */
+    char *argv[] = {
+        "ds4-server",
+        "--reasoning-effort", "medium",
+        "--thinking", "true",
+        "--temp", "0.85",
+        "--top-p", "0.92",
+        "--top-k", "42",
+        "--min-p", "0.08"
+    };
+    server_config cfg = parse_options(sizeof(argv) / sizeof(argv[0]), argv);
+    TEST_ASSERT(cfg.default_reasoning_effort_set && cfg.default_reasoning_effort == DS4_THINK_MEDIUM);
+    TEST_ASSERT(cfg.default_thinking_enabled_set && cfg.default_thinking_enabled == true);
+    TEST_ASSERT(cfg.default_temperature_set && fabsf(cfg.default_temperature - 0.85f) < 1e-4f);
+    TEST_ASSERT(cfg.default_top_p_set && fabsf(cfg.default_top_p - 0.92f) < 1e-4f);
+    TEST_ASSERT(cfg.default_top_k_set && cfg.default_top_k == 42);
+    TEST_ASSERT(cfg.default_min_p_set && fabsf(cfg.default_min_p - 0.08f) < 1e-4f);
+
+    /* Test --thinking false */
+    char *argv_nothink[] = {"ds4-server", "--thinking", "false"};
+    server_config cfg_nothink = parse_options(3, argv_nothink);
+    TEST_ASSERT(cfg_nothink.default_thinking_enabled_set && cfg_nothink.default_thinking_enabled == false);
+
+    /* Test defaults application to requests */
+    server s = {0};
+    s.default_reasoning_effort = DS4_THINK_MEDIUM;
+    s.default_reasoning_effort_set = true;
+    s.default_thinking_enabled = true;
+    s.default_thinking_enabled_set = true;
+    s.default_temperature = 0.85f;
+    s.default_temperature_set = true;
+    s.default_top_p = 0.92f;
+    s.default_top_p_set = true;
+    s.default_top_k = 42;
+    s.default_top_k_set = true;
+    s.default_min_p = 0.08f;
+    s.default_min_p_set = true;
+
+    request r1 = {0};
+    request_init(&r1, REQ_CHAT, 1024);
+    /* When request has not set sampling knobs, server defaults are applied */
+    request_apply_defaults(&r1, NULL, &s);
+    TEST_ASSERT(fabsf(r1.temperature - 0.85f) < 1e-4f);
+    TEST_ASSERT(fabsf(r1.top_p - 0.92f) < 1e-4f);
+    TEST_ASSERT(r1.top_k == 42);
+    TEST_ASSERT(fabsf(r1.min_p - 0.08f) < 1e-4f);
+    TEST_ASSERT(server_default_reasoning_effort(&s, NULL) == DS4_THINK_MEDIUM);
+    TEST_ASSERT(server_default_thinking_enabled(&s) == true);
+
+    /* When request explicitly sets sampling knobs, request values take precedence */
+    request r2 = {0};
+    request_init(&r2, REQ_CHAT, 1024);
+    r2.temperature = 0.2f;
+    r2.temperature_set = true;
+    r2.top_p = 0.5f;
+    r2.top_p_set = true;
+    r2.top_k = 10;
+    r2.top_k_set = true;
+    r2.min_p = 0.01f;
+    r2.min_p_set = true;
+    request_apply_defaults(&r2, NULL, &s);
+    TEST_ASSERT(fabsf(r2.temperature - 0.2f) < 1e-4f);
+    TEST_ASSERT(fabsf(r2.top_p - 0.5f) < 1e-4f);
+    TEST_ASSERT(r2.top_k == 10);
+    TEST_ASSERT(fabsf(r2.min_p - 0.01f) < 1e-4f);
 }
 
 static void test_render_glm_chat_prompt_text(void) {
@@ -20979,7 +21368,7 @@ static void test_request_parsers_reject_malformed_duplicate_owned_fields(void) {
     TEST_ASSERT(!ok);
     if (ok) request_free(&r);
 
-    ok = parse_completion_request(NULL,
+    ok = parse_completion_request(NULL, NULL,
         "{\"prompt\":\"hello\",\"prompt\":\"bad\\q\",\"max_tokens\":1}",
         1, 100, &r, err, sizeof(err));
     TEST_ASSERT(!ok);
@@ -23059,6 +23448,8 @@ static void ds4_server_unit_tests_run(void) {
     test_qwen_checkpoint_suffix_matches_render();
     test_qwen_thinking_visible_text_matches_render();
     test_qwen_reasoning_effort_levels();
+    test_qwen_preserve_thinking();
+    test_server_startup_defaults();
     test_render_glm_drops_old_reasoning_without_tools();
     test_render_glm_preserves_reasoning_with_tools();
     test_glm_tool_calls_render_matches_template();
