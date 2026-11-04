@@ -6077,7 +6077,7 @@ typedef struct {
 
 typedef struct {
     uint32_t active_mask;
-    uint32_t accumulate;
+    uint32_t accumulate; /* 0: write, 1: add, 2: save SIMD lanes, 3: resume lanes */
 } ds4_gpu_stream_expert_split_args;
 
 typedef struct {
@@ -13900,11 +13900,9 @@ static void *ds4_gpu_stream_expert_pread_pool_worker(void *arg) {
                 &g_stream_expert_pread_pool_tasks[task_index];
             pthread_mutex_unlock(&g_stream_expert_pread_pool_mutex);
 
-            task->ok = ds4_gpu_stream_expert_pread_into(task->offset,
-                                                        task->len,
-                                                        task->dst,
-                                                        &task->read_bytes,
-                                                        &task->ms);
+            const int ok = ds4_gpu_stream_expert_pread_into(
+                    task->offset, task->len, task->dst, &task->read_bytes, &task->ms);
+            __atomic_store_n(&task->ok, ok, __ATOMIC_RELEASE);
 
             pthread_mutex_lock(&g_stream_expert_pread_pool_mutex);
         }
@@ -16854,6 +16852,30 @@ static void ds4_gpu_stream_expert_pending_load_release_buffers(
     }
 }
 
+static ds4_gpu_stream_expert_cache_entry *ds4_gpu_stream_install_pending_slot(
+        ds4_gpu_stream_expert_pending_load *p, uint32_t load_i) {
+    const uint32_t slot = p->load_slots[load_i];
+    const uint32_t expert = (uint32_t)p->selected_ids[slot];
+    if (!p->gate_bufs[load_i]) {
+        /* An early wave already published this protected selection. */
+        ds4_gpu_stream_expert_cache_entry *entry = &g_stream_expert_cache[p->layer][expert];
+        return ds4_gpu_stream_expert_cache_entry_matches(entry, p->model_map, p->model_size,
+                p->gate_abs_offsets[slot], p->up_abs_offsets[slot], p->down_abs_offsets[slot],
+                p->gate_expert_bytes, p->down_expert_bytes) ? entry : NULL;
+    }
+    ds4_gpu_stream_expert_cache_entry *entry = ds4_gpu_stream_expert_cache_install_loaded(
+            p->model_map, p->model_size, p->layer, expert,
+            p->gate_abs_offsets[slot], p->up_abs_offsets[slot], p->down_abs_offsets[slot],
+            p->gate_expert_bytes, p->down_expert_bytes,
+            p->gate_bufs[load_i], p->up_bufs[load_i], p->down_bufs[load_i],
+            p->gate_inners[load_i], p->up_inners[load_i], p->down_inners[load_i]);
+    if (!entry) return NULL;
+    p->gate_bufs[load_i] = nil;
+    p->up_bufs[load_i] = nil;
+    p->down_bufs[load_i] = nil;
+    return entry;
+}
+
 static int ds4_gpu_stream_expert_pending_load_install(
         ds4_gpu_stream_expert_pending_load *p,
         ds4_gpu_stream_expert_cache_entry *entries[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED],
@@ -16884,29 +16906,10 @@ static int ds4_gpu_stream_expert_pending_load_install(
     }
     for (uint32_t load_i = 0; load_i < p->n_loads; load_i++) {
         const uint32_t slot = p->load_slots[load_i];
-        const uint32_t expert = (uint32_t)p->selected_ids[slot];
-        ds4_gpu_stream_expert_cache_entry *entry =
-            ds4_gpu_stream_expert_cache_install_loaded(p->model_map,
-                                                       p->model_size,
-                                                       p->layer,
-                                                       expert,
-                                                       p->gate_abs_offsets[slot],
-                                                       p->up_abs_offsets[slot],
-                                                       p->down_abs_offsets[slot],
-                                                       p->gate_expert_bytes,
-                                                       p->down_expert_bytes,
-                                                       p->gate_bufs[load_i],
-                                                       p->up_bufs[load_i],
-                                                       p->down_bufs[load_i],
-                                                       p->gate_inners[load_i],
-                                                       p->up_inners[load_i],
-                                                       p->down_inners[load_i]);
+        ds4_gpu_stream_expert_cache_entry *entry = ds4_gpu_stream_install_pending_slot(p, load_i);
         if (!entry) return 0;
         loaded_entries[slot] = entry;
         if (entries) entries[slot] = entry;
-        p->gate_bufs[load_i] = nil;
-        p->up_bufs[load_i] = nil;
-        p->down_bufs[load_i] = nil;
     }
     for (uint32_t i = 0; i < p->n_selected; i++) {
         if ((p->missing_mask & (1u << i)) == 0) continue;
@@ -33516,13 +33519,33 @@ static int ds4_gpu_encode_mul_mv_addr_q2_sum6(
     return 1;
 }
 
+static void ds4_gpu_bind_k3_split_slots(
+        id<MTLComputeCommandEncoder> enc, ds4_gpu_stream_expert_cache_entry *const *entries,
+        uint32_t mask, bool down) {
+    uint64_t first[16] = {0}, up[16] = {0};
+    int32_t slots[16];
+    for (uint32_t i = 0; i < 16; i++) {
+        slots[i] = (int32_t)i;
+        if (!(mask & (1u << i))) continue;
+        ds4_gpu_stream_expert_cache_entry *entry = entries[i];
+        if (down) first[i] = entry->down_buffer.gpuAddress + entry->down_inner;
+        else {
+            first[i] = entry->gate_buffer.gpuAddress + entry->gate_inner;
+            up[i] = entry->up_buffer.gpuAddress + entry->up_inner;
+        }
+    }
+    [enc setBytes:first length:sizeof(first) atIndex:down ? 2 : 3];
+    if (!down) [enc setBytes:up length:sizeof(up) atIndex:4];
+    [enc setBytes:slots length:sizeof(slots) atIndex:down ? 5 : 9];
+}
+
 static int ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu_masked(
         id<MTLCommandBuffer>        cb,
         id<MTLComputePipelineState> pipeline,
         const ds4_gpu_mul_mv_id_args *args,
         const ds4_gpu_dsv4_moe_swiglu_weight_args *act,
         const ds4_gpu_stream_expert_split_args *split,
-        ds4_gpu_stream_expert_cache_entry * const entries[6],
+        ds4_gpu_stream_expert_cache_entry * const *entries,
         id<MTLBuffer>               gate_addrs,
         id<MTLBuffer>               up_addrs,
         id<MTLBuffer>               src1,
@@ -33543,16 +33566,16 @@ static int ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu_masked(
     if (!cb || !pipeline || !args || !act || !split || !entries ||
         !gate_addrs || !up_addrs || !src1 || !dst_a || !dst_b || !dst_mid ||
         !ids || !weights ||
-        args->ne00 <= 0 || args->ne01 <= 0 || args->nei0 != 6 || args->nei1 <= 0 ||
-        args->ne02 <= 0 || args->ne02 > 384) {
+        args->ne00 <= 0 || args->ne01 <= 0 || (args->nei0 != 6 && args->nei0 != 16) || args->nei1 <= 0 ||
+        args->ne02 <= 0 || args->ne02 > DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT) {
         return 0;
     }
-    for (uint32_t i = 0; i < 6; i++) {
+    for (uint32_t i = 0; i < (uint32_t)args->nei0; i++) {
         if ((split->active_mask & (1u << i)) == 0) continue;
         if (!entries[i] || !entries[i]->gate_buffer || !entries[i]->up_buffer) return 0;
     }
     if (!ds4_gpu_stream_expert_cache_mark_entries_inflight(entries,
-                                                           6,
+                                                           (uint32_t)args->nei0,
                                                            split->active_mask)) {
         return 0;
     }
@@ -33567,15 +33590,19 @@ static int ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu_masked(
     [enc setBytes:args  length:sizeof(*args)  atIndex:0];
     [enc setBytes:act   length:sizeof(*act)   atIndex:1];
     [enc setBytes:split length:sizeof(*split) atIndex:2];
-    [enc setBuffer:gate_addrs offset:0 atIndex:3];
-    [enc setBuffer:up_addrs   offset:0 atIndex:4];
+    if (args->nei0 == 16) {
+        ds4_gpu_bind_k3_split_slots(enc, entries, split->active_mask, false);
+    } else {
+        [enc setBuffer:gate_addrs offset:0 atIndex:3];
+        [enc setBuffer:up_addrs offset:0 atIndex:4];
+        [enc setBuffer:ids offset:ids_off atIndex:9];
+    }
     [enc setBuffer:src1       offset:src1_off    atIndex:5];
     [enc setBuffer:dst_a      offset:dst_a_off   atIndex:6];
     [enc setBuffer:dst_b      offset:dst_b_off   atIndex:7];
     [enc setBuffer:dst_mid    offset:dst_mid_off atIndex:8];
-    [enc setBuffer:ids        offset:ids_off     atIndex:9];
     [enc setBuffer:weights    offset:weights_off atIndex:10];
-    for (uint32_t i = 0; i < 6; i++) {
+    for (uint32_t i = 0; i < (uint32_t)args->nei0; i++) {
         if ((split->active_mask & (1u << i)) == 0) continue;
         [enc useResource:entries[i]->gate_buffer usage:MTLResourceUsageRead];
         [enc useResource:entries[i]->up_buffer usage:MTLResourceUsageRead];
@@ -33594,7 +33621,7 @@ static int ds4_gpu_encode_mul_mv_addr_q2_sum6_masked(
         id<MTLComputePipelineState> pipeline,
         const ds4_gpu_mul_mv_id_args *args,
         const ds4_gpu_stream_expert_split_args *split,
-        ds4_gpu_stream_expert_cache_entry * const entries[6],
+        ds4_gpu_stream_expert_cache_entry * const *entries,
         id<MTLBuffer>               addrs,
         id<MTLBuffer>               src1,
         NSUInteger                  src1_off,
@@ -33603,19 +33630,20 @@ static int ds4_gpu_encode_mul_mv_addr_q2_sum6_masked(
         id<MTLBuffer>               ids,
         NSUInteger                  ids_off,
         NSUInteger                  threadgroup_bytes,
-        NSUInteger                  nsg) {
+        NSUInteger                  nsg,
+        const ds4_gpu_tensor       *carry) {
     if (!cb || !pipeline || !args || !split || !entries || !addrs ||
         !src1 || !dst || !ids ||
-        args->ne00 <= 0 || args->ne01 <= 0 || args->nei0 != 6 || args->nei1 <= 0 ||
-        args->ne02 <= 0 || args->ne02 > 384) {
+        args->ne00 <= 0 || args->ne01 <= 0 || (args->nei0 != 6 && args->nei0 != 16) || args->nei1 <= 0 ||
+        args->ne02 <= 0 || args->ne02 > DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT) {
         return 0;
     }
-    for (uint32_t i = 0; i < 6; i++) {
+    for (uint32_t i = 0; i < (uint32_t)args->nei0; i++) {
         if ((split->active_mask & (1u << i)) == 0) continue;
         if (!entries[i] || !entries[i]->down_buffer) return 0;
     }
     if (!ds4_gpu_stream_expert_cache_mark_entries_inflight(entries,
-                                                           6,
+                                                           (uint32_t)args->nei0,
                                                            split->active_mask)) {
         return 0;
     }
@@ -33627,11 +33655,18 @@ static int ds4_gpu_encode_mul_mv_addr_q2_sum6_masked(
     [enc setComputePipelineState:pipeline];
     [enc setBytes:args  length:sizeof(*args)  atIndex:0];
     [enc setBytes:split length:sizeof(*split) atIndex:1];
-    [enc setBuffer:addrs offset:0 atIndex:2];
+    /* Only the early prefix runs concurrently with cache installation. */
+    if (split->accumulate == 2u) ds4_gpu_bind_k3_split_slots(enc, entries, split->active_mask, true);
+    else {
+        [enc setBuffer:addrs offset:0 atIndex:2];
+        [enc setBuffer:ids offset:ids_off atIndex:5];
+    }
+    [enc setBuffer:carry ? ds4_gpu_tensor_buffer(carry) : dst
+            offset:carry ? ds4_gpu_tensor_offset(carry) : dst_off atIndex:6];
     [enc setBuffer:src1  offset:src1_off atIndex:3];
     [enc setBuffer:dst   offset:dst_off  atIndex:4];
-    [enc setBuffer:ids   offset:ids_off  atIndex:5];
-    for (uint32_t i = 0; i < 6; i++) {
+
+    for (uint32_t i = 0; i < (uint32_t)args->nei0; i++) {
         if ((split->active_mask & (1u << i)) == 0) continue;
         [enc useResource:entries[i]->down_buffer usage:MTLResourceUsageRead];
     }
@@ -42176,10 +42211,12 @@ static int ds4_gpu_routed_moe_one_tensor_impl(
                 if (getenv("DS4_GLM_TP_DEBUG")) fprintf(stderr, "ds4: routed_moe_one silent return at line %d\n", 32831);
                 return 0;
             }
+            const bool k3_split = ready_ids && activation_kind == 1u && n_expert == 16u &&
+                getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_MASKED_ADDR") == NULL &&
+                getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_ADDR_TABLE") == NULL;
             const bool stream_split_ready =
                 use_stream_expert_cache &&
-                n_expert <= 6 &&
-                ds4_gpu_stream_expert_split_ready();
+                ((n_expert <= 6 && ds4_gpu_stream_expert_split_ready()) || k3_split);
             const bool use_stream_compact_addr =
                 use_stream_expert_cache &&
                 use_iq2_selected_slots &&
@@ -42369,6 +42406,20 @@ static int ds4_gpu_routed_moe_one_tensor_impl(
                     return 0;
                 }
 
+                if (k3_split && ds4_gpu_stream_expert_pending_load_matches(
+                        model_map, model_size, layer_index, selected_ids, n_total_expert,
+                        n_expert, gate_expert_bytes, down_expert_bytes)) {
+                    ds4_gpu_stream_expert_pending_load *p = &g_stream_expert_pending_load;
+                    /* Each load owns three tasks in gate/up/down order. The
+                     * workers can keep writing other slots during this pass. */
+                    for (uint32_t i = 0; i < p->n_loads; i++) {
+                        const ds4_gpu_stream_expert_pread_task *t = &p->tasks[3u * i];
+                        if (__atomic_load_n(&t[0].ok, __ATOMIC_ACQUIRE) &&
+                            __atomic_load_n(&t[1].ok, __ATOMIC_ACQUIRE) &&
+                            __atomic_load_n(&t[2].ok, __ATOMIC_ACQUIRE) &&
+                            !ds4_gpu_stream_install_pending_slot(p, i)) return 0;
+                    }
+                }
                 for (uint32_t i = 0; i < n_expert; i++) {
                     const uint64_t expert_id = (uint64_t)(uint32_t)selected_ids[i];
                     if (expert_id > UINT64_MAX / gate_expert_bytes ||
@@ -42500,8 +42551,9 @@ static int ds4_gpu_routed_moe_one_tensor_impl(
                 use_stream_expert_masked_addr_table =
                     use_stream_expert_addr_table &&
                     use_iq2_selected_slots &&
-                    n_expert <= 6 &&
-                    ds4_gpu_stream_expert_masked_addr_requested() &&
+                    ((n_expert <= 6 && ds4_gpu_stream_expert_masked_addr_requested()) ||
+                     (k3_split && ds4_gpu_stream_expert_split_worthwhile(
+                             stream_expert_resident_mask, stream_expert_missing_mask))) &&
                     g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_masked_pipeline != nil &&
                     g_moe_mul_mv_addr_q2_k_sum6_masked_pipeline != nil;
                 use_stream_expert_split_deferred =
@@ -43124,6 +43176,20 @@ static int ds4_gpu_routed_moe_one_tensor_impl(
                                                                                gate_smem,
                                                                                2,
                                                                                false);
+                        uint32_t prefix_mask = 0;
+                        if (n_expert == 16u && expertsbuf && ds4_gpu_tensor_bytes(experts) >=
+                            (uint64_t)out_dim * 32u * sizeof(float)) {
+                            /* Only an uninterrupted prefix can start the exact down sum. */
+                            prefix_mask = stream_expert_resident_mask & ~(stream_expert_resident_mask + 1u);
+                        }
+                        if (ok && prefix_mask) {
+                            const ds4_gpu_stream_expert_split_args save = {prefix_mask, 2u};
+                            ok = ds4_gpu_encode_mul_mv_addr_q2_sum6_masked(
+                                    cb, g_moe_mul_mv_addr_q2_k_sum6_masked_pipeline, &down_args, &save,
+                                    stream_slot_entries, stream_down_addr_buf, midbuf, ds4_gpu_tensor_offset(mid),
+                                    outbuf, ds4_gpu_tensor_offset(out), selected_exec_buf, selected_exec_off,
+                                    down_smem, 2, experts);
+                        }
                         if (ok) {
                             ok = ds4_gpu_flush_commands();
                             if (ok) {
@@ -43212,17 +43278,9 @@ static int ds4_gpu_routed_moe_one_tensor_impl(
                             }
                         }
                         if (ok) {
-                            /*
-                             * The resident stage was submitted before the
-                             * CPU read of missing experts so I/O can overlap
-                             * with GPU work. The missing stage reuses the same
-                             * gate/up/mid scratch buffers, so it must not
-                             * execute until the resident command buffer has
-                             * finished. The down/sum pass is issued once after
-                             * all six mid slots exist; this keeps the final
-                             * accumulation order stable regardless of the
-                             * resident/missing split.
-                             */
+                            /* Both stages share gate/up/mid scratch. After the
+                             * reads finish, wait for the ready experts before
+                             * reusing it and finishing the ordered down sum. */
                             ok = ds4_gpu_wait_pending_command_buffers(
                                     "streaming expert split resident");
                             if (stream_split_timing) {
@@ -43241,8 +43299,8 @@ static int ds4_gpu_routed_moe_one_tensor_impl(
                             .accumulate = 0u,
                         };
                         ds4_gpu_stream_expert_split_args all_down_args = {
-                            .active_mask = 0x3fu,
-                            .accumulate = 0u,
+                            .active_mask = ((1u << n_expert) - 1u) & ~prefix_mask,
+                            .accumulate = prefix_mask ? 3u : 0u,
                         };
                         if (ok) {
                             ok = ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu_masked(cb,
@@ -43283,7 +43341,7 @@ static int ds4_gpu_routed_moe_one_tensor_impl(
                                                                            selected_exec_buf,
                                                                            selected_exec_off,
                                                                            down_smem,
-                                                                           2);
+                                                                           2, prefix_mask ? experts : NULL);
                         }
                         stream_expert_split_completed = ok;
                         if (stream_split_timing) {
@@ -43312,7 +43370,7 @@ static int ds4_gpu_routed_moe_one_tensor_impl(
                         }
                     } else {
                         ds4_gpu_stream_expert_split_args split_args = {
-                            .active_mask = 0x3fu,
+                            .active_mask = (1u << n_expert) - 1u,
                             .accumulate = 0u,
                         };
                         ok = ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu_masked(cb,
@@ -43534,8 +43592,7 @@ static int ds4_gpu_routed_moe_one_tensor_impl(
         NSUInteger down_dst_off = n_expert == 1 ? ds4_gpu_tensor_offset(out) :
             (expertsbuf ? ds4_gpu_tensor_offset(experts) : 0);
         if (ok && stream_expert_split_completed) {
-            /* The split path already wrote the resident partial output and
-             * accumulated the missing experts into out. */
+            /* Both waves have already finished the ordered down sum. */
         } else if (ok && use_q4_grouped_experts) {
             bool first_group = true;
             for (uint32_t expert_base = 0; ok && expert_base < n_total_expert; expert_base += q4_expert_group_size) {
@@ -43681,7 +43738,7 @@ static int ds4_gpu_routed_moe_one_tensor_impl(
                                                         false, 2, nil);
                 } else if (use_stream_expert_masked_addr_table) {
                     ds4_gpu_stream_expert_split_args split_args = {
-                        .active_mask = 0x3fu,
+                        .active_mask = (1u << n_expert) - 1u,
                         .accumulate = 0u,
                     };
                     ok = ds4_gpu_encode_mul_mv_addr_q2_sum6_masked(cb,
@@ -43697,7 +43754,7 @@ static int ds4_gpu_routed_moe_one_tensor_impl(
                                                                    selected_exec_buf,
                                                                    selected_exec_off,
                                                                    down_smem,
-                                                                   2);
+                                                                   2, NULL);
                 } else {
                     ok = ds4_gpu_encode_mul_mv_addr_q2_sum6(cb,
                                                              g_moe_mul_mv_addr_q2_k_sum6_pipeline,

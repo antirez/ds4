@@ -28,6 +28,11 @@ selects all 16 experts. A wrong guess only costs I/O. The runtime skips
 prediction across an AttnRes block boundary or when the next layer’s static
 weights are on disk. Set `K3_ROUTE_PREDICT=0` to benchmark without lookahead.
 
+After the actual router selects its 16 experts, Metal can start work on experts
+already in its cache or whose reads have finished. The other reads continue
+while the GPU computes. If the first experts in router order are ready, Metal
+can also start their output sum early and resume it in the original order.
+
 Routed gate/up weights use IQ2_XXS and routed down weights use Q2_K.
 Shared experts remain MXFP4, latent up projections use Q8_0, and attention,
 embeddings, the output head, routers, and norms retain higher precision.

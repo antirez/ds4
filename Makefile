@@ -197,7 +197,13 @@ test-k3-gguf: ds4 tests/test_k3_gguf tests/test_k3_tokenizer tests/test_k3_gguf_
 	    K3_ROUTE_PREDICT=$$prediction K3_TEST_DUMP="$$dir/$$prediction" \
 	    ./tests/test_k3_gguf_slice "$(K3_GGUF)"; \
 	done; \
-	cmp "$$dir/0" "$$dir/1"
+	cmp "$$dir/0" "$$dir/1"; \
+	for mode in serial overlap; do \
+	    ( if test "$$mode" = serial; then export DS4_METAL_DISABLE_STREAMING_EXPERT_MASKED_ADDR=1; fi; \
+	      K3_TEST_STATIC=1 K3_TEST_LAYER=10 K3_TEST_STREAM_LAYERS=4 K3_TEST_PREFILL_ROWS=8 \
+	      K3_TEST_DUMP="$$dir/$$mode" ./tests/test_k3_gguf_slice "$(K3_GGUF)" ); \
+	done; \
+	cmp "$$dir/serial" "$$dir/overlap"
 
 test-k3-gguf-source: tests/test_k3_gguf
 	./tests/test_k3_gguf "$(K3_GGUF)" "$(K3_MODEL)"

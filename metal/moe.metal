@@ -6256,6 +6256,7 @@ kernel void kernel_mul_mv_addr_q2_K_sum6_masked_f32(
         device const char * src1,
         device       char * dst,
         device const char * ids,
+        device float *carry [[buffer(6)]],
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiitg[[thread_index_in_threadgroup]],
@@ -6271,6 +6272,10 @@ kernel void kernel_mul_mv_addr_q2_K_sum6_masked_f32(
         (device const int32_t *)(ids + (uint64_t)token * args.nbi1);
 
     float sumf[nr0] = {0.f};
+    if (split.accumulate == 3u) {
+        for (short r = 0; r < nr0 && first_row + r < args.ne0; r++)
+            sumf[r] = carry[(first_row + r) * 32u + tiisg];
+    }
 
     const short ix = tiisg / 8;
     const short it = tiisg % 8;
@@ -6342,11 +6347,18 @@ kernel void kernel_mul_mv_addr_q2_K_sum6_masked_f32(
         }
     }
 
+    /* Save the per-lane FP32 accumulator before the SIMD reduction. The
+     * remaining experts resume the same multiply-add chain in router order. */
+    if (split.accumulate == 2u) {
+        for (short r = 0; r < nr0 && first_row + r < args.ne0; r++)
+            carry[(first_row + r) * 32u + tiisg] = sumf[r];
+        return;
+    }
     device float * dst_f32 = (device float *)(dst + (uint64_t)token * args.nb1);
     for (int row = 0; row < nr0 && first_row + row < args.ne0; row++) {
         const float sum_all = simd_sum(sumf[row]);
         if (tiisg == 0) {
-            if (split.accumulate) {
+            if (split.accumulate == 1u) {
                 dst_f32[first_row + row] += sum_all;
             } else {
                 dst_f32[first_row + row] = sum_all;
