@@ -156,10 +156,77 @@ static int check_decode_attention_overflow_path(void) {
     return rc;
 }
 
+/* Issue #803: the scalar prefill mixed fallback keeps scores in a fixed
+ * __shared__ float[512]. Shapes whose widest block needs more entries must be
+ * rejected by the launcher (so the caller falls back) instead of letting the
+ * kernel write past the array. */
+static int check_prefill_mixed_scores_window(void) {
+    /* head_dim != 512 keeps the launcher off the window/cublas paths and on
+     * the scalar fallback that owns the shared scores window. */
+    const uint32_t n_head = 2;
+    const uint32_t head_dim = 64;
+    const uint32_t ratio = 4;
+    const uint32_t max_tokens = 1024;
+    const uint64_t q_count = (uint64_t)max_tokens * n_head * head_dim;
+    const uint64_t raw_count = (uint64_t)max_tokens * head_dim;
+    const uint32_t max_comp = max_tokens / ratio;
+    const uint64_t comp_count = (uint64_t)max_comp * head_dim;
+    const uint64_t page = 4096;
+
+    float *q_host = (float *)calloc((size_t)q_count, sizeof(float));
+    float *raw_host = (float *)calloc((size_t)raw_count, sizeof(float));
+    float *comp_host = (float *)calloc((size_t)comp_count, sizeof(float));
+    float *model_host = (float *)calloc((size_t)page / sizeof(float), sizeof(float));
+    if (!q_host || !raw_host || !comp_host || !model_host) return 1;
+
+    ds4_gpu_tensor *heads = ds4_gpu_tensor_alloc(q_count * sizeof(float));
+    ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(q_count * sizeof(float));
+    ds4_gpu_tensor *raw = ds4_gpu_tensor_alloc(raw_count * sizeof(float));
+    ds4_gpu_tensor *comp = ds4_gpu_tensor_alloc(comp_count * sizeof(float));
+    int rc = 1;
+    if (heads && q && raw && comp &&
+        ds4_gpu_tensor_write(q, 0, q_host, q_count * sizeof(float)) &&
+        ds4_gpu_tensor_write(raw, 0, raw_host, raw_count * sizeof(float)) &&
+        ds4_gpu_tensor_write(comp, 0, comp_host, comp_count * sizeof(float))) {
+        rc = 0;
+        /* window=0 makes every raw row visible to the last token: 1024 raw
+         * scores never fit in 512, the launcher must refuse the launch. */
+        int wide = ds4_gpu_attention_prefill_static_mixed_heads_tensor(
+            heads, model_host, page, 0, q, raw, comp, 0,
+            max_tokens, max_comp, 0, ratio, n_head, head_dim);
+        if (wide != 0) {
+            fprintf(stderr,
+                    "prefill mixed accepted %u raw + %u comp scores into a 512-wide window\n",
+                    max_tokens, max_comp);
+            rc = 1;
+        }
+        /* A windowed shape that fits (128 raw + 256 comp = 384) must keep
+         * working, and its launch must complete cleanly. */
+        int fits = ds4_gpu_attention_prefill_static_mixed_heads_tensor(
+            heads, model_host, page, 0, q, raw, comp, 0,
+            max_tokens, max_comp, 128, ratio, n_head, head_dim);
+        if (fits == 0 || !ds4_gpu_synchronize()) {
+            fprintf(stderr, "prefill mixed rejected a shape that fits the scores window\n");
+            rc = 1;
+        }
+    }
+
+    ds4_gpu_tensor_free(comp);
+    ds4_gpu_tensor_free(raw);
+    ds4_gpu_tensor_free(q);
+    ds4_gpu_tensor_free(heads);
+    free(model_host);
+    free(comp_host);
+    free(raw_host);
+    free(q_host);
+    return rc;
+}
+
 int main(void) {
     if (!ds4_gpu_init()) return 1;
     int rc = check_large_topk();
     if (check_decode_attention_overflow_path() != 0) rc = 1;
+    if (check_prefill_mixed_scores_window() != 0) rc = 1;
     ds4_gpu_cleanup();
     if (rc == 0) puts("cuda long-context regression: OK");
     return rc;
