@@ -6638,6 +6638,11 @@ static bool agent_parse_bool_default(const char *s, bool def) {
 #define AGENT_READ_SMALL_CONTEXT_MAX 8192
 #define AGENT_READ_MEDIUM_CONTEXT_MAX 16384
 #define AGENT_TOOL_RESULT_RESERVE_TOKENS 1024
+/* Invalid tool calls one user turn may make before the agent stops and hands
+ * control back.  Each one is answered with a syntax reminder; a model that
+ * keeps failing (for example, trying to quote tool markup it read from a
+ * file) otherwise loops forever, alternating with ordinary tool calls. */
+#define AGENT_INVALID_TOOL_CALLS_PER_TURN 8
 #define AGENT_EDIT_UPTO_MIN_PREFIX_BYTES 64
 #define AGENT_EDIT_UPTO_MIN_PREFIX_LINES 2
 #define AGENT_COMPACT_SOFT_PERCENT 85
@@ -10347,6 +10352,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
     int carried_generation = 0;
     bool resume_assistant = false, resume_in_think = false;
     int resume_start = 0;
+    int invalid_tool_calls = 0;
     for (int tool_round = 0; ; tool_round++) {
         if (!resume_assistant &&
             !agent_worker_compact_if_needed(w, "soft limit before assistant continuation",
@@ -10714,6 +10720,11 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             agent_dsml_parser_free(&dsml);
             agent_set_status(w, AGENT_WORKER_IDLE);
             return 0;
+        }
+        if (malformed_tool && ++invalid_tool_calls > AGENT_INVALID_TOOL_CALLS_PER_TURN) {
+            agent_dsml_parser_free(&dsml);
+            agent_set_error(w, "stopped after repeated invalid tool calls in this turn");
+            return 1;
         }
 
         agent_tool_observation observation;
