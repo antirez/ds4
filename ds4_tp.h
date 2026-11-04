@@ -107,6 +107,7 @@ bool ds4_tp_is_rdma(const ds4_tp *tp);
 /* True once both peers agreed on the RDMA command mailbox (RC queue pairs,
  * not disabled with DS4_TP_DISABLE_RDMA_MAILBOX on either rank). */
 bool ds4_tp_command_mailbox_active(const ds4_tp *tp);
+bool ds4_tp_is_odl(const ds4_tp *tp);
 uint32_t ds4_tp_peer_ctx(const ds4_tp *tp);
 enum {
     DS4_TP_MODE_EXPERT_INTERMEDIATE_SPLIT = 1u,
@@ -241,6 +242,7 @@ typedef enum {
     DS4_TP_FRAME_SYNC_CHECKPOINT = 22,
     DS4_TP_FRAME_DSPARK_DRAFT = 23,
     DS4_TP_FRAME_SPEC_RESTORE = 24,
+    DS4_TP_FRAME_ODL_READY = 25,   /* OdinLink data-plane barrier (0 bytes) */
 } ds4_tp_frame_type;
 
 typedef struct {
