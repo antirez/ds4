@@ -27,6 +27,9 @@ enum {
     K3_EXPERT_FF = 3072,
     K3_SHARED_FF = 6144,
     K3_DENSE_FF = 33792,
+    K31_INDEX_HEADS = 32,
+    K31_INDEX_DIM = 128,
+    K31_INDEX_TOPK = 2048,
     K3_MAX_CONTEXT = 1048576,
     K3_ATTN_RES_BLOCK = 12,
     K3_ATTN_RES_BLOCKS =
@@ -89,6 +92,8 @@ typedef struct {
     const k3_st_tensor *kv_a_proj;
     const k3_st_tensor *kv_a_norm;
     const k3_st_tensor *kv_b_proj;
+    const k3_st_tensor *index_q, *index_k, *index_weights;
+    const k3_st_tensor *index_norm, *index_bias;
 
     /* Layer 0 dense MLP. */
     const k3_st_tensor *dense_gate;
@@ -113,6 +118,7 @@ typedef struct {
 typedef struct {
     char *directory;
     bool gguf;
+    bool dsa;
 } k3_model;
 
 typedef struct {

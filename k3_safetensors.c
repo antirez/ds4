@@ -291,6 +291,57 @@ static int json_u64(const json_doc *doc, int index, uint64_t *out) {
     return 1;
 }
 
+int k3_st_read_dsa_config(const char *directory, bool *dsa, char *err, size_t errcap) {
+    char path[4096];
+    *dsa = false;
+    const int n = snprintf(path, sizeof(path), "%s/config.json", directory);
+    if (n < 0 || (size_t)n >= sizeof(path)) return 0;
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        if (errno == ENOENT) return 1; /* Existing raw tensor fixtures. */
+        set_error(err, errcap, "could not open K3 config: %s", strerror(errno));
+        return 0;
+    }
+    char buf[65536];
+    const size_t size = fread(buf, 1, sizeof(buf), fp);
+    const int complete = !ferror(fp) && feof(fp);
+    fclose(fp);
+    json_doc doc;
+    if (!complete) { set_error(err, errcap, "invalid K3 config size"); return 0; }
+    if (!json_parse(&doc, buf, size, err, errcap)) return 0;
+    const int type = json_object_get(&doc, 0, "model_type");
+    const int text = json_object_get(&doc, 0, "text_config");
+    const int cfg = json_object_get(&doc, text, "dsa_config");
+    *dsa = type >= 0 && json_equal(&doc, type, "kimi_k31");
+    int ok = !*dsa && cfg < 0;
+    if (*dsa && cfg >= 0) {
+        const struct { const char *key; uint64_t value; } fields[] = {
+            {"index_topk", 2048}, {"index_head_dim", 128}, {"index_num_heads", 32},
+            {"index_rope_dim", 0}, {"index_topk_freq", 1}, {"index_skip_topk_offset", 1},
+        };
+        const int norm = json_object_get(&doc, cfg, "index_k_norm_type");
+        ok = norm >= 0 && json_equal(&doc, norm, "layernorm");
+        for (size_t i = 0; ok && i < sizeof(fields)/sizeof(fields[0]); i++) {
+            uint64_t v;
+            ok = json_u64(&doc, json_object_get(&doc, cfg, fields[i].key), &v) &&
+                 v == fields[i].value;
+        }
+        const int layers = json_object_get(&doc, cfg, "dsa_layers");
+        ok = ok && layers >= 0 && doc.tokens[layers].type == JSON_ARRAY;
+        int j = layers + 1;
+        for (uint32_t layer = 1; ok && layer <= 93; layer++) {
+            if (layer % 4 && layer != 93) continue;
+            uint64_t v;
+            ok = j < doc.count && doc.tokens[j].parent == layers && json_u64(&doc,j,&v) && v == layer;
+            j++;
+        }
+        ok = ok && j == json_skip(&doc, layers);
+    }
+    json_free(&doc);
+    if (!ok) set_error(err, errcap, "unsupported Kimi sparse attention configuration");
+    return ok;
+}
+
 static k3_st_dtype parse_dtype(const json_doc *doc, int index) {
     if (json_equal(doc, index, "U8")) return K3_ST_DTYPE_U8;
     if (json_equal(doc, index, "F32")) return K3_ST_DTYPE_F32;

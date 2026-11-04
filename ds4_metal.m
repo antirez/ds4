@@ -53381,6 +53381,7 @@ typedef struct {
     uint32_t cache_capacity;
     uint32_t max_partials;
     uint32_t n_partials;
+    uint32_t indexed;
 } k3_gpu_mla_args;
 
 int k3_gpu_mla_decode(
@@ -53398,7 +53399,8 @@ int k3_gpu_mla_decode(
         uint32_t              n_heads,
         uint32_t              position,
         uint32_t              cache_capacity,
-        uint32_t              max_partials) {
+        uint32_t              max_partials,
+        const ds4_gpu_tensor *selected) {
     enum {
         K3_MLA_Q_HEAD = 192,
         K3_MLA_KV = 576,
@@ -53408,7 +53410,7 @@ int k3_gpu_mla_decode(
         K3_MLA_CONTEXT_BLOCK = 1024,
     };
     if (!g_initialized && !ds4_gpu_init()) return 0;
-    const uint32_t n_partials =
+    const uint32_t n_partials = selected ? 2u :
         (position + K3_MLA_CONTEXT_BLOCK) / K3_MLA_CONTEXT_BLOCK;
     uint64_t q_elements = 0, gate_elements = 0, latent_elements = 0;
     uint64_t cache_elements = 0, partial_elements = 0, stats_elements = 0;
@@ -53416,6 +53418,7 @@ int k3_gpu_mla_decode(
     if (n_heads == 0 || cache_capacity == 0 ||
         position >= cache_capacity || max_partials == 0 ||
         n_partials > max_partials ||
+        (selected && (position < 2048u || !k3_gpu_tensor_has(selected, 2048u, sizeof(int32_t)))) ||
         !k3_gpu_mul_u64(n_heads, K3_MLA_Q_HEAD, &q_elements) ||
         !k3_gpu_mul_u64(n_heads, K3_MLA_V_HEAD, &gate_elements) ||
         !k3_gpu_mul_u64(n_heads, K3_MLA_LATENT, &latent_elements) ||
@@ -53465,6 +53468,7 @@ int k3_gpu_mla_decode(
             .cache_capacity = cache_capacity,
             .max_partials = max_partials,
             .n_partials = n_partials,
+            .indexed = selected != NULL,
         };
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
@@ -53502,6 +53506,8 @@ int k3_gpu_mla_decode(
                 offset:ds4_gpu_tensor_offset(partial_values) atIndex:4];
         [enc setBuffer:ds4_gpu_tensor_buffer(partial_stats)
                 offset:ds4_gpu_tensor_offset(partial_stats) atIndex:5];
+        const ds4_gpu_tensor *indices = selected ? selected : q;
+        [enc setBuffer:ds4_gpu_tensor_buffer(indices) offset:ds4_gpu_tensor_offset(indices) atIndex:6];
         [enc dispatchThreadgroups:MTLSizeMake(
                 ((NSUInteger)n_heads + 3u) / 4u, n_partials, 1)
             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
@@ -53537,11 +53543,76 @@ int k3_gpu_mla_decode(
     }
 }
 
+int k3_gpu_dsa_index(ds4_gpu_tensor *q, ds4_gpu_tensor *k, ds4_gpu_tensor *weights,
+                     ds4_gpu_tensor *cache, ds4_gpu_tensor *scores, ds4_gpu_tensor *selected,
+                     const void *map, uint64_t size, uint64_t norm_offset, uint64_t bias_offset,
+                     uint32_t pos, uint32_t rows) {
+    const uint32_t top = 2048u;
+    if (!rows || pos > UINT32_MAX - rows) return 0;
+    const uint32_t end = pos + rows;
+    const bool select = end > top;
+    const uint32_t tile = MIN(rows, 8u);
+    if (!k3_gpu_tensor_has(cache, end, 132u) || !k3_gpu_tensor_has(k, rows, 128u * 4u) ||
+        !k3_gpu_tensor_has(q, rows, 4096u * 4u) || !k3_gpu_tensor_has(weights, rows, 32u * 4u) ||
+        (select && (!k3_gpu_tensor_has(scores, (uint64_t)tile * end, sizeof(float)) ||
+                    !k3_gpu_tensor_has(selected, (uint64_t)rows * top, sizeof(int32_t))))) return 0;
+    @autoreleasepool {
+        uint64_t no = 0, bo = 0;
+        id<MTLBuffer> norm = k3_gpu_weight_buffer(map, size, norm_offset, 256, &no, "K3.1 index norm");
+        id<MTLBuffer> bias = k3_gpu_weight_buffer(map, size, bias_offset, 256, &bo, "K3.1 index bias");
+        id<MTLComputePipelineState> pack = ds4_gpu_get_pipeline("kernel_k31_index_prepare");
+        id<MTLComputePipelineState> score = select ? ds4_gpu_get_pipeline("kernel_k31_index_scores") : nil;
+        if (!norm || !bias || !pack || (select && !score)) return 0;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        struct { uint32_t pos, rows, row0, visible; } args = {pos, rows, 0, end};
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pack];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(k) offset:ds4_gpu_tensor_offset(k) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(q) offset:ds4_gpu_tensor_offset(q) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(weights) offset:ds4_gpu_tensor_offset(weights) atIndex:3];
+        [enc setBuffer:norm offset:no atIndex:4];
+        [enc setBuffer:bias offset:bo atIndex:5];
+        [enc setBuffer:ds4_gpu_tensor_buffer(cache) offset:ds4_gpu_tensor_offset(cache) atIndex:6];
+        [enc dispatchThreadgroups:MTLSizeMake(select ? 33 : 1, rows, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "K3.1 index projections")) return 0;
+        /* Tile the score matrix so long prompts use O(context) workspace. Rows
+         * whose entire prefix fits the selection use the dense attention loop. */
+        for (uint32_t row = pos < top ? MIN(top - pos, rows) : 0; row < rows; row += tile) {
+            uint32_t count = MIN(tile, rows - row);
+            args.row0 = row;
+            args.visible = pos + row + count;
+            cb = ds4_gpu_command_buffer(&owned);
+            if (!cb) return 0;
+            enc = ds4_gpu_compute_encoder(cb);
+            [enc setComputePipelineState:score];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            [enc setBuffer:ds4_gpu_tensor_buffer(q) offset:ds4_gpu_tensor_offset(q) atIndex:1];
+            [enc setBuffer:ds4_gpu_tensor_buffer(weights) offset:ds4_gpu_tensor_offset(weights) atIndex:2];
+            [enc setBuffer:ds4_gpu_tensor_buffer(cache) offset:ds4_gpu_tensor_offset(cache) atIndex:3];
+            [enc setBuffer:ds4_gpu_tensor_buffer(scores) offset:ds4_gpu_tensor_offset(scores) atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake((args.visible + 3u)/4u, count, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+            if (!ds4_gpu_finish_command_buffer(cb, owned, "K3.1 index scores")) return 0;
+            ds4_gpu_tensor *out = ds4_gpu_tensor_view(selected, (uint64_t)row * top * sizeof(int32_t),
+                                                     (uint64_t)count * top * sizeof(int32_t));
+            int ok = out && ds4_gpu_indexer_topk_tensor(out, scores, args.visible, count, top);
+            ds4_gpu_tensor_free(out);
+            if (!ok) return 0;
+        }
+        return 1;
+    }
+}
+
 typedef struct {
     uint32_t n_heads;
     uint32_t start_position;
     uint32_t n_tokens;
     uint32_t cache_capacity;
+    uint32_t indexed;
 } k3_gpu_mla_prefill_args;
 
 int k3_gpu_mla_prefill(
@@ -53557,7 +53628,8 @@ int k3_gpu_mla_prefill(
         uint32_t              n_heads,
         uint32_t              start_position,
         uint32_t              n_tokens,
-        uint32_t              cache_capacity) {
+        uint32_t              cache_capacity,
+        const ds4_gpu_tensor *selected) {
     enum {
         K3_MLA_Q_HEAD = 192,
         K3_MLA_KV = 576,
@@ -53583,6 +53655,7 @@ int k3_gpu_mla_prefill(
         !k3_gpu_mul_u64((uint64_t)n_heads * K3_MLA_KV_B_ROWS_PER_HEAD,
                         K3_MLA_LATENT, &weight_elements) ||
         !k3_gpu_mul_u64(weight_elements, sizeof(uint16_t), &weight_bytes) ||
+        (selected && !k3_gpu_tensor_has(selected, (uint64_t)n_tokens * 2048u, sizeof(int32_t))) ||
         !k3_gpu_tensor_has(q, q_elements, sizeof(float)) ||
         !k3_gpu_tensor_has(normalized_kv, kv_elements, sizeof(float)) ||
         !k3_gpu_tensor_has(output_gate, gate_elements, sizeof(float)) ||
@@ -53616,6 +53689,7 @@ int k3_gpu_mla_prefill(
             .start_position = start_position,
             .n_tokens = n_tokens,
             .cache_capacity = cache_capacity,
+            .indexed = selected != NULL,
         };
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
@@ -53649,6 +53723,8 @@ int k3_gpu_mla_prefill(
                 offset:ds4_gpu_tensor_offset(q_latent) atIndex:2];
         [enc setBuffer:ds4_gpu_tensor_buffer(cache)
                 offset:ds4_gpu_tensor_offset(cache) atIndex:3];
+        const ds4_gpu_tensor *indices = selected ? selected : q;
+        [enc setBuffer:ds4_gpu_tensor_buffer(indices) offset:ds4_gpu_tensor_offset(indices) atIndex:4];
         [enc dispatchThreadgroups:MTLSizeMake(
                 ((NSUInteger)n_heads + 3u) / 4u, n_tokens, 1)
             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];

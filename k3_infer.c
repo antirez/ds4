@@ -48,6 +48,7 @@ typedef struct {
 
 typedef struct {
     ds4_gpu_tensor *cache;
+    ds4_gpu_tensor *index_keys;
 } k3_mla_state;
 
 typedef struct {
@@ -256,6 +257,7 @@ struct k3_context {
     double speculative_started[K3_SPECULATIVE_BANKS];
     k3_kda_state kda[K3_N_LAYER];
     k3_mla_state mla[K3_N_LAYER];
+    ds4_gpu_tensor *index_scores, *index_ids;
 };
 
 static k3_context *execution_owner(k3_context *ctx) {
@@ -660,7 +662,8 @@ static int alloc_scratch(k3_context *ctx, char *err, size_t errcap) {
     k3_scratch *s = &ctx->scratch;
     const uint64_t rows = ctx->max_prefill_tokens;
     const uint64_t pairs = rows * K3_N_EXPERT_USED;
-    const uint64_t max_partials =
+    /* Each sparse decode consumes at most two 1,024-position blocks. */
+    const uint64_t max_partials = ctx->model->dsa ? 2u :
         ((uint64_t)K3_MAX_CONTEXT + 1023ull) / 1024ull;
     const uint64_t q_latent_rows =
         rows > max_partials ? rows : max_partials;
@@ -1216,6 +1219,18 @@ static int alloc_states(k3_context *ctx, char *err, size_t errcap) {
                 K3_MLA_CACHE_WIDTH,
                 sizeof(uint16_t),
                 0);
+            if (ctx->layers[i]->index_q && ctx->context_capacity > K31_INDEX_TOPK) {
+                ctx->mla[i].index_keys = alloc_tensor(ctx->context_capacity, K31_INDEX_DIM + sizeof(float), 1, 0);
+                if (!ctx->index_scores) {
+                    const uint32_t tile = ctx->max_prefill_tokens < 8u ? ctx->max_prefill_tokens : 8u;
+                    ctx->index_scores = alloc_tensor(tile, ctx->context_capacity, sizeof(float), 0);
+                    ctx->index_ids = alloc_tensor(ctx->max_prefill_tokens, K31_INDEX_TOPK, sizeof(int32_t), 0);
+                }
+                if (!ctx->mla[i].index_keys || !ctx->index_scores || !ctx->index_ids) {
+                    set_error(err, errcap, "GPU allocation failed for K3.1 indexer layer %u", i);
+                    return 0;
+                }
+            }
             if (!ctx->mla[i].cache) {
                 set_error(err, errcap,
                           "GPU allocation failed for MLA cache layer %u", i);
@@ -1241,10 +1256,13 @@ static int alloc_states(k3_context *ctx, char *err, size_t errcap) {
 }
 
 static void free_states(k3_context *ctx) {
+    free_tensor(&ctx->index_scores);
+    free_tensor(&ctx->index_ids);
     for (uint32_t i = 0; i < K3_N_LAYER; i++) {
         free_tensor(&ctx->kda[i].conv);
         free_tensor(&ctx->kda[i].recurrent);
         free_tensor(&ctx->mla[i].cache);
+        free_tensor(&ctx->mla[i].index_keys);
     }
 }
 
@@ -3626,7 +3644,21 @@ static int run_attention(k3_context *ctx,
                 K3_RMS_EPS)) {
             return 0;
         }
-        const uint32_t max_partials = (uint32_t)(
+        ds4_gpu_tensor *keys = ctx->mla[layer->index].index_keys;
+        const bool indexed = keys && ctx->position + rows > K31_INDEX_TOPK;
+        if (keys) {
+            /* MLA leaves the KDA key, gate and beta scratch free. Store keys
+             * even for short prefixes: a later token may cross the 2048 cutoff. */
+            if (!matmul(s->k, layer->index_k, s->attn_in, K3_N_EMBD, K31_INDEX_DIM, rows, source) ||
+                (indexed && (!matmul(s->raw_gate, layer->index_q, s->low_rank_norm, K3_Q_LORA,
+                                     K31_INDEX_HEADS * K31_INDEX_DIM, rows, source) ||
+                             !matmul(s->beta, layer->index_weights, s->attn_in, K3_N_EMBD,
+                                     K31_INDEX_HEADS, rows, source))) ||
+                !k3_gpu_dsa_index(s->raw_gate, s->k, s->beta, keys, ctx->index_scores, ctx->index_ids,
+                                  base, size, source_offset(source, layer->index_norm),
+                                  source_offset(source, layer->index_bias), ctx->position, rows)) return 0;
+        }
+        const uint32_t max_partials = ctx->model->dsa ? 2u : (uint32_t)(
             ((uint64_t)ctx->context_capacity + 1023ull) / 1024ull);
         const int ok = prefill
             ? k3_gpu_mla_prefill(
@@ -3642,7 +3674,7 @@ static int run_attention(k3_context *ctx,
                   K3_N_HEAD,
                   ctx->position,
                   rows,
-                  ctx->context_capacity)
+                  ctx->context_capacity, indexed ? ctx->index_ids : NULL)
             : k3_gpu_mla_decode(
                   s->attn_heads,
                   ctx->mla[layer->index].cache,
@@ -3658,7 +3690,7 @@ static int run_attention(k3_context *ctx,
                   K3_N_HEAD,
                   ctx->position,
                   ctx->context_capacity,
-                  max_partials);
+                  max_partials, indexed ? ctx->index_ids : NULL);
         if (!ok) return 0;
     }
 

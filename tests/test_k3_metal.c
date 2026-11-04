@@ -87,6 +87,110 @@ static void require_ok(int ok, const char *what) {
     }
 }
 
+/* At the top-k boundary the first key is anti-correlated with the query,
+ * the second has half the correlation, and all remaining keys tie. */
+static void test_k31_index(uint8_t *model, size_t model_bytes) {
+    enum { PREFIX = 2047, ROWS = 3, DIM = 128, HEADS = 32, TOP = 2048, END = PREFIX + ROWS };
+    size_t norm_off = model_bytes - 1024, bias_off = model_bytes - 512;
+    uint16_t *norm = (uint16_t *)(model + norm_off), *bias = (uint16_t *)(model + bias_off);
+    for (int d = 0; d < DIM; d++) { norm[d] = f32_to_bf16(1); bias[d] = 0; }
+    ds4_gpu_tensor *k = ds4_gpu_tensor_alloc_managed(PREFIX * DIM * sizeof(float));
+    ds4_gpu_tensor *q = ds4_gpu_tensor_alloc_managed(PREFIX * HEADS * DIM * sizeof(float));
+    ds4_gpu_tensor *w = ds4_gpu_tensor_alloc_managed(PREFIX * HEADS * sizeof(float));
+    ds4_gpu_tensor *cache = ds4_gpu_tensor_alloc(END * 132);
+    ds4_gpu_tensor *score = ds4_gpu_tensor_alloc(ROWS * END * sizeof(float));
+    ds4_gpu_tensor *ids = ds4_gpu_tensor_alloc(ROWS * TOP * sizeof(int32_t));
+    require_ok(k && q && w && cache && score && ids, "K3.1 index allocation");
+    float *keys = ds4_gpu_tensor_contents(k), *queries = ds4_gpu_tensor_contents(q);
+    float *weights = ds4_gpu_tensor_contents(w);
+    for (int i = 0; i < PREFIX; i++) {
+        for (int d = 0; d < DIM; d++) {
+            float x = (d & 1) ? -1 : 1;
+            keys[i * DIM + d] = (i == 0 || (i == 1 && d < DIM/4)) ? -x : x;
+        }
+    }
+    require_ok(k3_gpu_dsa_index(q,k,w,cache,score,ids,model,model_bytes,norm_off,bias_off,0,PREFIX),
+               "K3.1 dense-prefix key cache");
+    for (int i = 0; i < ROWS; i++) {
+        for (int d = 0; d < DIM; d++) keys[i * DIM + d] = (d & 1) ? -1 : 1;
+        for (int h = 0; h < HEADS; h++) {
+            weights[i * HEADS + h] = h == 0;
+            for (int d = 0; d < DIM; d++) queries[(i * HEADS + h) * DIM + d] = keys[i * DIM + d];
+        }
+    }
+    require_ok(k3_gpu_dsa_index(q,k,w,cache,score,ids,model,model_bytes,norm_off,bias_off,PREFIX,ROWS),
+               "K3.1 causal selection across 2048");
+    uint8_t first[132];
+    require_ok(ds4_gpu_tensor_read(cache, 0, first, sizeof(first)), "K3.1 cached key read");
+    float scale;
+    memcpy(&scale, first + DIM, sizeof(scale));
+    require_ok(scale == 1.0f / 256.0f && first[0] == 0xf8 && first[1] == 0x78,
+               "K3.1 FP8 keys and power-of-two scale");
+    int32_t selected[ROWS * TOP];
+    require_ok(ds4_gpu_tensor_read(ids,0,selected,sizeof(selected)), "K3.1 read selected positions");
+    for (int row = 1; row < ROWS; row++) {
+        uint8_t seen[END] = {0};
+        for (int j = 0; j < TOP; j++) {
+            int id = selected[row * TOP + j];
+            require_ok(id >= row && id <= PREFIX + row && !seen[id], "K3.1 sparse membership");
+            seen[id] = 1;
+        }
+    }
+    ds4_gpu_tensor_free(ids); ds4_gpu_tensor_free(score); ds4_gpu_tensor_free(cache);
+    ds4_gpu_tensor_free(w); ds4_gpu_tensor_free(q); ds4_gpu_tensor_free(k);
+}
+
+/* A dense cache physically gathered into the selected order is an independent
+ * reference for the sparse attention address calculation. */
+static void test_k31_sparse_mla(uint8_t *model, size_t bytes, size_t kv_offset) {
+    enum { COUNT = 2050, TOP = 2048, KV = 576, LATENT = 512 };
+    uint16_t *full = malloc(COUNT * KV * sizeof(*full));
+    uint16_t *compact = malloc(TOP * KV * sizeof(*compact));
+    int32_t *idx = malloc(TOP * sizeof(*idx));
+    require_ok(full && compact && idx, "K3.1 MLA oracle allocation");
+    for (int i = 0; i < COUNT; i++) for (int d = 0; d < KV; d++)
+        full[i * KV+d] = f32_to_bf16(i < 2 ? 8.0f : (float)(((i*3 + d*7)%19)-9)/32.0f);
+    for (int i = 0; i < TOP; i++) {
+        idx[i] = i == TOP-1 ? COUNT-1 : COUNT-2-i;
+        memcpy(compact + i*KV, full + idx[i]*KV, KV*sizeof(*full));
+    }
+    ds4_gpu_tensor *cache = ds4_gpu_tensor_alloc(COUNT*KV*sizeof(*full));
+    ds4_gpu_tensor *ids = ds4_gpu_tensor_alloc(TOP*sizeof(*idx));
+    ds4_gpu_tensor *q = ds4_gpu_tensor_alloc_managed(192*sizeof(float));
+    ds4_gpu_tensor *kv = ds4_gpu_tensor_alloc_managed(KV*sizeof(float));
+    ds4_gpu_tensor *gate = ds4_gpu_tensor_alloc_managed(128*sizeof(float));
+    ds4_gpu_tensor *latent = ds4_gpu_tensor_alloc(LATENT*sizeof(float));
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(128*sizeof(float));
+    require_ok(cache && ids && q && kv && gate && latent && out, "K3.1 MLA oracle tensors");
+    float *query = ds4_gpu_tensor_contents(q), *last = ds4_gpu_tensor_contents(kv), *g = ds4_gpu_tensor_contents(gate);
+    for (int i = 0; i < 192; i++) query[i]=(float)((i%3)-1)*0.125f;
+    for (int i = 0; i < KV; i++) last[i]=bf16_to_f32(full[(COUNT-1)*KV+i]);
+    for (int i = 0; i < 128; i++) g[i]=1;
+    require_ok(ds4_gpu_tensor_write(ids,0,idx,TOP*sizeof(*idx)), "K3.1 oracle IDs");
+    ds4_gpu_tensor *part = ds4_gpu_tensor_alloc(3*LATENT*sizeof(float));
+    ds4_gpu_tensor *stats = ds4_gpu_tensor_alloc(3*2*sizeof(float));
+    require_ok(part && stats,"K3.1 decode oracle scratch");
+    float result[3][128], decode[3][128];
+    for (int run = 0; run < 3; run++) {
+        const int count = run == 1 ? TOP : COUNT;
+        require_ok(ds4_gpu_tensor_write(cache,0,run == 1 ? compact : full,count*KV*sizeof(*full)) &&
+                   k3_gpu_mla_prefill(out,cache,latent,q,kv,gate,model,bytes,kv_offset,1,count-1,1,COUNT,
+                                      run == 0 ? ids : NULL) &&
+                   ds4_gpu_tensor_read(out,0,result[run],sizeof(result[run])), "K3.1 oracle attention");
+        require_ok(k3_gpu_mla_decode(out,cache,latent,part,stats,q,kv,gate,model,bytes,kv_offset,
+                                     1,count-1,COUNT,3,run == 0 ? ids : NULL) &&
+                   ds4_gpu_tensor_read(out,0,decode[run],sizeof(decode[run])), "K3.1 oracle decode");
+    }
+    require_ok(!memcmp(decode[0],decode[1],sizeof(decode[0])) &&
+               memcmp(decode[0],decode[2],sizeof(decode[0])) != 0, "K3.1 indexed decode equals compacted cache");
+    ds4_gpu_tensor_free(part); ds4_gpu_tensor_free(stats);
+    require_ok(!memcmp(result[0],result[1],sizeof(result[0])), "K3.1 sparse MLA equals compacted dense MLA");
+    require_ok(memcmp(result[0],result[2],sizeof(result[0])) != 0, "K3.1 excluded positions affect the dense control");
+    ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(latent); ds4_gpu_tensor_free(gate);
+    ds4_gpu_tensor_free(kv); ds4_gpu_tensor_free(q); ds4_gpu_tensor_free(ids); ds4_gpu_tensor_free(cache);
+    free(idx); free(compact); free(full);
+}
+
 int main(void) {
     enum {
         IN = 32,
@@ -290,6 +394,8 @@ int main(void) {
     require_ok(ds4_gpu_init(), "Metal initialization");
     require_ok(ds4_gpu_set_model_map(model, MAP_BYTES), "model map");
 
+    test_k31_index(model, MAP_BYTES);
+    test_k31_sparse_mla(model, MAP_BYTES, MLA_KV_B_OFF);
     ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(IN * sizeof(float));
     ds4_gpu_tensor *bf16_in =
         ds4_gpu_tensor_alloc(IN * sizeof(uint16_t));
@@ -1271,7 +1377,7 @@ int main(void) {
         mla_out, mla_cache, mla_q_latent, mla_partial, mla_stats,
         mla_q, mla_kv, mla_gate,
         model, MAP_BYTES, MLA_KV_B_OFF,
-        1, 1, 4, 1), "MLA decode");
+        1, 1, 4, 1, NULL), "MLA decode");
     float mla_actual[128];
     require_ok(ds4_gpu_tensor_read(
         mla_out, 0, mla_actual, sizeof(mla_actual)), "MLA output read");
@@ -1453,7 +1559,7 @@ int main(void) {
             mla_out, mla_cache, mla_q_latent, mla_partial, mla_stats,
             mla_q, mla_kv, mla_gate,
             model, MAP_BYTES, MLA_KV_B_OFF,
-            1, t, 4, 1), "MLA consistency decode");
+            1, t, 4, 1, NULL), "MLA consistency decode");
         require_ok(ds4_gpu_tensor_read(
             mla_out, 0, mla_decode_outputs + t * 128u,
             128u * sizeof(float)), "MLA consistency decode read");
@@ -1474,7 +1580,7 @@ int main(void) {
         mla_prefill_out, mla_prefill_cache, mla_prefill_latent,
         mla_prefill_q, mla_prefill_kv, mla_prefill_gate,
         model, MAP_BYTES, MLA_KV_B_OFF,
-        1, 0, CONSISTENCY_TOKENS, 4),
+        1, 0, CONSISTENCY_TOKENS, 4, NULL),
         "MLA consistency prefill");
     float mla_prefill_outputs[CONSISTENCY_TOKENS * 128];
     require_ok(ds4_gpu_tensor_read(

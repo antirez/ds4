@@ -35,6 +35,8 @@ typedef struct k3_st_shard k3_st_shard;
  * absolute file offsets, so callers can pass them directly to pread or use
  * them relative to k3_st_map().
  */
+/* Validate the released text indexer layout when a K3.1 config is present. */
+int k3_st_read_dsa_config(const char *directory, bool *dsa, char *err, size_t errcap);
 int k3_st_open(k3_st_shard **out, const char *path, char *err, size_t errcap);
 void k3_st_close(k3_st_shard *shard);
 

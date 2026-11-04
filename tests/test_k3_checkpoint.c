@@ -149,7 +149,7 @@ static int validate_downloaded_layers(
 }
 
 int main(int argc, char **argv) {
-    const char *directory = argc > 1 ? argv[1] : "models/Kimi-K3";
+    const char *directory = argc > 1 ? argv[1] : "models/Kimi-K3.1-Pro";
     char error[512] = {0};
     k3_model *model = NULL;
     k3_layer *layer = NULL;

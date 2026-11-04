@@ -23,8 +23,12 @@ DS4_TEST_MODEL ?= ds4flash.gguf
 DS4_TEST_MTP ?= gguf/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf
 DS4_DSPARK_MODEL ?= $(DS4_TEST_MODEL)
 DS4_DSPARK_SUPPORT ?= gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf
-K3_MODEL ?= models/Kimi-K3
 K3_GGUF ?= models/Kimi-K3-IQ2_XXS-Q2_K.gguf
+# The distributed K3.0 GGUF must be checked against its own source checkpoint.
+ifeq ($(origin K3_MODEL),undefined)
+test-k3-gguf-source: K3_MODEL = models/Kimi-K3
+endif
+K3_MODEL ?= models/Kimi-K3.1-Pro
 K3_DETECT_OBJS = k3_safetensors.o
 
 ifeq ($(UNAME_S),Darwin)

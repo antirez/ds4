@@ -352,7 +352,13 @@ int k3_gpu_mla_decode(
         uint32_t              n_heads,
         uint32_t              position,
         uint32_t              cache_capacity,
-        uint32_t              max_partials);
+        uint32_t              max_partials,
+        const ds4_gpu_tensor *selected);
+
+int k3_gpu_dsa_index(ds4_gpu_tensor *q, ds4_gpu_tensor *k, ds4_gpu_tensor *weights,
+                     ds4_gpu_tensor *cache, ds4_gpu_tensor *scores, ds4_gpu_tensor *selected,
+                     const void *map, uint64_t size, uint64_t norm_offset, uint64_t bias_offset,
+                     uint32_t pos, uint32_t rows);
 
 /*
  * Layer-major causal MLA prefill for a contiguous token chunk. q_latent must
@@ -372,7 +378,8 @@ int k3_gpu_mla_prefill(
         uint32_t              n_heads,
         uint32_t              start_position,
         uint32_t              n_tokens,
-        uint32_t              cache_capacity);
+        uint32_t              cache_capacity,
+        const ds4_gpu_tensor *selected);
 
 #ifdef __cplusplus
 }

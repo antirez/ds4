@@ -62,6 +62,7 @@ typedef struct {
     uint64_t data_offset;
     uint64_t file_size;
     uint64_t tensor_payload;
+    const char *model_name;
     char *tokenizer;
     size_t tokenizer_size;
 } k3q_plan;
@@ -397,7 +398,7 @@ static void finalize_plan(k3q_plan *plan) {
     metadata += kv_string_size("general.architecture",
                                strlen("kimi-k3"));
     metadata += kv_string_size("general.name",
-                               strlen("Kimi K3 DwarfStar Q2"));
+                               strlen(plan->model_name));
     metadata += kv_u32_size("general.alignment");
     metadata += kv_u32_size("general.file_type");
     metadata += kv_u32_size("kimi-k3.block_count");
@@ -445,6 +446,7 @@ static k3q_plan build_plan(const char *model_dir) {
                 error[0] ? error : "could not open model");
         exit(1);
     }
+    plan.model_name = model->dsa ? "Kimi K3.1 Pro DwarfStar Q2" : "Kimi K3 DwarfStar Q2";
     for (uint32_t layer = 0; layer < K3_N_LAYER; layer++) {
         fprintf(stderr, "k3-quantize: planning layer %u/%u\r",
                 layer + 1u, (uint32_t)K3_N_LAYER);
@@ -591,8 +593,7 @@ static void write_header_contents(FILE *fp, const k3q_plan *plan) {
     write_kv_string(fp, "general.architecture",
                     "kimi-k3", strlen("kimi-k3"));
     write_kv_string(fp, "general.name",
-                    "Kimi K3 DwarfStar Q2",
-                    strlen("Kimi K3 DwarfStar Q2"));
+                    plan->model_name, strlen(plan->model_name));
     write_kv_u32(fp, "general.alignment", K3Q_ALIGNMENT);
     write_kv_u32(fp, "general.file_type", 10);
     write_kv_u32(fp, "kimi-k3.block_count", K3_N_LAYER);

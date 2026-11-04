@@ -198,6 +198,10 @@ int k3_model_open(k3_model **out,
         return 0;
     }
     model->gguf = gguf;
+    if (!gguf && !k3_st_read_dsa_config(directory, &model->dsa, err, errcap)) {
+        k3_model_close(model);
+        return 0;
+    }
     if (gguf) {
         k3_st_shard *probe = NULL;
         if (!k3_st_open(&probe, directory, err, errcap) ||
@@ -207,6 +211,7 @@ int k3_model_open(k3_model **out,
             free(model);
             return 0;
         }
+        model->dsa = k3_st_find(probe, "language_model.model.layers.3.self_attn.indexer.wk.weight") != NULL;
         k3_st_close(probe);
     }
     *out = model;
@@ -278,7 +283,7 @@ fail:
 }
 
 static int bind_mla(k3_layer *layer,
-                    uint32_t index,
+                    uint32_t index, bool dsa,
                     char *err,
                     size_t errcap) {
     REQUIRE(q_a_proj, "self_attn.q_a_proj.weight",
@@ -295,6 +300,20 @@ static int bind_mla(k3_layer *layer,
             K3_ST_DTYPE_BF16,
             K3_N_HEAD * (K3_QK_NOPE + K3_V_HEAD),
             K3_KV_LORA);
+    char key[160];
+    if (!make_tensor_name(key, sizeof(key), index, "self_attn.indexer.wk.weight")) return 0;
+    if (!dsa && k3_st_find(layer->shard, key)) {
+        set_error(err, errcap, "unexpected K3.1 indexer in a K3.0 checkpoint at layer %u", index);
+        return 0;
+    }
+    if (dsa) {
+        REQUIRE(index_q, "self_attn.indexer.wq_b.weight", K3_ST_DTYPE_BF16,
+                K31_INDEX_HEADS * K31_INDEX_DIM, K3_Q_LORA);
+        REQUIRE(index_k, "self_attn.indexer.wk.weight", K3_ST_DTYPE_BF16, K31_INDEX_DIM, K3_N_EMBD);
+        REQUIRE(index_weights, "self_attn.indexer.weights_proj.weight", K3_ST_DTYPE_BF16, K31_INDEX_HEADS, K3_N_EMBD);
+        REQUIRE(index_norm, "self_attn.indexer.k_norm.weight", K3_ST_DTYPE_BF16, K31_INDEX_DIM);
+        REQUIRE(index_bias, "self_attn.indexer.k_norm.bias", K3_ST_DTYPE_BF16, K31_INDEX_DIM);
+    }
     return 1;
 fail:
     return 0;
@@ -468,6 +487,7 @@ static int set_static_span(k3_layer *layer,
         layer->kv_a_proj,
         layer->kv_a_norm,
         layer->kv_b_proj,
+        layer->index_q, layer->index_k, layer->index_weights, layer->index_norm, layer->index_bias,
         layer->router,
         layer->router_bias,
         layer->routed_down,
@@ -607,7 +627,7 @@ int k3_model_open_layer(const k3_model *model,
         !bind_common(layer, index, err, errcap) ||
         (layer->attention == K3_LAYER_KDA ?
             !bind_kda(layer, index, err, errcap) :
-            !bind_mla(layer, index, err, errcap)) ||
+            !bind_mla(layer, index, model->dsa, err, errcap)) ||
         (index == 0 ?
             !bind_dense_ffn(layer, index, err, errcap) :
             !bind_moe(layer, index, err, errcap)) ||

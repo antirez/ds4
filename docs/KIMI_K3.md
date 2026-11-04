@@ -1,17 +1,27 @@
 # Kimi K3 on Metal
 
-This branch supports the DwarfStar mixed-Q2 Kimi K3 GGUF and the original
-SafeTensors directory. Both use Metal. K3 vision, CUDA, ROCm, speculative
-decoding, steering, and reduced-power execution are not supported.
+Kimi K3.1 Pro text inference runs on Metal with Moonshot’s original
+SafeTensors. Point `-m` at the directory containing the shards, config and
+tokenizer. The full release has 96 shards and uses 1.56 TB of storage.
 
 ```sh
+hf download moonshotai/Kimi-K3.1-Pro --revision 6d0a0202956796543364d666ab19c6ad1a494ee1 --local-dir models/Kimi-K3.1-Pro
 make
+./ds4 -m models/Kimi-K3.1-Pro --ctx 4096 -p "Explain Redis streams."
+```
+
+K3.1 uses a learned index in 24 attention layers. Each query attends to all
+available positions through 2,048 tokens and to its selected 2,048 positions
+thereafter. The original K3 SafeTensors and its existing mixed-Q2 GGUF also
+run on this branch. K3 vision, CUDA, ROCm, speculative decoding, steering, and reduced-power execution are not supported.
+
+```sh
 ./ds4 -m models/Kimi-K3-IQ2_XXS-Q2_K.gguf --ctx 4096 -p "Explain Redis streams."
 ./ds4-agent -m models/Kimi-K3-IQ2_XXS-Q2_K.gguf --ctx 32768
 ./ds4-server -m models/Kimi-K3-IQ2_XXS-Q2_K.gguf --ctx 32768
 ```
 
-The GGUF is 799.783 GiB. It streams from SSD automatically when its local
+The original K3 GGUF is 799.783 GiB. It streams from SSD automatically when its local
 weights cannot fit safely in memory. The router still selects all 16 experts;
 streaming changes where the weights live, not the computation.
 
@@ -72,17 +82,16 @@ for diagnostic comparisons.
 
 ## Conversion
 
-With the original checkpoint in `models/Kimi-K3`:
+With the K3.1 Pro checkpoint in `models/Kimi-K3.1-Pro`:
 
 ```sh
 make -C gguf-tools k3-quantize
-./gguf-tools/k3-quantize --model models/Kimi-K3 \
-  --out models/Kimi-K3-IQ2_XXS-Q2_K.gguf --threads 16
+./gguf-tools/k3-quantize --model models/Kimi-K3.1-Pro \
+  --out models/Kimi-K3.1-Pro-IQ2_XXS-Q2_K.gguf --threads 16
 ```
 
 Use `--resume` after an interrupted conversion. The converter checks the
 partial file and its progress journal before continuing.
 
 `make test-k3-gguf` checks the completed GGUF and its Metal layer path.
-`make test-k3-gguf-source` additionally compares retained tensors with the
-original checkpoint.
+`make test-k3-gguf-source` compares retained tensors with the matching source checkpoint. For a K3.1 conversion set both `K3_MODEL` and `K3_GGUF` to its source and output paths.

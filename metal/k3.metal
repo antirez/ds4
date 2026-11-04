@@ -1701,6 +1701,7 @@ struct k3_mla_args {
     uint cache_capacity;
     uint max_partials;
     uint n_partials;
+    uint indexed;
 };
 
 kernel void kernel_k3_mla_store_cache(
@@ -1792,6 +1793,7 @@ kernel void kernel_k3_mla_attention_partials(
         device const ushort  *cache,
         device float         *partial_values,
         device float2        *partial_stats,
+        device const int     *selected,
         uint2 tgpig [[threadgroup_position_in_grid]],
         ushort lane [[thread_index_in_simdgroup]],
         ushort sg [[simdgroup_index_in_threadgroup]]) {
@@ -1800,7 +1802,7 @@ kernel void kernel_k3_mla_attention_partials(
     const uint part = tgpig.y;
     if (head >= args.n_heads || part >= args.n_partials) return;
     const uint begin = part * BLOCK_T;
-    const uint end = min(begin + BLOCK_T, args.position + 1u);
+    const uint end = min(begin + BLOCK_T, args.indexed ? 2048u : args.position + 1u);
     device const float *ql = q_latent + (ulong)head * 512u;
     device const float *qpe = q + (ulong)head * 192u + 128u;
     float accumulator[16];
@@ -1808,7 +1810,8 @@ kernel void kernel_k3_mla_attention_partials(
     float running_max = -INFINITY;
     float denominator = 0.0f;
 
-    for (uint token = begin; token < end; token++) {
+    for (uint i = begin; i < end; i++) {
+        const uint token = args.indexed ? (uint)selected[i] : i;
         device const ushort *kv = cache + (ulong)token * 576u;
         float kv_values[16];
         float score = 0.0f;
@@ -1954,11 +1957,76 @@ kernel void kernel_k3_mla_value_up_gate(
         (1.0f + exp(-output_gate[output]));
 }
 
+/* Each K3.1 index key has one E4M3 block with a power-of-two scale. */
+struct k31_index_key { uchar values[128]; float scale; };
+struct k31_index_args { uint pos, rows, row0, visible; };
+
+kernel void kernel_k31_index_prepare(
+        constant k31_index_args &args,
+        device const float *k, device float *q, device float *weights,
+        device const ushort *norm, device const ushort *bias,
+        device k31_index_key *cache, uint2 group [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]]) {
+    const uint row = group.y, head = group.x;
+    const bool is_key = head == 0;
+    device float *qh = q + ((ulong)row * 32u + (is_key ? 0u : head - 1u)) * 128u;
+    float x[4], sum = 0.0f;
+    for (uint j = 0; j < 4; j++) {
+        uint d = lane + 32u * j;
+        x[j] = k3_round_bf16(is_key ? k[row * 128u + d] : qh[d]);
+        sum += x[j];
+    }
+    if (is_key) {
+        float mean = simd_sum(sum) / 128.0f;
+        float ss = 0.0f;
+        for (uint j = 0; j < 4; j++) { x[j] -= mean; ss += x[j] * x[j]; }
+        float inv = rsqrt(simd_sum(ss) / 128.0f + 1e-5f);
+        for (uint j = 0; j < 4; j++) {
+            uint d = lane + 32u * j;
+            x[j] = k3_round_bf16(x[j] * inv * k3_bf16_to_f32(norm[d]) + k3_bf16_to_f32(bias[d]));
+        }
+    }
+    float amax = simd_max(max(max(abs(x[0]), abs(x[1])), max(abs(x[2]), abs(x[3]))));
+    float scale = exp2(ceil(log2(max(amax, is_key ? 1e-4f : 1e-10f) / 448.0f)));
+    for (uint j = 0; j < 4; j++) {
+        uint d = lane + 32u * j;
+        uchar v = k3_f32_to_e4m3fn(x[j] / scale);
+        if (is_key) cache[args.pos + row].values[d] = v;
+        else qh[d] = k3_e4m3fn_to_f32(v);
+    }
+    if (lane == 0) {
+        if (is_key) cache[args.pos + row].scale = scale;
+        else weights[row * 32u + head - 1u] = k3_round_bf16(weights[row * 32u + head - 1u]) * (scale / 64.0f);
+    }
+}
+
+kernel void kernel_k31_index_scores(
+        constant k31_index_args &args, device const float *q, device const float *weights,
+        device const k31_index_key *cache, device float *scores,
+        uint2 group [[threadgroup_position_in_grid]], ushort sg [[simdgroup_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]]) {
+    const uint key = group.x * 4u + sg, row = args.row0 + group.y;
+    if (key >= args.visible) return;
+    device float *out = scores + (ulong)group.y * args.visible;
+    if (key > args.pos + row) { if (lane == 0) out[key] = -INFINITY; return; }
+    float kv[4];
+    for (uint j = 0; j < 4; j++) kv[j] = k3_e4m3fn_to_f32(cache[key].values[lane + 32u * j]);
+    float sum = 0.0f;
+    for (uint h = 0; h < 32; h++) {
+        device const float *qh = q + ((ulong)row * 32u + h) * 128u;
+        float dot = 0.0f;
+        for (uint j = 0; j < 4; j++) dot += qh[lane + 32u * j] * kv[j];
+        sum += max(simd_sum(dot), 0.0f) * weights[row * 32u + h];
+    }
+    if (lane == 0) out[key] = sum * cache[key].scale;
+}
+
 struct k3_mla_prefill_args {
     uint n_heads;
     uint start_position;
     uint n_tokens;
     uint cache_capacity;
+    uint indexed;
 };
 
 kernel void kernel_k3_mla_prefill_store_cache(
@@ -2007,6 +2075,7 @@ kernel void kernel_k3_mla_prefill_attention(
         device const float           *q,
         device float                 *q_latent,
         device const ushort          *cache,
+        device const int             *selected,
         uint2 tgpig [[threadgroup_position_in_grid]],
         ushort lane [[thread_index_in_simdgroup]],
         ushort sg [[simdgroup_index_in_threadgroup]]) {
@@ -2023,7 +2092,10 @@ kernel void kernel_k3_mla_prefill_attention(
     float running_max = -INFINITY;
     float denominator = 0.0f;
 
-    for (uint token = 0; token <= last_key; token++) {
+    const bool sparse = args.indexed && last_key >= 2048u;
+    const uint count = sparse ? 2048u : last_key + 1u;
+    for (uint i = 0; i < count; i++) {
+        const uint token = sparse ? (uint)selected[(ulong)row * 2048u + i] : i;
         device const ushort *kv = cache + (ulong)token * 576u;
         float score = 0.0f;
         for (uint j = 0; j < 16u; j++) {

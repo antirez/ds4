@@ -32,7 +32,7 @@ static void check(k3_tokenizer *tokenizer,
 }
 
 int main(int argc, char **argv) {
-    const char *directory = argc > 1 ? argv[1] : "models/Kimi-K3";
+    const char *directory = argc > 1 ? argv[1] : "models/Kimi-K3.1-Pro";
     k3_tokenizer *tokenizer = NULL;
     char error[512] = {0};
     if (!k3_tokenizer_open(
