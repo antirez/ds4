@@ -11546,7 +11546,7 @@ static bool build_live_prompt_suffix(server *s, server_slot *slot,
  * (generate_job) materializes:
  *
  *   responses-visible -> responses-tool-output -> anthropic-tool-output ->
- *   memory-rewind (GLM only) -> memory-token -> thinking-visible ->
+ *   thinking-visible -> memory-rewind (GLM only) -> memory-token ->
  *   memory-text
  *
  * Both slot routing (job_slot_score, under dispatch) and the execution
@@ -11692,22 +11692,8 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
         return pr;
     }
 
-    const int common = ds4_session_common_prefix(slot->session, &req->prompt);
-    const bool token_image_prefix = ds4_session_vision_prefix_matches(
-        slot->session, req->images, req->image_count);
-    const int rewind_to = live_prefix_rewind_target(
-        ds4_engine_is_glm_dsa(s->engine), live_pos, req->prompt.len, common);
-    if (rewind_to >= 0 && token_image_prefix) {
-        pr.kind = REUSE_MEMORY_REWIND;
-        pr.reuse_tokens = rewind_to;
-        return pr;
-    }
-    if (common == live_pos && req->prompt.len >= live_pos && token_image_prefix) {
-        pr.kind = REUSE_MEMORY_TOKEN;
-        pr.reuse_tokens = common;
-        return pr;
-    }
-
+    /* A normalized visible replay must take precedence over token rewinds:
+     * its sampled live frontier may include bytes absent from the replay. */
     if (req->kind == REQ_CHAT && req->api != API_RESPONSES && ptext) {
         visible_image_key vimages;
         char *vkey = visible_prompt_key(req, ptext, &vimages);
@@ -11732,6 +11718,22 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
             }
             free(vkey);
         }
+    }
+
+    const int common = ds4_session_common_prefix(slot->session, &req->prompt);
+    const bool token_image_prefix = ds4_session_vision_prefix_matches(
+        slot->session, req->images, req->image_count);
+    const int rewind_to = live_prefix_rewind_target(
+        ds4_engine_is_glm_dsa(s->engine), live_pos, req->prompt.len, common);
+    if (rewind_to >= 0 && token_image_prefix) {
+        pr.kind = REUSE_MEMORY_REWIND;
+        pr.reuse_tokens = rewind_to;
+        return pr;
+    }
+    if (common == live_pos && req->prompt.len >= live_pos && token_image_prefix) {
+        pr.kind = REUSE_MEMORY_TOKEN;
+        pr.reuse_tokens = common;
+        return pr;
     }
 
     if (ptext && slot->live_text && slot->live_text_pos == live_pos &&
@@ -12970,6 +12972,40 @@ static char *build_qwen_tool_turn_visible_text(const request *r,
     buf_append(&visible, suffix, strlen(suffix) - strlen("<|im_end|>"));
     free(suffix);
     return buf_take(&visible);
+}
+
+/* DeepSeek/GLM chat clients replay a normalized tool turn; retain sampled KV
+ * under that visible key even when reasoning whitespace changed on replay. */
+static char *build_tool_call_visible_text(const request *r,
+                                          const char *content,
+                                          const char *reasoning,
+                                          const tool_calls *calls) {
+    if (!r || !r->prompt_text || !calls || calls->len == 0) return NULL;
+    char *suffix = build_tool_checkpoint_suffix(r, content, reasoning, calls);
+    buf visible = {0};
+    buf_puts(&visible, r->prompt_text);
+    buf_puts(&visible, suffix ? suffix : "");
+    free(suffix);
+    return buf_take(&visible);
+}
+
+static void remember_tool_call_checkpoint(server *s, server_slot *slot,
+                                          const job *j, const char *ctx,
+                                          uint64_t trace_id,
+                                          const char *content,
+                                          const char *reasoning,
+                                          const tool_calls *calls) {
+    char *visible = build_tool_call_visible_text(&j->req, content, reasoning,
+                                                 calls);
+    if (!visible) return;
+    thinking_live_remember(s, slot, visible, &j->req);
+    server_log(DS4_LOG_KVCACHE,
+               "ds4-server: tool-call live checkpoint remembered ctx=%s live=%d visible=%zu",
+               ctx, ds4_session_pos(slot->session), strlen(visible));
+    trace_event(s, trace_id,
+                "tool-call live checkpoint remembered: live=%d visible=%zu",
+                ds4_session_pos(slot->session), strlen(visible));
+    free(visible);
 }
 
 static bool remember_qwen_tool_turn_visible_checkpoint(server *s, server_slot *slot,
@@ -14605,18 +14641,23 @@ decode_again:
 
     if (j->req.kind == REQ_CHAT && parsed_calls.len &&
         j->req.api != API_RESPONSES &&
+        strcmp(final_finish, "error") && strcmp(final_finish, "length") &&
         should_canonicalize_tool_checkpoint(s, &parsed_calls))
     {
-        /* Chat/completions has no protocol object that binds the next request
-         * to this live KV state.  Canonicalize only the fallback tool-call
-         * path where we lack exact sampled DSML replay; when raw DSML is known,
-         * replaying those bytes keeps future prompts aligned without rebuilding
-         * hidden reasoning.  Responses deliberately skips this path because its
-         * previous_response_id contract binds the next turn to live state. */
+        /* Without exact sampled tool text, align the live checkpoint with
+         * the transcript that the next request will render. */
         canonicalize_tool_checkpoint(s, slot, j, ctx_span, trace_id,
                                      parsed_content ? parsed_content : "",
                                      parsed_reasoning, &parsed_calls);
-        thinking_live_clear(s, slot);
+    }
+    if (j->req.kind == REQ_CHAT && parsed_calls.len &&
+        j->req.api == API_OPENAI &&
+        j->req.model_syntax != SERVER_MODEL_SYNTAX_QWEN &&
+        strcmp(final_finish, "error") && strcmp(final_finish, "length"))
+    {
+        remember_tool_call_checkpoint(s, slot, j, ctx_span, trace_id,
+                                      parsed_content ? parsed_content : "",
+                                      parsed_reasoning, &parsed_calls);
     } else if (parsed_calls.len) {
         if (!remember_qwen_tool_turn_visible_checkpoint(
                 s, slot, j, ctx_span, finish, thinking.inside,
@@ -16511,6 +16552,13 @@ static void test_slot_probe_live_state_tiers(void) {
         TEST_ASSERT(pr.kind == REUSE_THINKING_VISIBLE);
         TEST_ASSERT(pr.reuse_tokens == 10);
         TEST_ASSERT(pr.suffix_off == slot.thinking_live.visible_len);
+        /* Even an exact token prefix must not override normalized replay. */
+        j.req.prompt.v[0] = 1;
+        for (int i = 1; i < 10; i++) ds4_tokens_push(&j.req.prompt, i + 1);
+        ds4_tokens_push(&j.req.prompt, 11);
+        TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &j.req).kind ==
+                    REUSE_THINKING_VISIBLE);
+        j.req.prompt.v[0] = 999; /* no token match in the Responses check */
         j.req.api = API_RESPONSES;  /* thinking tier must skip Responses */
         TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &j.req).kind ==
                     REUSE_NONE);
@@ -19809,6 +19857,7 @@ static void test_tool_checkpoint_suffix_is_future_prompt_canonical(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
     r.think_mode = DS4_THINK_HIGH;
+    r.prompt_text = xstrdup(prompt_text);
     r.tool_orders = orders;
     memset(&orders, 0, sizeof(orders));
     char *suffix = build_tool_checkpoint_suffix(&r, content, reasoning, &calls);
@@ -19835,7 +19884,11 @@ static void test_tool_checkpoint_suffix_is_future_prompt_canonical(void) {
                                                   &r.tool_orders, DS4_THINK_HIGH);
 
     TEST_ASSERT(!strcmp(canonical.ptr, future_prompt));
+    char *visible = build_tool_call_visible_text(&r, content, reasoning,
+                                                 &assistant.calls);
+    TEST_ASSERT(visible && !strcmp(visible, future_prompt));
 
+    free(visible);
     free(future_prompt);
     buf_free(&canonical);
     free(suffix);
@@ -19882,6 +19935,7 @@ static void test_glm_tool_checkpoint_suffix_is_canonical(void) {
     request_init(&r, REQ_CHAT, 128);
     r.model_syntax = SERVER_MODEL_SYNTAX_GLM;
     r.think_mode = DS4_THINK_HIGH;
+    r.prompt_text = xstrdup(prompt_text);
     r.tool_orders = orders;
     memset(&orders, 0, sizeof(orders));
 
@@ -19911,7 +19965,11 @@ static void test_glm_tool_checkpoint_suffix_is_canonical(void) {
         SERVER_MODEL_SYNTAX_GLM, &history_msgs, tool_schemas,
         &r.tool_orders, DS4_THINK_HIGH);
     TEST_ASSERT(!strcmp(canonical.ptr, future_prompt));
+    char *visible = build_tool_call_visible_text(&r, content, reasoning,
+                                                 &assistant.calls);
+    TEST_ASSERT(visible && !strcmp(visible, future_prompt));
 
+    free(visible);
     free(future_prompt);
     buf_free(&canonical);
     free(suffix);
