@@ -65,6 +65,17 @@ by every token, and paging them back in delays generation after a prompt.
 An oversized expert cache can displace those weights and slow decoding.
 More cache helps only while the rest of the working set still fits.
 
+Metal's GLM address cache can combine Q2_K gate/up projections with a Q4_K
+down projection. Each projection keeps its own byte stride and kernel; the
+shared intermediate is weighted SwiGLU output. This uses the same cache
+lifetime, capacity checks, and fallback policy as homogeneous Q2_K/Q4_K.
+It does not expand the supported layouts of CUDA or ROCm. Large prefills
+may still choose full-layer streaming instead of the address cache.
+
+`make test-glm-mixed-cache` compares mapped weights with file-backed cache
+reads for decode and prefill. The mapped copy is zeroed during cached runs,
+so silently falling back to mapped weights cannot pass the test.
+
 More context and more server sessions consume more memory. Metal GLM budgeting
 includes planned and already resident sessions; a request can still be refused
 when its mandatory allocations cannot fit. Disabling the memory guard is not

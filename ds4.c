@@ -8414,6 +8414,11 @@ static bool glm_stream_expert_cache_addr_layout_supported(
     const bool q4_addr =
         l->ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
         l->ffn_down_exps->type == DS4_TENSOR_Q4_K;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU) && !defined(DS4_ROCM_BUILD)
+    /* Metal's pair and down address kernels have independent quant strides. */
+    if (l->ffn_gate_exps->type == DS4_TENSOR_Q2_K &&
+        l->ffn_down_exps->type == DS4_TENSOR_Q4_K) return true;
+#endif
     return q2_addr || q4_addr;
 }
 
@@ -51300,10 +51305,7 @@ static bool glm_graph_encode_sparse_ffn_one(
         glm_graph_layer_uses_generic_routed_moe(l);
     const bool uniform_streaming_selected_cache =
         streaming_expert_cache &&
-        l->ffn_gate_exps->type == l->ffn_up_exps->type &&
-        l->ffn_gate_exps->type == l->ffn_down_exps->type &&
-        (l->ffn_gate_exps->type == DS4_TENSOR_Q2_K ||
-         l->ffn_gate_exps->type == DS4_TENSOR_Q4_K);
+        glm_stream_expert_cache_addr_layout_supported(g->weights, l, il);
     const bool streaming_selected_cache =
         generic_streaming_selected_cache ||
         uniform_streaming_selected_cache;
