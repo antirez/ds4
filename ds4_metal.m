@@ -48551,6 +48551,65 @@ static uint32_t glm53_gpu_bf16_mv_nsg(void) {
                ? 4u : 8u;
 }
 
+/* Shared encode/dispatch for the tuned BF16 tensor-unit matmul. weightbuf may
+ * be a model-map wrap or the prepared router slab; weight_off is the in-buffer
+ * byte offset of the [out_dim, in_dim] BF16 weight matrix. */
+static int glm53_gpu_run_bf16_matmul(
+        id<MTLBuffer>          weightbuf,
+        uint64_t               weight_off,
+        uint32_t               in_dim,
+        uint32_t               out_dim,
+        const ds4_gpu_tensor  *x,
+        ds4_gpu_tensor        *out,
+        uint32_t               n_rows) {
+    const bool use_mv = n_rows <= 8u;
+    const bool bc_inp = (in_dim % 32u) != 0u;
+    const bool bc_out = (out_dim % 64u) != 0u || (n_rows % 32u) != 0u;
+    id<MTLComputePipelineState> pipeline = use_mv
+        ? ds4_gpu_get_pipeline("kernel_glm53_mul_mv_bf16_f32")
+        : ds4_gpu_get_mul_mm_pipeline(
+            "kernel_glm53_mul_mm_bf16_f32", bc_inp, bc_out);
+    if (!pipeline) return 0;
+    int owned = 0;
+    id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+    if (!cb) return 0;
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    if (use_mv) {
+        const uint32_t nsg = glm53_gpu_bf16_mv_nsg();
+        glm53_gpu_bf16_matmul_args args = {
+            .in_dim = in_dim,
+            .out_dim = out_dim,
+            .n_rows = n_rows,
+        };
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:weightbuf offset:(NSUInteger)weight_off atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(x)
+                offset:ds4_gpu_tensor_offset(x) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(out)
+                offset:ds4_gpu_tensor_offset(out) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake((out_dim + nsg - 1u) / nsg,
+                                              n_rows, 1)
+            threadsPerThreadgroup:MTLSizeMake(32u * nsg, 1, 1)];
+    } else {
+        ds4_gpu_mul_mm_args args = ds4_gpu_make_mm_args(
+            in_dim, out_dim, n_rows, (uint64_t)in_dim * sizeof(uint16_t));
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:weightbuf offset:(NSUInteger)weight_off atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(x)
+                offset:ds4_gpu_tensor_offset(x) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(out)
+                offset:ds4_gpu_tensor_offset(out) atIndex:3];
+        [enc setThreadgroupMemoryLength:(bc_out ? 8192u : 6144u) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake((n_rows + 31u) / 32u,
+                                              (out_dim + 63u) / 64u, 1)
+            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    }
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return ds4_gpu_finish_command_buffer(cb, owned, "GLM-5.3 BF16 matmul");
+}
+
 int ds4_gpu_glm53_matmul_bf16(
         ds4_gpu_tensor       *out,
         const void           *model_map,
@@ -48577,52 +48636,108 @@ int ds4_gpu_glm53_matmul_bf16(
             model_map, model_size, weight_offset, weights * sizeof(uint16_t),
             &inner, "BF16 matrix");
         if (!weightbuf) return 0;
-        const bool use_mv = n_rows <= 8u;
-        const bool bc_inp = (in_dim % 32u) != 0u;
-        const bool bc_out = (out_dim % 64u) != 0u || (n_rows % 32u) != 0u;
-        id<MTLComputePipelineState> pipeline = use_mv
-            ? ds4_gpu_get_pipeline("kernel_glm53_mul_mv_bf16_f32")
-            : ds4_gpu_get_mul_mm_pipeline(
-                "kernel_glm53_mul_mm_bf16_f32", bc_inp, bc_out);
-        if (!pipeline) return 0;
+        return glm53_gpu_run_bf16_matmul(weightbuf, inner, in_dim, out_dim,
+                                         x, out, n_rows);
+    }
+}
+
+/* GLM-5.3-Flash router projections ship as F32 on disk, while the tuned
+ * tensor-unit BF16 matmul wants BF16 weights.  Convert each layer's router
+ * matrix once into a resident slab (slot = layer index; pages materialize on
+ * first write) so the prefill router runs the same tuned kernel as every
+ * other GLM-5.3-Flash projection.  The env var below disables this path
+ * alone; DS4_METAL_DISABLE_M3_ULTRA_GLM53_DECODE still covers the shared
+ * decode kernels. */
+#define DS4_GLM53_ROUTER_BF16_SLOTS 64u
+static id<MTLBuffer>   g_glm53_router_bf16_weights;
+static const void     *g_glm53_router_bf16_map;
+static uint64_t        g_glm53_router_bf16_slot_bytes;
+static uint64_t        g_glm53_router_bf16_prepared;
+
+static bool ds4_gpu_glm53_router_bf16_enabled(void) {
+    return getenv("DS4_METAL_DISABLE_GLM53_PREFILL_ROUTER_TENSOR") == NULL;
+}
+
+int ds4_gpu_glm53_router_weights_bf16_prepare(
+        uint32_t        slot,
+        const void     *model_map,
+        uint64_t        model_size,
+        uint64_t        weight_offset,
+        uint64_t        elems) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_gpu_glm53_router_bf16_enabled() ||
+        slot >= DS4_GLM53_ROUTER_BF16_SLOTS || elems == 0 ||
+        elems > (uint64_t)UINT32_MAX) return 0;
+    uint64_t slot_bytes = 0;
+    if (!glm53_gpu_mul_u64(elems, sizeof(uint16_t), &slot_bytes)) return 0;
+    if (!model_map || weight_offset > model_size ||
+        elems * sizeof(float) > model_size - weight_offset) return 0;
+    if (g_glm53_router_bf16_map != model_map) {
+        g_glm53_router_bf16_map = model_map;  /* new model: stale slots drop */
+        g_glm53_router_bf16_prepared = 0;
+    }
+    if ((g_glm53_router_bf16_prepared >> slot) & 1ull) return 1;
+    if (g_glm53_router_bf16_slot_bytes &&
+        g_glm53_router_bf16_slot_bytes != slot_bytes) return 0;
+    @autoreleasepool {
+        if (!g_glm53_router_bf16_weights) {
+            g_glm53_router_bf16_weights = [g_device newBufferWithLength:
+                    (NSUInteger)(DS4_GLM53_ROUTER_BF16_SLOTS * slot_bytes)
+                    options:MTLResourceStorageModeShared];
+            if (!g_glm53_router_bf16_weights) return 0;
+            g_glm53_router_bf16_slot_bytes = slot_bytes;
+        }
+        uint64_t inner = 0;
+        id<MTLBuffer> src = ds4_gpu_wrap_model_range(
+                model_map, model_size, weight_offset,
+                elems * sizeof(float), &inner);
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_glm53_cvt_f32_bf16");
+        if (!src || !pipeline) return 0;
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb) return 0;
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-        if (use_mv) {
-            const uint32_t nsg = glm53_gpu_bf16_mv_nsg();
-            glm53_gpu_bf16_matmul_args args = {
-                .in_dim = in_dim,
-                .out_dim = out_dim,
-                .n_rows = n_rows,
-            };
-            [enc setComputePipelineState:pipeline];
-            [enc setBytes:&args length:sizeof(args) atIndex:0];
-            [enc setBuffer:weightbuf offset:(NSUInteger)inner atIndex:1];
-            [enc setBuffer:ds4_gpu_tensor_buffer(x)
-                    offset:ds4_gpu_tensor_offset(x) atIndex:2];
-            [enc setBuffer:ds4_gpu_tensor_buffer(out)
-                    offset:ds4_gpu_tensor_offset(out) atIndex:3];
-            [enc dispatchThreadgroups:MTLSizeMake((out_dim + nsg - 1u) / nsg,
-                                                  n_rows, 1)
-                threadsPerThreadgroup:MTLSizeMake(32u * nsg, 1, 1)];
-        } else {
-            ds4_gpu_mul_mm_args args = ds4_gpu_make_mm_args(
-                in_dim, out_dim, n_rows, (uint64_t)in_dim * sizeof(uint16_t));
-            [enc setComputePipelineState:pipeline];
-            [enc setBytes:&args length:sizeof(args) atIndex:0];
-            [enc setBuffer:weightbuf offset:(NSUInteger)inner atIndex:1];
-            [enc setBuffer:ds4_gpu_tensor_buffer(x)
-                    offset:ds4_gpu_tensor_offset(x) atIndex:2];
-            [enc setBuffer:ds4_gpu_tensor_buffer(out)
-                    offset:ds4_gpu_tensor_offset(out) atIndex:3];
-            [enc setThreadgroupMemoryLength:(bc_out ? 8192u : 6144u) atIndex:0];
-            [enc dispatchThreadgroups:MTLSizeMake((n_rows + 31u) / 32u,
-                                                  (out_dim + 63u) / 64u, 1)
-                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-        }
+        const uint count = (uint)elems;
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:src offset:(NSUInteger)inner atIndex:0];
+        [enc setBuffer:g_glm53_router_bf16_weights
+                offset:(NSUInteger)(slot * slot_bytes) atIndex:1];
+        [enc setBytes:&count length:sizeof(count) atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake((count + 255u) / 256u, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
-        return ds4_gpu_finish_command_buffer(cb, owned, "GLM-5.3 BF16 matmul");
+        if (!ds4_gpu_finish_command_buffer(
+                cb, owned, "glm53 router bf16 prepare")) return 0;
+    }
+    g_glm53_router_bf16_prepared |= (uint64_t)1u << slot;
+    return 1;
+}
+
+int ds4_gpu_glm53_router_matmul_bf16_prepared(
+        ds4_gpu_tensor       *out,
+        uint32_t              slot,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_rows) {
+    if (!ds4_gpu_glm53_router_bf16_enabled() ||
+        slot >= DS4_GLM53_ROUTER_BF16_SLOTS || n_rows == 0 ||
+        !g_glm53_router_bf16_weights ||
+        !((g_glm53_router_bf16_prepared >> slot) & 1ull)) return 0;
+    uint64_t weights = 0, input = 0, output = 0;
+    if (!glm53_gpu_mul_u64(in_dim, out_dim, &weights) ||
+        !glm53_gpu_mul_u64(in_dim, n_rows, &input) ||
+        !glm53_gpu_mul_u64(out_dim, n_rows, &output) ||
+        weights * sizeof(uint16_t) != g_glm53_router_bf16_slot_bytes ||
+        (uint64_t)(slot + 1u) * g_glm53_router_bf16_slot_bytes >
+            (uint64_t)[g_glm53_router_bf16_weights length] ||
+        !glm53_gpu_tensor_has(x, input, sizeof(float)) ||
+        !glm53_gpu_tensor_has(out, output, sizeof(float))) return 0;
+    @autoreleasepool {
+        return glm53_gpu_run_bf16_matmul(g_glm53_router_bf16_weights,
+                (uint64_t)slot * g_glm53_router_bf16_slot_bytes,
+                in_dim, out_dim, x, out, n_rows);
     }
 }
 

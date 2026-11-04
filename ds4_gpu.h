@@ -3424,6 +3424,26 @@ int ds4_gpu_glm53_matmul_bf16(
         const ds4_gpu_tensor *x,
         uint32_t              n_rows);
 
+/* GLM-5.3-Flash prefill router on the tuned BF16 tensor-unit matmul.
+ * prepare() converts one layer's F32 router matrix into a resident BF16 slab
+ * (idempotent per slot); the matmul only runs once the slot is prepared.
+ * Both return 0 when DS4_METAL_DISABLE_GLM53_PREFILL_ROUTER_TENSOR is set,
+ * letting callers fall back to the generic F32 matmul. */
+int ds4_gpu_glm53_router_weights_bf16_prepare(
+        uint32_t        slot,
+        const void     *model_map,
+        uint64_t        model_size,
+        uint64_t        weight_offset,
+        uint64_t        elems);
+
+int ds4_gpu_glm53_router_matmul_bf16_prepared(
+        ds4_gpu_tensor       *out,
+        uint32_t              slot,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_rows);
+
 int ds4_gpu_glm53_matmul_bf16_qkv(
         ds4_gpu_tensor       *out_q,
         ds4_gpu_tensor       *out_k,

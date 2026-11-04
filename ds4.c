@@ -53148,14 +53148,27 @@ static bool glm_graph_encode_ffn_batch(
     (void)up_in;
     (void)down_in;
 
-    ok = ds4_gpu_matmul_f32_tensor(g->batch_router_logits,
-                                   model->map,
-                                   model->size,
-                                   l->ffn_gate_inp->abs_offset,
-                                   DS4_N_EMBD,
-                                   DS4_N_EXPERT,
-                                   g->batch_ffn_norm,
-                                   n_tokens) != 0;
+    ok = false;
+    if (g->glm53 &&
+        ds4_gpu_glm53_router_weights_bf16_prepare(
+                il, model->map, model->size,
+                l->ffn_gate_inp->abs_offset,
+                (uint64_t)DS4_N_EMBD * DS4_N_EXPERT)) {
+        ok = ds4_gpu_glm53_router_matmul_bf16_prepared(
+                g->batch_router_logits, il,
+                DS4_N_EMBD, DS4_N_EXPERT,
+                g->batch_ffn_norm, n_tokens) != 0;
+    }
+    if (!ok) {
+        ok = ds4_gpu_matmul_f32_tensor(g->batch_router_logits,
+                                       model->map,
+                                       model->size,
+                                       l->ffn_gate_inp->abs_offset,
+                                       DS4_N_EMBD,
+                                       DS4_N_EXPERT,
+                                       g->batch_ffn_norm,
+                                       n_tokens) != 0;
+    }
     if (!ok) {
         fprintf(stderr,
                 "ds4: GLM sparse FFN router projection failed at layer %u "

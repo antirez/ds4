@@ -141,3 +141,19 @@ kernel glm53_mul_mm_bf16_t kernel_mul_mm<
         half, half2x4, simdgroup_half8x8,
         glm53_bf16_block16, 1, glm53_dequantize_bf16,
         half, half4x4, float, float2x4>;
+
+// One-time F32 -> BF16 conversion of a GLM-5.3-Flash layer's router
+// projection so the prefill router can run on the tuned BF16 tensor-unit
+// matmul.  Round-to-nearest even on the discarded low half; router weights
+// are finite.
+kernel void kernel_glm53_cvt_f32_bf16(
+        device const float  *src,
+        device ushort       *dst,
+        constant uint       &count,
+        uint gid [[thread_position_in_grid]],
+        uint tit [[threads_per_grid]]) {
+    for (uint i = gid; i < count; i += tit) {
+        const uint u = as_type<uint>(src[i]);
+        dst[i] = (ushort)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+    }
+}
