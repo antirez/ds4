@@ -432,6 +432,30 @@ static void test_fragmented_terminal_input(void) {
     unsetenv("LINENOISE_ASSUME_TTY");
 }
 
+static void test_tui_needs_terminal(void) {
+    char *tui_args[] = {"ds4-agent", "--model", "m.gguf", "-p", "test"};
+    char *batch_args[] = {"ds4-agent", "--model", "m.gguf",
+                          "--non-interactive", "-p", "test"};
+    agent_config tui = parse_options(5, tui_args);
+    agent_config batch = parse_options(6, batch_args);
+    int fds[2];
+    AGENT_TEST_ASSERT(pipe(fds) == 0);
+    unsetenv("LINENOISE_ASSUME_TTY");
+    AGENT_TEST_ASSERT(!agent_tui_has_terminal(&tui, fds[0]));
+    AGENT_TEST_ASSERT(agent_tui_has_terminal(&batch, fds[0]));
+    setenv("LINENOISE_ASSUME_TTY", "1", 1);
+    AGENT_TEST_ASSERT(agent_tui_has_terminal(&tui, fds[0]));
+    unsetenv("LINENOISE_ASSUME_TTY");
+    int master = posix_openpt(O_RDWR | O_NOCTTY);
+    AGENT_TEST_ASSERT(master >= 0 && grantpt(master) == 0 && unlockpt(master) == 0);
+    int term = master >= 0 ? open(ptsname(master), O_RDWR | O_NOCTTY) : -1;
+    AGENT_TEST_ASSERT(term >= 0);
+    AGENT_TEST_ASSERT(agent_tui_has_terminal(&tui, term));
+    if (term >= 0) close(term);
+    if (master >= 0) close(master);
+    close(fds[0]); close(fds[1]);
+}
+
 static void test_shell_terminal_controls(void) {
     const char malicious[] = "before\x1b[2Jafter\x1b[H!\x1b]52;c;secret\a"
                              "\x1bPdata\x1b\\\x1b[31mred\x1b[0m\b\n";
@@ -1027,6 +1051,7 @@ int main(int argc, char **argv) {
     test_shell_spawn();
     test_background_jobs();
     test_fragmented_terminal_input();
+    test_tui_needs_terminal();
     test_shell_terminal_controls();
     test_markdown_literals();
     test_hint_rendering();

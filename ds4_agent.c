@@ -13511,9 +13511,23 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
     return 0;
 }
 
+/* The TUI puts stdin in raw mode, which needs a terminal.  main() checks this
+ * before the model loads, so a scripted run is refused at once instead of
+ * after a long load. */
+static bool agent_tui_has_terminal(const agent_config *cfg, int fd) {
+    return cfg->non_interactive || isatty(fd) ||
+           getenv("LINENOISE_ASSUME_TTY") != NULL;
+}
+
 #ifndef DS4_AGENT_TEST_NO_MAIN
 int main(int argc, char **argv) {
     agent_config cfg = parse_options(argc, argv);
+    if (!agent_tui_has_terminal(&cfg, STDIN_FILENO)) {
+        fprintf(stderr,
+                "ds4-agent: the interactive UI needs a terminal on stdin; "
+                "use --non-interactive for scripted runs\n");
+        return 2;
+    }
     if (cfg.chdir_path) {
         struct stat st;
         if (stat(cfg.chdir_path, &st) != 0) {
