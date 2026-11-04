@@ -27,6 +27,49 @@ python3 speed-bench/plot_speed.py speed-bench/m3_max.csv --title "M3 Max t/s"
 The script uses only the Python standard library. By default it writes a file
 next to the CSV using the `_ts.svg` suffix, such as `speed-bench/m3_max_ts.svg`.
 
+### Qwen3.8 Flash Next on a 64 GB Mac
+
+The CSV files collected above all use DeepSeek V4 Flash Q2, so they compare
+directly with each other. `m1_max_qwen38.csv` is **not** part of that set: it is
+Qwen3.8 Flash Next Q2 (`qwen38-q2`) on an M1 Max with 64 GB, kept under a
+separate name because a different model is not comparable against the Flash Q2
+numbers.
+
+Two deviations from the sweep above were necessary on a 64 GB machine:
+
+* `--prefill-chunk 2048`. The default chunk for this model is 8192, which plans
+  49.74 GiB (`buffers 7.49 GiB + resident model 41.72 GiB`) and pushes a 64 GB
+  Mac into swap. The cost is visible in the data: `gen_first_ms` rises from
+  ~48 ms to 280-460 ms and `gen_tps` scatters between 20.70 and 24.72 instead of
+  holding flat. At 2048 the run plans 44.36 GiB and stays resident.
+* `--ctx-max 16384`. `ds4-bench` keeps a restorable memory snapshot per frontier
+  on top of the 41.72 GiB resident model, and the 32768 frontier exhausts memory
+  here. Ordinary inference is unaffected: `./ds4 --ctx 32768 --prefill-chunk 2048`
+  reaches 271.94 t/s prefill and 22.76 t/s generation on a real 32,113-token
+  prompt, and `--ctx 131072` still loads at 48.44 GiB planned.
+
+Command used:
+
+```
+./ds4-bench \
+  -m ds4flash.gguf \
+  --prompt-file speed-bench/promessi_sposi.txt \
+  --ctx-start 2048 \
+  --ctx-max 16384 \
+  --step-incr 2048 \
+  --gen-tokens 128 \
+  --prefill-chunk 2048
+```
+
+The committed CSV is one unmodified `ds4-bench` run. A second identical run
+agreed within about 1% at every frontier (prefill 271.79-289.97, steady
+generation 24.05-24.78). The machine had ordinary desktop background load and no
+other GPU workloads. Adding `--mtp` raises generation to 33.19 t/s on highly
+predictable output and 28.91 t/s on prose, at a ~3% prefill cost.
+
+![M1 Max Qwen3.8 Flash Next Q2 throughput](m1_max_qwen38_ts.svg)
+
+
 ### Metal decode schedule A/B
 
 Build the balanced, same-engine Metal decode comparison with:
