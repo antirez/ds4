@@ -1,0 +1,166 @@
+/* DwarfStar — VitePress custom theme */
+
+:root {
+  --vp-c-brand-1: #2563eb;
+  --vp-c-brand-2: #3b82f6;
+  --vp-c-brand-3: #1d4ed8;
+
+  --vp-c-default-soft: rgba(37, 99, 235, 0.08);
+  --vp-c-brand-soft: rgba(37, 99, 235, 0.12);
+}
+
+/* Home hero */
+.VPHero .name,
+.VPHero .text {
+  line-height: 1.15;
+}
+
+.VPHero .tagline {
+  max-width: 40rem;
+  margin-inline: auto;
+}
+
+/* Custom metric cards */
+.metric-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 0.75rem;
+  margin: 1.25rem 0;
+}
+
+.metric-card {
+  border: 1px solid var(--vp-c-divider);
+  border-radius: 8px;
+  padding: 1rem;
+  background: var(--vp-c-bg-soft);
+}
+
+.metric-title {
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--vp-c-text-2);
+  margin-bottom: 0.35rem;
+}
+
+.metric-value {
+  font-size: 1.75rem;
+  font-weight: 800;
+  letter-spacing: -0.03em;
+  line-height: 1;
+  color: var(--vp-c-brand-1);
+  display: inline;
+}
+
+.metric-unit {
+  font-size: 0.8rem;
+  font-weight: 500;
+  color: var(--vp-c-text-2);
+  display: inline;
+  margin-left: 0.2rem;
+}
+
+.metric-detail {
+  font-size: 0.775rem;
+  color: var(--vp-c-text-2);
+  margin-top: 0.25rem;
+  line-height: 1.4;
+}
+
+.metric-bar {
+  margin-top: 0.625rem;
+  height: 3px;
+  background: var(--vp-c-divider);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.metric-bar-fill {
+  height: 100%;
+  background: var(--vp-c-brand-1);
+  border-radius: 2px;
+}
+
+.metric-label {
+  font-size: 0.7rem;
+  color: var(--vp-c-text-3);
+  margin-top: 0.35rem;
+}
+
+.metric-table {
+  width: 100%;
+  border: none !important;
+  margin: 0.5rem 0 0 !important;
+  display: block;
+}
+
+.metric-table tbody {
+  display: block;
+}
+
+.metric-table tr {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  padding: 0.2rem 0;
+}
+
+.metric-table td {
+  padding: 0 !important;
+  border: none !important;
+  background: transparent !important;
+  display: block;
+}
+
+.metric-table td:first-child {
+  color: var(--vp-c-text-2);
+  font-size: 0.85rem;
+}
+
+.metric-table .metric-val {
+  text-align: right;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--vp-c-text-1);
+}
+
+/* Chart containers */
+.chart-container {
+  margin: 1.25rem 0;
+  border: 1px solid var(--vp-c-divider);
+  border-radius: 8px;
+  padding: 0.75rem;
+  background: var(--vp-c-bg-soft);
+}
+
+.benchmark-chart {
+  width: 100%;
+  height: auto;
+}
+
+.model-chart {
+  margin: 0.75rem 0;
+  padding: 0.25rem 0;
+}
+
+/* Brand logos in feature cards */
+.VPFeature .icon img {
+  width: 32px;
+  height: 32px;
+}
+
+.VPFeature .icon svg {
+  width: 32px;
+  height: 32px;
+}
+.dark .chart-container {
+  background: var(--vp-c-bg-soft);
+}
+
+/* SVG chart styles */
+.model-chart svg .bar { fill: var(--vp-c-brand-1); rx: 4; }
+.model-chart svg .bar-value { fill: var(--vp-c-text-1); font-size: 12px; font-weight: 600; font-family: system-ui; }
+.model-chart svg .bar-name { fill: var(--vp-c-text-1); font-size: 12px; font-family: system-ui; }
+.model-chart svg .axis-label { fill: var(--vp-c-text-2); font-size: 10px; font-family: system-ui; }
+.model-chart svg .grid-line { stroke: var(--vp-c-divider); stroke-width: 1; stroke-dasharray: 3,3; }
