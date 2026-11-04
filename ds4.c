@@ -78528,6 +78528,20 @@ bool ds4_session_has_vision_state(const ds4_session *s) {
     return s && (s->checkpoint_image_count != 0 || s->sync_image_count != 0);
 }
 
+size_t ds4_session_checkpoint_image_count(const ds4_session *s) {
+    return (s && s->checkpoint_valid) ? s->checkpoint_image_count : 0;
+}
+
+bool ds4_session_checkpoint_image_span(const ds4_session *s, size_t i,
+                                       uint32_t *token_start,
+                                       uint32_t *token_count) {
+    if (!s || !s->checkpoint_valid || i >= s->checkpoint_image_count)
+        return false;
+    if (token_start) *token_start = s->checkpoint_images[i].token_start;
+    if (token_count) *token_count = s->checkpoint_images[i].token_count;
+    return true;
+}
+
 static bool ds4_session_vision_range_overlaps(
         const ds4_session *s,
         uint32_t           token_start,

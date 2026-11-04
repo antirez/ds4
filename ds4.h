@@ -470,6 +470,15 @@ bool ds4_session_rebase_vision_state(const ds4_session *s,
 /* True while a session contains, or is actively syncing, image-conditioned
  * state. Such state must not be written to the text-keyed disk KV cache. */
 bool ds4_session_has_vision_state(const ds4_session *s);
+/* Number of images recorded in the live checkpoint (0 if none, or the
+ * checkpoint is invalid). */
+size_t ds4_session_checkpoint_image_count(const ds4_session *s);
+/* Token span of the i-th checkpoint image (0 <= i < count). Returns false
+ * (leaving the out-params untouched) if i is out of range or the checkpoint
+ * is invalid. */
+bool ds4_session_checkpoint_image_span(const ds4_session *s, size_t i,
+                                       uint32_t *token_start,
+                                       uint32_t *token_count);
 bool ds4_session_rewrite_requires_rebuild(int live_len, int canonical_len, int common);
 ds4_session_rewrite_result ds4_session_rewrite_from_common(
         ds4_session *s, const ds4_tokens *prompt, int common,

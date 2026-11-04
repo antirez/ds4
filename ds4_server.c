@@ -10043,6 +10043,15 @@ struct server_slot {
     char *live_text;
     size_t live_text_len;
     int live_text_pos;              /* checkpoint.len at render time; 0 = stale */
+    /* Rendered byte length of each live-checkpoint image's expansion
+     * (<|vision_start|><|image_pad|>...<|vision_end|>, engine-dependent
+     * wrapper), refreshed alongside live_text. REUSE_MEMORY_TEXT compares
+     * the request's compact per-image nonce marker against this span by
+     * length alone -- the vision fingerprint-prefix gate earlier in
+     * slot_probe_reuse_locked() already proved it is the same image, so
+     * only its byte length is needed to keep both text cursors aligned. */
+    size_t live_text_image_len[16];
+    size_t live_text_image_count;
 
     job *assigned;
     job *running;
@@ -11734,14 +11743,55 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
         }
     }
 
-    if (ptext && slot->live_text && slot->live_text_pos == live_pos &&
-        slot->live_text_len <= plen &&
-        byte_prefix_match(ptext, plen, slot->live_text, slot->live_text_len))
-    {
-        pr.kind = REUSE_MEMORY_TEXT;
-        pr.reuse_tokens = live_pos;
-        pr.suffix_off = slot->live_text_len;
-        return pr;
+    /* memory-text, vision-aware (#1214): ptext carries each image as a
+     * short request-local nonce marker, while live_text holds that image's
+     * full <|vision_start|>...<|vision_end|> expansion -- never byte-equal
+     * by construction once any image is live, which made this tier
+     * permanently dead for vision conversations. The vision fingerprint-
+     * prefix gate above already proved slot->live_text_image_count of
+     * req->image_markers[] are the same images in the same order as the
+     * live checkpoint, so each one is skipped as a single unit (by its
+     * known rendered byte length) rather than compared byte-for-byte; the
+     * literal text around and between them must still match exactly. With
+     * no images this degenerates to the original plain byte_prefix_match. */
+    if (ptext && slot->live_text && slot->live_text_pos == live_pos) {
+        size_t pos_a = 0, pos_b = 0;
+        bool seg_ok = true;
+        for (size_t i = 0; seg_ok && i < slot->live_text_image_count; i++) {
+            if (!req->image_markers || i >= req->image_count) {
+                seg_ok = false;
+                break;
+            }
+            const char *marker = strstr(ptext + pos_a, req->image_markers[i]);
+            if (!marker) {
+                seg_ok = false;
+                break;
+            }
+            size_t seg_len = (size_t)(marker - (ptext + pos_a));
+            if (pos_b + seg_len > slot->live_text_len ||
+                memcmp(ptext + pos_a, slot->live_text + pos_b, seg_len) != 0)
+            {
+                seg_ok = false;
+                break;
+            }
+            pos_a += seg_len + strlen(req->image_markers[i]);
+            pos_b += seg_len + slot->live_text_image_len[i];
+            if (pos_b > slot->live_text_len) {
+                seg_ok = false;
+                break;
+            }
+        }
+        if (seg_ok) {
+            size_t tail_len = slot->live_text_len - pos_b;
+            if (pos_a + tail_len <= plen &&
+                memcmp(ptext + pos_a, slot->live_text + pos_b, tail_len) == 0)
+            {
+                pr.kind = REUSE_MEMORY_TEXT;
+                pr.reuse_tokens = live_pos;
+                pr.suffix_off = pos_a + tail_len;
+                return pr;
+            }
+        }
     }
 
     return pr;
@@ -11778,6 +11828,7 @@ static void slot_refresh_live_text(server *s, server_slot *slot) {
     slot->live_text = NULL;
     slot->live_text_len = 0;
     slot->live_text_pos = 0;
+    slot->live_text_image_count = 0;
     if (!s || !slot->session ||
         !ds4_session_checkpoint_valid(slot->session))
     {
@@ -11787,6 +11838,49 @@ static void slot_refresh_live_text(server *s, server_slot *slot) {
     if (!live || live->len <= 0) return;
     slot->live_text = render_tokens_text(s->engine, live, &slot->live_text_len);
     if (slot->live_text) slot->live_text_pos = live->len;
+
+    /* Record each checkpoint image's rendered byte length -- image_pad*N
+     * plus any <|vision_start|>/<|vision_end|> wrapper tokens immediately
+     * adjacent to it -- so the memory-text probe can skip its expansion
+     * span in live_text without detokenizing the whole prefix again. See
+     * slot_probe_reuse_locked(). Whether the wrapper tokens sit inside or
+     * outside [token_start, token_start+token_count) is a per-engine
+     * rendering detail (ds4_prompt_append_vision excludes them; some paths
+     * may not), so this checks their actual rendered text rather than
+     * assuming a fixed convention from the engine type. */
+    size_t nimg = ds4_session_checkpoint_image_count(slot->session);
+    if (nimg > 16) nimg = 16;
+    static const char VSTART[] = "<|vision_start|>", VEND[] = "<|vision_end|>";
+    for (size_t i = 0; i < nimg; i++) {
+        uint32_t token_start = 0, token_count = 0;
+        if (!ds4_session_checkpoint_image_span(slot->session, i,
+                                               &token_start, &token_count))
+            break;
+        int64_t start = (int64_t)token_start;
+        int64_t end = (int64_t)token_start + token_count;
+        if (start < 0 || end > live->len) break;
+        if (start > 0) {
+            size_t l = 0;
+            char *b = ds4_token_text(s->engine, live->v[start - 1], &l);
+            if (b && l == sizeof(VSTART) - 1 && !memcmp(b, VSTART, l)) start--;
+            free(b);
+        }
+        if (end < live->len) {
+            size_t l = 0;
+            char *b = ds4_token_text(s->engine, live->v[end], &l);
+            if (b && l == sizeof(VEND) - 1 && !memcmp(b, VEND, l)) end++;
+            free(b);
+        }
+        size_t len = 0;
+        for (int64_t p = start; p < end; p++) {
+            size_t piece_len = 0;
+            char *piece = ds4_token_text(s->engine, live->v[p], &piece_len);
+            free(piece);
+            len += piece_len;
+        }
+        slot->live_text_image_len[i] = len;
+        slot->live_text_image_count = i + 1;
+    }
 }
 
 /* =========================================================================
@@ -16710,6 +16804,63 @@ static void test_slot_probe_vision_tiers(void) {
         TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &j.req).kind ==
                     REUSE_NONE);
         visible_live_free(&slot.thinking_live);
+        ds4_session_free_test_checkpoint(slot.session);
+        request_free(&j.req);
+    }
+
+    /* 4. memory-text with an image INSIDE the matched prefix (#1214): the
+     *    live checkpoint's rendered text holds the image's full expansion,
+     *    while the request carries it as a short nonce marker. Before the
+     *    fix, the raw byte_prefix_match broke the instant it hit the image
+     *    and this tier went permanently dead for any vision conversation --
+     *    the exact bug reported in antirez/ds4#1214. The probe must now
+     *    skip the image span (by its known rendered length) and still
+     *    match the literal text around it. */
+    {
+        server_slot slot = {0};
+        slot.session = ds4_session_new_test_checkpoint(ckpt_tok, 10);
+        ds4_vision_span image = {.token_start = 3,
+            .embedding = {.token_count = 2, .fingerprint = {7}}};
+        ds4_session_set_test_images(slot.session, &image, 1);
+        const char *img_expansion = "<<<EXPANDED-IMAGE-BYTES>>>";
+        char live_text_buf[128];
+        snprintf(live_text_buf, sizeof(live_text_buf), "intro%stail",
+                 img_expansion);
+        slot.live_text = xstrdup(live_text_buf);
+        slot.live_text_len = strlen(slot.live_text);
+        slot.live_text_pos = 10;
+        slot.live_text_image_count = 1;
+        slot.live_text_image_len[0] = strlen(img_expansion);
+
+        job j = {0};
+        j.req.kind = REQ_CHAT;
+        j.req.api = API_OPENAI;
+        j.req.prompt_text =
+            xstrdup("intro<NONCE-X>tail and more text after");
+        ds4_tokens_push(&j.req.prompt, 999);  /* diverges: force text tier */
+        j.req.image_markers = xmalloc(sizeof(*j.req.image_markers));
+        snprintf(j.req.image_markers[0], sizeof(j.req.image_markers[0]),
+                 "<NONCE-X>");
+        j.req.images = calloc(1, sizeof(*j.req.images));
+        j.req.images[0].token_start = 3;
+        j.req.images[0].embedding.token_count = 2;
+        j.req.images[0].embedding.fingerprint[0] = 7;
+        j.req.image_count = 1;
+
+        slot_reuse pr = slot_probe_reuse_locked(&s, &slot, &j.req);
+        TEST_ASSERT(pr.kind == REUSE_MEMORY_TEXT);
+        TEST_ASSERT(pr.reuse_tokens == 10);
+        TEST_ASSERT(pr.suffix_off == strlen("intro<NONCE-X>tail"));
+
+        /* Safety control: a different image (fingerprint mismatch) must
+         * not be masked through -- the fingerprint-prefix gate earlier in
+         * the probe rejects it before the memory-text walk ever runs, so
+         * two different images can never be treated as interchangeable. */
+        j.req.images[0].embedding.fingerprint[0] = 8;  /* changed pixels */
+        TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &j.req).kind ==
+                    REUSE_NONE);
+
+        free(slot.live_text);
         ds4_session_free_test_checkpoint(slot.session);
         request_free(&j.req);
     }
