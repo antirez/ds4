@@ -10173,6 +10173,7 @@ struct server {
     server_image_cache image_cache; /* Protected by inference_mu. */
     bool disable_exact_dsml_tool_replay;
     bool enable_cors;
+    int loop_guard;
     pthread_mutex_t tool_mu;
     pthread_mutex_t kv_mu;
     pthread_mutex_t inference_mu;
@@ -13421,6 +13422,87 @@ static void *decode_worker_main(void *arg) {
  * shorter than the full prompt, we prefill to that boundary, store it, and
  * immediately continue to the real prompt.  The live graph therefore always
  * moves forward. */
+/* Repetition-loop breaker (--loop-guard N). A reply whose last N tokens are an
+ * exact cycle of period <= LOOP_GUARD_MAX_PERIOD is in a degenerate loop, for
+ * example "00 00 00 ..." while writing out a zero-filled packet in thinking.
+ * Sampling alone does not escape it: once the run is long, the cycle token is
+ * almost the whole distribution, and a model pushed off one cycle often starts
+ * another ("01 01 01 ..."). So the guard escalates instead of ending the reply:
+ * the first detection masks the cycle's non-trivial tokens for the next
+ * LOOP_GUARD_BAN_STEPS samples; a later one inside the thinking injects
+ * LOOP_GUARD_WRAP_TEXT, which closes the thinking, so the model answers from
+ * what it has. In answer text it keeps masking and stops with finish=length
+ * after LOOP_GUARD_MAX_NUDGES. Speculation pauses while the guard masks or
+ * injects: drafts that match the target's greedy token would bypass both. */
+#define LOOP_GUARD_MAX_PERIOD 8
+#define LOOP_GUARD_BAN_STEPS 64
+#define LOOP_GUARD_MAX_NUDGES 4
+#define LOOP_GUARD_RING 4096
+#define LOOP_GUARD_WRAP_TEXT \
+    "\n\nI am repeating myself and going in circles. I have enough to answer now, " \
+    "so I will stop thinking and respond.\n</think>\n\n"
+
+typedef struct {
+    int ring[LOOP_GUARD_RING];
+    int n;
+    int ban[LOOP_GUARD_MAX_PERIOD];
+    int nban;
+    int ban_steps;
+    int nudges;
+    ds4_tokens wrap;   /* forced tokens still to emit */
+    int wrap_pos;
+} loop_guard_state;
+
+static void loop_guard_push(loop_guard_state *g, int token) {
+    g->ring[g->n % LOOP_GUARD_RING] = token;
+    g->n++;
+}
+
+/* The period when the last `window` tokens repeat exactly, else 0. */
+static int loop_guard_period(const loop_guard_state *g, int window) {
+    if (window <= 0 || window > LOOP_GUARD_RING - LOOP_GUARD_MAX_PERIOD ||
+        g->n < window + LOOP_GUARD_MAX_PERIOD) return 0;
+    for (int p = 1; p <= LOOP_GUARD_MAX_PERIOD; p++) {
+        int i = 0;
+        for (; i < window; i++) {
+            const int a = g->n - 1 - i;
+            if (g->ring[a % LOOP_GUARD_RING] != g->ring[(a - p) % LOOP_GUARD_RING]) break;
+        }
+        if (i == window) return p;
+    }
+    return 0;
+}
+
+static bool loop_guard_injecting(const loop_guard_state *g) {
+    return g && g->wrap_pos < g->wrap.len;
+}
+
+/* Masks only tokens with a letter or digit: banning spaces, commas or newlines
+ * for 64 steps would damage the text around the loop. */
+static void loop_guard_mask(loop_guard_state *g, ds4_engine *e, int period) {
+    g->nban = 0;
+    for (int k = 0; k < period; k++) {
+        const int tok = g->ring[(g->n - 1 - k) % LOOP_GUARD_RING];
+        bool dup = false;
+        for (int b = 0; b < g->nban; b++) dup |= g->ban[b] == tok;
+        if (dup) continue;
+        size_t len = 0;
+        char *t = ds4_token_text(e, tok, &len);
+        bool alnum = false;
+        for (size_t c = 0; t && c < len; c++) alnum |= isalnum((unsigned char)t[c]) != 0;
+        free(t);
+        if (alnum) g->ban[g->nban++] = tok;
+    }
+    g->ban_steps = g->nban ? LOOP_GUARD_BAN_STEPS : 0;
+}
+
+static void loop_guard_wrap(loop_guard_state *g, ds4_engine *e) {
+    g->wrap.len = 0;
+    g->wrap_pos = 0;
+    g->ban_steps = 0;
+    ds4_tokenize_rendered_chat(e, LOOP_GUARD_WRAP_TEXT, &g->wrap);
+}
+
 static void generate_job_inner(server *s, server_slot *slot, job *j) {
     char err[160];
     err[0] = '\0';
@@ -13955,6 +14037,7 @@ decode_again:
     dsml_decode_tracker dsml_tracker;
     dsml_decode_tracker_init(&dsml_tracker);
     dsml_tracker.model_syntax = j->req.model_syntax;
+    loop_guard_state *lg = s->loop_guard > 0 ? calloc(1, sizeof(*lg)) : NULL;
 
     server_generation_enter(s);
     while (!g_stop_requested && !job_cancelled(j) && completion < max_tokens &&
@@ -13986,7 +14069,12 @@ decode_again:
             temperature = 0.0f;
         }
         const int eos_token = ds4_token_eos(s->engine);
-        int token = j->req.ignore_eos ?
+        if (lg && lg->ban_steps > 0 && !loop_guard_injecting(lg)) {
+            for (int b = 0; b < lg->nban; b++) ds4_session_mask_token(slot->session, lg->ban[b]);
+            lg->ban_steps--;
+        }
+        int token = loop_guard_injecting(lg) ? lg->wrap.v[lg->wrap_pos++] :
+            j->req.ignore_eos ?
             ds4_session_argmax_ignoring_eos(slot->session,
                                             j->req.think_mode) :
             ds4_session_sample(slot->session, temperature, top_k,
@@ -14010,6 +14098,7 @@ decode_again:
         const int block_start = ds4_session_pos(slot->session);
         if (!s->batched_mode &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
+            !(lg && (lg->ban_steps > 0 || loop_guard_injecting(lg))) &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {
             if (j->req.ignore_eos) {
@@ -14227,6 +14316,37 @@ decode_again:
                 }
             }
 
+            if (lg && !loop_guard_injecting(lg)) {
+                loop_guard_push(lg, token);
+                const int period = lg->ban_steps == 0 && (completion & 15) == 0 ?
+                    loop_guard_period(lg, s->loop_guard) : 0;
+                if (period > 0) {
+                    lg->nudges++;
+                    const char *action;
+                    if (lg->nudges > 1 && thinking.inside) {
+                        loop_guard_wrap(lg, s->engine);
+                        action = "closing the thinking";
+                    } else if (lg->nudges <= LOOP_GUARD_MAX_NUDGES) {
+                        loop_guard_mask(lg, s->engine, period);
+                        action = lg->nban ? "masking the cycle" : "nothing to mask";
+                    } else {
+                        action = "stopping";
+                    }
+                    server_log(DS4_LOG_WARNING,
+                               "ds4-server: chat ctx=%s%s%s loop guard: period %d repeated over %d tokens at gen=%d%s, detection %d: %s",
+                               ctx_span, req_flags[0] ? " " : "", req_flags, period, s->loop_guard,
+                               completion, thinking.inside ? " (thinking)" : "", lg->nudges, action);
+                    trace_event(s, trace_id, "loop guard: period=%d gen=%d detection=%d %s",
+                                period, completion, lg->nudges, action);
+                    if (!loop_guard_injecting(lg) && lg->ban_steps == 0) {
+                        finish = "length";
+                        stop_detail = "repetition loop";
+                        stop_decode = true;
+                        break;
+                    }
+                }
+            }
+
             if (completion >= next_decode_log) {
                 log_decode_progress(j->req.kind, prompt_tokens, completion,
                                     responses_protocol,
@@ -14289,6 +14409,8 @@ decode_again:
         if (stop_decode) break;
     }
     server_generation_leave(s);
+    if (lg) ds4_tokens_free(&lg->wrap);
+    free(lg);
 
     if (job_cancelled(j)) {
         request_live_state_clear(s, slot);
@@ -15464,6 +15586,7 @@ typedef struct {
     bool enable_cors;
     int batched_sessions;
     int mixed_prefill_quantum;
+    int loop_guard;
 } server_config;
 
 static int parse_int_arg(const char *s, const char *opt) {
@@ -15701,6 +15824,8 @@ static server_config parse_options(int argc, char **argv) {
             c.port = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--cors")) {
             c.enable_cors = true;
+        } else if (!strcmp(arg, "--loop-guard")) {
+            c.loop_guard = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--trace")) {
             c.trace_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--batched-session")) {
@@ -15984,6 +16109,7 @@ int main(int argc, char **argv) {
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
+    s.loop_guard = cfg.loop_guard;
     s.slots = xmalloc((size_t)slot_count * sizeof(*s.slots));
     memset(s.slots, 0, (size_t)slot_count * sizeof(*s.slots));
     if (s.batched_mode) {
@@ -18166,6 +18292,30 @@ static void test_streaming_holds_partial_utf8(void) {
     request_free(&r);
     close(sv[0]);
     close(sv[1]);
+}
+
+static void test_loop_guard_detects_short_cycles_only(void) {
+    loop_guard_state *g = calloc(1, sizeof(*g));
+    TEST_ASSERT(g != NULL);
+    /* Ordinary text: no cycle. */
+    for (int i = 0; i < 600; i++) loop_guard_push(g, 1000 + (i * 7919) % 5003);
+    TEST_ASSERT(loop_guard_period(g, 256) == 0);
+    /* A period-2 run (" 00" as two tokens) shorter than the window is ignored... */
+    for (int i = 0; i < 200; i++) loop_guard_push(g, i % 2 ? 15 : 223);
+    TEST_ASSERT(loop_guard_period(g, 256) == 0);
+    /* ...and detected once it covers the window. */
+    for (int i = 0; i < 100; i++) loop_guard_push(g, i % 2 ? 15 : 223);
+    TEST_ASSERT(loop_guard_period(g, 256) == 2);
+    /* Detection keeps working across the ring wrap, and reports the smallest period. */
+    for (int i = 0; i < LOOP_GUARD_RING + 300; i++) loop_guard_push(g, 42);
+    TEST_ASSERT(loop_guard_period(g, 256) == 1);
+    /* A period above LOOP_GUARD_MAX_PERIOD is not reported. */
+    for (int i = 0; i < 600; i++) loop_guard_push(g, 500 + i % (LOOP_GUARD_MAX_PERIOD + 1));
+    TEST_ASSERT(loop_guard_period(g, 256) == 0);
+    /* Window bounds are rejected. */
+    TEST_ASSERT(loop_guard_period(g, 0) == 0);
+    TEST_ASSERT(loop_guard_period(g, LOOP_GUARD_RING) == 0);
+    free(g);
 }
 
 static void test_request_defaults_use_min_p_filtering(void) {
@@ -23034,6 +23184,7 @@ static void ds4_server_unit_tests_run(void) {
     test_slot_routing_staleness_tiers();
     test_dispatch_routes_alien_request_to_empty_slot();
     test_request_defaults_use_min_p_filtering();
+    test_loop_guard_detects_short_cycles_only();
     test_chat_ignore_eos_contract();
     test_reasoning_effort_mapping();
     test_model_alias_thinking_controls();
