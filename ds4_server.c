@@ -8696,7 +8696,7 @@ static bool responses_sse_completed(int fd, const request *r,
         buf_puts(&b, ",\"error\":{\"code\":\"server_error\","
                      "\"message\":\"generation failed\"}");
     } else if (!strcmp(event_type, "response.incomplete")) {
-        buf_puts(&b, ",\"incomplete_details\":{\"reason\":\"max_tokens\"}");
+        buf_puts(&b, ",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}");
     }
     const char *item_status = responses_item_status_for_finish(finish);
     buf_puts(&b, ",\"output\":[");
@@ -8970,7 +8970,7 @@ static bool responses_final_response(int fd, bool enable_cors,
         buf_puts(&b, ",\"error\":{\"code\":\"server_error\","
                      "\"message\":\"generation failed\"}");
     } else if (finish && !strcmp(finish, "length")) {
-        buf_puts(&b, ",\"incomplete_details\":{\"reason\":\"max_tokens\"}");
+        buf_puts(&b, ",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}");
     }
     buf_puts(&b, ",\"output\":[");
     bool wrote = false;
@@ -17716,6 +17716,49 @@ static void test_responses_usage_reports_cache_details(void) {
     request_free(&r);
 }
 
+static void test_responses_incomplete_reports_max_output_tokens(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_RESPONSES;
+
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) {
+        request_free(&r);
+        return;
+    }
+
+    TEST_ASSERT(responses_final_response(sv[0], false, &r, "resp_cut", "1, 2", NULL, NULL,
+                                         "length", 10, 3));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "\"status\":\"incomplete\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"incomplete_details\":{\"reason\":\"max_output_tokens\"}") != NULL);
+    free(out);
+    close(sv[0]);
+    close(sv[1]);
+
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) {
+        request_free(&r);
+        return;
+    }
+
+    responses_stream st;
+    responses_stream_init(&r, &st);
+    TEST_ASSERT(responses_sse_completed(sv[0], &r, &st, NULL, NULL,
+                                        "length", 10, 3, 1234));
+    shutdown(sv[0], SHUT_WR);
+    out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "\"type\":\"response.incomplete\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"incomplete_details\":{\"reason\":\"max_output_tokens\"}") != NULL);
+    free(out);
+    responses_stream_free(&st);
+    close(sv[0]);
+    close(sv[1]);
+    request_free(&r);
+}
+
 static void test_openai_chat_stream_splits_reasoning_without_tools(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -23089,6 +23132,7 @@ static void ds4_server_unit_tests_run(void) {
     test_qwen_stream_split_reasoning_close();
     test_openai_stream_usage_reports_cache_details();
     test_responses_usage_reports_cache_details();
+    test_responses_incomplete_reports_max_output_tokens();
     test_openai_chat_stream_splits_reasoning_without_tools();
     test_openai_tool_stream_sends_partial_arguments();
     test_openai_glm_tool_stream_suppresses_raw_tool_call();
