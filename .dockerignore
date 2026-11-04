@@ -1,0 +1,25 @@
+# The build context must stay small: gguf/ holds ~150 GB of weights.
+gguf/
+*.gguf
+ds4flash.gguf
+
+# Build products and local state.
+ds4
+ds4-server
+ds4-bench
+ds4-eval
+ds4-agent
+*.o
+*.dSYM/
+core
+core.*
+
+# VCS and scratch.
+.git/
+.gitignore
+.gitattributes
+misc/
+__pycache__/
+*.pyc
+*.log
+.DS_Store

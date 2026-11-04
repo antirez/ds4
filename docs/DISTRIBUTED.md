@@ -165,6 +165,10 @@ choose non-overlapping ranges covering the entire model. Workers register
 their ranges with the coordinator; intermediate workers forward activations
 directly to the next stage.
 
+If a worker drops out, the coordinator holds requests for up to 120 seconds
+while a replacement registers its range, then replays interrupted sessions
+into it. Requests fail only if the route is still incomplete after that.
+
 Long prefill chunks can occupy different stages simultaneously. A single
 generation stream cannot use that overlap: each token must finish the route
 before the next one is sampled. Use pipeline mode primarily for capacity and

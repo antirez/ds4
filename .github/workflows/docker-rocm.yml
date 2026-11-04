@@ -1,0 +1,91 @@
+# Build the Strix Halo (ROCm gfx1151) image from the Dockerfile at the repo
+# root and push it to GitHub Container Registry as ghcr.io/<owner>/<repo>.
+#
+# Tags: `dev-rocm` and `dev-rocm-<short sha>` for main, plus `rocm-<version>`
+# for v* tags.  Pull requests build without pushing.
+name: docker-rocm
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: docker-rocm-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  # The runner's CPU is not the target's, so -march=native would be wrong.
+  NATIVE_CPU_FLAG: -march=znver4
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      # rocm/dev-ubuntu-24.04:*-full unpacks to ~28 GB and the image is built
+      # on top of it twice (build and runtime stages share its layers), which
+      # does not fit in a stock runner's free space.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Image name
+        id: image
+        run: echo "name=${REGISTRY}/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          flavor: latest=false
+          tags: |
+            type=raw,value=dev-rocm,enable={{is_default_branch}}
+            type=sha,prefix=dev-rocm-,enable={{is_default_branch}}
+            type=semver,pattern={{version}},prefix=rocm-
+            type=ref,event=pr,prefix=dev-rocm-pr-
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          build-args: |
+            NATIVE_CPU_FLAG=${{ env.NATIVE_CPU_FLAG }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # No layer cache: the base image alone exceeds the 10 GB GitHub
+          # Actions cache, and the compile step reruns on every source change.
+          provenance: false
