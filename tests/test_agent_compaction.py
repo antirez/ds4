@@ -222,9 +222,10 @@ try:
          "\nEnd archive. Reply with exactly READY.",
          "generation-fill")
     turn("Without calling any tools, output C code defining exactly 80 functions named "
-         "value_0 through value_79. Each takes no arguments and returns the square of "
-         "its numeric suffix as an int literal. Use one complete function per line, "
-         "in ascending order. No macros, comments, main function, or explanations.",
+         "value_0 through value_79, each with the signature int value_N(void). Each "
+         "takes no arguments and returns the square of its numeric suffix as an int "
+         "literal. Use one complete function per line, in ascending order. No macros, "
+         "comments, main function, or explanations.",
          "generation-boundary")
     part = (out / "generation-boundary.trace").read_text()
     generated = [(int(n), int(carried)) for n, carried in re.findall(
