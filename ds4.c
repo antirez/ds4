@@ -2883,12 +2883,16 @@ static void model_unmap_engram(ds4_model *m) {
     if (!tables[0] || !tables[1]) ds4_die("V4.1 GGUF is missing Engram tables");
     const uint64_t start = tables[0]->abs_offset;
     const long page = sysconf(_SC_PAGESIZE);
-    if (page <= 0 || start % (uint64_t)page || resident_end > start ||
+    if (page <= 0) ds4_die("cannot determine host page size");
+    /* Disk-only rows use pread, so their offsets need not match host pages.
+     * Only the unmap boundary must be aligned and clear of resident weights. */
+    const uint64_t cut = align_up(resident_end, (uint64_t)page);
+    if (cut > start ||
         tables[1]->abs_offset < start + tables[0]->bytes)
         ds4_die("V4.1 Engram tables must follow the page-aligned main weights");
-    if (munmap((void *)(m->map + start), (size_t)(m->size - start)) != 0)
+    if (munmap((void *)(m->map + cut), (size_t)(m->size - cut)) != 0)
         ds4_die_errno("cannot unmap disk-only region", "Engram");
-    m->size = start;
+    m->size = cut;
 }
 
 /* Like V4.1 Engram, the n-gram table must trail the resident weights. This
