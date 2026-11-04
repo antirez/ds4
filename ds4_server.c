@@ -3089,6 +3089,16 @@ static bool role_is_user_like(const char *role) {
     return !strcmp(role, "user") || !strcmp(role, "tool") || !strcmp(role, "function");
 }
 
+/* System messages before the first other message form the prompt's system
+ * block.  Templates that render a later system message where it occurs keep an
+ * append-only conversation append-only in tokens, which is what lets the next
+ * request extend the live KV instead of prefilling again. */
+static int chat_leading_system_count(const chat_msgs *msgs) {
+    int n = 0;
+    while (msgs && n < msgs->len && role_is_system(msgs->v[n].role)) n++;
+    return n;
+}
+
 static bool chat_history_uses_tool_context(const chat_msgs *msgs,
                                            const char *tool_schemas) {
     if (tool_schemas && tool_schemas[0]) return true;
@@ -3237,20 +3247,21 @@ static char *render_glm_chat_prompt_text(const chat_msgs *msgs,
         }
         buf_free(&tools);
     }
-    for (int i = 0; msgs && i < msgs->len; i++) {
-        const chat_msg *m = &msgs->v[i];
-        if (!role_is_system(m->role)) continue;
+    const int leading = chat_leading_system_count(msgs);
+    for (int i = 0; i < leading; i++) {
         buf_puts(&out, "<|system|>");
-        buf_puts(&out, m->content ? m->content : "");
+        buf_puts(&out, msgs->v[i].content ? msgs->v[i].content : "");
     }
 
     bool pending_assistant = false;
     bool observation_open = false;
-    for (int i = 0; msgs && i < msgs->len; i++) {
+    for (int i = leading; msgs && i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
         if (role_is_system(m->role)) {
+            /* The GLM template renders a system turn where it occurs. */
             observation_open = false;
-            continue;
+            buf_puts(&out, "<|system|>");
+            buf_puts(&out, m->content ? m->content : "");
         } else if (chat_msg_is_glm_tool_result(m)) {
             if (!observation_open) buf_puts(&out, "<|observation|>");
             append_glm_tool_result_message(&out, m);
@@ -3563,9 +3574,10 @@ static void append_qwen_conversation(buf *out, const chat_msgs *msgs, int start,
                                      const tool_schema_orders *tool_orders, bool think) {
     bool pending_assistant = false;
     bool tool_open = false;
+    const int leading = chat_leading_system_count(msgs);
     for (int i = start; msgs && i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
-        if (role_is_system(m->role)) continue;
+        if (role_is_system(m->role) && i < leading) continue;
         if (chat_msg_is_glm_tool_result(m)) {
             if (!tool_open) buf_puts(out, "<|im_start|>user");
             append_qwen_tool_result_message(out, m);
@@ -3577,7 +3589,13 @@ static void append_qwen_conversation(buf *out, const chat_msgs *msgs, int start,
             buf_puts(out, "<|im_end|>\n");
             tool_open = false;
         }
-        if (!strcmp(m->role, "user")) {
+        if (role_is_system(m->role)) {
+            /* A later system message stays where it occurs, in the Qwen
+             * template's form for a system message that is not first. */
+            buf_puts(out, "<|im_start|>system\n");
+            append_trimmed_text(out, m->content);
+            buf_puts(out, "<|im_end|>\n");
+        } else if (!strcmp(m->role, "user")) {
             buf_puts(out, "<|im_start|>user\n");
             append_trimmed_text(out, m->content);
             buf_puts(out, "<|im_end|>\n");
@@ -3599,11 +3617,10 @@ static char *render_qwen_chat_prompt_text(const chat_msgs *msgs,
     const char *effort = think ? ds4_qwen4_reasoning_effort_text(think_mode) : NULL;
     const bool have_tools = tool_schemas && tool_schemas[0];
     buf system = {0};
-    for (int i = 0; msgs && i < msgs->len; i++) {
-        const chat_msg *m = &msgs->v[i];
-        if (!role_is_system(m->role)) continue;
+    const int leading = chat_leading_system_count(msgs);
+    for (int i = 0; i < leading; i++) {
         if (system.len) buf_puts(&system, "\n\n");
-        append_trimmed_text(&system, m->content);
+        append_trimmed_text(&system, msgs->v[i].content);
     }
     buf out = {0};
     if (have_tools || system.len || effort) {
@@ -3816,11 +3833,14 @@ static char *render_glm_live_tool_tail(const chat_msgs *msgs, int start,
     buf out = {0};
     bool pending_assistant = false;
     bool observation_open = false;
+    const int leading = chat_leading_system_count(msgs);
     for (int i = start; msgs && i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
         if (role_is_system(m->role)) {
             observation_open = false;
-            continue;
+            if (i < leading) continue;
+            buf_puts(&out, "<|system|>");
+            buf_puts(&out, m->content ? m->content : "");
         } else if (chat_msg_is_glm_tool_result(m)) {
             if (!observation_open) buf_puts(&out, "<|observation|>");
             append_glm_tool_result_message(&out, m);
@@ -4080,6 +4100,23 @@ static bool anthropic_validate_tool_results(server *s, const chat_msgs *msgs,
     return ok;
 }
 
+/* Insert the Anthropic top-level system prompt into the parsed messages.
+ *
+ * This is the API's initial system prompt, not a later system turn, so it goes
+ * before the conversation: first for V4.1, and after any leading system
+ * messages for the other templates, which keeps their system block in the
+ * order it always had.  A system message later in messages[] then stays a
+ * later turn, which the renderers place where it occurs. */
+static void anthropic_place_system_prompt(chat_msgs *msgs, chat_msg msg,
+                                          server_model_syntax syntax) {
+    const int at = syntax == SERVER_MODEL_SYNTAX_DEEPSEEK41 ?
+        0 : chat_leading_system_count(msgs);
+    chat_msgs_push(msgs, msg);
+    memmove(msgs->v + at + 1, msgs->v + at,
+            (size_t)(msgs->len - 1 - at) * sizeof(msgs->v[0]));
+    msgs->v[at] = msg;
+}
+
 /* Prepare the Anthropic live-tool fast path.
  *
  * Anthropic's visible replay normally includes the assistant tool_use JSON and
@@ -4100,6 +4137,12 @@ static void anthropic_prepare_live_continuation(server *s, request *r,
         tail_start--;
     }
     if (tail_start == tail_end) return;
+    /* A system message after the tool results (e.g. a note about a message
+     * the user sent while the tool ran) is part of the new tail.  The tail
+     * renderers place it where it occurs; the DeepSeek template gathers every
+     * system message into the prompt head, so it cannot be appended to the
+     * live KV and the request takes the full render path instead. */
+    if (tail_end < msgs->len && r->model_syntax == SERVER_MODEL_SYNTAX_DEEPSEEK) return;
 
     stop_list_clear(&r->anthropic_live_call_ids);
     for (int i = tail_start; i < msgs->len; i++) {
@@ -4491,13 +4534,7 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
         msg.role = xstrdup("system");
         msg.content = system;
         system = NULL;
-        chat_msgs_push(&msgs, msg);
-        if (r->model_syntax == SERVER_MODEL_SYNTAX_DEEPSEEK41) {
-            /* This is the API's initial system prompt, not a later system
-             * turn, which V4.1 preserves at its original history position. */
-            memmove(msgs.v + 1, msgs.v, (size_t)(msgs.len - 1) * sizeof(msgs.v[0]));
-            msgs.v[0] = msg;
-        }
+        anthropic_place_system_prompt(&msgs, msg, r->model_syntax);
     }
     r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
@@ -18504,6 +18541,107 @@ static void test_render_qwen_chat_prompt_text(void) {
     chat_msgs_free(&msgs);
 }
 
+static void test_push_msg(chat_msgs *msgs, const char *role, const char *content,
+                          const char *reasoning) {
+    chat_msg m = {0};
+    m.role = xstrdup(role);
+    m.content = xstrdup(content);
+    if (reasoning) m.reasoning = xstrdup(reasoning);
+    chat_msgs_push(msgs, m);
+}
+
+/* A client that sends a system note with every turn (for example an output
+ * style reminder) only appends messages.  The rendered prompt must then only
+ * append text, or the next request cannot extend the live KV. */
+static void test_render_mid_conversation_system_appends_only(void) {
+    const server_model_syntax syntaxes[] = {
+        SERVER_MODEL_SYNTAX_QWEN, SERVER_MODEL_SYNTAX_GLM,
+    };
+    for (size_t k = 0; k < sizeof(syntaxes) / sizeof(syntaxes[0]); k++) {
+        for (int thinking = 0; thinking < 2; thinking++) {
+            const ds4_think_mode mode = thinking ? DS4_THINK_HIGH : DS4_THINK_NONE;
+            chat_msgs msgs = {0};
+            test_push_msg(&msgs, "system", "You are terse.", NULL);
+            test_push_msg(&msgs, "user", "Hello", NULL);
+            test_push_msg(&msgs, "system", "Style reminder.", NULL);
+            char *first = render_chat_prompt_text_for_syntax(syntaxes[k], &msgs, NULL, NULL, mode);
+            test_push_msg(&msgs, "assistant", "Hi.", NULL);
+            test_push_msg(&msgs, "user", "Again", NULL);
+            test_push_msg(&msgs, "system", "Style reminder.", NULL);
+            char *second = render_chat_prompt_text_for_syntax(syntaxes[k], &msgs, NULL, NULL, mode);
+            TEST_ASSERT(first && second && !strncmp(second, first, strlen(first)));
+
+            /* A user turn appended right after a system note. */
+            test_push_msg(&msgs, "assistant", "Done.", NULL);
+            test_push_msg(&msgs, "system", "Late note.", NULL);
+            char *third = render_chat_prompt_text_for_syntax(syntaxes[k], &msgs, NULL, NULL, mode);
+            test_push_msg(&msgs, "user", "More", NULL);
+            char *fourth = render_chat_prompt_text_for_syntax(syntaxes[k], &msgs, NULL, NULL, mode);
+            TEST_ASSERT(third && fourth && !strncmp(fourth, third, strlen(third)));
+
+            if (syntaxes[k] == SERVER_MODEL_SYNTAX_QWEN && !thinking) {
+                TEST_ASSERT(first && !strcmp(first,
+                    "<|im_start|>system\nYou are terse.<|im_end|>\n"
+                    "<|im_start|>user\nHello<|im_end|>\n"
+                    "<|im_start|>system\nStyle reminder.<|im_end|>\n"
+                    "<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+            }
+            if (syntaxes[k] == SERVER_MODEL_SYNTAX_GLM && !thinking) {
+                TEST_ASSERT(first && !strcmp(first,
+                    "[gMASK]<sop><|system|>You are terse.<|user|>Hello"
+                    "<|system|>Style reminder.<|assistant|><think></think>"));
+            }
+            free(first); free(second); free(third); free(fourth);
+            chat_msgs_free(&msgs);
+        }
+    }
+}
+
+/* Leading system messages, including the Anthropic top-level system prompt,
+ * render byte for byte as they did when every system message was gathered
+ * into the prompt head. */
+static void test_render_leading_system_unchanged(void) {
+    const struct {
+        server_model_syntax syntax;
+        ds4_think_mode mode;
+        const char *expected;
+    } cases[] = {
+        {SERVER_MODEL_SYNTAX_QWEN, DS4_THINK_NONE,
+         "<|im_start|>system\nBe terse.\n\nAnswer in English.<|im_end|>\n"
+         "<|im_start|>user\nHello<|im_end|>\n"
+         "<|im_start|>assistant\n<think>\ngreet\n</think>\n\nHi.<|im_end|>\n"
+         "<|im_start|>user\nAgain<|im_end|>\n"
+         "<|im_start|>assistant\n<think>\n\n</think>\n\n"},
+        {SERVER_MODEL_SYNTAX_GLM, DS4_THINK_NONE,
+         "[gMASK]<sop><|system|>Be terse.<|system|>Answer in English.<|user|>Hello"
+         "<|assistant|><think></think>Hi.<|user|>Again<|assistant|><think></think>"},
+        {SERVER_MODEL_SYNTAX_GLM, DS4_THINK_HIGH,
+         "[gMASK]<sop><|system|>Reasoning Effort: High<|system|>Be terse."
+         "<|system|>Answer in English.<|user|>Hello<|assistant|><think></think>Hi."
+         "<|user|>Again<|assistant|><think>"},
+        {SERVER_MODEL_SYNTAX_DEEPSEEK, DS4_THINK_NONE,
+         "<｜begin▁of▁sentence｜>Be terse.\n\nAnswer in English.<｜User｜>Hello"
+         "<｜Assistant｜></think>Hi.<｜end▁of▁sentence｜><｜User｜>Again<｜Assistant｜></think>"},
+    };
+    for (size_t k = 0; k < sizeof(cases) / sizeof(cases[0]); k++) {
+        chat_msgs msgs = {0};
+        test_push_msg(&msgs, "system", "Be terse.", NULL);
+        test_push_msg(&msgs, "user", "Hello", NULL);
+        test_push_msg(&msgs, "assistant", "Hi.", "greet");
+        test_push_msg(&msgs, "user", "Again", NULL);
+        chat_msg top = {0};
+        top.role = xstrdup("system");
+        top.content = xstrdup("Answer in English.");
+        anthropic_place_system_prompt(&msgs, top, cases[k].syntax);
+        TEST_ASSERT(!strcmp(msgs.v[1].content, "Answer in English."));
+        char *prompt = render_chat_prompt_text_for_syntax(cases[k].syntax, &msgs, NULL, NULL,
+                                                          cases[k].mode);
+        TEST_ASSERT(prompt && !strcmp(prompt, cases[k].expected));
+        free(prompt);
+        chat_msgs_free(&msgs);
+    }
+}
+
 static void test_qwen_reasoning_effort_levels(void) {
     bool enabled = true, got = false;
     ds4_think_mode mode = DS4_THINK_HIGH;
@@ -20138,13 +20276,14 @@ static void test_anthropic_live_tail_renders_tool_results_only(void) {
     chat_msg_add_tool_call_id(&user, "toolu_live");
     chat_msgs_push(&msgs, user);
 
-    /* Anthropic system text is parsed separately and appended to chat_msgs for
-     * rendering.  The live-tail finder must ignore it when locating the final
-     * tool_result run. */
+    /* Anthropic system text is parsed separately and placed before the
+     * conversation.  It must not stop the live-tail finder from locating the
+     * final tool_result run. */
     chat_msg system = {0};
     system.role = xstrdup("system");
     system.content = xstrdup("You are terse.");
-    chat_msgs_push(&msgs, system);
+    anthropic_place_system_prompt(&msgs, system, r.model_syntax);
+    TEST_ASSERT(!strcmp(msgs.v[0].role, "system"));
 
     anthropic_prepare_live_continuation(NULL, &r, &msgs);
     TEST_ASSERT(r.anthropic_live_call_ids.len == 1);
@@ -20159,6 +20298,62 @@ static void test_anthropic_live_tail_renders_tool_results_only(void) {
 
     chat_msgs_free(&msgs);
     request_free(&r);
+}
+
+/* Claude Code delivers a message the user sent while a tool ran as a system
+ * note right after the tool_result.  The live continuation must append it, or
+ * take the full render path; it must never drop it. */
+static void test_anthropic_live_tail_keeps_system_note(void) {
+    const server_model_syntax syntaxes[] = {
+        SERVER_MODEL_SYNTAX_QWEN, SERVER_MODEL_SYNTAX_GLM,
+        SERVER_MODEL_SYNTAX_DEEPSEEK41, SERVER_MODEL_SYNTAX_DEEPSEEK,
+    };
+    server s = {0};
+    server_slot slot;
+    test_server_bind_slot(&s, &slot);
+    pthread_mutex_init(&s.tool_mu, NULL);
+    for (size_t k = 0; k < sizeof(syntaxes) / sizeof(syntaxes[0]); k++) {
+        request r;
+        request_init(&r, REQ_CHAT, 128);
+        r.api = API_ANTHROPIC;
+        r.model_syntax = syntaxes[k];
+        r.think_mode = DS4_THINK_HIGH;
+        const char *json =
+            "[{\"role\":\"user\",\"content\":\"Run date.\"},"
+            "{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\","
+            "\"id\":\"toolu_1\",\"name\":\"Bash\",\"input\":{\"command\":\"date\"}}]},"
+            "{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\","
+            "\"tool_use_id\":\"toolu_1\",\"content\":\"Sat\"}]},"
+            "{\"role\":\"system\",\"content\":\"The user sent a new message: say PINEAPPLE\"}]";
+        chat_msgs msgs = {0};
+        TEST_ASSERT(parse_anthropic_messages(&json, &msgs));
+        chat_msg top = {0};
+        top.role = xstrdup("system");
+        top.content = xstrdup("You are terse.");
+        anthropic_place_system_prompt(&msgs, top, r.model_syntax);
+        anthropic_prepare_live_continuation(&s, &r, &msgs);
+        char *full = render_chat_prompt_text_for_syntax(r.model_syntax, &msgs, NULL, NULL,
+                                                        r.think_mode);
+        const char *tail = r.anthropic_live_suffix_text;
+        TEST_ASSERT(full && strstr(full, "PINEAPPLE"));
+        if (r.model_syntax == SERVER_MODEL_SYNTAX_DEEPSEEK) {
+            /* The note belongs in the prompt head: no live tail. */
+            TEST_ASSERT(tail == NULL);
+        } else {
+            const char *result = tail ? strstr(tail, "Sat") : NULL;
+            const char *note = tail ? strstr(tail, "PINEAPPLE") : NULL;
+            TEST_ASSERT(result && note && result < note);
+            /* The tail is exactly what the full render appends. */
+            const size_t full_len = full ? strlen(full) : 0;
+            const size_t tail_len = tail ? strlen(tail) : 0;
+            TEST_ASSERT(tail && full_len > tail_len &&
+                        !strcmp(full + full_len - tail_len, tail));
+        }
+        free(full);
+        chat_msgs_free(&msgs);
+        request_free(&r);
+    }
+    pthread_mutex_destroy(&s.tool_mu);
 }
 
 static void test_anthropic_tool_result_id_validation(void) {
@@ -23046,6 +23241,8 @@ static void ds4_server_unit_tests_run(void) {
     test_render_chat_prompt_text_renders_tools_before_system();
     test_render_glm_chat_prompt_text();
     test_render_qwen_chat_prompt_text();
+    test_render_mid_conversation_system_appends_only();
+    test_render_leading_system_unchanged();
     test_render_qwen_tool_round_trip();
     test_qwen_tool_visible_checkpoint_boundary();
     test_qwen_decode_tracker_markers();
@@ -23116,6 +23313,7 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_memory_replays_sampled_dsml();
     test_anthropic_tool_memory_replays_sampled_dsml();
     test_anthropic_live_tail_renders_tool_results_only();
+    test_anthropic_live_tail_keeps_system_note();
     test_anthropic_tool_result_id_validation();
     test_anthropic_full_replay_allows_unknown_live_id();
     test_anthropic_tool_use_parses_before_role();
