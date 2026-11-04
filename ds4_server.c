@@ -11478,11 +11478,78 @@ static int kv_cache_try_load(server *s, server_slot *slot, const request *req,
                              ds4_tokens *effective_prompt,
                              char **loaded_path_out,
                              uint8_t *loaded_ext_flags_out) {
-    return kv_cache_try_load_text(s, slot, req ? req->prompt_text : NULL,
-                                  effective_prompt,
-                                  loaded_path_out,
-                                  loaded_ext_flags_out,
-                                  req && req->api == API_RESPONSES);
+    /* A token-text store renders the session's tokens, and rendering is not
+     * the prompt text: a literal "<|system|>" in a source file tokenizes to
+     * the special token and renders back as "<｜System｜>", so the store of a
+     * 570k-token prompt never matched that prompt again. Look the request's
+     * own tokens up the way they were stored, then continue with those
+     * tokens rather than re-tokenizing rendered text.
+     *
+     * Both keys can match, at different depths: the prompt text matches only
+     * up to the first such divergence, the rendered key matches past it. Load
+     * whichever reaches further. Measured 2026-10-27: a 855,875-token prompt
+     * took the prompt-text hit at 569,344 while the rendered key held an
+     * 855,874-token checkpoint ("disk cache offers 855874"), re-prefilling
+     * 286,531 tokens (~20 min) on every resume. */
+    char *rendered = NULL;
+    bool same = true;
+    bool rendered_first = false;
+    if (req && req->prompt.len > 0 && req->api != API_RESPONSES) {
+        size_t rendered_len = 0;
+        rendered = ds4_kvstore_render_tokens_text(s->engine, &req->prompt, &rendered_len);
+        same = !rendered ||
+               (req->prompt_text && strcmp(rendered, req->prompt_text) == 0);
+        if (!same && s->kv.enabled) {
+            const int model_id = ds4_engine_model_id(s->engine);
+            const int quant = ds4_engine_routed_quant_bits(s->engine);
+            const int ctx = ds4_session_ctx(slot->session);
+            pthread_mutex_lock(&s->kv_mu);
+            const int ip = req->prompt_text ?
+                ds4_kvstore_find_text_prefix(&s->kv, req->prompt_text,
+                                             model_id, quant, ctx) : -1;
+            const int ir = ds4_kvstore_find_text_prefix(&s->kv, rendered,
+                                                        model_id, quant, ctx);
+            rendered_first = ir >= 0 &&
+                (ip < 0 || s->kv.entry[ir].tokens > s->kv.entry[ip].tokens);
+            pthread_mutex_unlock(&s->kv_mu);
+        }
+    }
+    int loaded = 0;
+    if (!rendered_first) {
+        loaded = kv_cache_try_load_text(s, slot, req ? req->prompt_text : NULL,
+                                        effective_prompt,
+                                        loaded_path_out,
+                                        loaded_ext_flags_out,
+                                        req && req->api == API_RESPONSES);
+        if (loaded > 0 || same) {
+            free(rendered);
+            return loaded > 0 ? loaded : 0;
+        }
+    }
+    loaded = kv_cache_try_load_text(s, slot, rendered, effective_prompt,
+                                    loaded_path_out, loaded_ext_flags_out, false);
+    free(rendered);
+    if (loaded <= 0) {
+        if (!rendered_first) return 0;
+        /* The deeper rendered entry failed to load; the prompt-text one may not. */
+        return kv_cache_try_load_text(s, slot, req->prompt_text, effective_prompt,
+                                      loaded_path_out, loaded_ext_flags_out, false);
+    }
+    pthread_mutex_lock(&s->inference_mu);
+    const ds4_tokens *live = ds4_session_tokens(slot->session);
+    const bool exact = live && live->len == loaded && live->len <= req->prompt.len &&
+                       ds4_tokens_starts_with(&req->prompt, live);
+    if (exact) ds4_tokens_copy(effective_prompt, &req->prompt);
+    else ds4_session_invalidate(slot->session);
+    pthread_mutex_unlock(&s->inference_mu);
+    if (!exact) {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: kv cache text hit did not match the request's tokens; rebuilding");
+        if (loaded_path_out) { free(*loaded_path_out); *loaded_path_out = NULL; }
+        if (loaded_ext_flags_out) *loaded_ext_flags_out = 0;
+        return 0;
+    }
+    return loaded;
 }
 
 /* A text-only suffix tokenizer would turn image markers into literal text.
