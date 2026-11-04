@@ -6894,13 +6894,13 @@ static void append_tool_calls_json(buf *b, const tool_calls *calls, const char *
     buf_putc(b, ']');
 }
 
-static void append_tool_call_deltas_json(buf *b, const tool_calls *calls, const char *id_prefix,
+static void append_tool_call_deltas_json(buf *b, const tool_calls *calls, int first, const char *id_prefix,
                                          const tool_schema_orders *orders) {
     (void)orders;
     buf_putc(b, '[');
-    for (int i = 0; i < calls->len; i++) {
+    for (int i = first; i < calls->len; i++) {
         const tool_call *tc = &calls->v[i];
-        if (i) buf_putc(b, ',');
+        if (i > first) buf_putc(b, ',');
         char idbuf[128];
         snprintf(idbuf, sizeof(idbuf), "%s_tool_%d", id_prefix, i);
         buf_puts(b, "{\"index\":");
@@ -7147,7 +7147,7 @@ static bool sse_chat_finish(int fd, const request *r, const char *id, const char
         buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
         json_escape(&b, r->model);
         buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":");
-        append_tool_call_deltas_json(&b, calls, id, &r->tool_orders);
+        append_tool_call_deltas_json(&b, calls, 0, id, &r->tool_orders);
         buf_puts(&b, "},\"finish_reason\":null}]}\n\n");
     }
     buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
@@ -7368,6 +7368,7 @@ typedef enum {
     DSML_TRACK_STRUCTURAL,
     DSML_TRACK_STRING_BODY,
     DSML_TRACK_JSON_PARAM,
+    DSML_TRACK_BETWEEN,
     DSML_TRACK_DONE,
 } dsml_track_mode;
 
@@ -7421,6 +7422,7 @@ typedef struct {
     bool json_in_string;
     bool json_escaped;
     server_model_syntax model_syntax;
+    size_t calls_end;           /* Qwen/GLM: text end of the last closed call */
 } dsml_decode_tracker;
 
 static size_t dsml_max_tool_start_len(void) {
@@ -7645,6 +7647,20 @@ static void dsml_decode_tracker_update(dsml_decode_tracker *dt,
             dt->decode = DSML_DECODE_STRUCTURAL;
         }
 
+        if (dt->mode == DSML_TRACK_BETWEEN) {
+            /* Qwen and GLM wrap every call: another one may follow before EOS */
+            while (dt->pos < raw_len && isspace((unsigned char)raw[dt->pos])) dt->pos++;
+            dt->decode = DSML_DECODE_OUTSIDE;
+            if (dt->pos >= raw_len || raw_partial_lit(raw, raw_len, dt->pos, dt->syn->tool_calls_start)) return;
+            if (!raw_full_lit(raw, raw_len, dt->pos, dt->syn->tool_calls_start)) {
+                dt->mode = DSML_TRACK_DONE;
+                return;
+            }
+            dt->pos += strlen(dt->syn->tool_calls_start);
+            dt->mode = DSML_TRACK_STRUCTURAL;
+            dt->decode = DSML_DECODE_STRUCTURAL;
+        }
+
         if (dt->mode == DSML_TRACK_STRING_BODY) {
             while (dt->pos < raw_len) {
                 if (raw_full_lit(raw, raw_len, dt->pos, dt->syn->param_end)) {
@@ -7712,7 +7728,10 @@ structural:
                 dt->mode = DSML_TRACK_DONE;
                 dt->pos += strlen(dt->syn->tool_calls_end);
                 dt->decode = DSML_DECODE_OUTSIDE;
-                return;
+                if (dt->model_syntax != SERVER_MODEL_SYNTAX_QWEN && dt->model_syntax != SERVER_MODEL_SYNTAX_GLM) return;
+                dt->calls_end = dt->pos;
+                dt->mode = DSML_TRACK_BETWEEN;
+                continue;
             }
             if (raw_full_lit(raw, raw_len, dt->pos, dt->syn->invoke_end)) {
                 dt->pos += strlen(dt->syn->invoke_end);
@@ -8159,11 +8178,14 @@ static bool openai_sse_finish_live(int fd, server *s, const request *r, const ch
 
     buf b = {0};
     long now = (long)time(NULL);
-    if (calls && calls->len && !st->tool.emitted_any) {
+    /* calls past the live-streamed ones: Qwen/GLM close the stream after one */
+    int first = 0;
+    if (st->tool.emitted_any) first = st->tool.state == DSML_TOOL_DONE ? st->tool.index : calls ? calls->len : 0;
+    if (calls && calls->len > first) {
         buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
         json_escape(&b, r->model);
         buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":");
-        append_tool_call_deltas_json(&b, calls, id, &r->tool_orders);
+        append_tool_call_deltas_json(&b, calls, first, id, &r->tool_orders);
         buf_puts(&b, "},\"finish_reason\":null}]}\n\n");
     }
     buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
@@ -14306,6 +14328,13 @@ decode_again:
         snprintf(err, sizeof(err), "shutdown requested");
     }
 
+    /* Qwen/GLM calls end at EOS: keep the closed ones and drop a cut-off one */
+    if (j->req.kind == REQ_CHAT && j->req.has_tools && !saw_tool_end &&
+        dsml_tracker.calls_end && dsml_tracker.calls_end <= text.len) {
+        text.len = dsml_tracker.calls_end;
+        text.ptr[text.len] = '\0';
+        saw_tool_end = true;
+    }
     if (j->req.kind == REQ_CHAT && j->req.has_tools &&
         saw_tool_start && !saw_tool_end && strcmp(finish, "error") != 0)
     {
@@ -20679,6 +20708,13 @@ static void test_glm_decode_tracker_boundaries(void) {
             }
             TEST_ASSERT(tracker.decode == expected[i]);
         }
+        TEST_ASSERT(tracker.mode == DSML_TRACK_BETWEEN && tracker.calls_end == raw.len);
+        buf_puts(&raw, "<tool_call>pwd</tool_call>");
+        dsml_decode_tracker_update(&tracker, raw.ptr, raw.len);
+        TEST_ASSERT(tracker.mode == DSML_TRACK_BETWEEN && tracker.calls_end == raw.len);
+        buf_puts(&raw, "done");
+        dsml_decode_tracker_update(&tracker, raw.ptr, raw.len);
+        TEST_ASSERT(tracker.mode == DSML_TRACK_DONE);
         buf_free(&raw);
     }
 }
@@ -20711,7 +20747,8 @@ static void test_tool_control_text_inside_arguments(void) {
                      DS4_PARAM_END DS4_INVOKE_END DS4_TOOL_CALLS_END);
         dsml_decode_tracker_update(&tracker, raw.ptr, raw.len);
         observe_tool_markers(&tracker, raw.ptr, &start, &end, &orphan);
-        TEST_ASSERT(start && end && !orphan);
+        /* GLM waits for a further call; the closed one is complete */
+        TEST_ASSERT(start && !orphan && (glm ? tracker.mode == DSML_TRACK_BETWEEN : end));
         tool_calls calls = {0};
         char *content = NULL, *reasoning = NULL;
         TEST_ASSERT(parse_generated_message_ex_for_syntax(tracker.model_syntax,
@@ -20732,24 +20769,29 @@ static void test_tool_control_text_inside_arguments(void) {
 }
 
 static void test_qwen_decode_tracker_markers(void) {
-    const char *raw = "<tool_call>\n<function=write>\n<parameter=content>\n"
-                      "literal </tool_call> </think> <think>\n"
-                      "</parameter>\n</function>\n</tool_call>";
+    /* each call has its own wrapper: text other than another call ends them */
+    const char *call1 = "<tool_call>\n<function=write>\n<parameter=content>\n"
+                        "literal </tool_call> </think> <think>\n"
+                        "</parameter>\n</function>\n</tool_call>";
+    const char *call2 = "\n<tool_call>\n<function=read>\n<parameter=path>\na\n</parameter>\n</function>\n</tool_call>";
+    char raw[512];
+    snprintf(raw, sizeof(raw), "%s%s\nok", call1, call2);
+    const size_t len1 = strlen(call1), len2 = len1 + strlen(call2), len = strlen(raw);
     dsml_decode_tracker tracker;
     dsml_decode_tracker_init(&tracker);
     tracker.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
     bool start = false, end = false, orphan = false;
-    size_t len = strlen(raw);
     for (size_t n = 1; n <= len; n++) {
         dsml_decode_tracker_update(&tracker, raw, n);
         char *prefix = xstrndup(raw, n);
         observe_tool_markers(&tracker, prefix, &start, &end, &orphan);
         free(prefix);
-        TEST_ASSERT(!end || n == len);
+        TEST_ASSERT(!end || n > len2 + 1);   /* the first non-space byte after the calls */
         TEST_ASSERT(!orphan);
+        if (n == len1 || n == len2) TEST_ASSERT(tracker.mode == DSML_TRACK_BETWEEN && tracker.calls_end == n);
     }
     TEST_ASSERT(start && end);
-    TEST_ASSERT(tracker.mode == DSML_TRACK_DONE);
+    TEST_ASSERT(tracker.mode == DSML_TRACK_DONE && tracker.calls_end == len2);
 }
 
 static void test_tool_body_escape_round_trip(void) {
