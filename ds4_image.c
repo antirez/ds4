@@ -13,6 +13,12 @@
 #include "third_party/iris/jpeg.h"
 #include "third_party/iris/png.h"
 
+#ifdef __APPLE__
+#include <CoreFoundation/CoreFoundation.h>
+#include <CoreGraphics/CoreGraphics.h>
+#include <ImageIO/ImageIO.h>
+#endif
+
 typedef struct {
     uint32_t state[8];
     uint64_t bytes;
@@ -232,6 +238,67 @@ static int ds4_oriented_rgb(
     return 1;
 }
 
+/* Pasted screenshots and clipboard images frequently arrive as WebP. macOS
+ * ImageIO decodes it with no new dependency: draw into RGBA8, premultiplied,
+ * over white so transparent pixels match what a JPEG viewer would show, then
+ * reuse the shared oriented-RGB path. */
+#ifdef __APPLE__
+static int ds4_decode_webp_imageio(
+        ds4_image *out,
+        const uint8_t *encoded,
+        size_t encoded_len,
+        char *error,
+        size_t error_cap) {
+    int ok = 0;
+    CFDataRef data = NULL;
+    CGImageSourceRef source = NULL;
+    CGImageRef image = NULL;
+    CGContextRef context = NULL;
+    data = CFDataCreate(NULL, encoded, (CFIndex)encoded_len);
+    if (data) source = CGImageSourceCreateWithData(data, NULL);
+    if (source) image = CGImageSourceCreateImageAtIndex(source, 0, NULL);
+    if (!image) {
+        ds4_image_error(error, error_cap, "invalid or unsupported WebP image");
+        goto webp_done;
+    }
+    size_t width = CGImageGetWidth(image);
+    size_t height = CGImageGetHeight(image);
+    if (width == 0 || height == 0 ||
+        width > DS4_IMAGE_MAX_DIMENSION || height > DS4_IMAGE_MAX_DIMENSION ||
+        width * height > DS4_IMAGE_MAX_PIXELS) {
+        ds4_image_error(error, error_cap, "WebP image exceeds the decoded image limits");
+        goto webp_done;
+    }
+    context = CGBitmapContextCreate(NULL, width, height, 8, 0,
+                                    CGColorSpaceCreateDeviceRGB(),
+                                    (CGBitmapInfo)(kCGImageAlphaPremultipliedLast |
+                                                   kCGBitmapByteOrder32Big));
+    if (!context) {
+        ds4_image_error(error, error_cap, "unable to allocate decoded WebP pixels");
+        goto webp_done;
+    }
+    CGContextSetRGBFillColor(context, 1.0, 1.0, 1.0, 1.0);
+    CGContextFillRect(context, CGRectMake(0, 0, (CGFloat)width, (CGFloat)height));
+    /* A plain draw already lands the image top row in buffer row 0: the
+     * context stores top-down memory, so the classic Cocoa flip idiom here
+     * would invert the picture. Verified pixel-exact against the PNG path. */
+    CGContextDrawImage(context, CGRectMake(0, 0, (CGFloat)width, (CGFloat)height), image);
+    const uint8_t *pixels = (const uint8_t *)CGBitmapContextGetData(context);
+    if (!pixels) {
+        ds4_image_error(error, error_cap, "unable to read decoded WebP pixels");
+        goto webp_done;
+    }
+    ok = ds4_oriented_rgb(out, pixels, (uint32_t)width, (uint32_t)height, 4, 1);
+    if (!ok) ds4_image_error(error, error_cap, "unable to allocate decoded WebP pixels");
+webp_done:
+    if (context) CFRelease(context);
+    if (image) CFRelease(image);
+    if (source) CFRelease(source);
+    if (data) CFRelease(data);
+    return ok;
+}
+#endif
+
 int ds4_image_decode_memory(
         ds4_image *out,
         const uint8_t *encoded,
@@ -274,6 +341,17 @@ int ds4_image_decode_memory(
         jpeg_free(decoded);
         if (!ok) ds4_image_error(error, error_cap, "unable to allocate decoded JPEG pixels");
         return ok;
+    }
+
+    if (encoded_len >= 12 &&
+        memcmp(encoded, "RIFF", 4) == 0 &&
+        memcmp(encoded + 8, "WEBP", 4) == 0) {
+#ifdef __APPLE__
+        return ds4_decode_webp_imageio(out, encoded, encoded_len, error, error_cap);
+#else
+        ds4_image_error(error, error_cap, "WebP images require the macOS ImageIO decoder");
+        return 0;
+#endif
     }
 
     ds4_image_error(error, error_cap, "image must be JPEG or PNG");
