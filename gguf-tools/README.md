@@ -11,6 +11,9 @@ The important pieces are:
   `q8_0`, `q8_K`, `q4_K`, `q2_K`, and `iq2_xxs`.
 - `imatrix/`: dataset and instructions for collecting routed-MoE activation
   importance with `ds4`.
+- `hotlist_to_inc.py`: converts a `DS4_MOE_RECORD_SELECTED_HOTLIST` recording
+  into a seeding hotlist table; the recording procedure and table wiring are
+  documented in `docs/SSD_STREAMING.md`.
 - `quality-testing/`: prompts and scripts used to compare local GGUF variants
   against official DeepSeek V4 Flash continuations.
 

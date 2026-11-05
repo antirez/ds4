@@ -1688,6 +1688,7 @@ static int ds4_expert_hotlist_sort_cmp(const void *a, const void *b) {
 
 #include "ds4_streaming_hotlist.inc"
 #include "ds4_streaming_hotlist_glm52.inc"
+#include "ds4_streaming_hotlist_v41.inc"
 
 static void ds4_json_write_string(FILE *fp, const char *s) {
     fputc('"', fp);
@@ -23026,6 +23027,9 @@ static bool metal_graph_streaming_expert_hotlist_load_default(
     } else if (g_ds4_shape.variant == DS4_VARIANT_GLM52) {
         hotlist = ds4_default_streaming_hotlist_glm52;
         hotlist_count = ds4_default_streaming_hotlist_glm52_count;
+    } else if (g_ds4_shape.variant == DS4_VARIANT_FLASH41) {
+        hotlist = ds4_default_streaming_hotlist_v41;
+        hotlist_count = ds4_default_streaming_hotlist_v41_count;
     } else {
         *loaded_out = 0;
         return true;
@@ -42490,6 +42494,152 @@ static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
                      const ds4_layer_weights *l, uint32_t il, uint32_t token) {
     return ds41_moe_partial(g, m, l, il, token, g->tp_world == 2) && ds41_moe_finish(g, il);
 }
+
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+/* Seed the SSD expert cache at V4.1 session create from the built-in
+ * hotlist (or DS4_METAL_STREAMING_EXPERT_HOTLIST file), mirroring the
+ * GLM path: a short prompt leaves the prompt-driven prefill seed nearly
+ * empty, so the first decode turns pay a miss storm instead. Metal
+ * only, like ds41_prefill_seed: the whole-table startup read is what
+ * this branch measured, and the CUDA/ROCm V4.1 paths keep their own
+ * cache-fill policies. */
+static bool ds41_seed_streaming_expert_cache_from_hotlist(
+        ds41_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
+        uint32_t preload_experts) {
+    if (!g || !g->streaming) return true;
+    if (!m || !w) return false;
+    if (getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_HOTLIST")) return true;
+
+    const char *path = getenv("DS4_METAL_STREAMING_EXPERT_HOTLIST");
+    const bool from_file = path && path[0];
+    const bool profile = getenv("DS4_METAL_STREAMING_EXPERT_HOTLIST_PROFILE") != NULL;
+    /* Clamp to the cache budget exactly like the GLM seeder: the seed
+     * is a hot preload, not a request to read past the budget and let
+     * eviction discard what was read - without it, a machine with a
+     * smaller expert cache still pays the whole-table read at every
+     * session create. */
+    uint32_t cache_budget = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *layer = &w->layer[il];
+        if (!layer->ffn_gate_exps || !layer->ffn_down_exps) continue;
+        const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
+        const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
+        if (layer->ffn_gate_exps->dim[1] > UINT64_MAX / gate_row_bytes ||
+            layer->ffn_down_exps->dim[1] > UINT64_MAX / down_row_bytes) {
+            fprintf(stderr,
+                    "ds4: V4.1 hotlist seed byte size overflow at layer %u\n",
+                    il);
+            return false;
+        }
+        cache_budget = ds4_gpu_stream_expert_cache_budget_for_expert_size(
+                layer->ffn_gate_exps->dim[1] * gate_row_bytes,
+                layer->ffn_down_exps->dim[1] * down_row_bytes);
+        break;
+    }
+    if (cache_budget == 0) return true;
+    /* The explicit --ssd-streaming-preload-experts count wins, the same
+     * contract the GLM seeder honors (metal_graph_streaming_expert_
+     * preload_count). Unset means the built-in table in full - unlike
+     * GLM's 4096-entry auto cap, deliberately, because full coverage is
+     * where the short-prompt win is measured - with
+     * DS4_METAL_STREAMING_EXPERT_AUTO_PRELOAD_CAP as the same brake the
+     * GLM seeder honors, for file sources as well. A file source
+     * defaults to the cache budget, not the built-in table's size, so
+     * an arbitrary recorded file is not truncated by an unrelated
+     * constant. */
+    uint32_t preload_count = from_file ? cache_budget
+                                       : ds4_default_streaming_hotlist_v41_count;
+    if (preload_experts) {
+        preload_count = preload_experts;
+    } else {
+        const char *cap_env = getenv("DS4_METAL_STREAMING_EXPERT_AUTO_PRELOAD_CAP");
+        if (cap_env && cap_env[0]) {
+            char *end = NULL;
+            unsigned long cap = strtoul(cap_env, &end, 10);
+            if (end != cap_env && *end == '\0' && cap > 0 && cap < preload_count)
+                preload_count = (uint32_t)cap;
+        }
+    }
+    if (preload_count > cache_budget) preload_count = cache_budget;
+    /* Skip when the cache already holds what the seed would install:
+     * the first session create pays the reads, later ones do not. */
+    const uint32_t current_count = ds4_gpu_stream_expert_cache_current_count();
+    if (!from_file && current_count >= preload_count) {
+        if (profile)
+            fprintf(stderr,
+                    "ds4: V4.1 hotlist seed skipped preload=%u current=%u\n",
+                    preload_count,
+                    current_count);
+        return true;
+    }
+    const double t0 = profile ? now_sec() : 0.0;
+
+    int32_t experts[DS4_MAX_LAYER][DS4_MAX_EXPERT];
+    uint32_t priorities[DS4_MAX_LAYER][DS4_MAX_EXPERT];
+    uint32_t counts[DS4_MAX_LAYER];
+    bool seen[DS4_MAX_LAYER][DS4_MAX_EXPERT];
+    memset(experts, 0, sizeof(experts));
+    memset(priorities, 0, sizeof(priorities));
+    memset(counts, 0, sizeof(counts));
+    memset(seen, 0, sizeof(seen));
+
+    uint32_t loaded = 0;
+    if (from_file) {
+        if (!metal_graph_streaming_expert_hotlist_load_file(path,
+                                                            preload_count,
+                                                            experts,
+                                                            priorities,
+                                                            counts,
+                                                            seen,
+                                                            &loaded))
+            return false;
+    } else if (!metal_graph_streaming_expert_hotlist_load_default(preload_count,
+                                                                  experts,
+                                                                  priorities,
+                                                                  counts,
+                                                                  seen,
+                                                                  &loaded)) {
+        return false;
+    }
+    if (loaded == 0) return true;
+
+    uint32_t seeded = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t n = counts[il];
+        if (n == 0) continue;
+        const ds4_layer_weights *layer = &w->layer[il];
+        if (!layer->ffn_gate_exps || !layer->ffn_down_exps) continue;
+        const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
+        const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
+        if (layer->ffn_gate_exps->dim[1] > UINT64_MAX / gate_row_bytes ||
+            layer->ffn_down_exps->dim[1] > UINT64_MAX / down_row_bytes) {
+            fprintf(stderr,
+                    "ds4: V4.1 hotlist seed byte size overflow at layer %u\n",
+                    il);
+            return false;
+        }
+        const uint64_t gate_expert_bytes = layer->ffn_gate_exps->dim[1] * gate_row_bytes;
+        const uint64_t down_expert_bytes = layer->ffn_down_exps->dim[1] * down_row_bytes;
+        const ds4_gpu_stream_expert_table table =
+            graph_stream_expert_table_make(m, layer, il,
+                                           gate_expert_bytes,
+                                           down_expert_bytes);
+        if (!ds4_gpu_stream_expert_cache_seed_experts(&table,
+                                                      experts[il],
+                                                      priorities[il],
+                                                      n))
+            return false;
+        seeded += n;
+    }
+    if (profile)
+        fprintf(stderr,
+                "ds4: V4.1 hotlist seed source=%s entries=%u elapsed=%.0f ms\n",
+                from_file ? "file" : "built-in",
+                seeded,
+                (now_sec() - t0) * 1000.0);
+    return true;
+}
+#endif /* __APPLE__ && !DS4_NO_GPU */
 
 static bool ds41_graph_encode_logits(ds41_gpu_graph *g, const ds4_model *m, const ds4_weights *w) {
     return ds41_hc_sum(g->x, g->residual, g->pre, false) && ds41_norm(g->norm, g->x, m, w->output_norm) &&
@@ -76361,6 +76511,22 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             }
             s->ds41_graph.allocation_bytes += UINT64_C(64) << 20;
         }
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+        /* Warm the SSD expert cache from the routing hotlist before the
+         * first prompt, like the GLM path; short prompts otherwise start
+         * with an almost-empty cache. Cold mode measures the empty cache
+         * on purpose. TP runs untested with the seed; it normally runs
+         * resident (no --ssd-streaming), so the gate is precautionary. */
+        if (e->ssd_streaming && !e->ssd_streaming_cold && !e->tp.active &&
+            !ds41_seed_streaming_expert_cache_from_hotlist(&s->ds41_graph,
+                                                           &e->model,
+                                                           &e->weights,
+                                                           e->ssd_streaming_preload_experts)) {
+            ds41_graph_free(&s->ds41_graph);
+            free(s);
+            return 1;
+        }
+#endif
         if (e->tp.active) {
             s->ds41_graph.tp_world = 2;
             s->ds41_graph.tp_balanced_route = e->tp.v41_balanced_route;
