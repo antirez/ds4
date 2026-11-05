@@ -212,12 +212,13 @@ test-k3-gguf: ds4 tests/test_k3_gguf tests/test_k3_tokenizer tests/test_k3_gguf_
 test-k3-gguf-source: tests/test_k3_gguf
 	./tests/test_k3_gguf "$(K3_GGUF)" "$(K3_MODEL)"
 
-test-k3: ds4 tests/test_k3_safetensors tests/test_k3_tokenizer tests/test_k3_metal tests/test_k3_checkpoint
+test-k3: ds4 tests/test_k3_safetensors tests/test_k3_tokenizer tests/test_k3_metal tests/test_k3_checkpoint tests/test_k3_gguf_slice
 	./tests/test_k3_safetensors
 	./tests/test_k3_tokenizer "$(K3_MODEL)"
 	@./ds4 -m "$(K3_MODEL)" --dump-tokens -p x | grep -q '^[[:space:]]*87  x$$'
 	./tests/test_k3_metal
 	./tests/test_k3_checkpoint "$(K3_MODEL)"
+	K3_STATIC_STAGING=1 K3_TEST_LAYER=1 ./tests/test_k3_gguf_slice "$(K3_MODEL)"
 
 k3_safetensors.o: k3_safetensors.c k3_safetensors.h
 	$(CC) $(CFLAGS) -c -o $@ k3_safetensors.c

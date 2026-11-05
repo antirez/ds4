@@ -128,7 +128,7 @@ int main(int argc, char **argv) {
         (static_test &&
          (setenv("K3_RESIDENT_STATIC", "1", 1) != 0 ||
           setenv("K3_RESIDENT_STATIC_GIB", "16", 1) != 0)) ||
-        setenv("K3_STATIC_STAGING", "0", 1) != 0) {
+        setenv("K3_STATIC_STAGING", "0", 0) != 0) {
         fail("could not configure slice test", NULL);
     }
     uint32_t context_capacity = steps;

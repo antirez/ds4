@@ -951,8 +951,7 @@ static uint64_t static_slots_capacity(const k3_context *ctx) {
     const uint64_t page = (uint64_t)page_value;
     uint64_t total = 0;
     for (uint32_t i = 0; i < 2; i++) {
-        if (max_static[i] == 0 ||
-            max_static[i] > UINT64_MAX - (page - 1u)) {
+        if (max_static[i] > UINT64_MAX - (page - 1u)) {
             return 0;
         }
         const uint64_t capacity =
@@ -976,12 +975,14 @@ static int alloc_static_slots(
         }
     }
     const long page_value = sysconf(_SC_PAGESIZE);
-    if (max_static[0] == 0 || max_static[1] == 0 || page_value <= 0) {
+    if ((max_static[0] == 0 && max_static[1] == 0) || page_value <= 0) {
         set_error(err, errcap, "invalid K3 static staging size");
         return 0;
     }
     const uint64_t page = (uint64_t)page_value;
     for (uint32_t i = 0; i < 2; i++) {
+        /* A single-layer slice uses only the slot for its own parity. */
+        if (!max_static[i]) continue;
         if (max_static[i] > UINT64_MAX - (page - 1u)) {
             set_error(err, errcap, "K3 static staging size overflow");
             return 0;
