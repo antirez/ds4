@@ -114,8 +114,11 @@ static void test_k31_index(uint8_t *model, size_t model_bytes) {
     for (int i = 0; i < ROWS; i++) {
         for (int d = 0; d < DIM; d++) keys[i * DIM + d] = (d & 1) ? -1 : 1;
         for (int h = 0; h < HEADS; h++) {
-            weights[i * HEADS + h] = h == 0;
-            for (int d = 0; d < DIM; d++) queries[(i * HEADS + h) * DIM + d] = keys[i * DIM + d];
+            weights[i * HEADS + h] = h == 0 ? 1.0f : (h == 1 ? 0.25f : 0.0f);
+            for (int d = 0; d < DIM; d++) {
+                const float x = keys[i * DIM + d];
+                queries[(i * HEADS + h) * DIM + d] = h == 1 ? -x : x;
+            }
         }
     }
     require_ok(k3_gpu_dsa_index(q,k,w,cache,score,ids,model,model_bytes,norm_off,bias_off,PREFIX,ROWS),
@@ -126,6 +129,18 @@ static void test_k31_index(uint8_t *model, size_t model_bytes) {
     memcpy(&scale, first + DIM, sizeof(scale));
     require_ok(scale == 1.0f / 256.0f && first[0] == 0xf8 && first[1] == 0x78,
                "K3.1 FP8 keys and power-of-two scale");
+    /* The first scored row sees 2049 of the 2050 keys. Its negative
+     * query head contributes only to the anti-correlated first key. */
+    float score_row[END], last_score;
+    const float masked = -INFINITY;
+    require_ok(ds4_gpu_tensor_read(score, 0, score_row, sizeof(score_row)) &&
+               ds4_gpu_tensor_read(score, (2u * END - 1u) * sizeof(float),
+                                   &last_score, sizeof(last_score)), "K3.1 read causal scores");
+    require_ok(score_row[0] == 0.5f && score_row[1] == 1.0f &&
+               score_row[2] == 2.0f && score_row[3] == 2.0f &&
+               score_row[END - 2] == 2.0f && last_score == 2.0f &&
+               memcmp(&score_row[END - 1], &masked, sizeof(masked)) == 0,
+               "K3.1 adjacent key scores and partial causal tail");
     int32_t selected[ROWS * TOP];
     require_ok(ds4_gpu_tensor_read(ids,0,selected,sizeof(selected)), "K3.1 read selected positions");
     for (int row = 1; row < ROWS; row++) {
