@@ -2005,20 +2005,36 @@ kernel void kernel_k31_index_scores(
         device const k31_index_key *cache, device float *scores,
         uint2 group [[threadgroup_position_in_grid]], ushort sg [[simdgroup_index_in_threadgroup]],
         ushort lane [[thread_index_in_simdgroup]]) {
-    const uint key = group.x * 4u + sg, row = args.row0 + group.y;
-    if (key >= args.visible) return;
-    device float *out = scores + (ulong)group.y * args.visible;
-    if (key > args.pos + row) { if (lane == 0) out[key] = -INFINITY; return; }
-    float kv[4];
-    for (uint j = 0; j < 4; j++) kv[j] = k3_e4m3fn_to_f32(cache[key].values[lane + 32u * j]);
-    float sum = 0.0f;
+    // Each SIMD group reuses a query head across four adjacent keys.
+    constexpr uint KEYS = 4;
+    const uint first = (group.x * 4u + sg) * KEYS;
+    const uint row = args.row0 + group.y;
+    if (first >= args.visible) return;
+    const uint count = min(KEYS, args.visible - first);
+    device float *out = scores + (ulong)group.y * args.visible + first;
+    float kv[KEYS][4], sum[KEYS] = {};
+    for (uint i = 0; i < KEYS; i++) {
+        const uint key = first + min(i, count - 1u);
+        for (uint j = 0; j < 4; j++)
+            kv[i][j] = k3_e4m3fn_to_f32(cache[key].values[lane + 32u * j]);
+    }
     for (uint h = 0; h < 32; h++) {
         device const float *qh = q + ((ulong)row * 32u + h) * 128u;
-        float dot = 0.0f;
-        for (uint j = 0; j < 4; j++) dot += qh[lane + 32u * j] * kv[j];
-        sum += max(simd_sum(dot), 0.0f) * weights[row * 32u + h];
+        float query[4];
+        for (uint j = 0; j < 4; j++) query[j] = qh[lane + 32u * j];
+        const float w = weights[row * 32u + h];
+        for (uint i = 0; i < KEYS; i++) {
+            float dot = 0.0f;
+            for (uint j = 0; j < 4; j++) dot += query[j] * kv[i][j];
+            sum[i] += max(simd_sum(dot), 0.0f) * w;
+        }
     }
-    if (lane == 0) out[key] = sum * cache[key].scale;
+    if (lane == 0) {
+        for (uint i = 0; i < count; i++) {
+            const uint key = first + i;
+            out[i] = key <= args.pos + row ? sum[i] * cache[key].scale : -INFINITY;
+        }
+    }
 }
 
 struct k3_mla_prefill_args {

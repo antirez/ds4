@@ -53594,7 +53594,8 @@ int k3_gpu_dsa_index(ds4_gpu_tensor *q, ds4_gpu_tensor *k, ds4_gpu_tensor *weigh
             [enc setBuffer:ds4_gpu_tensor_buffer(weights) offset:ds4_gpu_tensor_offset(weights) atIndex:2];
             [enc setBuffer:ds4_gpu_tensor_buffer(cache) offset:ds4_gpu_tensor_offset(cache) atIndex:3];
             [enc setBuffer:ds4_gpu_tensor_buffer(scores) offset:ds4_gpu_tensor_offset(scores) atIndex:4];
-            [enc dispatchThreadgroups:MTLSizeMake((args.visible + 3u)/4u, count, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)args.visible + 15u) / 16u, count, 1)
+                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
             ds4_gpu_end_compute_encoder(cb, enc);
             if (!ds4_gpu_finish_command_buffer(cb, owned, "K3.1 index scores")) return 0;
             ds4_gpu_tensor *out = ds4_gpu_tensor_view(selected, (uint64_t)row * top * sizeof(int32_t),
