@@ -560,26 +560,26 @@ static uint32_t expert_io_threads(void) {
     return cached;
 }
 
-static uint32_t expert_pipeline_batch(void) {
-    static int initialized = 0;
-    static uint32_t cached = 0;
-    if (initialized) return cached;
-    initialized = 1;
-    const char *value = getenv("K3_EXPERT_PIPELINE_BATCH");
-    if (!value || !value[0]) return cached;
-    char *end = NULL;
-    errno = 0;
-    const unsigned long parsed = strtoul(value, &end, 10);
-    if (!errno && end != value && *end == '\0' &&
-        parsed <= K3_STREAMED_EXPERT_SLOTS) {
-        cached = (uint32_t)parsed;
-    } else {
-        fprintf(stderr,
-                "k3: ignoring invalid K3_EXPERT_PIPELINE_BATCH=%s "
-                "(expected 0..%u)\n",
-                value, (uint32_t)K3_STREAMED_EXPERT_SLOTS);
+static uint32_t expert_pipeline_batch(int prefill) {
+    static int initialized;
+    static int override = -1;
+    if (!initialized) {
+        initialized = 1;
+        const char *value = getenv("K3_EXPERT_PIPELINE_BATCH");
+        if (value && value[0]) {
+            char *end = NULL;
+            errno = 0;
+            unsigned long n = strtoul(value, &end, 10);
+            if (!errno && end != value && *end == '\0' && n <= K3_STREAMED_EXPERT_SLOTS) {
+                override = (int)n;
+            } else {
+                fprintf(stderr, "k3: ignoring invalid K3_EXPERT_PIPELINE_BATCH=%s (expected 0..%u)\n",
+                        value, (uint32_t)K3_STREAMED_EXPERT_SLOTS);
+            }
+        }
     }
-    return cached;
+    /* Submit a few ready experts together while the reader fills the rest. */
+    return override >= 0 ? (uint32_t)override : (prefill ? 4u : 0u);
 }
 
 static uint32_t speculative_top_k(void) {
@@ -4071,6 +4071,7 @@ static int run_moe_ffn(k3_context *ctx,
                        k3_layer *layer,
                        const k3_weight_source *source,
                        uint32_t rows,
+                       int prefill,
                        k3_output_prefetch *output_prefetch,
                        char *err,
                        size_t errcap) {
@@ -4449,7 +4450,7 @@ static int run_moe_ffn(k3_context *ctx,
         (void)finish_all_speculative_experts(ctx, NULL, 0);
         return 0;
     }
-    const uint32_t pipeline_batch = expert_pipeline_batch();
+    const uint32_t pipeline_batch = expert_pipeline_batch(prefill);
     if (batched_prefill) {
         uint32_t offset = 0;
         while (offset < n_groups) {
@@ -4702,7 +4703,7 @@ static int run_layer(k3_context *ctx,
     const int ffn_ok = layer->index == 0
         ? run_dense_ffn(ctx, layer, source, rows)
         : run_moe_ffn(
-              ctx, layer, source, rows, output_prefetch, err, errcap);
+              ctx, layer, source, rows, prefill, output_prefetch, err, errcap);
     if (!ffn_ok) return 0;
     hidden_hook_emit(
         ctx, "ffn_out", layer->index, s->delta, rows);
