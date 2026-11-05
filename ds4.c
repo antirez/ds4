@@ -42081,7 +42081,7 @@ static bool ds41_attention_select_published(ds41_gpu_graph *g, const ds4_model *
         if (!ds41_index_q_project(g, m, l, il) ||
             !ds41_index_q_rope_quantize(g, il, pos) ||
             !ds41_matmul(g->index_weights, m, l->indexer_proj, g->norm, true)) return false;
-#ifdef __APPLE__
+#ifndef DS4_ROCM_BUILD
         /* past layer 20 only its candidate blocks can be selected; the list is built once per mask */
         if (il > 20u && (n_comp + 7u) / 8u > 2048u &&
             ds4_gpu_dsv41_indexer_candidates_tensor(g->selected_comp, g->index_scores, g->block_list,
@@ -42090,6 +42090,8 @@ static bool ds41_attention_select_published(ds41_gpu_graph *g, const ds4_model *
             g->block_list_mask = g->block_mask;
             return true;
         }
+#endif
+#ifdef __APPLE__
         if (!ds4_gpu_dsv41_indexer_score_row(g->index_scores, g->index_q, g->index_weights, g->index_cache[owner],
                                              g->index_bf16_ok ? g->index_bf16[owner] : NULL, n_comp)) return false;
 #else
