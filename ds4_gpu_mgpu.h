@@ -151,6 +151,25 @@ int ds4_gpu_tensor_copy_xdev3_default_dst(
         const ds4_gpu_tensor *src2,
         uint64_t              bytes2);
 
+/* The two default-stream handoffs above, for a host that keeps encoding. With
+ * no peer path the source stream fills a pinned buffer and the destination
+ * stream drains it, ordered by an event, so the host never waits for either
+ * device. A caller must take a device's output before sending it more: each
+ * direction has one buffer. */
+int ds4_gpu_tensor_copy_xdev_queued(ds4_gpu_tensor *dst,
+                                    const ds4_gpu_tensor *src,
+                                    uint64_t bytes);
+int ds4_gpu_tensor_copy_xdev3_queued(
+        ds4_gpu_tensor       *dst0,
+        const ds4_gpu_tensor *src0,
+        uint64_t              bytes0,
+        ds4_gpu_tensor       *dst1,
+        const ds4_gpu_tensor *src1,
+        uint64_t              bytes1,
+        ds4_gpu_tensor       *dst2,
+        const ds4_gpu_tensor *src2,
+        uint64_t              bytes2);
+
 /* Cross-device copy of three buffers between the same source/destination
  * tiers, recording a single readiness event for the destination stream. This
  * is meant for tiny grouped activation handoffs where three independent

@@ -3894,6 +3894,122 @@ extern "C" int ds4_gpu_tensor_copy_xdev_default(ds4_gpu_tensor *dst,
     return ds4_gpu_tensor_copy_xdev_default_impl(dst, src, bytes);
 }
 
+static int cuda_xdev_bounce_queued(ds4_gpu_tensor *const *dsts,
+                                   const ds4_gpu_tensor *const *srcs,
+                                   const uint64_t *sizes,
+                                   int n) {
+    const uint64_t align = 64u;
+    uint64_t total = 0;
+    int sd = -1;
+    int dd = -1;
+    for (int i = 0; i < n; i++) {
+        if (sizes[i] == 0u) continue;
+        if (!dsts[i] || !srcs[i] || sizes[i] > dsts[i]->bytes ||
+            sizes[i] > srcs[i]->bytes) {
+            return 0;
+        }
+        const int this_sd = ds4_tensor_device_idx(srcs[i]);
+        const int this_dd = ds4_tensor_device_idx(dsts[i]);
+        if (sd < 0) {
+            sd = this_sd;
+            dd = this_dd;
+        } else if (sd != this_sd || dd != this_dd) {
+            return 0;
+        }
+        total += (sizes[i] + align - 1u) & ~(align - 1u);
+    }
+    if (sd < 0) return 1;
+
+    int ok = 1;
+    if (g_xdev_bounce_bytes[sd][dd] < total) {
+        /* Earlier queued copies may still be reading the old buffer. */
+        WITH_DEVICE(g_gpu[sd].device_id) {
+            ok = cuda_ok(cudaDeviceSynchronize(), "bounce grow source sync");
+        }
+        if (ok) {
+            WITH_DEVICE(g_gpu[dd].device_id) {
+                ok = cuda_ok(cudaDeviceSynchronize(), "bounce grow destination sync");
+            }
+        }
+        if (!ok) return 0;
+        if (g_xdev_bounce[sd][dd]) (void)cudaFreeHost(g_xdev_bounce[sd][dd]);
+        g_xdev_bounce[sd][dd] = NULL;
+        g_xdev_bounce_bytes[sd][dd] = 0;
+        if (!cuda_ok(cudaMallocHost(&g_xdev_bounce[sd][dd], (size_t)total),
+                     "queued bounce alloc")) return 0;
+        g_xdev_bounce_bytes[sd][dd] = total;
+    }
+
+    char *const host = (char *)g_xdev_bounce[sd][dd];
+    WITH_DEVICE(g_gpu[sd].device_id) {
+        uint64_t off = 0;
+        for (int i = 0; ok && i < n; i++) {
+            if (sizes[i] == 0u) continue;
+            ok = cuda_ok(cudaMemcpyAsync(host + off, srcs[i]->ptr, (size_t)sizes[i],
+                                         cudaMemcpyDeviceToHost, 0),
+                         "queued bounce d2h");
+            off += (sizes[i] + align - 1u) & ~(align - 1u);
+        }
+        if (ok) {
+            ok = cuda_ok(cudaEventRecord((cudaEvent_t)g_gpu[sd].boundary_event, 0),
+                         "queued bounce source record");
+        }
+    }
+    if (!ok) return 0;
+    WITH_DEVICE(g_gpu[dd].device_id) {
+        ok = cuda_ok(cudaStreamWaitEvent(0, (cudaEvent_t)g_gpu[sd].boundary_event, 0),
+                     "queued bounce destination wait");
+        uint64_t off = 0;
+        for (int i = 0; ok && i < n; i++) {
+            if (sizes[i] == 0u) continue;
+            ok = cuda_ok(cudaMemcpyAsync(dsts[i]->ptr, host + off, (size_t)sizes[i],
+                                         cudaMemcpyHostToDevice, 0),
+                         "queued bounce h2d");
+            off += (sizes[i] + align - 1u) & ~(align - 1u);
+        }
+    }
+    return ok;
+}
+
+extern "C" int ds4_gpu_tensor_copy_xdev_queued(ds4_gpu_tensor *dst,
+                                                const ds4_gpu_tensor *src,
+                                                uint64_t bytes) {
+    if (!dst || !src) return 0;
+    const int sd = ds4_tensor_device_idx(src);
+    const int dd = ds4_tensor_device_idx(dst);
+    int peer = g_gpu_peer_ok[sd][dd];
+    if (g_xdev_force_cuda_peer) peer = 1;
+    if (g_xdev_force_host_bounce) peer = 0;
+    if (sd == dd || peer) return ds4_gpu_tensor_copy_xdev_default_impl(dst, src, bytes);
+    return cuda_xdev_bounce_queued(&dst, &src, &bytes, 1);
+}
+
+extern "C" int ds4_gpu_tensor_copy_xdev3_queued(
+        ds4_gpu_tensor *dst0,
+        const ds4_gpu_tensor *src0,
+        uint64_t bytes0,
+        ds4_gpu_tensor *dst1,
+        const ds4_gpu_tensor *src1,
+        uint64_t bytes1,
+        ds4_gpu_tensor *dst2,
+        const ds4_gpu_tensor *src2,
+        uint64_t bytes2) {
+    if (!dst0 || !src0) return 0;
+    const int sd = ds4_tensor_device_idx(src0);
+    const int dd = ds4_tensor_device_idx(dst0);
+    int peer = g_gpu_peer_ok[dd][sd];
+    if (g_xdev_force_cuda_peer) peer = 1;
+    if (g_xdev_force_host_bounce) peer = 0;
+    if (sd == dd || peer) {
+        return ds4_gpu_tensor_copy_xdev3_default_dst(dst0, src0, bytes0, dst1, src1, bytes1,
+                                                     dst2, src2, bytes2);
+    }
+    ds4_gpu_tensor *const dsts[3] = {dst0, dst1, dst2};
+    const ds4_gpu_tensor *const srcs[3] = {src0, src1, src2};
+    const uint64_t sizes[3] = {bytes0, bytes1, bytes2};
+    return cuda_xdev_bounce_queued(dsts, srcs, sizes, 3);
+}
+
 extern "C" int ds4_gpu_tensor_copy_xdev3_default_dst(
         ds4_gpu_tensor *dst0,
         const ds4_gpu_tensor *src0,
