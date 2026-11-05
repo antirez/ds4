@@ -11485,6 +11485,64 @@ static int kv_cache_try_load(server *s, server_slot *slot, const request *req,
                                   req && req->api == API_RESPONSES);
 }
 
+/* The bytes of a multimodal request's rendered prompt before its first image
+ * marker: the text a disk checkpoint of that request may cover. */
+static size_t request_text_before_first_image(const request *req) {
+    if (!req || !req->prompt_text || req->image_count == 0 || !req->image_markers)
+        return 0;
+    const char *marker = strstr(req->prompt_text, req->image_markers[0]);
+    return marker ? (size_t)(marker - req->prompt_text) : 0;
+}
+
+/* A cold checkpoint of a multimodal prompt ends before its first image: the
+ * disk format keys text alone.  A cut shorter than the store minimum is
+ * returned as is and the caller then stores nothing. */
+static int kv_cache_cold_len_before_first_image(int cold_store_len,
+                                                int first_image_pos) {
+    return cold_store_len > first_image_pos ? first_image_pos : cold_store_len;
+}
+
+/* Disk payloads carry no image identity, so an image request loads at most the
+ * text before its first image — the instructions a batch of photos shares.
+ * Nothing is re-tokenized: the loaded tokens must be an exact prefix of the
+ * multimodal prompt, which the sync then continues with the images in place.
+ * A payload that is not (a text entry whose last token differs) is dropped
+ * and the prompt prefills from zero, as it did before. */
+static int kv_cache_try_load_image_prefix(server *s, server_slot *slot,
+                                          const request *req,
+                                          char **loaded_path_out,
+                                          uint8_t *loaded_ext_flags_out) {
+    const size_t bytes = request_text_before_first_image(req);
+    if (bytes == 0) return 0;
+    char *text = xstrndup(req->prompt_text, bytes);
+    int loaded = kv_cache_try_load_text(s, slot, text, NULL, loaded_path_out,
+                                        loaded_ext_flags_out,
+                                        req->api == API_RESPONSES);
+    free(text);
+    if (loaded <= 0) return 0;
+    pthread_mutex_lock(&s->inference_mu);
+    const int common = ds4_session_common_prefix(slot->session, &req->prompt);
+    const bool exact = common == loaded &&
+                       req->images[0].token_start >= (uint32_t)loaded;
+    if (!exact) ds4_session_invalidate(slot->session);
+    pthread_mutex_unlock(&s->inference_mu);
+    if (exact) {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: kv cache image-prefix hit tokens=%d images=%zu first-image=%u",
+                   loaded, req->image_count, req->images[0].token_start);
+        return loaded;
+    }
+    server_log(DS4_LOG_KVCACHE,
+               "ds4-server: kv cache image-prefix payload dropped loaded=%d common=%d first-image=%u reason=not-a-token-prefix",
+               loaded, common, req->images[0].token_start);
+    if (loaded_path_out) {
+        free(*loaded_path_out);
+        *loaded_path_out = NULL;
+    }
+    if (loaded_ext_flags_out) *loaded_ext_flags_out = 0;
+    return 0;
+}
+
 /* A text-only suffix tokenizer would turn image markers into literal text.
  * Keep the exact live tokens and splice each new image's already-built token
  * block into the suffix. Historical image positions follow the live frontier,
@@ -13623,11 +13681,13 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                    j->req.image_count, cached, prompt_for_sync->len);
     }
     if (cached == 0) slot->continued_last_store_tokens = 0;
-    if (!multimodal && s->kv.enabled && cached == 0 &&
-        old_pos >= s->kv.opt.min_tokens) {
-        /* Loading a disk snapshot replaces the live Metal session.  Persist the
-         * current checkpoint first, otherwise a cache hit for an older prefix
-         * would silently discard the newer conversation state. */
+    if (s->kv.enabled && cached == 0 && old_pos >= s->kv.opt.min_tokens) {
+        /* Loading a disk snapshot or prefilling another prompt replaces the
+         * live Metal session.  Persist the current checkpoint first, otherwise
+         * a cache hit for an older prefix would silently discard the newer
+         * conversation state.  An image request evicts a text conversation
+         * like any other request; a live state that itself holds images is
+         * refused by the store, since the disk format cannot key it. */
         kv_cache_store_current(s, slot, "evict");
     }
     if (!multimodal && cached == 0) {
@@ -13638,6 +13698,14 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             cached = disk_cached;
             cache_source = "disk-text";
             prompt_for_sync = &effective_prompt;
+        }
+    } else if (cached == 0) {
+        disk_cached = kv_cache_try_load_image_prefix(s, slot, &j->req,
+                                                     &disk_cache_path,
+                                                     &disk_cache_ext_flags);
+        if (disk_cached > 0) {
+            cached = disk_cached;
+            cache_source = "disk-text";
         }
     }
     const bool responses_reasoning_state_preserved =
@@ -13726,7 +13794,10 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     ds4_session_set_display_progress(slot->session, server_progress_cb, &progress);
 
     int cold_store_len = 0;
-    if (!multimodal && cached == 0 &&
+    /* An image request stores the text before its first image, the prompt a
+     * batch of photos shares.  Its image positions are known against its own
+     * tokens only, so a live continuation's spliced prompt stores nothing. */
+    if ((!multimodal || prompt_for_sync == &j->req.prompt) && cached == 0 &&
         s->kv.enabled &&
         prompt_for_sync->len >= s->kv.opt.min_tokens &&
         s->kv.opt.cold_max_tokens > 0 &&
@@ -13737,6 +13808,10 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                                                     ds4_token_assistant(s->engine));
         cold_store_len = anchor >= s->kv.opt.min_tokens ?
                          anchor : kv_cache_store_len(&s->kv, prompt_for_sync->len);
+        if (multimodal) {
+            cold_store_len = kv_cache_cold_len_before_first_image(
+                cold_store_len, (int)j->req.images[0].token_start);
+        }
     }
     int suppressed_continued_last = -1;
     if (cold_store_len >= s->kv.opt.min_tokens) {
@@ -16754,6 +16829,25 @@ static void test_multimodal_prefill_resume_frontier(void) {
     TEST_ASSERT(server_multimodal_resume_frontier(160, 159, 170, true) == 0);
     TEST_ASSERT(server_multimodal_resume_frontier(160, 160, 159, true) == 0);
     TEST_ASSERT(server_multimodal_resume_frontier(160, 160, 170, false) == 0);
+}
+
+static void test_multimodal_disk_cache_prefix(void) {
+    char markers[1][SERVER_IMAGE_MARKER_BYTES];
+    memset(markers, 0, sizeof(markers));
+    snprintf(markers[0], sizeof(markers[0]), "\x1fimage-marker-0\x1f");
+    char text[256];
+    snprintf(text, sizeof(text), "system text%suser text", markers[0]);
+    request r;
+    memset(&r, 0, sizeof(r));
+    r.prompt_text = text;
+    r.image_markers = markers;
+    r.image_count = 1;
+    TEST_ASSERT(request_text_before_first_image(&r) == strlen("system text"));
+    r.image_count = 0;
+    TEST_ASSERT(request_text_before_first_image(&r) == 0);
+    /* The cold cut of an image prompt never reaches past its first image. */
+    TEST_ASSERT(kv_cache_cold_len_before_first_image(6000, 5500) == 5500);
+    TEST_ASSERT(kv_cache_cold_len_before_first_image(5000, 5500) == 5000);
 }
 
 static void test_batched_live_continuation_slot_binding(void) {
@@ -23026,6 +23120,7 @@ static void ds4_server_unit_tests_run(void) {
     test_batched_prefill_round_robin();
     test_mixed_prefill_quantum_option();
     test_multimodal_prefill_resume_frontier();
+    test_multimodal_disk_cache_prefix();
     test_batched_live_continuation_slot_binding();
     test_live_continuation_contract();
     test_slot_probe_and_routing_scores();
