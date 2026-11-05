@@ -596,17 +596,9 @@ extern "C" int ds4_gpu_dsv41_gather_kv(ds4_gpu_tensor *out, const ds4_gpu_tensor
 
 /* A warp owns one score. Preserve the 128-lane reduction tree, but keep
  * all partials in registers instead of synchronizing a block per head. */
-__global__ static void dsv41_index_scores_kernel(float *scores, const float *q,
-        const float *weights, const float *keys, uint32_t width,
-        uint32_t start, uint32_t ratio) {
-    const uint32_t key = blockIdx.x * 8u + threadIdx.x / 32u;
-    const uint32_t row = blockIdx.y, lane = threadIdx.x & 31u;
-    if (key >= width) return;
-    if (key >= (start + row + 1u) / ratio) {
-        if (!lane) scores[(uint64_t)row * width + key] = -INFINITY;
-        return;
-    }
-    const float *k = keys + (uint64_t)key * 128u + lane;
+__device__ __forceinline__ static float dsv41_index_score(const float *q, const float *weights,
+        const float *key, uint32_t row, uint32_t lane) {
+    const float *k = key + lane;
     const float k0 = k[0], k1 = k[32], k2 = k[64], k3 = k[96];
     float total = 0;
     for (uint32_t h = 0; h < 32u; h++) {
@@ -617,8 +609,110 @@ __global__ static void dsv41_index_scores_kernel(float *scores, const float *q,
         dot = warp_sum_f32(dot);
         total += fmaxf(dot, 0.0f) * weights[(uint64_t)row * 32u + h];
     }
-    if (!lane) scores[(uint64_t)row * width + key] = total * (1.0f / 64.0f);
+    return total * (1.0f / 64.0f);
 }
+
+__global__ static void dsv41_index_scores_kernel(float *scores, const float *q,
+        const float *weights, const float *keys, uint32_t width,
+        uint32_t start, uint32_t ratio) {
+    const uint32_t key = blockIdx.x * 8u + threadIdx.x / 32u;
+    const uint32_t row = blockIdx.y, lane = threadIdx.x & 31u;
+    if (key >= width) return;
+    if (key >= (start + row + 1u) / ratio) {
+        if (!lane) scores[(uint64_t)row * width + key] = -INFINITY;
+        return;
+    }
+    const float score = dsv41_index_score(q, weights, keys + (uint64_t)key * 128u, row, lane);
+    if (!lane) scores[(uint64_t)row * width + key] = score;
+}
+
+#ifndef __HIP_PLATFORM_AMD__
+/* The 2048 candidate blocks of a 0/-inf mask in ascending order. Each pass
+ * reads 4096 mask entries, four per thread, then places them by prefix sum. */
+__global__ static void dsv41_candidate_list_kernel(uint32_t *list, const float *mask,
+                                                   uint32_t blocks) {
+    __shared__ uint32_t before[1024];
+    __shared__ uint32_t pass_total;
+    const uint32_t tid = threadIdx.x;
+    uint32_t base = 0;
+    for (uint32_t b0 = 0; b0 < blocks; b0 += 4096u) {
+        const uint32_t b = b0 + tid * 4u;
+        bool keep[4];
+        uint32_t count = 0;
+        for (uint32_t j = 0; j < 4u; j++) {
+            keep[j] = b + j < blocks && mask[b + j] == 0.0f;
+            count += keep[j] ? 1u : 0u;
+        }
+        before[tid] = count;
+        __syncthreads();
+        if (!tid) {
+            uint32_t sum = 0;
+            for (uint32_t i = 0; i < 1024u; i++) {
+                const uint32_t c = before[i];
+                before[i] = sum;
+                sum += c;
+            }
+            pass_total = sum;
+        }
+        __syncthreads();
+        uint32_t at = base + before[tid];
+        for (uint32_t j = 0; j < 4u; j++) {
+            if (keep[j] && at < 2048u) list[at] = b + j;
+            at += keep[j] ? 1u : 0u;
+        }
+        base += pass_total;
+        __syncthreads();
+    }
+}
+
+__global__ static void dsv41_index_score_candidates_kernel(float *scores, const float *q,
+        const float *weights, const float *keys, const uint32_t *list, uint32_t count) {
+    const uint32_t i = blockIdx.x * 8u + threadIdx.x / 32u;
+    const uint32_t lane = threadIdx.x & 31u;
+    if (i >= count) return;
+    const uint64_t key = (uint64_t)list[i >> 3] * 8u + (i & 7u);
+    const float score = dsv41_index_score(q, weights, keys + key * 128u, 0u, lane);
+    if (!lane) scores[i] = score;
+}
+
+/* Positions in the candidate list back to key ids, in place and in order. */
+__global__ static void dsv41_candidate_ids_kernel(uint32_t *selected, const uint32_t *list,
+                                                  uint32_t count) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const uint32_t p = selected[i];
+    selected[i] = list[p >> 3] * 8u + (p & 7u);
+}
+
+extern "C" int ds4_gpu_dsv41_indexer_candidates_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *scores,
+        ds4_gpu_tensor *list, const ds4_gpu_tensor *q, const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *keys, const ds4_gpu_tensor *block_mask, uint32_t n_comp,
+        float scale, uint32_t top_k, int list_ready) {
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("DS4_METAL_DISABLE_V41_INDEX_CANDIDATES") == NULL;
+    const uint32_t blocks = n_comp <= (1u << 23) ? (n_comp + 7u) / 8u : 0u;
+    /* The partial last block is always a candidate, and it sorts last. */
+    const uint32_t count = 16384u - (blocks * 8u - n_comp);
+    if (!enabled || blocks <= 2048u || !top_k || top_k > 2048u || scale != 1.0f / 64.0f ||
+        !dsv41_has_floats(selected, top_k) || !dsv41_has_floats(scores, count) ||
+        !dsv41_has_floats(list, 2048u) || !dsv41_has_floats(block_mask, blocks) ||
+        !dsv41_has_floats(q, 4096u) || !dsv41_has_floats(weights, 32u) ||
+        !dsv41_has_floats(keys, (uint64_t)n_comp * 128u)) return 0;
+    if (!list_ready) {
+        dsv41_candidate_list_kernel<<<1, 1024, 0, cuda_decode_stream()>>>(
+            (uint32_t *)list->ptr, (const float *)block_mask->ptr, blocks);
+        if (!cuda_ok(cudaGetLastError(), "V4.1 candidate list")) return 0;
+    }
+    dsv41_index_score_candidates_kernel<<<(count + 7u) / 8u, 256, 0, cuda_decode_stream()>>>(
+        (float *)scores->ptr, (const float *)q->ptr, (const float *)weights->ptr,
+        (const float *)keys->ptr, (const uint32_t *)list->ptr, count);
+    if (!cuda_ok(cudaGetLastError(), "V4.1 candidate scores") ||
+        !ds4_gpu_indexer_topk_tensor(selected, scores, count, 1, top_k)) return 0;
+    dsv41_candidate_ids_kernel<<<(top_k + 255u) / 256u, 256, 0, cuda_decode_stream()>>>(
+        (uint32_t *)selected->ptr, (const uint32_t *)list->ptr, top_k);
+    return cuda_ok(cudaGetLastError(), "V4.1 candidate ids");
+}
+#endif
 
 extern "C" int ds4_gpu_dsv41_indexer_scores_batch(ds4_gpu_tensor *scores,
                                                    const ds4_gpu_tensor *q, const ds4_gpu_tensor *weights,
