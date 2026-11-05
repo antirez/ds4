@@ -13726,7 +13726,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     ds4_session_set_display_progress(slot->session, server_progress_cb, &progress);
 
     int cold_store_len = 0;
-    if (!multimodal && cached == 0 &&
+    if (!multimodal &&
         s->kv.enabled &&
         prompt_for_sync->len >= s->kv.opt.min_tokens &&
         s->kv.opt.cold_max_tokens > 0 &&
@@ -13735,8 +13735,17 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         const int anchor = kv_cache_chat_anchor_pos(&s->kv, prompt_for_sync,
                                                     ds4_token_user(s->engine),
                                                     ds4_token_assistant(s->engine));
-        cold_store_len = anchor >= s->kv.opt.min_tokens ?
-                         anchor : kv_cache_store_len(&s->kv, prompt_for_sync->len);
+        if (cached == 0) {
+            cold_store_len = anchor >= s->kv.opt.min_tokens ?
+                             anchor : kv_cache_store_len(&s->kv, prompt_for_sync->len);
+        } else if (s->kv.opt.cold_anchor == DS4_KVSTORE_COLD_ANCHOR_LAST_USER &&
+                   anchor > cached) {
+            /* A shorter entry (an older cut, a continued frontier) served the
+             * start of this prompt; the cut at the last user turn lies beyond
+             * it and is worth its own entry, so the next request with this
+             * history loads all of it. */
+            cold_store_len = anchor;
+        }
     }
     int suppressed_continued_last = -1;
     if (cold_store_len >= s->kv.opt.min_tokens) {
@@ -15716,6 +15725,13 @@ static server_config parse_options(int argc, char **argv) {
             c.kv_cache.min_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--kv-cache-cold-max-tokens")) {
             c.kv_cache.cold_max_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--kv-cache-cold-anchor")) {
+            const char *name = need_arg(&i, argc, argv, arg);
+            if (!ds4_kvstore_parse_cold_anchor(name, &c.kv_cache.cold_anchor)) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: --kv-cache-cold-anchor must be first-task or last-user, not '%s'", name);
+                exit(2);
+            }
         } else if (!strcmp(arg, "--kv-cache-continued-interval-tokens")) {
             c.kv_cache.continued_interval_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--kv-cache-boundary-trim-tokens")) {
@@ -21663,6 +21679,36 @@ static void test_kv_cache_chat_anchor_ignores_multiturn_tail(void) {
     ds4_tokens_free(&prompt);
 }
 
+static void test_kv_cache_chat_anchor_last_user_spans_multiturn_history(void) {
+    const int user = 9001;
+    const int assistant = 9002;
+    kv_disk_cache kc = {0};
+    kc.opt = kv_cache_default_options();
+    kc.opt.min_tokens = 2;
+    kc.opt.cold_anchor = DS4_KVSTORE_COLD_ANCHOR_LAST_USER;
+
+    ds4_tokens prompt = {0};
+    ds4_tokens_push(&prompt, 1);
+    ds4_tokens_push(&prompt, 2);
+    ds4_tokens_push(&prompt, user);      /* fixed history, first turn */
+    ds4_tokens_push(&prompt, 3);
+    ds4_tokens_push(&prompt, assistant);
+    ds4_tokens_push(&prompt, 4);
+    ds4_tokens_push(&prompt, user);      /* the question: cut right before it */
+    ds4_tokens_push(&prompt, 5);
+    ds4_tokens_push(&prompt, assistant);
+    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, user, assistant) == 6);
+
+    kc.opt.cold_anchor = DS4_KVSTORE_COLD_ANCHOR_FIRST_TASK;
+    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, user, assistant) == 2);
+
+    kc.opt.cold_anchor = DS4_KVSTORE_COLD_ANCHOR_LAST_USER;
+    kc.opt.min_tokens = 7;
+    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, user, assistant) == -1);
+
+    ds4_tokens_free(&prompt);
+}
+
 static void test_kv_cache_continued_uses_aligned_frontiers(void) {
     kv_disk_cache kc = {0};
     kc.enabled = true;
@@ -23170,6 +23216,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_store_len_uses_configured_boundary();
     test_kv_cache_chat_anchor_uses_last_user_before_assistant();
     test_kv_cache_chat_anchor_ignores_multiturn_tail();
+    test_kv_cache_chat_anchor_last_user_spans_multiturn_history();
     test_kv_cache_continued_uses_aligned_frontiers();
     test_kv_cache_cold_store_suppresses_duplicate_continued_boundary();
     test_kv_cache_file_size_must_fit_budget();
