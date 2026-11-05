@@ -4383,8 +4383,8 @@ static int run_moe_ffn(k3_context *ctx,
     k3_stream_batch stream_batch = {0};
     const int profile_io = io_profile_enabled();
     const double io_start = profile_io ? now_seconds() : 0.0;
-    const uint32_t first_batch_count = batched_prefill
-        ? K3_STREAMED_EXPERT_SLOTS : exact_count;
+    const uint32_t bank_size = K3_STREAMED_EXPERT_SLOTS / 2u;
+    const uint32_t first_batch_count = batched_prefill ? bank_size : exact_count;
     const k3_expert_group *first_batch_groups = batched_prefill
         ? groups : exact_groups;
     /*
@@ -4452,83 +4452,38 @@ static int run_moe_ffn(k3_context *ctx,
     }
     const uint32_t pipeline_batch = expert_pipeline_batch(prefill);
     if (batched_prefill) {
-        uint32_t offset = 0;
-        while (offset < n_groups) {
-            uint32_t batch_count = n_groups - offset;
-            if (batch_count > K3_STREAMED_EXPERT_SLOTS) {
-                batch_count = K3_STREAMED_EXPERT_SLOTS;
+        k3_stream_batch alternate = {0};
+        k3_stream_batch *banks[2] = {&stream_batch, &alternate};
+        int ok = 1;
+        for (uint32_t offset = 0, bank = 0; ok && offset < n_groups; offset += bank_size, bank ^= 1u) {
+            const uint32_t remaining = n_groups - offset;
+            const uint32_t count = remaining < bank_size ? remaining : bank_size;
+            const uint32_t next = offset + count;
+            /* The other half of the existing slots is free. Its reads stay in
+             * flight during both this GPU submission and the wait to reuse it. */
+            if (next < n_groups) {
+                const uint32_t left = n_groups - next;
+                const uint32_t other = bank ^ 1u;
+                ok = start_streamed_experts(ctx, layer, groups + next,
+                        left < bank_size ? left : bank_size,
+                        ctx->streamed_experts + other * bank_size, 0, banks[other], err, errcap);
             }
-            if (offset != 0) {
-                if (!ds4_gpu_synchronize() ||
-                    !start_streamed_experts(
-                        ctx,
-                        layer,
-                        &groups[offset],
-                        batch_count,
-                        ctx->streamed_experts,
-                        0,
-                        &stream_batch,
-                        err,
-                        errcap) ||
-                    !ds4_gpu_begin_commands()) {
-                    (void)finish_streamed_experts(
-                        &stream_batch, NULL, 0);
-                    if (!err || !err[0]) {
-                        set_error(
-                            err, errcap,
-                            "K3 layer %u expert batch setup failed",
-                            layer->index);
-                    }
-                    (void)finish_all_speculative_experts(ctx, NULL, 0);
-                    return 0;
-                }
+            for (uint32_t j = 0; ok && j < count; j++) {
+                ok = wait_streamed_expert(banks[bank], j, err, errcap) &&
+                     run_one_expert(ctx, layer, &groups[offset + j], input_prequantized,
+                                    &ctx->streamed_experts[bank * bank_size + j]);
+                if (ok && pipeline_batch && j + 1u < count && (j + 1u) % pipeline_batch == 0)
+                    ok = ds4_gpu_flush_commands();
             }
-            for (uint32_t j = 0; j < batch_count; j++) {
-                const uint32_t i = offset + j;
-                if (!wait_streamed_expert(
-                        &stream_batch, j, err, errcap) ||
-                    !run_one_expert(
-                        ctx,
-                        layer,
-                        &groups[i],
-                        input_prequantized,
-                        &ctx->streamed_experts[j])) {
-                    if (!err || !err[0]) {
-                        set_error(
-                            err, errcap,
-                            "K3 layer %u expert %u failed",
-                            layer->index, groups[i].expert);
-                    }
-                    (void)finish_streamed_experts(
-                        &stream_batch, NULL, 0);
-                    (void)finish_all_speculative_experts(ctx, NULL, 0);
-                    return 0;
-                }
-                if (pipeline_batch != 0 &&
-                    (j + 1u) < batch_count &&
-                    (j + 1u) % pipeline_batch == 0 &&
-                    !ds4_gpu_flush_commands()) {
-                    set_error(
-                        err, errcap,
-                        "K3 layer %u expert pipeline commit failed",
-                        layer->index);
-                    (void)finish_streamed_experts(
-                        &stream_batch, NULL, 0);
-                    (void)finish_all_speculative_experts(ctx, NULL, 0);
-                    return 0;
-                }
-            }
-            if (!finish_streamed_experts(
-                    &stream_batch, err, errcap)) {
-                if (!err || !err[0]) {
-                    set_error(err, errcap,
-                              "K3 layer %u expert streaming failed",
-                              layer->index);
-                }
-                (void)finish_all_speculative_experts(ctx, NULL, 0);
-                return 0;
-            }
-            offset += batch_count;
+            if (!finish_streamed_experts(banks[bank], err, errcap)) ok = 0;
+            if (ok && next < n_groups)
+                ok = ds4_gpu_synchronize() && ds4_gpu_begin_commands();
+        }
+        if (!ok) {
+            (void)finish_streamed_experts(&stream_batch, NULL, 0);
+            (void)finish_streamed_experts(&alternate, NULL, 0);
+            if (!err || !err[0]) set_error(err, errcap, "K3 layer %u expert prefill failed", layer->index);
+            return 0;
         }
     } else {
         for (uint32_t i = 0; i < n_groups; i++) {

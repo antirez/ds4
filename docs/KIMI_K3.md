@@ -10,6 +10,11 @@ make
 ./ds4 -m models/Kimi-K3.1-Pro --ctx 4096 -p "Explain Redis streams."
 ```
 
+During SafeTensors prefill, Metal starts computing ready experts while the
+SSD reads the remaining selections. Large batches alternate between halves
+of the existing expert buffers, so the reader can start the next group while
+the GPU finishes the current one.
+
 K3.1 uses a learned index in 24 attention layers. Each query attends to all
 available positions through 2,048 tokens and to its selected 2,048 positions
 thereafter. The original K3 SafeTensors and its existing mixed-Q2 GGUF also
