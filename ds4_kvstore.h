@@ -56,12 +56,24 @@ typedef struct {
     uint64_t file_size;
 } ds4_kvstore_entry;
 
+/* Where a chat prompt's cold checkpoint is cut (ds4_kvstore_chat_anchor_pos).
+ * FIRST_TASK: the last user marker before the first assistant marker — the
+ * stable scaffolding of an agent session, before the message that asks its
+ * task.  LAST_USER: the last user marker of the whole prompt — everything
+ * before the request's final user turn, so a client that resends a long fixed
+ * history (a prompt test suite, a few-shot preamble) reloads all of it. */
+typedef enum {
+    DS4_KVSTORE_COLD_ANCHOR_FIRST_TASK = 0,
+    DS4_KVSTORE_COLD_ANCHOR_LAST_USER = 1,
+} ds4_kvstore_cold_anchor;
+
 typedef struct {
     int min_tokens;
     int cold_max_tokens;
     int continued_interval_tokens;
     int boundary_trim_tokens;
     int boundary_align_tokens;
+    ds4_kvstore_cold_anchor cold_anchor;
 } ds4_kvstore_options;
 
 typedef struct {
@@ -107,6 +119,9 @@ typedef struct {
 } ds4_kvstore_load_result;
 
 ds4_kvstore_options ds4_kvstore_default_options(void);
+const char *ds4_kvstore_cold_anchor_name(ds4_kvstore_cold_anchor anchor);
+/* "first-task" or "last-user" -> *out; false for any other spelling. */
+bool ds4_kvstore_parse_cold_anchor(const char *name, ds4_kvstore_cold_anchor *out);
 uint8_t ds4_kvstore_reason_code(const char *reason);
 const char *ds4_kvstore_key_kind(uint8_t ext_flags);
 

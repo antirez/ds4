@@ -168,7 +168,19 @@ ds4_kvstore_options ds4_kvstore_default_options(void) {
         .continued_interval_tokens = KV_CACHE_DEFAULT_CONTINUED_INTERVAL_TOKENS,
         .boundary_trim_tokens = KV_CACHE_DEFAULT_BOUNDARY_TRIM_TOKENS,
         .boundary_align_tokens = KV_CACHE_DEFAULT_BOUNDARY_ALIGN_TOKENS,
+        .cold_anchor = DS4_KVSTORE_COLD_ANCHOR_FIRST_TASK,
     };
+}
+
+const char *ds4_kvstore_cold_anchor_name(ds4_kvstore_cold_anchor anchor) {
+    return anchor == DS4_KVSTORE_COLD_ANCHOR_LAST_USER ? "last-user" : "first-task";
+}
+
+bool ds4_kvstore_parse_cold_anchor(const char *name, ds4_kvstore_cold_anchor *out) {
+    if (!name || !out) return false;
+    if (!strcmp(name, "first-task")) { *out = DS4_KVSTORE_COLD_ANCHOR_FIRST_TASK; return true; }
+    if (!strcmp(name, "last-user")) { *out = DS4_KVSTORE_COLD_ANCHOR_LAST_USER; return true; }
+    return false;
 }
 
 uint8_t ds4_kvstore_reason_code(const char *reason) {
@@ -636,13 +648,14 @@ bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
     kc->opt = opt;
     ds4_kvstore_evict(kc, NULL, 0, NULL);
     kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
-            "%s: KV disk cache %s (budget=%llu MiB, cross-quant=%s, min=%d, cold_max=%d, continued=%d, trim=%d, align=%d, hit_half_life=%llus)",
+            "%s: KV disk cache %s (budget=%llu MiB, cross-quant=%s, min=%d, cold_max=%d, cold_anchor=%s, continued=%d, trim=%d, align=%d, hit_half_life=%llus)",
             kv_log_name(kc),
             kc->dir,
             (unsigned long long)(kc->budget_bytes / (1024ull * 1024ull)),
             reject_different_quant ? "reject" : "accept",
             kc->opt.min_tokens,
             kc->opt.cold_max_tokens,
+            ds4_kvstore_cold_anchor_name(kc->opt.cold_anchor),
             kc->opt.continued_interval_tokens,
             kc->opt.boundary_trim_tokens,
             kc->opt.boundary_align_tokens,
@@ -723,11 +736,15 @@ int ds4_kvstore_chat_anchor_pos(const ds4_kvstore *kc,
     /* Cold checkpoints maximize reuse across independent agent sessions.  The
      * stable rendered chat prefix is everything before the user message that
      * asks this specific task.  Some clients put stable user-role scaffolding
-     * first, so use the last user marker before the first assistant marker. */
+     * first, so use the last user marker before the first assistant marker.
+     * In LAST_USER mode the scan does not stop at an assistant marker: the
+     * prefix is everything before the prompt's final user turn, for a client
+     * whose every request repeats a long fixed history ahead of the question. */
+    const bool whole_prompt = kc->opt.cold_anchor == DS4_KVSTORE_COLD_ANCHOR_LAST_USER;
     int last_user = -1;
     for (int i = 0; i < prompt->len; i++) {
         const int token = prompt->v[i];
-        if (token == assistant_token_id) break;
+        if (token == assistant_token_id && !whole_prompt) break;
         if (token == user_token_id) last_user = i;
     }
     return last_user >= kc->opt.min_tokens ? last_user : -1;
