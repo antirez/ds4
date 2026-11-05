@@ -74690,13 +74690,18 @@ static int ds4_engine_open_internal(ds4_engine **out,
         const bool support_model_runtime_ready =
             e->mtp_ready ||
             (e->support_kind == DS4_SUPPORT_DSPARK && e->dspark);
-        bool support_uses_secondary_rocm_cache = false;
+        bool support_uses_aux_cache = false;
 #ifdef DS4_ROCM_BUILD
         /* The generic range cache is already keyed by model map. Keep the
          * resident target ranges when adding DSpark support on gfx1151. */
-        support_uses_secondary_rocm_cache =
+        support_uses_aux_cache =
             e->support_kind == DS4_SUPPORT_DSPARK &&
             ds4_gpu_dspark_gfx1151_fast_path() != 0;
+#endif
+#if !defined(__APPLE__) && !defined(DS4_NO_GPU)
+        /* The memory plan counts the drafter as resident. A mapped range only
+         * registers the host pages, so every proposal would read its weights
+         * across PCIe. */
         if (support_model_runtime_ready && e->ssd_streaming && e->dspark_weights.v41) {
             (void)ds4_gpu_set_model_fd_for_map(e->mtp_model.fd, e->mtp_model.map);
             const bool resident = ds4_gpu_set_aux_model_map_range(e->mtp_model.map,
@@ -74704,18 +74709,19 @@ static int ds4_engine_open_internal(ds4_engine **out,
                 e->mtp_model.size - e->mtp_model.tensor_data_pos) != 0;
             (void)ds4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
             if (!resident) {
-                fprintf(stderr, "ds4: ROCm failed to make the V4.1 drafter resident\n");
+                fprintf(stderr, "ds4: %s failed to make the V4.1 drafter resident\n",
+                        ds4_backend_name(e->backend));
                 free(load_offsets);
                 free(load_sizes);
                 ds4_engine_close(e);
                 *out = NULL;
                 return 1;
             }
-            support_uses_secondary_rocm_cache = true;
+            support_uses_aux_cache = true;
         }
 #endif
         if (support_model_runtime_ready &&
-            !support_uses_secondary_rocm_cache &&
+            !support_uses_aux_cache &&
             !ds4_gpu_set_model_map_range(e->mtp_model.map,
                                            e->mtp_model.size,
                                            e->mtp_model.tensor_data_pos,
