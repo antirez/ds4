@@ -45,6 +45,9 @@ typedef struct {
 
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);
+/* Page-aligned host bytes become a model view so Qwen GEMMs can bind them. */
+int ds4_gpu_register_host_model(const void *map, uint64_t size);
+void ds4_gpu_unregister_host_model(const void *map);
 
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes);
@@ -3531,6 +3534,33 @@ int ds4_gpu_mm3_moe_reduce_tensor(
 int ds4_gpu_mm3_publish(const ds4_gpu_tensor *a, const ds4_gpu_tensor *b, uint32_t n);
 int ds4_gpu_mm3_publish_wait(uint32_t n, int32_t *out);
 int ds4_gpu_mm3_glu_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *gate, const ds4_gpu_tensor *up, uint32_t n);
+int ds4_gpu_mm3_moe_mid_scaled_tensor(
+        ds4_gpu_tensor *mid, const ds4_gpu_tensor *x, const ds4_gpu_tensor *selected,
+        const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset,
+        uint64_t gate_scale_offset, uint64_t up_scale_offset, uint32_t weight_type,
+        uint32_t n_total_expert, uint32_t n_tokens, uint32_t n_slots, uint32_t in_dim, uint32_t ff_dim);
+int ds4_gpu_mm3_moe_down_scaled_tensor(
+        ds4_gpu_tensor *part, const ds4_gpu_tensor *mid, const ds4_gpu_tensor *selected,
+        const void *model_map, uint64_t model_size, uint64_t down_offset, uint64_t down_scale_offset,
+        uint32_t weight_type, uint32_t n_total_expert, uint32_t n_tokens, uint32_t n_slots,
+        uint32_t ff_dim, uint32_t out_dim);
+/* T>1 routed experts.  DS4_METAL_MM3_MOE_GROUPED=0 keeps the per-token kernels.
+ * lists is [n_expert][list_cap] of (token * n_slots + slot); list_cap must hold
+ * every pair.  The one-token kernels are not used here. */
+int ds4_gpu_mm3_moe_grouped_enabled(void);
+int ds4_gpu_mm3_moe_mid_grouped_tensor(
+        ds4_gpu_tensor *mid, const ds4_gpu_tensor *x, const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *lists, const ds4_gpu_tensor *counts,
+        const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset,
+        uint64_t gate_scale_offset, uint64_t up_scale_offset, uint32_t weight_type,
+        uint32_t n_total_expert, uint32_t n_tokens, uint32_t n_slots, uint32_t in_dim, uint32_t ff_dim,
+        uint32_t list_cap);
+int ds4_gpu_mm3_moe_down_grouped_tensor(
+        ds4_gpu_tensor *part, const ds4_gpu_tensor *mid, const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *lists, const ds4_gpu_tensor *counts,
+        const void *model_map, uint64_t model_size, uint64_t down_offset, uint64_t down_scale_offset,
+        uint32_t weight_type, uint32_t n_total_expert, uint32_t n_tokens, uint32_t n_slots,
+        uint32_t ff_dim, uint32_t out_dim, uint32_t list_cap);
 /* One-token routed experts, selected indexing experts of the given bases:
  * gate/up pair with SwiGLU-OAI into mid[n_slots][ff_dim]; down from mid into
  * part[n_slots][out_dim]. */

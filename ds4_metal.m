@@ -2121,6 +2121,63 @@ void ds4_gpu_model_residency_skip(int skip) {
     g_model_residency_skipped = skip;
 }
 
+int ds4_gpu_register_host_model(const void *map, uint64_t size) {
+    if (!map || size == 0 || (!g_initialized && !ds4_gpu_init())) return 0;
+    const uint64_t page = (uint64_t)getpagesize();
+    if (((uintptr_t)map & (uintptr_t)(page - 1)) != 0 || (size & (page - 1)) != 0) {
+        fprintf(stderr, "ds4: host model registration requires a page-aligned pointer and length\n");
+        return 0;
+    }
+    uint64_t max_buffer = (uint64_t)[g_device maxBufferLength] & ~(page - 1);
+    if (size > max_buffer) {
+        fprintf(stderr, "ds4: host model %.2f GiB exceeds the Metal buffer limit %.2f GiB\n",
+                (double)size / (1024.0 * 1024.0 * 1024.0),
+                (double)max_buffer / (1024.0 * 1024.0 * 1024.0));
+        return 0;
+    }
+    if (g_model_view_count >= DS4_METAL_MAX_MODEL_VIEWS) return 0;
+    id<MTLBuffer> buffer = [g_device newBufferWithBytesNoCopy:(void *)map
+                                                       length:(NSUInteger)size
+                                                      options:ds4_gpu_model_resource_options()
+                                                  deallocator:nil];
+    if (!buffer) {
+        fprintf(stderr, "ds4: Metal could not wrap the host model (%" PRIu64 " bytes)\n", size);
+        return 0;
+    }
+    buffer.label = @"ds4_host_model";
+    g_model_views[g_model_view_count].buffer = buffer;
+    g_model_views[g_model_view_count].model_map = map;
+    g_model_views[g_model_view_count].model_size = size;
+    g_model_views[g_model_view_count].model_offset = 0;
+    g_model_views[g_model_view_count].bytes = size;
+    g_model_view_count++;
+    if (g_model_residency_set) {
+        [g_model_residency_set addAllocation:buffer];
+        [g_model_residency_set commit];
+        [g_model_residency_set requestResidency];
+    }
+    return 1;
+}
+
+void ds4_gpu_unregister_host_model(const void *map) {
+    if (!map) return;
+    uint32_t kept = 0;
+    for (uint32_t i = 0; i < g_model_view_count; i++) {
+        if (g_model_views[i].model_map == map) {
+            if (g_model_residency_set && g_model_views[i].buffer)
+                [g_model_residency_set removeAllocation:g_model_views[i].buffer];
+            g_model_views[i].buffer = nil;
+            continue;
+        }
+        if (kept != i) g_model_views[kept] = g_model_views[i];
+        kept++;
+    }
+    for (uint32_t i = kept; i < g_model_view_count; i++)
+        g_model_views[i] = (ds4_gpu_model_view){0};
+    g_model_view_count = kept;
+    if (g_model_residency_set) [g_model_residency_set commit];
+}
+
 static int ds4_gpu_model_residency_request_views(void) {
     if (g_model_view_count == 0 ||
         g_ssd_streaming_mode ||
@@ -48287,7 +48344,11 @@ enum {
     QWEN4_K_MM3_ROUTER,
     QWEN4_K_MM3_MOE_REDUCE,
     QWEN4_K_MM3_GLU,
+    QWEN4_K_MM3_MOE_MID_SCALED,
+    QWEN4_K_MM3_MOE_DOWN_SCALED,
     QWEN4_K_MM3_PUBLISH,
+    QWEN4_K_MM3_MOE_MID_GROUPED,
+    QWEN4_K_MM3_MOE_DOWN_GROUPED,
     QWEN4_K_COUNT,
 };
 
@@ -48401,7 +48462,11 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_mm3_router",
     "kernel_mm3_moe_reduce",
     "kernel_mm3_glu",
+    "kernel_mm3_moe_mid_scaled",
+    "kernel_mm3_moe_down_scaled",
     "kernel_mm3_publish",
+    "kernel_mm3_moe_mid_grouped",
+    "kernel_mm3_moe_down_grouped",
 };
 
 typedef struct {
@@ -48587,10 +48652,13 @@ static uint32_t qwen4_expert_row_bytes(uint32_t weight_type, uint32_t in_dim) {
     if (in_dim == 0 || (in_dim % 32u) != 0) return 0;
     switch (weight_type) {
     case 8u:  return (in_dim / 32u) * 34u;   /* q8_0 */
+    case 11u: return (in_dim % 256u) ? 0u : (in_dim / 256u) * 110u;   /* q3_K */
     case 12u: return (in_dim % 256u) ? 0u : (in_dim / 256u) * 144u;   /* q4_K */
+    case 14u: return (in_dim % 256u) ? 0u : (in_dim / 256u) * 210u;   /* q6_K */
     case 10u: return (in_dim % 256u) ? 0u : (in_dim / 256u) * 84u;    /* q2_K */
     case 16u: return (in_dim % 256u) ? 0u : (in_dim / 256u) * 66u;    /* iq2_xxs */
     case 39u: return (in_dim / 32u) * 17u;   /* mxfp4 */
+    case 40u: return (in_dim % 64u) ? 0u : (in_dim / 64u) * 36u;      /* nvfp4 */
     case 2u:  return (in_dim / 32u) * 18u;   /* q4_0 */
     case 1u:  return in_dim * 2u;            /* f16 */
     case 30u: return in_dim * 2u;            /* bf16 */
@@ -50171,6 +50239,141 @@ int ds4_gpu_mm3_glu_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *gate, cons
     }
     return qwen4_dispatch(QWEN4_K_MM3_GLU, &args, sizeof(args), b, 3,
                           MTLSizeMake((n + 255u) / 256u, 1, 1), MTLSizeMake(256, 1, 1), 0);
+}
+
+int ds4_gpu_mm3_moe_mid_scaled_tensor(
+        ds4_gpu_tensor *mid, const ds4_gpu_tensor *x, const ds4_gpu_tensor *selected,
+        const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset,
+        uint64_t gate_scale_offset, uint64_t up_scale_offset, uint32_t weight_type,
+        uint32_t n_total_expert, uint32_t n_tokens, uint32_t n_slots, uint32_t in_dim, uint32_t ff_dim) {
+    const uint32_t row = qwen4_expert_row_bytes(weight_type, in_dim);
+    const uint64_t expert = (uint64_t)row * ff_dim;
+    qwen4_moe_args args = { n_tokens, n_slots, in_dim, ff_dim, weight_type, row, expert,
+                            0u, 0u, 0u, n_total_expert, 0u, 1u };
+    /* has_shared is unused by this MiniMax-only kernel; carry the A/B switch
+     * without widening the shared host/Metal argument ABI. */
+    args.has_shared = ds4_gpu_env_bool("DS4_METAL_MM3_Q3_PAIR") != 0;
+    qwen4_bind b[7];
+    if (n_tokens == 0 || n_slots == 0 || row == 0 || ff_dim == 0 ||
+        !qwen4_bind_weight(&b[0], model_map, model_size, gate_offset, expert * n_total_expert, "mm3 scaled gate experts") ||
+        !qwen4_bind_weight(&b[1], model_map, model_size, up_offset, expert * n_total_expert, "mm3 scaled up experts") ||
+        !qwen4_bind_tensor(&b[2], selected, (uint64_t)n_tokens * n_slots * 4u, "mm3 scaled selected") ||
+        !qwen4_bind_tensor(&b[3], x, (uint64_t)n_tokens * in_dim * 4u, "mm3 scaled input") ||
+        !qwen4_bind_tensor(&b[4], mid, (uint64_t)n_tokens * n_slots * ff_dim * 4u, "mm3 scaled mid") ||
+        !qwen4_bind_weight(&b[5], model_map, model_size, gate_scale_offset, (uint64_t)n_total_expert * 4u, "mm3 gate scales") ||
+        !qwen4_bind_weight(&b[6], model_map, model_size, up_scale_offset, (uint64_t)n_total_expert * 4u, "mm3 up scales")) {
+        return 0;
+    }
+    const uint32_t nsg = 4u, rows = 2u * nsg;
+    return qwen4_dispatch(QWEN4_K_MM3_MOE_MID_SCALED, &args, sizeof(args), b, 7,
+                          MTLSizeMake((ff_dim + rows - 1u) / rows, n_slots, n_tokens),
+                          MTLSizeMake(32u * nsg, 1, 1), 0);
+}
+
+int ds4_gpu_mm3_moe_down_scaled_tensor(
+        ds4_gpu_tensor *part, const ds4_gpu_tensor *mid, const ds4_gpu_tensor *selected,
+        const void *model_map, uint64_t model_size, uint64_t down_offset, uint64_t down_scale_offset,
+        uint32_t weight_type, uint32_t n_total_expert, uint32_t n_tokens, uint32_t n_slots,
+        uint32_t ff_dim, uint32_t out_dim) {
+    const uint32_t row = qwen4_expert_row_bytes(weight_type, ff_dim);
+    const uint64_t expert = (uint64_t)row * out_dim;
+    qwen4_moe_args args = { n_tokens, n_slots, ff_dim, out_dim, weight_type, row, expert,
+                            0u, 0u, 0u, n_total_expert, 0u, 1u };
+    args.has_shared = ds4_gpu_env_bool("DS4_METAL_MM3_Q6_FAST") != 0;
+    args.shared_type = ds4_gpu_env_bool("DS4_METAL_MM3_NVFP4_FAST") != 0;
+    qwen4_bind b[5];
+    if (n_tokens == 0 || n_slots == 0 || row == 0 || out_dim == 0 ||
+        !qwen4_bind_weight(&b[0], model_map, model_size, down_offset, expert * n_total_expert, "mm3 scaled down experts") ||
+        !qwen4_bind_tensor(&b[1], selected, (uint64_t)n_tokens * n_slots * 4u, "mm3 scaled selected") ||
+        !qwen4_bind_tensor(&b[2], mid, (uint64_t)n_tokens * n_slots * ff_dim * 4u, "mm3 scaled mid") ||
+        !qwen4_bind_tensor(&b[3], part, (uint64_t)n_tokens * n_slots * out_dim * 4u, "mm3 scaled partial") ||
+        !qwen4_bind_weight(&b[4], model_map, model_size, down_scale_offset, (uint64_t)n_total_expert * 4u, "mm3 down scales")) {
+        return 0;
+    }
+    const uint32_t nsg = 4u, rows = 2u * nsg;
+    return qwen4_dispatch(QWEN4_K_MM3_MOE_DOWN_SCALED, &args, sizeof(args), b, 5,
+                          MTLSizeMake((out_dim + rows - 1u) / rows, n_slots, n_tokens),
+                          MTLSizeMake(32u * nsg, 1, 1), 0);
+}
+
+/* Verify batches keep the per-pair grid. A prefill chunk is one group per
+ * expert row-block; the owner grid at T=1024 would be almost all idle. */
+#define MM3_MOE_GROUP_OWNER_MAX 16u
+
+int ds4_gpu_mm3_moe_grouped_enabled(void) {
+    return ds4_gpu_env_bool("DS4_METAL_MM3_MOE_GROUPED") != 0;
+}
+
+static MTLSize mm3_moe_grouped_grid(uint32_t row_blocks, uint32_t n_tokens, uint32_t n_slots,
+                                    uint32_t n_expert, uint32_t expert_major) {
+    return expert_major ? MTLSizeMake(row_blocks, n_expert, 1)
+                        : MTLSizeMake(row_blocks, n_slots, n_tokens);
+}
+
+int ds4_gpu_mm3_moe_mid_grouped_tensor(
+        ds4_gpu_tensor *mid, const ds4_gpu_tensor *x, const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *lists, const ds4_gpu_tensor *counts,
+        const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset,
+        uint64_t gate_scale_offset, uint64_t up_scale_offset, uint32_t weight_type,
+        uint32_t n_total_expert, uint32_t n_tokens, uint32_t n_slots, uint32_t in_dim, uint32_t ff_dim,
+        uint32_t list_cap) {
+    const uint32_t row = qwen4_expert_row_bytes(weight_type, in_dim);
+    const uint64_t expert = (uint64_t)row * ff_dim;
+    const uint32_t expert_major = n_tokens > MM3_MOE_GROUP_OWNER_MAX ? 1u : 0u;
+    qwen4_moe_args args = { n_tokens, n_slots, in_dim, ff_dim, weight_type, row, expert,
+                            0u, 0u, expert_major, n_total_expert, list_cap, 1u };
+    args.has_shared = ds4_gpu_env_bool("DS4_METAL_MM3_Q3_PAIR") != 0;
+    qwen4_bind b[9];
+    if (n_tokens < 2u || n_slots == 0 || row == 0 || ff_dim == 0 || list_cap == 0 ||
+        (uint64_t)n_tokens * n_slots > list_cap ||
+        !qwen4_bind_weight(&b[0], model_map, model_size, gate_offset, expert * n_total_expert, "mm3 grouped gate") ||
+        !qwen4_bind_weight(&b[1], model_map, model_size, up_offset, expert * n_total_expert, "mm3 grouped up") ||
+        !qwen4_bind_tensor(&b[2], selected, (uint64_t)n_tokens * n_slots * 4u, "mm3 grouped selected") ||
+        !qwen4_bind_tensor(&b[3], x, (uint64_t)n_tokens * in_dim * 4u, "mm3 grouped input") ||
+        !qwen4_bind_tensor(&b[4], mid, (uint64_t)n_tokens * n_slots * ff_dim * 4u, "mm3 grouped mid") ||
+        !qwen4_bind_weight(&b[5], model_map, model_size, gate_scale_offset, (uint64_t)n_total_expert * 4u, "mm3 grouped gate scales") ||
+        !qwen4_bind_weight(&b[6], model_map, model_size, up_scale_offset, (uint64_t)n_total_expert * 4u, "mm3 grouped up scales") ||
+        !qwen4_bind_tensor(&b[7], lists, (uint64_t)n_total_expert * list_cap * 4u, "mm3 grouped lists") ||
+        !qwen4_bind_tensor(&b[8], counts, (uint64_t)n_total_expert * 4u, "mm3 grouped counts")) {
+        return 0;
+    }
+    const uint32_t nsg = 4u, rows = 2u * nsg;
+    const uint32_t row_blocks = (ff_dim + rows - 1u) / rows;
+    return qwen4_dispatch(QWEN4_K_MM3_MOE_MID_GROUPED, &args, sizeof(args), b, 9,
+                          mm3_moe_grouped_grid(row_blocks, n_tokens, n_slots, n_total_expert, expert_major),
+                          MTLSizeMake(32u * nsg, 1, 1), 0);
+}
+
+int ds4_gpu_mm3_moe_down_grouped_tensor(
+        ds4_gpu_tensor *part, const ds4_gpu_tensor *mid, const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *lists, const ds4_gpu_tensor *counts,
+        const void *model_map, uint64_t model_size, uint64_t down_offset, uint64_t down_scale_offset,
+        uint32_t weight_type, uint32_t n_total_expert, uint32_t n_tokens, uint32_t n_slots,
+        uint32_t ff_dim, uint32_t out_dim, uint32_t list_cap) {
+    const uint32_t row = qwen4_expert_row_bytes(weight_type, ff_dim);
+    const uint64_t expert = (uint64_t)row * out_dim;
+    const uint32_t expert_major = n_tokens > MM3_MOE_GROUP_OWNER_MAX ? 1u : 0u;
+    qwen4_moe_args args = { n_tokens, n_slots, ff_dim, out_dim, weight_type, row, expert,
+                            0u, 0u, expert_major, n_total_expert, list_cap, 1u };
+    args.has_shared = ds4_gpu_env_bool("DS4_METAL_MM3_Q6_FAST") != 0;
+    args.shared_type = ds4_gpu_env_bool("DS4_METAL_MM3_NVFP4_FAST") != 0;
+    qwen4_bind b[7];
+    if (n_tokens < 2u || n_slots == 0 || row == 0 || out_dim == 0 || list_cap == 0 ||
+        (uint64_t)n_tokens * n_slots > list_cap ||
+        !qwen4_bind_weight(&b[0], model_map, model_size, down_offset, expert * n_total_expert, "mm3 grouped down") ||
+        !qwen4_bind_tensor(&b[1], selected, (uint64_t)n_tokens * n_slots * 4u, "mm3 grouped selected") ||
+        !qwen4_bind_tensor(&b[2], mid, (uint64_t)n_tokens * n_slots * ff_dim * 4u, "mm3 grouped mid") ||
+        !qwen4_bind_tensor(&b[3], part, (uint64_t)n_tokens * n_slots * out_dim * 4u, "mm3 grouped partial") ||
+        !qwen4_bind_weight(&b[4], model_map, model_size, down_scale_offset, (uint64_t)n_total_expert * 4u, "mm3 grouped down scales") ||
+        !qwen4_bind_tensor(&b[5], lists, (uint64_t)n_total_expert * list_cap * 4u, "mm3 grouped lists") ||
+        !qwen4_bind_tensor(&b[6], counts, (uint64_t)n_total_expert * 4u, "mm3 grouped counts")) {
+        return 0;
+    }
+    const uint32_t nsg = 4u, rows = 2u * nsg;
+    const uint32_t row_blocks = (out_dim + rows - 1u) / rows;
+    return qwen4_dispatch(QWEN4_K_MM3_MOE_DOWN_GROUPED, &args, sizeof(args), b, 7,
+                          mm3_moe_grouped_grid(row_blocks, n_tokens, n_slots, n_total_expert, expert_major),
+                          MTLSizeMake(32u * nsg, 1, 1), 0);
 }
 
 /* One-token routed experts on the DeepSeek routed matvecs (lane per 32-wide

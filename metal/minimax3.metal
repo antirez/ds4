@@ -448,6 +448,193 @@ kernel void kernel_mm3_glu(
     out[gid] = qwen4_swiglu_oai(gate[gid], up[gid]);
 }
 
+/* MiniMax GGUFs keep routed expert matrices unscaled and store one F32
+ * multiplier per expert/projection.  Gate and up must be scaled before the
+ * non-linearity; down must be scaled before the routed reduction. */
+static inline float2 mm3_q3_pair_dot(
+        device const char *gate_row,
+        device const char *up_row,
+        device const float *x,
+        uint in_dim,
+        ushort lane) {
+    float gate_acc = 0.0f, up_acc = 0.0f;
+    const uint nb = in_dim / 256u;
+    const uint lane0 = (uint)lane * 8u;
+    /* A lane's eight values stay inside one 16-value Q3_K scale group.
+     * Decode that group's metadata once per block, and reuse each activation
+     * load for the gate and up rows.  The generic row-dot path decoded the
+     * same scale eight times and loaded x independently for both matrices. */
+    const uint group = (uint)lane / 2u;
+    const uint local = group & 7u;
+    const uint l0 = ((uint)lane & 1u) * 8u;
+    const uint sg = group / 4u;
+    const uint kmask1 = sg > 1u ? (sg > 2u ? 192u : 48u) : (sg > 0u ? 12u : 3u);
+    const uint kmask2 = group >= 8u ? 0xF0u : 0x0Fu;
+    const uint qbase = (group >= 8u ? 32u : 0u) + (local & 1u) * 16u;
+    const uint qshift = 2u * (local / 2u);
+    const uint hbase = (local & 1u) * 16u;
+    const uint hbit = 1u << (group / 2u);
+    for (uint ib = 0; ib < nb; ib++) {
+        device const uchar *gb = (device const uchar *)(gate_row + (uint64_t)ib * 110u);
+        device const uchar *ub = (device const uchar *)(up_row + (uint64_t)ib * 110u);
+        device const uchar *gsc = gb + 96u, *usc = ub + 96u;
+        const uint gs2 = gsc[local], gs1 = gsc[8u + (local & 3u)];
+        const uint us2 = usc[local], us1 = usc[8u + (local & 3u)];
+        const uint gp = (local / 4u) & 1u ? (gs2 & kmask2) | ((gs1 & kmask1) << 2u)
+                                               : (gs2 & kmask2) | ((gs1 & kmask1) << 4u);
+        const uint up = (local / 4u) & 1u ? (us2 & kmask2) | ((us1 & kmask1) << 2u)
+                                               : (us2 & kmask2) | ((us1 & kmask1) << 4u);
+        const float gscale = (float)(*(device const half *)(gb + 108u)) *
+                             ((float)(group < 8u ? gp : gp / 16u) - 32.0f);
+        const float uscale = (float)(*(device const half *)(ub + 108u)) *
+                             ((float)(group < 8u ? up : up / 16u) - 32.0f);
+        device const uchar *gq = gb + 32u, *uq = ub + 32u;
+        for (uint i = 0; i < 8u; i++) {
+            const uint l = l0 + i;
+            const float xv = x[ib * 256u + lane0 + i];
+            const uint gqv = (gq[qbase + l] >> qshift) & 3u;
+            const uint uqv = (uq[qbase + l] >> qshift) & 3u;
+            gate_acc += gscale * ((float)gqv - ((gb[hbase + l] & hbit) ? 0.0f : 4.0f)) * xv;
+            up_acc += uscale * ((float)uqv - ((ub[hbase + l] & hbit) ? 0.0f : 4.0f)) * xv;
+        }
+    }
+    return float2(simd_sum(gate_acc), simd_sum(up_acc));
+}
+
+static inline float mm3_q6_row_dot(
+        device const char *row,
+        device const float *x,
+        uint in_dim,
+        ushort lane) {
+    float acc = 0.0f;
+    const uint nb = in_dim / 256u;
+    const uint lane0 = (uint)lane * 8u;
+    /* As with Q3_K, a lane's eight consecutive values remain inside one
+     * Q6_K scale group and one packed quadrant.  Hoist all address/scale
+     * decoding that does not vary across those eight values. */
+    const uint half128 = lane0 / 128u;
+    const uint p0 = lane0 & 127u;
+    const uint quadrant = p0 / 32u;
+    const uint l0 = p0 & 31u;
+    const uint qli0 = half128 * 64u + l0 + ((quadrant & 1u) ? 32u : 0u);
+    const uint qhi0 = half128 * 32u + l0;
+    const uint qh_shift = 2u * quadrant;
+    const uint scale_i = half128 * 8u + (l0 / 16u) + 2u * quadrant;
+    for (uint ib = 0; ib < nb; ib++) {
+        device const uchar *b = (device const uchar *)(row + (uint64_t)ib * 210u);
+        device const uchar *ql = b, *qh = b + 128u;
+        device const char *sc = (device const char *)(b + 192u);
+        const float scale = (float)(*(device const half *)(b + 208u)) * (float)sc[scale_i];
+        for (uint i = 0; i < 8u; i++) {
+            const uint lo = quadrant >= 2u ? ql[qli0 + i] >> 4u : ql[qli0 + i] & 0xFu;
+            const uint hi = (qh[qhi0 + i] >> qh_shift) & 3u;
+            acc += scale * (float)((int)(lo | (hi << 4u)) - 32) * x[ib * 256u + lane0 + i];
+        }
+    }
+    return simd_sum(acc);
+}
+
+static inline float mm3_nvfp4_row_dot(
+        device const char *row,
+        device const float *x,
+        uint in_dim,
+        ushort lane) {
+    float acc = 0.0f;
+    const uint nb = in_dim / 64u;
+    const uint lane_group = (uint)lane / 8u;
+    const uint lane0 = ((uint)lane & 7u) * 8u;
+    const uint sub = lane0 / 16u;
+    const uint j0 = lane0 & 15u;
+    for (uint ib = lane_group; ib < nb; ib += 4u) {
+        device const uchar *b = (device const uchar *)(row + (uint64_t)ib * 36u);
+        const uchar e = b[sub];
+        float scale = 0.0f;
+        if (e != 0u && e != 0x7Fu) {
+            const uint ex = (e >> 3u) & 0xFu, man = e & 7u;
+            scale = ex == 0u ? ldexp((float)man, -10) :
+                               ldexp(1.0f + (float)man / 8.0f, (int)ex - 8);
+        }
+        device const uchar *q = b + 4u + sub * 8u;
+        for (uint i = 0; i < 8u; i++) {
+            const uint j = j0 + i;
+            const uchar packed = q[j & 7u];
+            const uint qv = j < 8u ? packed & 0xFu : packed >> 4u;
+            acc += scale * ds4_metal_mxfp4_values[qv] * x[ib * 64u + lane0 + i];
+        }
+    }
+    return simd_sum(acc);
+}
+
+kernel void kernel_mm3_moe_mid_scaled(
+        constant ds4_metal_args_qwen4_moe & args,
+        device const char    *gate_base,
+        device const char    *up_base,
+        device const int32_t *selected,
+        device const float   *x,
+        device float         *mid,
+        device const float   *gate_scale,
+        device const float   *up_scale,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]]) {
+    const uint slot = tgpig.y, tok = tgpig.z;
+    const uint row0 = (tgpig.x * (ntg.x / 32u) + (uint)sgitg) * 2u;
+    if (row0 >= args.out_rows || slot >= args.n_slots || tok >= args.n_tokens) return;
+    const int32_t expert = selected[(uint64_t)tok * args.n_slots + slot];
+    const uint64_t out_base = ((uint64_t)tok * args.n_slots + slot) * args.out_rows;
+    if (expert < 0 || (uint)expert >= args.n_total_expert) {
+        if (tiisg == 0) for (uint r = row0; r < row0 + 2u && r < args.out_rows; r++) mid[out_base + r] = 0.0f;
+        return;
+    }
+    const uint e = (uint)expert;
+    const uint64_t ebase = (uint64_t)e * args.expert_bytes;
+    device const float *xt = x + (uint64_t)tok * args.in_dim;
+    for (uint r = row0; r < row0 + 2u && r < args.out_rows; r++) {
+        const uint64_t off = ebase + (uint64_t)r * args.row_bytes;
+        const float2 gu = args.weight_type == 11u && args.has_shared != 0u
+            ? mm3_q3_pair_dot(gate_base + off, up_base + off, xt, args.in_dim, tiisg)
+            : float2(qwen4_row_dot(gate_base + off, xt, args.weight_type, args.in_dim, tiisg),
+                     qwen4_row_dot(up_base + off, xt, args.weight_type, args.in_dim, tiisg));
+        const float g = gu.x, u = gu.y;
+        if (tiisg == 0) mid[out_base + r] = qwen4_swiglu_oai(g * gate_scale[e], u * up_scale[e]);
+    }
+}
+
+kernel void kernel_mm3_moe_down_scaled(
+        constant ds4_metal_args_qwen4_moe & args,
+        device const char    *down_base,
+        device const int32_t *selected,
+        device const float   *mid,
+        device float         *part,
+        device const float   *down_scale,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]]) {
+    const uint slot = tgpig.y, tok = tgpig.z;
+    const uint row0 = (tgpig.x * (ntg.x / 32u) + (uint)sgitg) * 2u;
+    if (row0 >= args.out_rows || slot >= args.n_slots || tok >= args.n_tokens) return;
+    const int32_t expert = selected[(uint64_t)tok * args.n_slots + slot];
+    const uint64_t pair = (uint64_t)tok * args.n_slots + slot;
+    if (expert < 0 || (uint)expert >= args.n_total_expert) {
+        if (tiisg == 0) for (uint r = row0; r < row0 + 2u && r < args.out_rows; r++) part[pair * args.out_rows + r] = 0.0f;
+        return;
+    }
+    const uint e = (uint)expert;
+    const uint64_t ebase = (uint64_t)e * args.expert_bytes;
+    device const float *m = mid + pair * args.in_dim;
+    for (uint r = row0; r < row0 + 2u && r < args.out_rows; r++) {
+        device const char *row = down_base + ebase + (uint64_t)r * args.row_bytes;
+        const float v = args.weight_type == 14u && args.has_shared != 0u
+            ? mm3_q6_row_dot(row, m, args.in_dim, tiisg)
+            : args.weight_type == 40u && args.shared_type != 0u
+                ? mm3_nvfp4_row_dot(row, m, args.in_dim, tiisg)
+                : qwen4_row_dot(row, m, args.weight_type, args.in_dim, tiisg);
+        if (tiisg == 0) part[pair * args.out_rows + r] = v * down_scale[e];
+    }
+}
+
 // Publish the decode router's choice to the CPU without waiting for the
 // command buffer: both id lists and then the sequence number go to one small
 // shared line the host polls.
@@ -465,4 +652,353 @@ kernel void kernel_mm3_publish(
     }
     atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
     atomic_store_explicit(&line[0], seq, memory_order_relaxed);
+}
+
+/* Grouped routed experts.  shared_row_bytes == 0 keeps today's
+ * (row block, slot, token) grid.  shared_row_bytes != 0 is the prefill grid
+ * (row block, expert).  Fast Q3/Q6/NVFP4 rows are decoded once per four
+ * tokens; the per-token product is the same expression as the one-token dot. */
+template <uint NJ>
+static inline void mm3_q3_pair_nj(
+        device const char *gate_row,
+        device const char *up_row,
+        device const float *x,
+        thread const uint *pairs,
+        uint n_slots,
+        uint in_dim,
+        ushort lane,
+        thread float *gate_out,
+        thread float *up_out) {
+    float gate_acc[NJ], up_acc[NJ];
+#pragma unroll
+    for (uint j = 0; j < NJ; j++) { gate_acc[j] = 0.0f; up_acc[j] = 0.0f; }
+    const uint nb = in_dim / 256u;
+    const uint lane0 = (uint)lane * 8u;
+    const uint group = (uint)lane / 2u;
+    const uint local = group & 7u;
+    const uint l0 = ((uint)lane & 1u) * 8u;
+    const uint sg = group / 4u;
+    const uint kmask1 = sg > 1u ? (sg > 2u ? 192u : 48u) : (sg > 0u ? 12u : 3u);
+    const uint kmask2 = group >= 8u ? 0xF0u : 0x0Fu;
+    const uint qbase = (group >= 8u ? 32u : 0u) + (local & 1u) * 16u;
+    const uint qshift = 2u * (local / 2u);
+    const uint hbase = (local & 1u) * 16u;
+    const uint hbit = 1u << (group / 2u);
+    for (uint ib = 0; ib < nb; ib++) {
+        device const uchar *gb = (device const uchar *)(gate_row + (uint64_t)ib * 110u);
+        device const uchar *ub = (device const uchar *)(up_row + (uint64_t)ib * 110u);
+        device const uchar *gsc = gb + 96u, *usc = ub + 96u;
+        const uint gs2 = gsc[local], gs1 = gsc[8u + (local & 3u)];
+        const uint us2 = usc[local], us1 = usc[8u + (local & 3u)];
+        const uint gp = (local / 4u) & 1u ? (gs2 & kmask2) | ((gs1 & kmask1) << 2u)
+                                               : (gs2 & kmask2) | ((gs1 & kmask1) << 4u);
+        const uint upv = (local / 4u) & 1u ? (us2 & kmask2) | ((us1 & kmask1) << 2u)
+                                                : (us2 & kmask2) | ((us1 & kmask1) << 4u);
+        const float gscale = (float)(*(device const half *)(gb + 108u)) *
+                             ((float)(group < 8u ? gp : gp / 16u) - 32.0f);
+        const float uscale = (float)(*(device const half *)(ub + 108u)) *
+                             ((float)(group < 8u ? upv : upv / 16u) - 32.0f);
+        device const uchar *gq = gb + 32u, *uq = ub + 32u;
+        for (uint i = 0; i < 8u; i++) {
+            const uint l = l0 + i;
+            const uint gqv = (gq[qbase + l] >> qshift) & 3u;
+            const uint uqv = (uq[qbase + l] >> qshift) & 3u;
+            const float gh = (gb[hbase + l] & hbit) ? 0.0f : 4.0f;
+            const float uh = (ub[hbase + l] & hbit) ? 0.0f : 4.0f;
+#pragma unroll
+            for (uint j = 0; j < NJ; j++) {
+                const float xv = x[(uint64_t)(pairs[j] / n_slots) * in_dim + ib * 256u + lane0 + i];
+                gate_acc[j] += gscale * ((float)gqv - gh) * xv;
+                up_acc[j] += uscale * ((float)uqv - uh) * xv;
+            }
+        }
+    }
+#pragma unroll
+    for (uint j = 0; j < NJ; j++) {
+        gate_out[j] = simd_sum(gate_acc[j]);
+        up_out[j] = simd_sum(up_acc[j]);
+    }
+}
+
+template <uint NJ>
+static inline void mm3_q6_nj(
+        device const char *row,
+        device const float *mid,
+        thread const uint *pairs,
+        uint in_dim,
+        ushort lane,
+        thread float *out) {
+    float acc[NJ];
+#pragma unroll
+    for (uint j = 0; j < NJ; j++) acc[j] = 0.0f;
+    const uint nb = in_dim / 256u;
+    const uint lane0 = (uint)lane * 8u;
+    const uint half128 = lane0 / 128u;
+    const uint p0 = lane0 & 127u;
+    const uint quadrant = p0 / 32u;
+    const uint l0 = p0 & 31u;
+    const uint qli0 = half128 * 64u + l0 + ((quadrant & 1u) ? 32u : 0u);
+    const uint qhi0 = half128 * 32u + l0;
+    const uint qh_shift = 2u * quadrant;
+    const uint scale_i = half128 * 8u + (l0 / 16u) + 2u * quadrant;
+    for (uint ib = 0; ib < nb; ib++) {
+        device const uchar *b = (device const uchar *)(row + (uint64_t)ib * 210u);
+        device const uchar *ql = b, *qh = b + 128u;
+        device const char *sc = (device const char *)(b + 192u);
+        const float scale = (float)(*(device const half *)(b + 208u)) * (float)sc[scale_i];
+        for (uint i = 0; i < 8u; i++) {
+            const uint lo = quadrant >= 2u ? ql[qli0 + i] >> 4u : ql[qli0 + i] & 0xFu;
+            const uint hi = (qh[qhi0 + i] >> qh_shift) & 3u;
+            const float w = scale * (float)((int)(lo | (hi << 4u)) - 32);
+#pragma unroll
+            for (uint j = 0; j < NJ; j++)
+                acc[j] += w * mid[(uint64_t)pairs[j] * in_dim + ib * 256u + lane0 + i];
+        }
+    }
+#pragma unroll
+    for (uint j = 0; j < NJ; j++) out[j] = simd_sum(acc[j]);
+}
+
+template <uint NJ>
+static inline void mm3_nvfp4_nj(
+        device const char *row,
+        device const float *mid,
+        thread const uint *pairs,
+        uint in_dim,
+        ushort lane,
+        thread float *out) {
+    float acc[NJ];
+#pragma unroll
+    for (uint j = 0; j < NJ; j++) acc[j] = 0.0f;
+    const uint nb = in_dim / 64u;
+    const uint lane_group = (uint)lane / 8u;
+    const uint lane0 = ((uint)lane & 7u) * 8u;
+    const uint sub = lane0 / 16u;
+    const uint j0 = lane0 & 15u;
+    for (uint ib = lane_group; ib < nb; ib += 4u) {
+        device const uchar *b = (device const uchar *)(row + (uint64_t)ib * 36u);
+        const uchar e = b[sub];
+        float scale = 0.0f;
+        if (e != 0u && e != 0x7Fu) {
+            const uint ex = (e >> 3u) & 0xFu, man = e & 7u;
+            scale = ex == 0u ? ldexp((float)man, -10) :
+                               ldexp(1.0f + (float)man / 8.0f, (int)ex - 8);
+        }
+        device const uchar *q = b + 4u + sub * 8u;
+        for (uint i = 0; i < 8u; i++) {
+            const uint qj = j0 + i;
+            const uchar packed = q[qj & 7u];
+            const uint qv = qj < 8u ? packed & 0xFu : packed >> 4u;
+            const float w = scale * ds4_metal_mxfp4_values[qv];
+#pragma unroll
+            for (uint j = 0; j < NJ; j++)
+                acc[j] += w * mid[(uint64_t)pairs[j] * in_dim + ib * 64u + lane0 + i];
+        }
+    }
+#pragma unroll
+    for (uint j = 0; j < NJ; j++) out[j] = simd_sum(acc[j]);
+}
+
+static inline void mm3_grouped_pairs(device const int32_t *list, uint j0, uint n, uint n_pairs,
+                                     thread uint *pairs) {
+    for (uint j = 0; j < 4u; j++) pairs[j] = 0u;
+    for (uint j = 0; j < n; j++) {
+        const uint pair = (uint)list[j0 + j];
+        pairs[j] = pair < n_pairs ? pair : 0u;
+    }
+}
+
+static inline void mm3_moe_mid_grouped_rows(
+        constant ds4_metal_args_qwen4_moe & args,
+        device const char *gate_base,
+        device const char *up_base,
+        device const float *x,
+        device float *mid,
+        device const float *gate_scale,
+        device const float *up_scale,
+        device const int32_t *list,
+        uint count,
+        uint expert,
+        uint row0,
+        ushort tiisg) {
+    const uint64_t ebase = (uint64_t)expert * args.expert_bytes;
+    const uint n_pairs = args.n_tokens * args.n_slots;
+    const bool q3 = args.weight_type == 11u && args.has_shared != 0u;
+    const float gs = gate_scale[expert], us = up_scale[expert];
+    for (uint r = row0; r < row0 + 2u && r < args.out_rows; r++) {
+        const uint64_t off = ebase + (uint64_t)r * args.row_bytes;
+        if (!q3) {
+            for (uint j = 0; j < count; j++) {
+                const uint pair = (uint)list[j];
+                if (pair >= n_pairs) continue;
+                device const float *xt = x + (uint64_t)(pair / args.n_slots) * args.in_dim;
+                const float g = qwen4_row_dot(gate_base + off, xt, args.weight_type, args.in_dim, tiisg);
+                const float u = qwen4_row_dot(up_base + off, xt, args.weight_type, args.in_dim, tiisg);
+                if (tiisg == 0) mid[(uint64_t)pair * args.out_rows + r] = qwen4_swiglu_oai(g * gs, u * us);
+            }
+            continue;
+        }
+        for (uint j0 = 0; j0 < count; j0 += 4u) {
+            const uint n = count - j0 < 4u ? count - j0 : 4u;
+            uint pairs[4];
+            mm3_grouped_pairs(list, j0, n, n_pairs, pairs);
+            float g[4], u[4];
+            if (n == 4u) mm3_q3_pair_nj<4>(gate_base + off, up_base + off, x, pairs, args.n_slots, args.in_dim, tiisg, g, u);
+            else if (n == 3u) mm3_q3_pair_nj<3>(gate_base + off, up_base + off, x, pairs, args.n_slots, args.in_dim, tiisg, g, u);
+            else if (n == 2u) mm3_q3_pair_nj<2>(gate_base + off, up_base + off, x, pairs, args.n_slots, args.in_dim, tiisg, g, u);
+            else mm3_q3_pair_nj<1>(gate_base + off, up_base + off, x, pairs, args.n_slots, args.in_dim, tiisg, g, u);
+            if (tiisg != 0) continue;
+            for (uint j = 0; j < n; j++) {
+                const uint pair = pairs[j];
+                if (pair >= n_pairs || (uint)list[j0 + j] != pair) continue;
+                mid[(uint64_t)pair * args.out_rows + r] = qwen4_swiglu_oai(g[j] * gs, u[j] * us);
+            }
+        }
+    }
+}
+
+static inline void mm3_moe_down_grouped_rows(
+        constant ds4_metal_args_qwen4_moe & args,
+        device const char *down_base,
+        device const float *mid,
+        device float *part,
+        device const float *down_scale,
+        device const int32_t *list,
+        uint count,
+        uint expert,
+        uint row0,
+        ushort tiisg) {
+    const uint64_t ebase = (uint64_t)expert * args.expert_bytes;
+    const uint n_pairs = args.n_tokens * args.n_slots;
+    const bool q6 = args.weight_type == 14u && args.has_shared != 0u;
+    const bool nv = args.weight_type == 40u && args.shared_type != 0u;
+    const float ds = down_scale[expert];
+    for (uint r = row0; r < row0 + 2u && r < args.out_rows; r++) {
+        device const char *row = down_base + ebase + (uint64_t)r * args.row_bytes;
+        if (!q6 && !nv) {
+            for (uint j = 0; j < count; j++) {
+                const uint pair = (uint)list[j];
+                if (pair >= n_pairs) continue;
+                const float v = qwen4_row_dot(row, mid + (uint64_t)pair * args.in_dim, args.weight_type, args.in_dim, tiisg);
+                if (tiisg == 0) part[(uint64_t)pair * args.out_rows + r] = v * ds;
+            }
+            continue;
+        }
+        for (uint j0 = 0; j0 < count; j0 += 4u) {
+            const uint n = count - j0 < 4u ? count - j0 : 4u;
+            uint pairs[4];
+            mm3_grouped_pairs(list, j0, n, n_pairs, pairs);
+            float v[4];
+            if (q6) {
+                if (n == 4u) mm3_q6_nj<4>(row, mid, pairs, args.in_dim, tiisg, v);
+                else if (n == 3u) mm3_q6_nj<3>(row, mid, pairs, args.in_dim, tiisg, v);
+                else if (n == 2u) mm3_q6_nj<2>(row, mid, pairs, args.in_dim, tiisg, v);
+                else mm3_q6_nj<1>(row, mid, pairs, args.in_dim, tiisg, v);
+            } else if (n == 4u) mm3_nvfp4_nj<4>(row, mid, pairs, args.in_dim, tiisg, v);
+            else if (n == 3u) mm3_nvfp4_nj<3>(row, mid, pairs, args.in_dim, tiisg, v);
+            else if (n == 2u) mm3_nvfp4_nj<2>(row, mid, pairs, args.in_dim, tiisg, v);
+            else mm3_nvfp4_nj<1>(row, mid, pairs, args.in_dim, tiisg, v);
+            if (tiisg != 0) continue;
+            for (uint j = 0; j < n; j++) {
+                const uint pair = pairs[j];
+                if (pair >= n_pairs || (uint)list[j0 + j] != pair) continue;
+                part[(uint64_t)pair * args.out_rows + r] = v[j] * ds;
+            }
+        }
+    }
+}
+
+static inline uint mm3_grouped_count(constant ds4_metal_args_qwen4_moe & args,
+                                     device const int32_t *counts, uint expert) {
+    uint count = (uint)counts[expert];
+    if (count > args.list_cap) count = args.list_cap;
+    return count;
+}
+
+kernel void kernel_mm3_moe_mid_grouped(
+        constant ds4_metal_args_qwen4_moe & args,
+        device const char    *gate_base,
+        device const char    *up_base,
+        device const int32_t *selected,
+        device const float   *x,
+        device float         *mid,
+        device const float   *gate_scale,
+        device const float   *up_scale,
+        device const int32_t *lists,
+        device const int32_t *counts,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]]) {
+    const uint row0 = (tgpig.x * (ntg.x / 32u) + (uint)sgitg) * 2u;
+    if (row0 >= args.out_rows) return;
+    if (args.shared_row_bytes != 0u) {
+        const uint e = tgpig.y;
+        if (e >= args.n_total_expert) return;
+        const uint count = mm3_grouped_count(args, counts, e);
+        if (count == 0u) return;
+        mm3_moe_mid_grouped_rows(args, gate_base, up_base, x, mid, gate_scale, up_scale,
+                                 lists + (uint64_t)e * args.list_cap, count, e, row0, tiisg);
+        return;
+    }
+    const uint slot = tgpig.y, tok = tgpig.z;
+    if (slot >= args.n_slots || tok >= args.n_tokens) return;
+    const uint pair = tok * args.n_slots + slot;
+    const int32_t expert = selected[pair];
+    if (expert < 0 || (uint)expert >= args.n_total_expert) {
+        if (tiisg == 0) {
+            for (uint r = row0; r < row0 + 2u && r < args.out_rows; r++)
+                mid[(uint64_t)pair * args.out_rows + r] = 0.0f;
+        }
+        return;
+    }
+    const uint e = (uint)expert;
+    device const int32_t *list = lists + (uint64_t)e * args.list_cap;
+    const uint count = mm3_grouped_count(args, counts, e);
+    if (count == 0u || (uint)list[0] != pair) return;
+    mm3_moe_mid_grouped_rows(args, gate_base, up_base, x, mid, gate_scale, up_scale,
+                             list, count, e, row0, tiisg);
+}
+
+kernel void kernel_mm3_moe_down_grouped(
+        constant ds4_metal_args_qwen4_moe & args,
+        device const char    *down_base,
+        device const int32_t *selected,
+        device const float   *mid,
+        device float         *part,
+        device const float   *down_scale,
+        device const int32_t *lists,
+        device const int32_t *counts,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]]) {
+    const uint row0 = (tgpig.x * (ntg.x / 32u) + (uint)sgitg) * 2u;
+    if (row0 >= args.out_rows) return;
+    if (args.shared_row_bytes != 0u) {
+        const uint e = tgpig.y;
+        if (e >= args.n_total_expert) return;
+        const uint count = mm3_grouped_count(args, counts, e);
+        if (count == 0u) return;
+        mm3_moe_down_grouped_rows(args, down_base, mid, part, down_scale,
+                                  lists + (uint64_t)e * args.list_cap, count, e, row0, tiisg);
+        return;
+    }
+    const uint slot = tgpig.y, tok = tgpig.z;
+    if (slot >= args.n_slots || tok >= args.n_tokens) return;
+    const uint pair = tok * args.n_slots + slot;
+    const int32_t expert = selected[pair];
+    if (expert < 0 || (uint)expert >= args.n_total_expert) {
+        if (tiisg == 0) {
+            for (uint r = row0; r < row0 + 2u && r < args.out_rows; r++)
+                part[(uint64_t)pair * args.out_rows + r] = 0.0f;
+        }
+        return;
+    }
+    const uint e = (uint)expert;
+    device const int32_t *list = lists + (uint64_t)e * args.list_cap;
+    const uint count = mm3_grouped_count(args, counts, e);
+    if (count == 0u || (uint)list[0] != pair) return;
+    mm3_moe_down_grouped_rows(args, down_base, mid, part, down_scale,
+                              list, count, e, row0, tiisg);
 }

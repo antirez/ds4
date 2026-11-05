@@ -2600,7 +2600,75 @@ struct ds4_metal_args_qwen4_moe {
 static inline float qwen4_row_dot(device const char *row, device const float *x,
                                   uint weight_type, uint in_dim, ushort tiisg) {
     float acc = 0.0f;
-    if (weight_type == 8) {
+    if (weight_type == 11) {
+        /* q3_K: 256 values in 110 bytes.  Each lane owns eight consecutive
+         * values; spelling the GGML layout out here keeps the reference path
+         * simple and, importantly, preserves its signed six-bit scales. */
+        const uint nb = in_dim / 256u;
+        const uint lane0 = (uint)tiisg * 8u;
+        for (uint ib = 0; ib < nb; ib++) {
+            device const uchar *b = (device const uchar *)(row + (uint64_t)ib * 110u);
+            device const uchar *hm = b;
+            device const uchar *q = b + 32u;
+            device const uchar *sc = b + 96u;
+            const float d = (float)(*(device const half *)(b + 108u));
+            for (uint i = 0; i < 8u; i++) {
+                const uint k = lane0 + i, group = k / 16u, local = group & 7u, l = k & 15u;
+                const uint sg = group / 4u;
+                const uint kmask1 = sg > 1u ? (sg > 2u ? 192u : 48u) : (sg > 0u ? 12u : 3u);
+                const uint kmask2 = group >= 8u ? 0xF0u : 0x0Fu;
+                const uint s2 = sc[local], s1 = sc[8u + (local & 3u)];
+                const uint packed = (local / 4u) & 1u ? (s2 & kmask2) | ((s1 & kmask1) << 2u)
+                                                       : (s2 & kmask2) | ((s1 & kmask1) << 4u);
+                const float scale = d * ((float)(group < 8u ? packed : packed / 16u) - 32.0f);
+                const uint qv = (q[(group >= 8u ? 32u : 0u) + (local & 1u) * 16u + l] >>
+                                 (2u * (local / 2u))) & 3u;
+                const uint hbit = 1u << (group / 2u);
+                const float v = scale * ((float)qv - ((hm[(local & 1u) * 16u + l] & hbit) ? 0.0f : 4.0f));
+                acc += v * x[ib * 256u + k];
+            }
+        }
+    } else if (weight_type == 14) {
+        /* q6_K: lower nibbles, packed high two bits, signed per-16 scale. */
+        const uint nb = in_dim / 256u;
+        const uint lane0 = (uint)tiisg * 8u;
+        for (uint ib = 0; ib < nb; ib++) {
+            device const uchar *b = (device const uchar *)(row + (uint64_t)ib * 210u);
+            device const uchar *ql = b, *qh = b + 128u;
+            device const char *sc = (device const char *)(b + 192u);
+            const float d = (float)(*(device const half *)(b + 208u));
+            for (uint i = 0; i < 8u; i++) {
+                const uint k = lane0 + i, half128 = k / 128u, p = k & 127u;
+                const uint quadrant = p / 32u, l = p & 31u;
+                const uint qli = half128 * 64u + l + ((quadrant & 1u) ? 32u : 0u);
+                const uint lo = (quadrant >= 2u ? ql[qli] >> 4u : ql[qli] & 0xFu);
+                const uint hi = (qh[half128 * 32u + l] >> (2u * quadrant)) & 3u;
+                const int qv = (int)(lo | (hi << 4u)) - 32;
+                const uint si = half128 * 8u + (l / 16u) + 2u * quadrant;
+                acc += d * (float)sc[si] * (float)qv * x[ib * 256u + k];
+            }
+        }
+    } else if (weight_type == 40) {
+        /* NVFP4: four UE4M3 scales and four packed E2M1 groups per block. */
+        const uint nb = in_dim / 64u;
+        const uint lane0 = ((uint)tiisg & 7u) * 8u;
+        for (uint ib = (uint)tiisg / 8u; ib < nb; ib += 4u) {
+            device const uchar *b = (device const uchar *)(row + (uint64_t)ib * 36u);
+            for (uint i = 0; i < 8u; i++) {
+                const uint k = lane0 + i, sub = k / 16u, j = k & 15u;
+                const uchar packed = b[4u + sub * 8u + (j & 7u)];
+                const uint qv = j < 8u ? packed & 0xFu : packed >> 4u;
+                const uchar e = b[sub];
+                float scale = 0.0f;
+                if (e != 0u && e != 0x7Fu) {
+                    const uint ex = (e >> 3u) & 0xFu, man = e & 7u;
+                    scale = ex == 0u ? ldexp((float)man, -10) :
+                                      ldexp(1.0f + (float)man / 8.0f, (int)ex - 8);
+                }
+                acc += scale * ds4_metal_mxfp4_values[qv] * x[ib * 64u + k];
+            }
+        }
+    } else if (weight_type == 8) {
         const short ix = tiisg / 8, it = tiisg % 8;
         const uint nb = in_dim / 32;
         for (uint ib = (uint)ix; ib < nb; ib += 4) {

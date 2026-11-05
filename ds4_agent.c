@@ -296,7 +296,14 @@ typedef enum {
     AGENT_TOOL_SYNTAX_GLM,
     AGENT_TOOL_SYNTAX_DSML41,
     AGENT_TOOL_SYNTAX_QWEN,
+    AGENT_TOOL_SYNTAX_MINIMAX,
 } agent_tool_syntax;
+
+/* MiniMax-M3.1's template prefixes every native tool XML tag with this token.
+ * Some checkpoints wrap the current DSML stanza inside this native envelope. */
+#define AGENT_MM_NS "]<]minimax[>["
+#define AGENT_MM_TOOL_START AGENT_MM_NS "<tool_call>"
+#define AGENT_MM_TOOL_END AGENT_MM_NS "</tool_call>"
 
 typedef enum {
     AGENT_DSML_SEARCH,
@@ -324,6 +331,9 @@ typedef struct {
     agent_tool_calls calls;
     char error[160];
 } agent_dsml_parser;
+
+static void agent_dsml_feed(agent_dsml_parser *p, const char *s, size_t n);
+static void agent_dsml_finish(agent_dsml_parser *p);
 
 typedef enum {
     AGENT_TOOL_PARAM_NORMAL,
@@ -410,6 +420,7 @@ static int agent_read_default_lines(agent_worker *w);
 static int agent_compact_reserve_tokens(agent_worker *w);
 
 static agent_tool_syntax agent_tool_syntax_for_engine(ds4_engine *engine) {
+    if (ds4_engine_is_minimax3(engine)) return AGENT_TOOL_SYNTAX_MINIMAX;
     if (ds4_engine_is_qwen4(engine)) return AGENT_TOOL_SYNTAX_QWEN;
     return ds4_engine_is_glm_dsa(engine) ? AGENT_TOOL_SYNTAX_GLM
          : ds4_engine_is_deepseek41(engine) ? AGENT_TOOL_SYNTAX_DSML41
@@ -424,6 +435,7 @@ static const char *agent_dsml_tag_name(agent_tool_syntax syntax, const char *nam
 }
 
 static const char *agent_tool_start(agent_tool_syntax syntax) {
+    if (syntax == AGENT_TOOL_SYNTAX_MINIMAX) return AGENT_MM_TOOL_START;
     if (syntax == AGENT_TOOL_SYNTAX_GLM || syntax == AGENT_TOOL_SYNTAX_QWEN) return "<tool_call>";
     return syntax == AGENT_TOOL_SYNTAX_DSML41 ? "<｜DSML｜ calls>" : "<｜DSML｜tool_calls>";
 }
@@ -1436,7 +1448,79 @@ static char *agent_build_qwen_tools_prompt(bool edit_upto, bool vision) {
 
 static char *agent_dsml41_tools_prompt(const char *source);
 
+/* MiniMax-M3.1 was trained on its own namespaced XML, not DeepSeek DSML.
+ * Teaching DSML makes the model splice ]<]minimax[>[ into DSML tags and then
+ * debug the parser. The developer block below is the same grammar the server
+ * renders from chat_template.jinja. */
+static const char agent_minimax_tools_prompt_intro[] =
+    "You are a coding agent running in a local workspace. Use tools for local file and system work. "
+    "Avoid printing large file contents or large code blocks as answers; create or edit files with tools, "
+    "then summarize results briefly.\n\n"
+    "# Tools\n\n"
+    "You may call one or more tools to assist with the user query.\n"
+    "Here are the tools available in JSONSchema format:\n\n"
+    "<tools>";
+
+static const char agent_minimax_tools_prompt_after_schemas[] =
+    "\n</tools>\n\n"
+    AGENT_TOOL_CONTRACTS
+    "To call tools, wrap every invocation in one "
+    AGENT_MM_TOOL_START AGENT_MM_TOOL_END
+    " block. Prefix every tool tag with the tool-tag token "
+    AGENT_MM_NS
+    ". A parameter value is the raw text between its namespaced open tag and its namespaced close tag. "
+    "Put the closing tag immediately after the value, with no extra newline. "
+    "Do not emit the tool-tag token inside a value; that token ends the value.\n\n"
+    "Example:\n"
+    AGENT_MM_TOOL_START "\n"
+    AGENT_MM_NS "<invoke name=\"list\">"
+    AGENT_MM_NS "<path>."
+    AGENT_MM_NS "</path>"
+    AGENT_MM_NS "</invoke>\n"
+    AGENT_MM_NS "<invoke name=\"bash\">"
+    AGENT_MM_NS "<command>pwd"
+    AGENT_MM_NS "</command>"
+    AGENT_MM_NS "</invoke>\n"
+    AGENT_MM_TOOL_END "\n\n"
+    "You may emit this block inside <think> or after </think>. "
+    "When a tool is needed, emit one complete block and stop. "
+    "Do not describe alternate tag spellings, and do not retry by inventing different markup.\n\n"
+    "# Rules\n\n"
+    "- read path alone returns a context-sized bounded chunk, not the whole file; for first looks at large files, prefer max_lines around 80-160.\n"
+    "- If read says more lines are available, call more with count=<lines> to read the next chunk.\n"
+    "- Use whole=true only when the user explicitly asks for the complete file contents or when bounded chunks are insufficient for the task; add raw=true only when line numbers would corrupt the payload.\n"
+    "- " AGENT_EDIT_TARGET_RULE "\n";
+
+static char *agent_build_minimax_tools_prompt(bool edit_upto, bool vision) {
+    static const char wrap[] = "\n<tool>";
+    const char *edit = edit_upto ? agent_glm_tools_prompt_edit_upto
+                                 : agent_glm_tools_prompt_edit_exact;
+    size_t lines = 1;
+    for (const char *q = agent_glm_tool_schemas; *q; q++) lines += *q == '\n';
+    size_t cap = strlen(agent_minimax_tools_prompt_intro) +
+                 strlen(agent_glm_tool_schemas) + lines * (sizeof(wrap) + 8) +
+                 strlen(agent_minimax_tools_prompt_after_schemas) + strlen(edit) +
+                 strlen(agent_glm_tools_prompt_rules_tail) + 1;
+    if (vision) cap += sizeof(wrap) + strlen(agent_vision_tool_schema) + 8;
+    char *out = xmalloc(cap);
+    size_t n = (size_t)snprintf(out, cap, "%s", agent_minimax_tools_prompt_intro);
+    const char *p = agent_glm_tool_schemas;
+    while (*p) {
+        const char *nl = strchr(p, '\n');
+        size_t len = nl ? (size_t)(nl - p) : strlen(p);
+        if (len) n += (size_t)snprintf(out + n, cap - n, "%s%.*s</tool>", wrap, (int)len, p);
+        p += len + (nl ? 1 : 0);
+    }
+    if (vision)
+        n += (size_t)snprintf(out + n, cap - n, "%s%s</tool>", wrap, agent_vision_tool_schema);
+    snprintf(out + n, cap - n, "%s%s%s", agent_minimax_tools_prompt_after_schemas, edit,
+             agent_glm_tools_prompt_rules_tail);
+    return out;
+}
+
 static char *agent_build_tools_prompt(ds4_engine *engine, bool edit_upto) {
+    if (agent_tool_syntax_for_engine(engine) == AGENT_TOOL_SYNTAX_MINIMAX)
+        return agent_build_minimax_tools_prompt(edit_upto, ds4_engine_has_vision(engine));
     if (agent_tool_syntax_for_engine(engine) == AGENT_TOOL_SYNTAX_QWEN)
         return agent_build_qwen_tools_prompt(edit_upto, ds4_engine_has_vision(engine));
     if (agent_tool_syntax_for_engine(engine) == AGENT_TOOL_SYNTAX_GLM)
@@ -1474,6 +1558,31 @@ static const char agent_qwen_syntax_reminder[] =
     "Tool-call syntax reminder:\n"
     "<tool_call>\n<function=$TOOL_NAME>\n<parameter=$PARAMETER_NAME>\n$PARAMETER_VALUE\n</parameter>\n"
     "</function>\n</tool_call>\n";
+
+static const char agent_minimax_syntax_reminder[] =
+    "MiniMax tool-call syntax reminder:\n"
+    AGENT_MM_TOOL_START "\n"
+    AGENT_MM_NS "<invoke name=\"$TOOL_NAME\">"
+    AGENT_MM_NS "<$PARAMETER_NAME>$PARAMETER_VALUE"
+    AGENT_MM_NS "</$PARAMETER_NAME>"
+    AGENT_MM_NS "</invoke>\n"
+    AGENT_MM_TOOL_END "\n"
+    "Prefix every tag with the tool-tag token. Put the closing tag immediately after the value.\n";
+
+static const char *agent_tool_syntax_name(agent_tool_syntax syntax) {
+    if (syntax == AGENT_TOOL_SYNTAX_QWEN) return "Qwen";
+    if (syntax == AGENT_TOOL_SYNTAX_GLM) return "GLM";
+    if (syntax == AGENT_TOOL_SYNTAX_MINIMAX) return "MiniMax";
+    return "DSML";
+}
+
+static const char *agent_tool_syntax_reminder_for(agent_tool_syntax syntax) {
+    if (syntax == AGENT_TOOL_SYNTAX_QWEN) return agent_qwen_syntax_reminder;
+    if (syntax == AGENT_TOOL_SYNTAX_GLM) return agent_glm_syntax_reminder;
+    if (syntax == AGENT_TOOL_SYNTAX_MINIMAX) return agent_minimax_syntax_reminder;
+    if (syntax == AGENT_TOOL_SYNTAX_DSML41) return agent_dsml41_syntax_reminder;
+    return agent_dsml_syntax_reminder;
+}
 
 #define AGENT_SYSTEM_PROMPT_REMINDER_TOKENS 50000
 
@@ -1545,6 +1654,20 @@ static char *agent_build_system_prompt_reminder(ds4_engine *engine,
     return out;
 }
 
+static void agent_append_minimax_developer(ds4_engine *engine, ds4_tokens *tokens,
+                                          const char *text, bool close_system) {
+    /* The root system block is still open on the first prompt. Later reminders
+     * are inserted between closed turns, so they must not emit a spare [e~[.
+     * Rendered-chat tokenization keeps ]<]minimax[>[ as the tool-tag token.
+     * User -sys text stays on the plain BPE path below. */
+    if (close_system)
+        ds4_tokenize_rendered_chat(engine, "[e~[\n]~b]developer\n", tokens);
+    else
+        ds4_tokenize_rendered_chat(engine, "]~b]developer\n", tokens);
+    ds4_tokenize_rendered_chat(engine, text ? text : "", tokens);
+    ds4_tokenize_rendered_chat(engine, "[e~[\n", tokens);
+}
+
 static void agent_append_system_prompt(ds4_engine *engine, ds4_tokens *tokens,
                                        const char *extra, bool edit_upto) {
     /* The built-in tool prompt is trusted DS4 control text.  Tokenize it like a
@@ -1553,9 +1676,11 @@ static void agent_append_system_prompt(ds4_engine *engine, ds4_tokens *tokens,
      * supplied -sys text: arbitrary user text containing <｜User｜>, <think>, or
      * ｜DSML｜ must remain plain content, not control tokens. */
     char *tools_prompt = agent_build_tools_prompt(engine, edit_upto);
-    if (agent_syntax_is_xml_tool_call(agent_tool_syntax_for_engine(engine)))
+    if (ds4_engine_is_minimax3(engine)) {
+        agent_append_minimax_developer(engine, tokens, tools_prompt, true);
+    } else if (agent_syntax_is_xml_tool_call(agent_tool_syntax_for_engine(engine))) {
         ds4_chat_append_message(engine, tokens, "system", tools_prompt);
-    else {
+    } else {
         if (ds4_engine_is_deepseek41(engine))
             ds4_chat_append_message(engine, tokens, "system", "");
         ds4_tokenize_rendered_chat(engine, tools_prompt, tokens);
@@ -1610,7 +1735,9 @@ static void agent_worker_maybe_append_system_prompt_reminder(agent_worker *w) {
     agent_publish_system_status(w, "Re-injecting system prompt reminder...");
     agent_trace(w, "system prompt reminder injected at transcript=%d",
                 w->transcript.len);
-    if (agent_syntax_is_xml_tool_call(agent_tool_syntax_for_engine(w->engine))) {
+    if (ds4_engine_is_minimax3(w->engine)) {
+        agent_append_minimax_developer(w->engine, &w->transcript, reminder, false);
+    } else if (agent_syntax_is_xml_tool_call(agent_tool_syntax_for_engine(w->engine))) {
         ds4_chat_append_message(w->engine, &w->transcript, "system", reminder);
     } else {
         ds4_tokenize_rendered_chat(w->engine, reminder, &w->transcript);
@@ -1944,6 +2071,21 @@ static bool agent_dsml_close_tag_at(const char *s, const char *name, size_t *tag
     return true;
 }
 
+/* MiniMax M3.1 frequently uses DSML opening/parameter tags but emits the
+ * final structural closers as ordinary XML.  The opener remains strict, so
+ * accepting this close-only variant cannot turn prose into a tool call. */
+static bool agent_plain_close_tag_at(const char *s, const char *name, size_t *tag_len) {
+    char prefix[64];
+    snprintf(prefix, sizeof(prefix), "</%s", name);
+    size_t prefix_len = strlen(prefix);
+    if (strncmp(s, prefix, prefix_len) != 0) return false;
+    const char *p = s + prefix_len;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    if (*p != '>') return false;
+    if (tag_len) *tag_len = (size_t)(p - s) + 1;
+    return true;
+}
+
 /* Recognize a streamed parameter close tag prefix.  Full close detection is
  * handled by agent_dsml_close_tag_at(); this helper exists for online behavior:
  * terminal rendering must hide partial close tags without waiting for the whole
@@ -2009,10 +2151,58 @@ static bool agent_tool_value_close_tail(agent_tool_syntax syntax,
     return agent_dsml_parameter_close_tail(syntax, tail, len, complete);
 }
 
+static void agent_minimax_close_tag(const char *name, char *dst, size_t dstlen) {
+    snprintf(dst, dstlen, "%s</%s>", AGENT_MM_NS, name ? name : "");
+}
+
+/* The close tag is the namespace token plus </name>. A literal </name> inside
+ * a shell command or a patch is ordinary value text. */
+static bool agent_minimax_close_tail(const char *name, const char *tail, size_t len,
+                                     bool *complete) {
+    char close[128];
+    agent_minimax_close_tag(name, close, sizeof(close));
+    size_t n = strlen(close);
+    *complete = false;
+    if (!n || len > n || memcmp(close, tail, len) != 0) return false;
+    *complete = len == n;
+    return true;
+}
+
+static bool agent_minimax_param_keeps_edges(const char *name) {
+    return name && (!strcmp(name, "old") || !strcmp(name, "new") ||
+                    !strcmp(name, "content"));
+}
+
+static int agent_minimax_match(const char *p, const char *end, const char *lit) {
+    size_t n = strlen(lit);
+    size_t have = (size_t)(end - p);
+    if (have >= n && memcmp(p, lit, n) == 0) return 1;
+    if (have < n && memcmp(lit, p, have) == 0) return 0;
+    return -1;
+}
+
 static void agent_dsml_update_param_close_prefix(agent_dsml_parser *p) {
     p->param_close_prefix = false;
     if (p->state != AGENT_DSML_PARAM_VALUE || p->raw_len <= p->param_value_start)
         return;
+
+    if (p->syntax == AGENT_TOOL_SYNTAX_MINIMAX) {
+        const char *value = p->raw + p->param_value_start;
+        const char *end = p->raw + p->raw_len;
+        const char *mark = end;
+        while (mark > value) {
+            mark--;
+            if (*mark == ']') break;
+        }
+        if (mark < value || *mark != ']') return;
+        size_t tail_len = (size_t)(end - mark);
+        if (tail_len > 96) return;
+        bool complete = false;
+        p->param_close_prefix =
+            agent_minimax_close_tail(p->param_name, mark, tail_len, &complete) &&
+            !complete;
+        return;
+    }
 
     const char *value = p->raw + p->param_value_start;
     const char *end = p->raw + p->raw_len;
@@ -2314,6 +2504,144 @@ static void agent_qwen_tool_parse(agent_dsml_parser *p) {
     }
 }
 
+/* MiniMax-M3.1 tool calls are namespaced XML, not DSML:
+ *   ]<]minimax[>[<tool_call>
+ *   ]<]minimax[>[<invoke name="list">]<]minimax[>[<path>.</path>]<]minimax[>[</invoke>
+ *   ]<]minimax[>[</tool_call>
+ * The namespace is one special token. Incomplete input waits. A literal
+ * </name> without that token stays inside the value. */
+static bool agent_minimax_name_ok(const char *s, size_t n) {
+    if (!n || n > 64) return false;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+              (c >= '0' && c <= '9') || c == '_' || c == '-'))
+            return false;
+    }
+    return true;
+}
+
+static void agent_minimax_tool_parse(agent_dsml_parser *p) {
+    static const char invoke_open[] = AGENT_MM_NS "<invoke name=\"";
+    static const char invoke_close[] = AGENT_MM_NS "</invoke>";
+    const char *start = AGENT_MM_TOOL_START;
+    if (p->raw_len < strlen(start) || memcmp(p->raw, start, strlen(start)) != 0)
+        return;
+
+    while (p->state == AGENT_DSML_STRUCTURAL || p->state == AGENT_DSML_PARAM_VALUE) {
+        const char *raw = p->raw;
+        const char *end = raw + p->raw_len;
+        if (p->state == AGENT_DSML_PARAM_VALUE) {
+            char close[128];
+            agent_minimax_close_tag(p->param_name, close, sizeof(close));
+            const char *value = raw + p->param_value_start;
+            const char *found = NULL;
+            size_t close_len = strlen(close);
+            for (const char *scan = value; (size_t)(end - scan) >= close_len; scan++) {
+                if (!memcmp(scan, close, close_len)) {
+                    found = scan;
+                    break;
+                }
+            }
+            if (!found) return;
+            const char *vs = value;
+            const char *ve = found;
+            if (!agent_minimax_param_keeps_edges(p->param_name)) {
+                while (ve > vs && (ve[-1] == ' ' || ve[-1] == '\t' ||
+                                   ve[-1] == '\n' || ve[-1] == '\r'))
+                    ve--;
+            }
+            agent_tool_call_add_arg(&p->current, p->param_name ? p->param_name : "",
+                                    vs, (size_t)(ve - vs), true, close);
+            free(p->param_name);
+            p->param_name = NULL;
+            p->param_close_prefix = false;
+            p->parse_pos = (size_t)(found - raw) + close_len;
+            p->state = AGENT_DSML_STRUCTURAL;
+            continue;
+        }
+
+        while (p->parse_pos < p->raw_len &&
+               (p->raw[p->parse_pos] == ' ' || p->raw[p->parse_pos] == '\t' ||
+                p->raw[p->parse_pos] == '\r' || p->raw[p->parse_pos] == '\n'))
+            p->parse_pos++;
+        if (p->parse_pos >= p->raw_len) return;
+
+        const char *cur = raw + p->parse_pos;
+        int tool_end = agent_minimax_match(cur, end, AGENT_MM_TOOL_END);
+        int inv_close = agent_minimax_match(cur, end, invoke_close);
+        if (tool_end == 0 || inv_close == 0) return;
+        if (tool_end == 1) {
+            if (p->current.name) agent_tool_calls_push(&p->calls, &p->current);
+            p->parse_pos += strlen(AGENT_MM_TOOL_END);
+            p->state = AGENT_DSML_DONE;
+            return;
+        }
+        if (!p->current.name) {
+            int opened = agent_minimax_match(cur, end, invoke_open);
+            if (opened == 0) return;
+            if (opened != 1) {
+                agent_dsml_set_error(p, "expected <invoke name=\"...\"> in MiniMax tool call");
+                return;
+            }
+            const char *name_start = cur + sizeof(invoke_open) - 1;
+            const char *quote = memchr(name_start, '"', (size_t)(end - name_start));
+            if (!quote) return;
+            if ((size_t)(end - quote) < 2) return;
+            if (quote[1] != '>') {
+                agent_dsml_set_error(p, "expected > after MiniMax invoke name");
+                return;
+            }
+            if (!agent_minimax_name_ok(name_start, (size_t)(quote - name_start))) {
+                agent_dsml_set_error(p, "invalid MiniMax tool name");
+                return;
+            }
+            agent_tool_call_free(&p->current);
+            p->current.name = xstrndup(name_start, (size_t)(quote - name_start));
+            p->parse_pos = (size_t)(quote + 2 - raw);
+            continue;
+        }
+        if (inv_close == 1) {
+            agent_tool_calls_push(&p->calls, &p->current);
+            p->parse_pos += sizeof(invoke_close) - 1;
+            continue;
+        }
+
+        const size_t ns_len = strlen(AGENT_MM_NS);
+        if ((size_t)(end - cur) < ns_len + 1 ||
+            memcmp(cur, AGENT_MM_NS, ns_len) != 0 || cur[ns_len] != '<') {
+            if (agent_minimax_match(cur, end, AGENT_MM_NS) == 0) return;
+            agent_dsml_set_error(p, "expected a parameter tag or </invoke> in MiniMax tool call");
+            return;
+        }
+        const char *key_start = cur + ns_len + 1;
+        if (key_start < end && *key_start == '/') {
+            agent_dsml_set_error(p, "unexpected MiniMax closing tag");
+            return;
+        }
+        const char *gt = memchr(key_start, '>', (size_t)(end - key_start));
+        if (!gt) {
+            size_t n = (size_t)(end - key_start);
+            if (n > 64 || (n && !agent_minimax_name_ok(key_start, n))) {
+                agent_dsml_set_error(p, "invalid MiniMax parameter name");
+                return;
+            }
+            return;
+        }
+        if (!agent_minimax_name_ok(key_start, (size_t)(gt - key_start))) {
+            agent_dsml_set_error(p, "invalid MiniMax parameter name");
+            return;
+        }
+        free(p->param_name);
+        p->param_name = xstrndup(key_start, (size_t)(gt - key_start));
+        p->param_is_string = true;
+        p->param_value_start = (size_t)(gt + 1 - raw);
+        p->parse_pos = p->param_value_start;
+        p->param_close_prefix = false;
+        p->state = AGENT_DSML_PARAM_VALUE;
+    }
+}
+
 static void agent_dsml_finish(agent_dsml_parser *p) {
     if (!p || p->state == AGENT_DSML_DONE || p->state == AGENT_DSML_ERROR)
         return;
@@ -2335,6 +2663,10 @@ static void agent_dsml_finish(agent_dsml_parser *p) {
  * until enough bytes arrive, while malformed completed input switches to
  * AGENT_DSML_ERROR so the model gets a retryable tool error. */
 static void agent_dsml_parse(agent_dsml_parser *p) {
+    if (p->syntax == AGENT_TOOL_SYNTAX_MINIMAX) {
+        agent_minimax_tool_parse(p);
+        return;
+    }
     if (p->syntax == AGENT_TOOL_SYNTAX_QWEN) {
         agent_qwen_tool_parse(p);
         return;
@@ -2372,13 +2704,15 @@ static void agent_dsml_parse(agent_dsml_parser *p) {
         if (p->parse_pos >= p->raw_len) return;
 
         size_t close_len = 0;
-        if (agent_dsml_close_tag_at(p->raw + p->parse_pos, calls, &close_len)) {
+        if (agent_dsml_close_tag_at(p->raw + p->parse_pos, calls, &close_len) ||
+            agent_plain_close_tag_at(p->raw + p->parse_pos, calls, &close_len)) {
             agent_tool_calls_push(&p->calls, &p->current);
             p->parse_pos += close_len;
             p->state = AGENT_DSML_DONE;
             return;
         }
-        if (agent_dsml_close_tag_at(p->raw + p->parse_pos, invoke, &close_len)) {
+        if (agent_dsml_close_tag_at(p->raw + p->parse_pos, invoke, &close_len) ||
+            agent_plain_close_tag_at(p->raw + p->parse_pos, invoke, &close_len)) {
             agent_tool_calls_push(&p->calls, &p->current);
             p->parse_pos += close_len;
             continue;
@@ -4040,14 +4374,17 @@ static void agent_tool_viz_restore_param_color(agent_stream_renderer *sr) {
  * as the model emits them, while still detecting the closing parameter tag. */
 static void agent_tool_viz_param_value_byte(agent_stream_renderer *sr, char c) {
     agent_tool_visualizer *v = &sr->viz;
+    const bool minimax = sr->parser &&
+                         sr->parser->syntax == AGENT_TOOL_SYNTAX_MINIMAX;
+    const char arm = minimax ? ']' : '<';
 
-    if (v->param_end_len || c == '<') {
+    if (v->param_end_len || c == arm) {
         if (v->param_end_len == sizeof(v->param_end_tail)) {
             size_t keep = v->param_end_len;
             v->param_end_len = 0;
             for (size_t i = 0; i < keep; i++)
                 agent_tool_viz_param_raw_byte(sr, v->param_end_tail[i]);
-            if (c != '<') {
+            if (c != arm) {
                 agent_tool_viz_param_raw_byte(sr, c);
                 return;
             }
@@ -4055,10 +4392,14 @@ static void agent_tool_viz_param_value_byte(agent_stream_renderer *sr, char c) {
         if (v->param_end_len < sizeof(v->param_end_tail))
             v->param_end_tail[v->param_end_len++] = c;
         bool complete = false;
-        if (agent_tool_value_close_tail(sr->parser->syntax,
-                                        v->param_end_tail,
-                                        v->param_end_len,
-                                        &complete)) {
+        bool held = minimax
+            ? agent_minimax_close_tail(v->param_name, v->param_end_tail,
+                                       v->param_end_len, &complete)
+            : agent_tool_value_close_tail(sr->parser->syntax,
+                                          v->param_end_tail,
+                                          v->param_end_len,
+                                          &complete);
+        if (held) {
             if (complete) agent_tool_viz_param_end(sr);
             return;
         }
@@ -4190,7 +4531,7 @@ static void agent_stream_preflight_closed_param(agent_stream_renderer *sr) {
                 sr->tool_preflight_error_msg);
 }
 
-static void agent_stream_feed_dsml_byte(agent_stream_renderer *sr, char c) {
+static void agent_stream_feed_dsml_byte_now(agent_stream_renderer *sr, char c) {
     bool was_param = !sr->dsml_ignored && sr->viz.param_active;
     agent_dsml_feed(sr->parser, &c, 1);
     if (!sr->dsml_ignored) {
@@ -4230,6 +4571,10 @@ static void agent_stream_feed_dsml_byte(agent_stream_renderer *sr, char c) {
     }
 }
 
+static void agent_stream_feed_dsml_byte(agent_stream_renderer *sr, char c) {
+    agent_stream_feed_dsml_byte_now(sr, c);
+}
+
 /* Start a DSML block from the streaming detector.  The detector may accept a
  * known malformed opening form for robustness, but the parser is seeded with
  * canonical bytes so all later parsing remains strict. */
@@ -4237,11 +4582,13 @@ static void agent_stream_start_dsml(agent_stream_renderer *sr, bool ignored) {
     sr->dsml_active = true;
     sr->dsml_ignored = ignored;
     if (ignored) sr->dsml_in_think = true;
+    else sr->dsml_in_think = false;
     sr->dsml_start_len = 0;
     sr->post_think_gap = false;
     agent_trace(sr->renderer->worker, "%s tool start detected%s",
                 sr->syntax == AGENT_TOOL_SYNTAX_QWEN ? "qwen" :
-                sr->syntax == AGENT_TOOL_SYNTAX_GLM ? "glm" : "dsml",
+                sr->syntax == AGENT_TOOL_SYNTAX_GLM ? "glm" :
+                sr->syntax == AGENT_TOOL_SYNTAX_MINIMAX ? "minimax" : "dsml",
                 ignored ? " inside thinking" : "");
     agent_dsml_start(sr->parser);
     if (!ignored) {
@@ -4267,6 +4614,16 @@ static bool agent_stream_dsml_start_match(agent_tool_syntax syntax,
                                           const char *tail, size_t len,
                                           bool *complete,
                                           bool *implicit_invoke) {
+    if (syntax == AGENT_TOOL_SYNTAX_MINIMAX) {
+        const size_t n = strlen(AGENT_MM_TOOL_START);
+        *complete = false;
+        *implicit_invoke = false;
+        if (len <= n && memcmp(AGENT_MM_TOOL_START, tail, len) == 0) {
+            *complete = len == n;
+            return true;
+        }
+        return false;
+    }
     if (agent_syntax_is_xml_tool_call(syntax)) {
         static const char glm_call[] = "<tool_call>";
         size_t form_len = sizeof(glm_call) - 1;
@@ -4341,6 +4698,11 @@ static bool agent_dsml_marker_detector_feed(agent_dsml_marker_detector *d,
 
 static void agent_stream_note_thinking_dsml_byte(agent_stream_renderer *sr,
                                                  char c) {
+    /* M3.1 commonly emits tool markup before it closes its reasoning block.
+     * MiniMax's tool template permits that placement, so do not poison the
+     * whole turn merely because an exploratory/malformed attempt contained a
+     * DSML marker.  Its parser still validates every executable call. */
+    if (sr->syntax == AGENT_TOOL_SYNTAX_MINIMAX) return;
     if (!sr->in_think || sr->dsml_in_think) return;
     if (agent_dsml_marker_detector_feed(&sr->think_dsml, c))
         sr->dsml_in_think = true;
@@ -4348,6 +4710,10 @@ static void agent_stream_note_thinking_dsml_byte(agent_stream_renderer *sr,
 
 static void agent_stream_note_plain_dsml_byte(agent_stream_renderer *sr,
                                               char c) {
+    /* MiniMax is not a DSML model. Mentioning those markers, or an old
+     * attempt that still emits them, must not become a tool error that
+     * teaches DSML back to the model. */
+    if (sr->syntax == AGENT_TOOL_SYNTAX_MINIMAX) return;
     if (sr->parser->state == AGENT_DSML_ERROR) return;
     if (sr->dsml_active || sr->in_think || sr->dsml_in_think) return;
     if (agent_dsml_marker_detector_feed(&sr->plain_dsml, c)) {
@@ -4393,8 +4759,14 @@ static void agent_stream_normal_byte(agent_stream_renderer *sr, char c) {
                  * strict and simple.  Also accept a direct invoke opener as an
                  * implicit tool_calls block; the model often knows it wants a
                  * tool but forgets the outer wrapper. */
-                agent_stream_start_dsml(sr, sr->in_think);
-                if (sr->syntax != AGENT_TOOL_SYNTAX_GLM && implicit_invoke) {
+                /* MiniMax M3.1 emits its native envelope from the reasoning
+                 * stream. A complete call there is executable. Other models
+                 * keep the conservative rejection rule. */
+                agent_stream_start_dsml(sr, sr->in_think &&
+                                        sr->syntax != AGENT_TOOL_SYNTAX_MINIMAX);
+                if (sr->syntax != AGENT_TOOL_SYNTAX_GLM &&
+                    sr->syntax != AGENT_TOOL_SYNTAX_MINIMAX &&
+                    implicit_invoke) {
                     for (size_t i = 0; i < strlen(canonical_invoke); i++)
                         agent_stream_feed_dsml_byte(sr, canonical_invoke[i]);
                 }
@@ -7953,6 +8325,108 @@ static void test_agent_dsml_stream_tool_call_chunked(void) {
     agent_dsml_parser_free(&p);
 }
 
+static void test_agent_minimax_native_call_inside_thinking(void) {
+    const char *chunks[] = {
+        "<think>I should inspect the directory. ",
+        AGENT_MM_TOOL_START "\n"
+        AGENT_MM_NS "<invoke name=\"bash\">"
+        AGENT_MM_NS "<command>pwd"
+        AGENT_MM_NS "</command>"
+        AGENT_MM_NS "</invoke>\n"
+        AGENT_MM_TOOL_END,
+    };
+    agent_dsml_parser p;
+    bool in_think = false;
+    char *out = agent_test_stream_capture(AGENT_TOOL_SYNTAX_MINIMAX, chunks,
+                                          sizeof(chunks)/sizeof(chunks[0]), &p, &in_think);
+    AGENT_TEST_ASSERT(p.state == AGENT_DSML_DONE);
+    AGENT_TEST_ASSERT(p.calls.len == 1);
+    AGENT_TEST_ASSERT(p.calls.v[0].name && !strcmp(p.calls.v[0].name, "bash"));
+    AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&p.calls.v[0], "command"), "pwd"));
+    AGENT_TEST_ASSERT(!in_think);
+    AGENT_TEST_ASSERT(strstr(out, "tool call ignored") == NULL);
+    AGENT_TEST_ASSERT(strstr(out, "invalid tool call") == NULL);
+    AGENT_TEST_ASSERT(strstr(out, "minimax") == NULL);
+    AGENT_TEST_ASSERT(strstr(out, "$ pwd") != NULL);
+    free(out);
+    agent_dsml_parser_free(&p);
+}
+
+static void test_agent_minimax_native_two_calls_and_literal_close(void) {
+    const char *text =
+        AGENT_MM_TOOL_START "\n"
+        AGENT_MM_NS "<invoke name=\"list\">"
+        AGENT_MM_NS "<path>.\n"
+        AGENT_MM_NS "</path>"
+        AGENT_MM_NS "</invoke>\n"
+        AGENT_MM_NS "<invoke name=\"bash\">"
+        AGENT_MM_NS "<command>echo </command>"
+        AGENT_MM_NS "</command>"
+        AGENT_MM_NS "</invoke>\n"
+        AGENT_MM_NS "<invoke name=\"edit\">"
+        AGENT_MM_NS "<path>a.c"
+        AGENT_MM_NS "</path>"
+        AGENT_MM_NS "<old>int x;\n"
+        AGENT_MM_NS "</old>"
+        AGENT_MM_NS "<new>int y;\n"
+        AGENT_MM_NS "</new>"
+        AGENT_MM_NS "</invoke>\n"
+        AGENT_MM_TOOL_END;
+    agent_dsml_parser p = {
+        .syntax = AGENT_TOOL_SYNTAX_MINIMAX,
+        .state = AGENT_DSML_SEARCH,
+    };
+    for (size_t i = 0; i < strlen(text); i++)
+        agent_dsml_feed(&p, text + i, 1);
+    agent_dsml_finish(&p);
+    AGENT_TEST_ASSERT(p.state == AGENT_DSML_DONE);
+    AGENT_TEST_ASSERT(p.calls.len == 3);
+    AGENT_TEST_ASSERT(!strcmp(p.calls.v[0].name, "list"));
+    AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&p.calls.v[0], "path"), "."));
+    AGENT_TEST_ASSERT(!strcmp(p.calls.v[1].name, "bash"));
+    AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&p.calls.v[1], "command"),
+                              "echo </command>"));
+    AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&p.calls.v[2], "old"), "int x;\n"));
+    AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&p.calls.v[2], "new"), "int y;\n"));
+    agent_dsml_parser_free(&p);
+}
+
+/* DSML is not MiniMax's grammar. Showing it must not execute a tool or start
+ * the retry loop that asks the model to repair DSML. */
+static void test_agent_minimax_ignores_dsml_markup(void) {
+    const char *chunks[] = {
+        "I will try. <｜DSML｜tool_calls><｜DSML｜invoke name=\"list\">"
+        "<｜DSML｜parameter name=\"path\" string=\"true\">.</｜DSML｜parameter>"
+        "</invoke></｜DSML｜tool_calls>",
+    };
+    agent_dsml_parser p;
+    bool in_think = false;
+    char *out = agent_test_stream_capture(AGENT_TOOL_SYNTAX_MINIMAX, chunks,
+                                          sizeof(chunks)/sizeof(chunks[0]), &p, &in_think);
+    AGENT_TEST_ASSERT(p.calls.len == 0);
+    AGENT_TEST_ASSERT(p.state != AGENT_DSML_ERROR);
+    AGENT_TEST_ASSERT(!in_think);
+    AGENT_TEST_ASSERT(strstr(out, "invalid tool call") == NULL);
+    free(out);
+    agent_dsml_parser_free(&p);
+}
+
+static void test_agent_minimax_tools_prompt_is_native(void) {
+    char *prompt = agent_build_minimax_tools_prompt(false, false);
+    char *upto = agent_build_minimax_tools_prompt(true, true);
+    AGENT_TEST_ASSERT(strstr(prompt, AGENT_MM_TOOL_START) != NULL);
+    AGENT_TEST_ASSERT(strstr(prompt, "<invoke name=\"list\">") != NULL);
+    AGENT_TEST_ASSERT(strstr(prompt, "<tool>") != NULL);
+    AGENT_TEST_ASSERT(strstr(prompt, "\"name\":\"bash\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(prompt, "DSML") == NULL);
+    AGENT_TEST_ASSERT(strstr(prompt, "<｜DSML｜") == NULL);
+    AGENT_TEST_ASSERT(strstr(prompt, "[upto]") == NULL);
+    AGENT_TEST_ASSERT(strstr(upto, "[upto]") != NULL);
+    AGENT_TEST_ASSERT(strstr(upto, "view_image") != NULL);
+    free(prompt);
+    free(upto);
+}
+
 static void test_agent_glm_tool_parser_rejects_missing_value(void) {
     const char *text = "<tool_call>list<arg_key>path</arg_key></tool_call>";
     agent_dsml_parser p = {
@@ -8179,6 +8653,10 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_glm_stream_ignores_tool_inside_think();
     test_agent_glm_stream_greedy_sampling_boundaries();
     test_agent_dsml_stream_tool_call_chunked();
+    test_agent_minimax_native_call_inside_thinking();
+    test_agent_minimax_native_two_calls_and_literal_close();
+    test_agent_minimax_ignores_dsml_markup();
+    test_agent_minimax_tools_prompt_is_native();
     test_agent_glm_tool_parser_rejects_missing_value();
     test_agent_terminal_wrap_output_is_deferred();
 }
@@ -10495,7 +10973,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             int toks[17];
             int ntok = 0;
             const int block_start = ds4_session_pos(w->session);
-            if (ds4_engine_mtp_draft_tokens(w->engine) > 1 &&
+            if (ds4_session_draft_tokens(w->session) > 1 &&
                 getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
                 ntok = ds4_session_eval_speculative(
                     w->session, token, max_tokens - generated,
@@ -10702,10 +11180,8 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                     dsml.state == AGENT_DSML_PARAM_VALUE))
         {
             malformed_tool = true;
-            snprintf(dsml.error, sizeof(dsml.error),
-                     tool_syntax == AGENT_TOOL_SYNTAX_QWEN ? "incomplete Qwen tool call" :
-                     tool_syntax == AGENT_TOOL_SYNTAX_GLM ? "incomplete GLM tool call" :
-                     "incomplete DSML tool call");
+            snprintf(dsml.error, sizeof(dsml.error), "incomplete %s tool call",
+                     agent_tool_syntax_name(tool_syntax));
         }
 
         agent_worker_append_assistant_turn_end(w);
@@ -10726,19 +11202,15 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 "edit old selector failed before new was generated");
             agent_tool_observation_puts(&observation, "\n");
         } else if (malformed_tool) {
-            agent_tool_observation_puts(
-                &observation,
-                tool_syntax == AGENT_TOOL_SYNTAX_QWEN ? "Tool error: invalid Qwen tool call: " :
-                tool_syntax == AGENT_TOOL_SYNTAX_GLM ? "Tool error: invalid GLM tool call: " :
-                "Tool error: invalid DSML tool call: ");
+            char label[80];
+            snprintf(label, sizeof(label), "Tool error: invalid %s tool call: ",
+                     agent_tool_syntax_name(tool_syntax));
+            agent_tool_observation_puts(&observation, label);
             agent_tool_observation_puts(
                 &observation, dsml.error[0] ? dsml.error : "parse error");
             agent_tool_observation_puts(&observation, "\n");
             agent_tool_observation_puts(
-                &observation, tool_syntax == AGENT_TOOL_SYNTAX_QWEN ?
-                agent_qwen_syntax_reminder : tool_syntax == AGENT_TOOL_SYNTAX_GLM ?
-                agent_glm_syntax_reminder : tool_syntax == AGENT_TOOL_SYNTAX_DSML41 ?
-                agent_dsml41_syntax_reminder : agent_dsml_syntax_reminder);
+                &observation, agent_tool_syntax_reminder_for(tool_syntax));
         } else {
             agent_tool_observation_free(&observation);
             observation = agent_execute_tool_observation(w, &dsml.calls);
@@ -10896,7 +11368,7 @@ static int worker_run_raw_prompt(agent_worker *w, const char *user_text) {
         int toks[17];
         int ntok = 0;
         const int block_start = ds4_session_pos(w->session);
-        if (ds4_engine_mtp_draft_tokens(w->engine) > 1 &&
+        if (ds4_session_draft_tokens(w->session) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
             ntok = ds4_session_eval_speculative(
                 w->session, token, max_tokens - generated,

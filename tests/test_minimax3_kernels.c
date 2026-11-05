@@ -339,6 +339,132 @@ static void test_reduce_glu(uint32_t T) {
     for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++) ds4_gpu_tensor_free(all[i]);
 }
 
+static double swiglu_oai(double g, double u) {
+    g = fmin(g, 7.0);
+    u = fmax(-7.0, fmin(7.0, u));
+    return g / (1.0 + exp(-1.702 * g)) * (u + 1.0);
+}
+
+static void deq_q3(const uint8_t *b, double *v) {
+    const double d = f16_to_f32(*(const uint16_t *)(b + 108));
+    uint32_t aux[4] = {0};
+    memcpy(aux, b + 96, 12);
+    const uint32_t km1 = 0x03030303u, km2 = 0x0f0f0f0fu, tmp = aux[2];
+    aux[2] = ((aux[0] >> 4) & km2) | (((tmp >> 4) & km1) << 4);
+    aux[3] = ((aux[1] >> 4) & km2) | (((tmp >> 6) & km1) << 4);
+    aux[0] = (aux[0] & km2) | (((tmp >> 0) & km1) << 4);
+    aux[1] = (aux[1] & km2) | (((tmp >> 2) & km1) << 4);
+    const int8_t *sc = (const int8_t *)aux;
+    const uint8_t *hm = b, *q = b + 32;
+    uint32_t m = 1, out = 0;
+    for (uint32_t n = 0, is = 0; n < 256; n += 128) {
+        for (uint32_t j = 0, shift = 0; j < 4; j++, shift += 2, m <<= 1) {
+            const double d0 = d * (sc[is++] - 32);
+            for (uint32_t l = 0; l < 16; l++) v[out++] = d0 * ((int)((q[l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4));
+            const double d1 = d * (sc[is++] - 32);
+            for (uint32_t l = 0; l < 16; l++) v[out++] = d1 * ((int)((q[l + 16] >> shift) & 3) - ((hm[l + 16] & m) ? 0 : 4));
+        }
+        q += 32;
+    }
+}
+
+static void deq_q6(const uint8_t *b, double *v) {
+    const uint8_t *ql = b, *qh = b + 128;
+    const int8_t *sc = (const int8_t *)(b + 192);
+    const double d = f16_to_f32(*(const uint16_t *)(b + 208));
+    uint32_t out = 0;
+    for (uint32_t n = 0; n < 256; n += 128) {
+        for (uint32_t l = 0; l < 32; l++) {
+            const uint32_t is = l / 16;
+            v[out + l] = d * sc[is] * ((int)((ql[l] & 15) | (((qh[l] >> 0) & 3) << 4)) - 32);
+            v[out + l + 32] = d * sc[is + 2] * ((int)((ql[l + 32] & 15) | (((qh[l] >> 2) & 3) << 4)) - 32);
+            v[out + l + 64] = d * sc[is + 4] * ((int)((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32);
+            v[out + l + 96] = d * sc[is + 6] * ((int)((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32);
+        }
+        out += 128; ql += 64; qh += 32; sc += 8;
+    }
+}
+
+static double ue4m3(uint8_t x) {
+    if (x == 0 || x == 0x7f) return 0.0;
+    const int e = (x >> 3) & 15, m = x & 7;
+    return (e == 0 ? ldexp((double)m, -9) : ldexp(1.0 + (double)m / 8.0, e - 7)) * 0.5;
+}
+
+static const double fp4[16] = { 0,.5,1,1.5,2,3,4,6, -0,-.5,-1,-1.5,-2,-3,-4,-6 };
+
+static void deq_nvfp4(const uint8_t *b, double *v) {
+    for (uint32_t s = 0; s < 4; s++) for (uint32_t j = 0; j < 8; j++) {
+        const uint8_t q = b[4 + s * 8 + j];
+        v[s * 16 + j] = ue4m3(b[s]) * fp4[q & 15];
+        v[s * 16 + j + 8] = ue4m3(b[s]) * fp4[q >> 4];
+    }
+}
+
+static void fill_quant(uint8_t *p, uint32_t type, uint32_t rows) {
+    const uint32_t bytes = type == 11 ? 110 : type == 14 ? 210 : 36;
+    for (uint32_t r = 0; r < rows; r++, p += bytes) {
+        for (uint32_t i = 0; i < bytes; i++) p[i] = (uint8_t)(g_rng = g_rng * 1664525u + 1013904223u);
+        if (type == 11) *(uint16_t *)(p + 108) = f32_to_f16_bits(0.0078125f);
+        if (type == 14) {
+            for (uint32_t i = 0; i < 16; i++) p[192 + i] = (uint8_t)((int)(i * 13u % 31u) - 15);
+            *(uint16_t *)(p + 208) = f32_to_f16_bits(0.00390625f);
+        }
+        if (type == 40) for (uint32_t i = 0; i < 4; i++) p[i] = (uint8_t)(0x30 + ((r + i) & 15));
+    }
+}
+
+static void test_scaled_experts(uint64_t *map_off, uint8_t *map) {
+    enum { NX = 256, NR = 8, NEX = 2, T = 2, NS = 1 };
+    float *x = rand_vec(T * NX, .25f), scales[3][NEX] = {{.75f, 1.25f}, {1.5f, .5f}, {.625f, 1.125f}};
+    int32_t ids[T] = {0, 1};
+    const uint64_t go = *map_off, expert_q3 = (uint64_t)110 * NR;
+    fill_quant(map + go, 11, 2 * NEX * NR);
+    const uint64_t uo = go + expert_q3 * NEX;
+    const uint64_t gso = uo + expert_q3 * NEX, uso = gso + sizeof(scales[0]);
+    memcpy(map + gso, scales[0], sizeof(scales[0])); memcpy(map + uso, scales[1], sizeof(scales[1]));
+    *map_off = uso + sizeof(scales[1]);
+    ds4_gpu_tensor *tx = upload(x, T * NX), *ti = ds4_gpu_tensor_alloc(sizeof(ids)), *mid = upload(NULL, T * NR);
+    require_ok(ds4_gpu_tensor_write(ti, 0, ids, sizeof(ids)), "expert ids upload");
+    require_ok(ds4_gpu_mm3_moe_mid_scaled_tensor(mid, tx, ti, map, (uint64_t)1 << 28, go, uo, gso, uso,
+                                                  11, NEX, T, NS, NX, NR), "scaled q3 mid");
+    require_ok(ds4_gpu_synchronize(), "scaled q3 sync");
+    float *gm = download_bytes(mid, T * NR * 4); double rm[T * NR], w[256];
+    for (uint32_t t = 0; t < T; t++) for (uint32_t r = 0; r < NR; r++) {
+        deq_q3(map + go + (uint64_t)ids[t] * expert_q3 + r * 110, w); double g = 0, u = 0;
+        for (uint32_t k = 0; k < NX; k++) g += w[k] * x[t * NX + k];
+        deq_q3(map + uo + (uint64_t)ids[t] * expert_q3 + r * 110, w);
+        for (uint32_t k = 0; k < NX; k++) u += w[k] * x[t * NX + k];
+        rm[t * NR + r] = swiglu_oai(g * scales[0][ids[t]], u * scales[1][ids[t]]);
+    }
+    check_close("scaled Q3_K gate/up experts", gm, rm, T * NR, 2e-4);
+    free(gm); ds4_gpu_tensor_free(mid);
+
+    for (uint32_t pass = 0; pass < 2; pass++) {
+        const uint32_t type = pass ? 40 : 14, rb = pass ? 144 : 210, block = pass ? 36 : 210;
+        const uint64_t down = *map_off, expert = (uint64_t)rb * NR;
+        fill_quant(map + down, type, NEX * NR * (pass ? 4 : 1));
+        const uint64_t so = down + expert * NEX; memcpy(map + so, scales[2], sizeof(scales[2]));
+        *map_off = so + sizeof(scales[2]);
+        ds4_gpu_tensor *part = upload(NULL, T * NR);
+        require_ok(ds4_gpu_mm3_moe_down_scaled_tensor(part, tx, ti, map, (uint64_t)1 << 28, down, so,
+                                                       type, NEX, T, NS, NX, NR), "scaled down");
+        require_ok(ds4_gpu_synchronize(), "scaled down sync");
+        float *gp = download_bytes(part, T * NR * 4); double rp[T * NR];
+        for (uint32_t t = 0; t < T; t++) for (uint32_t r = 0; r < NR; r++) {
+            double sum = 0; const uint8_t *row = map + down + (uint64_t)ids[t] * expert + r * rb;
+            for (uint32_t b = 0; b < (pass ? 4u : 1u); b++) {
+                if (pass) deq_nvfp4(row + b * block, w); else deq_q6(row, w);
+                for (uint32_t k = 0; k < (pass ? 64u : 256u); k++) sum += w[k] * x[t * NX + b * 64u + k];
+            }
+            rp[t * NR + r] = sum * scales[2][ids[t]];
+        }
+        check_close(pass ? "scaled NVFP4 down experts" : "scaled Q6_K down experts", gp, rp, T * NR, 2e-4);
+        free(gp); ds4_gpu_tensor_free(part);
+    }
+    free(x); ds4_gpu_tensor_free(tx); ds4_gpu_tensor_free(ti);
+}
+
 int main(void) {
     const uint64_t map_size = (uint64_t)1 << 28;
     uint8_t *map = mmap(NULL, map_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
@@ -355,6 +481,7 @@ int main(void) {
     test_sparse_attention(5000, 3);       /* sparse, partial own block */
     test_router(&off, map, 9);
     test_reduce_glu(3);
+    test_scaled_experts(&off, map);
     printf("all minimax3 kernel tests passed\n");
     return 0;
 }
