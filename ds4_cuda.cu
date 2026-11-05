@@ -1418,6 +1418,17 @@ static const void *g_support_host_base = NULL;
 static uint64_t g_support_host_size = 0;
 static uint64_t g_support_offset_bias = 0;
 
+extern "C" uint64_t ds4_gpu_device_free_vram(int device) {
+    int prev = -1;
+    if (cudaGetDevice(&prev) != cudaSuccess) prev = -1;
+    if (cudaSetDevice(device) != cudaSuccess) return 0;
+    size_t free_b = 0, total_b = 0;
+    uint64_t out = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) out = (uint64_t)free_b;
+    if (prev >= 0) (void)cudaSetDevice(prev);
+    return out;
+}
+
 extern "C" uint64_t ds4_gpu_tier_free_vram(int logical_tier) {
     if (logical_tier < 0 || logical_tier >= cuda_tier_count()) return 0;
     int prev = -1;

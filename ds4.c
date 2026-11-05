@@ -210,6 +210,7 @@ int ds4_gpu_device_cache_support_tensors(int device_id,
     (void)device_id; (void)exec_device_id; (void)ranges;
     (void)n_ranges; (void)main_model; return 0;
 }
+uint64_t ds4_gpu_device_free_vram(int device) { (void)device; return 0; }
 uint64_t ds4_gpu_tier_free_vram(int logical_tier) {
     (void)logical_tier; return 0;
 }
@@ -40926,9 +40927,16 @@ static void ds41_dspark_reset(ds41_dspark *d);
 static bool ds41_dspark_capture(ds41_dspark *d, uint32_t layer, uint32_t pos,
                                 const ds4_gpu_tensor *residual, uint32_t rows);
 
+/* CUDA expert devices prefill no faster with 8192 rows, and the wider buffers
+ * cost 3.2 GiB of context on the main device. Past 786K tokens a 24 GiB card
+ * only fits with 2048 rows, which cost 2-3% prefill and no decode speed. */
+static bool g_ds41_narrow_prefill;
+
 static uint32_t ds41_prefill_limit(uint32_t ctx) {
-    const uint32_t limit = ctx < 8192u || getenv("DS4_METAL_DISABLE_V41_WIDE_CHUNK") ? 2048u :
-        (ctx < 16384u || getenv("DS4_METAL_DISABLE_V41_8K_CHUNK")) ? 4096u : DS41_PREFILL_CAP;
+    const uint32_t limit = ctx < 8192u || (g_ds41_narrow_prefill && ctx > 786432u) ||
+        getenv("DS4_METAL_DISABLE_V41_WIDE_CHUNK") ? 2048u :
+        (ctx < 16384u || g_ds41_narrow_prefill || getenv("DS4_METAL_DISABLE_V41_8K_CHUNK")) ?
+        4096u : DS41_PREFILL_CAP;
     return ctx < limit ? ctx : limit;
 }
 
@@ -44650,6 +44658,7 @@ struct ds4_engine {
     int ds41_main_device;
     int ds41_expert_devices[DS4_MAX_GPUS];
     int ds41_expert_device_count;
+    bool ds41_experts_all_placed;
     ds4_model model;
     ds4_model mtp_model;
     ds4_model vision_model;
@@ -73298,6 +73307,51 @@ static void ds41_release_expert_devices(void) {
     g_ds41_expert_rows = 0;
 }
 
+/* Routed-row scratch per expert device; returns its total size. */
+static uint64_t ds41_expert_scratch_sizes(uint64_t *rows_out, uint64_t sizes[8]) {
+    uint64_t rows = ds41_expert_env_u64("DS4_V41_EXPERT_ROWS", 1024);
+    if (rows < 1) rows = 1;
+    if (rows > 8192) rows = 8192;
+    const uint64_t pairs = rows * DS4_N_EXPERT_USED;
+    const uint64_t s[8] = {
+        rows * DS4_N_EMBD * 4, pairs * 4, pairs * 4, pairs * DS4_N_FF_EXP * 4,
+        pairs * DS4_N_FF_EXP * 4, pairs * DS4_N_FF_EXP * 4, pairs * DS4_N_EMBD * 4,
+        rows * DS4_N_EMBD * 4,
+    };
+    uint64_t scratch = 0;
+    for (int i = 0; i < 8; i++) {
+        sizes[i] = s[i];
+        scratch += s[i];
+    }
+    *rows_out = rows;
+    return scratch;
+}
+
+/* The placement ds41_install_expert_devices will make, from free device memory
+ * alone. True when no routed layer is left to stream on the main device. */
+static bool ds41_expert_devices_hold_all(const ds4_engine *e) {
+    const ds4_weights *w = &e->weights;
+    uint64_t rows, sizes[8];
+    const uint64_t reserve = ds41_expert_scratch_sizes(&rows, sizes) +
+        (ds41_expert_env_u64("DS4_V41_EXPERT_RESERVE_MB", 1024) << 20);
+    uint32_t il = 0;
+    for (int t = 0; t < e->ds41_expert_device_count; t++) {
+        const uint64_t free_bytes = ds4_gpu_device_free_vram(e->ds41_expert_devices[t]);
+        uint64_t room = free_bytes > reserve ? free_bytes - reserve : 0;
+        for (; il < DS4_N_LAYER; il++) {
+            const ds4_layer_weights *l = &w->layer[il];
+            if (!l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps) continue;
+            const uint64_t layer = l->ffn_gate_exps->bytes + l->ffn_up_exps->bytes +
+                                   l->ffn_down_exps->bytes;
+            if (layer > room) break;
+            room -= layer;
+        }
+    }
+    for (; il < DS4_N_LAYER; il++)
+        if (w->layer[il].ffn_gate_exps) return false;
+    return true;
+}
+
 /* Fill each expert device with whole routed layers, in layer order, keeping
  * the routed-row scratch and a kernel workspace reserve free. Layers that do
  * not fit keep streaming from SSD on the main device. */
@@ -73307,17 +73361,8 @@ static bool ds41_install_expert_devices(ds4_engine *e) {
         fprintf(stderr, "ds4: V4.1 expert device initialization failed\n");
         return false;
     }
-    uint64_t rows = ds41_expert_env_u64("DS4_V41_EXPERT_ROWS", 1024);
-    if (rows < 1) rows = 1;
-    if (rows > 8192) rows = 8192;
-    const uint64_t pairs = rows * DS4_N_EXPERT_USED;
-    const uint64_t sizes[8] = {
-        rows * DS4_N_EMBD * 4, pairs * 4, pairs * 4, pairs * DS4_N_FF_EXP * 4,
-        pairs * DS4_N_FF_EXP * 4, pairs * DS4_N_FF_EXP * 4, pairs * DS4_N_EMBD * 4,
-        rows * DS4_N_EMBD * 4,
-    };
-    uint64_t scratch = 0;
-    for (int i = 0; i < 8; i++) scratch += sizes[i];
+    uint64_t rows, sizes[8];
+    const uint64_t scratch = ds41_expert_scratch_sizes(&rows, sizes);
     const uint64_t reserve = scratch +
         (ds41_expert_env_u64("DS4_V41_EXPERT_RESERVE_MB", 1024) << 20);
     ds4_tensor_range ranges[3 * DS4_MAX_LAYER];
@@ -73360,6 +73405,13 @@ static bool ds41_install_expert_devices(ds4_engine *e) {
                 return false;
             }
         }
+    }
+    /* Admission gave the streaming budget away on the promise of this layout. */
+    if (e->ds41_experts_all_placed && placed < routed) {
+        fprintf(stderr, "ds4: V4.1 expert devices hold %u of %u layers, but admission "
+                        "planned for all of them. Free GPU memory or use a smaller --ctx.\n",
+                placed, routed);
+        return false;
     }
     g_ds41_expert_rows = (uint32_t)rows;
     if (n_ranges && !ds4_gpu_expert_devices_load(ranges, n_ranges, reserve - scratch)) {
@@ -73607,6 +73659,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
             e->ds41_main_device = gpu_cfg->device_indices[0];
             for (int i = 1; i < gpu_cfg->n_gpus; i++)
                 e->ds41_expert_devices[e->ds41_expert_device_count++] = gpu_cfg->device_indices[i];
+            g_ds41_narrow_prefill = true;
             gpu_cfg = NULL;
         }
 #endif
@@ -74323,6 +74376,18 @@ static int ds4_engine_open_internal(ds4_engine **out,
             const uint32_t ctx = opt->context_size > 0 ? (uint32_t)opt->context_size : 4096;
             const uint32_t sessions = e->placement_session_count_hint > 0 ?
                 (uint32_t)e->placement_session_count_hint : 1;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+            /* The expert cache and prefill reserve are staged on demand for
+             * streamed layers. With none left, nothing on the main device
+             * ever allocates them, so they must not cost context. */
+            if (e->ssd_streaming && e->ds41_expert_device_count &&
+                ds41_expert_devices_hold_all(e)) {
+                e->ds41_experts_all_placed = true;
+                e->ssd_streaming_prefill_headroom_bytes = 0;
+                e->ssd_streaming_cache_experts = 0;
+                e->ssd_streaming_cache_bytes = 0;
+            }
+#endif
             if (!ds41_memory_admit(e, ds4_mul_sat_u64(ds41_graph_bytes(ctx), sessions), true)) {
                 ds4_engine_close(e);
                 *out = NULL;
