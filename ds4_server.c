@@ -3015,15 +3015,108 @@ static void append_glm_tool_calls_text(buf *b, const tool_calls *calls,
     }
 }
 
+/* Only these Qwen ChatML spellings are control tokens. This is a protocol
+ * escape, not HTML: ordinary entities remain literal. Escape the escape's
+ * leading '&' too, so literal and already-escaped data never share a key. */
+static const char *const qwen_chatml_tokens[] = {
+    "<|im_start|>", "<|im_end|>", "<|endoftext|>"
+};
+static const char *const qwen_chatml_escaped[] = {
+    "&lt;|im_start|&gt;", "&lt;|im_end|&gt;", "&lt;|endoftext|&gt;"
+};
+
+/* Recognize one complete escape or a prefix that a streaming caller must
+ * retain. Removing one amp; layer must not recursively decode literal data. */
+static size_t qwen_chatml_escape(const char *s, size_t n,
+                                  const char **decoded, bool *partial) {
+    *partial = false;
+    if (!n || *s != '&') return 0;
+    size_t pos = 1;
+    while (n - pos >= 4 && !memcmp(s + pos, "amp;", 4)) pos += 4;
+    if (n - pos < 4 && !memcmp(s + pos, "amp;", n - pos)) *partial = true;
+    for (size_t i = 0; i < sizeof(qwen_chatml_tokens) / sizeof(*qwen_chatml_tokens); i++) {
+        const char *tail = qwen_chatml_escaped[i] + 1;
+        size_t len = strlen(tail);
+        if (n - pos >= len && !memcmp(s + pos, tail, len)) {
+            *decoded = pos > 1 ? "&" : qwen_chatml_tokens[i];
+            return pos > 1 ? 5 : 1 + len;
+        }
+        if (n - pos < len && !memcmp(s + pos, tail, n - pos)) *partial = true;
+    }
+    return 0;
+}
+
+static char *qwen_decode_text(const char *text, size_t len, bool final,
+                               size_t *consumed) {
+    buf out = {0};
+    size_t pos = 0;
+    while (pos < len) {
+        if (text[pos] != '&') {
+            const char *amp = memchr(text + pos, '&', len - pos);
+            size_t n = amp ? (size_t)(amp - text - pos) : len - pos;
+            buf_append(&out, text + pos, n);
+            pos += n;
+            continue;
+        }
+        const char *decoded = NULL;
+        bool partial;
+        size_t n = qwen_chatml_escape(text + pos, len - pos, &decoded, &partial);
+        if (n) { buf_puts(&out, decoded); pos += n; }
+        else if (partial && !final) break;
+        else buf_putc(&out, text[pos++]);
+    }
+    if (consumed) *consumed = pos;
+    return buf_take(&out);
+}
+
+static void qwen_unescape_text(char *text) {
+    if (!text) return;
+    char *decoded = qwen_decode_text(text, strlen(text), true, NULL);
+    strcpy(text, decoded);
+    free(decoded);
+}
+
+static void append_qwen_text(buf *out, const char *text, bool trim) {
+    const char *start = text ? text : "";
+    if (trim) while (*start && isspace((unsigned char)*start)) start++;
+    const char *end = start + strlen(start);
+    if (trim) while (end > start && isspace((unsigned char)end[-1])) end--;
+    for (const char *p = start; p < end;) {
+        bool matched = false;
+        for (size_t i = 0; i < sizeof(qwen_chatml_tokens) / sizeof(*qwen_chatml_tokens); i++) {
+            size_t n = strlen(qwen_chatml_tokens[i]);
+            if ((size_t)(end - p) >= n && !memcmp(p, qwen_chatml_tokens[i], n)) {
+                buf_puts(out, qwen_chatml_escaped[i]);
+                p += n;
+                matched = true;
+                break;
+            }
+        }
+        if (matched) continue;
+        const char *decoded = NULL;
+        bool partial;
+        if (qwen_chatml_escape(p, (size_t)(end - p), &decoded, &partial)) {
+            buf_puts(out, "&amp;");
+            p++;
+        } else buf_putc(out, *p++);
+    }
+}
+
 /* Parameter values render as the template does: strings verbatim, other
  * JSON values as their (minified) JSON text. */
 static void append_qwen_tool_calls_text(buf *b, const tool_calls *calls, bool has_content,
                                         const tool_schema_orders *tool_orders) {
     if (!calls || calls->len == 0) return;
     if (calls->raw_tool_text && calls->raw_tool_text[0]) {
-        buf_puts(b, calls->raw_tool_text);
+        char *decoded = qwen_decode_text(calls->raw_tool_text,
+                                         strlen(calls->raw_tool_text), true, NULL);
+        append_qwen_text(b, decoded, false);
+        free(decoded);
         return;
     }
+    buf rendered = {0};
+    buf *destination = b;
+    b = &rendered;
     for (int i = 0; i < calls->len; i++) {
         const tool_call *tc = &calls->v[i];
         const tool_schema_order *order = tool_schema_orders_find(tool_orders, tc->name);
@@ -3066,6 +3159,8 @@ static void append_qwen_tool_calls_text(buf *b, const tool_calls *calls, bool ha
         }
         buf_puts(b, "</function>\n</tool_call>");
     }
+    append_qwen_text(destination, rendered.ptr, false);
+    buf_free(&rendered);
 }
 
 static void append_tool_calls_text_for_syntax(buf *b,
@@ -3472,7 +3567,7 @@ static void append_qwen_tools_prompt_text(buf *b, const char *tool_schemas) {
         }
         if (emitted) {
             buf_puts(b, "\n{\"type\": \"function\", \"function\": ");
-            buf_puts(b, inner.ptr ? inner.ptr : "{}");
+            append_qwen_text(b, inner.ptr ? inner.ptr : "{}", false);
             buf_putc(b, '}');
         }
         buf_free(&inner);
@@ -3497,7 +3592,10 @@ static void append_qwen_tools_prompt_text(buf *b, const char *tool_schemas) {
 static void append_qwen_tool_response(buf *b, const char *text, size_t len) {
     char *body = xstrndup(text ? text : "", len);
     buf_puts(b, "\n<tool_response>\n");
-    append_glm_tag_body_text(b, body, "</tool_response>");
+    buf escaped = {0};
+    append_glm_tag_body_text(&escaped, body, "</tool_response>");
+    append_qwen_text(b, escaped.ptr, false);
+    buf_free(&escaped);
     buf_puts(b, "\n</tool_response>");
     free(body);
 }
@@ -3528,7 +3626,7 @@ static void append_qwen_assistant_message(buf *out, const chat_msg *m,
     const char *reasoning = m && m->reasoning ? m->reasoning : "";
     const bool has_calls = m && m->calls.len > 0;
     buf body = {0};
-    append_trimmed_text(&body, content);
+    append_qwen_text(&body, content, true);
     const bool has_content = body.len > 0;
     if (has_content && !has_calls) {
         /* keep a plain answer's trailing whitespace so the echoed turn
@@ -3541,7 +3639,7 @@ static void append_qwen_assistant_message(buf *out, const chat_msg *m,
     if (!text_starts_with_think_tag(content)) {
         /* an empty reasoning block is exactly the no-thinking generation prompt */
         buf_puts(out, "<think>\n");
-        append_trimmed_text(out, reasoning);
+        append_qwen_text(out, reasoning, true);
         /* sampled tool text already carries what the model emitted after its
          * own </think>; the template separator would double it */
         const bool sampled_after_think = !has_content && reasoning[0] &&
@@ -3579,7 +3677,7 @@ static void append_qwen_conversation(buf *out, const chat_msgs *msgs, int start,
         }
         if (!strcmp(m->role, "user")) {
             buf_puts(out, "<|im_start|>user\n");
-            append_trimmed_text(out, m->content);
+            append_qwen_text(out, m->content, true);
             buf_puts(out, "<|im_end|>\n");
             pending_assistant = true;
         } else if (!strcmp(m->role, "assistant")) {
@@ -3620,7 +3718,7 @@ static char *render_qwen_chat_prompt_text(const chat_msgs *msgs,
         }
         if (system.len) {
             if (wrote) buf_puts(&out, "\n\n");
-            buf_puts(&out, system.ptr);
+            append_qwen_text(&out, system.ptr, false);
         }
         buf_puts(&out, "<|im_end|>\n");
     }
@@ -6513,10 +6611,12 @@ static char *qwen_strip_value_newlines(const char *start, const char *end) {
  * newline the reasoning ends with and the blank lines the answer starts with. */
 static void qwen_trim_split(char **content_out, char **reasoning_out) {
     if (reasoning_out && *reasoning_out) {
+        qwen_unescape_text(*reasoning_out);
         size_t n = strlen(*reasoning_out);
         while (n > 0 && (*reasoning_out)[n - 1] == '\n') (*reasoning_out)[--n] = '\0';
     }
     if (content_out && *content_out) {
+        qwen_unescape_text(*content_out);
         const char *c = *content_out;
         while (*c == '\n') c++;
         if (c != *content_out) {
@@ -6571,6 +6671,8 @@ static bool parse_qwen_generated_message_ex(const char *text,
             if (!candidate || !strstr(candidate, tool_end)) {
                 fprintf(stderr, "ds4-server: thinking not closed, ignoring incomplete Qwen tool calls in reasoning\n");
                 ds4_local_unterminated_reasoning(text, content_out, reasoning_out);
+                if (content_out) qwen_unescape_text(*content_out);
+                if (reasoning_out) qwen_unescape_text(*reasoning_out);
                 return true;
             }
             tool_search = candidate;
@@ -6607,6 +6709,7 @@ static bool parse_qwen_generated_message_ex(const char *text,
         trim_const_span(&name_start, &name_trim_end);
         if (name_trim_end <= name_start) return false;
         char *name = xstrndup(name_start, (size_t)(name_trim_end - name_start));
+        qwen_unescape_text(name);
         p = name_end + 1;
 
         buf args = {0};
@@ -6632,6 +6735,7 @@ static bool parse_qwen_generated_message_ex(const char *text,
             const char *key_trim_end = key_end;
             trim_const_span(&key_start, &key_trim_end);
             char *key = xstrndup(key_start, (size_t)(key_trim_end - key_start));
+            qwen_unescape_text(key);
             const char *value_start = key_end + 1;
             /* Only the parameter delimiter ends its value. Tool/function
              * markers inside argument data are literal text; check the call
@@ -6644,6 +6748,7 @@ static bool parse_qwen_generated_message_ex(const char *text,
                 return false;
             }
             char *value = qwen_strip_value_newlines(value_start, value_end);
+            qwen_unescape_text(value);
             const bool is_string = qwen_param_declared_string(orders, name, key) ||
                                    !qwen_param_value_is_json(value);
             if (is_string) ds4_tool_text_unescape(value, param_end);
@@ -6832,6 +6937,7 @@ static bool parse_generated_message_for_response_for_syntax(server_model_syntax 
     free(*content_out);
     free(*reasoning_out);
     *content_out = xstrdup(text ? text : "");
+    if (syntax == SERVER_MODEL_SYNTAX_QWEN) qwen_unescape_text(*content_out);
     *reasoning_out = NULL;
     tool_calls_free(calls);
 
@@ -7040,6 +7146,10 @@ static bool sse_error_event(int fd, const request *r, const char *msg) {
 }
 
 static bool sse_chunk(int fd, const request *r, const char *id, const char *text, const char *finish) {
+    char *decoded = r->kind == REQ_COMPLETION &&
+        r->model_syntax == SERVER_MODEL_SYNTAX_QWEN && text ?
+        qwen_decode_text(text, strlen(text), true, NULL) : NULL;
+    if (decoded) text = decoded;
     buf b = {0};
     long now = (long)time(NULL);
     if (r->kind == REQ_CHAT) {
@@ -7067,6 +7177,7 @@ static bool sse_chunk(int fd, const request *r, const char *id, const char *text
     }
     bool ok = send_all(fd, b.ptr, b.len);
     buf_free(&b);
+    free(decoded);
     return ok;
 }
 
@@ -8032,7 +8143,7 @@ static bool openai_tool_stream_update(int fd, server *s, const request *r, const
     return true;
 }
 
-static bool openai_sse_stream_update(int fd, server *s, const request *r, const char *id,
+static bool openai_sse_stream_update_decoded(int fd, server *s, const request *r, const char *id,
                                      openai_stream *st,
                                      const char *raw, size_t raw_len,
                                      bool final) {
@@ -8148,6 +8259,22 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
         if (!st->tool.active) st->mode = OPENAI_STREAM_SUPPRESS;
     }
     return true;
+}
+
+/* limitation: cumulative decoding is O(n²) over a stream; use an incremental
+ * decoded buffer if profiling shows this copy matters. Cursor offsets always
+ * refer to decoded bytes, and incomplete escapes remain withheld. */
+static bool openai_sse_stream_update(int fd, server *s, const request *r, const char *id,
+                                        openai_stream *st, const char *raw,
+                                        size_t raw_len, bool final) {
+    if (r->model_syntax != SERVER_MODEL_SYNTAX_QWEN || !raw)
+        return openai_sse_stream_update_decoded(fd, s, r, id, st, raw, raw_len, final);
+    char *decoded = qwen_decode_text(raw, raw_len, final, NULL);
+    raw = decoded;
+    raw_len = strlen(decoded);
+    bool ok = openai_sse_stream_update_decoded(fd, s, r, id, st, raw, raw_len, final);
+    free(decoded);
+    return ok;
 }
 
 static bool openai_sse_finish_live(int fd, server *s, const request *r, const char *id,
@@ -8751,7 +8878,7 @@ static bool responses_sse_completed(int fd, const request *r,
  * consumes: <think>...</think> is reasoning, anything before the tool-call
  * marker is output text. Tool-call argument deltas are not surfaced because
  * Codex' SSE parser only ingests function_call items via output_item.done. */
-static bool responses_sse_stream_update(int fd, const request *r,
+static bool responses_sse_stream_update_decoded(int fd, const request *r,
                                         responses_stream *st,
                                         const char *raw, size_t raw_len,
                                         bool final) {
@@ -8877,7 +9004,19 @@ static bool responses_sse_stream_update(int fd, const request *r,
     return true;
 }
 
-static bool responses_sse_finish_live(int fd, const request *r,
+static bool responses_sse_stream_update(int fd, const request *r, responses_stream *st,
+                                           const char *raw, size_t raw_len, bool final) {
+    if (r->model_syntax != SERVER_MODEL_SYNTAX_QWEN || !raw)
+        return responses_sse_stream_update_decoded(fd, r, st, raw, raw_len, final);
+    char *decoded = qwen_decode_text(raw, raw_len, final, NULL);
+    raw = decoded;
+    raw_len = strlen(decoded);
+    bool ok = responses_sse_stream_update_decoded(fd, r, st, raw, raw_len, final);
+    free(decoded);
+    return ok;
+}
+
+static bool responses_sse_finish_live_decoded(int fd, const request *r,
                                       responses_stream *st,
                                       const char *raw, size_t raw_len,
                                       const char *recovered_content,
@@ -8885,7 +9024,7 @@ static bool responses_sse_finish_live(int fd, const request *r,
                                       const char *finish,
                                       int prompt_tokens, int completion_tokens,
                                       long created_at) {
-    if (!responses_sse_stream_update(fd, r, st, raw, raw_len, true)) return false;
+    if (!responses_sse_stream_update_decoded(fd, r, st, raw, raw_len, true)) return false;
 
     /* Close any half-open reasoning summary so the TUI knows the part ended
      * before we slot in any tool calls or completion. */
@@ -8940,6 +9079,22 @@ static bool responses_sse_finish_live(int fd, const request *r,
     if (ok) ok = responses_sse_completed(fd, r, st, calls, items, finish,
                                          prompt_tokens, completion_tokens, created_at);
     free(items);
+    return ok;
+}
+
+static bool responses_sse_finish_live(int fd, const request *r,
+                                      responses_stream *st,
+                                      const char *raw, size_t raw_len,
+                                      const char *recovered_content,
+                                      const tool_calls *calls, const char *finish,
+                                      int prompt_tokens, int completion_tokens,
+                                      long created_at) {
+    char *decoded = r->model_syntax == SERVER_MODEL_SYNTAX_QWEN && raw ?
+        qwen_decode_text(raw, raw_len, true, NULL) : NULL;
+    if (decoded) { raw = decoded; raw_len = strlen(decoded); }
+    bool ok = responses_sse_finish_live_decoded(fd, r, st, raw, raw_len,
+        recovered_content, calls, finish, prompt_tokens, completion_tokens, created_at);
+    free(decoded);
     return ok;
 }
 
@@ -9021,6 +9176,10 @@ static bool final_response(int fd, bool enable_cors,
                            const request *r, const char *id, const char *text,
                            const char *reasoning, const tool_calls *calls, const char *finish,
                            int prompt_tokens, int completion_tokens) {
+    char *decoded = r->kind == REQ_COMPLETION &&
+        r->model_syntax == SERVER_MODEL_SYNTAX_QWEN && text ?
+        qwen_decode_text(text, strlen(text), true, NULL) : NULL;
+    if (decoded) text = decoded;
     buf b = {0};
     long now = (long)time(NULL);
     if (r->kind == REQ_CHAT) {
@@ -9052,6 +9211,7 @@ static bool final_response(int fd, bool enable_cors,
     buf_puts(&b, "}\n");
     bool ok = http_response(fd, enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
+    free(decoded);
     return ok;
 }
 
@@ -9659,7 +9819,7 @@ static size_t text_stream_safe_limit(const char *raw, size_t start,
     return utf8_stream_safe_len(raw, start, limit, final);
 }
 
-static bool anthropic_sse_stream_update(int fd, server *s, const request *r, const char *id,
+static bool anthropic_sse_stream_update_decoded(int fd, server *s, const request *r, const char *id,
                                         anthropic_stream *st,
                                         const char *raw, size_t raw_len,
                                         bool final) {
@@ -9791,6 +9951,19 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
         if (!st->tool.active) st->mode = ANTH_STREAM_SUPPRESS;
     }
     return true;
+}
+
+static bool anthropic_sse_stream_update(int fd, server *s, const request *r, const char *id,
+                                           anthropic_stream *st, const char *raw,
+                                           size_t raw_len, bool final) {
+    if (r->model_syntax != SERVER_MODEL_SYNTAX_QWEN || !raw)
+        return anthropic_sse_stream_update_decoded(fd, s, r, id, st, raw, raw_len, final);
+    char *decoded = qwen_decode_text(raw, raw_len, final, NULL);
+    raw = decoded;
+    raw_len = strlen(decoded);
+    bool ok = anthropic_sse_stream_update_decoded(fd, s, r, id, st, raw, raw_len, final);
+    free(decoded);
+    return ok;
 }
 
 static bool anthropic_sse_tool_blocks_live(int fd, const request *r, const char *id,
@@ -12807,11 +12980,11 @@ static char *build_qwen_assistant_suffix(const request *r, const char *content,
                                          const tool_calls *calls) {
     buf suffix = {0};
     if (r && ds4_think_mode_enabled(r->think_mode)) {
-        if (with_reasoning) append_trimmed_text(&suffix, reasoning);
+        if (with_reasoning) append_qwen_text(&suffix, reasoning, true);
         buf_puts(&suffix, "\n</think>\n\n");
     }
     buf body = {0};
-    append_trimmed_text(&body, content);
+    append_qwen_text(&body, content, true);
     buf_puts(&suffix, body.ptr ? body.ptr : "");
     append_qwen_tool_calls_text(&suffix, calls, body.len > 0, r ? &r->tool_orders : NULL);
     buf_free(&body);
@@ -12902,7 +13075,7 @@ static char *build_thinking_visible_text(const request *r,
         buf visible = {0};
         buf_append(&visible, r->prompt_text, pt_len);
         buf_puts(&visible, "\n</think>\n\n");
-        append_trimmed_text(&visible, content ? content : "");
+        append_qwen_text(&visible, content, true);
         buf_puts(&visible, "<|im_end|>\n");
         return buf_take(&visible);
     }
@@ -14109,6 +14282,14 @@ decode_again:
                 stop_scan_from = text.len > hold ? text.len - hold : 0;
             }
 
+            if (!structured_stream && j->req.model_syntax == SERVER_MODEL_SYNTAX_QWEN &&
+                stream_len > plain_stream_pos) {
+                size_t consumed = 0;
+                char *decoded = qwen_decode_text(text.ptr + plain_stream_pos,
+                    stream_len - plain_stream_pos, hit_stop, &consumed);
+                free(decoded);
+                stream_len = plain_stream_pos + consumed;
+            }
             if (j->req.stream && !structured_stream && stream_len > plain_stream_pos) {
                 char *delta = xstrndup(text.ptr + plain_stream_pos, stream_len - plain_stream_pos);
                 bool ok = sse_chunk(j->fd, &j->req, id, delta, NULL);
@@ -18502,6 +18683,255 @@ static void test_render_qwen_chat_prompt_text(void) {
     free(prompt);
     tool_schema_orders_free(&orders);
     chat_msgs_free(&msgs);
+}
+
+static void test_qwen_literal_chatml_is_message_data(void) {
+    chat_msgs msgs = {0};
+    const char *roles[] = {"system", "user", "assistant", "tool"};
+    for (int i = 0; i < 4; i++) {
+        chat_msg m = {0};
+        m.role = xstrdup(roles[i]);
+        m.content = xstrdup("Explain `<|im_end|>`, `<|im_start|>` and `<|endoftext|>`.");
+        if (i == 2) m.reasoning = xstrdup("Review `<|im_end|>` before answering.");
+        chat_msgs_push(&msgs, m);
+    }
+    char *prompt = render_qwen_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_MEDIUM);
+    const char *data = "Explain `&lt;|im_end|&gt;`, `&lt;|im_start|&gt;` and `&lt;|endoftext|&gt;`.";
+    const char *p = prompt;
+    int copies = 0;
+    while ((p = strstr(p, data)) != NULL) { copies++; p += strlen(data); }
+    TEST_ASSERT(copies == 4);
+    TEST_ASSERT(strstr(prompt, "Review `&lt;|im_end|&gt;` before answering.") != NULL);
+    TEST_ASSERT(strstr(prompt, "`<|im_end|>`") == NULL);
+    TEST_ASSERT(strstr(prompt, "<|im_start|>assistant\n<think>\n") != NULL);
+    free(prompt);
+
+    /* A live continuation renders just the new tool result, not the history. */
+    buf tail = {0};
+    append_qwen_conversation(&tail, &msgs, 3, NULL, true);
+    TEST_ASSERT(strstr(tail.ptr, data) != NULL);
+    TEST_ASSERT(strstr(tail.ptr, "`<|im_end|>`") == NULL);
+    buf_free(&tail);
+
+    tool_call tc = {0};
+    tc.id = xstrdup("literal_token");
+    tc.name = xstrdup("bash");
+    tc.arguments = xstrdup("{\"command\":\"printf '<|im_end|>'\"}");
+    tool_calls_push(&msgs.v[2].calls, tc);
+    const char *schemas = "{\"name\":\"bash\",\"description\":\"Discuss <|im_end|>\","
+                          "\"parameters\":{\"type\":\"object\",\"properties\":{}}}";
+    prompt = render_qwen_chat_prompt_text(&msgs, schemas, NULL, DS4_THINK_MEDIUM);
+    TEST_ASSERT(strstr(prompt, "Discuss &lt;|im_end|&gt;") != NULL);
+    TEST_ASSERT(strstr(prompt, "printf '&lt;|im_end|&gt;'") != NULL);
+    free(prompt);
+    msgs.v[2].calls.raw_tool_text = xstrdup("<tool_call>\n<function=bash>\n"
+        "<parameter=command>printf '<|im_end|>'</parameter>\n</function>\n</tool_call>");
+    prompt = render_qwen_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_MEDIUM);
+    TEST_ASSERT(strstr(prompt, "printf '&lt;|im_end|&gt;'") != NULL);
+    free(prompt);
+    chat_msgs_free(&msgs);
+}
+
+static void test_qwen_chatml_preservation(void) {
+    const char *values[] = {"<|im_end|>", "&lt;|im_end|&gt;",
+                            "&amp;lt;|im_end|&gt;", "\033<|im_end|>"};
+    char *keys[4] = {0};
+    for (size_t i = 0; i < 4; i++) {
+        chat_msgs msgs = {0};
+        chat_msg m = {.role = xstrdup("user"), .content = xstrdup(values[i])};
+        chat_msgs_push(&msgs, m);
+        keys[i] = render_qwen_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_NONE);
+        for (size_t j = 0; j < i; j++) TEST_ASSERT(strcmp(keys[i], keys[j]) != 0);
+        request visible_request;
+        request_init(&visible_request, REQ_CHAT, 128);
+        visible_request.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
+        visible_request.think_mode = DS4_THINK_NONE;
+        buf visible = {0};
+        buf_puts(&visible, keys[i]);
+        char *suffix = build_responses_visible_assistant_suffix(
+            &visible_request, values[i], NULL, NULL);
+        buf_puts(&visible, suffix);
+        free(suffix);
+        chat_msg assistant = {.role = xstrdup("assistant"), .content = xstrdup(values[i])};
+        chat_msg next = {.role = xstrdup("user"), .content = xstrdup("continue")};
+        chat_msgs_push(&msgs, assistant);
+        chat_msgs_push(&msgs, next);
+        char *replay = render_qwen_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_NONE);
+        TEST_ASSERT(byte_prefix_match(replay, strlen(replay), visible.ptr, visible.len));
+        free(replay);
+        buf_free(&visible);
+        request_free(&visible_request);
+        chat_msgs_free(&msgs);
+
+        tool_calls original = {0}, parsed = {0};
+        buf args = {0}, raw = {0};
+        buf_puts(&args, "{\"command\":");
+        json_escape(&args, values[i]);
+        buf_putc(&args, '}');
+        tool_call tc = {.name = xstrdup("bash"), .arguments = buf_take(&args)};
+        tool_calls_push(&original, tc);
+        append_qwen_tool_calls_text(&raw, &original, false, NULL);
+        char *content = NULL, *reasoning = NULL;
+        TEST_ASSERT(parse_qwen_generated_message_ex(raw.ptr, false,
+            &content, &reasoning, &parsed, NULL));
+        TEST_ASSERT(parsed.len == 1);
+        if (parsed.len == 1) {
+            json_args recovered = {0};
+            TEST_ASSERT(json_args_parse(parsed.v[0].arguments, &recovered));
+            TEST_ASSERT(recovered.len == 1 && !strcmp(recovered.v[0].value, values[i]));
+            json_args_free(&recovered);
+            buf reconstructed = {0}, sampled = {0};
+            append_qwen_tool_calls_text(&reconstructed, &original, false, NULL);
+            append_qwen_tool_calls_text(&sampled, &parsed, false, NULL);
+            TEST_ASSERT(!strcmp(reconstructed.ptr, sampled.ptr));
+            buf_free(&reconstructed);
+            buf_free(&sampled);
+        }
+        /* Both streaming APIs must preserve the same argument at every
+         * possible split, including inside literal/HTML ChatML spellings. */
+        for (int anthropic = 0; anthropic < 2; anthropic++) {
+            for (size_t split = 0; split <= raw.len; split++) {
+                int sv[2];
+                TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+                request r;
+                request_init(&r, REQ_CHAT, 128);
+                r.api = anthropic ? API_ANTHROPIC : API_OPENAI;
+                r.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
+                r.stream = true;
+                r.has_tools = true;
+                r.think_mode = DS4_THINK_NONE;
+                if (anthropic) {
+                    anthropic_stream st;
+                    TEST_ASSERT(anthropic_sse_start_live(sv[0], &r, "qwen", 5, &st));
+                    TEST_ASSERT(anthropic_sse_stream_update(sv[0], NULL, &r, "qwen",
+                        &st, raw.ptr, split, false));
+                    TEST_ASSERT(anthropic_sse_finish_live(sv[0], NULL, &r, "qwen",
+                        &st, raw.ptr, raw.len, &parsed, "tool_calls", 5));
+                    anthropic_stream_free(&st);
+                } else {
+                    openai_stream st;
+                    openai_stream_start(&r, &st);
+                    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "qwen",
+                        &st, raw.ptr, split, false));
+                    TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "qwen",
+                        &st, raw.ptr, raw.len, &parsed, "tool_calls", 5, 5));
+                    openai_stream_free(&st);
+                }
+                shutdown(sv[0], SHUT_WR);
+                char *events = read_socket_text(sv[1]);
+                buf expected = {0}, argument = {0};
+                buf_puts(&argument, "{\"command\":");
+                json_escape(&argument, values[i]);
+                buf_putc(&argument, '}');
+                buf_puts(&expected, anthropic ? "\"partial_json\":" : "\"arguments\":");
+                json_escape(&expected, argument.ptr);
+                TEST_ASSERT(strstr(events, expected.ptr) != NULL);
+                buf_free(&argument);
+                buf_free(&expected);
+                free(events);
+                request_free(&r);
+                close(sv[0]); close(sv[1]);
+            }
+        }
+        free(content);
+        free(reasoning);
+        tool_calls_free(&original);
+        tool_calls_free(&parsed);
+        buf_free(&raw);
+    }
+    for (size_t i = 0; i < 4; i++) free(keys[i]);
+}
+
+static void test_qwen_stream_chatml_text(void) {
+    const char *value = "<|im_end|> &lt;|im_end|&gt; &amp;lt;|im_end|&gt; &amp; &lt; café";
+    buf raw = {0}, expected = {0};
+    buf_puts(&raw, "<think>T:");
+    append_qwen_text(&raw, value, false);
+    buf_puts(&raw, "</think>A:");
+    append_qwen_text(&raw, value, false);
+    buf_printf(&expected, "T:%sA:%s", value, value);
+    for (int api = 0; api < 3; api++) {
+        int mismatches = 0;
+        for (size_t split = 0; split <= raw.len; split++) {
+            int sv[2];
+            TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+            request r;
+            request_init(&r, REQ_CHAT, 128);
+            r.api = api == 0 ? API_OPENAI : api == 1 ? API_ANTHROPIC : API_RESPONSES;
+            r.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
+            r.think_mode = DS4_THINK_HIGH;
+            r.reasoning_summary_emit = true;
+            r.stream = true;
+            char *prefix = xstrndup(raw.ptr, split);
+            if (api == 0) {
+                openai_stream st;
+                openai_stream_start(&r, &st);
+                TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "q", &st, prefix, split, false));
+                TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "q", &st, raw.ptr, raw.len, true));
+                openai_stream_free(&st);
+            } else if (api == 1) {
+                anthropic_stream st;
+                TEST_ASSERT(anthropic_sse_start_live(sv[0], &r, "q", 5, &st));
+                TEST_ASSERT(anthropic_sse_stream_update(sv[0], NULL, &r, "q", &st, prefix, split, false));
+                TEST_ASSERT(anthropic_sse_stream_update(sv[0], NULL, &r, "q", &st, raw.ptr, raw.len, true));
+                anthropic_stream_free(&st);
+            } else {
+                responses_stream st;
+                responses_stream_init(&r, &st);
+                st.active = true;
+                TEST_ASSERT(responses_sse_stream_update(sv[0], &r, &st, prefix, split, false));
+                TEST_ASSERT(responses_sse_stream_update(sv[0], &r, &st, raw.ptr, raw.len, true));
+                responses_stream_free(&st);
+            }
+            free(prefix);
+            shutdown(sv[0], SHUT_WR);
+            char *events = read_socket_text(sv[1]);
+            const char *first = api == 0 ? "\"reasoning_content\":" : api == 1 ? "\"thinking\":" : "\"delta\":";
+            const char *second = api == 0 ? "\"content\":" : api == 1 ? "\"text\":" : "\"delta\":";
+            buf received = {0};
+            const char *p = events;
+            for (;;) {
+                const char *a = strstr(p, first), *b = strstr(p, second);
+                if (!a && !b) break;
+                p = a && (!b || a <= b) ? a + strlen(first) : b + strlen(second);
+                char *part = NULL;
+                TEST_ASSERT(json_string(&p, &part));
+                buf_puts(&received, part ? part : "");
+                free(part);
+            }
+            if (!received.ptr || strcmp(received.ptr, expected.ptr)) mismatches++;
+            buf_free(&received);
+            free(events);
+            request_free(&r);
+            close(sv[0]); close(sv[1]);
+        }
+        TEST_ASSERT(mismatches == 0);
+    }
+    buf_free(&raw); buf_free(&expected);
+}
+
+static void test_qwen_completion_chatml_text(void) {
+    const char *value = "<|im_end|> &lt;|im_end|&gt; &amp;";
+    buf encoded = {0}, expected = {0};
+    append_qwen_text(&encoded, value, false);
+    buf_puts(&expected, "\"text\":");
+    json_escape(&expected, value);
+    for (int stream = 0; stream < 2; stream++) {
+        request r;
+        request_init(&r, REQ_COMPLETION, 128);
+        r.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
+        int sv[2];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        TEST_ASSERT(stream ? sse_chunk(sv[0], &r, "q", encoded.ptr, NULL) :
+            final_response(sv[0], false, &r, "q", encoded.ptr, NULL, NULL, "stop", 1, 1));
+        shutdown(sv[0], SHUT_WR);
+        char *out = read_socket_text(sv[1]);
+        TEST_ASSERT(strstr(out, expected.ptr) != NULL);
+        free(out);
+        request_free(&r);
+        close(sv[0]); close(sv[1]);
+    }
+    buf_free(&encoded); buf_free(&expected);
 }
 
 static void test_qwen_reasoning_effort_levels(void) {
@@ -23046,6 +23476,10 @@ static void ds4_server_unit_tests_run(void) {
     test_render_chat_prompt_text_renders_tools_before_system();
     test_render_glm_chat_prompt_text();
     test_render_qwen_chat_prompt_text();
+    test_qwen_literal_chatml_is_message_data();
+    test_qwen_chatml_preservation();
+    test_qwen_stream_chatml_text();
+    test_qwen_completion_chatml_text();
     test_render_qwen_tool_round_trip();
     test_qwen_tool_visible_checkpoint_boundary();
     test_qwen_decode_tracker_markers();
