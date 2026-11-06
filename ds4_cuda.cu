@@ -27,6 +27,7 @@
 #include "cuda/mmq/ds4_mmq.h"
 #include "cuda/mmq/ds4_repack.h"
 #include "ds4_image.h"
+#include "ds4_metrics.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -29328,8 +29329,11 @@ static void *cuda_stream_prefetch_read(void *) {
             }
             const uint64_t bytes = std::min(chunk, copy.bytes - offset);
             const char *payload = NULL;
+            const uint64_t read_t0 = ds4_metric_now_ns();
             p.ok = cuda_model_stage_read_from(p.fd, &p.direct_fd, p.align, p.file_size,
                 p.stage[ring], p.stage_bytes, copy.offset + offset, bytes, &payload) != 0;
+            ds4_metric_add(DS4_METRIC_SSD_READ_NS, ds4_metric_now_ns() - read_t0);
+            if (p.ok) ds4_metric_add(DS4_METRIC_SSD_READ_BYTES, bytes);
             if (!p.ok || p.cancel.load(std::memory_order_relaxed)) { p.ok = false; break; }
             p.ok = cudaMemcpyAsync(copy.destination + offset, payload, bytes,
                 cudaMemcpyHostToDevice, p.stream) == cudaSuccess &&

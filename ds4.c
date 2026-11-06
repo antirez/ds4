@@ -1604,6 +1604,137 @@ static double now_sec(void) {
 }
 
 /* =========================================================================
+ * Phase Metrics.
+ * =========================================================================
+ *
+ * See ds4_metrics.h.  Counters are relaxed atomics: a reader may see a torn
+ * view across counters, and no inference path ever takes a lock here.
+ *
+ * Phases are measured at the public API, and only the outermost call on a
+ * thread records.  ds4_session_sync_multimodal() ends in ds4_session_sync(),
+ * the mixed prefill/decode batch can fall back to a sync plus a decode batch,
+ * the speculative entry points fall back to plain eval, and payload staging
+ * runs ds4_session_save_payload(): the thread-local depth keeps those inner
+ * calls silent instead of counting the same wall time twice. */
+static uint64_t g_metrics[DS4_METRIC_COUNT];
+static __thread int g_metrics_depth;
+
+void ds4_metric_add(ds4_metric m, uint64_t v) {
+    if ((unsigned)m < DS4_METRIC_COUNT && v)
+        __atomic_fetch_add(&g_metrics[m], v, __ATOMIC_RELAXED);
+}
+
+uint64_t ds4_metric_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    const uint64_t ns = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    return ns ? ns : 1; /* 0 is the "nested, not timing" marker below */
+}
+
+static const char *const g_metric_names[DS4_METRIC_COUNT] = {
+#define DS4_METRIC_NAME(id, name, help) name,
+    DS4_METRICS(DS4_METRIC_NAME)
+#undef DS4_METRIC_NAME
+};
+
+static const char *const g_metric_help[DS4_METRIC_COUNT] = {
+#define DS4_METRIC_HELP(id, name, help) help,
+    DS4_METRICS(DS4_METRIC_HELP)
+#undef DS4_METRIC_HELP
+};
+
+const char *ds4_metric_name(ds4_metric m) {
+    return (unsigned)m < DS4_METRIC_COUNT ? g_metric_names[m] : "";
+}
+
+const char *ds4_metric_help(ds4_metric m) {
+    return (unsigned)m < DS4_METRIC_COUNT ? g_metric_help[m] : "";
+}
+
+int ds4_metric_is_ns(ds4_metric m) {
+    const char *name = ds4_metric_name(m);
+    const size_t n = strlen(name);
+    return n >= 3 && strcmp(name + n - 3, "_ns") == 0;
+}
+
+void ds4_metrics_snapshot(uint64_t out[DS4_METRIC_COUNT]) {
+    for (int i = 0; i < DS4_METRIC_COUNT; i++)
+        out[i] = __atomic_load_n(&g_metrics[i], __ATOMIC_RELAXED);
+}
+
+/* Start timing a phase.  Returns the start time, or 0 when an enclosing
+ * phase already owns the accounting on this thread. */
+static uint64_t metrics_begin(void) {
+    return g_metrics_depth++ == 0 ? ds4_metric_now_ns() : 0;
+}
+
+/* Close a phase opened by metrics_begin(); t0 == 0 means nested. */
+static void metrics_end(uint64_t t0, ds4_metric ns) {
+    g_metrics_depth--;
+    if (t0) ds4_metric_add(ns, ds4_metric_now_ns() - t0);
+}
+
+/* One decode forward pass over `rows` sessions that committed `tokens`. */
+static void metrics_end_decode(uint64_t t0, int rows, int tokens) {
+    metrics_end(t0, DS4_METRIC_DECODE_NS);
+    if (!t0) return;
+    ds4_metric_add(DS4_METRIC_DECODE_PASSES, 1);
+    ds4_metric_add(DS4_METRIC_DECODE_ROWS, rows > 0 ? (uint64_t)rows : 0);
+    ds4_metric_add(DS4_METRIC_DECODE_TOKENS, tokens > 0 ? (uint64_t)tokens : 0);
+}
+
+static void metrics_summary_puts(char *buf, size_t cap, size_t *len, const char *fmt, ...) {
+    if (*len >= cap) return;
+    va_list ap;
+    va_start(ap, fmt);
+    const int n = vsnprintf(buf + *len, cap - *len, fmt, ap);
+    va_end(ap);
+    *len = n < 0 ? cap : *len + (size_t)n;
+}
+
+static double metrics_mib(double bytes) {
+    return bytes / (1024.0 * 1024.0);
+}
+
+void ds4_metrics_summary(const uint64_t now[DS4_METRIC_COUNT],
+                         const uint64_t prev[DS4_METRIC_COUNT],
+                         double wall_seconds, char *buf, size_t cap) {
+#define D(id) ((double)(now[DS4_METRIC_##id] - (prev ? prev[DS4_METRIC_##id] : 0)))
+    const double prefill_s = D(PREFILL_NS) / 1e9;
+    const double decode_s = D(DECODE_NS) / 1e9;
+    const double vision_s = D(VISION_NS) / 1e9;
+    const double kv_s = (D(KV_SAVE_NS) + D(KV_LOAD_NS)) / 1e9;
+    const double net_s = (D(NET_SEND_NS) + D(NET_RECV_NS)) / 1e9;
+    const double ssd_s = D(SSD_READ_NS) / 1e9;
+    size_t len = 0;
+    if (cap) buf[0] = '\0';
+    metrics_summary_puts(buf, cap, &len,
+        "prefill %.0f tok %.1fs %.1f t/s (%.0f reused) | decode %.0f tok %.1fs %.1f t/s %.2f tok/pass",
+        D(PREFILL_TOKENS), prefill_s, prefill_s > 0 ? D(PREFILL_TOKENS) / prefill_s : 0.0,
+        D(PREFILL_REUSED_TOKENS),
+        D(DECODE_TOKENS), decode_s, decode_s > 0 ? D(DECODE_TOKENS) / decode_s : 0.0,
+        D(DECODE_PASSES) > 0 ? D(DECODE_TOKENS) / D(DECODE_PASSES) : 0.0);
+    if (D(VISION_IMAGES) > 0)
+        metrics_summary_puts(buf, cap, &len, " | vision %.0f img %.1fs", D(VISION_IMAGES), vision_s);
+    if (D(KV_SAVE_CALLS) + D(KV_LOAD_CALLS) > 0)
+        metrics_summary_puts(buf, cap, &len, " | kv save %.0f load %.0f %.1fs",
+                             D(KV_SAVE_CALLS), D(KV_LOAD_CALLS), kv_s);
+    if (D(NET_SEND_BYTES) + D(NET_RECV_BYTES) > 0)
+        metrics_summary_puts(buf, cap, &len, " | net %.1f MiB out %.1f MiB in wait %.1fs",
+                             metrics_mib(D(NET_SEND_BYTES)), metrics_mib(D(NET_RECV_BYTES)), net_s);
+    if (D(SSD_READ_BYTES) > 0)
+        metrics_summary_puts(buf, cap, &len, " | ssd %.1f MiB %.1fs",
+                             metrics_mib(D(SSD_READ_BYTES)), ssd_s);
+    if (wall_seconds > 0.0) {
+        const double busy = prefill_s + decode_s + vision_s + kv_s;
+        metrics_summary_puts(buf, cap, &len, " | busy %.0f%% (prefill %.0f%% decode %.0f%%) of %.0fs",
+                             100.0 * busy / wall_seconds, 100.0 * prefill_s / wall_seconds,
+                             100.0 * decode_s / wall_seconds, wall_seconds);
+    }
+#undef D
+}
+
+/* =========================================================================
  * Metal Routed Expert Locality Profiler.
  * =========================================================================
  *
@@ -65596,8 +65727,23 @@ uint64_t ds4_session_payload_bytes(ds4_session *s) {
 #endif
 }
 
+static int ds4_session_write_staged_payload_unmetered(const ds4_session_payload_file *payload,
+                                                      FILE *fp, char *err, size_t errlen);
+
 int ds4_session_write_staged_payload(const ds4_session_payload_file *payload,
                                      FILE *fp, char *err, size_t errlen) {
+    const uint64_t t0 = metrics_begin();
+    const int rc = ds4_session_write_staged_payload_unmetered(payload, fp, err, errlen);
+    metrics_end(t0, DS4_METRIC_KV_SAVE_NS);
+    if (t0 && rc == 0) {
+        ds4_metric_add(DS4_METRIC_KV_SAVE_CALLS, 1);
+        ds4_metric_add(DS4_METRIC_KV_SAVE_BYTES, payload->bytes);
+    }
+    return rc;
+}
+
+static int ds4_session_write_staged_payload_unmetered(const ds4_session_payload_file *payload,
+                                                      FILE *fp, char *err, size_t errlen) {
     if (!payload || !payload->path || !fp) {
         payload_set_err(err, errlen, "invalid staged session payload");
         return 1;
@@ -65624,8 +65770,19 @@ void ds4_session_payload_file_free(ds4_session_payload_file *payload) {
     memset(payload, 0, sizeof(*payload));
 }
 
+static int ds4_session_stage_payload_unmetered(ds4_session *s, ds4_session_payload_file *out,
+                                               char *err, size_t errlen);
+
 int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
                               char *err, size_t errlen) {
+    const uint64_t t0 = metrics_begin();
+    const int rc = ds4_session_stage_payload_unmetered(s, out, err, errlen);
+    metrics_end(t0, DS4_METRIC_KV_SAVE_NS);
+    return rc;
+}
+
+static int ds4_session_stage_payload_unmetered(ds4_session *s, ds4_session_payload_file *out,
+                                               char *err, size_t errlen) {
     if (!out) {
         payload_set_err(err, errlen, "invalid session payload staging request");
         return 1;
@@ -65944,7 +66101,22 @@ static int qwen4_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *
 }
 #endif
 
+static int ds4_session_save_payload_unmetered(ds4_session *s, FILE *fp, char *err, size_t errlen);
+
 int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
+    const uint64_t t0 = metrics_begin();
+    const long start = fp ? ftell(fp) : -1;
+    const int rc = ds4_session_save_payload_unmetered(s, fp, err, errlen);
+    metrics_end(t0, DS4_METRIC_KV_SAVE_NS);
+    if (t0 && rc == 0) {
+        const long end = ftell(fp);
+        ds4_metric_add(DS4_METRIC_KV_SAVE_CALLS, 1);
+        if (start >= 0 && end > start) ds4_metric_add(DS4_METRIC_KV_SAVE_BYTES, (uint64_t)(end - start));
+    }
+    return rc;
+}
+
+static int ds4_session_save_payload_unmetered(ds4_session *s, FILE *fp, char *err, size_t errlen) {
     if (!s || !fp || !s->checkpoint_valid) {
         payload_set_err(err, errlen, "session has no valid checkpoint to save");
         return 1;
@@ -66295,7 +66467,22 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
 #endif
 }
 
+static int ds4_session_load_payload_unmetered(ds4_session *s, FILE *fp, uint64_t payload_bytes,
+                                              char *err, size_t errlen);
+
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen) {
+    const uint64_t t0 = metrics_begin();
+    const int rc = ds4_session_load_payload_unmetered(s, fp, payload_bytes, err, errlen);
+    metrics_end(t0, DS4_METRIC_KV_LOAD_NS);
+    if (t0 && rc == 0) {
+        ds4_metric_add(DS4_METRIC_KV_LOAD_CALLS, 1);
+        ds4_metric_add(DS4_METRIC_KV_LOAD_BYTES, payload_bytes);
+    }
+    return rc;
+}
+
+static int ds4_session_load_payload_unmetered(ds4_session *s, FILE *fp, uint64_t payload_bytes,
+                                              char *err, size_t errlen) {
     if (!s || !fp) {
         payload_set_err(err, errlen, "invalid session payload load");
         return 1;
@@ -75898,12 +76085,26 @@ int ds4_chat_append_multimodal_message(
     return 1;
 }
 
+static int ds4_engine_vision_encode_image_unmetered(
+        ds4_engine *e, const ds4_image *image, ds4_vision_embedding *out,
+        char *error, size_t error_cap);
+
 static int ds4_engine_vision_encode_image(
         ds4_engine            *e,
         const ds4_image       *image,
         ds4_vision_embedding  *out,
         char                  *error,
         size_t                 error_cap) {
+    const uint64_t t0 = metrics_begin();
+    const int ok = ds4_engine_vision_encode_image_unmetered(e, image, out, error, error_cap);
+    metrics_end(t0, DS4_METRIC_VISION_NS);
+    if (t0 && ok) ds4_metric_add(DS4_METRIC_VISION_IMAGES, 1);
+    return ok;
+}
+
+static int ds4_engine_vision_encode_image_unmetered(
+        ds4_engine *e, const ds4_image *image, ds4_vision_embedding *out,
+        char *error, size_t error_cap) {
     if (!e || !image || !out || !e->vision_ready) {
         if (error && error_cap) snprintf(error, error_cap, "vision encoder is not loaded");
         return 0;
@@ -78940,14 +79141,40 @@ static int ds4_session_sync_lockstep(ds4_session *s, const ds4_tokens *prompt,
  * graph sequence and the per-layer gates pair up.  The worker acks a sync
  * once its matching prefill completes, surfacing worker-side failures
  * here instead of as a gate timeout mid-decode. */
+static int ds4_session_sync_unmetered(ds4_session *s, const ds4_tokens *prompt,
+                                      char *err, size_t errlen);
+
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
-#ifndef DS4_NO_GPU
-    if (s) s->dspark_rewind_end = 0;
-#endif
+    /* Stale image state is dropped before the reuse estimate, or the
+     * prefix it invalidates would count as reused rather than prefilled. */
     if (s && s->checkpoint_valid && !ds4_session_vision_prefix_matches(
                      s, s->sync_images, s->sync_image_count)) {
         ds4_session_invalidate(s);
     }
+    const uint64_t t0 = metrics_begin();
+    /* Every backend reuses the live state only when the prompt extends the
+     * checkpoint; any other prompt is evaluated from the first token. */
+    const int reused = t0 && s && prompt && s->checkpoint_valid &&
+                       prompt->len >= s->checkpoint.len &&
+                       ds4_tokens_starts_with(prompt, &s->checkpoint) ? s->checkpoint.len : 0;
+    const int rc = ds4_session_sync_unmetered(s, prompt, err, errlen);
+    metrics_end(t0, DS4_METRIC_PREFILL_NS);
+    if (t0) {
+        ds4_metric_add(DS4_METRIC_PREFILL_CALLS, 1);
+        if (rc == 0 && prompt) {
+            ds4_metric_add(DS4_METRIC_PREFILL_REUSED_TOKENS, (uint64_t)reused);
+            ds4_metric_add(DS4_METRIC_PREFILL_TOKENS,
+                           prompt->len > reused ? (uint64_t)(prompt->len - reused) : 0);
+        }
+    }
+    return rc;
+}
+
+static int ds4_session_sync_unmetered(ds4_session *s, const ds4_tokens *prompt,
+                                      char *err, size_t errlen) {
+#ifndef DS4_NO_GPU
+    if (s) s->dspark_rewind_end = 0;
+#endif
 #ifndef DS4_NO_GPU
     ds4_session_dspark_scheduler_begin_request(s);
 #endif
@@ -81647,7 +81874,10 @@ int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
         probe_mtp = false;
     }
 #endif
-    return ds4_session_eval_probe_tp(s, token, probe_mtp, err, errlen);
+    const uint64_t t0 = metrics_begin();
+    const int rc = ds4_session_eval_probe_tp(s, token, probe_mtp, err, errlen);
+    metrics_end_decode(t0, 1, rc == 0);
+    return rc;
 }
 
 /* A distributed coordinator maps only its own --layers slice, but the batch
@@ -84041,9 +84271,25 @@ static bool qwen4_batch_spec_next(const ds4_engine *e) {
 }
 #endif
 
+static int ds4_sessions_eval_batch_speculative_argmax_unmetered(
+        ds4_decode_item *items, int count, int (*accepted)[2], int *n_accepted,
+        char *err, size_t errlen);
+
 int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count,
                                                int (*accepted)[2], int *n_accepted,
                                                char *err, size_t errlen) {
+    const uint64_t t0 = metrics_begin();
+    const int rc = ds4_sessions_eval_batch_speculative_argmax_unmetered(
+            items, count, accepted, n_accepted, err, errlen);
+    int tokens = 0;
+    if (rc == 0 && n_accepted) for (int i = 0; i < count; i++) tokens += n_accepted[i];
+    metrics_end_decode(t0, count, tokens);
+    return rc;
+}
+
+static int ds4_sessions_eval_batch_speculative_argmax_unmetered(
+        ds4_decode_item *items, int count, int (*accepted)[2], int *n_accepted,
+        char *err, size_t errlen) {
     if (!items || count <= 0 || !accepted || !n_accepted) {
         if (err && errlen) snprintf(err, errlen, "empty speculative decode batch");
         return 1;
@@ -84301,8 +84547,19 @@ static int ds4_sessions_eval_batch_distributed(ds4_decode_item *items, int count
     return rc;
 }
 
+static int ds4_sessions_eval_batch_unmetered(ds4_decode_item *items, int count,
+                                             char *err, size_t errlen);
+
 int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
                             char *err, size_t errlen) {
+    const uint64_t t0 = metrics_begin();
+    const int rc = ds4_sessions_eval_batch_unmetered(items, count, err, errlen);
+    metrics_end_decode(t0, count, rc == 0 ? count : 0);
+    return rc;
+}
+
+static int ds4_sessions_eval_batch_unmetered(ds4_decode_item *items, int count,
+                                             char *err, size_t errlen) {
     if (!items || count <= 0) {
         if (err && errlen) snprintf(err, errlen, "empty decode batch");
         return 1;
@@ -84383,6 +84640,14 @@ int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
     return 0;
 }
 
+static int ds4_sessions_eval_batch_with_prefill_unmetered(
+        ds4_decode_item *items, int count, ds4_session *prefill_session,
+        const ds4_tokens *prefill_prompt, char *err, size_t errlen);
+
+/* A mixed pass extends one prompt while stepping the other sessions.  The
+ * prefill chunk dominates its cost, so the pass counts as prefill; the
+ * decode rows riding along are not decode-speed samples and stay out of
+ * the decode counters. */
 int ds4_sessions_eval_batch_with_prefill(
         ds4_decode_item *items,
         int count,
@@ -84390,6 +84655,23 @@ int ds4_sessions_eval_batch_with_prefill(
         const ds4_tokens *prefill_prompt,
         char *err,
         size_t errlen) {
+    const uint64_t t0 = metrics_begin();
+    const int tokens = prefill_session && prefill_prompt && prefill_session->checkpoint_valid &&
+                       prefill_prompt->len > prefill_session->checkpoint.len ?
+                       prefill_prompt->len - prefill_session->checkpoint.len : 0;
+    const int rc = ds4_sessions_eval_batch_with_prefill_unmetered(
+            items, count, prefill_session, prefill_prompt, err, errlen);
+    metrics_end(t0, DS4_METRIC_PREFILL_NS);
+    if (t0) {
+        ds4_metric_add(DS4_METRIC_PREFILL_CALLS, 1);
+        if (rc == 0) ds4_metric_add(DS4_METRIC_PREFILL_TOKENS, (uint64_t)tokens);
+    }
+    return rc;
+}
+
+static int ds4_sessions_eval_batch_with_prefill_unmetered(
+        ds4_decode_item *items, int count, ds4_session *prefill_session,
+        const ds4_tokens *prefill_prompt, char *err, size_t errlen) {
     if (!items || count <= 0 || !prefill_session || !prefill_prompt ||
         !prefill_session->engine) {
         if (err && errlen) snprintf(err, errlen, "invalid mixed model batch");
@@ -89152,7 +89434,26 @@ static int ds4_session_dist_dspark_cycle(
 #endif
 }
 
+static int ds4_session_eval_speculative_argmax_unmetered(
+        ds4_session *s, int first_token, int max_tokens, int eos_token,
+        bool ignore_eos, ds4_think_mode think_mode,
+        int *accepted, int accepted_cap,
+        char *err, size_t errlen);
+
 static int ds4_session_eval_speculative_argmax_impl(
+        ds4_session *s, int first_token, int max_tokens, int eos_token,
+        bool ignore_eos, ds4_think_mode think_mode,
+        int *accepted, int accepted_cap,
+        char *err, size_t errlen) {
+    const uint64_t t0 = metrics_begin();
+    const int n = ds4_session_eval_speculative_argmax_unmetered(
+            s, first_token, max_tokens, eos_token, ignore_eos, think_mode,
+            accepted, accepted_cap, err, errlen);
+    metrics_end_decode(t0, 1, n);
+    return n;
+}
+
+static int ds4_session_eval_speculative_argmax_unmetered(
         ds4_session *s, int first_token, int max_tokens, int eos_token,
         bool ignore_eos, ds4_think_mode think_mode,
         int *accepted, int accepted_cap,
@@ -90030,12 +90331,29 @@ int ds4_session_eval_speculative_argmax_ignoring_eos(
         accepted, accepted_cap, err, errlen);
 }
 
+static int ds4_session_eval_speculative_unmetered(
+        ds4_session *s, int first_token, int max_tokens, int eos_token,
+        float temperature, int top_k, float top_p, float min_p, uint64_t *rng,
+        int *accepted, int accepted_cap, char *err, size_t errlen);
+
 int ds4_session_eval_speculative(ds4_session *s, int first_token,
                                  int max_tokens, int eos_token,
                                  float temperature, int top_k,
                                  float top_p, float min_p, uint64_t *rng,
                                  int *accepted, int accepted_cap,
                                  char *err, size_t errlen) {
+    const uint64_t t0 = metrics_begin();
+    const int n = ds4_session_eval_speculative_unmetered(
+            s, first_token, max_tokens, eos_token, temperature, top_k, top_p,
+            min_p, rng, accepted, accepted_cap, err, errlen);
+    metrics_end_decode(t0, 1, n);
+    return n;
+}
+
+static int ds4_session_eval_speculative_unmetered(
+        ds4_session *s, int first_token, int max_tokens, int eos_token,
+        float temperature, int top_k, float top_p, float min_p, uint64_t *rng,
+        int *accepted, int accepted_cap, char *err, size_t errlen) {
     if (temperature <= 0.0f) {
         return ds4_session_eval_speculative_argmax(
             s, first_token, max_tokens, eos_token,

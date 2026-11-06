@@ -1293,6 +1293,7 @@ static void print_repl_help(void) {
     puts("  /power N       Set GPU duty cycle percentage, 1..100.");
     puts("  /steer F       Set FFN steering for subsequent tokens; no value shows it.");
     puts("  /read FILE     Submit a text file, PNG, or JPEG.");
+    puts("  /stats         Show prefill, decode, and I/O time accounting for this run.");
     puts("  /quit, /exit   Leave the prompt.");
     puts("  Ctrl+C         Stop generation and return to the prompt.");
 }
@@ -1707,6 +1708,7 @@ static bool cli_file_has_image_magic(const char *path) {
 }
 
 static int run_repl(ds4_engine *engine, cli_config *cfg) {
+    const uint64_t repl_t0 = ds4_metric_now_ns();
     repl_chat chat;
     if (repl_chat_init(engine, &chat, cfg) != 0) return 1;
 
@@ -1746,6 +1748,13 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
 
         if (!strcmp(cmd, "/help")) {
             print_repl_help();
+        } else if (!strcmp(cmd, "/stats")) {
+            uint64_t v[DS4_METRIC_COUNT];
+            char line[512];
+            ds4_metrics_snapshot(v);
+            ds4_metrics_summary(v, NULL, (double)(ds4_metric_now_ns() - repl_t0) / 1e9,
+                                line, sizeof(line));
+            puts(line);
         } else if (!strncmp(cmd, "/think", 6) &&
                    (cmd[6] == '\0' || isspace((unsigned char)cmd[6]))) {
             const char *arg = trim_inplace(cmd + 6);

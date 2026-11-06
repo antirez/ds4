@@ -7,6 +7,7 @@
 #include <stdio.h>
 
 #include "ds4_ssd.h"
+#include "ds4_metrics.h"
 
 /* Public engine boundary.
  *

@@ -135,6 +135,40 @@ Quantization variants may share compatible prefixes. Add
 Cache files contain prompt text and model state: treat the directory as
 private. It is disposable; stop the server before clearing it.
 
+## Metrics
+
+`GET /metrics` returns Prometheus text and `GET /metrics/json` returns the
+same counters as JSON with derived rates. Both are cumulative since startup
+and cheap to scrape. The engine counts wall time per phase at its public API,
+so a request's cost is split into:
+
+| Counter family | Meaning |
+| --- | --- |
+| `ds4_prefill_*` | Prompt syncs: tokens evaluated, tokens reused from the live KV prefix, seconds |
+| `ds4_decode_*` | Forward passes, session rows, committed tokens, seconds; tokens per pass is the speculative gain and rows per pass the batch size |
+| `ds4_vision_*` | Images encoded and seconds |
+| `ds4_kv_save_*`, `ds4_kv_load_*` | Disk KV payloads written and restored, bytes, seconds |
+| `ds4_net_*` | Bytes and blocked seconds exchanged with other nodes (pipeline or TP), gate count, and worker compute reported in pipeline telemetry |
+| `ds4_ssd_read_*` | Routed-expert bytes streamed from disk and seconds |
+| `ds4_server_*` | Requests by endpoint and finish reason, prompt/cached/completion tokens, queue-wait, time-to-first-token and request-duration histograms, disk KV and image cache hits, live gauges |
+
+On a distributed coordinator the network wait is nested inside prefill and
+decode time; `network_transport_seconds_estimate` in the JSON view subtracts
+the compute the workers reported, leaving transport latency. The JSON
+`time_share` object gives the fraction of uptime spent in each phase, which
+is the number to look at when deciding whether a deployment is bound by
+prompt processing, generation, or idle waiting for clients.
+
+```sh
+curl -s http://127.0.0.1:8000/metrics | grep -E '^ds4_(prefill|decode)_'
+curl -s http://127.0.0.1:8000/metrics/json | python3 -m json.tool
+```
+
+`--metrics-log 60` additionally logs one line per minute with the interval's
+deltas: prefill and decode throughput, time shares, network and disk I/O,
+requests completed, and average time to first token and queue wait. The
+interactive `ds4` CLI exposes the same engine accounting with `/stats`.
+
 ## Tool history and debugging
 
 For DeepSeek, the server preserves sampled DSML tool blocks and assigns

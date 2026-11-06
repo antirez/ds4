@@ -19,6 +19,7 @@
 #include <sys/mman.h>
 #include <sys/sysctl.h>
 #include <mach/mach.h>
+#include "ds4_metrics.h"
 #include <mach-o/dyld.h>
 #include <objc/runtime.h>
 
@@ -13740,6 +13741,8 @@ static void ds4_gpu_stream_expert_cache_note_pread(
         uint32_t layer,
         uint64_t bytes,
         double   ms) {
+    ds4_metric_add(DS4_METRIC_SSD_READ_BYTES, bytes);
+    ds4_metric_add(DS4_METRIC_SSD_READ_NS, (uint64_t)(ms * 1.0e6));
     if (g_stream_expert_cache_pread_bytes > UINT64_MAX - bytes) {
         g_stream_expert_cache_pread_bytes = UINT64_MAX;
     } else {
