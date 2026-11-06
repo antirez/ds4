@@ -2894,6 +2894,24 @@ static bool ds4_gpu_ported_m5_decode_feature_enabled(
     return pre_m5 || ds4_gpu_device_is_m5_apple_silicon();
 }
 
+static MTLCompileOptions *ds4_gpu_compile_options(void) {
+    /* The default language version follows the host executable's SDK, which
+     * can predate this library's SDK. The shaders need Metal 3.2 on macOS 15
+     * and MetalPerformancePrimitives needs Metal 4.0 on macOS 26. */
+    MTLCompileOptions *options = [MTLCompileOptions new];
+#if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000
+    if (@available(macOS 15.0, *)) {
+        options.languageVersion = MTLLanguageVersion3_2;
+    }
+#endif
+#if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
+    if (@available(macOS 26.0, *)) {
+        options.languageVersion = MTLLanguageVersion4_0;
+    }
+#endif
+    return options;
+}
+
 static int ds4_gpu_compile_tensor_probe(void) {
 #if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
     if (!g_device) return 0;
@@ -2922,7 +2940,7 @@ static int ds4_gpu_compile_tensor_probe(void) {
 
         NSError *error = nil;
         NSString *source = [NSString stringWithUTF8String:src];
-        id<MTLLibrary> probe_library = [g_device newLibraryWithSource:source options:[MTLCompileOptions new] error:&error];
+        id<MTLLibrary> probe_library = [g_device newLibraryWithSource:source options:ds4_gpu_compile_options() error:&error];
         if (!probe_library) {
             fprintf(stderr, "ds4: Metal 4 tensor API probe compile failed: %s\n",
                     error ? [[error localizedDescription] UTF8String] : "(unknown)");
@@ -7029,7 +7047,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        MTLCompileOptions *options = [MTLCompileOptions new];
+        MTLCompileOptions *options = ds4_gpu_compile_options();
         NSMutableDictionary *macros = [NSMutableDictionary new];
         if (g_metal4_tensor_api_enabled) {
             macros[@"DS4_METAL_HAS_TENSOR"] = @"1";
