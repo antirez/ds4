@@ -6,7 +6,7 @@ There are two modes:
 
 | Mode | Split | Main use |
 | --- | --- | --- |
-| Tensor parallelism | Routed experts and per-layer work across two Macs, or two Sparks for V4.1 Q2 | Resident inference with lower per-token work on each GPU |
+| Tensor parallelism | Routed experts and per-layer work across two Macs or two Sparks | Resident inference with lower per-token work on each GPU |
 | Pipeline parallelism | Complete layer ranges across several machines | Fit larger models and overlap long prefills |
 
 These are separate from [tensor parallelism across CUDA cards](CUDA_MULTI_GPU.md).
@@ -99,9 +99,10 @@ See [speculation](SPECULATIVE_DECODING.md) and [serving](SERVER.md).
 
 ## Tensor parallelism between two Sparks
 
-V4.1 Flash Q2 text inference supports one GPU per rank, with a 50/50 expert
-split. Each Spark holds about 81 GiB of weights, plus context and runtime
-buffers. Engram tables stay on disk. Do not add `--ssd-streaming` or
+V4 Flash 0731 Q2/MXFP4 and V4.1 Flash Q2 text inference support one GPU per rank,
+with a 50/50 expert split. Each Spark holds about 45 GiB of Flash 0731 Q2
+weights, 77 GiB of Flash MXFP4, or 81 GiB for V4.1, plus context and runtime
+buffers. V4.1 Engram tables stay on disk. Do not add `--ssd-streaming` or
 `--cuda-tensor-parallel`: those select different memory/execution modes.
 
 Build the same commit with `make cuda-spark` on both machines and download
@@ -124,15 +125,23 @@ For example, with the coordinator at `172.31.250.1` on the direct link:
 ```
 
 The link address selects the matching verbs device and GID. If selection is
-ambiguous, use `--rdma-device` and `--rdma-gid-index`. The transport stages
-CUDA results through host memory; this is RoCE, not GPUDirect. TCP is also
-available with `--transport tcp` on both peers.
+ambiguous, use `--rdma-device` and `--rdma-gid-index`. TCP is also available
+with `--transport tcp` on both peers.
+
+For Flash 0731, download `ds4f-q2` or `ds4f-mxfp4` on both hosts and use its
+GGUF path in the same commands. For DSpark, download `ds4f-dspark` on both and
+add `--dspark --mtp-model PATH` to both commands. With MXFP4 over RDMA, both
+GPUs also share the drafter work. This needs about 2.5 GiB extra per rank,
+beside the support model and context. If the worker has no drafter, or the
+configuration cannot use the split, drafting stays on the coordinator.
+Speed depends on the prompt.
 
 The coordinator can be `ds4-agent`, `ds4-server` or `ds4-bench`. Match context
-sizes on both sides. With five or more ready sessions, the server batches decode
-across both GPUs. Smaller groups run in order, which is faster at those sizes.
-Use `--batched-session 8` on the server; allow memory for all eight contexts.
-Vision, DSpark and other model/quant layouts are not supported by CUDA network TP.
+sizes and any `--prefill-chunk` overrides on both sides. For V4.1, five or more
+ready sessions use native batched decode; smaller groups run in order.
+Use `--batched-session 8` on the server and allow memory for all eight contexts.
+Flash 0731 network sessions currently run in order, without native batching.
+CUDA network TP does not support vision, V4.1 DSpark or other model/quant layouts.
 
 ## Pipeline parallelism
 

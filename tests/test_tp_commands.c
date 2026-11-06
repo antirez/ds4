@@ -190,18 +190,228 @@ static void check_logits_halves(void) {
     puts("TP logits halves: exact frames, reuse, canaries, EOF, invalid frames and timeout: ok");
 }
 
+typedef struct {
+    ds4_tp tp;
+    bool on, agreed, peer_on;
+    uint8_t meta[DS4_TP_DSPARK_META_BYTES];
+    int ok;
+} dspark_peer;
+
+static void *agree_dspark(void *arg) {
+    dspark_peer *p = arg;
+    char err[256];
+    p->ok = ds4_tp_agree_dspark_split(&p->tp, p->on, p->meta, &p->agreed,
+                                      &p->peer_on, err, sizeof(err));
+    return NULL;
+}
+
+/* Lockstep TP drafter agreement: off/off, leader only, worker only, both on
+ * with the same metadata, both on with different metadata. */
+static void check_dspark_agreement(void) {
+    for (unsigned c = 0; c < 5; c++) {
+        int fd[2];
+        assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fd) == 0);
+        dspark_peer p[2];
+        memset(p, 0, sizeof(p));
+        for (unsigned r = 0; r < 2; r++) {
+            tp_socket_tune(fd[r]);
+            assert(tp_socket_set_gate_timeout(fd[r], 3000));
+            p[r].tp.data_fd = fd[r];
+            p[r].tp.gate_timeout_ms = 3000;
+            p[r].on = c >= 3 || (c == 1 && r == 0) || (c == 2 && r == 1);
+            memset(p[r].meta, 0x5a, sizeof(p[r].meta));
+        }
+        if (c == 4) p[1].meta[17] ^= 1u;
+        pthread_t th;
+        assert(pthread_create(&th, NULL, agree_dspark, &p[1]) == 0);
+        agree_dspark(&p[0]);
+        assert(pthread_join(th, NULL) == 0);
+        for (unsigned r = 0; r < 2; r++) {
+            assert(p[r].ok == (c != 4));
+            assert(p[r].agreed == (c == 3));
+            assert(c == 4 || p[r].peer_on == p[1 - r].on);
+            assert(ds4_tp_failed(&p[r].tp) == (c == 4));
+        }
+        close(fd[0]);
+        close(fd[1]);
+    }
+}
+
+static void check_verify_commits(void) {
+    const int32_t modes[] = {DS4_TP_VERIFY_COMMIT_FULL,
+        DS4_TP_VERIFY_COMMIT_PREFIX, DS4_TP_VERIFY_ROLLBACK_REPLAY};
+    for (unsigned scenario = 0; scenario < 7; scenario++) {
+        int fd[2];
+        assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fd) == 0);
+        assert(tp_socket_set_gate_timeout(fd[1], 50));
+        ds4_tp leader = {.control_fd = fd[0]}, worker = {.control_fd = fd[1]};
+        int32_t mode = -1, count = -1;
+        if (scenario == 0) {
+            for (unsigned i = 0; i < 300; i++) {
+                const int32_t n = i % 3u ? 2 : 0;
+                assert(ds4_tp_send_verify_commit(&leader, modes[i % 3u], n));
+                assert(ds4_tp_send_eval(&leader, 42, i, 123));
+                assert(ds4_tp_recv_verify_commit(&worker, &mode, &count));
+                assert(mode == modes[i % 3u] && count == n);
+                ds4_tp_command command;
+                char err[256];
+                assert(ds4_tp_recv_command(&worker, &command, err, sizeof(err)));
+                assert(command.type == DS4_TP_FRAME_EVAL && command.seq == i);
+                ds4_tp_command_free(&command);
+            }
+        } else {
+            /* Wrong type/size, truncated header/payload, EOF and timeout. */
+            ds4_tp_frame_header h = {DS4_TP_MAGIC,
+                scenario == 1 ? DS4_TP_FRAME_EVAL : DS4_TP_FRAME_VERIFY_COMMIT,
+                scenario == 2 ? 4 : 8};
+            if (scenario <= 4)
+                assert(tp_write_full(fd[0], &h, scenario == 3 ? 4 : sizeof(h)));
+            if (scenario == 4) assert(tp_write_full(fd[0], &count, sizeof(count)));
+            if (scenario < 6) assert(shutdown(fd[0], SHUT_WR) == 0);
+            assert(!ds4_tp_recv_verify_commit(&worker, &mode, &count));
+            assert(mode == -1 && count == -1);
+        }
+        close(fd[0]); close(fd[1]);
+    }
+    puts("TP verify commits: all modes, ordering, malformed frames, EOF and timeout: ok");
+}
+
+/* Transport-only: supply the engine's three possible return statuses. */
+static void check_spec_restore(void) {
+    int fd[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fd) == 0);
+    assert(tp_socket_set_gate_timeout(fd[0], 50));
+    assert(tp_socket_set_gate_timeout(fd[1], 50));
+    ds4_tp leader = {.control_fd = fd[0]}, worker = {.control_fd = fd[1]};
+    ds4_tp_command cmd;
+    char err[256];
+    const int positions[] = {0, 123, INT_MAX};
+    const int statuses[] = {0, 1, -1};
+    for (unsigned i = 0; i < sizeof(positions) / sizeof(positions[0]); i++) {
+        assert(ds4_tp_send_spec_restore(&leader, 42, positions[i]));
+        assert(ds4_tp_recv_command(&worker, &cmd, err, sizeof(err)));
+        assert(cmd.type == DS4_TP_FRAME_SPEC_RESTORE && cmd.session_id == 42 &&
+               cmd.value == positions[i]);
+        assert(cmd.seq == 0 && cmd.limit == 0 && cmd.n_tokens == 0 &&
+               cmd.n_items == 0 && cmd.n_images == 0);
+        ds4_tp_command_free(&cmd);
+        int status = 99;
+        assert(ds4_tp_send_command_ack(&worker, 42, statuses[i]));
+        assert(ds4_tp_wait_command_status(&leader, 42, &status,
+                                          "spec restore", err, sizeof(err)));
+        assert(status == statuses[i] && !ds4_tp_failed(&leader));
+        if (status == 0) {
+            assert(ds4_tp_send_eval(&leader, 42, i, 7));
+            assert(ds4_tp_recv_command(&worker, &cmd, err, sizeof(err)));
+            assert(cmd.type == DS4_TP_FRAME_EVAL && cmd.session_id == 42 &&
+                   cmd.seq == i && cmd.value == 7);
+            ds4_tp_command_free(&cmd);
+        } else if (status == 1) {
+            assert(ds4_tp_send_invalidate(&leader, 42));
+            assert(ds4_tp_recv_command(&worker, &cmd, err, sizeof(err)));
+            assert(cmd.type == DS4_TP_FRAME_INVALIDATE && cmd.session_id == 42);
+            ds4_tp_command_free(&cmd);
+        }
+    }
+    assert(!ds4_tp_send_spec_restore(&leader, 42, -1));
+    assert(!ds4_tp_send_spec_restore(&leader, 42, INT_MIN));
+    char byte;
+    assert(recv(fd[1], &byte, 1, MSG_DONTWAIT) == -1 &&
+           (errno == EAGAIN || errno == EWOULDBLOCK));
+    const ds4_tp_value_command bad[] = {{42, -1, 0}, {42, 0, 1}};
+    for (unsigned i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        assert(tp_send_frame(fd[0], DS4_TP_FRAME_SPEC_RESTORE, &bad[i], sizeof(bad[i])));
+        assert(!ds4_tp_recv_command(&worker, &cmd, err, sizeof(err)));
+        ds4_tp_command_free(&cmd);
+    }
+    const ds4_tp_value_command msg = {42, 123, 0};
+    assert(tp_send_frame(fd[0], DS4_TP_FRAME_SPEC_RESTORE, &msg, sizeof(msg) - 4u));
+    assert(!ds4_tp_recv_command(&worker, &cmd, err, sizeof(err)));
+    ds4_tp_command_free(&cmd);
+    close(fd[0]); close(fd[1]);
+    puts("TP spec restore: positions, status ACKs, command reuse and malformed frames: ok");
+}
+
+static void check_failed_link(void) {
+    int fd[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fd) == 0);
+    ds4_tp tp = {.control_fd = fd[0], .data_fd = fd[0], .n_layer = 1};
+    ds4_tp_mark_failed(&tp);
+    for (unsigned mode = 0; mode < 2; mode++) {
+#ifdef DS4_TP_HAVE_VERBS
+        tp.rdma_active = tp.rdma.mbox_active = mode != 0;
+#endif
+        /* No slab or QP: a failed link must not touch either transport. */
+        const int token = 7;
+        uint32_t gates = 2, out = 42, in = 123;
+        assert(!ds4_tp_send_eval(&tp, 1, 1, token));
+        assert(!ds4_tp_send_verify(&tp, 1, &token, 1));
+        assert(!ds4_tp_send_verify_commit(&tp, DS4_TP_VERIFY_ROLLBACK_REPLAY, 1));
+        assert(!ds4_tp_send_dspark_draft(&tp, 1, token, 1, DS4_TP_DSPARK_DRAFT));
+        assert(!ds4_tp_send_spec_restore(&tp, 1, 0));
+        assert(!ds4_tp_gate_exchange(&tp, 0, 0, 1));
+        assert(!ds4_tp_batch_gate_exchange(&tp, 0, 2, 1));
+        assert(!ds4_tp_big_gate_exchange(&tp, 0, 1, &out, &in, sizeof(out)));
+        assert(!ds4_tp_batch_block_begin_gates(&tp, 2, 1, &gates));
+        assert(!ds4_tp_batch_block_end(&tp));
+        assert(gates == 2 && in == 123 && ds4_tp_failed(&tp));
+        char byte;
+        assert(recv(fd[1], &byte, 1, MSG_DONTWAIT) == -1 &&
+               (errno == EAGAIN || errno == EWOULDBLOCK));
+    }
+    close(fd[0]); close(fd[1]);
+    puts("TP failed links refuse commands and gates without I/O: ok");
+}
+
+#ifdef DS4_TP_HAVE_VERBS
+static void check_mailbox_verify_commits(void) {
+    for (unsigned scenario = 0; scenario < 6; scenario++) {
+        ds4_tp tp = {.n_layer = 1, .n_slots = 2, .vec_bytes = 16,
+            .rdma_active = true, .rdma = {.mbox_active = true}};
+        tp_slab_layout(&tp);
+        tp.slab = calloc(1, tp.slab_bytes);
+        assert(tp.slab);
+        uint8_t *record = tp.slab + tp.mbox_in_off;
+        const ds4_tp_frame_header h = {
+            scenario == 3 ? 0 : DS4_TP_MAGIC,
+            scenario == 1 ? DS4_TP_FRAME_EVAL :
+                scenario == 5 ? DS4_TP_MBOX_FRAME_TCP : DS4_TP_FRAME_VERIFY_COMMIT,
+            scenario == 2 ? 4 : scenario == 5 ? 0 : 8};
+        const int32_t payload[2] = {DS4_TP_VERIFY_COMMIT_PREFIX, 2};
+        const uint64_t seq = scenario == 4 ? 2 : 1;
+        memcpy(record, &h, sizeof(h));
+        memcpy(record + sizeof(h), payload, sizeof(payload));
+        memcpy(record + DS4_TP_MBOX_SEQ_OFF, &seq, sizeof(seq));
+        int32_t mode = -1, count = -1;
+        assert(ds4_tp_recv_verify_commit(&tp, &mode, &count) == (scenario == 0));
+        assert(mode == (scenario == 0 ? DS4_TP_VERIFY_COMMIT_PREFIX : -1));
+        assert(count == (scenario == 0 ? 2 : -1));
+        free(tp.slab);
+    }
+    puts("TP mailbox verify commits: exact payload, malformed frames and sequence: ok");
+}
+#endif
+
 int main(void) {
     check_backend_options();
+    check_dspark_agreement();
     check_bulk_exchange();
     check_sync_cancellation();
     check_logits_halves();
+    check_verify_commits();
+    check_spec_restore();
+    check_failed_link();
+#ifdef DS4_TP_HAVE_VERBS
+    check_mailbox_verify_commits();
+#endif
     int fd[2];
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fd) == 0);
     ds4_tp leader = { .control_fd = fd[0] };
     ds4_tp worker = { .control_fd = fd[1] };
     char err[256] = "";
     ds4_tp_command cmd;
-    assert(DS4_TP_PROTOCOL_VERSION == 14);
+    assert(DS4_TP_PROTOCOL_VERSION == 21);
+    assert(DS4_TP_FRAME_SPEC_RESTORE == 24);
     for (int i = 0; i < 4; i++) {
         assert(ds4_tp_send_eval(&leader, 42, 2*i, 100+i));
         assert(ds4_tp_recv_command(&worker, &cmd, err, sizeof(err)));
@@ -240,6 +450,57 @@ int main(void) {
     assert(ds4_tp_recv_command(&worker, &cmd, err, sizeof(err)));
     assert(cmd.type == DS4_TP_FRAME_SYNC && cmd.n_tokens == 3);
     assert(memcmp(cmd.tokens, tokens, sizeof(tokens)) == 0);
+    ds4_tp_command_free(&cmd);
+    for (uint32_t flags = 0; flags <= DS4_TP_VERIFY_FLAGS; flags++) {
+        /* A seed block without a lockstep proposal is meaningless. */
+        const bool valid = !(flags & DS4_TP_VERIFY_DSPARK_SEED) ||
+                           (flags & DS4_TP_VERIFY_DSPARK_TP);
+        assert(ds4_tp_send_verify_flags(&leader, 42, tokens, 3, flags) == valid);
+        if (!valid) continue;
+        assert(ds4_tp_recv_command(&worker, &cmd, err, sizeof(err)));
+        assert(cmd.type == DS4_TP_FRAME_VERIFY && cmd.n_tokens == 3 &&
+               cmd.session_id == 42 && (uint32_t)cmd.value == flags);
+        assert(!memcmp(cmd.tokens, tokens, sizeof(tokens)));
+        ds4_tp_command_free(&cmd);
+    }
+    assert(!ds4_tp_send_verify_flags(&leader, 42, tokens, 3, DS4_TP_VERIFY_FLAGS + 1u));
+    assert(!ds4_tp_send_verify_flags(&leader, 42, tokens, 3, DS4_TP_VERIFY_DSPARK_SEED));
+    const uint32_t invalid_types[] = {DS4_TP_FRAME_VERIFY, DS4_TP_FRAME_VERIFY,
+                                      DS4_TP_FRAME_VERIFY, DS4_TP_FRAME_SYNC};
+    const uint32_t invalid_flags[] = {DS4_TP_VERIFY_FLAGS + 1u, DS4_TP_VERIFY_DSPARK_SEED,
+                                      DS4_TP_VERIFY_HEAD_SPLIT | DS4_TP_VERIFY_DSPARK_SEED,
+                                      DS4_TP_VERIFY_HEAD_SPLIT};
+    for (unsigned i = 0; i < sizeof(invalid_types) / sizeof(invalid_types[0]); i++) {
+        assert(tp_send_token_command_flags(&leader, invalid_types[i], 42,
+                                           tokens, 3, invalid_flags[i]));
+        assert(!ds4_tp_recv_command(&worker, &cmd, err, sizeof(err)));
+        ds4_tp_command_free(&cmd);
+    }
+    for (int i = 0; i < 4; i++) {
+        const uint32_t mode = i % 2 ? DS4_TP_DSPARK_DRAFT : DS4_TP_DSPARK_MAINTAIN;
+        assert(ds4_tp_send_dspark_draft(&leader, 43, 300 + i, 1 + 7 * i, mode));
+        assert(ds4_tp_recv_command(&worker, &cmd, err, sizeof(err)));
+        assert(cmd.type == DS4_TP_FRAME_DSPARK_DRAFT && cmd.session_id == 43 &&
+               cmd.value == 300 + i && cmd.limit == 1 + 7 * i && cmd.seq == mode);
+        ds4_tp_command_free(&cmd);
+    }
+    assert(!ds4_tp_send_dspark_draft(&leader, 43, 1, 0, DS4_TP_DSPARK_DRAFT));
+    assert(!ds4_tp_send_dspark_draft(&leader, 43, -1, 5, DS4_TP_DSPARK_DRAFT));
+    assert(!ds4_tp_send_dspark_draft(&leader, 43, 1, 5, 0));
+    assert(!ds4_tp_send_dspark_draft(&leader, 43, 1, 5, 3));
+    const ds4_tp_dspark_draft_command bad_drafts[] = {
+        {43, 1, 0, DS4_TP_DSPARK_DRAFT, 0}, {43, -1, 5, DS4_TP_DSPARK_DRAFT, 0},
+        {43, 1, 5, 0, 0}, {43, 1, 5, 3, 0}, {43, 1, 5, DS4_TP_DSPARK_DRAFT, 1},
+    };
+    for (unsigned i = 0; i < sizeof(bad_drafts) / sizeof(bad_drafts[0]); i++) {
+        assert(tp_send_frame(fd[0], DS4_TP_FRAME_DSPARK_DRAFT, &bad_drafts[i],
+                             sizeof(bad_drafts[i])));
+        assert(!ds4_tp_recv_command(&worker, &cmd, err, sizeof(err)));
+        ds4_tp_command_free(&cmd);
+    }
+    assert(tp_send_frame(fd[0], DS4_TP_FRAME_DSPARK_DRAFT, &bad_drafts[0],
+                         sizeof(bad_drafts[0]) - 4u));
+    assert(!ds4_tp_recv_command(&worker, &cmd, err, sizeof(err)));
     ds4_tp_command_free(&cmd);
     assert(ds4_tp_send_command_ack(&worker, 42, 0));
     assert(ds4_tp_wait_command_ack(&leader, 42, "rebuild", err, sizeof(err)));

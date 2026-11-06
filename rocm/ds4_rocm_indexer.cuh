@@ -421,7 +421,9 @@ __global__ static void dspark_markov_argmax_kernel(
 }
 
 __device__ __forceinline__ static uint32_t topk_float_ordered_key(float v) {
-    const uint32_t u = __float_as_uint(v);
+    uint32_t u = __float_as_uint(v);
+    /* Match the comparison sort's equal treatment of signed zeros. */
+    if ((u & 0x7fffffffu) == 0u) u = 0u;
     return (u & 0x80000000u) ? ~u : (u ^ 0x80000000u);
 }
 

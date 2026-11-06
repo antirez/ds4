@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x); exit(1); } } while (0)
 static uint32_t state = 1743;
@@ -88,9 +89,132 @@ static double seconds(void) {
     return t.tv_sec + t.tv_nsec / 1e9;
 }
 
+/* TP shared/down projections receive compact input slices. Integer-valued
+ * inputs with a +/-127 maximum quantize exactly, allowing a double oracle. */
+static void check_slices(void) {
+    enum { WIDTH = 2048, OUTPUTS = 65, ROWS = 8, BLOCKS = WIDTH / 32 };
+    const size_t bytes = OUTPUTS * BLOCKS * 34u;
+    unsigned char *model = malloc(bytes);
+    float *input = malloc(ROWS * WIDTH * sizeof(float));
+    float *compact = malloc(ROWS * WIDTH * sizeof(float));
+    float *actual = malloc((ROWS * OUTPUTS + 8) * sizeof(float));
+    CHECK(model && input && compact && actual && ds4_gpu_init());
+    for (unsigned b = 0; b < OUTPUTS * BLOCKS; b++) {
+        const uint16_t scale = 0x2c00; /* 1/16 */
+        memcpy(model + b * 34u, &scale, 2);
+        for (unsigned k = 0; k < 32; k++) model[b * 34u + 2u + k] = random_bits() >> 24;
+    }
+    for (unsigned r = 0; r < ROWS; r++) for (unsigned k = 0; k < WIDTH; k++)
+        input[r * WIDTH + k] = (k % 32 == 0 ? 127 : (int)(random_bits() % 255) - 127);
+    char path[] = "/tmp/ds4-q8-slice-XXXXXX";
+    const int fd = mkstemp(path);
+    CHECK(fd >= 0);
+    FILE *file = fdopen(dup(fd), "wb");
+    CHECK(file && fwrite(model, 1, bytes, file) == bytes);
+    CHECK(fclose(file) == 0 && unlink(path) == 0);
+    const uint64_t offset = 0, size = bytes;
+    CHECK(ds4_gpu_set_model_map_spans(model, bytes, &offset, &size, 1, 0));
+    CHECK(ds4_gpu_set_model_fd_for_map(fd, model));
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(ROWS * WIDTH * sizeof(float));
+    ds4_gpu_tensor *y = ds4_gpu_tensor_alloc((ROWS * OUTPUTS + 8) * sizeof(float));
+    CHECK(x && y);
+    const unsigned starts[] = {0, WIDTH / 2, 32, WIDTH - 32};
+    const unsigned widths[] = {WIDTH / 2, WIDTH / 2, WIDTH - 64, 32};
+    for (unsigned part = 0; part < 4; part++) {
+        const unsigned first = starts[part], count = widths[part];
+        for (unsigned r = 0; r < ROWS; r++)
+            memcpy(compact + r * count, input + r * WIDTH + first, count * sizeof(float));
+        CHECK(ds4_gpu_tensor_write(x, 0, compact, ROWS * count * sizeof(float)));
+        for (unsigned rows = 1; rows <= ROWS; rows++) {
+            CHECK(ds4_gpu_tensor_fill_f32(y, NAN, ROWS * OUTPUTS + 8));
+            CHECK(ds4_gpu_matmul_q8_0_kslice_rows_tensor(y, model, bytes, 0,
+                    WIDTH, OUTPUTS, first, count, x, rows));
+            CHECK(ds4_gpu_tensor_read(y, 0, actual, (ROWS * OUTPUTS + 8) * sizeof(float)));
+            for (unsigned r = 0; r < rows; r++) for (unsigned o = 0; o < OUTPUTS; o++) {
+                double expected = 0;
+                for (unsigned k = first; k < first + count; k++)
+                    expected += (double)(int8_t)model[(o * BLOCKS + k / 32) * 34 + 2 + k % 32] *
+                                input[r * WIDTH + k] / 16.0;
+                CHECK(isfinite(actual[r * OUTPUTS + o]));
+                CHECK(fabs(actual[r * OUTPUTS + o] - expected) < 0.002);
+            }
+            for (unsigned i = rows * OUTPUTS; i < ROWS * OUTPUTS + 8; i++) CHECK(isnan(actual[i]));
+        }
+    }
+    CHECK(!ds4_gpu_matmul_q8_0_kslice_rows_tensor(y, model, bytes, 0,
+            WIDTH, OUTPUTS, WIDTH - 32, 64, x, 6));
+    ds4_gpu_tensor_free(y); ds4_gpu_tensor_free(x); ds4_gpu_cleanup();
+    CHECK(close(fd) == 0);
+    free(actual); free(compact); free(input); free(model);
+    puts("CUDA Q8 compact K slices, rows 1-8, rank halves and tails: double reference PASS");
+}
+
 static int compare_time(const void *a, const void *b) {
     const double x = *(const double *)a, y = *(const double *)b;
     return (x > y) - (x < y);
+}
+
+static void check_slice_rows(unsigned width, unsigned outputs, int timing) {
+    const unsigned rows = 8, count = width / 2, blocks = width / 32;
+    const uint64_t offset = 0, bytes = (uint64_t)outputs * blocks * 34u;
+    unsigned char *model = malloc(bytes);
+    float *input = malloc((size_t)rows * count * 4u);
+    float *expected = malloc((size_t)rows * outputs * 4u);
+    float *actual = malloc(((size_t)rows * outputs + 8) * 4u);
+    CHECK(model && input && expected && actual && ds4_gpu_init());
+    for (uint64_t b = 0; b < bytes / 34u; b++) {
+        const uint16_t scale = 0x2000u + random_bits() % 1024u;
+        memcpy(model + b * 34u, &scale, 2);
+        for (unsigned k = 0; k < 32; k++) model[b * 34u + 2u + k] = random_bits() >> 24;
+    }
+    for (size_t i = 0; i < (size_t)rows * count; i++)
+        input[i] = ((int)(random_bits() >> 16) - 32768) / 8192.0f;
+    char path[] = "/tmp/ds4-q8-slice-rows-XXXXXX";
+    const int fd = mkstemp(path);
+    CHECK(fd >= 0);
+    FILE *file = fdopen(dup(fd), "wb");
+    CHECK(file && fwrite(model, 1, bytes, file) == bytes);
+    CHECK(fclose(file) == 0 && unlink(path) == 0);
+    CHECK(ds4_gpu_set_model_map_spans(model, bytes, &offset, &bytes, 1, 0));
+    CHECK(ds4_gpu_set_model_fd_for_map(fd, model));
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc((uint64_t)rows * count * 4u);
+    ds4_gpu_tensor *y = ds4_gpu_tensor_alloc(((uint64_t)rows * outputs + 8) * 4u);
+    CHECK(x && y && ds4_gpu_tensor_write(x, 0, input, (size_t)rows * count * 4u));
+    for (unsigned r = 0; r < rows; r++) {
+        ds4_gpu_tensor *xr = ds4_gpu_tensor_view(x, (uint64_t)r * count * 4u, count * 4u);
+        ds4_gpu_tensor *yr = ds4_gpu_tensor_view(y, (uint64_t)r * outputs * 4u, outputs * 4u);
+        CHECK(xr && yr && ds4_gpu_matmul_q8_0_kslice_rows_tensor(yr,
+            model, bytes, 0, width, outputs, count, count, xr, 1));
+        ds4_gpu_tensor_free(xr); ds4_gpu_tensor_free(yr);
+    }
+    CHECK(ds4_gpu_tensor_read(y, 0, expected, (size_t)rows * outputs * 4u));
+    for (unsigned n = 1; n <= rows; n++) {
+        CHECK(ds4_gpu_tensor_fill_f32(y, NAN, (size_t)rows * outputs + 8));
+        CHECK(ds4_gpu_matmul_q8_0_kslice_rows_tensor(y, model, bytes, 0,
+            width, outputs, count, count, x, n));
+        CHECK(ds4_gpu_tensor_read(y, 0, actual, ((size_t)rows * outputs + 8) * 4u));
+        CHECK(!memcmp(expected, actual, (size_t)n * outputs * 4u));
+        for (size_t i = (size_t)n * outputs; i < (size_t)rows * outputs + 8; i++)
+            CHECK(isnan(actual[i]));
+        if (timing) {
+            double elapsed[9];
+            for (unsigned trial = 0; trial < 11; trial++) {
+                const double start = seconds();
+                for (unsigned repeat = 0; repeat < 20; repeat++)
+                    CHECK(ds4_gpu_matmul_q8_0_kslice_rows_tensor(y, model, bytes, 0,
+                        width, outputs, count, count, x, n));
+                CHECK(ds4_gpu_synchronize());
+                if (trial >= 2) elapsed[trial - 2] = (seconds() - start) / 20;
+            }
+            qsort(elapsed, 9, sizeof(*elapsed), compare_time);
+            printf("Q8 slice width=%u outputs=%u rows=%u median=%.3f ms\n",
+                width, outputs, n, elapsed[4] * 1000);
+        }
+    }
+    ds4_gpu_tensor_free(y); ds4_gpu_tensor_free(x); ds4_gpu_cleanup();
+    CHECK(close(fd) == 0);
+    free(actual); free(expected); free(input); free(model);
+    printf("Q8 slice width=%u outputs=%u: scalar rows exact PASS\n", width, outputs);
 }
 
 static void bench(uint32_t width, uint32_t outputs, uint32_t rows) {
@@ -125,6 +249,17 @@ static void bench(uint32_t width, uint32_t outputs, uint32_t rows) {
 }
 
 int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--slices")) {
+        check_slices();
+        check_slice_rows(2048, 65, 0);
+        check_slice_rows(8192, 65, 0);
+        return 0;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--bench-slices")) {
+        check_slice_rows(2048, 4096, 1);
+        check_slice_rows(8192, 4096, 1);
+        return 0;
+    }
     if (argc == 2 && !strcmp(argv[1], "--tp-head")) {
         CHECK(ds4_gpu_init());
         check(160, 129280, 8);
@@ -144,6 +279,9 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (argc != 1) return 2;
+    check_slices();
+    check_slice_rows(2048, 65, 0);
+    check_slice_rows(8192, 65, 0);
     const uint32_t blocks[] = {1, 3, 31, 32, 33, 128, 256};
     const uint32_t outputs[] = {1, 3, 63, 64, 65};
     for (size_t b = 0; b < sizeof(blocks) / sizeof(*blocks); b++)

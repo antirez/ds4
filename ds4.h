@@ -493,6 +493,9 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
                       int top_k, float top_p, float min_p, uint64_t *rng);
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
 #ifdef DS4_TEST_HOOKS
+/* Teacher-force a V4.1 verification block, returning logits after each token. */
+int ds4_test_ds41_verify_tokens(ds4_session *s, const int *tokens, int count,
+                                float *logits, char *err, size_t errlen);
 int ds4_test_sample_logits(const float *logits, uint32_t n_vocab,
                            float temperature, int top_k,
                            float top_p, float min_p, uint64_t *rng,
@@ -580,14 +583,28 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
                                  char *err, size_t errlen);
 /* TP worker side of a mirrored speculative-verify block: run its half of the
  * batch verify for KV side effects, then obey the leader's commit frame
- * (keep, or roll back and replay). Only called from ds4_tp_worker_run. */
+ * (keep, or roll back and replay). flags are the VERIFY frame's
+ * DS4_TP_VERIFY_* bits. Only called from ds4_tp_worker_run. */
 int ds4_session_tp_spec_cycle(ds4_session *s, const int *drafts, int draft_n,
-                              char *err, size_t errlen);
+                              uint32_t flags, char *err, size_t errlen);
 int ds4_session_glm_tp_spec_cycle(ds4_session *s, int token, int limit,
                                  char *err, size_t errlen);
+/* TP worker side of a lockstep DSpark DRAFT/MAINTAIN frame (mode is a
+ * DS4_TP_DSPARK_* value).  Only called from ds4_tp_worker_run. */
+int ds4_session_tp_dspark_draft(ds4_session *s, int token, int pos,
+                                uint32_t mode, char *err, size_t errlen);
+/* Internal TP restore: no collectives and no logits exchange. Return 0 after
+ * restoring a recent verifier prefix, 1 if unavailable, -1 on copy failure.
+ * Logits are valid only at the block start; otherwise replay before sampling. */
+int ds4_session_restore_speculative_prefix(ds4_session *s, int pos);
 void ds4_session_invalidate(ds4_session *s);
-/* Keep the token prefix, restoring recurrent state where possible. Otherwise
- * the checkpoint becomes invalid: sync the retained prefix before eval.
+/* Try a recent speculative rewind, including valid next-token logits. False
+ * means the caller must use ordinary rewind/sync before continuing; a failed
+ * restore may have invalidated the checkpoint. */
+bool ds4_session_rewind_speculative(ds4_session *s, int pos);
+/* Keep the token prefix, restoring recurrent state where possible. This may
+ * copy GPU state and replay a bounded speculative suffix on both TP ranks.
+ * Otherwise the checkpoint becomes invalid: sync the retained prefix before eval.
  * Callers retaining images must use sync_multimodal for that rebuild. */
 void ds4_session_rewind(ds4_session *s, int pos);
 int ds4_session_pos(ds4_session *s);

@@ -1,5 +1,6 @@
-/* Small SSD batches must retain isolated decode's quantization and slot sum. */
+/* SSD scalar/batch parity and resident TP expert ownership. */
 #include "ds4_gpu.h"
+#include "ds4_gpu_tp.h"
 #include <errno.h>
 #include <math.h>
 #include <stdint.h>
@@ -12,6 +13,11 @@
 enum { LAYERS = 2, MAX_SLOTS = 6 };
 static uint32_t rng = 41;
 static bool owned_mmq_test;
+static int unexpected_exchange(void *ud, uint32_t layer, uint32_t gate, uint64_t seq) {
+    (void)ud; (void)layer; (void)gate; (void)seq;
+    CHECK(false);
+    return 0;
+}
 static unsigned char random_byte(void) {
     rng = rng * 1664525u + 1013904223u;
     return rng >> 24;
@@ -42,10 +48,12 @@ static void exact(const float *actual, const float *expected, size_t count) {
 }
 
 static void run(unsigned dim, unsigned mid_dim, unsigned slots, bool scalar_only,
-                bool owned, bool q4, unsigned ROWS, unsigned EXPERTS) {
-    const unsigned gate_type = q4 ? 12 : 16, down_type = q4 ? 12 : 10;
-    const size_t gate_row = (q4 ? 144 : 66) * (dim / 256);
-    const size_t down_row = (q4 ? 144 : 84) * (mid_dim / 256);
+                bool owned, unsigned format, unsigned ROWS, unsigned EXPERTS) {
+    const bool q4 = format == 12, mx = format == 39;
+    const unsigned gate_type = mx ? 39 : q4 ? 12 : 16;
+    const unsigned down_type = mx ? 39 : q4 ? 12 : 10;
+    const size_t gate_row = mx ? 17 * (dim / 32) : (q4 ? 144 : 66) * (dim / 256);
+    const size_t down_row = mx ? 17 * (mid_dim / 32) : (q4 ? 144 : 84) * (mid_dim / 256);
     const size_t gate_bytes = mid_dim * gate_row, down_bytes = dim * down_row;
     const size_t layer_bytes = EXPERTS * (2 * gate_bytes + down_bytes);
     const size_t model_bytes = LAYERS * layer_bytes;
@@ -58,11 +66,12 @@ static void run(unsigned dim, unsigned mid_dim, unsigned slots, bool scalar_only
     CHECK(model && input && expected && expected_mid && actual && actual_mid);
     for (unsigned layer = 0; layer < LAYERS; layer++) {
         for (unsigned part = 0; part < 3; part++) {
-            const size_t unit = q4 ? 144 : part == 2 ? 84 : 66;
+            const size_t unit = mx ? 17 : q4 ? 144 : part == 2 ? 84 : 66;
             const size_t bytes = EXPERTS * (part == 2 ? down_bytes : gate_bytes);
             unsigned char *w = model + layer * layer_bytes + part * EXPERTS * gate_bytes;
             for (size_t i = 0; i < bytes; i++) w[i] = random_byte();
             for (size_t i = 0; i < bytes; i += unit) {
+                if (mx) { w[i] = 118; continue; }
                 const size_t d = i + (!q4 && part == 2 ? 80 : 0);
                 w[d] = 0; w[d + 1] = 0x14;
                 if (q4 || part == 2) { w[d + 2] = 0; w[d + 3] = 0; }
@@ -78,9 +87,11 @@ static void run(unsigned dim, unsigned mid_dim, unsigned slots, bool scalar_only
         CHECK(n > 0);
         off += (size_t)n;
     }
-    CHECK(ds4_gpu_init() && ds4_gpu_set_model_fd_for_map(fd, model) &&
-          ds4_gpu_set_model_map(model, model_bytes));
-    ds4_gpu_set_ssd_streaming(true);
+    const uint64_t map_offset = 0, map_bytes = model_bytes;
+    CHECK(ds4_gpu_init() &&
+          ds4_gpu_set_model_map_spans(model, model_bytes, &map_offset, &map_bytes, 1, 0) &&
+          ds4_gpu_set_model_fd_for_map(fd, model));
+    ds4_gpu_set_ssd_streaming(!mx);
     ds4_gpu_set_streaming_expert_cache_expert_bytes(2 * gate_bytes + down_bytes);
     ds4_gpu_tensor *x = tensor(ROWS * dim * sizeof(float));
     ds4_gpu_tensor *ids = tensor(ROWS * slots * sizeof(int32_t));
@@ -93,7 +104,7 @@ static void run(unsigned dim, unsigned mid_dim, unsigned slots, bool scalar_only
     int32_t selected[ROWS * MAX_SLOTS];
     float sw[ROWS * MAX_SLOTS];
     const unsigned budgets[] = {0, 3, 12, 24};
-    const unsigned counts[] = {1, 2, 4, 7, 8, 9, 16, 17, 31, 32, 127, 128, 129,
+    const unsigned counts[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 17, 31, 32, 127, 128, 129,
         8191, 8192, 8193};
     uint64_t scalar_hash = UINT64_C(1469598103934665603);
     for (unsigned pass = 0; pass < 2; pass++) {
@@ -131,7 +142,7 @@ static void run(unsigned dim, unsigned mid_dim, unsigned slots, bool scalar_only
         }
         if (owned) {
             float *sum = calloc(ROWS * dim, sizeof(float));
-            float *one = malloc(dim * sizeof(float));
+            float *one = malloc(ROWS * dim * sizeof(float));
             CHECK(sum && one);
             ds4_gpu_set_ssd_streaming(false);
             if (slots == 6) {
@@ -165,7 +176,10 @@ static void run(unsigned dim, unsigned mid_dim, unsigned slots, bool scalar_only
                 CHECK(ds4_gpu_tensor_write(x, 0, input, rows * dim * sizeof(float)));
                 for (unsigned layer = 0; layer < LAYERS; layer++) {
                     const size_t g = layer * layer_bytes, u = g + EXPERTS * gate_bytes, d = u + EXPERTS * gate_bytes;
-                    if (owned_mmq_test && !q4 && rows >= 128 && EXPERTS / 2 >= slots) {
+                    /* Compare identical batch reductions split and unsplit;
+                     * scalar and matrix kernels may round differently. */
+                    if ((mx && rows > 1) ||
+                        (owned_mmq_test && !q4 && rows >= 128 && EXPERTS / 2 >= slots)) {
                         CHECK(ds4_gpu_tensor_write(ids, 0, selected, rows * slots * sizeof(int32_t)));
                         CHECK(ds4_gpu_tensor_write(weights, 0, sw, rows * slots * sizeof(float)));
                         bool half = false;
@@ -189,12 +203,33 @@ static void run(unsigned dim, unsigned mid_dim, unsigned slots, bool scalar_only
                             rank * (EXPERTS / 2), EXPERTS / 2, clamp, x, layer, rows, &half));
                         CHECK(!half && ds4_gpu_tensor_read(out, 0, actual, (rows * dim + 1) * sizeof(float)));
                         CHECK(actual[rows * dim] == 12345);
+                        if (mx) {
+                            /* The network graph uses the generic entry point,
+                             * which must filter ownership without changing its inputs. */
+                            int32_t check_ids[rows * MAX_SLOTS];
+                            float check_weights[rows * MAX_SLOTS];
+                            poison_experts(gate, up, mid, down, rows, slots, dim, mid_dim);
+                            CHECK(ds4_gpu_tensor_write(ids, 0, selected, rows * slots * sizeof(int32_t)));
+                            CHECK(ds4_gpu_tensor_write(weights, 0, sw, rows * slots * sizeof(float)));
+                            CHECK(ds4_gpu_tp_init(rank, out, 0, 0, dim * sizeof(float), unexpected_exchange, NULL));
+                            CHECK(ds4_gpu_routed_moe_batch_tensor(out, gate, up, mid, down,
+                                model, model_bytes, g, u, d, gate_type, down_type, gate_bytes, gate_row,
+                                down_bytes, down_row, dim, mid_dim, dim, ids, weights, EXPERTS, slots,
+                                clamp, x, layer, rows, &half, false));
+                            CHECK(!half && ds4_gpu_tensor_read(out, 0, one, rows * dim * sizeof(float)));
+                            CHECK(ds4_gpu_tensor_read(ids, 0, check_ids, rows * slots * sizeof(int32_t)));
+                            CHECK(ds4_gpu_tensor_read(weights, 0, check_weights, rows * slots * sizeof(float)));
+                            CHECK(!memcmp(check_ids, selected, rows * slots * sizeof(int32_t)));
+                            CHECK(!memcmp(check_weights, sw, rows * slots * sizeof(float)));
+                            exact(one, actual, rows * dim);
+                            ds4_gpu_tp_shutdown();
+                        }
                         for (unsigned i = 0; i < rows * dim; i++) {
                             CHECK(isfinite(actual[i]));
                             sum[i] += actual[i];
                             if (pass && (i / dim) % 2 != rank) CHECK(actual[i] == 0);
                         }
-                        if (!q4 && dim == 5120 && mid_dim == 2304 && rows <= 8) {
+                        if (!q4 && !mx && dim == 5120 && mid_dim == 2304 && rows <= 8) {
                             /* Each local small-batch row must match its own
                              * scalar partial, not just the two-rank sum. */
                             for (unsigned row = 0; row < rows; row++) {
@@ -216,12 +251,12 @@ static void run(unsigned dim, unsigned mid_dim, unsigned slots, bool scalar_only
                         const float reference = expected[layer * ROWS * dim + i];
                         if (fabsf(sum[i] - reference) > 3e-5f * (1 + fabsf(reference)))
                             fprintf(stderr, "owned %s sum rows=%u index=%u actual=%g reference=%g\n",
-                                q4 ? "Q4_K" : "IQ2", rows, i, sum[i], reference);
+                                mx ? "MXFP4" : q4 ? "Q4_K" : "IQ2", rows, i, sum[i], reference);
                         CHECK(fabsf(sum[i] - reference) <= 3e-5f * (1 + fabsf(reference)));
                     }
                 }
             }
-            ds4_gpu_set_ssd_streaming(true);
+            ds4_gpu_set_ssd_streaming(!mx);
             free(one);
             free(sum);
         }
@@ -253,7 +288,7 @@ static void run(unsigned dim, unsigned mid_dim, unsigned slots, bool scalar_only
         }
     }
     fprintf(stderr, "CUDA %s %s: width=%u mid=%u slots=%u rows=%u experts=%u scalar_hash=%016llx PASS\n",
-            q4 ? "Q4_K" : "IQ2/Q2_K", owned ? "owned partials" : scalar_only ? "scalar" : "SSD scalar/batch exact",
+            mx ? "MXFP4" : q4 ? "Q4_K" : "IQ2/Q2_K", owned ? "owned partials" : scalar_only ? "scalar" : "SSD scalar/batch exact",
             dim, mid_dim, slots, ROWS, EXPERTS,
             (unsigned long long)scalar_hash);
     ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(ids); ds4_gpu_tensor_free(weights);
@@ -269,29 +304,35 @@ static void run(unsigned dim, unsigned mid_dim, unsigned slots, bool scalar_only
 
 int main(int argc, char **argv) {
     const bool scalar_only = argc == 2 && !strcmp(argv[1], "--scalar-only");
+    const bool mx = argc == 2 && !strcmp(argv[1], "--owned-mxfp4");
     const bool large = argc == 2 && !strcmp(argv[1], "--owned-mmq-large");
     owned_mmq_test = large || (argc == 2 && !strcmp(argv[1], "--owned-mmq"));
-    const bool owned = owned_mmq_test || (argc == 2 && !strcmp(argv[1], "--owned"));
+    const bool owned = mx || owned_mmq_test || (argc == 2 && !strcmp(argv[1], "--owned"));
     if (argc > 1 && !scalar_only && !owned) {
-        fprintf(stderr, "usage: %s [--scalar-only|--owned|--owned-mmq|--owned-mmq-large]\n", argv[0]);
+        fprintf(stderr, "usage: %s [--scalar-only|--owned|--owned-mmq|--owned-mmq-large|--owned-mxfp4]\n", argv[0]);
         return 2;
+    }
+    if (mx) {
+        run(512, 512, 6, false, true, 39, 129, 16);
+        run(4096, 2048, 6, false, true, 39, 8, 16);
+        return 0;
     }
     if (owned && !owned_mmq_test) CHECK(setenv("DS4_CUDA_MOE_NO_OWNED_MMQ", "1", 1) == 0);
     if (large) {
-        run(512, 512, 6, false, true, false, 8193, 16);
+        run(512, 512, 6, false, true, 16, 8193, 16);
         return 0;
     }
-    run(512, 512, 3, scalar_only, owned, false, 8, 8);
-    run(512, 512, 6, scalar_only, owned, false, 8, 8);
-    run(5120, 2304, 6, scalar_only, owned, false, 8, 8);
-    run(4096, 2048, 6, scalar_only, owned, false, 8, 8);
+    run(512, 512, 3, scalar_only, owned, 16, 8, 8);
+    run(512, 512, 6, scalar_only, owned, 16, 8, 8);
+    run(5120, 2304, 6, scalar_only, owned, 16, 8, 8);
+    run(4096, 2048, 6, scalar_only, owned, 16, 8, 8);
     if (owned) {
-        run(5120, 2304, 6, false, true, false, 129, owned_mmq_test ? 16 : 8);
-        run(4352, 512, 3, false, true, false, 129, 8);
-        run(512, 512, 3, false, true, true, 8, 8);
-        run(4096, 2048, 6, false, true, true, 8, 8);
-        run(512, 512, 6, false, true, false, 129, 384);
-        run(512, 512, 6, false, true, true, 129, 384);
+        run(5120, 2304, 6, false, true, 16, 129, owned_mmq_test ? 16 : 8);
+        run(4352, 512, 3, false, true, 16, 129, 8);
+        run(512, 512, 3, false, true, 12, 8, 8);
+        run(4096, 2048, 6, false, true, 12, 8, 8);
+        run(512, 512, 6, false, true, 16, 129, 384);
+        run(512, 512, 6, false, true, 12, 129, 384);
     }
     return 0;
 }

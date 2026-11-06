@@ -205,6 +205,7 @@ static bool tensor_type_info(uint32_t type, uint64_t &block_elems, uint64_t &blo
     case 28: block_elems = 1; block_bytes = 8; return true;
     case 29: block_elems = 256; block_bytes = 56; return true;
     case 30: block_elems = 1; block_bytes = 2; return true;
+    case 39: block_elems = 32; block_bytes = 17; return true;
     default: return false;
     }
 }

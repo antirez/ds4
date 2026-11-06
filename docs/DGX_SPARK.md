@@ -14,7 +14,7 @@ make cuda-spark
 ./ds4 --cuda
 ```
 
-The build selects `sm_121` and enables the Blackwell-specific kernels.
+The build targets GB10 (`sm_121a`) and enables the Blackwell-specific kernels.
 Do not use `--cuda-tensor-parallel` on a single Spark.
 Stop other inference services before loading a model so they do not compete
 for memory. Restore any services you stopped when finished.
@@ -36,8 +36,10 @@ other programs and the context. Use the same options with `ds4-agent` or
 
 Two Sparks can instead keep half the experts each, using
 [network tensor parallelism](DISTRIBUTED.md#tensor-parallelism-between-two-sparks).
-Both need the complete GGUF on their local SSD. V4.1 CUDA vision and DSpark
-are not supported. The [model guide](MODELS.md#deepseek-v41-flash) covers
+Both need the complete GGUF on their local SSD. Single-host V4.1
+[DSpark](SPECULATIVE_DECODING.md#deepseek-v41-flash-dspark) also works with SSD
+streaming; TP speculation and CUDA vision are not supported for V4.1.
+The [model guide](MODELS.md#deepseek-v41-flash) covers
 thinking levels and the separate Metal configurations.
 
 September 13-14, 2026, Q2 SSD with automatic cache sizing: a 3,241-token
@@ -51,14 +53,53 @@ prefill plus the reply fell from about 87 to 59 seconds.
 See the [QA record](../QA_BEFORE_RELEASES.md#cuda-ssd-streaming) for conditions
 and longer-context measurements.
 
-On two Sparks over RoCE, September 13 measurements averaged **21.9 t/s** for
-one session: Q2, a 1K prompt, 64K allocated context and 2,048 teacher-forced
-decode tokens. This does not use speculative decoding. Separately, eight
-ready sessions reached about **28 aggregate t/s**, not 28 t/s per client. Decode batching
-starts at five ready sessions; smaller groups run in order. Separate long
-runs measured about 400 t/s for a 32K prefill and 290 t/s for an 8K append. The
-[network TP QA record](../QA_BEFORE_RELEASES.md#cuda-network-tensor-parallelism)
-has the timing controls and memory limits.
+On two Sparks over the direct RoCE link, Q2 measured **21.8 t/s** for one
+session on October 2, 2026: a 1K prompt, 64K allocated context and 2,048
+teacher-forced decode tokens, without speculation.
+
+| Work | Speed |
+| --- | ---: |
+| Fresh 32K prefill | 411 t/s |
+| Add 8K after 32K | 314 t/s |
+
+Both runs used 64K allocated context and 512 decode tokens per frontier;
+decode at these longer contexts was about 18 t/s. Engram tables stayed on disk.
+
+Decode batching starts at five ready sessions; smaller groups run in order.
+The earlier eight-session reference is about **28 aggregate t/s**, not per
+client. See the [network TP QA record](../QA_BEFORE_RELEASES.md#cuda-network-tensor-parallelism)
+for the workloads and memory limits.
+
+## Flash 0731 on two Sparks
+
+[Network tensor parallelism](DISTRIBUTED.md#tensor-parallelism-between-two-sparks)
+also supports Flash 0731 Q2 and MXFP4, including DSpark with the matching
+support file. Each host holds about 45 GiB of Q2 weights or 77 GiB of MXFP4,
+plus context and runtime buffers. Download `ds4f-mxfp4` on both for MXFP4.
+
+October 2, 2026, Q2, direct 200 Gb/s RoCE, 64K allocated context: a 105-token
+English prose prompt decoded 512 tokens at **26.0 t/s** without speculation.
+A fresh 32K prefill reached **618 t/s**; appending 8K reached **610 t/s**.
+Ordinary decode at those longer frontiers was about 19 t/s. These are single
+measurements, not release medians.
+
+October 4, 2026, matching 0731 DSpark support, default speculation settings,
+temperature zero, 64K allocated context and 512 generated tokens. Both formats
+use the drafter on both ranks over RDMA. These are medians of two runs per case
+(four for MXFP4 prose), including the first token or block. Benchmark processes
+ran on the performance cores (`taskset -c 5-9,15-19`):
+
+| Weights | Prompt | DSpark |
+| --- | --- | ---: |
+| Q2 | English prose, 105 tokens | 44.0 t/s |
+| Q2 | C hash table, 31 tokens | 83.3 t/s |
+| MXFP4 | English prose, 105 tokens | 41.7 t/s |
+| MXFP4 | C hash table, 31 tokens | 75.6 t/s |
+
+On one Spark, the same Q2 prose and coding prompts reached 23.4 and 44.0 t/s
+with DSpark. These are workload-specific measurements, not a promised speedup;
+poor draft acceptance can still make it slower. The measured settings are
+automatic once DSpark is enabled; speculation itself remains opt-in.
 
 ## Qwen3.8 Flash Next
 

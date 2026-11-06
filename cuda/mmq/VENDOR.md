@@ -94,6 +94,14 @@ Symbols the vendored files reference, and how they resolve in this directory:
 
 ## Re-syncing with upstream
 
+Local MMVQ bounds fix: pass the logical row count to the generic vector
+kernel instead of using its output stride as a row bound. Both generic and
+multi-token MoE kernels also guard tail-row weight loads.
+
+MXFP4 MMQ uses Q8_1 activations on Blackwell as on older GPUs. Its tile
+loader, K iteration and activation-block stride use the integer-MMA layout;
+the stored MXFP4 weights are unchanged.
+
 When upstream lands a bugfix or perf improvement we want, the procedure is:
 
 ```sh

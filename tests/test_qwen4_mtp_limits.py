@@ -11,6 +11,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--ssd-streaming", action="store_true")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     out = args.output or Path(tempfile.mkdtemp(prefix="qwen-mtp-limits-"))
@@ -18,6 +19,8 @@ def main():
     base = [str(root / "ds4"), "-m", str(args.model.resolve()),
             "--ctx", "256", "--temp", "0",
             "--nothink", "-p", "Count from one to ten.", "-n", "24"]
+    if args.ssd_streaming:
+        base += ["--ssd-streaming", "--ssd-streaming-cache-experts", "1024"]
     for name, chunk, unfused in [("one-row", 1, False),
                                   ("two-rows-depth-three", 2, False),
                                   ("unfused", 128, True)]:

@@ -21,6 +21,10 @@ typedef int (*ds4_gpu_tp_big_exchange_fn)(void *ud, uint32_t layer,
                                         uint64_t seq, const void *out,
                                         void *in, uint64_t bytes);
 
+/* CUDA: optional pinned slab shared by an integrated GPU and the transport.
+ * NULL requests the ordinary device tensor plus host staging fallback. */
+ds4_gpu_tensor *ds4_gpu_tp_slab_alloc(uint64_t bytes);
+
 int ds4_gpu_tp_init(uint32_t rank, ds4_gpu_tensor *slab,
                     uint64_t gpu_flags_off, uint64_t out_off, uint64_t vec_bytes,
                     ds4_gpu_tp_exchange_fn fn, void *ud);
@@ -37,6 +41,8 @@ int ds4_gpu_tp_big_gate_encode(uint32_t layer, uint32_t rows,
 /* Metal multi-session tapes reuse slab slots and therefore require event
  * arrival. Single-session flag gates may flush in layer order. */
 void ds4_gpu_tp_set_session_batch_mode(int enabled);
+/* Metal decode gates publish and wait inside the command buffer (no flush per gate). */
+int ds4_gpu_tp_decode_inline_gates(void);
 int ds4_gpu_tp_decode_split_flush_safe(void);
 /* Weight ranges consumed by the next Metal poll gate of the given kind. */
 int ds4_gpu_tp_gate_prefetch_plan(uint32_t gate,

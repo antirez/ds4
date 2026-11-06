@@ -173,7 +173,7 @@ static int get_mmq_y_host(const int cc) {
 
 static constexpr __device__ int get_iter_k([[maybe_unused]] const ggml_type type) {
 #if defined(BLACKWELL_MMA_AVAILABLE)
-if (type == GGML_TYPE_NVFP4 || type == GGML_TYPE_MXFP4) {
+if (type == GGML_TYPE_NVFP4) {
     return MMQ_ITER_K_FP4;
 }
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
@@ -3530,13 +3530,10 @@ struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_Q8_0> {
 template <int mmq_x, int mmq_y, bool need_check>
 struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_MXFP4> {
     static constexpr int              vdr          = VDR_MXFP4_Q8_1_MMQ;
-#ifdef BLACKWELL_MMA_AVAILABLE
-    static constexpr load_tiles_mmq_t load_tiles  = load_tiles_mxfp4_fp4<mmq_y, need_check>;
-    static constexpr vec_dot_mmq_t    vec_dot_mma = vec_dot_fp4_fp4_mma<mmq_x, mmq_y, GGML_TYPE_MXFP4>;
-#else
+    // Packed FP4 weights do not imply FP4 activations. Preserve Q8 activation
+    // precision on Blackwell too, using the exact integer weight mantissas.
     static constexpr load_tiles_mmq_t load_tiles   = load_tiles_mxfp4<mmq_y, need_check>;
     static constexpr vec_dot_mmq_t    vec_dot_mma  = vec_dot_q8_0_q8_1_mma<mmq_x, mmq_y, MMQ_Q8_1_DS_LAYOUT_D4>;
-#endif // BLACKWELL_MMA_AVAILABLE
     static constexpr vec_dot_mmq_t    vec_dot_dp4a = vec_dot_q8_0_q8_1_dp4a<mmq_x, mmq_y>;
 };
 
@@ -3685,13 +3682,16 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
     // FP4 tile stores 8 blocks
-    constexpr int ne_block = (type == GGML_TYPE_MXFP4 || type == GGML_TYPE_NVFP4) ? QK_K : 4 * QK8_1;
+    constexpr int ne_block = type == GGML_TYPE_NVFP4 ? QK_K : 4 * QK8_1;
 #else
     constexpr int ne_block = 4 * QK8_1;
 #endif  // defined(BLACKWELL_MMA_AVAILABLE)
 
     constexpr int ITER_K          = get_iter_k(type);
     constexpr int blocks_per_iter = ITER_K / qk;
+    static_assert(type != GGML_TYPE_MXFP4 ||
+                  (ITER_K == MMQ_ITER_K && ne_block == 4 * QK8_1),
+                  "MXFP4 MMQ requires Q8_1 activation tiles");
     // Invalid columns must be zero before the matrix instruction. Masking
     // only write-back is too late: stale or NaN tail blocks can contaminate
     // other values in the same hardware matrix fragment.

@@ -224,7 +224,9 @@ python3 gguf-tools/deepseek41_quantize.py \
 
 Omit `--dry-run` to write the file. Add `--resume` after an interrupted conversion.
 Use `libds4quants.so` on Linux. Gate/up experts use IQ2_XXS and down experts use
-Q2_K; attention, shared experts and the output head use Q8_0. Engram rows retain
+Q2_K; attention, shared experts and the output head use Q8_0. `--quant q4` uses
+Q4_K experts instead and `--quant mxfp4` keeps the released MXFP4 experts
+unchanged, repacked into GGUF blocks without calibration. Engram rows retain
 their original FP8 values and scales, packed together at the end of the GGUF for
 disk lookups. Vision and DSpark weights are not included.
 
@@ -250,6 +252,24 @@ Pass `--quant q4` to the audit as well when checking a Q4 file.
 The audit checks the complete layout, all non-expert tensors, sampled experts
 and native Engram rows. It does not replace [inference quality tests](quality-testing/deepseek-v4.1-flash-20260910/README.md).
 
+### Convert V4.1 DSpark
+
+The V4.1 support converter needs NumPy, the official config and tensor index,
+and only the shards containing `mtp.*` tensors (44, 45 and 46 of the pinned
+checkpoint). No imatrix or main-model GGUF is needed:
+
+```sh
+python3 gguf-tools/deepseek41_dspark.py \
+  --hf models/DeepSeek-V4.1-Flash \
+  --source-revision df42c109f1defefcbfcedbe7d905718a12266e40 \
+  --out gguf/DeepSeek-V4.1-Flash-DSpark.gguf
+```
+
+The result is 8.04 GiB. Routed experts keep their native MXFP4 payloads;
+dense weights expand losslessly to F16 or F32. Add `--dry-run` to inspect the
+layout, or `--verify` to compare every tensor in an existing output against
+the source. This file works only with the V4.1 Flash target.
+
 ## Convert A DSpark Support Checkpoint
 
 The DSpark Flash checkpoint is published as Hugging Face safetensors and stores
@@ -267,7 +287,7 @@ The manifest reads only `model.safetensors.index.json`; it does not require the
 large shard files to be present.  The final summary should report three DSpark
 stages and zero unknown DSpark tensors before attempting a full conversion.
 
-To build the support GGUF used by `ds4 --mtp`, run the DSpark support mode.  This
+To build the support GGUF used by `ds4 --dspark`, run the DSpark support mode.  This
 mode writes standalone DSpark metadata plus the packed `mtp.*` tensor payloads;
 it does not require a base-model GGUF template:
 
@@ -277,6 +297,12 @@ gguf-tools/deepseek4-quantize \
   --dspark-support \
   --out DeepSeek-V4-Flash-DSpark-support-0731.gguf
 ```
+
+Add `--experts mxfp4` to preserve the checkpoint's routed expert weights
+without requantization. Use a different output filename, such as
+`DeepSeek-V4-Flash-DSpark-MXFP4-support-0731.gguf`. This takes about 10.1 GiB
+instead of 5.6 GiB; the other tensors keep the same formats. A more accurate
+drafter can improve acceptance, but does not guarantee faster generation.
 
 `--dspark-support --dry-run` reads safetensors shard headers to derive exact
 GGUF shapes and types, but it does not read tensor payloads.  The DSpark metadata

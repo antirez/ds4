@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
 #include <vector>
 #include <unistd.h>
 
@@ -25,8 +26,9 @@ static ds4_gpu_tensor *tensor(uint64_t bytes) {
     CHECK(t);
     return t;
 }
+static int unused_exchange(void *, uint32_t, uint32_t, uint64_t) { return 0; }
 
-static void run(unsigned dim, unsigned mid_dim, unsigned experts) {
+static void run(unsigned dim, unsigned mid_dim, unsigned experts, bool verify_only = false) {
     constexpr unsigned slots = 6, rows = 256;
     const uint64_t gate_row = dim / 256u * 66u, down_row = mid_dim / 256u * 84u;
     const uint64_t unit[] = {gate_row * mid_dim, gate_row * mid_dim, down_row * dim};
@@ -73,6 +75,8 @@ static void run(unsigned dim, unsigned mid_dim, unsigned experts) {
     FILE *f = fdopen(fd, "wb");
     CHECK(f && std::fwrite(model.data(), 1, model.size(), f) == model.size());
     CHECK(std::fclose(f) == 0);
+    const int source_fd = open(path, O_RDONLY);
+    CHECK(source_fd >= 0);
     std::vector<float> input(rows * dim), weights(rows * slots), one(dim);
     std::vector<int32_t> ids(rows * slots);
     for (auto &v : input) v = ((int)byte() - 128) / 128.0f;
@@ -103,12 +107,14 @@ static void run(unsigned dim, unsigned mid_dim, unsigned experts) {
             }
         }
         CHECK(ds4_gpu_set_model_map_spans(model.data(), mapped_size, offsets, sizes, 3, 0));
+        CHECK(ds4_gpu_set_model_fd_for_map(source_fd, model.data()));
         for (unsigned i = 0; i < 3; i++)
             CHECK(ds4_gpu_cache_model_range(model.data(), model.size(), offsets[i], sizes[i], "owned"));
         auto *x = tensor(input.size() * 4), *sel = tensor(ids.size() * 4), *sw = tensor(weights.size() * 4);
         auto *out = tensor((rows + 1) * dim * 4);
         auto *gate = tensor(rows * slots * mid_dim * 4), *up = tensor(rows * slots * mid_dim * 4);
         auto *mid = tensor(rows * slots * mid_dim * 4), *down = tensor(rows * slots * dim * 4);
+        auto *slab = tensor(2 * dim * 4);
         auto invoke = [&](unsigned n) {
             bool half = false;
             const bool ok = owned ? ds4_gpu_routed_moe_batch_owned_tensor(out, gate, up, mid, down,
@@ -121,6 +127,7 @@ static void run(unsigned dim, unsigned mid_dim, unsigned experts) {
         };
         for (unsigned c = 0; c < sizeof(counts) / sizeof(*counts); c++) {
             const unsigned n = counts[c];
+            if (verify_only && n > 8) break;
             CHECK(ds4_gpu_tensor_write(x, 0, input.data(), n * dim * 4));
             CHECK(ds4_gpu_tensor_write(sel, 0, ids.data(), n * slots * 4));
             CHECK(ds4_gpu_tensor_write(sw, 0, weights.data(), n * slots * 4));
@@ -165,6 +172,25 @@ static void run(unsigned dim, unsigned mid_dim, unsigned experts) {
                 if (n <= 8 || (n >= 128 && (dim == 5120 || experts == 384)))
                     CHECK(different == 0);
             }
+            /* Public Flash entry points must select the same shard without
+             * modifying the router's full selected-id and weight arrays. */
+            CHECK(ds4_gpu_tensor_write(sel, 0, ids.data(), n * slots * 4));
+            CHECK(ds4_gpu_tensor_write(sw, 0, weights.data(), n * slots * 4));
+            CHECK(ds4_gpu_tp_init(rank, slab, dim * 4, 0, dim * 4, unused_exchange, nullptr));
+            ds4_gpu_tp_suspend_expert_sharding(!owned);
+            CHECK(ds4_gpu_routed_moe_batch_tensor(out, gate, up, mid, down,
+                model.data(), model.size(), off[0], off[1], off[2], 16, 10,
+                unit[0], gate_row, unit[2], down_row, dim, mid_dim, dim,
+                sel, sw, experts, slots, 10.0f, x, 0, n, nullptr, false));
+            std::vector<float> network(n * dim), saved_weights(n * slots);
+            std::vector<int32_t> saved_ids(n * slots);
+            CHECK(ds4_gpu_tensor_read(out, 0, network.data(), network.size() * 4));
+            CHECK(!std::memcmp(actual.data(), network.data(), network.size() * 4));
+            CHECK(ds4_gpu_tensor_read(sel, 0, saved_ids.data(), saved_ids.size() * 4));
+            CHECK(ds4_gpu_tensor_read(sw, 0, saved_weights.data(), saved_weights.size() * 4));
+            CHECK(!std::memcmp(ids.data(), saved_ids.data(), saved_ids.size() * 4));
+            CHECK(!std::memcmp(weights.data(), saved_weights.data(), saved_weights.size() * 4));
+            ds4_gpu_tp_shutdown();
             if (owned && n <= 8) for (unsigned r = 0; r < n; r++) {
                 CHECK(ds4_gpu_tensor_write(x, 0, input.data() + r * dim, dim * 4));
                 CHECK(ds4_gpu_tensor_write(sel, 0, ids.data() + r * slots, slots * 4));
@@ -174,15 +200,47 @@ static void run(unsigned dim, unsigned mid_dim, unsigned experts) {
                 CHECK(!std::memcmp(one.data(), actual.data() + r * dim, dim * 4));
             }
         }
-        for (auto *t : {x, sel, sw, out, gate, up, mid, down}) ds4_gpu_tensor_free(t);
+        if (!owned) {
+            /* The optional shared contribution belongs after the routed sum,
+             * and only the logical output row may be touched. */
+            auto *shared = tensor((rows + 1) * dim * 4);
+            auto *shared_row = ds4_gpu_tensor_view(shared, 0, dim * 4);
+            CHECK(shared_row);
+            CHECK(ds4_gpu_tensor_write(x, 0, input.data(), dim * 4));
+            CHECK(ds4_gpu_tensor_write(sel, 0, ids.data(), slots * 4));
+            CHECK(ds4_gpu_tensor_write(sw, 0, weights.data(), slots * 4));
+            for (float add : {0.25f, -0.5f}) {
+                CHECK(ds4_gpu_tensor_fill_f32(shared, add, (rows + 1) * dim));
+                CHECK(ds4_gpu_tensor_fill_f32(out, NAN, 2 * dim));
+                CHECK(ds4_gpu_routed_moe_one_tensor(out, gate, up, mid, down,
+                    model.data(), model.size(), off[0], off[1], off[2], 16, 10,
+                    unit[0], gate_row, unit[2], down_row, dim, mid_dim, dim,
+                    sel, sw, experts, slots, 10.0f, x,
+                    add > 0 ? shared : shared_row, 0, false));
+                std::vector<float> sum(2 * dim);
+                CHECK(ds4_gpu_tensor_read(out, 0, sum.data(), sum.size() * 4));
+                for (unsigned i = 0; i < dim; i++) {
+                    CHECK(sum[i] == reference[0][i] + add);
+                    CHECK(std::isnan(sum[dim + i]));
+                }
+            }
+            ds4_gpu_tensor_free(shared_row);
+            ds4_gpu_tensor_free(shared);
+        }
+        for (auto *t : {x, sel, sw, out, gate, up, mid, down, slab}) ds4_gpu_tensor_free(t);
         ds4_gpu_cleanup();
     }
+    CHECK(close(source_fd) == 0);
     CHECK(unlink(path) == 0);
     std::printf("aligned TP %u/%u experts=%u: owned geometry, empty ranks, scalar rows, prefill PASS\n", dim, mid_dim, experts);
 }
 
 int main(void) {
     run(1024, 256, 16);
+    /* Flash verification uses the row-exact Q8_K kernels. Large Flash
+     * prefills use different activation quantizers/reductions and are
+     * checked with the model scorer, not a bitwise scalar-row oracle. */
+    run(4096, 2048, 16, true);
     run(5120, 2304, 16);
     run(1024, 256, 384);
     return 0;

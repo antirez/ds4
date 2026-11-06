@@ -1,4 +1,4 @@
-/* Run on two dedicated Metal hosts; the peer is the ordinary ds4 worker. */
+/* Run on two dedicated GPU hosts; the peer is the ordinary ds4 worker. */
 #include "../ds4.h"
 #include "../ds4_tp.h"
 #include <math.h>
@@ -22,8 +22,9 @@ static void progress(void *ud, const char *event, int current, int total) {
 static bool cancelled(void *ud) { return ((interruption *)ud)->stopped; }
 
 int main(int argc, char **argv) {
-    if (argc != 7) {
-        fprintf(stderr, "usage: %s MODEL PROMPT LISTEN_HOST PORT RDMA_DEVICE GID\n", argv[0]);
+    const bool cuda = argc == 8 && !strcmp(argv[7], "--cuda");
+    if (argc != 7 && !cuda) {
+        fprintf(stderr, "usage: %s MODEL PROMPT LISTEN_HOST PORT RDMA_DEVICE GID [--cuda]\n", argv[0]);
         return 2;
     }
     int rc = 1;
@@ -35,7 +36,9 @@ int main(int argc, char **argv) {
     ds4_tp *tp = NULL;
     ds4_tokens tokens = {0};
     ds4_session_snapshot snapshot = {0};
-    ds4_engine_options opt = {.model_path = argv[1], .backend = DS4_BACKEND_METAL,
+    ds4_engine_options opt = {.model_path = argv[1],
+        .backend = cuda ? DS4_BACKEND_CUDA : DS4_BACKEND_METAL,
+        .prefill_chunk = cuda ? 2048 : 0,
         .context_size = 65536, .power_percent = 100};
     opt.tp = (ds4_tp_options){.role = DS4_TP_LEADER, .requested = true,
         .listen_host = argv[3], .listen_port = atoi(argv[4]),

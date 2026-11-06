@@ -35,6 +35,18 @@ static void *exchange(void *arg) {
         if (!ds4_tp_batch_gate_exchange(tp, 0, rows, rows)) return NULL;
         check_pattern(tp->slab + ds4_tp_slab_batch_in_offset(tp, 0), bytes, 1 - p->rank);
     }
+    for (unsigned trial = 0; trial < 3; trial++) {
+        uint32_t gates = trial == 0 ? 2 : trial == 1 ? 1 + p->rank : 1;
+        assert(ds4_tp_batch_block_begin_gates(tp, 3, 40, &gates));
+        assert(gates == (trial == 0 ? 2u : 1u));
+        for (unsigned slot = 0; slot < 40 * gates; slot++) {
+            const size_t bytes = tp->vec_bytes * 3;
+            pattern(tp->slab + ds4_tp_slab_batch_out_offset(tp, slot), bytes, slot * 2 + p->rank);
+            assert(ds4_tp_batch_gate_exchange(tp, slot, 3, slot + 1));
+            check_pattern(tp->slab + ds4_tp_slab_batch_in_offset(tp, slot), bytes, slot * 2 + 1 - p->rank);
+        }
+        assert(ds4_tp_batch_block_end(tp));
+    }
     const size_t capacity = 16 * 1024 * 1024 + 13;
     void *out = malloc(capacity), *in = malloc(capacity);
     assert(out && in);
@@ -53,6 +65,9 @@ static void *exchange(void *arg) {
         }
         check_pattern(in, lengths[i], 1 - p->rank);
     }
+    uint32_t gates = 2;
+    assert(!ds4_tp_batch_block_begin_gates(tp, 1 + p->rank, 40, &gates));
+    assert(ds4_tp_failed(tp));
     free(in); free(out);
     return NULL;
 }

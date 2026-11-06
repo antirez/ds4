@@ -2508,10 +2508,13 @@ static void dspark_shape_reversed_from_info(tensor_meta *m, const st_info *info)
 }
 
 static void dspark_plan_set_size(dspark_tensor_plan *tp) {
-    if (tp->meta.type != DS4Q_TYPE_I32 && !is_quantizable_target(tp->meta.type)) {
+    const bool preserved_mxfp4 =
+        tp->kind == DSPARK_PLAN_EXPERT && tp->meta.type == DS4Q_TYPE_MXFP4;
+    if (tp->meta.type != DS4Q_TYPE_I32 &&
+        !is_quantizable_target(tp->meta.type) && !preserved_mxfp4) {
         die("unsupported DSpark planned tensor type");
     }
-    if (ds4q_can_quantize(tp->meta.type) &&
+    if ((ds4q_can_quantize(tp->meta.type) || preserved_mxfp4) &&
         tp->meta.ne[0] % ds4q_block_size(tp->meta.type) != 0) {
         fprintf(stderr,
                 "error: DSpark tensor %s ne[0]=%" PRId64

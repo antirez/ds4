@@ -1,10 +1,14 @@
 #define main quality_scorer_main
 #define ds4_session_sync quality_test_sync
 #define ds4_token_text quality_test_token_text
+#define ds4_tokenize_text quality_test_tokenize_text
+#define ds4_tokens_free quality_test_tokens_free
 #include "../gguf-tools/quality-testing/score_official.c"
 #undef main
 #undef ds4_session_sync
 #undef ds4_token_text
+#undef ds4_tokenize_text
+#undef ds4_tokens_free
 #include <assert.h>
 
 static int sync_calls, sync_lengths[2], sync_fail;
@@ -19,6 +23,82 @@ char *quality_test_token_text(ds4_engine *engine, int token, size_t *len) {
     assert(copy);
     memcpy(copy, text[token], *len + 1);
     return copy;
+}
+
+void quality_test_tokenize_text(ds4_engine *engine, const char *text, ds4_tokens *out) {
+    (void)engine;
+    assert(!out->v && out->len == 0);
+    out->v = malloc(2 * sizeof(*out->v));
+    assert(out->v);
+    if (!strcmp(text, "A")) out->v[out->len++] = 0;
+    else if (!strcmp(text, "B")) out->v[out->len++] = 1;
+    else if (!strcmp(text, "AB")) {
+        out->v[out->len++] = 0;
+        out->v[out->len++] = 1;
+    }
+}
+
+void quality_test_tokens_free(ds4_tokens *tokens) {
+    free(tokens->v);
+    memset(tokens, 0, sizeof(*tokens));
+}
+
+static void check_top1(void) {
+    const struct {
+        const char *alts;
+        int count;
+        unsigned matches;
+    } fixtures[] = {
+        {"[]", 0, 0},
+        {"[{\"bytes\":[65],\"logprob\":-1},"
+          "{\"bytes\":[66],\"logprob\":-2}]", 1, 1u << 0},
+        {"[{\"bytes\":[65],\"logprob\":-2},"
+          "{\"bytes\":[66],\"logprob\":-1}]", 1, 1u << 1},
+        {"[{\"bytes\":null,\"logprob\":-1},"
+          "{\"bytes\":[65],\"logprob\":-2}]", 0, 0},
+        {"[{\"bytes\":[239,191,189],\"logprob\":-1},"
+          "{\"bytes\":[65],\"logprob\":-2}]", 0, 0},
+        {"[{\"bytes\":[65,66],\"logprob\":-1},"
+          "{\"bytes\":[65],\"logprob\":-2}]", 0, 0},
+        {"[{\"bytes\":[65],\"logprob\":-1},"
+          "{\"bytes\":[66],\"logprob\":-1},"
+          "{\"bytes\":[65],\"logprob\":-1}]", 1, (1u << 0) | (1u << 1)},
+        {"[{\"bytes\":null,\"logprob\":-1},"
+          "{\"bytes\":[65],\"logprob\":-2},"
+          "{\"bytes\":[66],\"logprob\":-1}]", 1, 1u << 1},
+        {"[{\"bytes\":null,\"logprob\":-1},"
+          "{\"bytes\":[239,191,189],\"logprob\":-1},"
+          "{\"bytes\":[65],\"logprob\":-2}]", 0, 0},
+        {"[{\"bytes\":[65],\"logprob\":-1.0000000000001},"
+          "{\"bytes\":[66],\"logprob\":-1}]", 1, 1u << 1},
+    };
+    for (size_t f = 0; f < sizeof(fixtures) / sizeof(*fixtures); f++) {
+        char json[1024];
+        snprintf(json, sizeof(json), "{\"choices\":[{\"logprobs\":{\"content\":["
+                 "{\"bytes\":[65],\"logprob\":-2,\"top_logprobs\":%s}]}}]}", fixtures[f].alts);
+        api_ref ref;
+        assert(api_ref_parse(json, &ref));
+        assert(ref.n_pos == 1);
+        api_pos *pos = &ref.pos[0];
+        const int rotations = pos->n_alts ? pos->n_alts : 1;
+        for (int rotation = 0; rotation < rotations; rotation++) {
+            for (int greedy = 0; greedy < 3; greedy++) {
+                api_metrics metrics = {.top1_count = 7, .top1_match = 3};
+                const int token = api_top1_update(NULL, pos, greedy, &metrics);
+                const int match = !!(fixtures[f].matches & (1u << greedy));
+                assert(metrics.top1_count == 7 + fixtures[f].count);
+                assert(metrics.top1_match == 3 + match);
+                assert((token >= 0) == fixtures[f].count);
+                assert((token == greedy) == match);
+            }
+            if (pos->n_alts) {
+                const api_alt first = pos->alts[0];
+                memmove(pos->alts, pos->alts + 1, (size_t)(pos->n_alts - 1) * sizeof(*pos->alts));
+                pos->alts[pos->n_alts - 1] = first;
+            }
+        }
+        api_ref_free(&ref);
+    }
 }
 
 static void check_token_alignment(void) {
@@ -86,6 +166,7 @@ static void check_continued_prefill(void) {
 int main(void) {
     check_continued_prefill();
     check_token_alignment();
+    check_top1();
     const char *invalid[] = {
         "{}",
         "{\"choices\":[]}",
@@ -113,6 +194,6 @@ int main(void) {
     assert(ref.pos[0].alts[0].len == 1 && ref.pos[0].alts[0].bytes[0] == 'A');
     assert(ref.pos[0].alts[0].logprob == -0.25);
     api_ref_free(&ref);
-    puts("quality API parser and continued-prefill scheduling: PASS");
+    puts("quality API parser, top-1 selection and continued-prefill scheduling: PASS");
     return 0;
 }

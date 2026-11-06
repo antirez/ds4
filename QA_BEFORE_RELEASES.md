@@ -16,7 +16,8 @@ manual run. Report skipped checks and unresolved failures explicitly.
 
 Preferred release test hosts:
 
-- CUDA / DGX Spark: `toor@192.168.4.180` and `toor@192.168.4.181`.
+- CUDA / DGX Spark: `antirez@dgxspark1` and `antirez@dgxspark2`.
+  Use their direct 200 Gb/s RoCE link for network TP, not the VPN or WiFi.
 - Metal / distributed Mac testing: `mac-m5max-it` and `mac-m5max-us`.
 - ROCm: The Strix Halo system at antirez@strixhalo (Framework Desktop).
 
@@ -828,14 +829,14 @@ or count a pass on another host as resolving that failure.
 ## 8. CUDA / DGX Spark
 
 Before a release, ask the user for CUDA access if it is not already configured.
-Use either DGX Spark / GB10 host, `toor@192.168.4.180` or
-`toor@192.168.4.181`. Do not claim CUDA is release-ready without this pass.
+Use either DGX Spark / GB10 host, `antirez@dgxspark1` or
+`antirez@dgxspark2`. Do not claim CUDA is release-ready without this pass.
 
-Both Sparks normally run vLLM. Before stopping it, record its process, service
-or container, model, ports, and exact launch command. Confirm all vLLM workers
-have exited before loading DwarfStar. At the end, stop every DwarfStar process,
-restore the exact vLLM service, and verify its original ports and model health.
-Do not use high-performance Hugging Face Xet mode while vLLM is resident.
+Check for existing inference services first. Before stopping one, record its
+process, service or container, model, ports, and exact launch command. Confirm
+all workers have exited before loading DwarfStar. At the end, stop the test
+processes, restore the original service, and verify its ports and model health.
+Do not use high-performance Hugging Face Xet mode while a model is resident.
 
 - Fetch or push the exact release commit to the CUDA machine.
 - Build:
@@ -845,6 +846,58 @@ Do not use high-performance Hugging Face Xet mode while vLLM is resident.
   receiving explicit permission to use `192.168.60.250` for this QA pass.
 - Run:
   `make cuda-regression`.
+- Build and run `tests/test_cuda_pool`, also under Compute Sanitizer.
+  Exercise repeated initialization/cleanup, graph replay and pre-existing
+  release thresholds above and below the runtime's scratch budget. Cleanup
+  must restore the prior threshold and trim unused retained allocations.
+- Run `tests/test_cuda_grouped_q8`, also under Compute Sanitizer. Grouped
+  Q8 outputs must match scalar rows exactly for short verify blocks, ragged
+  shapes, compact group slices and the 8/16/32-row boundaries; output tails
+  must stay untouched.
+  Compare whole-model prefill and decode, including V4.1, before accepting
+  a primitive speedup. Repeat paired timings if a regression appears.
+- Run `tests/test_cuda_tokentile`, also under Compute Sanitizer, after
+  short-block attention changes. Compare against the double-precision CPU
+  reference across raw-ring wrap, compression boundaries, head tails and
+  peaky queries; cover both sides of the short-row dispatch boundary.
+- Run `make test-cuda-indexed-one` after changing single-row indexed
+  attention. Require exact scalar-path agreement across ring wrap, masked
+  compressed rows, head tails and graph replays with changed queries. Check
+  the double-precision reference and run memcheck, racecheck and synccheck.
+  Compare full-model logits after fresh and continued prefill, and repeat
+  physical Q2/MXFP4 speculative and server cancellation tests.
+- Run `tests/test_cuda_q8_rows --slices` after changing compact shared-expert
+  projections. Compare both rank halves, an asymmetric middle slice and the
+  final 32-column block against the double-precision reference; check output
+  tails and invalid ranges under Compute Sanitizer too.
+- Run `tests/test_cuda_dspark`, also under Compute Sanitizer, after proposal
+  changes. Cover ties, negative scores, vocabulary tails, invalid previous
+  tokens and output canaries against the CPU Markov/argmax reference. Exercise
+  every supported Markov rank and a full-size vocabulary with a ragged tail.
+- Run `tests/test_cuda_compressor` after changing batched verification state.
+  Pooled rows, rolling state and every saved prefix must match sequential
+  updates exactly across compression boundaries. Run Compute Sanitizer too.
+- Run `make test-cuda-copy-spans` on Spark after changing speculative cache
+  copies. Snapshot, restore and every accepted-prefix slot must match ordered
+  copies byte for byte, including graph replay and untouched destination
+  guards. Check unaligned spans, multiple launches, invalid bounds and overlap
+  fallback under Compute Sanitizer. Repeat single-host and physical TP
+  speculative tests with Q2, and TP tests with MXFP4.
+- Run `tests/test_cuda_attn_side`, including Compute Sanitizer memcheck and
+  initcheck, racecheck and synccheck, after changing projection overlap. Check
+  every intermediate, delayed side-stream input, paired projections for one
+  through eight rows, graph capture/replay, and scratch failure. Repeat a
+  single-host Q2 run to cover asynchronous model-copy ordering without TP.
+- Run `make test-cuda-router-stream` after changing router dispatch or CUDA
+  stream handling. Graph replay with new logits and delayed side-stream
+  inputs must match eager execution for each router launch mode. Run all four
+  Compute Sanitizer tools; confirm graph and side-stream checks did not skip.
+- Run `make test-cuda-q8-0-gemv CUDA_ARCH=sm_121` after changing dense Q8
+  verification kernels. Require bit-exact agreement with MMQ on the same
+  quantized activations, including non-finite values, unsupported shapes,
+  delayed side-stream inputs and graph replay with changed inputs. Run
+  memcheck, initcheck, racecheck and synccheck. Compare full-model Q2 and
+  MXFP4 outputs, acceptance decisions and timings on both TP ranks.
 - After aligned Q8 scratch changes, run `make test-cuda-q8-scratch
   CUDA_ARCH=sm_121`, also under Compute Sanitizer. Dense and paired outputs
   must be exact with reused scratch, an undersized buffer, and captured graph
@@ -869,17 +922,29 @@ Do not use high-performance Hugging Face Xet mode while vLLM is resident.
   `make test-mxfp4-cuda CUDA_ARCH=native` on the multi-GPU CUDA host only after
   receiving explicit permission for `192.168.60.250`, and
   `make test-mxfp4-cuda CUDA_ARCH=sm_121` on DGX Spark. Dense MMQ, routed MMQ,
-  routed MMVQ, fused gate/up, and fused down must pass. The Spark run must also
-  pass the Blackwell K-tile guard. This synthetic parity test does not replace
-  full-model continuation scoring.
+  routed MMVQ, fused gate/up, and fused down must pass, including odd rows,
+  K=256/768 and large batches. Require the same Q8-activation accuracy bounds
+  on Blackwell as on older devices; do not relax them for native FP4 hardware.
+  Run `make test-mmvq-cuda CUDA_ARCH=sm_121` under Compute Sanitizer to check
+  tail loads, routed output bounds, masked experts and output canaries.
+  On Spark, also run `tests/test_mxfp4_staged_cuda`: compare staged gate/up
+  outputs exactly, including misaligned rows and large-width fallbacks.
+  Run memcheck and racecheck when changing its shared-memory staging.
+  For shared MMVQ changes, also run `make test-mmvq-rocm` on Strix Halo.
+  These primitive tests do not replace full-model continuation scoring.
 - With that permission, run the native MXFP4 GGUF resident on the multi-GPU
   host, and run it with `--ssd-streaming` on DGX Spark. Use the same greedy prompt and continuation
   fixture on both. Record prefill and generation speed, require finite logits,
-  and compare quality with the Metal MXFP4 result. Blackwell MMQ quantizes
-  activations to native FP4 for batched work; decode MMVQ keeps Q8 activations,
-  so quality must be checked rather than inferred from kernel-only parity.
+  and compare quality with the Metal MXFP4 result. Both MMQ and MMVQ must keep
+  eight-bit activations. Compare ordinary scalar decoding with the actual
+  multi-row speculative verifier against checkpoint-matched official
+  continuations, reporting teacher-forced NLL and API top-token agreement.
+  A small prefill chunk alone does not exercise the verifier's cache commits.
 - Run a short CLI prompt with the Flash GGUF and record generation t/s.
 - Run a longer prompt that exercises routed experts past a few thousand tokens.
+- Run `tests/test_deepseek_indexer FLASH_Q2_GGUF` on one otherwise idle GPU.
+  It checks that decode selects the model's 512 highest-scoring compressed
+  rows across the attention boundaries, including continued prefill.
 - With explicit permission for this QA pass, run the full-vocabulary decode
   oracle on the eight-GPU CUDA host:
   `DS4_TEST_MODEL=/path/to/flash.gguf make test-cuda-session-batch`.
@@ -1618,7 +1683,66 @@ the long sparse-boundary tests; neither substitutes for the other.
 - Unsupported backends, pipeline and speculative modes must fail explicitly until
   their V4.1 implementation is validated; an older graph/drafter is not a fallback.
 
-#### Metal Reference Checks
+### DSpark
+
+Use `DeepSeek-V4.1-Flash-DSpark.gguf`, not a V4.0 drafter. The native support
+model is 8.04 GiB and remains resident while the target can use SSD streaming.
+On 128 GiB hosts, leave room for both models and context buffers. This path
+supports one Metal, CUDA or ROCm host and two-rank Metal/CUDA TP. For TP,
+pass the matching `--dspark --mtp-model DSPARK` options on both peers.
+
+- Run `python3 tests/test_deepseek41_dspark_conversion.py` and audit every
+  real tensor with `python3 gguf-tools/deepseek41_dspark.py --hf SOURCE
+  --source-revision REVISION --out DSPARK --verify`. The source must be
+  pinned and the three native draft shards
+  present. Preserve MXFP4 experts and all source values; no extra quantization.
+- Build `tests/test_deepseek41_dspark` for the backend under test. Run
+  `tests/test_deepseek41_dspark --candidate-mask` to check the all-blocks
+  shortcut and both sides of the 16K candidate-selection boundary. Run
+  `tests/test_deepseek41_dspark TARGET DSPARK DUMP_DIRECTORY`, then
+  `python3 tests/deepseek41_dspark_reference.py SOURCE DUMP_DIRECTORY`.
+  CUDA uses `--expert-activation q8-mmq`; ROCm uses `--expert-activation q8-k`
+  for its existing expert activation policy. This independent native-weight oracle checks target
+  feature capture, all three stages, Markov logits and confidence.
+- Run `tests/test_deepseek41_dspark TARGET DSPARK --runtime`. Require causal
+  logits when rejected future tokens change, every retained prefix from zero
+  through six, direct stop-boundary rewinds, continued decoding and save/load
+  after verification. Exercise opportunistic and exact sampling. Loading an
+  older target snapshot must warm missing draft features rather than reuse
+  stale ones. Repeat the backend primitives, including 128-expert/top-3 routing.
+- Repeat the runtime test on physical Metal RDMA and CUDA RoCE pairs:
+  `tests/test_deepseek41_dspark TARGET DSPARK --runtime-tp HOST PORT DEVICE GID`.
+  Start the normal `ds4` TP worker with context 2048 and the matching drafter.
+  Require all prefix commits, correction rewinds, both sampling modes and
+  cancellation to finish without a lost peer. Also reject mismatched DSpark
+  settings at startup (`DS4_TEST_TP_MODE_MISMATCH=3` in `test_tp_link`).
+- Build `gguf-tools/quality-testing/score_official_verify`. Compare the matching
+  official manifest with `--mtp-model DSPARK` against the same command plus
+  `--verify-batch 6`. Keep `--ssd-streaming --ssd-streaming-cache-experts 40gb`
+  and context identical. Score the short/boundary fixture above and
+  `deepseek-v4.1-flash-20260919-router/manifest-sensitivity.tsv` at context
+  34816; also repeat its `manifest-long.tsv` with `--continued-prefill 32`.
+  Report paired teacher-forced NLL and API top-token agreement. Greedy sampled
+  prefix length and scalar-versus-verifier text equality are not quality gates.
+  Repeat the scalar/verifier comparison on both physical TP pairs using the
+  normal coordinator flags instead of SSD streaming; start a matching worker
+  for each run. Verify the complete vocabulary, not just the local half.
+- Run real CLI and agent code/prose requests at temperature zero and above
+  zero, including `--mtp-exact-sampling`. Against an otherwise idle speculative
+  server, run `tests/test_server_speculative_stop.py --model deepseek-v4.1-flash
+  --output OUTPUT_DIRECTORY`. Require correct retrieval, tool results, SSE
+  completion, prompt-prefix reuse and bounded finish latency. Repeat a real
+  coding client's edit/build/test loop and cancellation near context capacity.
+  Record acceptance and end-to-end timing; working speculation does not by
+  itself establish a speedup.
+- On ROCm, repeat at least ten actual server cold starts outside a debugger,
+  alternating default and exact sampling. Send a request, check the answer,
+  and shut down cleanly each time. Watch usable host memory, excluding CMA.
+  If startup crashes, retain the binary and core or backtrace plus kernel
+  logs; distinguish a userspace HIP failure from OOM or a GPU reset. A clean
+  rerun is evidence against recurrence, not an explanation of a prior crash.
+
+### Metal Reference Checks
 
 The calibrated Q2 main weights occupy about 151.8 GiB, Q4 about 294.15 GiB;
 188.8 GiB of Engram remains disk-only. Validate the release artifacts with
@@ -1802,20 +1926,89 @@ subset or an older Flash fixture is not a substitute for these gates.
 
 ### CUDA Network Tensor Parallelism
 
-Use the two Sparks above with identical commits and V4.1 Q2 files, one GPU
-per rank. Expert shards are resident; Engram stays on disk. Do not combine
+Use the two Sparks above with identical commits and matching Flash 0731 Q2,
+Flash 0731 MXFP4 or V4.1 Q2 files, one GPU per rank. Expert shards are resident;
+V4.1 Engram stays on disk. Do not combine
 network TP with `--ssd-streaming`, `--cuda-tensor-parallel` or `--quality`.
-The Linux transport uses RoCEv2 and host staging, not GPUDirect. Protocol 14
-requires updating all peers together, including Metal peers.
+The Linux transport uses RoCEv2. Spark shares pinned host-visible exchange
+buffers with CUDA, with device/host staging as a fallback; this is not discrete
+GPU GPUDirect. Both peers must use the same protocol version and agree on
+expert splitting, verification exchanges and vocabulary-head splitting.
+Incompatible peers must fail at the handshake, before inference.
+
+For Flash 0731, score the full matching 100-case continuation set and its
+continued-prefill variant against a single-host control. Run fresh 32K and
+appended 8K prefills and compare full frontier logits with the prior build.
+Use `tests/test_metal_tp_spec MODEL SUPPORT HOST PORT DEVICE GID --cuda`
+with a CUDA worker for short/continued speculative verification, and
+`tests/test_metal_tp_cancel MODEL PROMPT HOST PORT DEVICE GID --cuda` for
+cancellation/rebuild. Repeat speculative verification with `--tcp` and a TCP
+worker. Require no
+errors or unexpected accepted-token replay; report scalar/batch logit gaps
+rather than claiming exact greedy equality when the oracle allows a tolerance.
+Compare default DSpark settings as well as unpruned diagnostic runs, on short
+prose, code and a book continuation with at least a 4K prefix. Record accepted
+tokens per cycle and time spent proposing/verifying. Inspect the continuations
+for repetition; a changed passage is not a controlled throughput comparison.
+Check the independent scalar-target oracle on prose too, not just coding
+prompts. Report control failures and logit gaps without relaxing the tolerance
+to make a candidate pass.
+
+For default Q2 and MXFP4 DSpark over RDMA, pass `--dspark --mtp-model SUPPORT`
+on both ranks and require the `TP DSpark drafter split active` message when
+memory allows the optional halves. Repeat with
+`DS4_TP_DISABLE_DSPARK_SPLIT=1` to check the local-drafter fallback. Run
+`make test-dspark-history` for the shared cache-window and confidence inputs.
+The history check covers local and split-drafter maintenance separately.
+Run `make test-cuda-dspark-tp CUDA_ARCH=sm_121` and repeat its fixtures under
+Compute Sanitizer. The shared-expert overlap fixture must match the inline
+path bitwise at every supported batch width; run racecheck and initcheck too.
+Check sampled and exact-sampling modes, partial and
+seed-only commits, snapshot rebuild, continued prompts and server tool loops.
+Rank-state or proposal disagreement is a failure, even if local drafting
+later lets the request finish. Repeat without worker support, over TCP and
+with `DS4_CUDA_MOE_NO_DIRECT_DOWN_SUM6=1`: supported configurations must keep
+local drafting. Steering and tensor dumps also retain the local drafter.
+Check the extra expert-half allocation against requested contexts and session
+count; insufficient headroom must disable the optional split, not cause OOM.
+
+For verifier arithmetic changes, teacher-force official continuation tokens
+through the actual speculative verifier, not just the ordinary scorer's
+prefill path. Compare NLL and API top-token agreement per prompt against the
+prior build, with uncertainty intervals. A changed greedy prefix alone does
+not establish a quality regression; nor does coherent text establish parity.
+The speculative oracle also interleaves 256- and 8192-token sessions and
+frees/recreates workspace borrowers. Require exact isolated-session logits.
+In a multi-session server run, both peers must report shared prefill scratch;
+the CLI worker must not allocate a separate full workspace per session.
+Check memory headroom on both hosts, not just the coordinator's estimate.
+Flash network session batching currently uses the mirrored ordered fallback;
+its full logits must match isolated sessions, but do not report it as native
+batching. The native batching requirements below apply to V4.1.
 
 - Build `tests/test_tp_commands`, `tests/test_tp_tcp`, `tests/test_tp_rdma`,
   `tests/test_tp_link`, `tests/test_cuda_tp` and `tests/test_cuda_ssd_batch`.
   Run the command/TCP/RDMA unit tests under ASAN/UBSAN. Tiny socket buffers,
   stalled peers, half-close and disconnect must fail promptly, not deadlock.
+  Inject one-sided head-row and verify-window failures. A failed context
+  must refuse subsequent commands and gates without touching the transport;
+  recovery requires a new connection, not a replay on the failed link.
+  Repeat the physical link test with `DS4_TEST_TP_HEAD_ROW_FAULT=1` on both
+  peers to check that a rejected head row sends no replay or decode command.
 - Run the physical link test in both directions on each available direct
   link, with TCP and RDMA. Check the reported device, RoCEv2 GID and RC
   transport. A management-network ping is not an RDMA test. Stop a worker
   during exchange and require bounded coordinator failure.
+  Exercise command-mailbox ring wrap, delayed credits, oversized SYNC
+  followed by short commands, immediate STOP and peer exit. Disable the
+  mailbox on just one rank: both must agree on the TCP command fallback.
+  Verification begin records and head rows must belong to the current
+  exchange, including after rollback; stale readiness must never suffice.
+- Run `tests/test_cuda_tp_link` over RDMA and TCP, including staged buffers
+  and Compute Sanitizer. Check one- and two-gate blocks, asymmetric offers,
+  transitions back to scalar decode, and exact row payloads. Enable graph
+  diagnostics on just one model peer: both must negotiate the replicated
+  verifier, not exchange incompatible attention or shared-expert partials.
 - Run `tests/test_cuda_tp` normally and under Compute Sanitizer. Check
   device-to-host visibility, row/batch/bulk exchange, growing staging buffers,
   output canaries, failed-peer propagation, rebind and cleanup. Transport
@@ -1829,6 +2022,21 @@ requires updating all peers together, including Metal peers.
   `--owned-mmq-large` also checks 8191/8192/8193 rows through the global
   assignment-map path. V4.1 small owned batches must match each rank's scalar
   partials exactly, not merely produce a close combined sum.
+- Run `tests/test_cuda_ssd_batch --owned-mxfp4`, also under Compute Sanitizer.
+  Cover one through eight verifier rows and the 129-row matrix path, both
+  owned halves, empty contributions, poisoned scratch and output canaries.
+  The generic network entry must match explicit ownership without modifying
+  router IDs or weights. Score the matching MXFP4 model through the actual
+  verifier as well as ordinary prefill; a Q2-only pass does not cover it.
+- Run `tests/test_cuda_mxfp4_split`, also under Compute Sanitizer, for the
+  intermediate-dimension split. Gate/up rows must be exact; down-half sums
+  must satisfy the reference tolerance. Check returned allocation bytes,
+  invalid/unbound calls, and that startup retains no duplicate raw experts.
+  Compare official verifier scores: the changed reduction is not bitwise.
+- Run `tests/test_cuda_verify_head`, also under Compute Sanitizer. Split
+  halves must match every full-head logit and its global top token, including
+  ties and non-finite inputs. On the physical pair, test partial/full accepts,
+  cancellation, snapshot rebuild, continued prefill and both sampling modes.
 - Run `tests/test_cuda_tp_repack`, also under Compute Sanitizer. Compare
   aligned expert shards with independent raw shards and the whole expert
   table. Include empty rank contributions, poisoned scratch, output canaries,
@@ -1854,6 +2062,19 @@ requires updating all peers together, including Metal peers.
   captured graphs, changed inputs on replay, partial-launch failure and
   repeated cleanup/reinitialization. Verify model logits with graphs both
   enabled and disabled before accepting a scheduling change.
+  Check the shared expert's gate, up and intermediate BF16 values too, with
+  clamped/unclamped and large/small inputs, including the real 5120x2304 shape.
+- Build `tests/test_cuda_tp_link` and run it on both hosts as
+  `tests/test_cuda_tp_link RANK COORDINATOR PORT rdma DEVICE GID` (rank 0/1).
+  Repeat under Compute Sanitizer, with TCP, and with
+  `DS4_CUDA_DISABLE_TP_HOST_SLAB=1` for the staged fallback. Scalar and changing
+  batch sizes must return exact payloads; a stopped peer must fail within
+  the configured deadline. Check shutdown and reinitialization too.
+- Run `tests/test_tp_rdma` under ASan/UBSan after transport changes. Cover
+  negotiated 16/32/64 KiB completion accounting and malformed completions.
+  On the physical pair, test current peers and one previous-version peer;
+  Linux RC may negotiate larger messages, while old/Metal peers keep 16 KiB.
+  Follow bulk prefill with decode and another bulk transfer on the same QP.
 - Record CPU affinity on both ranks for paired timings. Spark has faster
   and slower CPU groups; compare the same allowed group and do not change
   system-wide CPU settings between runs.
@@ -1905,19 +2126,22 @@ requires updating all peers together, including Metal peers.
 
 Use the direct RoCE link, Q2 shards, disk-only Engram and no speculation.
 A 1K Promessi Sposi prefix, 64K context and 2048 teacher-forced decode tokens
-has a reference mean of about 21.9 t/s; 1K prefill is about 205 t/s. Capture
+has a reference mean of about 21.8 t/s; 1K prefill is about 209 t/s. Capture
 CPU affinity, temperature and clocks on both ranks. Repeat long runs rather
 than discarding low results without explaining them.
 
-Long-context reference points, 1024 teacher-forced decode tokens per frontier:
+Long-context reference points, 64K allocation and 512 teacher-forced decode
+tokens per frontier (October 2, 2026):
 
 | Existing tokens | Added tokens | Prefill | Decode |
 | ---: | ---: | ---: | ---: |
-| 0 | 32768 | 406.93 t/s | 20.86 t/s |
-| 32768 | 8192 | 297.11 t/s | 20.64 t/s |
+| 0 | 32768 | 410.92 t/s | 17.97 t/s |
+| 32768 | 8192 | 313.70 t/s | 17.93 t/s |
 
 These are single measurements, not release medians. Prefix replay between
-frontiers is excluded from append time; record it separately. Eight-session
+frontiers is excluded from append time; record it separately. Both ranks
+used `taskset -c 5-9,15-19`; verify which CPU cores are faster on the test
+hosts rather than assuming these IDs apply to every Spark. Eight-session
 native decode is roughly 28 aggregate t/s at 1K allocation. Never report that
 number as per-client throughput or a single-session result.
 
