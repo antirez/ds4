@@ -3835,10 +3835,6 @@ int ds4_gpu_qwen4_moe_mm_down_tensor(
  * ownership. Cache overflow and off-size layers use explicit owned SSD reads,
  * never mapped routed weights. Returns zero on invalid input or I/O failure. */
 #ifdef __APPLE__
-/* Streamed decode handshake (ds4_metal_stream_handshake.inc): it applies by
- * default only without MTP, so the graph reports its MTP state before each
- * streamed layer. */
-void ds4_gpu_qwen4_stream_set_mtp(int mtp);
 int ds4_gpu_qwen4_moe_stream_tensor(
         ds4_gpu_tensor *mid, ds4_gpu_tensor *part, const ds4_gpu_tensor *x,
         const ds4_gpu_tensor *selected, const ds4_gpu_tensor *lists, const ds4_gpu_tensor *counts,

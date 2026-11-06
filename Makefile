@@ -274,7 +274,7 @@ test-metal-qwen4-mxfp4-stage: tests/test_metal_qwen4_mxfp4_stage
 tests/test_qwen4_ssd_experts.o: tests/test_qwen4_ssd_experts.c ds4_gpu.h
 	$(CC) $(CFLAGS) -fno-fast-math -I. -c -o $@ $<
 
-tests/ds4_metal_qwen_ssd.o: ds4_metal.m ds4_metal_device.h ds4_gpu.h ds4_gpu_tp.h ds4_deepseek41_gpu.h ds4_qwen4_vision.h $(METAL_SRCS) tests/qwen4_ssd_pread_probe.h
+tests/ds4_metal_qwen_ssd.o: ds4_metal.m ds4_metal_device.h ds4_gpu.h ds4_gpu_tp.h ds4_deepseek41_gpu.h ds4_qwen4_vision.h ds4_metal_stream_overlap.inc ds4_metal_stream_handshake.inc $(METAL_SRCS) tests/qwen4_ssd_pread_probe.h
 	$(CC) $(OBJCFLAGS) -include tests/qwen4_ssd_pread_probe.h -c -o $@ ds4_metal.m
 
 tests/test_qwen4_ssd_experts: tests/test_qwen4_ssd_experts.o $(filter-out ds4_metal.o,$(CORE_OBJS)) tests/ds4_metal_qwen_ssd.o
@@ -317,7 +317,7 @@ test-metal-ssd-experts: tests/test_metal_ssd_experts
 	./tests/test_metal_ssd_experts --q4
 	./tests/test_metal_ssd_experts --mxfp4
 
-tests/test_metal_ssd_reuse.o: tests/test_metal_ssd_reuse.m ds4_metal.m ds4_metal_device.h ds4_gpu.h ds4_gpu_tp.h ds4_deepseek41_gpu.h $(METAL_SRCS)
+tests/test_metal_ssd_reuse.o: tests/test_metal_ssd_reuse.m ds4_metal.m ds4_metal_device.h ds4_gpu.h ds4_gpu_tp.h ds4_deepseek41_gpu.h ds4_metal_stream_overlap.inc ds4_metal_stream_handshake.inc $(METAL_SRCS)
 	$(CC) $(OBJCFLAGS) -I. -c -o $@ $<
 
 tests/test_metal_ssd_reuse: tests/test_metal_ssd_reuse.o ds4_image.o

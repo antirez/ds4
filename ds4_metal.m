@@ -1406,11 +1406,8 @@ static void ds4_gpu_invalidate_completion_counters(void) {
     g_dsv4_hc_producer_last_completion = nil;
 }
 
-static int qwen4_stream_handshake_service_all(void);  /* ds4_metal_stream_handshake.inc */
 static int ds4_gpu_wait_command_buffer(id<MTLCommandBuffer> cb, const char *label) {
-    const int handshake_ok = qwen4_stream_handshake_service_all();
     [cb waitUntilCompleted];
-    if (!handshake_ok) return 0;
     if (getenv("DS4_METAL_CB_TIMES")) {
         static double prev_gpu_end;
         static uint64_t n_printed;
@@ -11957,12 +11954,13 @@ int ds4_gpu_synchronize(void) {
 static void qwen4_nax_release_scratch(void);
 static void qwen4_batch_release_scratch(void);
 
+static void qwen4_stream_handshake_reset(void);  /* ds4_metal_stream_handshake.inc */
 void ds4_gpu_cleanup(void) {
     if (!g_initialized) return;
     ds4_gpu_queue_keepalive_stop_thread();
 
     @autoreleasepool {
-        (void)qwen4_stream_handshake_service_all();
+        qwen4_stream_handshake_reset();
         ds4_gpu_decode_pipeline_fast_cache_reset();
         ds4_gpu_parallel_ffn_reset_state(YES);
         if (g_batch_cb) {
@@ -52765,7 +52763,7 @@ int ds4_gpu_qwen4_moe_down_tensor(
     const uint64_t experts_bytes = expert_bytes * n_total_expert;
     const uint64_t shared_bytes = (uint64_t)sh_row_bytes * out_dim;
     qwen4_moe_args args = { n_tokens, n_slots, ff_dim, out_dim, weight_type, row_bytes, expert_bytes,
-                            has_shared ? 1u : 0u, has_shared ? shared_type : 0u, sh_row_bytes, 0u,
+                            has_shared ? 1u : 0u, has_shared ? shared_type : 0u, sh_row_bytes, n_total_expert,
                             {0}, 0u, 0u, 0u };
     qwen4_bind b[5];
     if (n_tokens == 0 || n_slots == 0 || row_bytes == 0 || (ff_dim % 32u) != 0 ||
