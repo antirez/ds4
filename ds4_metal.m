@@ -1406,8 +1406,11 @@ static void ds4_gpu_invalidate_completion_counters(void) {
     g_dsv4_hc_producer_last_completion = nil;
 }
 
+static int qwen4_stream_handshake_service_all(void);  /* ds4_metal_stream_handshake.inc */
 static int ds4_gpu_wait_command_buffer(id<MTLCommandBuffer> cb, const char *label) {
+    const int handshake_ok = qwen4_stream_handshake_service_all();
     [cb waitUntilCompleted];
+    if (!handshake_ok) return 0;
     if (getenv("DS4_METAL_CB_TIMES")) {
         static double prev_gpu_end;
         static uint64_t n_printed;
@@ -11959,6 +11962,7 @@ void ds4_gpu_cleanup(void) {
     ds4_gpu_queue_keepalive_stop_thread();
 
     @autoreleasepool {
+        (void)qwen4_stream_handshake_service_all();
         ds4_gpu_decode_pipeline_fast_cache_reset();
         ds4_gpu_parallel_ffn_reset_state(YES);
         if (g_batch_cb) {
@@ -53652,6 +53656,9 @@ static int qwen4_stream_missing_gate_up_ready(
     return ok;
 }
 
+#include "ds4_metal_stream_overlap.inc"
+#include "ds4_metal_stream_handshake.inc"
+
 int ds4_gpu_qwen4_moe_stream_tensor(
         ds4_gpu_tensor *mid, ds4_gpu_tensor *part, const ds4_gpu_tensor *x,
         const ds4_gpu_tensor *selected, const ds4_gpu_tensor *lists, const ds4_gpu_tensor *counts,
@@ -53712,6 +53719,10 @@ int ds4_gpu_qwen4_moe_stream_tensor(
         }
     }
 
+    int handshake_ok = 0;
+    if (!mm && qwen4_stream_handshake_layer(&handshake_ok, g_batch_cb != nil, table, mid, part, x, selected,
+            gate_type, down_type, n_tokens, n_slots, in_dim, ff_dim, shared_gate_offset,
+            shared_up_offset, shared_down_offset, shared_type, shared_down_type)) return handshake_ok;
     int32_t *ids = malloc((size_t)n_ids * sizeof(*ids));
     if (!ids) return 0;
     qwen4_moe_half_pass half_pass = {0};
@@ -53876,6 +53887,7 @@ done:
     ds4_gpu_tensor_free(overlap.resident_counts);
     ds4_gpu_tensor_free(overlap.missing_counts);
     free(ids);
+    ok = qwen4_stream_early_commit(ok, had_batch, n_tokens);
     if (!had_batch && g_batch_cb && !ds4_gpu_end_commands()) ok = 0;
     if (had_batch && !g_batch_cb && !ds4_gpu_begin_commands()) ok = 0;
     return ok;

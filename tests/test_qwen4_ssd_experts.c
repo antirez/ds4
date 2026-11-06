@@ -700,6 +700,10 @@ static void check_half_split(const weights *w, uint32_t T, uint32_t nt,
 }
 
 int main(void) {
+    /* These cases pin the ordinary streamed path's contract (synchronous
+     * rejection, exact reads, recovery); the decode handshake, on by default
+     * without MTP, defers those checks to the next GPU wait. */
+    setenv("DS4_QWEN4_STREAM_HANDSHAKE", "0", 1);
     weights formats[] = {{.gate_type=16, .down_type=10, .shared_down_type=8},
                          {.gate_type=12, .down_type=39, .shared_down_type=39},
                          {.gate_type=8, .down_type=8, .shared_down_type=8}};

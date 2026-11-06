@@ -213,6 +213,54 @@ replays the retained prefix on the next evaluation. The native context is
 262144 tokens; `DS4_QWEN4_YARN_FACTOR=2` or `=4` enables static YaRN for
 longer contexts, with a possible quality cost on shorter prompts.
 
+## Streamed decode overlap
+
+Each streamed decode layer starts with a full GPU drain, because the CPU
+needs the router's expert ids before it can load experts. The layer's expert
+work used to wait in the open command buffer until the next layer's drain
+committed it, so the GPU idled while the CPU encoded the reduce and the next
+layer's attention and router. That buffer is now committed as soon as the
+experts are encoded (`ds4_metal_stream_overlap.inc`;
+`DS4_QWEN4_STREAM_EARLY_COMMIT=0` restores the old behaviour). Greedy output
+is byte-identical.
+
+The decode handshake (`ds4_metal_stream_handshake.inc`) removes that drain
+for single-token decode. It is on by default when MTP is off;
+`DS4_QWEN4_STREAM_HANDSHAKE=0` turns it off and `=1` also uses it with
+`--mtp` (for single-token steps only, which measured no faster): the router's
+ids are copied to shared words at the end of a command buffer, the next
+command buffer starts with a wait for a shared event, and the experts run
+through the layer's expert address table. The CPU encodes the next layer,
+then spins until the words hold the ids, loads the missing experts, writes
+their addresses and releases the GPU. Every command-buffer wait services the
+pending layers first. It allocates the whole cache budget's slabs up front
+(slots stay unlocked until used), because the kernels must see every slab
+when they are encoded. `DS4_QWEN4_STREAM_HANDSHAKE_PROFILE=1` prints the
+CPU wait and service times per layer; on an M4 Pro the CPU waited about
+0.9 ms per layer for the GPU and serviced a layer in 0.1 ms, so decode is
+bound by GPU work rather than drains. `DS4_QWEN4_STREAM_HANDSHAKE_MAX_TOKENS=2`
+or `3` extends it to MTP verification steps; they measured about 5% slower
+than the ordinary path, so MTP steps keep the ordinary path by default.
+
+Measured on an M4 Pro 48 GB (AC power, High Power Mode), Q2 model,
+`ds4-bench --ssd-streaming` with the 4K-token `promessi_sposi.txt` prompt,
+128 tokens, `--ctx-alloc 262144` (13.3 GiB expert cache), three interleaved
+rounds against the preceding main (tok/s, min to max):
+
+| | Prefill | Decode | Steady decode |
+| --- | ---: | ---: | ---: |
+| main | 218-222 | 17.4-18.3 | 18.5-19.0 |
+| early commit + handshake | 222-222 | 20.9-21.8 | 22.5-23.0 |
+
+Early commit alone measured 19.5-20.0 steady against 19.0-19.2 on an earlier
+base; the handshake adds the rest. With `--mtp` only the single-token steps
+use the handshake and the result was noisy but not better.
+Output was identical in every run and prefill did not change.
+`tests/test_qwen4_ssd_experts` pins the ordinary streamed path, whose
+synchronous rejection of invalid expert ids the handshake defers to the next
+GPU wait; `tests/test_qwen4_generation --ssd-streaming` passes bit-exact with
+the handshake on.
+
 ## Metal tuning on M1 Max and M2-M4
 
 The established M1 Max simdgroup optimizations also apply to Apple M2, M3
