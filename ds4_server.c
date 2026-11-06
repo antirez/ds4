@@ -15309,7 +15309,7 @@ static ssize_t header_end(const char *p, size_t n) {
     return -1;
 }
 
-static long content_length(const char *h, size_t n) {
+static long long content_length(const char *h, size_t n) {
     const char *p = h, *end = h + n;
     while (p < end) {
         const char *line = p;
@@ -15319,18 +15319,22 @@ static long content_length(const char *h, size_t n) {
         if (len >= 15 && strncasecmp(line, "Content-Length:", 15) == 0) {
             const char *v = line + 15;
             while (v < line + len && isspace((unsigned char)*v)) v++;
-            return strtol(v, NULL, 10);
+            return strtoll(v, NULL, 10);
         }
         if (p < end) p++;
     }
     return 0;
 }
 
+/* Agent sessions replay their whole image history on every turn, so bodies
+ * grow to many hundreds of MiB of base64 before the context window fills.
+ * The body is received straight into its final buffer: staging it through
+ * the doubling header buffer would briefly hold three copies. */
 static bool read_http_request(int fd, http_request *r) {
     buf b = {0};
     ssize_t hend = -1;
     const size_t max_header = 64 * 1024;
-    const size_t max_body = 64 * 1024 * 1024;
+    const size_t max_body = (size_t)4 << 30;
 
     while (hend < 0 && b.len < max_header) {
         char tmp[4096];
@@ -15353,21 +15357,25 @@ static bool read_http_request(int fd, http_request *r) {
     char *q = strchr(r->path, '?');
     if (q) *q = '\0';
 
-    long clen = content_length(b.ptr, (size_t)hend);
-    if (clen < 0 || (size_t)clen > max_body) goto fail;
-    while (b.len < (size_t)hend + (size_t)clen) {
-        char tmp[8192];
-        ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) goto fail;
-        buf_append(&b, tmp, (size_t)n);
-    }
-
+    long long clen = content_length(b.ptr, (size_t)hend);
+    if (clen < 0 || (unsigned long long)clen > max_body) goto fail;
     r->body_len = (size_t)clen;
     r->body = xmalloc(r->body_len + 1);
-    memcpy(r->body, b.ptr + hend, r->body_len);
-    r->body[r->body_len] = '\0';
+    size_t got = b.len - (size_t)hend;
+    if (got > r->body_len) got = r->body_len;
+    memcpy(r->body, b.ptr + hend, got);
     buf_free(&b);
+    while (got < r->body_len) {
+        ssize_t n = recv(fd, r->body + got, r->body_len - got, 0);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) {
+            free(r->body);
+            r->body = NULL;
+            return false;
+        }
+        got += (size_t)n;
+    }
+    r->body[r->body_len] = '\0';
     return true;
 fail:
     buf_free(&b);
@@ -15637,7 +15645,9 @@ static void *client_main(void *arg) {
         http_request_free(&hr);
         goto done;
     }
-    if (ok) req.raw_body = xstrndup(hr.body, hr.body_len);
+    /* raw_body is only ever written to the --trace log; skip the copy of a
+     * possibly multi-GiB body otherwise. */
+    if (ok && s->trace) req.raw_body = xstrndup(hr.body, hr.body_len);
     http_request_free(&hr);
     if (!ok) {
         http_error(fd, s->enable_cors, 400, err);

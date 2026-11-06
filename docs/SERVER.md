@@ -105,7 +105,8 @@ OpenAI chat and Responses accept inline PNG/JPEG data URIs. Anthropic accepts
 base64 image sources. Remote URLs and server-side file paths are rejected.
 Image blocks preserve their order in the request. There is no fixed cap on the
 number of images: a request is rejected only when its tokens, image blocks
-included, do not fit the context window. The HTTP body is limited to 64 MiB.
+included, do not fit the context window. The HTTP body is limited to 4 GiB, so
+long sessions that replay their full screenshot history each turn fit.
 
 ## Disk KV cache
 
