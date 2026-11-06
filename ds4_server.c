@@ -12895,7 +12895,9 @@ static char *build_thinking_visible_text(const request *r,
     size_t pt_len = strlen(r->prompt_text);
     if (r->model_syntax == SERVER_MODEL_SYNTAX_QWEN) {
         /* the next request renders this turn as an empty think block plus the
-         * trimmed content, closed by <|im_end|> */
+         * trimmed content, closed by <|im_end|>. Generation stopped on that
+         * <|im_end|> without evaluating it, so leave it out of the key: the
+         * next suffix then evaluates it, as for Qwen tool-call turns. */
         const char *gen = "<|im_start|>assistant\n<think>\n";
         const size_t gen_len = strlen(gen);
         if (pt_len < gen_len || memcmp(r->prompt_text + pt_len - gen_len, gen, gen_len) != 0) return NULL;
@@ -12903,7 +12905,6 @@ static char *build_thinking_visible_text(const request *r,
         buf_append(&visible, r->prompt_text, pt_len);
         buf_puts(&visible, "\n</think>\n\n");
         append_trimmed_text(&visible, content ? content : "");
-        buf_puts(&visible, "<|im_end|>\n");
         return buf_take(&visible);
     }
     const char *think_tag = "<think>";
@@ -18797,7 +18798,8 @@ static void test_qwen_string_arguments_follow_schema(void) {
 }
 
 /* Qwen: the thinking-mode live checkpoint key must be exactly what the next
- * request renders for this turn when the client does not send reasoning back */
+ * request renders for this turn when the client does not send reasoning back,
+ * up to the turn's <|im_end|>, which the next suffix must evaluate */
 static void test_qwen_thinking_visible_text_matches_render(void) {
     const char *schemas[] = {NULL, "{\"name\":\"lookup\",\"parameters\":{\"type\":\"object\"}}"};
     for (size_t i = 0; i < sizeof(schemas) / sizeof(schemas[0]); i++) {
@@ -18835,7 +18837,8 @@ static void test_qwen_thinking_visible_text_matches_render(void) {
             SERVER_MODEL_SYNTAX_QWEN, &history, schemas[i], NULL, DS4_THINK_HIGH);
         TEST_ASSERT(strlen(future) > strlen(visible));
         TEST_ASSERT(!memcmp(future, visible, strlen(visible)));
-        TEST_ASSERT(!strncmp(future + strlen(visible), "<|im_start|>user\n", 17));
+        TEST_ASSERT(!strncmp(future + strlen(visible),
+                             "<|im_end|>\n<|im_start|>user\n", 28));
         free(future);
         /* Echoed or edited history must not match the reasoning-free alias. */
         history.v[1].reasoning = xstrdup("2 plus 2 is 4.");
