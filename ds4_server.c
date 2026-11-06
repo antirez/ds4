@@ -3671,11 +3671,6 @@ static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
         ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
         return true;
     }
-    if (count > SERVER_MAX_IMAGES) {
-        snprintf(err, errlen, "too many images; at most %d are allowed",
-                 SERVER_MAX_IMAGES);
-        return false;
-    }
     if (!e || !s || !ds4_engine_has_vision(e)) {
         snprintf(err, errlen, "image input requires starting ds4-server with --vision FILE");
         return false;
@@ -9977,20 +9972,28 @@ typedef struct {
  * before any prefix is reused. Normalization preserves all byte offsets. */
 typedef struct {
     size_t count;
-    size_t offsets[SERVER_MAX_IMAGES];
+    size_t *offsets;
 } visible_image_key;
+
+static void visible_image_key_free(visible_image_key *images) {
+    free(images->offsets);
+    images->offsets = NULL;
+    images->count = 0;
+}
 
 static char *visible_prompt_key(const request *req, const char *text,
                                  visible_image_key *images) {
     memset(images, 0, sizeof(*images));
-    if (!req || !text || req->image_count > SERVER_MAX_IMAGES ||
-        (req->image_count && !req->image_markers)) return NULL;
+    if (!req || !text || (req->image_count && !req->image_markers)) return NULL;
     char *key = xstrdup(text);
+    if (req->image_count)
+        images->offsets = xmalloc(req->image_count * sizeof(images->offsets[0]));
     const char *cursor = text;
     for (size_t i = 0; i < req->image_count; i++) {
         const char *marker = strstr(cursor, req->image_markers[i]);
         size_t len = strlen(req->image_markers[i]);
         if (!marker || !len) {
+            visible_image_key_free(images);
             free(key);
             return NULL;
         }
@@ -10503,7 +10506,7 @@ static void live_tool_state_clear_locked(live_tool_state *st) {
     free(st->visible_text);
     st->visible_text = NULL;
     st->visible_len = 0;
-    memset(&st->images, 0, sizeof(st->images));
+    visible_image_key_free(&st->images);
     st->valid = false;
     st->live_tokens = 0;
 }
@@ -10520,7 +10523,7 @@ static void visible_live_clear_locked(visible_live_state *st) {
     free(st->visible_text);
     st->visible_text = NULL;
     st->visible_len = 0;
-    memset(&st->images, 0, sizeof(st->images));
+    visible_image_key_free(&st->images);
     st->live_tokens = 0;
     st->valid = false;
     st->token_text_disk_key = false;
@@ -11527,28 +11530,28 @@ static bool build_live_prompt_suffix(server *s, server_slot *slot,
                                       const request *req, const char *suffix,
                                       ds4_tokens *out) {
     const ds4_tokens *live = ds4_session_tokens(slot->session);
-    if (!live || !suffix || req->image_count > SERVER_MAX_IMAGES) return false;
-    ds4_vision_span spans[SERVER_MAX_IMAGES];
+    if (!live || !suffix || (req->image_count && !req->image_markers)) return false;
+    ds4_vision_span *spans = req->image_count ?
+        xmalloc(req->image_count * sizeof(spans[0])) : NULL;
     size_t old_count = req->image_count;
     for (size_t i = 0; i < req->image_count; i++) {
-        if (!req->image_markers) return false;
         spans[i] = req->images[i];
         if (old_count == req->image_count &&
             strstr(suffix, req->image_markers[i])) old_count = i;
     }
-    if (!ds4_session_rebase_vision_state(slot->session, spans, old_count)) return false;
     ds4_tokens prompt = {0};
-    ds4_tokens_copy(&prompt, live);
+    bool ok = ds4_session_rebase_vision_state(slot->session, spans, old_count);
+    if (ok) ds4_tokens_copy(&prompt, live);
     const char *cursor = suffix;
     const int wrapper = ds4_engine_is_glm_dsa(s->engine) ? 1 : 0;
-    for (size_t i = old_count; i < req->image_count; i++) {
+    for (size_t i = old_count; ok && i < req->image_count; i++) {
         const char *marker = strstr(cursor, req->image_markers[i]);
         int64_t start = (int64_t)req->images[i].token_start - wrapper;
         uint64_t end = (uint64_t)req->images[i].token_start +
                         req->images[i].embedding.token_count + wrapper;
         if (!marker || start < 0 || end > (uint64_t)req->prompt.len) {
-            ds4_tokens_free(&prompt);
-            return false;
+            ok = false;
+            break;
         }
         char *text = xstrndup(cursor, (size_t)(marker - cursor));
         ds4_tokenize_rendered_chat(s->engine, text, &prompt);
@@ -11558,16 +11561,21 @@ static bool build_live_prompt_suffix(server *s, server_slot *slot,
             ds4_tokens_push(&prompt, req->prompt.v[p]);
         cursor = marker + strlen(req->image_markers[i]);
     }
-    ds4_tokenize_rendered_chat(s->engine, cursor, &prompt);
-    if (!ds4_session_vision_prefix_matches(slot->session, spans, req->image_count)) {
-        ds4_tokens_free(&prompt);
-        return false;
+    if (ok) {
+        ds4_tokenize_rendered_chat(s->engine, cursor, &prompt);
+        ok = ds4_session_vision_prefix_matches(slot->session, spans,
+                                               req->image_count);
     }
-    for (size_t i = 0; i < req->image_count; i++)
-        req->images[i].token_start = spans[i].token_start;
-    ds4_tokens_free(out);
-    *out = prompt;
-    return true;
+    if (ok) {
+        for (size_t i = 0; i < req->image_count; i++)
+            req->images[i].token_start = spans[i].token_start;
+        ds4_tokens_free(out);
+        *out = prompt;
+    } else {
+        ds4_tokens_free(&prompt);
+    }
+    free(spans);
+    return ok;
 }
 
 
@@ -11691,14 +11699,14 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
                       byte_prefix_match(vkey, vlen,
                           slot->responses_live.visible_text,
                           slot->responses_live.visible_len);
+            free(vkey);
+            visible_image_key_free(&vimages);
             if (ok) {
                 pr.kind = REUSE_RESPONSES_VISIBLE;
                 pr.reuse_tokens = live_pos;
                 pr.suffix_off = slot->responses_live.visible_len;
-                free(vkey);
                 return pr;
             }
-            free(vkey);
         }
     }
 
@@ -11757,14 +11765,14 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
                       byte_prefix_match(vkey, vlen,
                           slot->thinking_live.visible_text,
                           slot->thinking_live.visible_len);
+            free(vkey);
+            visible_image_key_free(&vimages);
             if (ok) {
                 pr.kind = REUSE_THINKING_VISIBLE;
                 pr.reuse_tokens = live_pos;
                 pr.suffix_off = slot->thinking_live.visible_len;
-                free(vkey);
                 return pr;
             }
-            free(vkey);
         }
     }
 
@@ -17029,6 +17037,7 @@ static void test_slot_probe_vision_tiers(void) {
         slot.thinking_live.visible_len =
             strlen(slot.thinking_live.visible_text);
         slot.thinking_live.images.count = 1;
+        slot.thinking_live.images.offsets = xmalloc(sizeof(size_t));
         slot.thinking_live.images.offsets[0] = 4;
         job j = {0};
         j.req.kind = REQ_CHAT;
@@ -23045,11 +23054,13 @@ static void test_visible_image_key(void) {
     TEST_ASSERT(a && b && !strcmp(a, b));
     TEST_ASSERT(visible_image_prefix_matches(&next, &first, strlen(a)));
     free(b);
+    visible_image_key_free(&next);
     req.image_count = 0;
     b = visible_prompt_key(&req, a, &next);
     TEST_ASSERT(b && !strcmp(a, b));
     TEST_ASSERT(!visible_image_prefix_matches(&next, &first, strlen(a)));
     free(b);
+    visible_image_key_free(&next);
     req.image_count = 2;
     b = visible_prompt_key(&req, "xnonce_Zy-nextnonce_B", &next);
     TEST_ASSERT(b && byte_prefix_match(b, strlen(b), a, strlen(a)));
@@ -23058,7 +23069,32 @@ static void test_visible_image_key(void) {
     TEST_ASSERT(!visible_image_prefix_matches(&next, &first, strlen(a)));
     free(b);
     free(a);
+    visible_image_key_free(&next);
+    visible_image_key_free(&first);
     TEST_ASSERT(visible_prompt_key(&req, "marker missing", &next) == NULL);
+    TEST_ASSERT(next.offsets == NULL && next.count == 0);
+
+    /* Agent loops attach one screenshot per step: image counts are bounded
+     * by the context window, never by a fixed array. */
+    enum { many = 300 };
+    char (*many_markers)[SERVER_IMAGE_MARKER_BYTES] =
+        xmalloc(many * sizeof(many_markers[0]));
+    buf text = {0};
+    for (size_t i = 0; i < many; i++) {
+        snprintf(many_markers[i], SERVER_IMAGE_MARKER_BYTES, "img_%zu_", i);
+        buf_puts(&text, "step ");
+        buf_puts(&text, many_markers[i]);
+    }
+    request wide = {.image_count = many, .image_markers = many_markers};
+    char *w = visible_prompt_key(&wide, text.ptr, &first);
+    TEST_ASSERT(w && first.count == many);
+    for (size_t i = 1; i < many; i++)
+        TEST_ASSERT(first.offsets[i] > first.offsets[i - 1]);
+    TEST_ASSERT(visible_image_prefix_matches(&first, &first, text.len));
+    free(w);
+    visible_image_key_free(&first);
+    buf_free(&text);
+    free(many_markers);
 
     request glm = {.model_syntax = SERVER_MODEL_SYNTAX_GLM, .think_mode = DS4_THINK_HIGH,
                    .prompt_text = "<|user|>hello<|assistant|><think>"};
