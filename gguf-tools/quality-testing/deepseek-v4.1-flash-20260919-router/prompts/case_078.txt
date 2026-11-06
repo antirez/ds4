@@ -1,0 +1,1 @@
+Spiega perche aprire un file in modalita append non rende automaticamente atomiche operazioni composte.

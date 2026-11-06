@@ -1,0 +1,1 @@
+Given a sorted array, describe how binary search finds the insertion point.

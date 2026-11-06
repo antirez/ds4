@@ -1,0 +1,3 @@
+# Perché la residenza delle pagine mmap può differire dalla dimensione virtuale
+
+Quando usi `mmap()`, il kernel crea

@@ -1,0 +1,6 @@
+**Latency** and **throughput** are two fundamental metrics used to measure the performance of computer systems, networks, and storage devices. While they are related, they measure different aspects of performance.
+
+### 1. Definitions
+
+#### **Latency**
+- **Definition**: The time delay between the cause and

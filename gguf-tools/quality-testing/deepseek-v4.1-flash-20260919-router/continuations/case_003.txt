@@ -1,0 +1,8 @@
+# The Bug: Mutable Default Argument
+
+## The Problem
+
+The default value `[]` is evaluated **only once**, when the function is defined. This means the same list object is shared across *every* call to `append_item` that doesn't pass in `items`.
+
+```python
+def append_item(x

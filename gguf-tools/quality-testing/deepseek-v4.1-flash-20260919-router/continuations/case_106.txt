@@ -1,0 +1,7 @@
+Based only on the provided records:
+
+- Record 17: owner R323, bin 629, revision 4.
+- Record 256: owner R876, bin 553, revision 5.
+- Record 509: owner R698, bin 004, revision 6.
+
+I located them by finding the

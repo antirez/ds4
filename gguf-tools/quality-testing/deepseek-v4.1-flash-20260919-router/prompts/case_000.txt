@@ -1,0 +1,1 @@
+Write a Python generator that yields adjacent pairs from an iterable without storing the whole iterable.

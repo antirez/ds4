@@ -1,0 +1,3 @@
+# Tre invarianti per una tabella di token speciali
+
+Ecco tre invarianti tipici per una tabella che mappa token speciali (es

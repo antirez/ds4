@@ -1,0 +1,4 @@
+# Checklist: Revisione Lifetime di Memoria in una PR
+
+## Puntatori e Reference
+- [ ] Ogni reference ritornata punta a

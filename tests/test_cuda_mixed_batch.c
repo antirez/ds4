@@ -12,11 +12,16 @@
  * Exercise compressed/indexed context with:
  *   DS4_TEST_CONTEXT=4096 DS4_TEST_MIXED_INITIAL=2048 \
  *   DS4_TEST_MIXED_ROUNDS=8 make test-cuda-mixed-batch
+ * Single-Spark V4.1 SSD: DS4_TEST_CUDA_SINGLE_GPU=1 DS4_TEST_SSD_CACHE_GIB=64
+ * DS4_TEST_SESSION_COUNT=3 DS4_TEST_MIXED_QUANTUM=5 (at most eight native rows).
+ * For two-host RoCE, set DS4_TEST_TP_LISTEN_HOST and optionally DS4_TEST_TP_PORT
+ * (default 19841), then start a matching ds4 worker on the other host.
  */
 
 #include "ds4.h"
 #include "ds4_gpu_args.h"
 #include "ds4_gpu_mgpu.h"
+#include "ds4_tp.h"
 
 #include <math.h>
 #include <stdbool.h>
@@ -88,7 +93,7 @@ static void compare_logits(ds4_session *mixed, ds4_session *control,
     }
     const int mixed_argmax = ds4_session_argmax(mixed);
     const int control_argmax = ds4_session_argmax(control);
-    if (different != 0 || mixed_argmax != control_argmax) {
+    if (!isfinite(worst) || different != 0 || mixed_argmax != control_argmax) {
         fprintf(stderr,
                 "FAIL: %s logits row=%d round=%d differing=%d worst=%g "
                 "argmax=%d/%d\n",
@@ -101,6 +106,12 @@ static void compare_logits(ds4_session *mixed, ds4_session *control,
 int main(void) {
     const char *model = getenv("DS4_TEST_MODEL");
     if (!model || !model[0]) fail("DS4_TEST_MODEL is not set", NULL, -1, -1);
+    const char *tp_host = getenv("DS4_TEST_TP_LISTEN_HOST");
+    const bool network_tp = tp_host && *tp_host;
+    const bool single_gpu = network_tp || getenv("DS4_TEST_CUDA_SINGLE_GPU") != NULL;
+    const int ssd_gib = env_int("DS4_TEST_SSD_CACHE_GIB", 0, 1, 90);
+    if (network_tp && ssd_gib) fail("network TP needs resident shards", NULL, -1, -1);
+    if (ssd_gib && !single_gpu) fail("SSD test requires a single GPU", NULL, -1, -1);
 
     const int session_count = env_int(
             "DS4_TEST_SESSION_COUNT", DEFAULT_SESSION_COUNT, 3,
@@ -120,7 +131,9 @@ int main(void) {
     setenv("DS4_CUDA_MIXED_PREFILL_DECODE", "1", 1);
 
     const char *gpu_devices = getenv("DS4_TEST_GPU_DEVICES");
-    if (!gpu_devices || !gpu_devices[0]) gpu_devices = "0,2,4,6,1,3,5,7";
+    if (!gpu_devices || !gpu_devices[0]) gpu_devices = single_gpu ? "0" : "0,2,4,6,1,3,5,7";
+    if (ssd_gib && strcmp(gpu_devices, "0"))
+        fail("SSD test uses the default CUDA device", NULL, -1, -1);
     ds4_gpu_config gpu = {0};
     bool skip_cuda = false;
     char err[256] = {0};
@@ -132,14 +145,45 @@ int main(void) {
     ds4_engine_options options = {
         .model_path = model,
         .backend = DS4_BACKEND_CUDA,
+        .context_size = context,
         .n_threads = 1,
-        .cuda_tensor_parallel = true,
+        .cuda_tensor_parallel = !single_gpu,
+        .ssd_streaming = ssd_gib != 0,
+        .ssd_streaming_cache_bytes = (uint64_t)ssd_gib << 30,
         .share_session_prefill_workspace = true,
         .placement_ctx_hint = (uint32_t)context,
+        .placement_session_count_hint = ssd_gib ? 2 * (session_count + 1) : 0,
     };
+    if (network_tp) {
+        options.tp.role = DS4_TP_LEADER;
+        options.tp.listen_host = tp_host;
+        options.tp.listen_port = env_int("DS4_TEST_TP_PORT", 19841, 1, 65535);
+        options.tp.transport = DS4_TP_TRANSPORT_RDMA;
+        options.placement_session_count_hint = 2 * (session_count + 1);
+        if (options.placement_session_count_hint > 8)
+            fail("network oracle needs at most eight live sessions", NULL, -1, -1);
+    }
     ds4_engine *engine = NULL;
-    if (ds4_engine_create_with_gpu_config(&engine, &options, &gpu) != 0) {
+    if (ds4_engine_create_with_gpu_config(&engine, &options, (ssd_gib || network_tp) ? NULL : &gpu) != 0) {
         fail("engine open", NULL, -1, -1);
+    }
+
+    ds4_tp *tp = NULL;
+    if (network_tp) {
+        ds4_tp_identity identity = {
+            .gguf_bytes = ds4_engine_model_bytes(engine),
+            .model_id = (uint32_t)ds4_engine_model_id(engine),
+            .n_layer = (uint32_t)ds4_engine_layer_count(engine),
+            .n_embd = (uint32_t)ds4_engine_embd_dim(engine),
+            .n_vocab = (uint32_t)ds4_engine_vocab_size(engine),
+            .quant_bits = (uint32_t)ds4_engine_routed_quant_bits(engine),
+            .ctx_size = (uint32_t)context,
+        };
+        ds4_engine_tp_gate_schedule(engine, &identity.gate_slot_start,
+            &identity.gate_slot_step, &identity.gates_per_token, identity.gate_slot_mask);
+        if (!ds4_tp_create(&tp, &options.tp, &identity, err, sizeof(err)) ||
+            !ds4_engine_tp_bind(engine, tp, err, sizeof(err)))
+            fail("network TP setup", err, -1, -1);
     }
 
     const char phrase[] = " numbered-token";
@@ -279,6 +323,8 @@ int main(void) {
     ds4_session_free(prefill_control);
     ds4_session_free(prefill_mixed);
     ds4_tokens_free(&long_prompt);
+    if (tp) (void)ds4_tp_send_stop(tp);
     ds4_engine_close(engine);
+    ds4_tp_free(tp);
     return 0;
 }

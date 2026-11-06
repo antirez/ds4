@@ -1,0 +1,1 @@
+A TCP server must preserve a partially written reply when a client reads slowly because TCP is a byte-stream protocol, not a message-oriented one: the server's `write()` calls enqueue bytes into the socket's send buffer, and the kernel transmits them only as the receiver's window and the network allow. If the client

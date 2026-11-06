@@ -1,0 +1,1 @@
+Find the problem in: unsigned n = 0; if (n - 1 < 10) puts("small");

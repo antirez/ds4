@@ -1,0 +1,29 @@
+Read the archive, then answer only the final question.
+Record 0000: warehouse 000 assigns parcel 0000 to desk 000.
+Record 0001: warehouse 037 assigns parcel 0053 to desk 011.
+Record 0002: warehouse 074 assigns parcel 0106 to desk 022.
+Record 0003: warehouse 111 assigns parcel 0159 to desk 033.
+Record 0004: warehouse 148 assigns parcel 0212 to desk 044.
+Record 0005: warehouse 185 assigns parcel 0265 to desk 055.
+Record 0006: warehouse 222 assigns parcel 0318 to desk 066.
+Record 0007: warehouse 259 assigns parcel 0371 to desk 077.
+Record 0008: warehouse 296 assigns parcel 0424 to desk 088.
+Record 0009: warehouse 333 assigns parcel 0477 to desk 099.
+Record 0010: warehouse 370 assigns parcel 0530 to desk 110.
+Record 0011: warehouse 407 assigns parcel 0583 to desk 121.
+Record 0012: warehouse 444 assigns parcel 0636 to desk 132.
+Record 0013: warehouse 481 assigns parcel 0689 to desk 143.
+Record 0014: warehouse 518 assigns parcel 0742 to desk 154.
+Record 0015: warehouse 555 assigns parcel 0795 to desk 165.
+Record 0016: warehouse 592 assigns parcel 0848 to desk 176.
+Record 0017: warehouse 629 assigns parcel 0901 to desk 187.
+Record 0018: warehouse 666 assigns parcel 0954 to desk 198.
+Record 0019: warehouse 703 assigns parcel 1007 to desk 209.
+Record 0020: warehouse 740 assigns parcel 0051 to desk 220.
+Record 0021: warehouse 777 assigns parcel 0104 to desk 231.
+Record 0022: warehouse 814 assigns parcel 0157 to desk 242.
+Record 0023: warehouse 851 assigns parcel 0210 to desk 253.
+Record 0024: warehouse 888 assigns parcel 0263 to desk 007.
+Record 0025: warehouse 925 assigns parcel 0316 to desk 018.
+Record  x x x x x x x
+Final question: which warehouse is named in Record 0002? Give only its number.

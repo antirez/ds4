@@ -1,0 +1,15 @@
+# SQL Query: Customers With No Orders
+
+## Option 1: `NOT EXISTS` (Recommended)
+
+```sql
+SELECT c.id
+FROM customers c
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM orders o
+    WHERE o.customer_id = c.id
+);
+```
+
+## Option 2: `

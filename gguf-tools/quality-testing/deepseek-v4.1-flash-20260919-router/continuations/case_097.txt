@@ -1,0 +1,7 @@
+# Why a Checksum Does Not Authenticate the Sender
+
+A checksum values are designed to detect **accidental errors**, not to prove **who created or sent a file**. Here's why in detail:
+
+## 1. What a checksum actually does
+
+A checksum (e.g., CRC32,

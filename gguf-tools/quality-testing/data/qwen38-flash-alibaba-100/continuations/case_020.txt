@@ -1,0 +1,3 @@
+To describe how binary search finds the insertion point in a sorted array, we must look at the specific variant of binary search often referred to as **`bisect_left`** (in Python) or **`lower_bound`** (in C++).
+
+The goal is not just to find if an element exists,

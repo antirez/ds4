@@ -14,3 +14,7 @@ quality-testing/data/*
 !quality-testing/data/glm53-flash-openrouter-zai-fp8-100/**
 !quality-testing/data/flash-vision-exp-openrouter-novita-100/
 !quality-testing/data/flash-vision-exp-openrouter-novita-100/**
+!quality-testing/data/qwen38-flash-alibaba-100/
+!quality-testing/data/qwen38-flash-alibaba-100/**
+!quality-testing/data/qwen38-flash-alibaba-long/
+!quality-testing/data/qwen38-flash-alibaba-long/**

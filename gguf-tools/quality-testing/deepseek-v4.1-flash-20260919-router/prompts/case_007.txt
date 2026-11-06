@@ -1,0 +1,1 @@
+Explain what happens when a TCP sender successfully writes bytes but the receiver then crashes before processing them.

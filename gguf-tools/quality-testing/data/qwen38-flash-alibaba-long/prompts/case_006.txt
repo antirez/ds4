@@ -1,0 +1,47 @@
+Review the following C routines. Answer only the final question.
+int clamp_0000(int x) { if (x < 0) return 0; if (x > 100) return 100; return x; }
+int clamp_0001(int x) { if (x < 1) return 1; if (x > 101) return 101; return x; }
+int clamp_0002(int x) { if (x < 2) return 2; if (x > 102) return 102; return x; }
+int clamp_0003(int x) { if (x < 3) return 3; if (x > 103) return 103; return x; }
+int clamp_0004(int x) { if (x < 4) return 4; if (x > 104) return 104; return x; }
+int clamp_0005(int x) { if (x < 5) return 5; if (x > 105) return 105; return x; }
+int clamp_0006(int x) { if (x < 6) return 6; if (x > 106) return 106; return x; }
+int clamp_0007(int x) { if (x < 7) return 7; if (x > 107) return 107; return x; }
+int clamp_0008(int x) { if (x < 8) return 8; if (x > 108) return 108; return x; }
+int clamp_0009(int x) { if (x < 9) return 9; if (x > 109) return 109; return x; }
+int clamp_0010(int x) { if (x < 10) return 10; if (x > 110) return 110; return x; }
+int clamp_0011(int x) { if (x < 11) return 11; if (x > 111) return 111; return x; }
+int clamp_0012(int x) { if (x < 12) return 12; if (x > 112) return 112; return x; }
+int clamp_0013(int x) { if (x < 13) return 13; if (x > 113) return 113; return x; }
+int clamp_0014(int x) { if (x < 14) return 14; if (x > 114) return 114; return x; }
+int clamp_0015(int x) { if (x < 15) return 15; if (x > 115) return 115; return x; }
+int clamp_0016(int x) { if (x < 16) return 16; if (x > 116) return 116; return x; }
+int clamp_0017(int x) { if (x < 17) return 17; if (x > 117) return 117; return x; }
+int clamp_0018(int x) { if (x < 18) return 18; if (x > 118) return 118; return x; }
+int clamp_0019(int x) { if (x < 19) return 19; if (x > 119) return 119; return x; }
+int clamp_0020(int x) { if (x < 20) return 20; if (x > 120) return 120; return x; }
+int clamp_0021(int x) { if (x < 21) return 21; if (x > 121) return 121; return x; }
+int clamp_0022(int x) { if (x < 22) return 22; if (x > 122) return 122; return x; }
+int clamp_0023(int x) { if (x < 23) return 23; if (x > 123) return 123; return x; }
+int clamp_0024(int x) { if (x < 24) return 24; if (x > 124) return 124; return x; }
+int clamp_0025(int x) { if (x < 25) return 25; if (x > 125) return 125; return x; }
+int clamp_0026(int x) { if (x < 26) return 26; if (x > 126) return 126; return x; }
+int clamp_0027(int x) { if (x < 27) return 27; if (x > 127) return 127; return x; }
+int clamp_0028(int x) { if (x < 28) return 28; if (x > 128) return 128; return x; }
+int clamp_0029(int x) { if (x < 29) return 29; if (x > 129) return 129; return x; }
+int clamp_0030(int x) { if (x < 30) return 30; if (x > 130) return 130; return x; }
+int clamp_0031(int x) { if (x < 31) return 31; if (x > 131) return 131; return x; }
+int clamp_0032(int x) { if (x < 32) return 32; if (x > 132) return 132; return x; }
+int clamp_0033(int x) { if (x < 33) return 33; if (x > 133) return 133; return x; }
+int clamp_0034(int x) { if (x < 34) return 34; if (x > 134) return 134; return x; }
+int clamp_0035(int x) { if (x < 35) return 35; if (x > 135) return 135; return x; }
+int clamp_0036(int x) { if (x < 36) return 36; if (x > 136) return 136; return x; }
+int clamp_0037(int x) { if (x < 37) return 37; if (x > 137) return 137; return x; }
+int clamp_0038(int x) { if (x < 38) return 38; if (x > 138) return 138; return x; }
+int clamp_0039(int x) { if (x < 39) return 39; if (x > 139) return 139; return x; }
+int clamp_0040(int x) { if (x < 40) return 40; if (x > 140) return 140; return x; }
+int clamp_0041(int x) { if (x < 41) return 41; if (x > 141) return 141; return x; }
+int clamp_0042(int x) { if (x < 42) return 42; if (x > 142) return 142; return x; }
+int clamp_0043(int x) { if (x < 43) return 43; if (x > 143) return 143; return x; }
+
+For clamp_0017, explain the outputs for inputs -5, 50 and 999 and give a boundary test.

@@ -1,0 +1,1 @@
+Write a Python function returning the index of the first value greater than a threshold in a sorted list.

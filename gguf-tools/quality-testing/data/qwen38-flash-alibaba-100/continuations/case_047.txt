@@ -1,0 +1,3 @@
+In the context of Large Language Models (LLMs) and Transformer architectures, **KV Cache** (Key-Value Cache) is a mechanism used to speed up inference by storing the Key and Value vectors from previous tokens so they don’t need to be recomputed.
+
+The difference between **Raw KV Rows** and **

@@ -1,0 +1,1 @@
+A tokenizer must treat special tags (such as `<|start|>`, `

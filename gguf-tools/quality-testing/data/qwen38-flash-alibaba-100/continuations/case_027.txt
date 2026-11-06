@@ -1,0 +1,1 @@
+In the context of **Low-Bit Quantization** (specifically for Large Language Models or deep neural networks), an **Importance Matrix** is a data structure used to determine which weights in a model are most critical to preserve with high precision, and which can be aggressively quantized (compressed) without significantly degrading

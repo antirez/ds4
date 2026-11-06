@@ -1,0 +1,1 @@
+Write a small JavaScript function that groups an array of objects by their category property.

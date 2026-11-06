@@ -1,0 +1,3 @@
+# Why a Failed CAS Must Update or Reload the Expected Value
+
+A compare-and-swap (CAS) operation takes three arguments: a memory location, an *expected* value, and a *new* value. It atomically checks whether the current value equals the expected value, and if so, replaces it with

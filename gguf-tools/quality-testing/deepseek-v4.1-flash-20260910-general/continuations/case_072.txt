@@ -1,0 +1,1 @@
+Nel contesto dei database distribuiti, per **consistenza eventuale** (in inglese *eventual consistency*) si intende un modello di

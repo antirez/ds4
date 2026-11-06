@@ -1,0 +1,1 @@
+Explain why the average of two percentages may be misleading when their denominators differ.

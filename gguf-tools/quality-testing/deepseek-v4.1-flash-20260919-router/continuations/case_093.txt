@@ -1,0 +1,9 @@
+```python
+def transpose_matrix(matrix):
+    """
+    Transpose a rectangular matrix after validating its structure.
+
+    A valid rectangular matrix is a non-empty list of non-empty lists,
+    where every row has the same length. Elements may be of any type.
+    """
+    # Check that the outer container is a non

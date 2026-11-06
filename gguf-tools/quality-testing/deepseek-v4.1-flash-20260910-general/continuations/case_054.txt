@@ -1,0 +1,3 @@
+# Testare che un mmap su file non venga rimappato ripetutamente
+
+Ci sono diversi approcci, a seconda di cosa vuoi

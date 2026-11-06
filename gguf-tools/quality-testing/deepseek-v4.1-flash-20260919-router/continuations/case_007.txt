@@ -1,0 +1,7 @@
+# TCP Sender Writes Successfully, Receiver Crashes Before Processing
+
+This scenario exposes one of the most important gaps in TCP's guarantees. Here's what happens, step by step.
+
+## The short answer
+
+The sender thinks everything is fine. TCP will ACK the data once it's in the receiver's

@@ -3,7 +3,7 @@
 This directory contains the prompts, tracked official fixtures, and scripts used
 to compare local GGUF variants against hosted-model continuations.
 
-The metric is target-token negative log likelihood: collect a deterministic
+The main metric is target-token negative log likelihood: collect an
 official continuation, then ask each local GGUF how much probability it assigns
 to that exact continuation token by token.  This avoids judging quality from one
 sampled answer.
@@ -27,6 +27,14 @@ calling hosted APIs:
   official DeepSeek API with `top_logprobs=20`.
 - `data/pro-0813`: 100 DeepSeek V4 PRO 0813 continuations collected from the
   official DeepSeek API with `top_logprobs=20`.
+- `data/qwen38-flash-alibaba-100`: 100 non-thinking Qwen3.8 Flash
+  continuations from Alibaba through OpenRouter, with top-five logprobs.
+- `data/qwen38-flash-alibaba-long`: 12 archive/code continuations from the
+  same endpoint, with prompts from 2K to 24K tokens.
+- [deepseek-v4.1-flash-20260919-router](deepseek-v4.1-flash-20260919-router/README.md):
+  112 fresh official V4.1 Flash continuations, including 12 longer prompts up
+  to 23K tokens. Temperature-1 samples with top-20 logprobs, intended for
+  paired numerical comparisons. These are not V4 Flash or Vision-Exp vectors.
 
 DeepSeek V4 Flash also has tracked official smoke vectors in
 `tests/test-vectors/`.  Those vectors drive `./ds4_test --logprob-vectors` and
@@ -35,17 +43,25 @@ include short prompts plus long-prompt attention cases.
 The hosted APIs expose output-token logprobs and top-logprob alternatives, not
 full vocabulary logits.
 
+The scorer verifies each API token's bytes against the local token boundaries,
+not just the number of tokens. If they differ, it still scores the continuation
+text but skips API logprob comparisons for that case. Alternatives containing
+Unicode replacement characters are excluded because the original token bytes
+may have been lost by the provider.
+
 ## 2. Collect Official Continuations
 
-For the tracked DeepSeek V4 Flash 0731 fixture:
+The Flash 0731 fixture is historical. The official API now redirects the old
+Flash names to V4.1; do not overwrite `data/flash` with new calls. Collect
+current V4.1 references in a separate directory:
 
 ```sh
 export DEEPSEEK_API_KEY=...
 python3 gguf-tools/quality-testing/collect_official.py \
-  --model deepseek-v4-flash \
+  --model deepseek-flash \
   --endpoint https://api.deepseek.com/chat/completions \
   --prompts gguf-tools/quality-testing/prompts.jsonl \
-  --out gguf-tools/quality-testing/data/flash \
+  --out /tmp/deepseek-v4.1-flash-new \
   --count 100 \
   --max-tokens 24 \
   --top-logprobs 20 \
@@ -116,13 +132,45 @@ The prompt list is tracked in `prompts.jsonl`.  Curated fixture directories are
 also tracked after review; ad-hoc API collection directories should stay
 untracked until they are intentionally promoted into the release QA set.
 
+Use `--system TEXT` when the reference needs an explicit system message.
+`--system ''` sends an empty message, which is different from omitting it:
+some providers insert a default system prompt when none is supplied. The
+collector records this setting and rejects a changed system message on resume.
+For a nonempty system message, render the matching local chat prompt and use
+`--rendered-prompt`; the scorer's ordinary prompt mode adds no system message.
+
+For Qwen, use the following settings in a new output directory:
+
+```sh
+python3 gguf-tools/quality-testing/collect_official.py \
+  --out /tmp/qwen-official \
+  --model qwen/qwen3.8-flash \
+  --endpoint https://openrouter.ai/api/v1/chat/completions \
+  --provider-order alibaba --require-parameters \
+  --require-response-provider Alibaba --require-response-model qwen/qwen3.8-flash \
+  --system '' --thinking omit --reasoning-effort none \
+  --count 100 --max-tokens 64 --top-logprobs 5
+```
+
+This reads `OPENROUTER_API_KEY` from the environment and disables provider
+fallbacks. Omitting `--system ''` caused Alibaba to add 13 prompt tokens in
+the September 2026 checks. The empty message matches Qwen's published
+no-thinking template and the scorer's ordinary prompt mode.
+
+Alibaba does not disclose this endpoint's precision. The
+[official model card](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) describes
+hosted Flash as based on Flash Next, not as a byte-identical checkpoint.
+Agreement with this service is an external quality check, not proof of exact
+native-weight inference.
+
 ## 3. Build The Local Scorer
 
 ```sh
 make -C gguf-tools quality-score
 ```
 
-The scorer links against the DS4 runtime and uses Metal by default.
+The scorer links against the DS4 runtime, using Metal on macOS and CUDA on
+Linux. On a DGX Spark, pass `CUDA_ARCH=sm_121` to the build command.
 
 Build the optional llama.cpp control scorer with:
 
@@ -153,6 +201,71 @@ Use `data/flash/manifest.tsv` for Flash GGUFs and
 `data/pro-0813/manifest.tsv` for PRO 0813. The scorer and comparator do not
 care which model produced the manifest; the manifest path selects the
 continuation set.
+
+Add `--continued-prefill N` to process each prompt in two calls, leaving its
+last `N` tokens for the second call. This checks continued-prefill quality
+against the same official answers. Every prompt must contain more than `N`
+tokens; otherwise the scorer fails instead of silently skipping the test.
+
+Add `--session-batch N` (2 to 8) to score an official continuation alongside
+unrelated, independently advancing sessions. The scorer rotates their row
+order on every step. Compare against a run without this option using the same
+manifest, model and context; budget memory for all `N` sessions.
+
+Check session isolation separately on a dedicated Metal host:
+
+```sh
+DS4_TEST_MODEL=MODEL.gguf DS4_TEST_BATCH_ISOLATION=1 \
+  DS4_TEST_SESSION_COUNT=4 DS4_TEST_DECODE_STEPS=32 \
+  MTL_DEBUG_LAYER=1 ./tests/test_metal_session_batch
+```
+
+This requires exact logits when companion prompts and row order change, then
+checks a continued prefill and resumed serial decoding. It also checks that
+invalid batches leave the target unchanged. It does not replace serial/batch
+quality comparisons: different arithmetic can round differently without
+sessions contaminating one another. Use `DS4_TEST_PROMPT_FILE` and
+`DS4_TEST_CONTEXT_SIZE` to repeat at longer prefixes. For physical TP, the test
+also accepts `DS4_TEST_TP_RDMA_DEVICE` and `DS4_TEST_TP_GID_INDEX` alongside
+its coordinator/worker settings. Throughput measurements must run separately
+without Metal API validation.
+
+For Metal V4.1 prefill scheduling changes, also run:
+
+```sh
+make tests/test_deepseek41_prefill
+./tests/test_deepseek41_prefill --dispatch
+MTL_DEBUG_LAYER=1 ./tests/test_deepseek41_prefill MODEL.gguf speed-bench/promessi_sposi.txt
+```
+
+The model test uses SSD streaming and two 128K sessions. Run it alone on a
+dedicated host with at least 128 GiB RAM. It alternates small and large appends
+through 113K context, checking dispatch, progress, unchanged-prefix reuse,
+saved state and subsequent decoding against a control without decoder deferral.
+Keep the official continuation checks too: this scheduling test does not judge
+quality across different floating-point operation orders. Measure speed without
+Metal API validation, separately for initial and continued prefills.
+
+Run the same mixed-prefix test over physical RDMA on two dedicated Metal hosts.
+Start the worker with the same model and a 131072-token context, then the test
+on the coordinator (replace the host and RDMA device names):
+
+```sh
+# Worker
+MTL_DEBUG_LAYER=1 ./ds4 -m MODEL.gguf --ctx 131072 \
+  --tensor-parallel --role worker --coordinator COORDINATOR 19455 \
+  --transport rdma --rdma-device WORKER_DEVICE --rdma-gid-index 1
+
+# Coordinator
+MTL_DEBUG_LAYER=1 ./tests/test_deepseek41_prefill --tensor-parallel \
+  MODEL.gguf speed-bench/promessi_sposi.txt COORDINATOR 19455 COORDINATOR_DEVICE 1
+```
+
+This compares equal TP prefill partitions and queued versus synchronous decode,
+including full logits and cache state. TP snapshots rebuild both ranks from
+tokens, so restoration is compared with an equivalent fresh replay. Also run
+the official scorer in TP mode for initial and continued prompts; scheduling
+parity alone does not establish model quality.
 
 Add `--quality` to disable DS4's speed-oriented numerical shortcuts. For an
 independent llama.cpp comparison of a DeepSeek V4 GGUF, use the same manifest
@@ -213,7 +326,10 @@ Output fields:
 - `first_token_matches`: how often the local greedy first token matches the
   official first token.
 - `avg_greedy_lcp`: average greedy longest common prefix against the official
-  continuation.
+  continuation. This measures exact agreement, not general answer quality;
+  one early mismatch discards all later agreement. Do not use it alone as a
+  quality gate, especially for sampled references. Compare paired NLL and
+  API probability agreement under matching execution settings as well.
 - `api_target_mae`: when the manifest includes `response_file`, absolute
   local-vs-API logprob delta for aligned official output tokens.
 - `api_top_coverage`: fraction of API top-logprob alternatives that map exactly
@@ -255,3 +371,39 @@ Run the host-only positive and negative controls:
 ```sh
 python3 -m unittest discover -s gguf-tools/quality-testing/tests -v
 ```
+
+## 7. Qwen3.8 Spark Baseline
+
+Measured on 2026-09-15, using one DGX Spark per quant. The short set has 100
+cases and 5,696 target tokens; the long set has 12 cases and 766 target tokens,
+with prefixes from 1,971 to 23,985 tokens. These are ordinary decoding and
+prefill checks, without MTP or vision.
+
+| Suite | GGUF | API top-token agreement | NLL, default | NLL, `--quality` |
+| --- | --- | ---: | ---: | ---: |
+| Short | Q2 | 88.90% | 0.352980 | 0.352915 |
+| Short | Q4 | 92.08% | 0.290297 | 0.290538 |
+| Long | Q2 | 93.99% | 0.154199 | 0.154106 |
+| Long | Q4 | 97.26% | 0.124611 | 0.125546 |
+
+Agreement is measured after feeding the same official continuation prefix,
+not as a percentage of correct answers. The two short cases with damaged
+emoji metadata contribute to NLL but not API agreement, which covers 5,568
+short-set tokens. All 766 long-set tokens align. Every local prompt and target
+token ID was also checked against Qwen's published tokenizer.
+
+The default fast path shows no material loss relative to `--quality` in these
+sets. The paired case-bootstrap intervals include zero for both quants and
+both suites. Q4 is closer to the hosted reference than Q2 on average.
+These measurements do not prove identical native weights or correctness at
+every context length.
+
+Leaving the last 1 or 256 prompt tokens for a separate continued prefill
+changed aggregate NLL by less than 0.0008 for either quant. Independent CLI
+answers at about 2K and 24K context also retrieved the correct archive owner
+and revision, and gave the correct clamp outputs and boundary tests, for
+both Q2 and Q4.
+
+Raw per-case scores, weight/source hashes and comparison details are retained
+in [short results](data/qwen38-flash-alibaba-100/cuda-spark-20260915/results.json)
+and [long results](data/qwen38-flash-alibaba-long/cuda-spark-20260915/results.json).

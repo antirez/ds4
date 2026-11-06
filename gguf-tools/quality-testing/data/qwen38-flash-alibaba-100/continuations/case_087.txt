@@ -1,0 +1,6 @@
+Here are three examples of useful server metrics, along with why they are critical for monitoring system health and performance:
+
+### 1. CPU Utilization (%)
+- **What it measures**: The percentage of time the CPU is busy executing non-idle tasks.
+- **Why it’s useful**: 
+  - High

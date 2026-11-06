@@ -5690,7 +5690,7 @@ static const char *cuda_model_range_ptr_from_fd(
     return (const char *)dev;
 }
 
-static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size) {
+static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, bool primary = true) {
     if (!model_map || model_size == 0 || map_offset > model_size || map_size > model_size - map_offset) return 0;
     if (map_size == 0) return 0;
     if (cuda_model_image_range_ptr(model_map, map_offset, map_size)) return 1;
@@ -5767,13 +5767,15 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
         return 0;
     }
     g_model_images.push_back({model_map, map_size, (char *)dev, map_offset});
-    g_model_host_base = model_map;
     /* Sparse layer slices may create several disjoint device images, so no
      * single base pointer can represent this model. Tensor lookups scan the
      * image table and subtract each image's file offset. */
-    g_model_device_base = NULL;
-    g_model_registered_size = model_size;
-    g_model_device_owned = 1;
+    if (primary) {
+        g_model_host_base = model_map;
+        g_model_device_base = NULL;
+        g_model_registered_size = model_size;
+        g_model_device_owned = 1;
+    }
     const double t1 = cuda_wall_sec();
     fprintf(stderr,
             DS4_GPU_LOG_PREFIX "model chunk copy complete in %.3fs (%.2f GiB tensors)\n",
@@ -6199,6 +6201,10 @@ extern "C" int ds4_gpu_set_aux_model_map_range(
         map_offset > model_size || map_size > model_size - map_offset) {
         return 0;
     }
+    /* A file-backed resident drafter must survive target streaming-cache
+     * eviction. Keep it in the owned image table, outside that bounded cache. */
+    if (g_model_fd >= 0 && g_model_fd_host_base == model_map)
+        return cuda_model_copy_chunked(model_map, model_size, map_offset, map_size, false);
     if (cuda_model_range_is_cached(model_map, map_offset, map_size)) return 1;
     if (!cuda_model_range_copy_uncached(model_map, map_offset, map_size,
                                         "GLM-5.3 vision encoder")) {

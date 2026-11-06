@@ -1,0 +1,7 @@
+# Verificare che un backup sia davvero ripristinabile
+
+Un backup che non è mai stato testato **non è un backup**: è solo una speranza. Ecco come verificarlo seriamente.
+
+## 1. Principi fondamentali
+
+- **Un backup è valido solo se

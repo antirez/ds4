@@ -1,0 +1,1 @@
+In a deterministic selection algorithm—especially ones that pick the "top k" or a single best item—changing the order of equal-scored items can matter because **ties are usually broken by position, not by value**. The algorithm only sees the score, so when scores are equal, the only remaining distinguishing information is

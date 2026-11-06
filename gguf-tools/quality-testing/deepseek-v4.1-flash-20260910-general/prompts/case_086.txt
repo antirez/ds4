@@ -1,0 +1,1 @@
+In one paragraph, explain why checksums catch accidental corruption.

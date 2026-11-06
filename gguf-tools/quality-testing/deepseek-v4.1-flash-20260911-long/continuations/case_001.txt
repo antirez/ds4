@@ -1,0 +1,1 @@
+A TCP server must preserve a partially written reply when a client reads slowly because TCP provides a reliable, ordered byte stream with flow control, not message boundaries. If the server writes a reply larger than the available socket send buffer or the client’s receive window, the write may be only partially accepted by the kernel and the

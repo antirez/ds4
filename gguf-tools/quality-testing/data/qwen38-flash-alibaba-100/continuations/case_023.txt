@@ -1,0 +1,5 @@
+**Backpressure** in a network server is a flow control mechanism that prevents a fast producer (sender) from overwhelming a slow consumer (receiver).
+
+In simple terms, it is the process of **signaling upstream components to slow down or stop sending data when downstream components cannot keep up with processing it.**
+
+### 

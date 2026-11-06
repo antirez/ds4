@@ -1,5 +1,8 @@
 #include "ds4.h"
+#include "ds4_distributed.h"
+#include "ds4_tp.h"
 
+#include <float.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,15 +25,34 @@ static void count_progress(void *ud, const char *event, int current, int total) 
 static float max_logit_delta(const float *a, const float *b, int count) {
     float max_delta = 0.0f;
     for (int i = 0; i < count; i++) {
+        if (!isfinite(a[i]) || !isfinite(b[i])) return INFINITY;
         float delta = fabsf(a[i] - b[i]);
+        if (!isfinite(delta)) return INFINITY;
         if (delta > max_delta) max_delta = delta;
     }
     return max_delta;
 }
 
 int main(int argc, char **argv) {
-    if (argc != 4) {
-        fprintf(stderr, "usage: %s MAIN.gguf VISION.gguf IMAGE\n", argv[0]);
+    if (argc == 2 && !strcmp(argv[1], "--logit-oracle")) {
+        const float a[] = {1.0f, 2.0f, 3.0f};
+        float b[] = {1.0f, 2.25f, 3.0f};
+        if (max_logit_delta(a, a, 3) != 0.0f ||
+            max_logit_delta(a, b, 3) != 0.25f) return 1;
+        const float invalid[] = {NAN, INFINITY, -INFINITY};
+        for (size_t i = 0; i < sizeof(invalid) / sizeof(*invalid); i++) {
+            b[1] = invalid[i];
+            if (isfinite(max_logit_delta(a, b, 3)) ||
+                isfinite(max_logit_delta(b, a, 3)) ||
+                isfinite(max_logit_delta(b, b, 3))) return 1;
+        }
+        const float high[] = {FLT_MAX}, low[] = {-FLT_MAX};
+        if (isfinite(max_logit_delta(high, low, 1))) return 1;
+        puts("Vision logit comparison rejects non-finite values: PASS");
+        return 0;
+    }
+    if (argc < 4) {
+        fprintf(stderr, "usage: %s MAIN.gguf VISION.gguf IMAGE [--ssd-streaming] [--quality] [--tokens N] [TP options]\n", argv[0]);
         return 2;
     }
     ds4_engine_options options = {0};
@@ -42,14 +64,80 @@ int main(int argc, char **argv) {
     options.backend = DS4_BACKEND_CUDA;
 #endif
     options.context_size = 4096;
-    options.quality = true;
 #ifdef DS4_ROCM_BUILD
     options.ssd_streaming = true;
     options.ssd_streaming_cache_bytes = UINT64_C(32) << 30;
 #endif
 
+    ds4_dist_options dist = {0};
+    int generate = 48;
+    char parse_error[256] = {0};
+    for (int i = 4; i < argc; i++) {
+        if (!strcmp(argv[i], "--quality")) {
+            options.quality = true;
+            continue;
+        }
+        if (!strcmp(argv[i], "--tokens") && i + 1 < argc) {
+            char *end = NULL;
+            const long value = strtol(argv[++i], &end, 10);
+            if (end == argv[i] || *end || value < 1 || value > 512) {
+                fprintf(stderr, "--tokens must be between 1 and 512\n");
+                return 2;
+            }
+            generate = (int)value;
+            continue;
+        }
+        if (!strcmp(argv[i], "--ssd-streaming")) {
+            options.ssd_streaming = true;
+            continue;
+        }
+        const ds4_dist_cli_parse_result d = ds4_dist_parse_cli_arg(
+            argv[i], &i, argc, argv, &dist, parse_error, sizeof(parse_error));
+        if (d == DS4_DIST_CLI_MATCHED) continue;
+        if (d != DS4_DIST_CLI_ERROR) {
+            const ds4_tp_cli_parse_result t = ds4_tp_parse_cli_arg(
+                argv[i], &i, argc, argv, &options.tp, parse_error, sizeof(parse_error));
+            if (t == DS4_TP_CLI_MATCHED) continue;
+        }
+        fprintf(stderr, "invalid test option %s: %s\n", argv[i], parse_error);
+        return 2;
+    }
+    if (!ds4_tp_adopt_distributed_options(&options.tp, &dist, parse_error, sizeof(parse_error)) ||
+        !ds4_tp_validate_engine_options(&options, parse_error, sizeof(parse_error)) ||
+        dist.role != DS4_DISTRIBUTED_NONE) {
+        fprintf(stderr, "invalid vision test configuration: %s\n", parse_error);
+        return 2;
+    }
+
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &options) != 0) return 1;
+    if (options.tp.role == DS4_TP_WORKER) {
+        const int status = ds4_tp_worker_run(engine, &options.tp);
+        ds4_engine_close(engine);
+        return status;
+    }
+    ds4_tp *tp = NULL;
+    if (options.tp.role == DS4_TP_LEADER) {
+        ds4_tp_identity identity = {
+            .gguf_bytes = ds4_engine_model_bytes(engine),
+            .model_id = (uint32_t)ds4_engine_model_id(engine),
+            .n_layer = (uint32_t)ds4_engine_layer_count(engine),
+            .n_embd = (uint32_t)ds4_engine_embd_dim(engine),
+            .n_vocab = (uint32_t)ds4_engine_vocab_size(engine),
+            .quant_bits = (uint32_t)ds4_engine_routed_quant_bits(engine),
+            .ctx_size = options.context_size,
+        };
+        ds4_engine_tp_gate_schedule(engine, &identity.gate_slot_start,
+                                    &identity.gate_slot_step, &identity.gates_per_token,
+                                    identity.gate_slot_mask);
+        if (!ds4_tp_create(&tp, &options.tp, &identity, parse_error, sizeof(parse_error)) ||
+            !ds4_engine_tp_bind(engine, tp, parse_error, sizeof(parse_error))) {
+            fprintf(stderr, "vision test TP setup failed: %s\n", parse_error);
+            ds4_engine_close(engine);
+            ds4_tp_free(tp);
+            return 1;
+        }
+    }
     char error[256] = {0};
     ds4_vision_embedding embedding = {0};
     ds4_vision_span span = {0};
@@ -164,9 +252,9 @@ int main(int argc, char **argv) {
     }
     const float max_delta =
         max_logit_delta(image_logits, zero_image_logits, n_vocab);
-    if (!(max_delta > 1.0e-4f)) {
+    if (!isfinite(max_delta) || !(max_delta > 1.0e-4f)) {
         snprintf(error, sizeof(error),
-                 "visual embedding did not affect output logits");
+                 "visual embedding produced invalid or unchanged output logits");
         goto done;
     }
     memcpy(span.embedding.data, image_embedding_data,
@@ -189,7 +277,7 @@ int main(int argc, char **argv) {
         goto done;
     }
     ds4_session_set_progress(session, NULL, NULL);
-    for (int i = 0; i < 48; i++) {
+    for (int i = 0; i < generate; i++) {
         int token = ds4_session_argmax(session);
         if (token < 0) {
             snprintf(error, sizeof(error), "argmax failed");
@@ -215,6 +303,8 @@ done:
     ds4_tokens_free(&prompt);
     ds4_vision_embedding_free(&span.embedding);
     ds4_vision_embedding_free(&embedding);
+    if (tp) (void)ds4_tp_send_stop(tp);
     ds4_engine_close(engine);
+    ds4_tp_free(tp);
     return rc;
 }

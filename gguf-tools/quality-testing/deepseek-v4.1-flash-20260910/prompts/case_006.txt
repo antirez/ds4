@@ -1,0 +1,7 @@
+Read the archive, then answer only the final question.
+Record 0000: warehouse 000 assigns parcel 0000 to desk 000.
+Record 0001: warehouse 037 assigns parcel 0053 to desk 011.
+Record 0002: warehouse 074 assigns parcel 0106 to desk 022.
+Record 0003: warehouse 111 assigns parcel 0159 to desk 033.
+Record 0004: warehouse 148 assigns parcel 0212 to desk x x x x x x x
+Final question: which warehouse is named in Record 0002? Give only its number.

@@ -71,6 +71,52 @@ static void test_vision_prefix(void) {
     free(s);
 }
 
+/* Fingerprint-prefix reuse: positions may differ (hidden reasoning shifts them
+ * and rebase repairs them), appended images are allowed, but a fingerprint or
+ * row-count change is never reusable.  This predicate gates the server's live
+ * reuse probe, so a mismatch must never look reusable. */
+static void test_vision_fingerprint_prefix(void) {
+    ds4_session *s = calloc(1, sizeof(*s));
+    assert(s);
+    s->checkpoint_valid = true;
+    s->checkpoint.len = 100;
+    ds4_vision_identity ckpt = {.token_start = 50, .token_count = 10,
+                                .fingerprint = {1}};
+    s->checkpoint_images = &ckpt;
+    s->checkpoint_image_count = 1;
+
+    ds4_vision_span images[2] = {
+        {.token_start = 50, .embedding = {.token_count = 10, .fingerprint = {1}}},
+        {.token_start = 90, .embedding = {.token_count = 10, .fingerprint = {2}}},
+    };
+    assert(ds4_session_vision_fingerprint_prefix_matches(s, images, 1));
+    /* Appended image: allowed, as long as the historical one still matches. */
+    assert(ds4_session_vision_fingerprint_prefix_matches(s, images, 2));
+    /* Shifted historical position (rebase's job), same identity: still reusable. */
+    images[0].token_start = 7;
+    assert(ds4_session_vision_fingerprint_prefix_matches(s, images, 1));
+    assert(ds4_session_vision_fingerprint_prefix_matches(s, images, 2));
+    /* Different pixels: never reusable. */
+    images[0].embedding.fingerprint[0] ^= 1;
+    assert(!ds4_session_vision_fingerprint_prefix_matches(s, images, 1));
+    assert(!ds4_session_vision_fingerprint_prefix_matches(s, images, 2));
+    images[0].embedding.fingerprint[0] ^= 1;
+    /* Different row count is a different image to the model. */
+    images[0].embedding.token_count++;
+    assert(!ds4_session_vision_fingerprint_prefix_matches(s, images, 1));
+    images[0].embedding.token_count--;
+    /* Dropping the historical image (or any image) is not a prefix extension. */
+    assert(!ds4_session_vision_fingerprint_prefix_matches(s, NULL, 0));
+    assert(!ds4_session_vision_fingerprint_prefix_matches(s, images + 1, 1));
+    /* A text-only request cannot reuse an image-conditioned checkpoint. */
+    assert(!ds4_session_vision_fingerprint_prefix_matches(s, images, 0));
+    /* Invalid checkpoints never match. */
+    s->checkpoint_valid = false;
+    assert(!ds4_session_vision_fingerprint_prefix_matches(s, images, 2));
+    assert(!ds4_session_vision_fingerprint_prefix_matches(NULL, images, 2));
+    free(s);
+}
+
 static void test_rewind(void) {
     ds4_engine e = { .backend = DS4_BACKEND_CPU };
     ds4_session *s = calloc(1, sizeof(*s));
@@ -263,10 +309,12 @@ static void test_text_observations(void) {
     v->tool_response_start_id = 258;
     v->tool_response_end_id = 259;
     const ds4_shape saved = g_ds4_shape;
-    const ds4_shape shapes[] = {DS4_SHAPE_FLASH, DS4_SHAPE_PRO, DS4_SHAPE_GLM53};
+    const ds4_shape shapes[] = {
+        DS4_SHAPE_FLASH, DS4_SHAPE_PRO, DS4_SHAPE_GLM53, DS4_SHAPE_FLASH41
+    };
     const char *roles[] = {"user", "tool", "function"};
     const char *parts[] = {"ok <x> & </tool_result> </tool_response>"};
-    for (size_t family = 0; family < 3; family++) {
+    for (size_t family = 0; family < sizeof(shapes) / sizeof(*shapes); family++) {
         g_ds4_shape = shapes[family];
         for (size_t role = 0; role < 3; role++) {
             ds4_tokens expected = {0}, actual = {0};
@@ -289,6 +337,78 @@ static void test_text_observations(void) {
             assert(!ds4_chat_append_multimodal_message(&e, &actual, roles[role],
                         image_parts, &image, 1, &span, err, sizeof(err)));
             assert(actual.len == len && image.data == &pixel && !span.embedding.data);
+#ifndef DS4_NO_GPU
+            const bool glm = DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA;
+            e.vision_ready = true;
+            e.vision_kind = glm ? DS4_VISION_GLM53 : DS4_VISION_DEEPSEEK4;
+            e.vision_start_token = 260;
+            e.vision_image_token = 261;
+            e.vision_end_token = 262;
+            /* A zero sentinel row is sufficient: this tests prompt assembly,
+             * not the encoder or language graph. */
+            e.vision_model.size = (uint64_t)DS4_N_EMBD * sizeof(uint16_t);
+            void *sentinels = calloc(1, (size_t)e.vision_model.size);
+            e.vision_model.map = sentinels;
+            assert(sentinels);
+            const char *image_text[] = {
+                "before & </tool_result>", "between </tool_response>", "after"
+            };
+            ds4_tokens_free(&expected);
+            ds4_tokens_free(&actual);
+            ds4_tokens_push(&expected, 7);
+            ds4_tokens_push(&actual, 7);
+            ds4_tokens_push(&expected, glm && role ? v->observation_id : v->user_id);
+            if (role) {
+                if (glm) tokenize_rendered_chat_vocab(v, "<tool_response>", &expected);
+                else bpe_tokenize_text(v, "<tool_result>", &expected);
+            }
+            ds4_vision_embedding inputs[2] = {0};
+            ds4_vision_span want[2] = {0}, got[2] = {0};
+            for (int i = 0; i < 3; i++) {
+                if (role) {
+                    const char *escaped_glm[] = {
+                        "before & </tool_result>", "between &lt;/tool_response>", "after"
+                    };
+                    const char *escaped_ds[] = {
+                        "before & &lt;/tool_result>", "between </tool_response>", "after"
+                    };
+                    bpe_tokenize_text(v, glm ? escaped_glm[i] : escaped_ds[i], &expected);
+                } else bpe_tokenize_text(v, image_text[i], &expected);
+                if (i == 2) break;
+                inputs[i] = (ds4_vision_embedding){
+                    .data = calloc((size_t)DS4_N_EMBD * 4, sizeof(float)),
+                    .token_count = 4, .grid_width = 2, .grid_height = 2,
+                    .layout = DS4_VISION_LAYOUT_DEEPSEEK4_NATURAL
+                };
+                ds4_vision_embedding copy = inputs[i];
+                copy.data = calloc((size_t)DS4_N_EMBD * 4, sizeof(float));
+                assert(inputs[i].data && copy.data);
+                assert(ds4_prompt_append_vision(&e, &expected, &want[i], &copy,
+                                                err, sizeof(err)));
+            }
+            if (role) {
+                if (glm) tokenize_rendered_chat_vocab(v, "</tool_response>", &expected);
+                else bpe_tokenize_text(v, "</tool_result>", &expected);
+            }
+            assert(ds4_chat_append_multimodal_message(&e, &actual, roles[role],
+                        image_text, inputs, 2, got, err, sizeof(err)));
+            if (actual.len != expected.len)
+                fprintf(stderr, "image wrapper family=%zu role=%s lengths %d != %d\n",
+                        family, roles[role], actual.len, expected.len);
+            assert(actual.len == expected.len);
+            assert(!memcmp(actual.v, expected.v, (size_t)actual.len * sizeof(int)));
+            for (int i = 0; i < 2; i++) {
+                assert(!inputs[i].data);
+                assert(got[i].token_start == want[i].token_start);
+                assert(got[i].embedding.token_count == want[i].embedding.token_count);
+                ds4_vision_embedding_free(&want[i].embedding);
+                ds4_vision_embedding_free(&got[i].embedding);
+            }
+            free(sentinels);
+            e.vision_model.map = NULL;
+            e.vision_ready = false;
+            e.vision_kind = DS4_VISION_NONE;
+#endif
             ds4_tokens_free(&expected);
             ds4_tokens_free(&actual);
         }
@@ -332,6 +452,63 @@ static void pool_update(ds4_glm_gpu_graph *g, ds4_gpu_tensor *x,
         0, 4096, 8192, pos, rows, 16, POOL_DIM, 4, 1e-6f, false));
     assert(ds4_gpu_synchronize());
 }
+
+/* The pair starting at top_k - 1 previously reached the verifier with a
+ * one-row chunk and invalidated the session. Nearby pairs must still use
+ * MTP, and GLM 5.3's mixed attention path must remain eligible. */
+static void test_glm_mtp_boundary(void) {
+    const ds4_shape saved_shape = g_ds4_shape;
+    g_ds4_shape = DS4_SHAPE_GLM53;
+    ds4_glm_gpu_graph *g = calloc(1, sizeof(*g));
+    assert(g);
+    const uint32_t limit = glm_graph_indexer_top_k_limit();
+    for (uint32_t pos = limit - 2u; pos <= limit + 1u; pos++) {
+        g->glm53 = false;
+        const bool bridge = glm_graph_mtp_needs_boundary_step(g, pos);
+        assert(bridge == (pos == limit - 1u));
+        if (!bridge) assert(glm_graph_limit_indexed_prefill_chunk(g, pos, 2u) == 2u);
+        g->glm53 = true;
+        assert(!glm_graph_mtp_needs_boundary_step(g, pos));
+    }
+    free(g);
+    g_ds4_shape = saved_shape;
+}
+
+#ifdef __APPLE__
+static void test_glm_mixed_ssd_prefill(void) {
+    const char *flag = "DS4_METAL_DISABLE_GLM_MIXED_PREFILL";
+    const char *previous = getenv(flag);
+    char *saved = previous ? strdup(previous) : NULL;
+    assert(!previous || saved);
+    assert(unsetenv(flag) == 0);
+    const ds4_shape saved_shape = g_ds4_shape;
+    g_ds4_shape = DS4_SHAPE_GLM52;
+    ds4_glm_gpu_graph *g = calloc(1, sizeof(*g));
+    ds4_gpu_tensor *scratch = ds4_gpu_tensor_alloc(sizeof(float));
+    assert(g && scratch);
+    g->ssd_streaming = g->generic_routed_moe = true;
+    g->layer_count = glm_graph_normal_layer_count();
+    g->indexed_prefill_cap = g->indexed_prefill_score_cap = g->compact_cache_cap = 4096;
+    g->batch_indexer_q = g->batch_indexer_weights = g->batch_indexer_scores = scratch;
+    g->batch_indexer_selected = g->batch_qk_low = g->batch_attn_lora = scratch;
+    const uint32_t limit = glm_graph_indexer_top_k_limit();
+    assert(glm_graph_limit_indexed_prefill_chunk(g, 0, 4096) == 4096);
+    assert(glm_graph_limit_indexed_prefill_chunk(g, limit - 256, 512) == 512);
+    assert(glm_graph_limit_indexed_prefill_chunk(g, limit - 255, 512) == 255);
+    assert(glm_graph_limit_indexed_prefill_chunk(g, limit - 256, 511) == 256);
+    assert(glm_graph_mtp_needs_boundary_step(g, limit - 1));
+    g->tp_world = 2;
+    assert(glm_graph_limit_indexed_prefill_chunk(g, 0, 4096) == limit);
+    g->tp_world = 1;
+    assert(setenv(flag, "1", 1) == 0);
+    assert(glm_graph_limit_indexed_prefill_chunk(g, 0, 4096) == limit);
+    assert(saved ? setenv(flag, saved, 1) == 0 : unsetenv(flag) == 0);
+    free(saved);
+    ds4_gpu_tensor_free(scratch);
+    free(g);
+    g_ds4_shape = saved_shape;
+}
+#endif
 
 static void test_glm_spec_rollback(void) {
     const ds4_shape saved_shape = g_ds4_shape;
@@ -409,8 +586,238 @@ static void test_glm_spec_rollback(void) {
 }
 #endif
 
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+static void test_spark_dspark_policy(void) {
+    assert(ds4_gpu_init());
+    if (!ds4_gpu_device_is_spark()) {
+        ds4_gpu_cleanup();
+        return;
+    }
+    const ds4_shape saved_shape = g_ds4_shape;
+    const bool saved_vision = g_ds4_flash_vision_exp;
+    g_ds4_shape = DS4_SHAPE_FLASH;
+    g_ds4_flash_vision_exp = false;
+    ds4_engine *e = calloc(1, sizeof(*e));
+    ds4_session *s = calloc(1, sizeof(*s));
+    assert(e && s);
+    ds4_tensor gate = {.type = DS4_TENSOR_MXFP4};
+    ds4_tensor down = {.type = DS4_TENSOR_MXFP4};
+    e->backend = DS4_BACKEND_CUDA;
+    e->tp.active = true;
+    e->weights.layer[DS4_N_LEADING_DENSE].ffn_gate_exps = &gate;
+    e->weights.layer[DS4_N_LEADING_DENSE].ffn_down_exps = &down;
+    s->engine = e;
+    unsetenv("DS4_DSPARK_SCHEDULER_WINDOW");
+    unsetenv("DS4_DSPARK_SCHEDULER_MIN_AVG_MILLI");
+    unsetenv("DS4_DSPARK_SCHEDULER_TAIL_MIN_TOKENS");
+    unsetenv("DS4_DSPARK_SEED_BATCH");
+    assert(ds4_dspark_spark_tp_policy(e, true));
+    assert(ds4_dspark_scheduler_window(s) == 16);
+    assert(ds4_dspark_scheduler_min_avg_milli(s) == 1000);
+    assert(ds4_dspark_scheduler_tail_min_tokens(s) == 4);
+    assert(ds4_dspark_scheduler_tail_min_tokens(NULL) == 10);
+    setenv("DS4_DSPARK_SCHEDULER_TAIL_MIN_TOKENS", "7", 1);
+    assert(ds4_dspark_scheduler_tail_min_tokens(s) == 7);
+    setenv("DS4_DSPARK_SCHEDULER_TAIL_MIN_TOKENS", "0", 1);
+    assert(ds4_dspark_scheduler_tail_min_tokens(s) == 0);
+    unsetenv("DS4_DSPARK_SCHEDULER_TAIL_MIN_TOKENS");
+    setenv("DS4_DSPARK_SEED_BATCH", "0", 1);
+    assert(ds4_dspark_scheduler_tail_min_tokens(s) == 10);
+    unsetenv("DS4_DSPARK_SEED_BATCH");
+    setenv("DS4_DSPARK_SCHEDULER_WINDOW", "7", 1);
+    setenv("DS4_DSPARK_SCHEDULER_MIN_AVG_MILLI", "1800", 1);
+    assert(ds4_dspark_scheduler_window(s) == 7);
+    assert(ds4_dspark_scheduler_min_avg_milli(s) == 1800);
+    unsetenv("DS4_DSPARK_SCHEDULER_WINDOW");
+    unsetenv("DS4_DSPARK_SCHEDULER_MIN_AVG_MILLI");
+    e->tp.active = false;
+    assert(!ds4_dspark_spark_tp_policy(e, false));
+    assert(ds4_dspark_scheduler_tail_min_tokens(s) == 10);
+    assert(ds4_dspark_scheduler_window(s) == 4);
+    assert(ds4_dspark_scheduler_min_avg_milli(s) == 1500);
+    e->tp.active = true;
+    e->ssd_streaming = true;
+    assert(!ds4_dspark_spark_tp_policy(e, true));
+    assert(ds4_dspark_scheduler_tail_min_tokens(s) == 10);
+    e->ssd_streaming = false;
+    e->dspark_exact_sampling = true;
+    assert(!ds4_dspark_spark_tp_policy(e, true));
+    assert(ds4_dspark_scheduler_tail_min_tokens(s) == 10);
+    e->dspark_exact_sampling = false;
+    g_ds4_flash_vision_exp = true;
+    assert(!ds4_dspark_spark_tp_policy(e, true));
+    assert(ds4_dspark_scheduler_tail_min_tokens(s) == 10);
+    g_ds4_flash_vision_exp = false;
+    gate.type = DS4_TENSOR_IQ2_XXS;
+    down.type = DS4_TENSOR_Q2_K;
+    assert(ds4_dspark_spark_tp_policy(e, true));
+    assert(ds4_dspark_scheduler_window(s) == 16);
+    assert(ds4_dspark_scheduler_min_avg_milli(s) == 1000);
+    assert(ds4_dspark_scheduler_tail_min_tokens(s) == 4);
+    e->ssd_streaming = true;
+    assert(!ds4_dspark_spark_tp_policy(e, true));
+    assert(ds4_dspark_scheduler_window(s) == 4);
+    assert(ds4_dspark_scheduler_min_avg_milli(s) == 1500);
+    e->ssd_streaming = false;
+    e->dspark_exact_sampling = true;
+    assert(!ds4_dspark_spark_tp_policy(e, true));
+    assert(ds4_dspark_scheduler_window(s) == 4);
+    e->dspark_exact_sampling = false;
+    g_ds4_flash_vision_exp = true;
+    assert(!ds4_dspark_spark_tp_policy(e, true));
+    g_ds4_flash_vision_exp = false;
+    down.type = DS4_TENSOR_Q8_0;
+    assert(!ds4_dspark_spark_tp_policy(e, true));
+    assert(ds4_dspark_scheduler_window(s) == 4);
+    assert(ds4_dspark_scheduler_tail_min_tokens(s) == 10);
+
+    /* The support model can be split even when target experts are owned
+     * whole. Reject unmeasured policies before allocating optional halves. */
+    down.type = DS4_TENSOR_Q2_K;
+    ds4_tensor output = {.type = DS4_TENSOR_Q8_0, .dim = {4096, DS4_N_VOCAB}};
+    ds4_tensor draft_gate = {.type = DS4_TENSOR_IQ2_XXS, .ndim = 3,
+                             .dim = {4096, 2048, 256}};
+    ds4_tensor draft_down = {.type = DS4_TENSOR_Q2_K, .ndim = 3,
+                             .dim = {2048, 4096, 256}};
+    ds4_tensor dense = {.type = DS4_TENSOR_Q8_0, .dim = {4096, 2048}};
+    e->dspark = true;
+    e->support_kind = DS4_SUPPORT_DSPARK;
+    e->weights.output = &output;
+    e->dspark_weights.n_stages = 1;
+    e->dspark_weights.block_size = 6;
+    e->dspark_weights.markov_rank = 128;
+    e->dspark_weights.stage[0].markov_w1 = &dense;
+    e->dspark_weights.stage[0].markov_w2 = &dense;
+    ds4_layer_weights *draft = &e->dspark_weights.stage[0].block;
+    draft->ffn_gate_exps = draft->ffn_up_exps = &draft_gate;
+    draft->ffn_down_exps = &draft_down;
+    draft->attn_q_b = draft->attn_output_a = draft->attn_output_b = &dense;
+    draft->ffn_gate_shexp = draft->ffn_up_shexp = draft->ffn_down_shexp = &dense;
+    unsetenv("DS4_TP_DISABLE_DSPARK_SPLIT");
+    assert(!e->cuda_tp_expert_split);
+    assert(tp_dspark_split_eligible(e, true, true));
+    assert(tp_dspark_split_eligible(e, false, true));
+    assert(!tp_dspark_split_eligible(e, true, false));
+    e->dspark_confidence_threshold = 0.4f;
+    assert(!tp_dspark_split_eligible(e, true, true));
+    assert(tp_dspark_split_eligible(e, false, true));
+    e->dspark_confidence_threshold = 0;
+    e->dspark_exact_sampling = true;
+    assert(!tp_dspark_split_eligible(e, true, true));
+    e->dspark_exact_sampling = false;
+    e->ssd_streaming = true;
+    assert(!tp_dspark_split_eligible(e, true, true));
+    e->ssd_streaming = false;
+    g_ds4_flash_vision_exp = true;
+    assert(!tp_dspark_split_eligible(e, true, true));
+    g_ds4_flash_vision_exp = false;
+    down.type = DS4_TENSOR_Q8_0;
+    assert(!tp_dspark_split_eligible(e, true, true));
+    down.type = DS4_TENSOR_Q2_K;
+    setenv("DS4_TP_DISABLE_DSPARK_SPLIT", "1", 1);
+    assert(!tp_dspark_split_eligible(e, true, true));
+    unsetenv("DS4_TP_DISABLE_DSPARK_SPLIT");
+    e->backend = DS4_BACKEND_METAL;
+    assert(!tp_dspark_split_eligible(e, true, true));
+    assert(ds4_dspark_scheduler_tail_min_tokens(s) == 10);
+    free(s);
+    free(e);
+    g_ds4_shape = saved_shape;
+    g_ds4_flash_vision_exp = saved_vision;
+    ds4_gpu_cleanup();
+    puts("Spark DSpark policy: measured layout, exclusions and overrides: ok");
+}
+#endif
+
+/* Lockstep TP drafter VERIFY flags and the worker's proposal check. */
+static void test_dspark_tp_verify_flags(void) {
+    const int proposal[5] = {11, 12, 13, 14, 15};
+    const int seeded[6] = {7, 11, 12, 13, 14, 15};
+    /* A seed block trimmed to its seed carries no proposal row: unmarked,
+     * so the worker verifies the seed without a check. */
+    assert(dspark_tp_verify_flags(false, true, 1, 1) == 0u);
+    assert(dspark_tp_verify_flags(true, true, 1, 1) == DS4_TP_VERIFY_HEAD_SPLIT);
+    assert(dspark_tp_block_matches(dspark_tp_verify_flags(false, true, 1, 1),
+                                   seeded, 1, false, proposal, 0));
+    /* Full and trimmed seed blocks. */
+    const uint32_t full = dspark_tp_verify_flags(false, true, 1, 6);
+    assert(full == (DS4_TP_VERIFY_DSPARK_TP | DS4_TP_VERIFY_DSPARK_SEED));
+    assert(dspark_tp_block_matches(full, seeded, 6, true, proposal, 5));
+    assert(dspark_tp_block_matches(full, seeded, 2, true, proposal, 5));
+    assert(!dspark_tp_block_matches(full, seeded, 6, false, proposal, 5));
+    assert(!dspark_tp_block_matches(full, seeded, 6, true, proposal, 4));
+    assert(!dspark_tp_block_matches(full, seeded, 1, true, proposal, 5));
+    int changed[6];
+    memcpy(changed, seeded, sizeof(changed));
+    changed[4] = 99;
+    assert(!dspark_tp_block_matches(full, changed, 6, true, proposal, 5));
+    assert(dspark_tp_block_matches(full, changed, 4, true, proposal, 5));
+    /* Seed decoded first: the block is the proposal itself (an EOS can trim
+     * it to one row). */
+    const uint32_t plain = dspark_tp_verify_flags(false, true, 0, 1);
+    assert(plain == DS4_TP_VERIFY_DSPARK_TP);
+    assert(dspark_tp_block_matches(plain, proposal, 1, true, proposal, 5));
+    assert(!dspark_tp_block_matches(plain, seeded, 1, true, proposal, 5));
+    /* Leader-local drafts are never checked. */
+    assert(dspark_tp_verify_flags(true, false, 1, 6) == DS4_TP_VERIFY_HEAD_SPLIT);
+    assert(dspark_tp_block_matches(0u, changed, 6, false, proposal, 0));
+    /* Every produced flag set is one the TP layer accepts, and a marked block
+     * always holds a proposal row. */
+    for (int head = 0; head < 2; head++) {
+        for (int tp = 0; tp < 2; tp++) {
+            for (int seed = 0; seed < 2; seed++) {
+                for (int n = 1; n <= 6; n++) {
+                    const uint32_t f = dspark_tp_verify_flags(head, tp, seed, n);
+                    assert(!(f & DS4_TP_VERIFY_DSPARK_SEED) || (f & DS4_TP_VERIFY_DSPARK_TP));
+                    assert(!(f & DS4_TP_VERIFY_DSPARK_TP) || (tp && n > seed));
+                    assert(((f & DS4_TP_VERIFY_HEAD_SPLIT) != 0) == (head != 0));
+                    assert((f & ~DS4_TP_VERIFY_FLAGS) == 0u);
+                }
+            }
+        }
+    }
+}
+
+/* Memory kept for the hinted sessions before the TP drafter halves are built. */
+static void test_dspark_tp_split_reserve(void) {
+    const ds4_shape saved_shape = g_ds4_shape;
+    g_ds4_shape = DS4_SHAPE_FLASH;
+    const uint64_t gib = UINT64_C(1) << 30, mib = UINT64_C(1) << 20;
+    ds4_dspark_weights dw;
+    memset(&dw, 0, sizeof(dw));
+    dw.n_stages = 3;
+    dw.block_size = 5;
+    dw.target_layer_count = 3;
+    ds4_context_memory mem;
+    memset(&mem, 0, sizeof(mem));
+    mem.prefill_cap = 2048;
+    mem.raw_cap = 2304;
+    /* The reference Flash capture state (about 111 MiB) bounds from above. */
+    const uint64_t one = tp_dspark_split_reserve_bytes(&mem, &dw, 1);
+    assert(one >= 4 * gib + 111 * mib && one <= 4 * gib + 113 * mib);
+    const uint64_t capture = one - 4 * gib;
+    mem.total_bytes = 3 * gib;
+    assert(tp_dspark_split_reserve_bytes(&mem, &dw, 1) == 7 * gib + capture);
+    assert(tp_dspark_split_reserve_bytes(&mem, &dw, 8) == 4 * gib + 8 * (3 * gib + capture));
+    assert(tp_dspark_split_reserve_bytes(&mem, &dw, 0) ==
+           tp_dspark_split_reserve_bytes(&mem, &dw, 1));
+    mem.total_bytes = UINT64_MAX / 2;
+    assert(tp_dspark_split_reserve_bytes(&mem, &dw, 3) == UINT64_MAX);
+    /* Larger prefill or raw caps only grow it. */
+    mem.total_bytes = 0;
+    mem.prefill_cap = 4096;
+    const uint64_t wider = tp_dspark_split_reserve_bytes(&mem, &dw, 1);
+    assert(wider > one);
+    mem.raw_cap = 4608;
+    assert(tp_dspark_split_reserve_bytes(&mem, &dw, 1) > wider);
+    g_ds4_shape = saved_shape;
+}
+
 int main(void) {
+    test_dspark_tp_verify_flags();
+    test_dspark_tp_split_reserve();
     test_vision_prefix();
+    test_vision_fingerprint_prefix();
     test_rewind();
     test_session_memory();
     test_payload_tokens();
@@ -418,7 +825,14 @@ int main(void) {
     test_text_observations();
 #ifndef DS4_NO_GPU
     test_glm_attention_budget();
+    test_glm_mtp_boundary();
+#ifdef __APPLE__
+    test_glm_mixed_ssd_prefill();
+#endif
     test_glm_spec_rollback();
+#endif
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    test_spark_dspark_policy();
 #endif
     puts("session state tests: ok");
     return 0;

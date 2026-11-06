@@ -1,0 +1,3 @@
+Testare un parser da riga di comando (CLI) con casi limite è fondamentale per garantire robustezza, sicurezza e usabilità. Un parser mal progettato può causare crash, interpretazioni errate o vulnerabilità di sicurezza (es. injection).
+
+Ecco una guida strutturata su come farlo, suddivisa

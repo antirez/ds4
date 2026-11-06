@@ -1,0 +1,1 @@
+A TCP server must preserve a partially written reply when a client reads slowly because TCP send buffers are finite, so if the server tries to write more data than the client has acknowledged and the buffer fills, the send operation can only complete part of the reply. Since TCP is a byte-stream protocol with no message boundaries, the

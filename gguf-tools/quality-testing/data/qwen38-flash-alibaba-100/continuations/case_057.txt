@@ -1,0 +1,1 @@
+La differenza fondamentale tra **righe KV raw** (grezze) e **righe KV compresse** risiede nel modo in cui i dati vengono archiviati fisicamente su disco o in memoria, con implicazioni dirette sulle prestazioni di lettura/scrittura, sull'uso dello spazio e sulla complessità

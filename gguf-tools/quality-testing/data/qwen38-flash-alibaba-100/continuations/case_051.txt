@@ -1,0 +1,5 @@
+La ragione per cui piccole differenze nei logit possono cambiare drasticamente una continuazione greedy risiede nella natura **discreta** e **non continua** della funzione di argmax, combinata con la sensibilità numerica dei modelli linguistici.
+
+Ecco una spiegazione dettagliata:
+
+### 1. La

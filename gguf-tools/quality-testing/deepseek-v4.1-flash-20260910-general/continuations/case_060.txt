@@ -1,0 +1,5 @@
+# Median of Three Numbers
+
+```python
+def median_of_three(a, b, c):
+    """Return the median (middle value) of three numbers

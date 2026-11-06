@@ -1,0 +1,13 @@
+# Longest Common Prefix
+
+```python
+def longest_common_prefix(strings):
+    """
+    Compute the longest common prefix of a list of strings.
+
+    Args:
+        strings: A list of strings (may be empty).
+
+    Returns:
+        The longest common prefix shared by all strings, or "" if
+       

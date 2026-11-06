@@ -1,0 +1,9 @@
+Looking at this code, there's a bounds-checking bug on the array access:
+
+```c
+int lookup(int *a, int n, int index) { if (index > n) return -1; return a[index]; }
+```
+
+## The bug
+
+The check `index > n` allows `index ==

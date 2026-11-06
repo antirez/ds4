@@ -1,0 +1,1 @@
+Explain how a bounded work queue differs from simply creating one thread per incoming request.

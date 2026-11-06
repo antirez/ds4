@@ -1,0 +1,1 @@
+A tokenizer should treat special tags carefully because mishandling them can silently corrupt meaning, break model behavior, or create security holes. Here are the main reasons

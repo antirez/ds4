@@ -1,0 +1,12 @@
+```json
+{
+  "type": "object",
+  "properties": {
+    "name": {
+      "type": "string"
+    },
+    "arguments": {
+      "type": "object"
+    }
+  },
+  "required": ["name", "

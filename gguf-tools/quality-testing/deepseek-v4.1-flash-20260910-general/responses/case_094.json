@@ -1,0 +1,226 @@
+{
+  "id": "3dce66d7-d517-4ac8-a734-528f310b8223",
+  "object": "chat.completion",
+  "created": 1789058777,
+  "model": "deepseek-flash",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Tokyo"
+      },
+      "logprobs": {
+        "content": [
+          {
+            "token": "Tokyo",
+            "logprob": -0.0005159239,
+            "bytes": [
+              84,
+              111,
+              107,
+              121,
+              111
+            ],
+            "top_logprobs": [
+              {
+                "token": "Tokyo",
+                "logprob": -0.0005159239,
+                "bytes": [
+                  84,
+                  111,
+                  107,
+                  121,
+                  111
+                ]
+              },
+              {
+                "token": "The",
+                "logprob": -7.5821886,
+                "bytes": [
+                  84,
+                  104,
+                  101
+                ]
+              },
+              {
+                "token": "Tok",
+                "logprob": -12.830459,
+                "bytes": [
+                  84,
+                  111,
+                  107
+                ]
+              },
+              {
+                "token": " Tokyo",
+                "logprob": -13.245561,
+                "bytes": [
+                  32,
+                  84,
+                  111,
+                  107,
+                  121,
+                  111
+                ]
+              },
+              {
+                "token": "tok",
+                "logprob": -14.848832,
+                "bytes": [
+                  116,
+                  111,
+                  107
+                ]
+              },
+              {
+                "token": "Japan",
+                "logprob": -14.9269495,
+                "bytes": [
+                  74,
+                  97,
+                  112,
+                  97,
+                  110
+                ]
+              },
+              {
+                "token": "TO",
+                "logprob": -14.938836,
+                "bytes": [
+                  84,
+                  79
+                ]
+              },
+              {
+                "token": "**",
+                "logprob": -15.232797,
+                "bytes": [
+                  42,
+                  42
+                ]
+              },
+              {
+                "token": "Toy",
+                "logprob": -15.739705,
+                "bytes": [
+                  84,
+                  111,
+                  121
+                ]
+              },
+              {
+                "token": "#",
+                "logprob": -16.372478,
+                "bytes": [
+                  35
+                ]
+              },
+              {
+                "token": "What",
+                "logprob": -16.52645,
+                "bytes": [
+                  87,
+                  104,
+                  97,
+                  116
+                ]
+              },
+              {
+                "token": "東京",
+                "logprob": -17.149054,
+                "bytes": [
+                  230,
+                  157,
+                  177,
+                  228,
+                  186,
+                  172
+                ]
+              },
+              {
+                "token": "To",
+                "logprob": -17.163229,
+                "bytes": [
+                  84,
+                  111
+                ]
+              },
+              {
+                "token": "It",
+                "logprob": -17.345459,
+                "bytes": [
+                  73,
+                  116
+                ]
+              },
+              {
+                "token": "东京",
+                "logprob": -17.608824,
+                "bytes": [
+                  228,
+                  184,
+                  156,
+                  228,
+                  186,
+                  172
+                ]
+              },
+              {
+                "token": "T",
+                "logprob": -18.176046,
+                "bytes": [
+                  84
+                ]
+              },
+              {
+                "token": "Paris",
+                "logprob": -18.818613,
+                "bytes": [
+                  80,
+                  97,
+                  114,
+                  105,
+                  115
+                ]
+              },
+              {
+                "token": "A",
+                "logprob": -18.89687,
+                "bytes": [
+                  65
+                ]
+              },
+              {
+                "token": "*",
+                "logprob": -18.942272,
+                "bytes": [
+                  42
+                ]
+              },
+              {
+                "token": "H",
+                "logprob": -19.066463,
+                "bytes": [
+                  72
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 16,
+    "completion_tokens": 1,
+    "total_tokens": 17,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    },
+    "prompt_cache_hit_tokens": 0,
+    "prompt_cache_miss_tokens": 16
+  },
+  "system_fingerprint": "aeb56401ca74e127821c4f9126dcb669"
+}

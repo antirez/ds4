@@ -1,0 +1,1 @@
+In one paragraph, explain how a compiler uses an abstract syntax tree.

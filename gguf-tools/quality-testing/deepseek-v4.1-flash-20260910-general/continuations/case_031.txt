@@ -1,0 +1,6 @@
+# Funzione C: clamp di un intero
+
+```c
+#include <stdio.h>
+
+int clamp(int valore, int minimo, int massimo)

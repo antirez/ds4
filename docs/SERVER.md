@@ -32,6 +32,8 @@ relative runtime files such as Metal kernels can be found.
 The Flash and PRO names accepted by the model endpoints are compatibility
 aliases, not separate loaded models. The GGUF passed at startup selects the model.
 
+`GET /v1/models` and `GET /v1/models/{id}` include `architecture.input_modalities` and `architecture.output_modalities`. Input modalities are `["text", "image"]` when the loaded engine has vision enabled, otherwise `["text"]`; output modalities are always `["text"]`. Compatibility aliases report the same loaded-engine capabilities.
+
 ```sh
 curl http://127.0.0.1:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
@@ -60,21 +62,38 @@ preallocates independent KV states and queues requests when all slots are busy.
 Choose context and slot count together: a context that fits once may not fit
 four times. Idle slots can be cached before reuse; active requests are not evicted.
 
+Where the model supports it, the slots share one prefill workspace instead of
+each keeping its own, so an extra slot costs only its caches. That matters most
+for Qwen3.8 Flash Next, whose transients are sized by the prefill chunk rather
+than by the context: at the default chunk they run to several GiB per session.
+The startup line reports both figures.
+
 | Backend/model | Decode execution |
 | --- | --- |
 | Metal, resident Flash | Native shared-expert/QKV batching where supported |
+| Metal, resident V4.1 Flash | Native decoding for 2-8 sessions |
+| Metal RDMA TP, V4.1 Flash | Native decoding for 3-8 sessions; ordered fallback for two |
+| Metal SSD streaming, V4.1 Flash | Ordered fallback |
 | Metal, GLM 5.2 | Ordered fallback |
 | Metal, GLM 5.3 | Native batching through 2051 visible tokens; ordered fallback afterward |
+| Metal, Qwen3.8 Flash Next with resident weights | Native batching of the shared work; recurrent state, caches and PLE history stay per session |
 | CUDA, supported multi-GPU Flash TP layout | Native grouped decode and mixed prefill/decode |
+| Metal, Qwen3.8 Flash Next with SSD expert streaming | Ordered fallback with per-session streaming workspaces |
 | Single-GPU CUDA, including Spark | Ordered fallback |
 
 Fallback executes the rows separately. It provides concurrency and scheduling
 fairness, not the aggregate speedup of native batching. Native grouping may
-change floating-point reduction order slightly.
+change floating-point reduction order slightly. V4.1 sessions containing images
+use the ordered fallback.
 
 Long prefills yield to active decoders in bounded intervals, normally 128
-tokens. `--mixed-prefill-quantum N` changes that interval for testing.
-Session-batched serving uses ordinary target decoding, not MTP/DSpark.
+tokens. `--mixed-prefill-quantum N` changes that interval for testing. While
+nothing is decoding, a V4.1 slot prefills in the engine's own chunk.
+Session-batched serving uses ordinary target decoding, except Qwen3.8 on
+Metal, where `--mtp` also batches speculative decoding with resident weights
+and uses ordered speculative cycles with SSD expert streaming. Its
+`--mtp-exact-sampling` mode uses ordinary batches for nonzero-temperature
+requests. Other models do not use MTP/DSpark while session batching is active.
 For the eight-L40S example, see [CUDA GPUs](CUDA_MULTI_GPU.md#serve-multiple-users).
 
 ## Images

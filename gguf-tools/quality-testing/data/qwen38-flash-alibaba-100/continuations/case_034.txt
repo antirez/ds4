@@ -1,0 +1,3 @@
+Salvare l'header di un checkpoint di modello in modo sicuro è fondamentale per prevenire attacchi come **deserializzazione non sicura** (es. `pickle` in Python), che possono portare all'esecuzione arbitraria di codice.
+
+Ecco un formato sicuro e best practice, basato su standard aperti e validazione

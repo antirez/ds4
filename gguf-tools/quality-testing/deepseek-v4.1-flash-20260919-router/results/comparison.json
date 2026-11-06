@@ -1,0 +1,5055 @@
+{
+  "source_commit": "aafc65b444f03599328e484359ac03b08b27a6c3",
+  "router_pr": 1044,
+  "router_upstream_commit": "7f5f1b77ae831ec0ec5bb97486efa8600c57bd82",
+  "candidate_changes": "Only metal/unary.metal and metal/dsv4_misc.metal, loaded with source overrides.",
+  "production_source_modified_for_experiment": false,
+  "overlap_credit": "Emilian Bold, f3e16a19d37f9c17d2f42869474742e9993c7098; adapted privately to the current scorer.",
+  "model": "DeepSeek-V4.1-Flash-IQ2_XXS-Q2_K-imatrix.gguf",
+  "model_file_bytes": 365713686528,
+  "model_integrity": "File size, inode and mtime unchanged within each host suite; no full GGUF hash was computed.",
+  "source_sha256": {
+    "ds4.c": "fbd4b0c2057f097332e40ef418180c16223a2bdd69623e491e0c5e8c649e8c2c",
+    "ds4_metal.m": "8fe598fa01d82abe9a191964434bae27af6d77d9ab7e3cda57fe05622c2721ff",
+    "metal/unary.metal": "56be9a0316b02d4f16cdf9487074e5a7c94215a15d9b58917e38c474cbe16dde",
+    "metal/dsv4_misc.metal": "94e48cd289bada052adbb9d84b0d4799bbc38b342ca89ade62d7a2d5cc2a37b3",
+    "router1044/metal/unary.metal": "4607dbea21501230a193f8a333b1bd543d566f405568a094d6faf2c17cb0c5cf",
+    "router1044/metal/dsv4_misc.metal": "a978211b6f274d863f7ea2bbee9db52d5d3ecf64c1c7642d4c2f353f96249c1c",
+    "gguf-tools/quality-testing/score_official.c": "b5574f7cb2048cbbe71314be8357d0a7153ca1a571d335a701f91a892fcaf658"
+  },
+  "scores_sha256": {
+    "base-default": "22977d4a7a292df81d137b8cef1f7cccde104b007328cf26577e5cde9d389414",
+    "fix-default": "1aa597ccbaa1245d5f622b28da92f6ee932a95e8f229c127b861da75e1c8cfac",
+    "base-continued1": "220f9cba49748b91f0467a170034f80117dfaaa8842d21005cd64102d1dddf61",
+    "fix-continued1": "6f170f90c6e9f63f3ef0c1469a2150e63caa6999aa292e83a8b34f9e2e8f5165",
+    "base-safe": "3db8265e6fc9f923f4bcf6ed47b47c3c442e05dd5c64e1459a9be0bab36fbb7e",
+    "fix-safe": "a86822609cb4792aeb5cbb723ee70c597c2f5e3567c0773f6cfe4544387e8f1b"
+  },
+  "execution": {
+    "default": {
+      "host": "M5 Max IT",
+      "ram_gib": 128,
+      "context": 34816,
+      "ssd_streaming": true,
+      "expert_cache": "48gb",
+      "continued_prefill": null,
+      "safe_metal_math": false,
+      "runs": {
+        "base": {
+          "seconds": 1072.655615041,
+          "minimum_available_gib": 28.902450561523438,
+          "api_unaligned_cases": [
+            "case_047"
+          ],
+          "maximum_swap_mib": 0.0
+        },
+        "fix": {
+          "seconds": 1090.6524200420001,
+          "minimum_available_gib": 28.707244873046875,
+          "api_unaligned_cases": [
+            "case_047"
+          ],
+          "maximum_swap_mib": 0.0
+        }
+      }
+    },
+    "continued1": {
+      "host": "M5 Max US",
+      "ram_gib": 128,
+      "context": 34816,
+      "ssd_streaming": true,
+      "expert_cache": "64gb",
+      "continued_prefill": 1,
+      "safe_metal_math": false,
+      "runs": {
+        "base": {
+          "seconds": 604.01930925,
+          "minimum_available_gib": 20.378326416015625,
+          "api_unaligned_cases": []
+        },
+        "fix": {
+          "seconds": 652.796184375,
+          "minimum_available_gib": 19.281600952148438,
+          "api_unaligned_cases": []
+        }
+      }
+    },
+    "safe": {
+      "host": "M5 Max US",
+      "ram_gib": 128,
+      "context": 34816,
+      "ssd_streaming": true,
+      "expert_cache": "64gb",
+      "continued_prefill": null,
+      "safe_metal_math": true,
+      "runs": {
+        "base": {
+          "seconds": 601.081912916,
+          "minimum_available_gib": 20.65264892578125,
+          "api_unaligned_cases": []
+        },
+        "fix": {
+          "seconds": 594.9326142909999,
+          "minimum_available_gib": 20.59515380859375,
+          "api_unaligned_cases": []
+        }
+      }
+    }
+  },
+  "overlap_definition": "Sum min(API probability, local probability) over unique mapped API alternatives; no renormalization.",
+  "overlap_bounds": "Lower bound is the known sum; upper bound adds min(unmapped API mass, unmapped local mass).",
+  "bootstrap": {
+    "unit": "prompt",
+    "draws": 10000,
+    "seed": 1044,
+    "confidence": 0.95
+  },
+  "validation": "Complete paired manifests and counts; independent per-position trace reconstruction of NLL, overlap and captured mass.",
+  "caveats": [
+    "Curated prompt set, not a random task benchmark. Long prompts reuse three task families; long-set intervals are descriptive, not independent-task confidence.",
+    "Temperature-1 API samples, not greedy references or full vocabulary logits.",
+    "Case 047 has 65 local tokens versus 64 API/published-tokenizer tokens; text NLL retained, API comparisons omitted.",
+    "No equivalence margin was prespecified; intervals including zero are not proof of equivalence.",
+    "V4.1 references cannot establish quality for the older Flash or Vision-Exp checkpoints."
+  ],
+  "comparisons": {
+    "default-all": {
+      "baseline": {
+        "cases": 112,
+        "tokens": 6923,
+        "nll": 0.3968404546430738,
+        "api_cases": 111,
+        "api_positions": 6858,
+        "overlap_lower": 0.9076234385363857,
+        "overlap_upper": 0.907847204764088,
+        "mapped_api_mass": 0.9997742120394976,
+        "top1_agreement": 0.9034703995333917,
+        "mean_lcp": 5.5625
+      },
+      "candidate": {
+        "cases": 112,
+        "tokens": 6923,
+        "nll": 0.39535267457200635,
+        "api_cases": 111,
+        "api_positions": 6858,
+        "overlap_lower": 0.9076386474902038,
+        "overlap_upper": 0.9078617500120257,
+        "mapped_api_mass": 0.9997742120394976,
+        "top1_agreement": 0.9024496937882764,
+        "mean_lcp": 6.071428571428571
+      },
+      "delta_candidate_minus_baseline": {
+        "nll": -0.0014877800710674793,
+        "overlap_lower": 1.5208953818124371e-05,
+        "overlap_upper": 1.4545247937758354e-05,
+        "mapped_api_mass": 0.0,
+        "top1_agreement": -0.001020705745115258,
+        "mean_lcp": 0.5089285714285712
+      },
+      "full_overlap_delta_bounds": [
+        -0.0002085572738841357,
+        0.00023831147564001842
+      ],
+      "paired_prompt_bootstrap_95_percent": {
+        "nll": [
+          -0.0033284728460963196,
+          0.00019892128375320744
+        ],
+        "overlap_lower": [
+          -0.00037471059616953566,
+          0.0004267064166496477
+        ],
+        "top1_agreement": [
+          -0.0032291207984735063,
+          0.001198501872659176
+        ],
+        "mean_lcp": [
+          -0.15178571428571427,
+          1.5982142857142858
+        ]
+      },
+      "nll_case_wins": {
+        "candidate": 64,
+        "baseline": 48
+      },
+      "per_case": [
+        {
+          "id": "case_000",
+          "group": "short",
+          "delta_nll": 0.011403150000000029,
+          "delta_overlap": -0.0008583569999999208
+        },
+        {
+          "id": "case_001",
+          "group": "short",
+          "delta_nll": -0.0008557969999999915,
+          "delta_overlap": 0.0005174760000000722
+        },
+        {
+          "id": "case_002",
+          "group": "short",
+          "delta_nll": 0.001862782999999979,
+          "delta_overlap": -0.0014293760000000377
+        },
+        {
+          "id": "case_003",
+          "group": "short",
+          "delta_nll": 0.010241794000000026,
+          "delta_overlap": -0.002728860999999916
+        },
+        {
+          "id": "case_004",
+          "group": "short",
+          "delta_nll": -0.0025657500000000055,
+          "delta_overlap": -0.0005082320000000529
+        },
+        {
+          "id": "case_005",
+          "group": "short",
+          "delta_nll": 0.013856000999999951,
+          "delta_overlap": -0.0008985599999999927
+        },
+        {
+          "id": "case_006",
+          "group": "short",
+          "delta_nll": 0.0009173920000000169,
+          "delta_overlap": -0.0008151969999999897
+        },
+        {
+          "id": "case_007",
+          "group": "short",
+          "delta_nll": -0.00838881800000002,
+          "delta_overlap": 0.00012072900000004161
+        },
+        {
+          "id": "case_008",
+          "group": "short",
+          "delta_nll": -0.005908128999999984,
+          "delta_overlap": -0.00029698899999996975
+        },
+        {
+          "id": "case_009",
+          "group": "short",
+          "delta_nll": -0.008091156000000016,
+          "delta_overlap": 0.004317893999999933
+        },
+        {
+          "id": "case_010",
+          "group": "short",
+          "delta_nll": -0.002015054999999988,
+          "delta_overlap": -0.000548380000000015
+        },
+        {
+          "id": "case_011",
+          "group": "short",
+          "delta_nll": -0.007150926000000002,
+          "delta_overlap": -0.0021215149999999072
+        },
+        {
+          "id": "case_012",
+          "group": "short",
+          "delta_nll": -0.0013709840000000195,
+          "delta_overlap": -0.0024422549999999488
+        },
+        {
+          "id": "case_013",
+          "group": "short",
+          "delta_nll": 0.005807300999999987,
+          "delta_overlap": 1.6533000000040765e-05
+        },
+        {
+          "id": "case_014",
+          "group": "short",
+          "delta_nll": 0.0018416230000000144,
+          "delta_overlap": -0.00025153199999994325
+        },
+        {
+          "id": "case_015",
+          "group": "short",
+          "delta_nll": 0.005341378000000008,
+          "delta_overlap": 0.003671402000000046
+        },
+        {
+          "id": "case_016",
+          "group": "short",
+          "delta_nll": 0.01712872000000004,
+          "delta_overlap": -0.0028361270000000216
+        },
+        {
+          "id": "case_017",
+          "group": "short",
+          "delta_nll": 0.006864806000000001,
+          "delta_overlap": 0.00011658700000005684
+        },
+        {
+          "id": "case_018",
+          "group": "short",
+          "delta_nll": 0.0029123730000000236,
+          "delta_overlap": 0.00024123399999997908
+        },
+        {
+          "id": "case_019",
+          "group": "short",
+          "delta_nll": -0.006806683000000091,
+          "delta_overlap": -0.00037783199999996686
+        },
+        {
+          "id": "case_020",
+          "group": "short",
+          "delta_nll": 0.003608265999999999,
+          "delta_overlap": 0.004566825999999913
+        },
+        {
+          "id": "case_021",
+          "group": "short",
+          "delta_nll": -0.010770953999999944,
+          "delta_overlap": 0.0060454759999999386
+        },
+        {
+          "id": "case_022",
+          "group": "short",
+          "delta_nll": -0.0003989580000000048,
+          "delta_overlap": 0.00032277499999999737
+        },
+        {
+          "id": "case_023",
+          "group": "short",
+          "delta_nll": -0.0027515889999999987,
+          "delta_overlap": -0.0015248310000000043
+        },
+        {
+          "id": "case_024",
+          "group": "short",
+          "delta_nll": -0.0017452890000000387,
+          "delta_overlap": 0.0004505070000000444
+        },
+        {
+          "id": "case_025",
+          "group": "short",
+          "delta_nll": -0.010312649000000007,
+          "delta_overlap": -0.000739196000000053
+        },
+        {
+          "id": "case_026",
+          "group": "short",
+          "delta_nll": -0.000589046000000093,
+          "delta_overlap": -0.0012487150000000113
+        },
+        {
+          "id": "case_027",
+          "group": "short",
+          "delta_nll": 0.00030347299999999855,
+          "delta_overlap": -0.00037947200000010284
+        },
+        {
+          "id": "case_028",
+          "group": "short",
+          "delta_nll": 0.0033526310000000503,
+          "delta_overlap": -0.0015442979999999995
+        },
+        {
+          "id": "case_029",
+          "group": "short",
+          "delta_nll": 0.010108919999999966,
+          "delta_overlap": 0.002694634000000029
+        },
+        {
+          "id": "case_030",
+          "group": "short",
+          "delta_nll": 0.0012836360000000047,
+          "delta_overlap": 9.436599999990136e-05
+        },
+        {
+          "id": "case_031",
+          "group": "short",
+          "delta_nll": 0.005825339999999957,
+          "delta_overlap": 0.0004076350000000728
+        },
+        {
+          "id": "case_032",
+          "group": "short",
+          "delta_nll": -0.0015324480000000196,
+          "delta_overlap": 0.0003851940000000331
+        },
+        {
+          "id": "case_033",
+          "group": "short",
+          "delta_nll": 0.012565839999999995,
+          "delta_overlap": -0.0014195569999999602
+        },
+        {
+          "id": "case_034",
+          "group": "short",
+          "delta_nll": -0.0035719029999999874,
+          "delta_overlap": -0.0009593799999999542
+        },
+        {
+          "id": "case_035",
+          "group": "short",
+          "delta_nll": 0.0013257009999999847,
+          "delta_overlap": 0.0005894539999999893
+        },
+        {
+          "id": "case_036",
+          "group": "short",
+          "delta_nll": -0.001732874999999967,
+          "delta_overlap": 0.0007830250000000483
+        },
+        {
+          "id": "case_037",
+          "group": "short",
+          "delta_nll": 2.154700000001064e-05,
+          "delta_overlap": 0.0009679879999999752
+        },
+        {
+          "id": "case_038",
+          "group": "short",
+          "delta_nll": 0.013202118999999957,
+          "delta_overlap": -0.0023532200000000447
+        },
+        {
+          "id": "case_039",
+          "group": "short",
+          "delta_nll": -0.0036614879999999905,
+          "delta_overlap": -0.0006341199999999603
+        },
+        {
+          "id": "case_040",
+          "group": "short",
+          "delta_nll": -0.0044598929999999926,
+          "delta_overlap": -0.0014965120000000054
+        },
+        {
+          "id": "case_041",
+          "group": "short",
+          "delta_nll": -0.0014435770000000292,
+          "delta_overlap": 0.0006409560000000258
+        },
+        {
+          "id": "case_042",
+          "group": "short",
+          "delta_nll": -0.005286910000000006,
+          "delta_overlap": 0.001780271
+        },
+        {
+          "id": "case_043",
+          "group": "short",
+          "delta_nll": -0.000959034999999997,
+          "delta_overlap": 0.000897071000000027
+        },
+        {
+          "id": "case_044",
+          "group": "short",
+          "delta_nll": 0.008975538000000005,
+          "delta_overlap": -0.0003819840000000019
+        },
+        {
+          "id": "case_045",
+          "group": "short",
+          "delta_nll": -0.010254578999999986,
+          "delta_overlap": 0.0024198409999999226
+        },
+        {
+          "id": "case_046",
+          "group": "short",
+          "delta_nll": 0.0036985459999999692,
+          "delta_overlap": -0.00034716600000006537
+        },
+        {
+          "id": "case_047",
+          "group": "short",
+          "delta_nll": -0.00012139700000002307,
+          "delta_overlap": 0.0
+        },
+        {
+          "id": "case_048",
+          "group": "short",
+          "delta_nll": -0.002226773000000015,
+          "delta_overlap": -0.0005747710000000295
+        },
+        {
+          "id": "case_049",
+          "group": "short",
+          "delta_nll": -0.020480598999999988,
+          "delta_overlap": -0.0007529219999999892
+        },
+        {
+          "id": "case_050",
+          "group": "short",
+          "delta_nll": 0.002736776999999968,
+          "delta_overlap": -0.0017181320000000389
+        },
+        {
+          "id": "case_051",
+          "group": "short",
+          "delta_nll": 0.005276205000000006,
+          "delta_overlap": 0.00027743999999996216
+        },
+        {
+          "id": "case_052",
+          "group": "short",
+          "delta_nll": -0.020349284000000023,
+          "delta_overlap": -0.00423334799999997
+        },
+        {
+          "id": "case_053",
+          "group": "short",
+          "delta_nll": -0.002327242999999979,
+          "delta_overlap": -0.002300711999999927
+        },
+        {
+          "id": "case_054",
+          "group": "short",
+          "delta_nll": -0.06381324900000007,
+          "delta_overlap": 0.00891243900000005
+        },
+        {
+          "id": "case_055",
+          "group": "short",
+          "delta_nll": -0.001511307999999989,
+          "delta_overlap": -0.0006488369999999577
+        },
+        {
+          "id": "case_056",
+          "group": "short",
+          "delta_nll": -0.0013171719999999776,
+          "delta_overlap": -0.00376339399999992
+        },
+        {
+          "id": "case_057",
+          "group": "short",
+          "delta_nll": -0.007857168999999997,
+          "delta_overlap": 0.0036267620000000056
+        },
+        {
+          "id": "case_058",
+          "group": "short",
+          "delta_nll": -0.005470372000000001,
+          "delta_overlap": 2.6022000000014422e-05
+        },
+        {
+          "id": "case_059",
+          "group": "short",
+          "delta_nll": 0.005538952999999999,
+          "delta_overlap": -0.002642420000000034
+        },
+        {
+          "id": "case_060",
+          "group": "short",
+          "delta_nll": -0.0029058470000000725,
+          "delta_overlap": 0.0015572510000000372
+        },
+        {
+          "id": "case_061",
+          "group": "short",
+          "delta_nll": 0.007295620999999919,
+          "delta_overlap": -0.0016887389999999947
+        },
+        {
+          "id": "case_062",
+          "group": "short",
+          "delta_nll": 0.002924766999999995,
+          "delta_overlap": 0.0013755049999999436
+        },
+        {
+          "id": "case_063",
+          "group": "short",
+          "delta_nll": 0.007702501000000028,
+          "delta_overlap": 0.0011544879999999536
+        },
+        {
+          "id": "case_064",
+          "group": "short",
+          "delta_nll": 0.019098142,
+          "delta_overlap": -0.010187695000000052
+        },
+        {
+          "id": "case_065",
+          "group": "short",
+          "delta_nll": 0.015181283000000004,
+          "delta_overlap": 0.0006017929999999616
+        },
+        {
+          "id": "case_066",
+          "group": "short",
+          "delta_nll": -0.008889528000000008,
+          "delta_overlap": 0.002675199000000017
+        },
+        {
+          "id": "case_067",
+          "group": "short",
+          "delta_nll": -0.02035678000000002,
+          "delta_overlap": -0.002397840999999956
+        },
+        {
+          "id": "case_068",
+          "group": "short",
+          "delta_nll": -0.004799266999999996,
+          "delta_overlap": -0.001679821999999942
+        },
+        {
+          "id": "case_069",
+          "group": "short",
+          "delta_nll": -0.0025578420000000046,
+          "delta_overlap": 0.00023300800000003452
+        },
+        {
+          "id": "case_070",
+          "group": "short",
+          "delta_nll": -0.007665837000000009,
+          "delta_overlap": 0.002779348000000015
+        },
+        {
+          "id": "case_071",
+          "group": "short",
+          "delta_nll": -0.0069459210000000216,
+          "delta_overlap": -0.0006427020000000505
+        },
+        {
+          "id": "case_072",
+          "group": "short",
+          "delta_nll": -0.0025777490000000007,
+          "delta_overlap": 0.00204089399999996
+        },
+        {
+          "id": "case_073",
+          "group": "short",
+          "delta_nll": 0.012287510000000057,
+          "delta_overlap": -0.0016807829999999635
+        },
+        {
+          "id": "case_074",
+          "group": "short",
+          "delta_nll": -0.009141767000000023,
+          "delta_overlap": -0.0047506929999999725
+        },
+        {
+          "id": "case_075",
+          "group": "short",
+          "delta_nll": 0.0019376589999999805,
+          "delta_overlap": 0.0012257419999999186
+        },
+        {
+          "id": "case_076",
+          "group": "short",
+          "delta_nll": 0.004430355,
+          "delta_overlap": -0.0035491590000000794
+        },
+        {
+          "id": "case_077",
+          "group": "short",
+          "delta_nll": -0.0014207529999999968,
+          "delta_overlap": -0.00038738100000001996
+        },
+        {
+          "id": "case_078",
+          "group": "short",
+          "delta_nll": -0.008810285000000001,
+          "delta_overlap": 0.0018101990000000123
+        },
+        {
+          "id": "case_079",
+          "group": "short",
+          "delta_nll": -0.0035943030000000764,
+          "delta_overlap": -0.00044662699999997724
+        },
+        {
+          "id": "case_080",
+          "group": "short",
+          "delta_nll": -0.012394162000000042,
+          "delta_overlap": 0.0010610620000000015
+        },
+        {
+          "id": "case_081",
+          "group": "short",
+          "delta_nll": -0.005006242999999966,
+          "delta_overlap": 0.0005819710000000144
+        },
+        {
+          "id": "case_082",
+          "group": "short",
+          "delta_nll": 0.009564450999999974,
+          "delta_overlap": -0.0030088910000000135
+        },
+        {
+          "id": "case_083",
+          "group": "short",
+          "delta_nll": 0.00024561100000003444,
+          "delta_overlap": -0.001216321999999992
+        },
+        {
+          "id": "case_084",
+          "group": "short",
+          "delta_nll": -0.0008632040000000063,
+          "delta_overlap": 0.0013928530000000272
+        },
+        {
+          "id": "case_085",
+          "group": "short",
+          "delta_nll": -5.688799999992167e-05,
+          "delta_overlap": -0.0005723730000000149
+        },
+        {
+          "id": "case_086",
+          "group": "short",
+          "delta_nll": -0.0019388780000000327,
+          "delta_overlap": -0.004260265999999957
+        },
+        {
+          "id": "case_087",
+          "group": "short",
+          "delta_nll": 2.1620000000055484e-05,
+          "delta_overlap": -0.0019731849999999884
+        },
+        {
+          "id": "case_088",
+          "group": "short",
+          "delta_nll": -0.0001070440000000561,
+          "delta_overlap": 0.005435458999999976
+        },
+        {
+          "id": "case_089",
+          "group": "short",
+          "delta_nll": -0.003742580999999995,
+          "delta_overlap": 0.0007531680000000263
+        },
+        {
+          "id": "case_090",
+          "group": "short",
+          "delta_nll": 0.007595055999999989,
+          "delta_overlap": -0.003217417
+        },
+        {
+          "id": "case_091",
+          "group": "short",
+          "delta_nll": 5.0331999999930765e-05,
+          "delta_overlap": 0.0028196560000000037
+        },
+        {
+          "id": "case_092",
+          "group": "short",
+          "delta_nll": -0.0017475329999999678,
+          "delta_overlap": 0.0017938209999999177
+        },
+        {
+          "id": "case_093",
+          "group": "short",
+          "delta_nll": 0.002355735000000081,
+          "delta_overlap": -0.000813701
+        },
+        {
+          "id": "case_094",
+          "group": "short",
+          "delta_nll": -0.0038800209999999558,
+          "delta_overlap": 0.0009211719999999701
+        },
+        {
+          "id": "case_095",
+          "group": "short",
+          "delta_nll": 0.002596977000000056,
+          "delta_overlap": -0.000279837000000005
+        },
+        {
+          "id": "case_096",
+          "group": "short",
+          "delta_nll": -0.010001660999999995,
+          "delta_overlap": 0.001705161000000066
+        },
+        {
+          "id": "case_097",
+          "group": "short",
+          "delta_nll": -0.005118591000000006,
+          "delta_overlap": -0.0013789869999999427
+        },
+        {
+          "id": "case_098",
+          "group": "short",
+          "delta_nll": -0.02443326999999995,
+          "delta_overlap": 0.0011471829999999406
+        },
+        {
+          "id": "case_099",
+          "group": "short",
+          "delta_nll": -0.006352742000000022,
+          "delta_overlap": -0.0001323579999999991
+        },
+        {
+          "id": "case_100",
+          "group": "long-retrieval",
+          "delta_nll": 0.006315230000000005,
+          "delta_overlap": 0.00013742900000002223
+        },
+        {
+          "id": "case_101",
+          "group": "long-code",
+          "delta_nll": 0.003275762999999987,
+          "delta_overlap": 0.0005344980000000499
+        },
+        {
+          "id": "case_102",
+          "group": "long-italian",
+          "delta_nll": -0.0011352650000000016,
+          "delta_overlap": 0.0008125890000000302
+        },
+        {
+          "id": "case_103",
+          "group": "long-retrieval",
+          "delta_nll": -0.003529140000000014,
+          "delta_overlap": 0.0011381560000000013
+        },
+        {
+          "id": "case_104",
+          "group": "long-code",
+          "delta_nll": 0.0063506949999999895,
+          "delta_overlap": -0.0007094469999999742
+        },
+        {
+          "id": "case_105",
+          "group": "long-italian",
+          "delta_nll": -0.001541720999999996,
+          "delta_overlap": 0.00031548699999994767
+        },
+        {
+          "id": "case_106",
+          "group": "long-retrieval",
+          "delta_nll": 0.004380482000000019,
+          "delta_overlap": 0.0016437740000000423
+        },
+        {
+          "id": "case_107",
+          "group": "long-code",
+          "delta_nll": 0.0014819130000000014,
+          "delta_overlap": -0.0007632149999999838
+        },
+        {
+          "id": "case_108",
+          "group": "long-italian",
+          "delta_nll": 0.000407519999999998,
+          "delta_overlap": -0.0005236680000000327
+        },
+        {
+          "id": "case_109",
+          "group": "long-retrieval",
+          "delta_nll": -0.007627918000000011,
+          "delta_overlap": 0.0010187429999999331
+        },
+        {
+          "id": "case_110",
+          "group": "long-code",
+          "delta_nll": -0.006506306999999989,
+          "delta_overlap": 0.0011876279999999406
+        },
+        {
+          "id": "case_111",
+          "group": "long-italian",
+          "delta_nll": 0.0009466839999999997,
+          "delta_overlap": 0.0004109330000000577
+        }
+      ]
+    },
+    "default-short": {
+      "baseline": {
+        "cases": 100,
+        "tokens": 6160,
+        "nll": 0.4220847877784091,
+        "api_cases": 99,
+        "api_positions": 6095,
+        "overlap_lower": 0.9015163771408883,
+        "overlap_upper": 0.9017481478016977,
+        "mapped_api_mass": 0.9997663872463294,
+        "top1_agreement": 0.8977850697292863,
+        "mean_lcp": 5.13
+      },
+      "candidate": {
+        "cases": 100,
+        "tokens": 6160,
+        "nll": 0.4203885746086039,
+        "api_cases": 99,
+        "api_positions": 6095,
+        "overlap_lower": 0.9014789700947599,
+        "overlap_upper": 0.9017099518502033,
+        "mapped_api_mass": 0.9997663872463294,
+        "top1_agreement": 0.8963084495488105,
+        "mean_lcp": 5.2
+      },
+      "delta_candidate_minus_baseline": {
+        "nll": -0.001696213169805172,
+        "overlap_lower": -3.7407046128423715e-05,
+        "overlap_upper": -3.81959514943464e-05,
+        "mapped_api_mass": 0.0,
+        "top1_agreement": -0.001476620180475785,
+        "mean_lcp": 0.07000000000000028
+      },
+      "full_overlap_delta_bounds": [
+        -0.0002691777069377954,
+        0.0001935747093150253
+      ],
+      "paired_prompt_bootstrap_95_percent": {
+        "nll": [
+          -0.003797110724132465,
+          0.0001340308559987236
+        ],
+        "overlap_lower": [
+          -0.0004685329423077749,
+          0.00041693155933851864
+        ],
+        "top1_agreement": [
+          -0.0038493723849372385,
+          0.0011030570438071226
+        ],
+        "mean_lcp": [
+          -0.24,
+          0.39
+        ]
+      },
+      "nll_case_wins": {
+        "candidate": 59,
+        "baseline": 41
+      },
+      "per_case": [
+        {
+          "id": "case_000",
+          "group": "short",
+          "delta_nll": 0.011403150000000029,
+          "delta_overlap": -0.0008583569999999208
+        },
+        {
+          "id": "case_001",
+          "group": "short",
+          "delta_nll": -0.0008557969999999915,
+          "delta_overlap": 0.0005174760000000722
+        },
+        {
+          "id": "case_002",
+          "group": "short",
+          "delta_nll": 0.001862782999999979,
+          "delta_overlap": -0.0014293760000000377
+        },
+        {
+          "id": "case_003",
+          "group": "short",
+          "delta_nll": 0.010241794000000026,
+          "delta_overlap": -0.002728860999999916
+        },
+        {
+          "id": "case_004",
+          "group": "short",
+          "delta_nll": -0.0025657500000000055,
+          "delta_overlap": -0.0005082320000000529
+        },
+        {
+          "id": "case_005",
+          "group": "short",
+          "delta_nll": 0.013856000999999951,
+          "delta_overlap": -0.0008985599999999927
+        },
+        {
+          "id": "case_006",
+          "group": "short",
+          "delta_nll": 0.0009173920000000169,
+          "delta_overlap": -0.0008151969999999897
+        },
+        {
+          "id": "case_007",
+          "group": "short",
+          "delta_nll": -0.00838881800000002,
+          "delta_overlap": 0.00012072900000004161
+        },
+        {
+          "id": "case_008",
+          "group": "short",
+          "delta_nll": -0.005908128999999984,
+          "delta_overlap": -0.00029698899999996975
+        },
+        {
+          "id": "case_009",
+          "group": "short",
+          "delta_nll": -0.008091156000000016,
+          "delta_overlap": 0.004317893999999933
+        },
+        {
+          "id": "case_010",
+          "group": "short",
+          "delta_nll": -0.002015054999999988,
+          "delta_overlap": -0.000548380000000015
+        },
+        {
+          "id": "case_011",
+          "group": "short",
+          "delta_nll": -0.007150926000000002,
+          "delta_overlap": -0.0021215149999999072
+        },
+        {
+          "id": "case_012",
+          "group": "short",
+          "delta_nll": -0.0013709840000000195,
+          "delta_overlap": -0.0024422549999999488
+        },
+        {
+          "id": "case_013",
+          "group": "short",
+          "delta_nll": 0.005807300999999987,
+          "delta_overlap": 1.6533000000040765e-05
+        },
+        {
+          "id": "case_014",
+          "group": "short",
+          "delta_nll": 0.0018416230000000144,
+          "delta_overlap": -0.00025153199999994325
+        },
+        {
+          "id": "case_015",
+          "group": "short",
+          "delta_nll": 0.005341378000000008,
+          "delta_overlap": 0.003671402000000046
+        },
+        {
+          "id": "case_016",
+          "group": "short",
+          "delta_nll": 0.01712872000000004,
+          "delta_overlap": -0.0028361270000000216
+        },
+        {
+          "id": "case_017",
+          "group": "short",
+          "delta_nll": 0.006864806000000001,
+          "delta_overlap": 0.00011658700000005684
+        },
+        {
+          "id": "case_018",
+          "group": "short",
+          "delta_nll": 0.0029123730000000236,
+          "delta_overlap": 0.00024123399999997908
+        },
+        {
+          "id": "case_019",
+          "group": "short",
+          "delta_nll": -0.006806683000000091,
+          "delta_overlap": -0.00037783199999996686
+        },
+        {
+          "id": "case_020",
+          "group": "short",
+          "delta_nll": 0.003608265999999999,
+          "delta_overlap": 0.004566825999999913
+        },
+        {
+          "id": "case_021",
+          "group": "short",
+          "delta_nll": -0.010770953999999944,
+          "delta_overlap": 0.0060454759999999386
+        },
+        {
+          "id": "case_022",
+          "group": "short",
+          "delta_nll": -0.0003989580000000048,
+          "delta_overlap": 0.00032277499999999737
+        },
+        {
+          "id": "case_023",
+          "group": "short",
+          "delta_nll": -0.0027515889999999987,
+          "delta_overlap": -0.0015248310000000043
+        },
+        {
+          "id": "case_024",
+          "group": "short",
+          "delta_nll": -0.0017452890000000387,
+          "delta_overlap": 0.0004505070000000444
+        },
+        {
+          "id": "case_025",
+          "group": "short",
+          "delta_nll": -0.010312649000000007,
+          "delta_overlap": -0.000739196000000053
+        },
+        {
+          "id": "case_026",
+          "group": "short",
+          "delta_nll": -0.000589046000000093,
+          "delta_overlap": -0.0012487150000000113
+        },
+        {
+          "id": "case_027",
+          "group": "short",
+          "delta_nll": 0.00030347299999999855,
+          "delta_overlap": -0.00037947200000010284
+        },
+        {
+          "id": "case_028",
+          "group": "short",
+          "delta_nll": 0.0033526310000000503,
+          "delta_overlap": -0.0015442979999999995
+        },
+        {
+          "id": "case_029",
+          "group": "short",
+          "delta_nll": 0.010108919999999966,
+          "delta_overlap": 0.002694634000000029
+        },
+        {
+          "id": "case_030",
+          "group": "short",
+          "delta_nll": 0.0012836360000000047,
+          "delta_overlap": 9.436599999990136e-05
+        },
+        {
+          "id": "case_031",
+          "group": "short",
+          "delta_nll": 0.005825339999999957,
+          "delta_overlap": 0.0004076350000000728
+        },
+        {
+          "id": "case_032",
+          "group": "short",
+          "delta_nll": -0.0015324480000000196,
+          "delta_overlap": 0.0003851940000000331
+        },
+        {
+          "id": "case_033",
+          "group": "short",
+          "delta_nll": 0.012565839999999995,
+          "delta_overlap": -0.0014195569999999602
+        },
+        {
+          "id": "case_034",
+          "group": "short",
+          "delta_nll": -0.0035719029999999874,
+          "delta_overlap": -0.0009593799999999542
+        },
+        {
+          "id": "case_035",
+          "group": "short",
+          "delta_nll": 0.0013257009999999847,
+          "delta_overlap": 0.0005894539999999893
+        },
+        {
+          "id": "case_036",
+          "group": "short",
+          "delta_nll": -0.001732874999999967,
+          "delta_overlap": 0.0007830250000000483
+        },
+        {
+          "id": "case_037",
+          "group": "short",
+          "delta_nll": 2.154700000001064e-05,
+          "delta_overlap": 0.0009679879999999752
+        },
+        {
+          "id": "case_038",
+          "group": "short",
+          "delta_nll": 0.013202118999999957,
+          "delta_overlap": -0.0023532200000000447
+        },
+        {
+          "id": "case_039",
+          "group": "short",
+          "delta_nll": -0.0036614879999999905,
+          "delta_overlap": -0.0006341199999999603
+        },
+        {
+          "id": "case_040",
+          "group": "short",
+          "delta_nll": -0.0044598929999999926,
+          "delta_overlap": -0.0014965120000000054
+        },
+        {
+          "id": "case_041",
+          "group": "short",
+          "delta_nll": -0.0014435770000000292,
+          "delta_overlap": 0.0006409560000000258
+        },
+        {
+          "id": "case_042",
+          "group": "short",
+          "delta_nll": -0.005286910000000006,
+          "delta_overlap": 0.001780271
+        },
+        {
+          "id": "case_043",
+          "group": "short",
+          "delta_nll": -0.000959034999999997,
+          "delta_overlap": 0.000897071000000027
+        },
+        {
+          "id": "case_044",
+          "group": "short",
+          "delta_nll": 0.008975538000000005,
+          "delta_overlap": -0.0003819840000000019
+        },
+        {
+          "id": "case_045",
+          "group": "short",
+          "delta_nll": -0.010254578999999986,
+          "delta_overlap": 0.0024198409999999226
+        },
+        {
+          "id": "case_046",
+          "group": "short",
+          "delta_nll": 0.0036985459999999692,
+          "delta_overlap": -0.00034716600000006537
+        },
+        {
+          "id": "case_047",
+          "group": "short",
+          "delta_nll": -0.00012139700000002307,
+          "delta_overlap": 0.0
+        },
+        {
+          "id": "case_048",
+          "group": "short",
+          "delta_nll": -0.002226773000000015,
+          "delta_overlap": -0.0005747710000000295
+        },
+        {
+          "id": "case_049",
+          "group": "short",
+          "delta_nll": -0.020480598999999988,
+          "delta_overlap": -0.0007529219999999892
+        },
+        {
+          "id": "case_050",
+          "group": "short",
+          "delta_nll": 0.002736776999999968,
+          "delta_overlap": -0.0017181320000000389
+        },
+        {
+          "id": "case_051",
+          "group": "short",
+          "delta_nll": 0.005276205000000006,
+          "delta_overlap": 0.00027743999999996216
+        },
+        {
+          "id": "case_052",
+          "group": "short",
+          "delta_nll": -0.020349284000000023,
+          "delta_overlap": -0.00423334799999997
+        },
+        {
+          "id": "case_053",
+          "group": "short",
+          "delta_nll": -0.002327242999999979,
+          "delta_overlap": -0.002300711999999927
+        },
+        {
+          "id": "case_054",
+          "group": "short",
+          "delta_nll": -0.06381324900000007,
+          "delta_overlap": 0.00891243900000005
+        },
+        {
+          "id": "case_055",
+          "group": "short",
+          "delta_nll": -0.001511307999999989,
+          "delta_overlap": -0.0006488369999999577
+        },
+        {
+          "id": "case_056",
+          "group": "short",
+          "delta_nll": -0.0013171719999999776,
+          "delta_overlap": -0.00376339399999992
+        },
+        {
+          "id": "case_057",
+          "group": "short",
+          "delta_nll": -0.007857168999999997,
+          "delta_overlap": 0.0036267620000000056
+        },
+        {
+          "id": "case_058",
+          "group": "short",
+          "delta_nll": -0.005470372000000001,
+          "delta_overlap": 2.6022000000014422e-05
+        },
+        {
+          "id": "case_059",
+          "group": "short",
+          "delta_nll": 0.005538952999999999,
+          "delta_overlap": -0.002642420000000034
+        },
+        {
+          "id": "case_060",
+          "group": "short",
+          "delta_nll": -0.0029058470000000725,
+          "delta_overlap": 0.0015572510000000372
+        },
+        {
+          "id": "case_061",
+          "group": "short",
+          "delta_nll": 0.007295620999999919,
+          "delta_overlap": -0.0016887389999999947
+        },
+        {
+          "id": "case_062",
+          "group": "short",
+          "delta_nll": 0.002924766999999995,
+          "delta_overlap": 0.0013755049999999436
+        },
+        {
+          "id": "case_063",
+          "group": "short",
+          "delta_nll": 0.007702501000000028,
+          "delta_overlap": 0.0011544879999999536
+        },
+        {
+          "id": "case_064",
+          "group": "short",
+          "delta_nll": 0.019098142,
+          "delta_overlap": -0.010187695000000052
+        },
+        {
+          "id": "case_065",
+          "group": "short",
+          "delta_nll": 0.015181283000000004,
+          "delta_overlap": 0.0006017929999999616
+        },
+        {
+          "id": "case_066",
+          "group": "short",
+          "delta_nll": -0.008889528000000008,
+          "delta_overlap": 0.002675199000000017
+        },
+        {
+          "id": "case_067",
+          "group": "short",
+          "delta_nll": -0.02035678000000002,
+          "delta_overlap": -0.002397840999999956
+        },
+        {
+          "id": "case_068",
+          "group": "short",
+          "delta_nll": -0.004799266999999996,
+          "delta_overlap": -0.001679821999999942
+        },
+        {
+          "id": "case_069",
+          "group": "short",
+          "delta_nll": -0.0025578420000000046,
+          "delta_overlap": 0.00023300800000003452
+        },
+        {
+          "id": "case_070",
+          "group": "short",
+          "delta_nll": -0.007665837000000009,
+          "delta_overlap": 0.002779348000000015
+        },
+        {
+          "id": "case_071",
+          "group": "short",
+          "delta_nll": -0.0069459210000000216,
+          "delta_overlap": -0.0006427020000000505
+        },
+        {
+          "id": "case_072",
+          "group": "short",
+          "delta_nll": -0.0025777490000000007,
+          "delta_overlap": 0.00204089399999996
+        },
+        {
+          "id": "case_073",
+          "group": "short",
+          "delta_nll": 0.012287510000000057,
+          "delta_overlap": -0.0016807829999999635
+        },
+        {
+          "id": "case_074",
+          "group": "short",
+          "delta_nll": -0.009141767000000023,
+          "delta_overlap": -0.0047506929999999725
+        },
+        {
+          "id": "case_075",
+          "group": "short",
+          "delta_nll": 0.0019376589999999805,
+          "delta_overlap": 0.0012257419999999186
+        },
+        {
+          "id": "case_076",
+          "group": "short",
+          "delta_nll": 0.004430355,
+          "delta_overlap": -0.0035491590000000794
+        },
+        {
+          "id": "case_077",
+          "group": "short",
+          "delta_nll": -0.0014207529999999968,
+          "delta_overlap": -0.00038738100000001996
+        },
+        {
+          "id": "case_078",
+          "group": "short",
+          "delta_nll": -0.008810285000000001,
+          "delta_overlap": 0.0018101990000000123
+        },
+        {
+          "id": "case_079",
+          "group": "short",
+          "delta_nll": -0.0035943030000000764,
+          "delta_overlap": -0.00044662699999997724
+        },
+        {
+          "id": "case_080",
+          "group": "short",
+          "delta_nll": -0.012394162000000042,
+          "delta_overlap": 0.0010610620000000015
+        },
+        {
+          "id": "case_081",
+          "group": "short",
+          "delta_nll": -0.005006242999999966,
+          "delta_overlap": 0.0005819710000000144
+        },
+        {
+          "id": "case_082",
+          "group": "short",
+          "delta_nll": 0.009564450999999974,
+          "delta_overlap": -0.0030088910000000135
+        },
+        {
+          "id": "case_083",
+          "group": "short",
+          "delta_nll": 0.00024561100000003444,
+          "delta_overlap": -0.001216321999999992
+        },
+        {
+          "id": "case_084",
+          "group": "short",
+          "delta_nll": -0.0008632040000000063,
+          "delta_overlap": 0.0013928530000000272
+        },
+        {
+          "id": "case_085",
+          "group": "short",
+          "delta_nll": -5.688799999992167e-05,
+          "delta_overlap": -0.0005723730000000149
+        },
+        {
+          "id": "case_086",
+          "group": "short",
+          "delta_nll": -0.0019388780000000327,
+          "delta_overlap": -0.004260265999999957
+        },
+        {
+          "id": "case_087",
+          "group": "short",
+          "delta_nll": 2.1620000000055484e-05,
+          "delta_overlap": -0.0019731849999999884
+        },
+        {
+          "id": "case_088",
+          "group": "short",
+          "delta_nll": -0.0001070440000000561,
+          "delta_overlap": 0.005435458999999976
+        },
+        {
+          "id": "case_089",
+          "group": "short",
+          "delta_nll": -0.003742580999999995,
+          "delta_overlap": 0.0007531680000000263
+        },
+        {
+          "id": "case_090",
+          "group": "short",
+          "delta_nll": 0.007595055999999989,
+          "delta_overlap": -0.003217417
+        },
+        {
+          "id": "case_091",
+          "group": "short",
+          "delta_nll": 5.0331999999930765e-05,
+          "delta_overlap": 0.0028196560000000037
+        },
+        {
+          "id": "case_092",
+          "group": "short",
+          "delta_nll": -0.0017475329999999678,
+          "delta_overlap": 0.0017938209999999177
+        },
+        {
+          "id": "case_093",
+          "group": "short",
+          "delta_nll": 0.002355735000000081,
+          "delta_overlap": -0.000813701
+        },
+        {
+          "id": "case_094",
+          "group": "short",
+          "delta_nll": -0.0038800209999999558,
+          "delta_overlap": 0.0009211719999999701
+        },
+        {
+          "id": "case_095",
+          "group": "short",
+          "delta_nll": 0.002596977000000056,
+          "delta_overlap": -0.000279837000000005
+        },
+        {
+          "id": "case_096",
+          "group": "short",
+          "delta_nll": -0.010001660999999995,
+          "delta_overlap": 0.001705161000000066
+        },
+        {
+          "id": "case_097",
+          "group": "short",
+          "delta_nll": -0.005118591000000006,
+          "delta_overlap": -0.0013789869999999427
+        },
+        {
+          "id": "case_098",
+          "group": "short",
+          "delta_nll": -0.02443326999999995,
+          "delta_overlap": 0.0011471829999999406
+        },
+        {
+          "id": "case_099",
+          "group": "short",
+          "delta_nll": -0.006352742000000022,
+          "delta_overlap": -0.0001323579999999991
+        }
+      ]
+    },
+    "default-long": {
+      "baseline": {
+        "cases": 12,
+        "tokens": 763,
+        "nll": 0.19303299446788993,
+        "api_cases": 12,
+        "api_positions": 763,
+        "overlap_lower": 0.9564078935895405,
+        "overlap_upper": 0.9565677187690282,
+        "mapped_api_mass": 0.9998367180871512,
+        "top1_agreement": 0.9488859764089121,
+        "mean_lcp": 9.166666666666666
+      },
+      "candidate": {
+        "cases": 12,
+        "tokens": 763,
+        "nll": 0.19322797702883357,
+        "api_cases": 12,
+        "api_positions": 763,
+        "overlap_lower": 0.9568434099085926,
+        "overlap_upper": 0.9570035715012895,
+        "mapped_api_mass": 0.9998367180871512,
+        "top1_agreement": 0.9515072083879423,
+        "mean_lcp": 13.333333333333334
+      },
+      "delta_candidate_minus_baseline": {
+        "nll": 0.00019498256094363509,
+        "overlap_lower": 0.0004355163190521427,
+        "overlap_upper": 0.00043585273226121046,
+        "mapped_api_mass": 0.0,
+        "top1_agreement": 0.002621231979030192,
+        "mean_lcp": 4.166666666666668
+      },
+      "full_overlap_delta_bounds": [
+        0.0002756911395643824,
+        0.0005956779117489708
+      ],
+      "paired_prompt_bootstrap_95_percent": {
+        "nll": [
+          -0.002276695927916117,
+          0.0025928876055408955
+        ],
+        "overlap_lower": [
+          6.46506503240718e-06,
+          0.0008536896870832022
+        ],
+        "top1_agreement": [
+          0.0,
+          0.006510416666666667
+        ],
+        "mean_lcp": [
+          0.0,
+          12.5
+        ]
+      },
+      "nll_case_wins": {
+        "candidate": 5,
+        "baseline": 7
+      },
+      "per_case": [
+        {
+          "id": "case_100",
+          "group": "long-retrieval",
+          "delta_nll": 0.006315230000000005,
+          "delta_overlap": 0.00013742900000002223
+        },
+        {
+          "id": "case_101",
+          "group": "long-code",
+          "delta_nll": 0.003275762999999987,
+          "delta_overlap": 0.0005344980000000499
+        },
+        {
+          "id": "case_102",
+          "group": "long-italian",
+          "delta_nll": -0.0011352650000000016,
+          "delta_overlap": 0.0008125890000000302
+        },
+        {
+          "id": "case_103",
+          "group": "long-retrieval",
+          "delta_nll": -0.003529140000000014,
+          "delta_overlap": 0.0011381560000000013
+        },
+        {
+          "id": "case_104",
+          "group": "long-code",
+          "delta_nll": 0.0063506949999999895,
+          "delta_overlap": -0.0007094469999999742
+        },
+        {
+          "id": "case_105",
+          "group": "long-italian",
+          "delta_nll": -0.001541720999999996,
+          "delta_overlap": 0.00031548699999994767
+        },
+        {
+          "id": "case_106",
+          "group": "long-retrieval",
+          "delta_nll": 0.004380482000000019,
+          "delta_overlap": 0.0016437740000000423
+        },
+        {
+          "id": "case_107",
+          "group": "long-code",
+          "delta_nll": 0.0014819130000000014,
+          "delta_overlap": -0.0007632149999999838
+        },
+        {
+          "id": "case_108",
+          "group": "long-italian",
+          "delta_nll": 0.000407519999999998,
+          "delta_overlap": -0.0005236680000000327
+        },
+        {
+          "id": "case_109",
+          "group": "long-retrieval",
+          "delta_nll": -0.007627918000000011,
+          "delta_overlap": 0.0010187429999999331
+        },
+        {
+          "id": "case_110",
+          "group": "long-code",
+          "delta_nll": -0.006506306999999989,
+          "delta_overlap": 0.0011876279999999406
+        },
+        {
+          "id": "case_111",
+          "group": "long-italian",
+          "delta_nll": 0.0009466839999999997,
+          "delta_overlap": 0.0004109330000000577
+        }
+      ]
+    },
+    "default-aligned": {
+      "baseline": {
+        "cases": 111,
+        "tokens": 6858,
+        "nll": 0.3923029902645086,
+        "api_cases": 111,
+        "api_positions": 6858,
+        "overlap_lower": 0.9076234385363857,
+        "overlap_upper": 0.907847204764088,
+        "mapped_api_mass": 0.9997742120394976,
+        "top1_agreement": 0.9034703995333917,
+        "mean_lcp": 5.612612612612613
+      },
+      "candidate": {
+        "cases": 111,
+        "tokens": 6858,
+        "nll": 0.3908022596363371,
+        "api_cases": 111,
+        "api_positions": 6858,
+        "overlap_lower": 0.9076386474902038,
+        "overlap_upper": 0.9078617500120257,
+        "mapped_api_mass": 0.9997742120394976,
+        "top1_agreement": 0.9024496937882764,
+        "mean_lcp": 6.126126126126126
+      },
+      "delta_candidate_minus_baseline": {
+        "nll": -0.0015007306281715205,
+        "overlap_lower": 1.5208953818124371e-05,
+        "overlap_upper": 1.4545247937758354e-05,
+        "mapped_api_mass": 0.0,
+        "top1_agreement": -0.001020705745115258,
+        "mean_lcp": 0.5135135135135132
+      },
+      "full_overlap_delta_bounds": [
+        -0.0002085572738841357,
+        0.00023831147564001842
+      ],
+      "paired_prompt_bootstrap_95_percent": {
+        "nll": [
+          -0.0033875872761000834,
+          0.0002043658416641722
+        ],
+        "overlap_lower": [
+          -0.00037095189152338334,
+          0.0004288799224115898
+        ],
+        "top1_agreement": [
+          -0.0032319670926986926,
+          0.0013045368894042614
+        ],
+        "mean_lcp": [
+          -0.15315315315315314,
+          1.6036036036036037
+        ]
+      },
+      "nll_case_wins": {
+        "candidate": 63,
+        "baseline": 48
+      },
+      "per_case": [
+        {
+          "id": "case_000",
+          "group": "short",
+          "delta_nll": 0.011403150000000029,
+          "delta_overlap": -0.0008583569999999208
+        },
+        {
+          "id": "case_001",
+          "group": "short",
+          "delta_nll": -0.0008557969999999915,
+          "delta_overlap": 0.0005174760000000722
+        },
+        {
+          "id": "case_002",
+          "group": "short",
+          "delta_nll": 0.001862782999999979,
+          "delta_overlap": -0.0014293760000000377
+        },
+        {
+          "id": "case_003",
+          "group": "short",
+          "delta_nll": 0.010241794000000026,
+          "delta_overlap": -0.002728860999999916
+        },
+        {
+          "id": "case_004",
+          "group": "short",
+          "delta_nll": -0.0025657500000000055,
+          "delta_overlap": -0.0005082320000000529
+        },
+        {
+          "id": "case_005",
+          "group": "short",
+          "delta_nll": 0.013856000999999951,
+          "delta_overlap": -0.0008985599999999927
+        },
+        {
+          "id": "case_006",
+          "group": "short",
+          "delta_nll": 0.0009173920000000169,
+          "delta_overlap": -0.0008151969999999897
+        },
+        {
+          "id": "case_007",
+          "group": "short",
+          "delta_nll": -0.00838881800000002,
+          "delta_overlap": 0.00012072900000004161
+        },
+        {
+          "id": "case_008",
+          "group": "short",
+          "delta_nll": -0.005908128999999984,
+          "delta_overlap": -0.00029698899999996975
+        },
+        {
+          "id": "case_009",
+          "group": "short",
+          "delta_nll": -0.008091156000000016,
+          "delta_overlap": 0.004317893999999933
+        },
+        {
+          "id": "case_010",
+          "group": "short",
+          "delta_nll": -0.002015054999999988,
+          "delta_overlap": -0.000548380000000015
+        },
+        {
+          "id": "case_011",
+          "group": "short",
+          "delta_nll": -0.007150926000000002,
+          "delta_overlap": -0.0021215149999999072
+        },
+        {
+          "id": "case_012",
+          "group": "short",
+          "delta_nll": -0.0013709840000000195,
+          "delta_overlap": -0.0024422549999999488
+        },
+        {
+          "id": "case_013",
+          "group": "short",
+          "delta_nll": 0.005807300999999987,
+          "delta_overlap": 1.6533000000040765e-05
+        },
+        {
+          "id": "case_014",
+          "group": "short",
+          "delta_nll": 0.0018416230000000144,
+          "delta_overlap": -0.00025153199999994325
+        },
+        {
+          "id": "case_015",
+          "group": "short",
+          "delta_nll": 0.005341378000000008,
+          "delta_overlap": 0.003671402000000046
+        },
+        {
+          "id": "case_016",
+          "group": "short",
+          "delta_nll": 0.01712872000000004,
+          "delta_overlap": -0.0028361270000000216
+        },
+        {
+          "id": "case_017",
+          "group": "short",
+          "delta_nll": 0.006864806000000001,
+          "delta_overlap": 0.00011658700000005684
+        },
+        {
+          "id": "case_018",
+          "group": "short",
+          "delta_nll": 0.0029123730000000236,
+          "delta_overlap": 0.00024123399999997908
+        },
+        {
+          "id": "case_019",
+          "group": "short",
+          "delta_nll": -0.006806683000000091,
+          "delta_overlap": -0.00037783199999996686
+        },
+        {
+          "id": "case_020",
+          "group": "short",
+          "delta_nll": 0.003608265999999999,
+          "delta_overlap": 0.004566825999999913
+        },
+        {
+          "id": "case_021",
+          "group": "short",
+          "delta_nll": -0.010770953999999944,
+          "delta_overlap": 0.0060454759999999386
+        },
+        {
+          "id": "case_022",
+          "group": "short",
+          "delta_nll": -0.0003989580000000048,
+          "delta_overlap": 0.00032277499999999737
+        },
+        {
+          "id": "case_023",
+          "group": "short",
+          "delta_nll": -0.0027515889999999987,
+          "delta_overlap": -0.0015248310000000043
+        },
+        {
+          "id": "case_024",
+          "group": "short",
+          "delta_nll": -0.0017452890000000387,
+          "delta_overlap": 0.0004505070000000444
+        },
+        {
+          "id": "case_025",
+          "group": "short",
+          "delta_nll": -0.010312649000000007,
+          "delta_overlap": -0.000739196000000053
+        },
+        {
+          "id": "case_026",
+          "group": "short",
+          "delta_nll": -0.000589046000000093,
+          "delta_overlap": -0.0012487150000000113
+        },
+        {
+          "id": "case_027",
+          "group": "short",
+          "delta_nll": 0.00030347299999999855,
+          "delta_overlap": -0.00037947200000010284
+        },
+        {
+          "id": "case_028",
+          "group": "short",
+          "delta_nll": 0.0033526310000000503,
+          "delta_overlap": -0.0015442979999999995
+        },
+        {
+          "id": "case_029",
+          "group": "short",
+          "delta_nll": 0.010108919999999966,
+          "delta_overlap": 0.002694634000000029
+        },
+        {
+          "id": "case_030",
+          "group": "short",
+          "delta_nll": 0.0012836360000000047,
+          "delta_overlap": 9.436599999990136e-05
+        },
+        {
+          "id": "case_031",
+          "group": "short",
+          "delta_nll": 0.005825339999999957,
+          "delta_overlap": 0.0004076350000000728
+        },
+        {
+          "id": "case_032",
+          "group": "short",
+          "delta_nll": -0.0015324480000000196,
+          "delta_overlap": 0.0003851940000000331
+        },
+        {
+          "id": "case_033",
+          "group": "short",
+          "delta_nll": 0.012565839999999995,
+          "delta_overlap": -0.0014195569999999602
+        },
+        {
+          "id": "case_034",
+          "group": "short",
+          "delta_nll": -0.0035719029999999874,
+          "delta_overlap": -0.0009593799999999542
+        },
+        {
+          "id": "case_035",
+          "group": "short",
+          "delta_nll": 0.0013257009999999847,
+          "delta_overlap": 0.0005894539999999893
+        },
+        {
+          "id": "case_036",
+          "group": "short",
+          "delta_nll": -0.001732874999999967,
+          "delta_overlap": 0.0007830250000000483
+        },
+        {
+          "id": "case_037",
+          "group": "short",
+          "delta_nll": 2.154700000001064e-05,
+          "delta_overlap": 0.0009679879999999752
+        },
+        {
+          "id": "case_038",
+          "group": "short",
+          "delta_nll": 0.013202118999999957,
+          "delta_overlap": -0.0023532200000000447
+        },
+        {
+          "id": "case_039",
+          "group": "short",
+          "delta_nll": -0.0036614879999999905,
+          "delta_overlap": -0.0006341199999999603
+        },
+        {
+          "id": "case_040",
+          "group": "short",
+          "delta_nll": -0.0044598929999999926,
+          "delta_overlap": -0.0014965120000000054
+        },
+        {
+          "id": "case_041",
+          "group": "short",
+          "delta_nll": -0.0014435770000000292,
+          "delta_overlap": 0.0006409560000000258
+        },
+        {
+          "id": "case_042",
+          "group": "short",
+          "delta_nll": -0.005286910000000006,
+          "delta_overlap": 0.001780271
+        },
+        {
+          "id": "case_043",
+          "group": "short",
+          "delta_nll": -0.000959034999999997,
+          "delta_overlap": 0.000897071000000027
+        },
+        {
+          "id": "case_044",
+          "group": "short",
+          "delta_nll": 0.008975538000000005,
+          "delta_overlap": -0.0003819840000000019
+        },
+        {
+          "id": "case_045",
+          "group": "short",
+          "delta_nll": -0.010254578999999986,
+          "delta_overlap": 0.0024198409999999226
+        },
+        {
+          "id": "case_046",
+          "group": "short",
+          "delta_nll": 0.0036985459999999692,
+          "delta_overlap": -0.00034716600000006537
+        },
+        {
+          "id": "case_048",
+          "group": "short",
+          "delta_nll": -0.002226773000000015,
+          "delta_overlap": -0.0005747710000000295
+        },
+        {
+          "id": "case_049",
+          "group": "short",
+          "delta_nll": -0.020480598999999988,
+          "delta_overlap": -0.0007529219999999892
+        },
+        {
+          "id": "case_050",
+          "group": "short",
+          "delta_nll": 0.002736776999999968,
+          "delta_overlap": -0.0017181320000000389
+        },
+        {
+          "id": "case_051",
+          "group": "short",
+          "delta_nll": 0.005276205000000006,
+          "delta_overlap": 0.00027743999999996216
+        },
+        {
+          "id": "case_052",
+          "group": "short",
+          "delta_nll": -0.020349284000000023,
+          "delta_overlap": -0.00423334799999997
+        },
+        {
+          "id": "case_053",
+          "group": "short",
+          "delta_nll": -0.002327242999999979,
+          "delta_overlap": -0.002300711999999927
+        },
+        {
+          "id": "case_054",
+          "group": "short",
+          "delta_nll": -0.06381324900000007,
+          "delta_overlap": 0.00891243900000005
+        },
+        {
+          "id": "case_055",
+          "group": "short",
+          "delta_nll": -0.001511307999999989,
+          "delta_overlap": -0.0006488369999999577
+        },
+        {
+          "id": "case_056",
+          "group": "short",
+          "delta_nll": -0.0013171719999999776,
+          "delta_overlap": -0.00376339399999992
+        },
+        {
+          "id": "case_057",
+          "group": "short",
+          "delta_nll": -0.007857168999999997,
+          "delta_overlap": 0.0036267620000000056
+        },
+        {
+          "id": "case_058",
+          "group": "short",
+          "delta_nll": -0.005470372000000001,
+          "delta_overlap": 2.6022000000014422e-05
+        },
+        {
+          "id": "case_059",
+          "group": "short",
+          "delta_nll": 0.005538952999999999,
+          "delta_overlap": -0.002642420000000034
+        },
+        {
+          "id": "case_060",
+          "group": "short",
+          "delta_nll": -0.0029058470000000725,
+          "delta_overlap": 0.0015572510000000372
+        },
+        {
+          "id": "case_061",
+          "group": "short",
+          "delta_nll": 0.007295620999999919,
+          "delta_overlap": -0.0016887389999999947
+        },
+        {
+          "id": "case_062",
+          "group": "short",
+          "delta_nll": 0.002924766999999995,
+          "delta_overlap": 0.0013755049999999436
+        },
+        {
+          "id": "case_063",
+          "group": "short",
+          "delta_nll": 0.007702501000000028,
+          "delta_overlap": 0.0011544879999999536
+        },
+        {
+          "id": "case_064",
+          "group": "short",
+          "delta_nll": 0.019098142,
+          "delta_overlap": -0.010187695000000052
+        },
+        {
+          "id": "case_065",
+          "group": "short",
+          "delta_nll": 0.015181283000000004,
+          "delta_overlap": 0.0006017929999999616
+        },
+        {
+          "id": "case_066",
+          "group": "short",
+          "delta_nll": -0.008889528000000008,
+          "delta_overlap": 0.002675199000000017
+        },
+        {
+          "id": "case_067",
+          "group": "short",
+          "delta_nll": -0.02035678000000002,
+          "delta_overlap": -0.002397840999999956
+        },
+        {
+          "id": "case_068",
+          "group": "short",
+          "delta_nll": -0.004799266999999996,
+          "delta_overlap": -0.001679821999999942
+        },
+        {
+          "id": "case_069",
+          "group": "short",
+          "delta_nll": -0.0025578420000000046,
+          "delta_overlap": 0.00023300800000003452
+        },
+        {
+          "id": "case_070",
+          "group": "short",
+          "delta_nll": -0.007665837000000009,
+          "delta_overlap": 0.002779348000000015
+        },
+        {
+          "id": "case_071",
+          "group": "short",
+          "delta_nll": -0.0069459210000000216,
+          "delta_overlap": -0.0006427020000000505
+        },
+        {
+          "id": "case_072",
+          "group": "short",
+          "delta_nll": -0.0025777490000000007,
+          "delta_overlap": 0.00204089399999996
+        },
+        {
+          "id": "case_073",
+          "group": "short",
+          "delta_nll": 0.012287510000000057,
+          "delta_overlap": -0.0016807829999999635
+        },
+        {
+          "id": "case_074",
+          "group": "short",
+          "delta_nll": -0.009141767000000023,
+          "delta_overlap": -0.0047506929999999725
+        },
+        {
+          "id": "case_075",
+          "group": "short",
+          "delta_nll": 0.0019376589999999805,
+          "delta_overlap": 0.0012257419999999186
+        },
+        {
+          "id": "case_076",
+          "group": "short",
+          "delta_nll": 0.004430355,
+          "delta_overlap": -0.0035491590000000794
+        },
+        {
+          "id": "case_077",
+          "group": "short",
+          "delta_nll": -0.0014207529999999968,
+          "delta_overlap": -0.00038738100000001996
+        },
+        {
+          "id": "case_078",
+          "group": "short",
+          "delta_nll": -0.008810285000000001,
+          "delta_overlap": 0.0018101990000000123
+        },
+        {
+          "id": "case_079",
+          "group": "short",
+          "delta_nll": -0.0035943030000000764,
+          "delta_overlap": -0.00044662699999997724
+        },
+        {
+          "id": "case_080",
+          "group": "short",
+          "delta_nll": -0.012394162000000042,
+          "delta_overlap": 0.0010610620000000015
+        },
+        {
+          "id": "case_081",
+          "group": "short",
+          "delta_nll": -0.005006242999999966,
+          "delta_overlap": 0.0005819710000000144
+        },
+        {
+          "id": "case_082",
+          "group": "short",
+          "delta_nll": 0.009564450999999974,
+          "delta_overlap": -0.0030088910000000135
+        },
+        {
+          "id": "case_083",
+          "group": "short",
+          "delta_nll": 0.00024561100000003444,
+          "delta_overlap": -0.001216321999999992
+        },
+        {
+          "id": "case_084",
+          "group": "short",
+          "delta_nll": -0.0008632040000000063,
+          "delta_overlap": 0.0013928530000000272
+        },
+        {
+          "id": "case_085",
+          "group": "short",
+          "delta_nll": -5.688799999992167e-05,
+          "delta_overlap": -0.0005723730000000149
+        },
+        {
+          "id": "case_086",
+          "group": "short",
+          "delta_nll": -0.0019388780000000327,
+          "delta_overlap": -0.004260265999999957
+        },
+        {
+          "id": "case_087",
+          "group": "short",
+          "delta_nll": 2.1620000000055484e-05,
+          "delta_overlap": -0.0019731849999999884
+        },
+        {
+          "id": "case_088",
+          "group": "short",
+          "delta_nll": -0.0001070440000000561,
+          "delta_overlap": 0.005435458999999976
+        },
+        {
+          "id": "case_089",
+          "group": "short",
+          "delta_nll": -0.003742580999999995,
+          "delta_overlap": 0.0007531680000000263
+        },
+        {
+          "id": "case_090",
+          "group": "short",
+          "delta_nll": 0.007595055999999989,
+          "delta_overlap": -0.003217417
+        },
+        {
+          "id": "case_091",
+          "group": "short",
+          "delta_nll": 5.0331999999930765e-05,
+          "delta_overlap": 0.0028196560000000037
+        },
+        {
+          "id": "case_092",
+          "group": "short",
+          "delta_nll": -0.0017475329999999678,
+          "delta_overlap": 0.0017938209999999177
+        },
+        {
+          "id": "case_093",
+          "group": "short",
+          "delta_nll": 0.002355735000000081,
+          "delta_overlap": -0.000813701
+        },
+        {
+          "id": "case_094",
+          "group": "short",
+          "delta_nll": -0.0038800209999999558,
+          "delta_overlap": 0.0009211719999999701
+        },
+        {
+          "id": "case_095",
+          "group": "short",
+          "delta_nll": 0.002596977000000056,
+          "delta_overlap": -0.000279837000000005
+        },
+        {
+          "id": "case_096",
+          "group": "short",
+          "delta_nll": -0.010001660999999995,
+          "delta_overlap": 0.001705161000000066
+        },
+        {
+          "id": "case_097",
+          "group": "short",
+          "delta_nll": -0.005118591000000006,
+          "delta_overlap": -0.0013789869999999427
+        },
+        {
+          "id": "case_098",
+          "group": "short",
+          "delta_nll": -0.02443326999999995,
+          "delta_overlap": 0.0011471829999999406
+        },
+        {
+          "id": "case_099",
+          "group": "short",
+          "delta_nll": -0.006352742000000022,
+          "delta_overlap": -0.0001323579999999991
+        },
+        {
+          "id": "case_100",
+          "group": "long-retrieval",
+          "delta_nll": 0.006315230000000005,
+          "delta_overlap": 0.00013742900000002223
+        },
+        {
+          "id": "case_101",
+          "group": "long-code",
+          "delta_nll": 0.003275762999999987,
+          "delta_overlap": 0.0005344980000000499
+        },
+        {
+          "id": "case_102",
+          "group": "long-italian",
+          "delta_nll": -0.0011352650000000016,
+          "delta_overlap": 0.0008125890000000302
+        },
+        {
+          "id": "case_103",
+          "group": "long-retrieval",
+          "delta_nll": -0.003529140000000014,
+          "delta_overlap": 0.0011381560000000013
+        },
+        {
+          "id": "case_104",
+          "group": "long-code",
+          "delta_nll": 0.0063506949999999895,
+          "delta_overlap": -0.0007094469999999742
+        },
+        {
+          "id": "case_105",
+          "group": "long-italian",
+          "delta_nll": -0.001541720999999996,
+          "delta_overlap": 0.00031548699999994767
+        },
+        {
+          "id": "case_106",
+          "group": "long-retrieval",
+          "delta_nll": 0.004380482000000019,
+          "delta_overlap": 0.0016437740000000423
+        },
+        {
+          "id": "case_107",
+          "group": "long-code",
+          "delta_nll": 0.0014819130000000014,
+          "delta_overlap": -0.0007632149999999838
+        },
+        {
+          "id": "case_108",
+          "group": "long-italian",
+          "delta_nll": 0.000407519999999998,
+          "delta_overlap": -0.0005236680000000327
+        },
+        {
+          "id": "case_109",
+          "group": "long-retrieval",
+          "delta_nll": -0.007627918000000011,
+          "delta_overlap": 0.0010187429999999331
+        },
+        {
+          "id": "case_110",
+          "group": "long-code",
+          "delta_nll": -0.006506306999999989,
+          "delta_overlap": 0.0011876279999999406
+        },
+        {
+          "id": "case_111",
+          "group": "long-italian",
+          "delta_nll": 0.0009466839999999997,
+          "delta_overlap": 0.0004109330000000577
+        }
+      ]
+    },
+    "default-sensitivity": {
+      "baseline": {
+        "cases": 37,
+        "tokens": 2228,
+        "nll": 0.3021088424376122,
+        "api_cases": 37,
+        "api_positions": 2228,
+        "overlap_lower": 0.924555874870763,
+        "overlap_upper": 0.9246598303358814,
+        "mapped_api_mass": 0.9998935768351748,
+        "top1_agreement": 0.9183123877917415,
+        "mean_lcp": 6.864864864864865
+      },
+      "candidate": {
+        "cases": 37,
+        "tokens": 2228,
+        "nll": 0.3015224233070018,
+        "api_cases": 37,
+        "api_positions": 2228,
+        "overlap_lower": 0.9245212255613777,
+        "overlap_upper": 0.9246253238388548,
+        "mapped_api_mass": 0.9998935768351748,
+        "top1_agreement": 0.9169658886894075,
+        "mean_lcp": 8.45945945945946
+      },
+      "delta_candidate_minus_baseline": {
+        "nll": -0.0005864191306104161,
+        "overlap_lower": -3.464930938523736e-05,
+        "overlap_upper": -3.450649702663178e-05,
+        "mapped_api_mass": 0.0,
+        "top1_agreement": -0.0013464991023339756,
+        "mean_lcp": 1.5945945945945947
+      },
+      "full_overlap_delta_bounds": [
+        -0.00013860477450367004,
+        6.94489680918009e-05
+      ],
+      "paired_prompt_bootstrap_95_percent": {
+        "nll": [
+          -0.002829212016766977,
+          0.0016345148401297476
+        ],
+        "overlap_lower": [
+          -0.0007223124472199932,
+          0.0006337552604736894
+        ],
+        "top1_agreement": [
+          -0.00408905043162199,
+          0.0013895321908290875
+        ],
+        "mean_lcp": [
+          0.0,
+          4.54054054054054
+        ]
+      },
+      "nll_case_wins": {
+        "candidate": 23,
+        "baseline": 14
+      },
+      "per_case": [
+        {
+          "id": "case_000",
+          "group": "short",
+          "delta_nll": 0.011403150000000029,
+          "delta_overlap": -0.0008583569999999208
+        },
+        {
+          "id": "case_004",
+          "group": "short",
+          "delta_nll": -0.0025657500000000055,
+          "delta_overlap": -0.0005082320000000529
+        },
+        {
+          "id": "case_008",
+          "group": "short",
+          "delta_nll": -0.005908128999999984,
+          "delta_overlap": -0.00029698899999996975
+        },
+        {
+          "id": "case_012",
+          "group": "short",
+          "delta_nll": -0.0013709840000000195,
+          "delta_overlap": -0.0024422549999999488
+        },
+        {
+          "id": "case_016",
+          "group": "short",
+          "delta_nll": 0.01712872000000004,
+          "delta_overlap": -0.0028361270000000216
+        },
+        {
+          "id": "case_020",
+          "group": "short",
+          "delta_nll": 0.003608265999999999,
+          "delta_overlap": 0.004566825999999913
+        },
+        {
+          "id": "case_024",
+          "group": "short",
+          "delta_nll": -0.0017452890000000387,
+          "delta_overlap": 0.0004505070000000444
+        },
+        {
+          "id": "case_028",
+          "group": "short",
+          "delta_nll": 0.0033526310000000503,
+          "delta_overlap": -0.0015442979999999995
+        },
+        {
+          "id": "case_032",
+          "group": "short",
+          "delta_nll": -0.0015324480000000196,
+          "delta_overlap": 0.0003851940000000331
+        },
+        {
+          "id": "case_036",
+          "group": "short",
+          "delta_nll": -0.001732874999999967,
+          "delta_overlap": 0.0007830250000000483
+        },
+        {
+          "id": "case_040",
+          "group": "short",
+          "delta_nll": -0.0044598929999999926,
+          "delta_overlap": -0.0014965120000000054
+        },
+        {
+          "id": "case_044",
+          "group": "short",
+          "delta_nll": 0.008975538000000005,
+          "delta_overlap": -0.0003819840000000019
+        },
+        {
+          "id": "case_048",
+          "group": "short",
+          "delta_nll": -0.002226773000000015,
+          "delta_overlap": -0.0005747710000000295
+        },
+        {
+          "id": "case_052",
+          "group": "short",
+          "delta_nll": -0.020349284000000023,
+          "delta_overlap": -0.00423334799999997
+        },
+        {
+          "id": "case_056",
+          "group": "short",
+          "delta_nll": -0.0013171719999999776,
+          "delta_overlap": -0.00376339399999992
+        },
+        {
+          "id": "case_060",
+          "group": "short",
+          "delta_nll": -0.0029058470000000725,
+          "delta_overlap": 0.0015572510000000372
+        },
+        {
+          "id": "case_064",
+          "group": "short",
+          "delta_nll": 0.019098142,
+          "delta_overlap": -0.010187695000000052
+        },
+        {
+          "id": "case_068",
+          "group": "short",
+          "delta_nll": -0.004799266999999996,
+          "delta_overlap": -0.001679821999999942
+        },
+        {
+          "id": "case_072",
+          "group": "short",
+          "delta_nll": -0.0025777490000000007,
+          "delta_overlap": 0.00204089399999996
+        },
+        {
+          "id": "case_076",
+          "group": "short",
+          "delta_nll": 0.004430355,
+          "delta_overlap": -0.0035491590000000794
+        },
+        {
+          "id": "case_080",
+          "group": "short",
+          "delta_nll": -0.012394162000000042,
+          "delta_overlap": 0.0010610620000000015
+        },
+        {
+          "id": "case_084",
+          "group": "short",
+          "delta_nll": -0.0008632040000000063,
+          "delta_overlap": 0.0013928530000000272
+        },
+        {
+          "id": "case_088",
+          "group": "short",
+          "delta_nll": -0.0001070440000000561,
+          "delta_overlap": 0.005435458999999976
+        },
+        {
+          "id": "case_092",
+          "group": "short",
+          "delta_nll": -0.0017475329999999678,
+          "delta_overlap": 0.0017938209999999177
+        },
+        {
+          "id": "case_096",
+          "group": "short",
+          "delta_nll": -0.010001660999999995,
+          "delta_overlap": 0.001705161000000066
+        },
+        {
+          "id": "case_100",
+          "group": "long-retrieval",
+          "delta_nll": 0.006315230000000005,
+          "delta_overlap": 0.00013742900000002223
+        },
+        {
+          "id": "case_101",
+          "group": "long-code",
+          "delta_nll": 0.003275762999999987,
+          "delta_overlap": 0.0005344980000000499
+        },
+        {
+          "id": "case_102",
+          "group": "long-italian",
+          "delta_nll": -0.0011352650000000016,
+          "delta_overlap": 0.0008125890000000302
+        },
+        {
+          "id": "case_103",
+          "group": "long-retrieval",
+          "delta_nll": -0.003529140000000014,
+          "delta_overlap": 0.0011381560000000013
+        },
+        {
+          "id": "case_104",
+          "group": "long-code",
+          "delta_nll": 0.0063506949999999895,
+          "delta_overlap": -0.0007094469999999742
+        },
+        {
+          "id": "case_105",
+          "group": "long-italian",
+          "delta_nll": -0.001541720999999996,
+          "delta_overlap": 0.00031548699999994767
+        },
+        {
+          "id": "case_106",
+          "group": "long-retrieval",
+          "delta_nll": 0.004380482000000019,
+          "delta_overlap": 0.0016437740000000423
+        },
+        {
+          "id": "case_107",
+          "group": "long-code",
+          "delta_nll": 0.0014819130000000014,
+          "delta_overlap": -0.0007632149999999838
+        },
+        {
+          "id": "case_108",
+          "group": "long-italian",
+          "delta_nll": 0.000407519999999998,
+          "delta_overlap": -0.0005236680000000327
+        },
+        {
+          "id": "case_109",
+          "group": "long-retrieval",
+          "delta_nll": -0.007627918000000011,
+          "delta_overlap": 0.0010187429999999331
+        },
+        {
+          "id": "case_110",
+          "group": "long-code",
+          "delta_nll": -0.006506306999999989,
+          "delta_overlap": 0.0011876279999999406
+        },
+        {
+          "id": "case_111",
+          "group": "long-italian",
+          "delta_nll": 0.0009466839999999997,
+          "delta_overlap": 0.0004109330000000577
+        }
+      ]
+    },
+    "continued1-all": {
+      "baseline": {
+        "cases": 37,
+        "tokens": 2228,
+        "nll": 0.30114761165574505,
+        "api_cases": 37,
+        "api_positions": 2228,
+        "overlap_lower": 0.9247953804500031,
+        "overlap_upper": 0.9248995989372425,
+        "mapped_api_mass": 0.9998935768351748,
+        "top1_agreement": 0.9187612208258528,
+        "mean_lcp": 9.567567567567568
+      },
+      "candidate": {
+        "cases": 37,
+        "tokens": 2228,
+        "nll": 0.3001110724851885,
+        "api_cases": 37,
+        "api_positions": 2228,
+        "overlap_lower": 0.9247677479925762,
+        "overlap_upper": 0.9248721297349352,
+        "mapped_api_mass": 0.9998935768351748,
+        "top1_agreement": 0.9169658886894075,
+        "mean_lcp": 9.81081081081081
+      },
+      "delta_candidate_minus_baseline": {
+        "nll": -0.0010365391705565719,
+        "overlap_lower": -2.7632457426873813e-05,
+        "overlap_upper": -2.7469202307339735e-05,
+        "mapped_api_mass": 0.0,
+        "top1_agreement": -0.0017953321364452268,
+        "mean_lcp": 0.2432432432432421
+      },
+      "full_overlap_delta_bounds": [
+        -0.00013185094466627856,
+        7.674928493206501e-05
+      ],
+      "paired_prompt_bootstrap_95_percent": {
+        "nll": [
+          -0.003268464835689046,
+          0.0012012624814329465
+        ],
+        "overlap_lower": [
+          -0.0007447176844697685,
+          0.00066297730745156
+        ],
+        "top1_agreement": [
+          -0.004476275738585497,
+          0.0008869179600886918
+        ],
+        "mean_lcp": [
+          0.0,
+          0.7297297297297297
+        ]
+      },
+      "nll_case_wins": {
+        "candidate": 26,
+        "baseline": 11
+      },
+      "per_case": [
+        {
+          "id": "case_000",
+          "group": "short",
+          "delta_nll": 0.011403150000000029,
+          "delta_overlap": -0.0008583569999999208
+        },
+        {
+          "id": "case_004",
+          "group": "short",
+          "delta_nll": -0.0025657500000000055,
+          "delta_overlap": -0.0005082320000000529
+        },
+        {
+          "id": "case_008",
+          "group": "short",
+          "delta_nll": -0.005908128999999984,
+          "delta_overlap": -0.00029698899999996975
+        },
+        {
+          "id": "case_012",
+          "group": "short",
+          "delta_nll": -0.0013709840000000195,
+          "delta_overlap": -0.0024422549999999488
+        },
+        {
+          "id": "case_016",
+          "group": "short",
+          "delta_nll": 0.01712872000000004,
+          "delta_overlap": -0.0028361270000000216
+        },
+        {
+          "id": "case_020",
+          "group": "short",
+          "delta_nll": 0.003608265999999999,
+          "delta_overlap": 0.004566825999999913
+        },
+        {
+          "id": "case_024",
+          "group": "short",
+          "delta_nll": -0.0017452890000000387,
+          "delta_overlap": 0.0004505070000000444
+        },
+        {
+          "id": "case_028",
+          "group": "short",
+          "delta_nll": 0.0033526310000000503,
+          "delta_overlap": -0.0015442979999999995
+        },
+        {
+          "id": "case_032",
+          "group": "short",
+          "delta_nll": -0.0015324480000000196,
+          "delta_overlap": 0.0003851940000000331
+        },
+        {
+          "id": "case_036",
+          "group": "short",
+          "delta_nll": -0.001732874999999967,
+          "delta_overlap": 0.0007830250000000483
+        },
+        {
+          "id": "case_040",
+          "group": "short",
+          "delta_nll": -0.0044598929999999926,
+          "delta_overlap": -0.0014965120000000054
+        },
+        {
+          "id": "case_044",
+          "group": "short",
+          "delta_nll": 0.008975538000000005,
+          "delta_overlap": -0.0003819840000000019
+        },
+        {
+          "id": "case_048",
+          "group": "short",
+          "delta_nll": -0.002226773000000015,
+          "delta_overlap": -0.0005747710000000295
+        },
+        {
+          "id": "case_052",
+          "group": "short",
+          "delta_nll": -0.020349284000000023,
+          "delta_overlap": -0.00423334799999997
+        },
+        {
+          "id": "case_056",
+          "group": "short",
+          "delta_nll": -0.0013171719999999776,
+          "delta_overlap": -0.00376339399999992
+        },
+        {
+          "id": "case_060",
+          "group": "short",
+          "delta_nll": -0.0029058470000000725,
+          "delta_overlap": 0.0015572510000000372
+        },
+        {
+          "id": "case_064",
+          "group": "short",
+          "delta_nll": 0.019098142,
+          "delta_overlap": -0.010187695000000052
+        },
+        {
+          "id": "case_068",
+          "group": "short",
+          "delta_nll": -0.004799266999999996,
+          "delta_overlap": -0.001679821999999942
+        },
+        {
+          "id": "case_072",
+          "group": "short",
+          "delta_nll": -0.0025777490000000007,
+          "delta_overlap": 0.00204089399999996
+        },
+        {
+          "id": "case_076",
+          "group": "short",
+          "delta_nll": 0.004430355,
+          "delta_overlap": -0.0035491590000000794
+        },
+        {
+          "id": "case_080",
+          "group": "short",
+          "delta_nll": -0.012394162000000042,
+          "delta_overlap": 0.0010610620000000015
+        },
+        {
+          "id": "case_084",
+          "group": "short",
+          "delta_nll": -0.0008632040000000063,
+          "delta_overlap": 0.0013928530000000272
+        },
+        {
+          "id": "case_088",
+          "group": "short",
+          "delta_nll": -0.0001070440000000561,
+          "delta_overlap": 0.005435458999999976
+        },
+        {
+          "id": "case_092",
+          "group": "short",
+          "delta_nll": -0.0017475329999999678,
+          "delta_overlap": 0.0017938209999999177
+        },
+        {
+          "id": "case_096",
+          "group": "short",
+          "delta_nll": -0.010001660999999995,
+          "delta_overlap": 0.001705161000000066
+        },
+        {
+          "id": "case_100",
+          "group": "long-retrieval",
+          "delta_nll": -0.007992184999999999,
+          "delta_overlap": 0.0014403449999998985
+        },
+        {
+          "id": "case_101",
+          "group": "long-code",
+          "delta_nll": 0.006063197999999992,
+          "delta_overlap": -0.002144936999999958
+        },
+        {
+          "id": "case_102",
+          "group": "long-italian",
+          "delta_nll": -0.00016133800000000045,
+          "delta_overlap": -5.2987999999976054e-05
+        },
+        {
+          "id": "case_103",
+          "group": "long-retrieval",
+          "delta_nll": -0.003529140000000014,
+          "delta_overlap": 0.0011381560000000013
+        },
+        {
+          "id": "case_104",
+          "group": "long-code",
+          "delta_nll": 0.005552376999999997,
+          "delta_overlap": -0.0015344219999999797
+        },
+        {
+          "id": "case_105",
+          "group": "long-italian",
+          "delta_nll": -0.0036016620000000055,
+          "delta_overlap": 0.0015964620000000762
+        },
+        {
+          "id": "case_106",
+          "group": "long-retrieval",
+          "delta_nll": 0.004380482000000019,
+          "delta_overlap": 0.0016437740000000423
+        },
+        {
+          "id": "case_107",
+          "group": "long-code",
+          "delta_nll": 0.0014819130000000014,
+          "delta_overlap": -0.0007632149999999838
+        },
+        {
+          "id": "case_108",
+          "group": "long-italian",
+          "delta_nll": -0.0012411059999999988,
+          "delta_overlap": 0.0009195850000000005
+        },
+        {
+          "id": "case_109",
+          "group": "long-retrieval",
+          "delta_nll": -0.007627918000000011,
+          "delta_overlap": 0.0010187429999999331
+        },
+        {
+          "id": "case_110",
+          "group": "long-code",
+          "delta_nll": -0.005581690000000028,
+          "delta_overlap": 0.0018346639999999859
+        },
+        {
+          "id": "case_111",
+          "group": "long-italian",
+          "delta_nll": -0.0017125679999999994,
+          "delta_overlap": 0.0004528059999999723
+        }
+      ]
+    },
+    "continued1-short": {
+      "baseline": {
+        "cases": 25,
+        "tokens": 1465,
+        "nll": 0.35891762878634814,
+        "api_cases": 25,
+        "api_positions": 1465,
+        "overlap_lower": 0.9079667347462393,
+        "overlap_upper": 0.908041592196297,
+        "mapped_api_mass": 0.9999231899578657,
+        "top1_agreement": 0.9023890784982935,
+        "mean_lcp": 5.76
+      },
+      "candidate": {
+        "cases": 25,
+        "tokens": 1465,
+        "nll": 0.3579242407201365,
+        "api_cases": 25,
+        "api_positions": 1465,
+        "overlap_lower": 0.907687214191463,
+        "overlap_upper": 0.9077621136228564,
+        "mapped_api_mass": 0.9999231899578657,
+        "top1_agreement": 0.898976109215017,
+        "mean_lcp": 6.12
+      },
+      "delta_candidate_minus_baseline": {
+        "nll": -0.0009933880662116312,
+        "overlap_lower": -0.00027952055477631355,
+        "overlap_upper": -0.0002794785734405725,
+        "mapped_api_mass": 0.0,
+        "top1_agreement": -0.0034129692832765013,
+        "mean_lcp": 0.3600000000000003
+      },
+      "full_overlap_delta_bounds": [
+        -0.0003543780048339551,
+        -0.00020462112338293093
+      ],
+      "paired_prompt_bootstrap_95_percent": {
+        "nll": [
+          -0.004042382225290694,
+          0.002163551289915962
+        ],
+        "overlap_lower": [
+          -0.0012906256276768197,
+          0.0007399100312331999
+        ],
+        "top1_agreement": [
+          -0.007047216349541931,
+          0.0006435006435006435
+        ],
+        "mean_lcp": [
+          0.0,
+          1.08
+        ]
+      },
+      "nll_case_wins": {
+        "candidate": 18,
+        "baseline": 7
+      },
+      "per_case": [
+        {
+          "id": "case_000",
+          "group": "short",
+          "delta_nll": 0.011403150000000029,
+          "delta_overlap": -0.0008583569999999208
+        },
+        {
+          "id": "case_004",
+          "group": "short",
+          "delta_nll": -0.0025657500000000055,
+          "delta_overlap": -0.0005082320000000529
+        },
+        {
+          "id": "case_008",
+          "group": "short",
+          "delta_nll": -0.005908128999999984,
+          "delta_overlap": -0.00029698899999996975
+        },
+        {
+          "id": "case_012",
+          "group": "short",
+          "delta_nll": -0.0013709840000000195,
+          "delta_overlap": -0.0024422549999999488
+        },
+        {
+          "id": "case_016",
+          "group": "short",
+          "delta_nll": 0.01712872000000004,
+          "delta_overlap": -0.0028361270000000216
+        },
+        {
+          "id": "case_020",
+          "group": "short",
+          "delta_nll": 0.003608265999999999,
+          "delta_overlap": 0.004566825999999913
+        },
+        {
+          "id": "case_024",
+          "group": "short",
+          "delta_nll": -0.0017452890000000387,
+          "delta_overlap": 0.0004505070000000444
+        },
+        {
+          "id": "case_028",
+          "group": "short",
+          "delta_nll": 0.0033526310000000503,
+          "delta_overlap": -0.0015442979999999995
+        },
+        {
+          "id": "case_032",
+          "group": "short",
+          "delta_nll": -0.0015324480000000196,
+          "delta_overlap": 0.0003851940000000331
+        },
+        {
+          "id": "case_036",
+          "group": "short",
+          "delta_nll": -0.001732874999999967,
+          "delta_overlap": 0.0007830250000000483
+        },
+        {
+          "id": "case_040",
+          "group": "short",
+          "delta_nll": -0.0044598929999999926,
+          "delta_overlap": -0.0014965120000000054
+        },
+        {
+          "id": "case_044",
+          "group": "short",
+          "delta_nll": 0.008975538000000005,
+          "delta_overlap": -0.0003819840000000019
+        },
+        {
+          "id": "case_048",
+          "group": "short",
+          "delta_nll": -0.002226773000000015,
+          "delta_overlap": -0.0005747710000000295
+        },
+        {
+          "id": "case_052",
+          "group": "short",
+          "delta_nll": -0.020349284000000023,
+          "delta_overlap": -0.00423334799999997
+        },
+        {
+          "id": "case_056",
+          "group": "short",
+          "delta_nll": -0.0013171719999999776,
+          "delta_overlap": -0.00376339399999992
+        },
+        {
+          "id": "case_060",
+          "group": "short",
+          "delta_nll": -0.0029058470000000725,
+          "delta_overlap": 0.0015572510000000372
+        },
+        {
+          "id": "case_064",
+          "group": "short",
+          "delta_nll": 0.019098142,
+          "delta_overlap": -0.010187695000000052
+        },
+        {
+          "id": "case_068",
+          "group": "short",
+          "delta_nll": -0.004799266999999996,
+          "delta_overlap": -0.001679821999999942
+        },
+        {
+          "id": "case_072",
+          "group": "short",
+          "delta_nll": -0.0025777490000000007,
+          "delta_overlap": 0.00204089399999996
+        },
+        {
+          "id": "case_076",
+          "group": "short",
+          "delta_nll": 0.004430355,
+          "delta_overlap": -0.0035491590000000794
+        },
+        {
+          "id": "case_080",
+          "group": "short",
+          "delta_nll": -0.012394162000000042,
+          "delta_overlap": 0.0010610620000000015
+        },
+        {
+          "id": "case_084",
+          "group": "short",
+          "delta_nll": -0.0008632040000000063,
+          "delta_overlap": 0.0013928530000000272
+        },
+        {
+          "id": "case_088",
+          "group": "short",
+          "delta_nll": -0.0001070440000000561,
+          "delta_overlap": 0.005435458999999976
+        },
+        {
+          "id": "case_092",
+          "group": "short",
+          "delta_nll": -0.0017475329999999678,
+          "delta_overlap": 0.0017938209999999177
+        },
+        {
+          "id": "case_096",
+          "group": "short",
+          "delta_nll": -0.010001660999999995,
+          "delta_overlap": 0.001705161000000066
+        }
+      ]
+    },
+    "continued1-long": {
+      "baseline": {
+        "cases": 12,
+        "tokens": 763,
+        "nll": 0.19022615019266054,
+        "api_cases": 12,
+        "api_positions": 763,
+        "overlap_lower": 0.9571072624369151,
+        "overlap_upper": 0.9572678556547854,
+        "mapped_api_mass": 0.9998367180871512,
+        "top1_agreement": 0.9501965923984272,
+        "mean_lcp": 17.5
+      },
+      "candidate": {
+        "cases": 12,
+        "tokens": 763,
+        "nll": 0.1891067586395806,
+        "api_cases": 12,
+        "api_positions": 763,
+        "overlap_lower": 0.957563268331542,
+        "overlap_upper": 0.9577242576565538,
+        "mapped_api_mass": 0.9998367180871512,
+        "top1_agreement": 0.9515072083879423,
+        "mean_lcp": 17.5
+      },
+      "delta_candidate_minus_baseline": {
+        "nll": -0.0011193915530799403,
+        "overlap_lower": 0.00045600589462690966,
+        "overlap_upper": 0.0004564020017683301,
+        "mapped_api_mass": 0.0,
+        "top1_agreement": 0.001310615989515096,
+        "mean_lcp": 0.0
+      },
+      "full_overlap_delta_bounds": [
+        0.0002954126767565901,
+        0.0006169952196386497
+      ],
+      "paired_prompt_bootstrap_95_percent": {
+        "nll": [
+          -0.0037187203275401075,
+          0.0014832775507812419
+        ],
+        "overlap_lower": [
+          -0.00028722536200964655,
+          0.0011291283004108115
+        ],
+        "top1_agreement": [
+          0.0,
+          0.00395778364116095
+        ],
+        "mean_lcp": [
+          0.0,
+          0.0
+        ]
+      },
+      "nll_case_wins": {
+        "candidate": 8,
+        "baseline": 4
+      },
+      "per_case": [
+        {
+          "id": "case_100",
+          "group": "long-retrieval",
+          "delta_nll": -0.007992184999999999,
+          "delta_overlap": 0.0014403449999998985
+        },
+        {
+          "id": "case_101",
+          "group": "long-code",
+          "delta_nll": 0.006063197999999992,
+          "delta_overlap": -0.002144936999999958
+        },
+        {
+          "id": "case_102",
+          "group": "long-italian",
+          "delta_nll": -0.00016133800000000045,
+          "delta_overlap": -5.2987999999976054e-05
+        },
+        {
+          "id": "case_103",
+          "group": "long-retrieval",
+          "delta_nll": -0.003529140000000014,
+          "delta_overlap": 0.0011381560000000013
+        },
+        {
+          "id": "case_104",
+          "group": "long-code",
+          "delta_nll": 0.005552376999999997,
+          "delta_overlap": -0.0015344219999999797
+        },
+        {
+          "id": "case_105",
+          "group": "long-italian",
+          "delta_nll": -0.0036016620000000055,
+          "delta_overlap": 0.0015964620000000762
+        },
+        {
+          "id": "case_106",
+          "group": "long-retrieval",
+          "delta_nll": 0.004380482000000019,
+          "delta_overlap": 0.0016437740000000423
+        },
+        {
+          "id": "case_107",
+          "group": "long-code",
+          "delta_nll": 0.0014819130000000014,
+          "delta_overlap": -0.0007632149999999838
+        },
+        {
+          "id": "case_108",
+          "group": "long-italian",
+          "delta_nll": -0.0012411059999999988,
+          "delta_overlap": 0.0009195850000000005
+        },
+        {
+          "id": "case_109",
+          "group": "long-retrieval",
+          "delta_nll": -0.007627918000000011,
+          "delta_overlap": 0.0010187429999999331
+        },
+        {
+          "id": "case_110",
+          "group": "long-code",
+          "delta_nll": -0.005581690000000028,
+          "delta_overlap": 0.0018346639999999859
+        },
+        {
+          "id": "case_111",
+          "group": "long-italian",
+          "delta_nll": -0.0017125679999999994,
+          "delta_overlap": 0.0004528059999999723
+        }
+      ]
+    },
+    "continued1-aligned": {
+      "baseline": {
+        "cases": 37,
+        "tokens": 2228,
+        "nll": 0.30114761165574505,
+        "api_cases": 37,
+        "api_positions": 2228,
+        "overlap_lower": 0.9247953804500031,
+        "overlap_upper": 0.9248995989372425,
+        "mapped_api_mass": 0.9998935768351748,
+        "top1_agreement": 0.9187612208258528,
+        "mean_lcp": 9.567567567567568
+      },
+      "candidate": {
+        "cases": 37,
+        "tokens": 2228,
+        "nll": 0.3001110724851885,
+        "api_cases": 37,
+        "api_positions": 2228,
+        "overlap_lower": 0.9247677479925762,
+        "overlap_upper": 0.9248721297349352,
+        "mapped_api_mass": 0.9998935768351748,
+        "top1_agreement": 0.9169658886894075,
+        "mean_lcp": 9.81081081081081
+      },
+      "delta_candidate_minus_baseline": {
+        "nll": -0.0010365391705565719,
+        "overlap_lower": -2.7632457426873813e-05,
+        "overlap_upper": -2.7469202307339735e-05,
+        "mapped_api_mass": 0.0,
+        "top1_agreement": -0.0017953321364452268,
+        "mean_lcp": 0.2432432432432421
+      },
+      "full_overlap_delta_bounds": [
+        -0.00013185094466627856,
+        7.674928493206501e-05
+      ],
+      "paired_prompt_bootstrap_95_percent": {
+        "nll": [
+          -0.003268464835689046,
+          0.0012012624814329465
+        ],
+        "overlap_lower": [
+          -0.0007447176844697685,
+          0.00066297730745156
+        ],
+        "top1_agreement": [
+          -0.004476275738585497,
+          0.0008869179600886918
+        ],
+        "mean_lcp": [
+          0.0,
+          0.7297297297297297
+        ]
+      },
+      "nll_case_wins": {
+        "candidate": 26,
+        "baseline": 11
+      },
+      "per_case": [
+        {
+          "id": "case_000",
+          "group": "short",
+          "delta_nll": 0.011403150000000029,
+          "delta_overlap": -0.0008583569999999208
+        },
+        {
+          "id": "case_004",
+          "group": "short",
+          "delta_nll": -0.0025657500000000055,
+          "delta_overlap": -0.0005082320000000529
+        },
+        {
+          "id": "case_008",
+          "group": "short",
+          "delta_nll": -0.005908128999999984,
+          "delta_overlap": -0.00029698899999996975
+        },
+        {
+          "id": "case_012",
+          "group": "short",
+          "delta_nll": -0.0013709840000000195,
+          "delta_overlap": -0.0024422549999999488
+        },
+        {
+          "id": "case_016",
+          "group": "short",
+          "delta_nll": 0.01712872000000004,
+          "delta_overlap": -0.0028361270000000216
+        },
+        {
+          "id": "case_020",
+          "group": "short",
+          "delta_nll": 0.003608265999999999,
+          "delta_overlap": 0.004566825999999913
+        },
+        {
+          "id": "case_024",
+          "group": "short",
+          "delta_nll": -0.0017452890000000387,
+          "delta_overlap": 0.0004505070000000444
+        },
+        {
+          "id": "case_028",
+          "group": "short",
+          "delta_nll": 0.0033526310000000503,
+          "delta_overlap": -0.0015442979999999995
+        },
+        {
+          "id": "case_032",
+          "group": "short",
+          "delta_nll": -0.0015324480000000196,
+          "delta_overlap": 0.0003851940000000331
+        },
+        {
+          "id": "case_036",
+          "group": "short",
+          "delta_nll": -0.001732874999999967,
+          "delta_overlap": 0.0007830250000000483
+        },
+        {
+          "id": "case_040",
+          "group": "short",
+          "delta_nll": -0.0044598929999999926,
+          "delta_overlap": -0.0014965120000000054
+        },
+        {
+          "id": "case_044",
+          "group": "short",
+          "delta_nll": 0.008975538000000005,
+          "delta_overlap": -0.0003819840000000019
+        },
+        {
+          "id": "case_048",
+          "group": "short",
+          "delta_nll": -0.002226773000000015,
+          "delta_overlap": -0.0005747710000000295
+        },
+        {
+          "id": "case_052",
+          "group": "short",
+          "delta_nll": -0.020349284000000023,
+          "delta_overlap": -0.00423334799999997
+        },
+        {
+          "id": "case_056",
+          "group": "short",
+          "delta_nll": -0.0013171719999999776,
+          "delta_overlap": -0.00376339399999992
+        },
+        {
+          "id": "case_060",
+          "group": "short",
+          "delta_nll": -0.0029058470000000725,
+          "delta_overlap": 0.0015572510000000372
+        },
+        {
+          "id": "case_064",
+          "group": "short",
+          "delta_nll": 0.019098142,
+          "delta_overlap": -0.010187695000000052
+        },
+        {
+          "id": "case_068",
+          "group": "short",
+          "delta_nll": -0.004799266999999996,
+          "delta_overlap": -0.001679821999999942
+        },
+        {
+          "id": "case_072",
+          "group": "short",
+          "delta_nll": -0.0025777490000000007,
+          "delta_overlap": 0.00204089399999996
+        },
+        {
+          "id": "case_076",
+          "group": "short",
+          "delta_nll": 0.004430355,
+          "delta_overlap": -0.0035491590000000794
+        },
+        {
+          "id": "case_080",
+          "group": "short",
+          "delta_nll": -0.012394162000000042,
+          "delta_overlap": 0.0010610620000000015
+        },
+        {
+          "id": "case_084",
+          "group": "short",
+          "delta_nll": -0.0008632040000000063,
+          "delta_overlap": 0.0013928530000000272
+        },
+        {
+          "id": "case_088",
+          "group": "short",
+          "delta_nll": -0.0001070440000000561,
+          "delta_overlap": 0.005435458999999976
+        },
+        {
+          "id": "case_092",
+          "group": "short",
+          "delta_nll": -0.0017475329999999678,
+          "delta_overlap": 0.0017938209999999177
+        },
+        {
+          "id": "case_096",
+          "group": "short",
+          "delta_nll": -0.010001660999999995,
+          "delta_overlap": 0.001705161000000066
+        },
+        {
+          "id": "case_100",
+          "group": "long-retrieval",
+          "delta_nll": -0.007992184999999999,
+          "delta_overlap": 0.0014403449999998985
+        },
+        {
+          "id": "case_101",
+          "group": "long-code",
+          "delta_nll": 0.006063197999999992,
+          "delta_overlap": -0.002144936999999958
+        },
+        {
+          "id": "case_102",
+          "group": "long-italian",
+          "delta_nll": -0.00016133800000000045,
+          "delta_overlap": -5.2987999999976054e-05
+        },
+        {
+          "id": "case_103",
+          "group": "long-retrieval",
+          "delta_nll": -0.003529140000000014,
+          "delta_overlap": 0.0011381560000000013
+        },
+        {
+          "id": "case_104",
+          "group": "long-code",
+          "delta_nll": 0.005552376999999997,
+          "delta_overlap": -0.0015344219999999797
+        },
+        {
+          "id": "case_105",
+          "group": "long-italian",
+          "delta_nll": -0.0036016620000000055,
+          "delta_overlap": 0.0015964620000000762
+        },
+        {
+          "id": "case_106",
+          "group": "long-retrieval",
+          "delta_nll": 0.004380482000000019,
+          "delta_overlap": 0.0016437740000000423
+        },
+        {
+          "id": "case_107",
+          "group": "long-code",
+          "delta_nll": 0.0014819130000000014,
+          "delta_overlap": -0.0007632149999999838
+        },
+        {
+          "id": "case_108",
+          "group": "long-italian",
+          "delta_nll": -0.0012411059999999988,
+          "delta_overlap": 0.0009195850000000005
+        },
+        {
+          "id": "case_109",
+          "group": "long-retrieval",
+          "delta_nll": -0.007627918000000011,
+          "delta_overlap": 0.0010187429999999331
+        },
+        {
+          "id": "case_110",
+          "group": "long-code",
+          "delta_nll": -0.005581690000000028,
+          "delta_overlap": 0.0018346639999999859
+        },
+        {
+          "id": "case_111",
+          "group": "long-italian",
+          "delta_nll": -0.0017125679999999994,
+          "delta_overlap": 0.0004528059999999723
+        }
+      ]
+    },
+    "continued1-sensitivity": {
+      "baseline": {
+        "cases": 37,
+        "tokens": 2228,
+        "nll": 0.30114761165574505,
+        "api_cases": 37,
+        "api_positions": 2228,
+        "overlap_lower": 0.9247953804500031,
+        "overlap_upper": 0.9248995989372425,
+        "mapped_api_mass": 0.9998935768351748,
+        "top1_agreement": 0.9187612208258528,
+        "mean_lcp": 9.567567567567568
+      },
+      "candidate": {
+        "cases": 37,
+        "tokens": 2228,
+        "nll": 0.3001110724851885,
+        "api_cases": 37,
+        "api_positions": 2228,
+        "overlap_lower": 0.9247677479925762,
+        "overlap_upper": 0.9248721297349352,
+        "mapped_api_mass": 0.9998935768351748,
+        "top1_agreement": 0.9169658886894075,
+        "mean_lcp": 9.81081081081081
+      },
+      "delta_candidate_minus_baseline": {
+        "nll": -0.0010365391705565719,
+        "overlap_lower": -2.7632457426873813e-05,
+        "overlap_upper": -2.7469202307339735e-05,
+        "mapped_api_mass": 0.0,
+        "top1_agreement": -0.0017953321364452268,
+        "mean_lcp": 0.2432432432432421
+      },
+      "full_overlap_delta_bounds": [
+        -0.00013185094466627856,
+        7.674928493206501e-05
+      ],
+      "paired_prompt_bootstrap_95_percent": {
+        "nll": [
+          -0.003268464835689046,
+          0.0012012624814329465
+        ],
+        "overlap_lower": [
+          -0.0007447176844697685,
+          0.00066297730745156
+        ],
+        "top1_agreement": [
+          -0.004476275738585497,
+          0.0008869179600886918
+        ],
+        "mean_lcp": [
+          0.0,
+          0.7297297297297297
+        ]
+      },
+      "nll_case_wins": {
+        "candidate": 26,
+        "baseline": 11
+      },
+      "per_case": [
+        {
+          "id": "case_000",
+          "group": "short",
+          "delta_nll": 0.011403150000000029,
+          "delta_overlap": -0.0008583569999999208
+        },
+        {
+          "id": "case_004",
+          "group": "short",
+          "delta_nll": -0.0025657500000000055,
+          "delta_overlap": -0.0005082320000000529
+        },
+        {
+          "id": "case_008",
+          "group": "short",
+          "delta_nll": -0.005908128999999984,
+          "delta_overlap": -0.00029698899999996975
+        },
+        {
+          "id": "case_012",
+          "group": "short",
+          "delta_nll": -0.0013709840000000195,
+          "delta_overlap": -0.0024422549999999488
+        },
+        {
+          "id": "case_016",
+          "group": "short",
+          "delta_nll": 0.01712872000000004,
+          "delta_overlap": -0.0028361270000000216
+        },
+        {
+          "id": "case_020",
+          "group": "short",
+          "delta_nll": 0.003608265999999999,
+          "delta_overlap": 0.004566825999999913
+        },
+        {
+          "id": "case_024",
+          "group": "short",
+          "delta_nll": -0.0017452890000000387,
+          "delta_overlap": 0.0004505070000000444
+        },
+        {
+          "id": "case_028",
+          "group": "short",
+          "delta_nll": 0.0033526310000000503,
+          "delta_overlap": -0.0015442979999999995
+        },
+        {
+          "id": "case_032",
+          "group": "short",
+          "delta_nll": -0.0015324480000000196,
+          "delta_overlap": 0.0003851940000000331
+        },
+        {
+          "id": "case_036",
+          "group": "short",
+          "delta_nll": -0.001732874999999967,
+          "delta_overlap": 0.0007830250000000483
+        },
+        {
+          "id": "case_040",
+          "group": "short",
+          "delta_nll": -0.0044598929999999926,
+          "delta_overlap": -0.0014965120000000054
+        },
+        {
+          "id": "case_044",
+          "group": "short",
+          "delta_nll": 0.008975538000000005,
+          "delta_overlap": -0.0003819840000000019
+        },
+        {
+          "id": "case_048",
+          "group": "short",
+          "delta_nll": -0.002226773000000015,
+          "delta_overlap": -0.0005747710000000295
+        },
+        {
+          "id": "case_052",
+          "group": "short",
+          "delta_nll": -0.020349284000000023,
+          "delta_overlap": -0.00423334799999997
+        },
+        {
+          "id": "case_056",
+          "group": "short",
+          "delta_nll": -0.0013171719999999776,
+          "delta_overlap": -0.00376339399999992
+        },
+        {
+          "id": "case_060",
+          "group": "short",
+          "delta_nll": -0.0029058470000000725,
+          "delta_overlap": 0.0015572510000000372
+        },
+        {
+          "id": "case_064",
+          "group": "short",
+          "delta_nll": 0.019098142,
+          "delta_overlap": -0.010187695000000052
+        },
+        {
+          "id": "case_068",
+          "group": "short",
+          "delta_nll": -0.004799266999999996,
+          "delta_overlap": -0.001679821999999942
+        },
+        {
+          "id": "case_072",
+          "group": "short",
+          "delta_nll": -0.0025777490000000007,
+          "delta_overlap": 0.00204089399999996
+        },
+        {
+          "id": "case_076",
+          "group": "short",
+          "delta_nll": 0.004430355,
+          "delta_overlap": -0.0035491590000000794
+        },
+        {
+          "id": "case_080",
+          "group": "short",
+          "delta_nll": -0.012394162000000042,
+          "delta_overlap": 0.0010610620000000015
+        },
+        {
+          "id": "case_084",
+          "group": "short",
+          "delta_nll": -0.0008632040000000063,
+          "delta_overlap": 0.0013928530000000272
+        },
+        {
+          "id": "case_088",
+          "group": "short",
+          "delta_nll": -0.0001070440000000561,
+          "delta_overlap": 0.005435458999999976
+        },
+        {
+          "id": "case_092",
+          "group": "short",
+          "delta_nll": -0.0017475329999999678,
+          "delta_overlap": 0.0017938209999999177
+        },
+        {
+          "id": "case_096",
+          "group": "short",
+          "delta_nll": -0.010001660999999995,
+          "delta_overlap": 0.001705161000000066
+        },
+        {
+          "id": "case_100",
+          "group": "long-retrieval",
+          "delta_nll": -0.007992184999999999,
+          "delta_overlap": 0.0014403449999998985
+        },
+        {
+          "id": "case_101",
+          "group": "long-code",
+          "delta_nll": 0.006063197999999992,
+          "delta_overlap": -0.002144936999999958
+        },
+        {
+          "id": "case_102",
+          "group": "long-italian",
+          "delta_nll": -0.00016133800000000045,
+          "delta_overlap": -5.2987999999976054e-05
+        },
+        {
+          "id": "case_103",
+          "group": "long-retrieval",
+          "delta_nll": -0.003529140000000014,
+          "delta_overlap": 0.0011381560000000013
+        },
+        {
+          "id": "case_104",
+          "group": "long-code",
+          "delta_nll": 0.005552376999999997,
+          "delta_overlap": -0.0015344219999999797
+        },
+        {
+          "id": "case_105",
+          "group": "long-italian",
+          "delta_nll": -0.0036016620000000055,
+          "delta_overlap": 0.0015964620000000762
+        },
+        {
+          "id": "case_106",
+          "group": "long-retrieval",
+          "delta_nll": 0.004380482000000019,
+          "delta_overlap": 0.0016437740000000423
+        },
+        {
+          "id": "case_107",
+          "group": "long-code",
+          "delta_nll": 0.0014819130000000014,
+          "delta_overlap": -0.0007632149999999838
+        },
+        {
+          "id": "case_108",
+          "group": "long-italian",
+          "delta_nll": -0.0012411059999999988,
+          "delta_overlap": 0.0009195850000000005
+        },
+        {
+          "id": "case_109",
+          "group": "long-retrieval",
+          "delta_nll": -0.007627918000000011,
+          "delta_overlap": 0.0010187429999999331
+        },
+        {
+          "id": "case_110",
+          "group": "long-code",
+          "delta_nll": -0.005581690000000028,
+          "delta_overlap": 0.0018346639999999859
+        },
+        {
+          "id": "case_111",
+          "group": "long-italian",
+          "delta_nll": -0.0017125679999999994,
+          "delta_overlap": 0.0004528059999999723
+        }
+      ]
+    },
+    "safe-all": {
+      "baseline": {
+        "cases": 37,
+        "tokens": 2228,
+        "nll": 0.3061080491315081,
+        "api_cases": 37,
+        "api_positions": 2228,
+        "overlap_lower": 0.9249835926672607,
+        "overlap_upper": 0.9250876911731969,
+        "mapped_api_mass": 0.9998935768351748,
+        "top1_agreement": 0.9169658886894075,
+        "mean_lcp": 9.27027027027027
+      },
+      "candidate": {
+        "cases": 37,
+        "tokens": 2228,
+        "nll": 0.30506589826032315,
+        "api_cases": 37,
+        "api_positions": 2228,
+        "overlap_lower": 0.9247970349763776,
+        "overlap_upper": 0.9249018642032372,
+        "mapped_api_mass": 0.9998935768351748,
+        "top1_agreement": 0.9192100538599641,
+        "mean_lcp": 8.27027027027027
+      },
+      "delta_candidate_minus_baseline": {
+        "nll": -0.0010421508711849214,
+        "overlap_lower": -0.0001865576908831601,
+        "overlap_upper": -0.0001858269699597237,
+        "mapped_api_mass": 0.0,
+        "top1_agreement": 0.002244165170556589,
+        "mean_lcp": -1.0
+      },
+      "full_overlap_delta_bounds": [
+        -0.00029065619681933885,
+        -8.172846402354494e-05
+      ],
+      "paired_prompt_bootstrap_95_percent": {
+        "nll": [
+          -0.00339331445218869,
+          0.001370131244774735
+        ],
+        "overlap_lower": [
+          -0.0006606977431074495,
+          0.00029950830489672194
+        ],
+        "top1_agreement": [
+          -0.0013192612137203166,
+          0.005780346820809248
+        ],
+        "mean_lcp": [
+          -4.054054054054054,
+          1.054054054054054
+        ]
+      },
+      "nll_case_wins": {
+        "candidate": 20,
+        "baseline": 17
+      },
+      "per_case": [
+        {
+          "id": "case_000",
+          "group": "short",
+          "delta_nll": 0.0016960270000000444,
+          "delta_overlap": 0.0013824979999998988
+        },
+        {
+          "id": "case_004",
+          "group": "short",
+          "delta_nll": 0.003969910999999993,
+          "delta_overlap": -0.0005245449999999874
+        },
+        {
+          "id": "case_008",
+          "group": "short",
+          "delta_nll": 0.0007593239999999779,
+          "delta_overlap": -0.001232158999999955
+        },
+        {
+          "id": "case_012",
+          "group": "short",
+          "delta_nll": -0.006446581000000007,
+          "delta_overlap": 0.0004475760000000051
+        },
+        {
+          "id": "case_016",
+          "group": "short",
+          "delta_nll": -0.006346665000000029,
+          "delta_overlap": -0.0012219439999999748
+        },
+        {
+          "id": "case_020",
+          "group": "short",
+          "delta_nll": -0.010004651000000003,
+          "delta_overlap": 0.0017427389999999932
+        },
+        {
+          "id": "case_024",
+          "group": "short",
+          "delta_nll": -0.004553173999999993,
+          "delta_overlap": -0.00035004699999996447
+        },
+        {
+          "id": "case_028",
+          "group": "short",
+          "delta_nll": 0.009600017999999988,
+          "delta_overlap": 0.001163525000000054
+        },
+        {
+          "id": "case_032",
+          "group": "short",
+          "delta_nll": -0.002548822000000006,
+          "delta_overlap": -0.0014622239999999564
+        },
+        {
+          "id": "case_036",
+          "group": "short",
+          "delta_nll": -0.008166461000000014,
+          "delta_overlap": 0.0012529530000000566
+        },
+        {
+          "id": "case_040",
+          "group": "short",
+          "delta_nll": 0.004710394999999978,
+          "delta_overlap": -1.7096999999965945e-05
+        },
+        {
+          "id": "case_044",
+          "group": "short",
+          "delta_nll": -0.003838836000000012,
+          "delta_overlap": -0.0012368589999999235
+        },
+        {
+          "id": "case_048",
+          "group": "short",
+          "delta_nll": -0.0015085709999999586,
+          "delta_overlap": -0.001157002000000018
+        },
+        {
+          "id": "case_052",
+          "group": "short",
+          "delta_nll": 0.011169541000000005,
+          "delta_overlap": -0.0015222070000000532
+        },
+        {
+          "id": "case_056",
+          "group": "short",
+          "delta_nll": -0.016525508999999994,
+          "delta_overlap": 0.0007752100000000262
+        },
+        {
+          "id": "case_060",
+          "group": "short",
+          "delta_nll": -0.004044364999999939,
+          "delta_overlap": -0.001802041000000032
+        },
+        {
+          "id": "case_064",
+          "group": "short",
+          "delta_nll": 0.013351479,
+          "delta_overlap": -0.001642974999999991
+        },
+        {
+          "id": "case_068",
+          "group": "short",
+          "delta_nll": 0.01620860700000004,
+          "delta_overlap": -0.0018206539999999771
+        },
+        {
+          "id": "case_072",
+          "group": "short",
+          "delta_nll": -9.495699999999968e-05,
+          "delta_overlap": 0.00012011600000005895
+        },
+        {
+          "id": "case_076",
+          "group": "short",
+          "delta_nll": 0.005140031999999999,
+          "delta_overlap": -0.0034785489999999974
+        },
+        {
+          "id": "case_080",
+          "group": "short",
+          "delta_nll": 0.004138336999999992,
+          "delta_overlap": -0.0030599239999999917
+        },
+        {
+          "id": "case_084",
+          "group": "short",
+          "delta_nll": -0.0001487159999999932,
+          "delta_overlap": -0.0006800200000000034
+        },
+        {
+          "id": "case_088",
+          "group": "short",
+          "delta_nll": -0.013575216000000001,
+          "delta_overlap": 0.002337227000000053
+        },
+        {
+          "id": "case_092",
+          "group": "short",
+          "delta_nll": -0.006292555000000033,
+          "delta_overlap": 0.00015494900000001532
+        },
+        {
+          "id": "case_096",
+          "group": "short",
+          "delta_nll": -0.002257395999999995,
+          "delta_overlap": -0.0011947700000000117
+        },
+        {
+          "id": "case_100",
+          "group": "long-retrieval",
+          "delta_nll": -0.008891256999999986,
+          "delta_overlap": -0.0003827600000000375
+        },
+        {
+          "id": "case_101",
+          "group": "long-code",
+          "delta_nll": -0.0016397989999999973,
+          "delta_overlap": 0.0009894000000000291
+        },
+        {
+          "id": "case_102",
+          "group": "long-italian",
+          "delta_nll": 0.003190895000000001,
+          "delta_overlap": -0.0015581919999999583
+        },
+        {
+          "id": "case_103",
+          "group": "long-retrieval",
+          "delta_nll": -0.011898027000000033,
+          "delta_overlap": 0.002872169000000091
+        },
+        {
+          "id": "case_104",
+          "group": "long-code",
+          "delta_nll": -0.0036948129999999912,
+          "delta_overlap": 0.0011201779999999717
+        },
+        {
+          "id": "case_105",
+          "group": "long-italian",
+          "delta_nll": 0.0001532999999999951,
+          "delta_overlap": -0.0007888489999999804
+        },
+        {
+          "id": "case_106",
+          "group": "long-retrieval",
+          "delta_nll": -0.007461781999999972,
+          "delta_overlap": -0.0003036389999999667
+        },
+        {
+          "id": "case_107",
+          "group": "long-code",
+          "delta_nll": 0.003086820999999962,
+          "delta_overlap": -0.0023077989999999993
+        },
+        {
+          "id": "case_108",
+          "group": "long-italian",
+          "delta_nll": 0.0005432690000000007,
+          "delta_overlap": 0.00016571599999992692
+        },
+        {
+          "id": "case_109",
+          "group": "long-retrieval",
+          "delta_nll": 0.006154695999999987,
+          "delta_overlap": -0.00023031900000003436
+        },
+        {
+          "id": "case_110",
+          "group": "long-code",
+          "delta_nll": 0.005137480999999999,
+          "delta_overlap": 0.00023445600000004951
+        },
+        {
+          "id": "case_111",
+          "group": "long-italian",
+          "delta_nll": 0.005289581999999999,
+          "delta_overlap": 0.00333895900000003
+        }
+      ]
+    },
+    "safe-short": {
+      "baseline": {
+        "cases": 25,
+        "tokens": 1465,
+        "nll": 0.36002004234334467,
+        "api_cases": 25,
+        "api_positions": 1465,
+        "overlap_lower": 0.9082576260465329,
+        "overlap_upper": 0.9083328019372514,
+        "mapped_api_mass": 0.9999231899578657,
+        "top1_agreement": 0.9017064846416383,
+        "mean_lcp": 5.32
+      },
+      "candidate": {
+        "cases": 25,
+        "tokens": 1465,
+        "nll": 0.3588429284976109,
+        "api_cases": 25,
+        "api_positions": 1465,
+        "overlap_lower": 0.9078350178798225,
+        "overlap_upper": 0.9079107811293604,
+        "mapped_api_mass": 0.9999231899578657,
+        "top1_agreement": 0.9030716723549488,
+        "mean_lcp": 5.84
+      },
+      "delta_candidate_minus_baseline": {
+        "nll": -0.0011771138457337682,
+        "overlap_lower": -0.00042260816671046975,
+        "overlap_upper": -0.00042202080789099927,
+        "mapped_api_mass": 0.0,
+        "top1_agreement": 0.0013651877133105117,
+        "mean_lcp": 0.5199999999999996
+      },
+      "full_overlap_delta_bounds": [
+        -0.0004977840574289516,
+        -0.0003468449171725174
+      ],
+      "paired_prompt_bootstrap_95_percent": {
+        "nll": [
+          -0.004217018706206896,
+          0.002025881646416389
+        ],
+        "overlap_lower": [
+          -0.0009604716451729481,
+          0.0001405606892678692
+        ],
+        "top1_agreement": [
+          -0.003014318010550113,
+          0.006081081081081081
+        ],
+        "mean_lcp": [
+          0.0,
+          1.56
+        ]
+      },
+      "nll_case_wins": {
+        "candidate": 15,
+        "baseline": 10
+      },
+      "per_case": [
+        {
+          "id": "case_000",
+          "group": "short",
+          "delta_nll": 0.0016960270000000444,
+          "delta_overlap": 0.0013824979999998988
+        },
+        {
+          "id": "case_004",
+          "group": "short",
+          "delta_nll": 0.003969910999999993,
+          "delta_overlap": -0.0005245449999999874
+        },
+        {
+          "id": "case_008",
+          "group": "short",
+          "delta_nll": 0.0007593239999999779,
+          "delta_overlap": -0.001232158999999955
+        },
+        {
+          "id": "case_012",
+          "group": "short",
+          "delta_nll": -0.006446581000000007,
+          "delta_overlap": 0.0004475760000000051
+        },
+        {
+          "id": "case_016",
+          "group": "short",
+          "delta_nll": -0.006346665000000029,
+          "delta_overlap": -0.0012219439999999748
+        },
+        {
+          "id": "case_020",
+          "group": "short",
+          "delta_nll": -0.010004651000000003,
+          "delta_overlap": 0.0017427389999999932
+        },
+        {
+          "id": "case_024",
+          "group": "short",
+          "delta_nll": -0.004553173999999993,
+          "delta_overlap": -0.00035004699999996447
+        },
+        {
+          "id": "case_028",
+          "group": "short",
+          "delta_nll": 0.009600017999999988,
+          "delta_overlap": 0.001163525000000054
+        },
+        {
+          "id": "case_032",
+          "group": "short",
+          "delta_nll": -0.002548822000000006,
+          "delta_overlap": -0.0014622239999999564
+        },
+        {
+          "id": "case_036",
+          "group": "short",
+          "delta_nll": -0.008166461000000014,
+          "delta_overlap": 0.0012529530000000566
+        },
+        {
+          "id": "case_040",
+          "group": "short",
+          "delta_nll": 0.004710394999999978,
+          "delta_overlap": -1.7096999999965945e-05
+        },
+        {
+          "id": "case_044",
+          "group": "short",
+          "delta_nll": -0.003838836000000012,
+          "delta_overlap": -0.0012368589999999235
+        },
+        {
+          "id": "case_048",
+          "group": "short",
+          "delta_nll": -0.0015085709999999586,
+          "delta_overlap": -0.001157002000000018
+        },
+        {
+          "id": "case_052",
+          "group": "short",
+          "delta_nll": 0.011169541000000005,
+          "delta_overlap": -0.0015222070000000532
+        },
+        {
+          "id": "case_056",
+          "group": "short",
+          "delta_nll": -0.016525508999999994,
+          "delta_overlap": 0.0007752100000000262
+        },
+        {
+          "id": "case_060",
+          "group": "short",
+          "delta_nll": -0.004044364999999939,
+          "delta_overlap": -0.001802041000000032
+        },
+        {
+          "id": "case_064",
+          "group": "short",
+          "delta_nll": 0.013351479,
+          "delta_overlap": -0.001642974999999991
+        },
+        {
+          "id": "case_068",
+          "group": "short",
+          "delta_nll": 0.01620860700000004,
+          "delta_overlap": -0.0018206539999999771
+        },
+        {
+          "id": "case_072",
+          "group": "short",
+          "delta_nll": -9.495699999999968e-05,
+          "delta_overlap": 0.00012011600000005895
+        },
+        {
+          "id": "case_076",
+          "group": "short",
+          "delta_nll": 0.005140031999999999,
+          "delta_overlap": -0.0034785489999999974
+        },
+        {
+          "id": "case_080",
+          "group": "short",
+          "delta_nll": 0.004138336999999992,
+          "delta_overlap": -0.0030599239999999917
+        },
+        {
+          "id": "case_084",
+          "group": "short",
+          "delta_nll": -0.0001487159999999932,
+          "delta_overlap": -0.0006800200000000034
+        },
+        {
+          "id": "case_088",
+          "group": "short",
+          "delta_nll": -0.013575216000000001,
+          "delta_overlap": 0.002337227000000053
+        },
+        {
+          "id": "case_092",
+          "group": "short",
+          "delta_nll": -0.006292555000000033,
+          "delta_overlap": 0.00015494900000001532
+        },
+        {
+          "id": "case_096",
+          "group": "short",
+          "delta_nll": -0.002257395999999995,
+          "delta_overlap": -0.0011947700000000117
+        }
+      ]
+    },
+    "safe-long": {
+      "baseline": {
+        "cases": 12,
+        "tokens": 763,
+        "nll": 0.20259419584796853,
+        "api_cases": 12,
+        "api_positions": 763,
+        "overlap_lower": 0.95709832543183,
+        "overlap_upper": 0.957257956875242,
+        "mapped_api_mass": 0.9998367180871512,
+        "top1_agreement": 0.9462647444298821,
+        "mean_lcp": 17.5
+      },
+      "candidate": {
+        "cases": 12,
+        "tokens": 763,
+        "nll": 0.20181118096330275,
+        "api_cases": 12,
+        "api_positions": 763,
+        "overlap_lower": 0.957364997029396,
+        "overlap_upper": 0.9575256344564869,
+        "mapped_api_mass": 0.9998367180871512,
+        "top1_agreement": 0.9501965923984272,
+        "mean_lcp": 13.333333333333334
+      },
+      "delta_candidate_minus_baseline": {
+        "nll": -0.0007830148846657836,
+        "overlap_lower": 0.0002666715975659928,
+        "overlap_upper": 0.00026767758124490726,
+        "mapped_api_mass": 0.0,
+        "top1_agreement": 0.003931847968545177,
+        "mean_lcp": -4.166666666666666
+      },
+      "full_overlap_delta_bounds": [
+        0.00010704015415408108,
+        0.00042730902465681897
+      ],
+      "paired_prompt_bootstrap_95_percent": {
+        "nll": [
+          -0.00412485861328125,
+          0.0023133027418086476
+        ],
+        "overlap_lower": [
+          -0.0005767523700383833,
+          0.0012029324614159765
+        ],
+        "top1_agreement": [
+          -0.0013020833333333333,
+          0.009234828496042216
+        ],
+        "mean_lcp": [
+          -12.5,
+          0.0
+        ]
+      },
+      "nll_case_wins": {
+        "candidate": 5,
+        "baseline": 7
+      },
+      "per_case": [
+        {
+          "id": "case_100",
+          "group": "long-retrieval",
+          "delta_nll": -0.008891256999999986,
+          "delta_overlap": -0.0003827600000000375
+        },
+        {
+          "id": "case_101",
+          "group": "long-code",
+          "delta_nll": -0.0016397989999999973,
+          "delta_overlap": 0.0009894000000000291
+        },
+        {
+          "id": "case_102",
+          "group": "long-italian",
+          "delta_nll": 0.003190895000000001,
+          "delta_overlap": -0.0015581919999999583
+        },
+        {
+          "id": "case_103",
+          "group": "long-retrieval",
+          "delta_nll": -0.011898027000000033,
+          "delta_overlap": 0.002872169000000091
+        },
+        {
+          "id": "case_104",
+          "group": "long-code",
+          "delta_nll": -0.0036948129999999912,
+          "delta_overlap": 0.0011201779999999717
+        },
+        {
+          "id": "case_105",
+          "group": "long-italian",
+          "delta_nll": 0.0001532999999999951,
+          "delta_overlap": -0.0007888489999999804
+        },
+        {
+          "id": "case_106",
+          "group": "long-retrieval",
+          "delta_nll": -0.007461781999999972,
+          "delta_overlap": -0.0003036389999999667
+        },
+        {
+          "id": "case_107",
+          "group": "long-code",
+          "delta_nll": 0.003086820999999962,
+          "delta_overlap": -0.0023077989999999993
+        },
+        {
+          "id": "case_108",
+          "group": "long-italian",
+          "delta_nll": 0.0005432690000000007,
+          "delta_overlap": 0.00016571599999992692
+        },
+        {
+          "id": "case_109",
+          "group": "long-retrieval",
+          "delta_nll": 0.006154695999999987,
+          "delta_overlap": -0.00023031900000003436
+        },
+        {
+          "id": "case_110",
+          "group": "long-code",
+          "delta_nll": 0.005137480999999999,
+          "delta_overlap": 0.00023445600000004951
+        },
+        {
+          "id": "case_111",
+          "group": "long-italian",
+          "delta_nll": 0.005289581999999999,
+          "delta_overlap": 0.00333895900000003
+        }
+      ]
+    },
+    "safe-aligned": {
+      "baseline": {
+        "cases": 37,
+        "tokens": 2228,
+        "nll": 0.3061080491315081,
+        "api_cases": 37,
+        "api_positions": 2228,
+        "overlap_lower": 0.9249835926672607,
+        "overlap_upper": 0.9250876911731969,
+        "mapped_api_mass": 0.9998935768351748,
+        "top1_agreement": 0.9169658886894075,
+        "mean_lcp": 9.27027027027027
+      },
+      "candidate": {
+        "cases": 37,
+        "tokens": 2228,
+        "nll": 0.30506589826032315,
+        "api_cases": 37,
+        "api_positions": 2228,
+        "overlap_lower": 0.9247970349763776,
+        "overlap_upper": 0.9249018642032372,
+        "mapped_api_mass": 0.9998935768351748,
+        "top1_agreement": 0.9192100538599641,
+        "mean_lcp": 8.27027027027027
+      },
+      "delta_candidate_minus_baseline": {
+        "nll": -0.0010421508711849214,
+        "overlap_lower": -0.0001865576908831601,
+        "overlap_upper": -0.0001858269699597237,
+        "mapped_api_mass": 0.0,
+        "top1_agreement": 0.002244165170556589,
+        "mean_lcp": -1.0
+      },
+      "full_overlap_delta_bounds": [
+        -0.00029065619681933885,
+        -8.172846402354494e-05
+      ],
+      "paired_prompt_bootstrap_95_percent": {
+        "nll": [
+          -0.00339331445218869,
+          0.001370131244774735
+        ],
+        "overlap_lower": [
+          -0.0006606977431074495,
+          0.00029950830489672194
+        ],
+        "top1_agreement": [
+          -0.0013192612137203166,
+          0.005780346820809248
+        ],
+        "mean_lcp": [
+          -4.054054054054054,
+          1.054054054054054
+        ]
+      },
+      "nll_case_wins": {
+        "candidate": 20,
+        "baseline": 17
+      },
+      "per_case": [
+        {
+          "id": "case_000",
+          "group": "short",
+          "delta_nll": 0.0016960270000000444,
+          "delta_overlap": 0.0013824979999998988
+        },
+        {
+          "id": "case_004",
+          "group": "short",
+          "delta_nll": 0.003969910999999993,
+          "delta_overlap": -0.0005245449999999874
+        },
+        {
+          "id": "case_008",
+          "group": "short",
+          "delta_nll": 0.0007593239999999779,
+          "delta_overlap": -0.001232158999999955
+        },
+        {
+          "id": "case_012",
+          "group": "short",
+          "delta_nll": -0.006446581000000007,
+          "delta_overlap": 0.0004475760000000051
+        },
+        {
+          "id": "case_016",
+          "group": "short",
+          "delta_nll": -0.006346665000000029,
+          "delta_overlap": -0.0012219439999999748
+        },
+        {
+          "id": "case_020",
+          "group": "short",
+          "delta_nll": -0.010004651000000003,
+          "delta_overlap": 0.0017427389999999932
+        },
+        {
+          "id": "case_024",
+          "group": "short",
+          "delta_nll": -0.004553173999999993,
+          "delta_overlap": -0.00035004699999996447
+        },
+        {
+          "id": "case_028",
+          "group": "short",
+          "delta_nll": 0.009600017999999988,
+          "delta_overlap": 0.001163525000000054
+        },
+        {
+          "id": "case_032",
+          "group": "short",
+          "delta_nll": -0.002548822000000006,
+          "delta_overlap": -0.0014622239999999564
+        },
+        {
+          "id": "case_036",
+          "group": "short",
+          "delta_nll": -0.008166461000000014,
+          "delta_overlap": 0.0012529530000000566
+        },
+        {
+          "id": "case_040",
+          "group": "short",
+          "delta_nll": 0.004710394999999978,
+          "delta_overlap": -1.7096999999965945e-05
+        },
+        {
+          "id": "case_044",
+          "group": "short",
+          "delta_nll": -0.003838836000000012,
+          "delta_overlap": -0.0012368589999999235
+        },
+        {
+          "id": "case_048",
+          "group": "short",
+          "delta_nll": -0.0015085709999999586,
+          "delta_overlap": -0.001157002000000018
+        },
+        {
+          "id": "case_052",
+          "group": "short",
+          "delta_nll": 0.011169541000000005,
+          "delta_overlap": -0.0015222070000000532
+        },
+        {
+          "id": "case_056",
+          "group": "short",
+          "delta_nll": -0.016525508999999994,
+          "delta_overlap": 0.0007752100000000262
+        },
+        {
+          "id": "case_060",
+          "group": "short",
+          "delta_nll": -0.004044364999999939,
+          "delta_overlap": -0.001802041000000032
+        },
+        {
+          "id": "case_064",
+          "group": "short",
+          "delta_nll": 0.013351479,
+          "delta_overlap": -0.001642974999999991
+        },
+        {
+          "id": "case_068",
+          "group": "short",
+          "delta_nll": 0.01620860700000004,
+          "delta_overlap": -0.0018206539999999771
+        },
+        {
+          "id": "case_072",
+          "group": "short",
+          "delta_nll": -9.495699999999968e-05,
+          "delta_overlap": 0.00012011600000005895
+        },
+        {
+          "id": "case_076",
+          "group": "short",
+          "delta_nll": 0.005140031999999999,
+          "delta_overlap": -0.0034785489999999974
+        },
+        {
+          "id": "case_080",
+          "group": "short",
+          "delta_nll": 0.004138336999999992,
+          "delta_overlap": -0.0030599239999999917
+        },
+        {
+          "id": "case_084",
+          "group": "short",
+          "delta_nll": -0.0001487159999999932,
+          "delta_overlap": -0.0006800200000000034
+        },
+        {
+          "id": "case_088",
+          "group": "short",
+          "delta_nll": -0.013575216000000001,
+          "delta_overlap": 0.002337227000000053
+        },
+        {
+          "id": "case_092",
+          "group": "short",
+          "delta_nll": -0.006292555000000033,
+          "delta_overlap": 0.00015494900000001532
+        },
+        {
+          "id": "case_096",
+          "group": "short",
+          "delta_nll": -0.002257395999999995,
+          "delta_overlap": -0.0011947700000000117
+        },
+        {
+          "id": "case_100",
+          "group": "long-retrieval",
+          "delta_nll": -0.008891256999999986,
+          "delta_overlap": -0.0003827600000000375
+        },
+        {
+          "id": "case_101",
+          "group": "long-code",
+          "delta_nll": -0.0016397989999999973,
+          "delta_overlap": 0.0009894000000000291
+        },
+        {
+          "id": "case_102",
+          "group": "long-italian",
+          "delta_nll": 0.003190895000000001,
+          "delta_overlap": -0.0015581919999999583
+        },
+        {
+          "id": "case_103",
+          "group": "long-retrieval",
+          "delta_nll": -0.011898027000000033,
+          "delta_overlap": 0.002872169000000091
+        },
+        {
+          "id": "case_104",
+          "group": "long-code",
+          "delta_nll": -0.0036948129999999912,
+          "delta_overlap": 0.0011201779999999717
+        },
+        {
+          "id": "case_105",
+          "group": "long-italian",
+          "delta_nll": 0.0001532999999999951,
+          "delta_overlap": -0.0007888489999999804
+        },
+        {
+          "id": "case_106",
+          "group": "long-retrieval",
+          "delta_nll": -0.007461781999999972,
+          "delta_overlap": -0.0003036389999999667
+        },
+        {
+          "id": "case_107",
+          "group": "long-code",
+          "delta_nll": 0.003086820999999962,
+          "delta_overlap": -0.0023077989999999993
+        },
+        {
+          "id": "case_108",
+          "group": "long-italian",
+          "delta_nll": 0.0005432690000000007,
+          "delta_overlap": 0.00016571599999992692
+        },
+        {
+          "id": "case_109",
+          "group": "long-retrieval",
+          "delta_nll": 0.006154695999999987,
+          "delta_overlap": -0.00023031900000003436
+        },
+        {
+          "id": "case_110",
+          "group": "long-code",
+          "delta_nll": 0.005137480999999999,
+          "delta_overlap": 0.00023445600000004951
+        },
+        {
+          "id": "case_111",
+          "group": "long-italian",
+          "delta_nll": 0.005289581999999999,
+          "delta_overlap": 0.00333895900000003
+        }
+      ]
+    },
+    "safe-sensitivity": {
+      "baseline": {
+        "cases": 37,
+        "tokens": 2228,
+        "nll": 0.3061080491315081,
+        "api_cases": 37,
+        "api_positions": 2228,
+        "overlap_lower": 0.9249835926672607,
+        "overlap_upper": 0.9250876911731969,
+        "mapped_api_mass": 0.9998935768351748,
+        "top1_agreement": 0.9169658886894075,
+        "mean_lcp": 9.27027027027027
+      },
+      "candidate": {
+        "cases": 37,
+        "tokens": 2228,
+        "nll": 0.30506589826032315,
+        "api_cases": 37,
+        "api_positions": 2228,
+        "overlap_lower": 0.9247970349763776,
+        "overlap_upper": 0.9249018642032372,
+        "mapped_api_mass": 0.9998935768351748,
+        "top1_agreement": 0.9192100538599641,
+        "mean_lcp": 8.27027027027027
+      },
+      "delta_candidate_minus_baseline": {
+        "nll": -0.0010421508711849214,
+        "overlap_lower": -0.0001865576908831601,
+        "overlap_upper": -0.0001858269699597237,
+        "mapped_api_mass": 0.0,
+        "top1_agreement": 0.002244165170556589,
+        "mean_lcp": -1.0
+      },
+      "full_overlap_delta_bounds": [
+        -0.00029065619681933885,
+        -8.172846402354494e-05
+      ],
+      "paired_prompt_bootstrap_95_percent": {
+        "nll": [
+          -0.00339331445218869,
+          0.001370131244774735
+        ],
+        "overlap_lower": [
+          -0.0006606977431074495,
+          0.00029950830489672194
+        ],
+        "top1_agreement": [
+          -0.0013192612137203166,
+          0.005780346820809248
+        ],
+        "mean_lcp": [
+          -4.054054054054054,
+          1.054054054054054
+        ]
+      },
+      "nll_case_wins": {
+        "candidate": 20,
+        "baseline": 17
+      },
+      "per_case": [
+        {
+          "id": "case_000",
+          "group": "short",
+          "delta_nll": 0.0016960270000000444,
+          "delta_overlap": 0.0013824979999998988
+        },
+        {
+          "id": "case_004",
+          "group": "short",
+          "delta_nll": 0.003969910999999993,
+          "delta_overlap": -0.0005245449999999874
+        },
+        {
+          "id": "case_008",
+          "group": "short",
+          "delta_nll": 0.0007593239999999779,
+          "delta_overlap": -0.001232158999999955
+        },
+        {
+          "id": "case_012",
+          "group": "short",
+          "delta_nll": -0.006446581000000007,
+          "delta_overlap": 0.0004475760000000051
+        },
+        {
+          "id": "case_016",
+          "group": "short",
+          "delta_nll": -0.006346665000000029,
+          "delta_overlap": -0.0012219439999999748
+        },
+        {
+          "id": "case_020",
+          "group": "short",
+          "delta_nll": -0.010004651000000003,
+          "delta_overlap": 0.0017427389999999932
+        },
+        {
+          "id": "case_024",
+          "group": "short",
+          "delta_nll": -0.004553173999999993,
+          "delta_overlap": -0.00035004699999996447
+        },
+        {
+          "id": "case_028",
+          "group": "short",
+          "delta_nll": 0.009600017999999988,
+          "delta_overlap": 0.001163525000000054
+        },
+        {
+          "id": "case_032",
+          "group": "short",
+          "delta_nll": -0.002548822000000006,
+          "delta_overlap": -0.0014622239999999564
+        },
+        {
+          "id": "case_036",
+          "group": "short",
+          "delta_nll": -0.008166461000000014,
+          "delta_overlap": 0.0012529530000000566
+        },
+        {
+          "id": "case_040",
+          "group": "short",
+          "delta_nll": 0.004710394999999978,
+          "delta_overlap": -1.7096999999965945e-05
+        },
+        {
+          "id": "case_044",
+          "group": "short",
+          "delta_nll": -0.003838836000000012,
+          "delta_overlap": -0.0012368589999999235
+        },
+        {
+          "id": "case_048",
+          "group": "short",
+          "delta_nll": -0.0015085709999999586,
+          "delta_overlap": -0.001157002000000018
+        },
+        {
+          "id": "case_052",
+          "group": "short",
+          "delta_nll": 0.011169541000000005,
+          "delta_overlap": -0.0015222070000000532
+        },
+        {
+          "id": "case_056",
+          "group": "short",
+          "delta_nll": -0.016525508999999994,
+          "delta_overlap": 0.0007752100000000262
+        },
+        {
+          "id": "case_060",
+          "group": "short",
+          "delta_nll": -0.004044364999999939,
+          "delta_overlap": -0.001802041000000032
+        },
+        {
+          "id": "case_064",
+          "group": "short",
+          "delta_nll": 0.013351479,
+          "delta_overlap": -0.001642974999999991
+        },
+        {
+          "id": "case_068",
+          "group": "short",
+          "delta_nll": 0.01620860700000004,
+          "delta_overlap": -0.0018206539999999771
+        },
+        {
+          "id": "case_072",
+          "group": "short",
+          "delta_nll": -9.495699999999968e-05,
+          "delta_overlap": 0.00012011600000005895
+        },
+        {
+          "id": "case_076",
+          "group": "short",
+          "delta_nll": 0.005140031999999999,
+          "delta_overlap": -0.0034785489999999974
+        },
+        {
+          "id": "case_080",
+          "group": "short",
+          "delta_nll": 0.004138336999999992,
+          "delta_overlap": -0.0030599239999999917
+        },
+        {
+          "id": "case_084",
+          "group": "short",
+          "delta_nll": -0.0001487159999999932,
+          "delta_overlap": -0.0006800200000000034
+        },
+        {
+          "id": "case_088",
+          "group": "short",
+          "delta_nll": -0.013575216000000001,
+          "delta_overlap": 0.002337227000000053
+        },
+        {
+          "id": "case_092",
+          "group": "short",
+          "delta_nll": -0.006292555000000033,
+          "delta_overlap": 0.00015494900000001532
+        },
+        {
+          "id": "case_096",
+          "group": "short",
+          "delta_nll": -0.002257395999999995,
+          "delta_overlap": -0.0011947700000000117
+        },
+        {
+          "id": "case_100",
+          "group": "long-retrieval",
+          "delta_nll": -0.008891256999999986,
+          "delta_overlap": -0.0003827600000000375
+        },
+        {
+          "id": "case_101",
+          "group": "long-code",
+          "delta_nll": -0.0016397989999999973,
+          "delta_overlap": 0.0009894000000000291
+        },
+        {
+          "id": "case_102",
+          "group": "long-italian",
+          "delta_nll": 0.003190895000000001,
+          "delta_overlap": -0.0015581919999999583
+        },
+        {
+          "id": "case_103",
+          "group": "long-retrieval",
+          "delta_nll": -0.011898027000000033,
+          "delta_overlap": 0.002872169000000091
+        },
+        {
+          "id": "case_104",
+          "group": "long-code",
+          "delta_nll": -0.0036948129999999912,
+          "delta_overlap": 0.0011201779999999717
+        },
+        {
+          "id": "case_105",
+          "group": "long-italian",
+          "delta_nll": 0.0001532999999999951,
+          "delta_overlap": -0.0007888489999999804
+        },
+        {
+          "id": "case_106",
+          "group": "long-retrieval",
+          "delta_nll": -0.007461781999999972,
+          "delta_overlap": -0.0003036389999999667
+        },
+        {
+          "id": "case_107",
+          "group": "long-code",
+          "delta_nll": 0.003086820999999962,
+          "delta_overlap": -0.0023077989999999993
+        },
+        {
+          "id": "case_108",
+          "group": "long-italian",
+          "delta_nll": 0.0005432690000000007,
+          "delta_overlap": 0.00016571599999992692
+        },
+        {
+          "id": "case_109",
+          "group": "long-retrieval",
+          "delta_nll": 0.006154695999999987,
+          "delta_overlap": -0.00023031900000003436
+        },
+        {
+          "id": "case_110",
+          "group": "long-code",
+          "delta_nll": 0.005137480999999999,
+          "delta_overlap": 0.00023445600000004951
+        },
+        {
+          "id": "case_111",
+          "group": "long-italian",
+          "delta_nll": 0.005289581999999999,
+          "delta_overlap": 0.00333895900000003
+        }
+      ]
+    }
+  }
+}

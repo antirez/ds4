@@ -1,0 +1,5 @@
+Valutare 50 prompt (o un numero significativo di varianti) è generalmente più utile che affidarsi a un singolo "prompt preferito" per diverse ragioni fondamentali legate alla natura dei modelli linguistici (LLM) e al processo di ottimizzazione.
+
+Ecco i motivi principali:
+
+### 1. **

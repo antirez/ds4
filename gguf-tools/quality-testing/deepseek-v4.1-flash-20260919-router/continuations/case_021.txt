@@ -1,0 +1,7 @@
+# Why Reference Counting Can't Break Cycles
+
+The core problem is that **reference counting only knows about local, per-object information** — specifically, "how many pointers currently point at me?" — and it has no way to reason about the global shape of the reference graph.
+
+## How it normally works
+
+Each object carries

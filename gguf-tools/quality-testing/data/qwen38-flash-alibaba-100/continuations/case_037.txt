@@ -1,0 +1,1 @@
+Una **matrice di importanza** (o *importance matrix*) nella quantizzazione low-bit è una struttura dati che assegna un peso numerico a ciascun elemento o gruppo di elementi di una matrice di pesi (ad esempio, in una rete neurale) per indicare quanto sia critico preservare la precisione di

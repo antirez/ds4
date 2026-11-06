@@ -1,0 +1,5 @@
+To explain why quantization error affects rare experts more than common experts, we must look at the mechanics of **Mixture-of-Experts (MoE)** architectures and how **quantization** interacts with statistical frequency.
+
+### 1. Context: MoE and Quantization Basics
+
+*   **Mixture-of-

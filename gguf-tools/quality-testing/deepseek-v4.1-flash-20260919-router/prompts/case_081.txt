@@ -1,0 +1,1 @@
+Write a Python function that splits a sequence into chunks of size n and rejects nonpositive n.

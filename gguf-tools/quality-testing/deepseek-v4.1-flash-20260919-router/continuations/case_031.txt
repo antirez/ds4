@@ -1,0 +1,3 @@
+UTF-8 cannot generally be truncated safely at an arbitrary byte offset because a single UTF-8 encoded character (code point) may occupy **1 to 4 bytes**, and the decoder has no way to know from a byte in isolation whether it is the start of a character or a continuation byte.
+
+## How UTF-

@@ -1,0 +1,5 @@
+# Why Quantization Error Hurts Rare Experts More Than Common Experts
+
+## The core idea
+
+Quantization replaces high-precision weights with a small set of discrete

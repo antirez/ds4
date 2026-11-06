@@ -1,0 +1,7 @@
+# Removing Duplicate Strings While Preserving Order
+
+Here's a Python function that removes duplicates while keeping the order of first occurrences:
+
+## Solution 1: Using `dict.fromkeys()` (Python 3.7+)
+
+The cleanest approach leverages the fact that dictionaries maintain insertion order in Python 3.7+

@@ -1,0 +1,1 @@
+Explain how a hash table handles collisions.

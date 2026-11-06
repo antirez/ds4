@@ -1,0 +1,7 @@
+# Testing That Cancellation Releases a Worker and Its Memory
+
+A simple, reliable approach is to **combine a lifecycle signal with a memory measurement** around a cancellable task, then assert both drop back to baseline.
+
+## The basic recipe
+
+1. **Record a baseline** (worker count + memory) before starting

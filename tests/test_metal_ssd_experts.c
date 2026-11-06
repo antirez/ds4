@@ -2,6 +2,7 @@
 #include "ds4_gpu.h"
 
 #include <math.h>
+#include <mach/mach.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,9 +10,14 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-enum { E = 256, N = 8, STEPS = 48 };
-static int D = 256, H = 512;
+enum { STEPS = 48 };
+static int D = 256, H = 512, E = 256, N = 8;
+static uint32_t quant_type = 16;
 typedef struct { uint16_t d; uint8_t qs[64]; } iq2_block;
+typedef struct { uint16_t d, dmin; uint8_t scales[12], qs[128]; } q4_block;
+typedef struct { uint8_t e, qs[16]; } mxfp4_block;
+static uint64_t block_bytes = sizeof(iq2_block);
+static uint32_t block_values = 256;
 
 static uint32_t rng = 1;
 static uint32_t random_u32(void) {
@@ -19,6 +25,27 @@ static uint32_t random_u32(void) {
     rng ^= rng >> 17;
     rng ^= rng << 5;
     return rng;
+}
+
+static int check_streaming_table_admission(void) {
+    const char *flags[] = {"DS4_METAL_ENABLE_PRO_Q4_EXPERT_TABLE_AUTO",
+        "DS4_METAL_ENABLE_Q4_EXPERT_TABLE", "DS4_METAL_ENABLE_PRO_Q4_EXPERT_ADDRESS_AUTO"};
+    int ok = 1;
+    ds4_gpu_set_ssd_streaming(true);
+    for (size_t i = 0; i < sizeof(flags) / sizeof(*flags); i++) {
+        if (getenv(flags[i])) {
+            fprintf(stderr, "Run the SSD admission test without Q4 table overrides\n");
+            return 0;
+        }
+    }
+    ok = ds4_gpu_pro_q4_expert_table_auto_available() == 0;
+    for (size_t i = 0; i < sizeof(flags) / sizeof(*flags); i++) {
+        if (setenv(flags[i], "1", 1)) return 0;
+        ok = ok && ds4_gpu_pro_q4_expert_table_auto_available() == 0;
+        if (unsetenv(flags[i])) return 0;
+    }
+    fprintf(stderr, "Metal SSD excludes persistent full-expert tables: %s\n", ok ? "PASS" : "FAIL");
+    return ok;
 }
 
 static int check_mapping_lifetime(void) {
@@ -67,8 +94,8 @@ static int check_mapping_lifetime(void) {
 static int check_batch_cache(void *model, uint64_t bytes, uint64_t expert) {
     enum { T = 257 };
     const uint64_t tensor = E * expert;
-    const uint64_t row = D / 256 * sizeof(iq2_block);
-    const uint64_t down_row = H / 256 * sizeof(iq2_block);
+    const uint64_t row = D / block_values * block_bytes;
+    const uint64_t down_row = H / block_values * block_bytes;
     const size_t xb = T * D * sizeof(float), mb = T * N * H * sizeof(float);
     const size_t ob = T * D * sizeof(float), ib = T * N * sizeof(int32_t);
     float *x = malloc(xb), *weights = malloc(ib), *ref = malloc(ob), *got = malloc(ob);
@@ -104,12 +131,17 @@ static int check_batch_cache(void *model, uint64_t bytes, uint64_t expert) {
                      ds4_gpu_tensor_fill_f32(out, NAN, T * D) &&
                      ds4_gpu_begin_commands() && ds4_gpu_routed_moe_batch_tensor(
                         out, gate, up, mid, down, model, bytes, 0, tensor, 2 * tensor,
-                        16, 16, expert, row, expert, down_row, D, H, D,
+                        quant_type, quant_type, expert, row, expert, down_row, D, H, D,
                         it, wt, E, N, 7.0f, xt, 3 + c % 2, n, &half[streamed],
                         !streamed) && ds4_gpu_end_commands() &&
                      ds4_gpu_tensor_read(out, 0, streamed ? got : ref, n * D * sizeof(float)) &&
                      ds4_gpu_tensor_read(mid, 0, streamed ? got_mid : ref_mid,
                         n * N * H * (half[streamed] ? sizeof(uint16_t) : sizeof(float)));
+                if (c == 0 && !streamed && quant_type != 16 && !quality &&
+                    ds4_gpu_stream_expert_cache_current_count() != 0) {
+                    fprintf(stderr, "Resident type=%u single-row batch populated the SSD cache\n", quant_type);
+                    ok = 0;
+                }
             }
             if (!ok || half[0] != half[1] || memcmp(ref, got, n * D * sizeof(float)) ||
                 memcmp(ref_mid, got_mid, n * N * H *
@@ -117,7 +149,9 @@ static int check_batch_cache(void *model, uint64_t bytes, uint64_t expert) {
                 fprintf(stderr, "SSD batch mismatch tokens=%u quality=%d\n", n, quality);
                 ok = 0;
             }
-            if (c == 0 && ds4_gpu_stream_expert_cache_current_count() == 0) {
+            /* The unfused six-expert quality path reads the layer directly. */
+            if (c == 0 && (quant_type == 16 || !quality) &&
+                ds4_gpu_stream_expert_cache_current_count() == 0) {
                 fprintf(stderr, "SSD batch did not populate the expert cache\n");
                 ok = 0;
             }
@@ -130,20 +164,74 @@ done:
     ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(it); ds4_gpu_tensor_free(wt);
     ds4_gpu_tensor_free(gate); ds4_gpu_tensor_free(up); ds4_gpu_tensor_free(mid);
     ds4_gpu_tensor_free(down); ds4_gpu_tensor_free(out);
-    fprintf(stderr, "Metal SSD IQ2 batch cache exact outputs: %s\n", ok ? "PASS" : "FAIL");
+    fprintf(stderr, "Metal SSD type=%u batch cache exact outputs: %s\n", quant_type, ok ? "PASS" : "FAIL");
     return ok;
 }
 
+static uint64_t memory_footprint(void) {
+    task_vm_info_data_t info;
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&info, &count) != KERN_SUCCESS)
+        return UINT64_MAX;
+    return info.phys_footprint;
+}
+
+static int check_seed_release(void *model, uint64_t bytes, uint64_t expert) {
+    int32_t ids[E];
+    for (int i = 0; i < E; i++) ids[i] = i;
+    const ds4_gpu_stream_expert_table table = {
+        .model_map = model, .model_size = bytes, .layer = 3, .n_total_expert = E,
+        .gate_offset = 0, .up_offset = E * expert, .down_offset = 2 * E * expert,
+        .gate_expert_bytes = expert, .down_expert_bytes = expert,
+    };
+    /* Repeatedly replace a small seeded cache, without a caller-owned ObjC
+     * pool. Logical entry counts alone cannot detect retained Metal buffers. */
+    uint64_t baseline = 0;
+    for (unsigned pass = 0; pass < 10; pass++) {
+        ds4_gpu_set_streaming_expert_cache_budget(E);
+        if (!ds4_gpu_begin_commands() ||
+            !ds4_gpu_stream_expert_cache_seed_experts_gpu_copy(&table, ids, NULL, E) ||
+            !ds4_gpu_end_commands() || ds4_gpu_stream_expert_cache_current_count() != (uint32_t)E)
+            return 0;
+        ds4_gpu_set_streaming_expert_cache_budget(0);
+        if (ds4_gpu_stream_expert_cache_current_count() != 0) return 0;
+        const uint64_t footprint = memory_footprint();
+        if (footprint == UINT64_MAX) return 0;
+        if (pass == 1) baseline = footprint;
+        fprintf(stderr, "Metal SSD seed/release %u: %.2f MiB footprint\n",
+                pass, footprint / 1048576.0);
+        if (pass > 1 && footprint > baseline + 3 * bytes + (UINT64_C(32) << 20)) {
+            fprintf(stderr, "Metal SSD seed/release retains discarded buffers\n");
+            return 0;
+        }
+    }
+    return 1;
+}
+
 int main(int argc, char **argv) {
-    if (argc == 2 && !strcmp(argv[1], "--full-glm-shape")) {
+    if (argc == 2 && !strcmp(argv[1], "--table-admission")) {
+        const int ok = ds4_gpu_init() && check_streaming_table_admission();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    } else if (argc == 2 && !strcmp(argv[1], "--full-glm-shape")) {
         D = 6144;
         H = 2048;
+    } else if (argc == 2 && !strcmp(argv[1], "--q4")) {
+        E = 384;
+        N = 6;
+        quant_type = 12;
+        block_bytes = sizeof(q4_block);
+    } else if (argc == 2 && !strcmp(argv[1], "--mxfp4")) {
+        N = 6;
+        quant_type = 39;
+        block_bytes = sizeof(mxfp4_block);
+        block_values = 32;
     } else if (argc != 1) {
-        fprintf(stderr, "usage: %s [--full-glm-shape]\n", argv[0]);
+        fprintf(stderr, "usage: %s [--full-glm-shape | --q4 | --mxfp4 | --table-admission]\n", argv[0]);
         return 1;
     }
-    const uint64_t row = D / 256 * sizeof(iq2_block);
-    const uint64_t down_row = H / 256 * sizeof(iq2_block);
+    const uint64_t row = D / block_values * block_bytes;
+    const uint64_t down_row = H / block_values * block_bytes;
     const uint64_t expert = H * row;
     const uint64_t tensor = E * expert;
     const size_t bytes = 3 * tensor;
@@ -152,15 +240,31 @@ int main(int argc, char **argv) {
     void *model = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED,
                        fileno(file), 0);
     if (model == MAP_FAILED) return 1;
-    iq2_block *block = model;
-    for (size_t i = 0; i < bytes / sizeof(*block); i++) {
-        block[i].d = 0x1400;
-        for (size_t j = 0; j < sizeof(block[i].qs); j++)
-            block[i].qs[j] = random_u32();
+    for (size_t i = 0; i < bytes / block_bytes; i++) {
+        if (quant_type == 12) {
+            q4_block *block = (q4_block *)model + i;
+            block->d = 0x0400;
+            block->dmin = 0x1000;
+            for (size_t j = 0; j < sizeof(block->scales); j++)
+                block->scales[j] = random_u32();
+            for (size_t j = 0; j < sizeof(block->qs); j++)
+                block->qs[j] = random_u32();
+        } else if (quant_type == 39) {
+            mxfp4_block *block = (mxfp4_block *)model + i;
+            block->e = 118 + random_u32() % 5;
+            for (size_t j = 0; j < sizeof(block->qs); j++)
+                block->qs[j] = random_u32();
+        } else {
+            iq2_block *block = (iq2_block *)model + i;
+            block->d = 0x1400;
+            for (size_t j = 0; j < sizeof(block->qs); j++)
+                block->qs[j] = random_u32();
+        }
     }
     int ok = msync(model, bytes, MS_SYNC) == 0 && ds4_gpu_init();
+    if (ok) ok = check_streaming_table_admission();
     ds4_gpu_set_quality(false);
-    ds4_gpu_set_glm_model(true);
+    ds4_gpu_set_glm_model(quant_type == 16);
     ds4_gpu_set_ssd_streaming(true);
     ds4_gpu_set_streaming_expert_cache_budget(16);
     ds4_gpu_set_streaming_expert_cache_expert_bytes(expert * 3);
@@ -202,7 +306,7 @@ int main(int argc, char **argv) {
                  ds4_gpu_begin_commands() &&
                  ds4_gpu_routed_moe_one_tensor(
                     out, gate, up, mid, down, model, bytes, 0, tensor, 2 * tensor,
-                    16, 16, expert, row, expert, down_row, D, H, D,
+                    quant_type, quant_type, expert, row, expert, down_row, D, H, D,
                     it, wt, E, N, 7.0f, xt, NULL, 3, !streamed) &&
                  ds4_gpu_end_commands() &&
                  ds4_gpu_tensor_read(out, 0, streamed ? actual : reference,
@@ -229,11 +333,12 @@ int main(int argc, char **argv) {
     ds4_gpu_tensor_free(gate); ds4_gpu_tensor_free(up); ds4_gpu_tensor_free(mid);
     ds4_gpu_tensor_free(down); ds4_gpu_tensor_free(out);
     if (ok) ok = check_batch_cache(model, bytes, expert);
+    if (ok && D == 256) ok = check_seed_release(model, bytes, expert);
     ds4_gpu_print_memory_report("SSD expert test");
     if (ok) ok = check_mapping_lifetime();
     ds4_gpu_cleanup();
     munmap(model, bytes);
     fclose(file);
-    fprintf(stderr, "Metal SSD IQ2 eight-expert eviction: %s\n", ok ? "PASS" : "FAIL");
+    fprintf(stderr, "Metal SSD type=%u %d-expert eviction: %s\n", quant_type, N, ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }

@@ -1,0 +1,1 @@
+Explain why changing the order of equal-scored items can matter in a deterministic selection algorithm.

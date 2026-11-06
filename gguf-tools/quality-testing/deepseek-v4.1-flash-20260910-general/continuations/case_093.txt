@@ -1,0 +1,5 @@
+# Why a Page Cache Makes a Second File Read Faster
+
+## The Core Idea
+
+When you read a file, the operating system doesn't hand bytes directly from

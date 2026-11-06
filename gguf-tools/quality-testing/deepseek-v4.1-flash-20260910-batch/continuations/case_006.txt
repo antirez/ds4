@@ -1,0 +1,7 @@
+Looking at this code, there's an off-by-one bounds bug:
+
+```c
+int lookup(int *a, int n, int index) { if (index > n) return -1; return a[index]; }
+```
+
+**The bug:** The check `index > n` rejects only indices *strictly greater

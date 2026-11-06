@@ -1,5 +1,6 @@
-// Production aligned IQ2/Q2 MoE parity, including small verifier batches.
-// Compare raw and aligned entries, fused gate/up and separate token rows.
+// Production IQ2/Q2 MoE parity, including small verifier batches.
+// Compare raw and aligned entries, fused gate/up and separate token rows,
+// and fused down/sum against the sum of independent expert projections.
 // Both entries use the same Q8_1 activation quantizer.
 // Build/run: make test-cuda-dspark-moe CUDA_ARCH=sm_121
 // Use --check-only to skip timing loops under Compute Sanitizer.
@@ -60,10 +61,22 @@ static int test_q2_down(cudaStream_t stream, std::mt19937 &rng) {
         CK(cudaMemcpy(got.data(), a, out_bytes, cudaMemcpyDeviceToHost));
         CK(cudaMemcpy(ref.data(), b, out_bytes, cudaMemcpyDeviceToHost));
         if (memcmp(got.data(), ref.data(), out_bytes)) bad++;
+        if (ds4_mmq_q2_K_moe_down_sum6_vec(raw, dx, di, a, rows, columns,
+                                          tokens, experts, 6, stream)) return 1;
+        CK(cudaStreamSynchronize(stream));
+        CK(cudaMemcpy(got.data(), a, (size_t)tokens * rows * sizeof(float), cudaMemcpyDeviceToHost));
+        for (int t = 0; t < tokens; t++) {
+            for (int row = 0; row < rows; row++) {
+                float expected = 0.0f;
+                for (int s = 0; s < 6; s++) expected += ref[((size_t)t * 6 + s) * rows + row];
+                const float actual = got[(size_t)t * rows + row];
+                if (!std::isfinite(actual) || fabsf(actual - expected) > 1e-3f + fabsf(expected) * 2e-5f) bad++;
+            }
+        }
         CK(cudaFree(dx)); CK(cudaFree(di)); CK(cudaFree(a)); CK(cudaFree(b));
     }
     CK(cudaFree(aligned)); CK(cudaFree(raw));
-    printf("Q2 down assignments 6..48: exact failures=%d\n", bad);
+    printf("Q2 down assignments 6..48: layout/sum failures=%d\n", bad);
     return bad;
 }
 
@@ -372,6 +385,21 @@ int main(int argc, char **argv) {
             }
         }
         bad4_mid += count_bad(em4, om4, nullptr, nullptr);
+        if (ds4_mmq_iq2_xxs_moe_gate_up_mid_vec(
+                dW, dRawUp, dX4, dIds4, dW4, dMid4,
+                M, K, n_tok, n_experts, n_slots, clampv, stream)) return 1;
+        CK(cudaStreamSynchronize(stream));
+        CK(cudaMemcpy(om4.data(), dMid4, sizeof(float) * om4.size(), cudaMemcpyDeviceToHost));
+        bad4_mid += count_bad(em4, om4, nullptr, nullptr);
+        for (int t = 0; t < n_tok; t++) {
+            if (ds4_mmq_iq2_xxs_moe_gate_up_mid_vec(
+                    dW, dRawUp, dX4 + t * K, dIds4 + t * n_slots,
+                    dW4 + t * n_slots, dMid4 + t * n_slots * M,
+                    M, K, 1, n_experts, n_slots, clampv, stream)) return 1;
+        }
+        CK(cudaStreamSynchronize(stream));
+        CK(cudaMemcpy(serial_mid.data(), dMid4, sizeof(float) * serial_mid.size(), cudaMemcpyDeviceToHost));
+        if (memcmp(om4.data(), serial_mid.data(), sizeof(float) * om4.size())) bad_dedup++;
         CK(cudaFree(dX4)); CK(cudaFree(dOut4B)); CK(cudaFree(dOut4A));
         CK(cudaFree(dMid4)); CK(cudaFree(dW4)); CK(cudaFree(dIds4)); CK(cudaFree(dUp4B));
       }

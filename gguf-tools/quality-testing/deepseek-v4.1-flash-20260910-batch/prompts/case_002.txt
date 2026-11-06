@@ -1,0 +1,19 @@
+The following is background from an archive. Read it, then answer the final task.
+Entry 0000: workshop 000 sent package 0000 to desk 000; status checked.
+Entry 0001: workshop 017 sent package 0029 to desk 011; status checked.
+Entry 0002: workshop 034 sent package 0058 to desk 022; status checked.
+Entry 0003: workshop 051 sent package 0087 to desk 033; status checked.
+Entry 0004: workshop 068 sent package 0116 to desk 044; status checked.
+Entry 0005: workshop 085 sent package 0145 to desk 055; status checked.
+Entry 0006: workshop 102 sent package 0174 to desk 066; status checked.
+Entry 0007: workshop 119 sent package 0203 to desk 077; status checked.
+Entry 0008: workshop 136 sent package 0232 to desk 088; status checked.
+Entry 0009: workshop 153 sent package 0261 to desk 099; status checked.
+Entry 0010: workshop 170 sent package 0290 to desk 110; status checked.
+Entry 0011: workshop 187 sent package 0319 to desk 121; status checked.
+Entry 0012: workshop 204 sent package 0348 to desk 132; status checked.
+Entry 0013: workshop 221 sent package 0377 to desk 143; status checked.
+Entry 0014: workshop 238 sent package 0406 to desk 154; status checked.
+Entry 0015: workshop 255 sent package 0435 to desk 165; status checked
+Final task:
+Scrivi in italiano un breve racconto su un tecnico che trova e corregge un errore nel registro del magazzino.

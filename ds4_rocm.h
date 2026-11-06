@@ -139,5 +139,10 @@ extern "C" __device__ __attribute__((pure))  float __ocml_log1p_f32(float);
 extern "C" __device__ __attribute__((const)) float __ocml_sqrt_f32(float);
 
 static __device__ __forceinline__ float ds4_precise_expf(float x)   { return __ocml_exp_f32(x); }
-static __device__ __forceinline__ float ds4_precise_log1pf(float x) { return __ocml_log1p_f32(x); }
+static __device__ __forceinline__ float ds4_precise_log1pf(float x) {
+    /* OCML's unsafe-math mode can reduce log1p(x) to log(1+x), losing
+     * small router probabilities. The cubic's relative error here is < 2^-31. */
+    if (fabsf(x) < 0x1p-10f) return x * (1.0f - x * (0.5f - x / 3.0f));
+    return __ocml_log1p_f32(x);
+}
 static __device__ __forceinline__ float ds4_precise_sqrtf(float x)  { return __ocml_sqrt_f32(x); }

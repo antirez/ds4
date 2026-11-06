@@ -37,3 +37,6 @@ ROCM_UNAVAILABLE_INT(ds4_gpu_shared_mid_swiglu_q8_0_decode_exact_tensor)
 
 extern "C" uint64_t ds4_gpu_tp_big_gate_kick(...) { return 0; }
 ROCM_UNAVAILABLE_INT(ds4_gpu_tp_big_gate_wait)
+ROCM_UNAVAILABLE_INT(ds4_gpu_tp_init)
+extern "C" void ds4_gpu_tp_shutdown(void) {}
+extern "C" int ds4_gpu_tp_failed(void) { return 1; }

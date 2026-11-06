@@ -1,0 +1,5 @@
+# Pseudocodice: Inserimento in un Heap Binario
+
+## Concetto
+
+L'inserimento in un heap binario avviene in

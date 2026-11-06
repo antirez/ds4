@@ -101,17 +101,48 @@ kernel void kernel_deepseek4_vision_add_residual(
     x[off] = deepseek4_vision_round_bf16(x[off] + residual[off]);
 }
 
+kernel void kernel_deepseek41_vision_bias_residual(
+        constant deepseek4_vision_rows_args &args,
+        device float                       *x,
+        device const ushort                *bias,
+        device const float                 *residual,
+        uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= args.width || gid.y >= args.rows) return;
+    const ulong off = (ulong)gid.y * args.width + gid.x;
+    const float projected = deepseek4_vision_round_bf16(
+        x[off] + glm53_bf16_to_f32(bias[gid.x]));
+    x[off] = deepseek4_vision_round_bf16(projected + residual[off]);
+}
+
+static inline void deepseek4_vision_swiglu_split(
+        constant deepseek4_vision_rows_args &args,
+        device const float                 *gate_up,
+        device float                       *out,
+        uint2 gid,
+        bool round_silu) {
+    if (gid.x >= args.width || gid.y >= args.rows) return;
+    const ulong source = (ulong)gid.y * args.width * 2u + gid.x;
+    const float gate = gate_up[source];
+    const float up = gate_up[source + args.width];
+    float activated = gate / (1.0f + exp(-gate));
+    if (round_silu) activated = deepseek4_vision_round_bf16(activated);
+    out[(ulong)gid.y * args.width + gid.x] = deepseek4_vision_round_bf16(activated * up);
+}
+
 kernel void kernel_deepseek4_vision_swiglu_split(
         constant deepseek4_vision_rows_args &args,
         device const float                 *gate_up,
         device float                       *out,
         uint2 gid [[thread_position_in_grid]]) {
-    if (gid.x >= args.width || gid.y >= args.rows) return;
-    const ulong source = (ulong)gid.y * args.width * 2u + gid.x;
-    const float gate = gate_up[source];
-    const float up = gate_up[source + args.width];
-    out[(ulong)gid.y * args.width + gid.x] = deepseek4_vision_round_bf16(
-        (gate / (1.0f + exp(-gate))) * up);
+    deepseek4_vision_swiglu_split(args, gate_up, out, gid, false);
+}
+
+kernel void kernel_deepseek41_vision_swiglu_split(
+        constant deepseek4_vision_rows_args &args,
+        device const float                 *gate_up,
+        device float                       *out,
+        uint2 gid [[thread_position_in_grid]]) {
+    deepseek4_vision_swiglu_split(args, gate_up, out, gid, true);
 }
 
 /* Match F.unfold(x, 3, stride=3): channels are outermost, followed by the

@@ -1,0 +1,12 @@
+Let's go step-by-step.
+
+---
+
+**Step 1: Write down what we know.**
+
+- Perimeter of rectangle: \( P = 34 \)
+- Width: \( w = 5 \)
+- Length: \( l = ? \)
+- Area: \( A = ? \)
+
+The perimeter formula for a

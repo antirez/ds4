@@ -1,0 +1,1 @@
+A TCP server must preserve a partially written reply when a client reads slowly because TCP provides a reliable, ordered byte stream, not a message-oriented protocol, so a single `send` or `write` may accept only part of the reply into the socket's send buffer depending on available buffer space and the receiver's advertised window

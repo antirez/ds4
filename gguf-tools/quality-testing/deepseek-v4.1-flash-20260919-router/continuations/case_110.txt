@@ -1,0 +1,6 @@
+Looking at this code, the vast majority of the functions (`limit_0` through `limit_899`) are completely memory-safe. They perform simple arithmetic comparisons and returns with no pointer dereferencing, no array indexing, and no memory allocation.
+
+The **actual unsafe function** is:
+
+```c
+int checked_get

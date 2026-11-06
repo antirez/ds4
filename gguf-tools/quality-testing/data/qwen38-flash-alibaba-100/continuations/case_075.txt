@@ -1,0 +1,6 @@
+Un **trie** (pronunciato "try", da *retrieval*) è una struttura dati ad albero ordinata che rappresenta un insieme di stringhe in modo efficiente, sfruttando i prefissi comuni.
+
+### Come funziona la rappresentazione:
+
+1.  **Radice vuota**:  
+   

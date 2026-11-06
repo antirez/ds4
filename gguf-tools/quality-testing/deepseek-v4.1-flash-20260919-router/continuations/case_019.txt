@@ -1,0 +1,5 @@
+# Handling Clients That Send Valid Headers But Never Finish the Request Body
+
+This is a classic slowloris-style / stalled-upload scenario. A robust server needs defenses at multiple layers because an attacker (or a flaky client) can tie up sockets, worker threads, memory buffers, and backend connections indefinitely.
+
+##

@@ -1,0 +1,250 @@
+{
+  "id": "4a0d6d28-9c23-472f-9c5d-191b8a8b75c7",
+  "object": "chat.completion",
+  "created": 1789046366,
+  "model": "deepseek-flash",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "074"
+      },
+      "logprobs": {
+        "content": [
+          {
+            "token": "074",
+            "logprob": -8.463824e-06,
+            "bytes": [
+              48,
+              55,
+              52
+            ],
+            "top_logprobs": [
+              {
+                "token": "074",
+                "logprob": -8.463824e-06,
+                "bytes": [
+                  48,
+                  55,
+                  52
+                ]
+              },
+              {
+                "token": "74",
+                "logprob": -11.6980505,
+                "bytes": [
+                  55,
+                  52
+                ]
+              },
+              {
+                "token": "2",
+                "logprob": -16.675423,
+                "bytes": [
+                  50
+                ]
+              },
+              {
+                "token": "Based",
+                "logprob": -16.972897,
+                "bytes": [
+                  66,
+                  97,
+                  115,
+                  101,
+                  100
+                ]
+              },
+              {
+                "token": "002",
+                "logprob": -17.65809,
+                "bytes": [
+                  48,
+                  48,
+                  50
+                ]
+              },
+              {
+                "token": "The",
+                "logprob": -17.721373,
+                "bytes": [
+                  84,
+                  104,
+                  101
+                ]
+              },
+              {
+                "token": "072",
+                "logprob": -18.02706,
+                "bytes": [
+                  48,
+                  55,
+                  50
+                ]
+              },
+              {
+                "token": "Ware",
+                "logprob": -18.088522,
+                "bytes": [
+                  87,
+                  97,
+                  114,
+                  101
+                ]
+              },
+              {
+                "token": "073",
+                "logprob": -18.76646,
+                "bytes": [
+                  48,
+                  55,
+                  51
+                ]
+              },
+              {
+                "token": "000",
+                "logprob": -18.806717,
+                "bytes": [
+                  48,
+                  48,
+                  48
+                ]
+              },
+              {
+                "token": "076",
+                "logprob": -18.953941,
+                "bytes": [
+                  48,
+                  55,
+                  54
+                ]
+              },
+              {
+                "token": "0",
+                "logprob": -18.961502,
+                "bytes": [
+                  48
+                ]
+              },
+              {
+                "token": " ",
+                "logprob": -19.213074,
+                "bytes": [
+                  32
+                ]
+              },
+              {
+                "token": "<｜｜end▁of▁sentence｜｜>",
+                "logprob": -19.34711,
+                "bytes": [
+                  60,
+                  239,
+                  189,
+                  156,
+                  239,
+                  189,
+                  156,
+                  101,
+                  110,
+                  100,
+                  226,
+                  150,
+                  129,
+                  111,
+                  102,
+                  226,
+                  150,
+                  129,
+                  115,
+                  101,
+                  110,
+                  116,
+                  101,
+                  110,
+                  99,
+                  101,
+                  239,
+                  189,
+                  156,
+                  239,
+                  189,
+                  156,
+                  62
+                ]
+              },
+              {
+                "token": "740",
+                "logprob": -19.614607,
+                "bytes": [
+                  55,
+                  52,
+                  48
+                ]
+              },
+              {
+                "token": "Let",
+                "logprob": -20.1458,
+                "bytes": [
+                  76,
+                  101,
+                  116
+                ]
+              },
+              {
+                "token": "Record",
+                "logprob": -20.462425,
+                "bytes": [
+                  82,
+                  101,
+                  99,
+                  111,
+                  114,
+                  100
+                ]
+              },
+              {
+                "token": "In",
+                "logprob": -20.573683,
+                "bytes": [
+                  73,
+                  110
+                ]
+              },
+              {
+                "token": "075",
+                "logprob": -20.688229,
+                "bytes": [
+                  48,
+                  55,
+                  53
+                ]
+              },
+              {
+                "token": "077",
+                "logprob": -20.814411,
+                "bytes": [
+                  48,
+                  55,
+                  55
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 1023,
+    "completion_tokens": 1,
+    "total_tokens": 1024,
+    "prompt_tokens_details": {
+      "cached_tokens": 384
+    },
+    "prompt_cache_hit_tokens": 384,
+    "prompt_cache_miss_tokens": 639
+  },
+  "system_fingerprint": "aeb56401ca74e127821c4f9126dcb669"
+}

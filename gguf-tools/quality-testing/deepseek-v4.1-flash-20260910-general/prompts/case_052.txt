@@ -1,0 +1,1 @@
+Spiega online softmax nell'attenzione con variabili semplici.

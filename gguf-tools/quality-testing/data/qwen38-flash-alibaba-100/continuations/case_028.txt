@@ -1,0 +1,5 @@
+Grouped MoE (Mixture of Experts) expert execution improves prefill performance primarily by **optimizing memory bandwidth utilization and reducing kernel launch overhead through batched, contiguous computation**.
+
+Here’s a detailed breakdown of why this is critical for the prefill phase:
+
+### 1. Prefill vs. Decode:

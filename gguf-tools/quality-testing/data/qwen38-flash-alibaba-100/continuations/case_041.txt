@@ -1,0 +1,1 @@
+In the context of Large Language Models (LLMs) and autoregressive generation, **greedy decoding** selects the token with the highest probability at each step. The "logit" is the raw output score from the final layer of the neural network before it is converted into a probability distribution via the Softmax function.

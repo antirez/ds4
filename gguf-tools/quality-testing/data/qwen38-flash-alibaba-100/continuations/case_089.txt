@@ -1,0 +1,7 @@
+A hash table handles collisions (when two different keys produce the same hash index) using one of two primary strategies: **Chaining** or **Open Addressing**.
+
+Here is a detailed explanation of how each method works, along with their pros and cons.
+
+---
+
+### 1. Chaining (Separate

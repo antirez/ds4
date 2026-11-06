@@ -1,0 +1,10 @@
+# Preventing Lost Updates in Concurrent Counter Increments
+
+## The Problem: Lost Update
+
+Suppose a counter row `count = 10` and two clients each want to add 1.
+
+**Naive read-modify-write (no transaction):**
+
+| Time | Client A | Client B | DB value |
+|------

@@ -1,0 +1,5 @@
+To derive why RMSNorm (Root Mean Square Normalization) requires a **sum of squares** and a **scaling pass**, we must look at the mathematical goal of normalization in neural networks: stabilizing the distribution of activations to facilitate faster and more stable training.
+
+Here is the step-by-step logical derivation.
+
+---

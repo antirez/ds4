@@ -122,6 +122,46 @@ static int check_attention_bounds(void) {
     return memcmp(bounds, expected, sizeof(expected)) == 0;
 }
 
+/* A flat image must stay flat: the resampler normalizes by the tap sum, so
+ * every content pixel keeps the source color exactly, whatever the scale or
+ * the edge clamping, and only the gray canvas padding differs. This pins the
+ * tap weights and the content placement inside the padded canvas. */
+static int check_uniform_resample(uint32_t width, uint32_t height, uint8_t color) {
+    ds4_image image = {.width = width, .height = height};
+    image.rgb = malloc((size_t)width * height * 3u);
+    if (!image.rgb) return 0;
+    memset(image.rgb, color, (size_t)width * height * 3u);
+
+    char error[160] = {0};
+    ds4_deepseek4_image_patches patches = {0};
+    if (!ds4_image_preprocess_deepseek4(&patches, &image, error, sizeof(error))) {
+        fprintf(stderr, "uniform preprocess failed: %s\n", error);
+        free(image.rgb);
+        return 0;
+    }
+    const float content = (float)color / 127.5f - 1.0f;
+    const float padding = 127.0f / 127.5f - 1.0f;
+    const size_t values = (size_t)patches.patch_count * 3u * 14u * 14u;
+    size_t content_values = 0;
+    int ok = 1;
+    for (size_t i = 0; ok && i < values; i++) {
+        float value = patches.patches[i];
+        if (fabsf(value - content) <= 1e-6f) content_values++;
+        else if (fabsf(value - padding) > 1e-6f) ok = 0;
+    }
+    if (ok) {
+        ok = content_values ==
+             (size_t)patches.content_width * patches.content_height * 3u;
+    }
+    if (!ok) {
+        fprintf(stderr, "uniform %ux%u resample lost the flat content area\n",
+                width, height);
+    }
+    ds4_deepseek4_image_patches_free(&patches);
+    free(image.rgb);
+    return ok;
+}
+
 int main(void) {
     static const uint8_t types_a[] = {
         1, 1, 1, 0, 2, 2, 2, 2, 2, 2, 3, 3, 4,
@@ -140,7 +180,10 @@ int main(void) {
         !check_layout(1, 1, 3, types_c, sizeof(types_c),
                       perm_c, sizeof(perm_c) / sizeof(perm_c[0])) ||
         !check_span_parser() ||
-        !check_attention_bounds()) {
+        !check_attention_bounds() ||
+        !check_uniform_resample(613, 409, 200) ||
+        !check_uniform_resample(90, 70, 31) ||
+        !check_uniform_resample(1900, 137, 96)) {
         return 1;
     }
 

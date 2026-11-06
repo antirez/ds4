@@ -1,0 +1,7 @@
+# Errore di sintassi vs errore logico
+
+## Errore di sintassi
+È un errore **grammaticale**: il codice è scritto male e il computer non riesce nemmeno a capirlo. Il programma **non parte**.
+
+**Esempio (Python):**
+```python

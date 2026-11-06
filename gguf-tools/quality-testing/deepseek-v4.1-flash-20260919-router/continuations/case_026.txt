@@ -1,0 +1,8 @@
+# Running Mean Without Storing All Input
+
+Here's a clean implementation using the **Welford's algorithm** approach. The key insight is that you can compute a running mean using only the current count and current mean—no need to store previous values.
+
+```python
+def running_mean():
+    """
+    Generator that

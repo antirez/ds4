@@ -1,0 +1,168 @@
+{
+  "schema": "ds4-official-continuations-v1",
+  "created_at": "2026-09-15T11:49:58Z",
+  "model": "qwen/qwen3.8-flash",
+  "system": "",
+  "endpoint": "https://openrouter.ai/api/v1/chat/completions",
+  "observed_models": [
+    "qwen/qwen3.8-flash"
+  ],
+  "observed_providers": [
+    "Alibaba"
+  ],
+  "temperature": 0,
+  "max_tokens": 64,
+  "top_logprobs": 5,
+  "thinking": "omit",
+  "reasoning_effort": "none",
+  "token_limit_field": "max_tokens",
+  "provider_order": [
+    "alibaba"
+  ],
+  "allow_provider_fallbacks": false,
+  "require_parameters": true,
+  "required_response_model": "qwen/qwen3.8-flash",
+  "required_response_provider": "Alibaba",
+  "case_count": 12,
+  "hosted_endpoint": "Alibaba | qwen/qwen3.8-flash-20260826",
+  "provider_precision": "not disclosed",
+  "native_checkpoint": "Qwen/Qwen3.8-Flash-Next",
+  "identity_caveat": "Official hosted Flash is based on Flash Next; identical native checkpoint weights are not guaranteed.",
+  "tokenizer_sha256": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3",
+  "chat_template_sha256": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041",
+  "alignment": [
+    {
+      "id": "case_000",
+      "prompt_tokens": 1988,
+      "api_prompt_tokens": 1988,
+      "target_tokens": 64,
+      "api_target_tokens": 64,
+      "aligned": true,
+      "prompt_count_matches": true,
+      "provider": "Alibaba",
+      "model": "qwen/qwen3.8-flash"
+    },
+    {
+      "id": "case_001",
+      "prompt_tokens": 2096,
+      "api_prompt_tokens": 2096,
+      "target_tokens": 64,
+      "api_target_tokens": 64,
+      "aligned": true,
+      "prompt_count_matches": true,
+      "provider": "Alibaba",
+      "model": "qwen/qwen3.8-flash"
+    },
+    {
+      "id": "case_002",
+      "prompt_tokens": 4092,
+      "api_prompt_tokens": 4092,
+      "target_tokens": 64,
+      "api_target_tokens": 64,
+      "aligned": true,
+      "prompt_count_matches": true,
+      "provider": "Alibaba",
+      "model": "qwen/qwen3.8-flash"
+    },
+    {
+      "id": "case_003",
+      "prompt_tokens": 8162,
+      "api_prompt_tokens": 8162,
+      "target_tokens": 64,
+      "api_target_tokens": 64,
+      "aligned": true,
+      "prompt_count_matches": true,
+      "provider": "Alibaba",
+      "model": "qwen/qwen3.8-flash"
+    },
+    {
+      "id": "case_004",
+      "prompt_tokens": 16376,
+      "api_prompt_tokens": 16376,
+      "target_tokens": 63,
+      "api_target_tokens": 63,
+      "aligned": true,
+      "prompt_count_matches": true,
+      "provider": "Alibaba",
+      "model": "qwen/qwen3.8-flash"
+    },
+    {
+      "id": "case_005",
+      "prompt_tokens": 23983,
+      "api_prompt_tokens": 23983,
+      "target_tokens": 63,
+      "api_target_tokens": 63,
+      "aligned": true,
+      "prompt_count_matches": true,
+      "provider": "Alibaba",
+      "model": "qwen/qwen3.8-flash"
+    },
+    {
+      "id": "case_006",
+      "prompt_tokens": 1971,
+      "api_prompt_tokens": 1971,
+      "target_tokens": 64,
+      "api_target_tokens": 64,
+      "aligned": true,
+      "prompt_count_matches": true,
+      "provider": "Alibaba",
+      "model": "qwen/qwen3.8-flash"
+    },
+    {
+      "id": "case_007",
+      "prompt_tokens": 2059,
+      "api_prompt_tokens": 2059,
+      "target_tokens": 64,
+      "api_target_tokens": 64,
+      "aligned": true,
+      "prompt_count_matches": true,
+      "provider": "Alibaba",
+      "model": "qwen/qwen3.8-flash"
+    },
+    {
+      "id": "case_008",
+      "prompt_tokens": 4083,
+      "api_prompt_tokens": 4083,
+      "target_tokens": 64,
+      "api_target_tokens": 64,
+      "aligned": true,
+      "prompt_count_matches": true,
+      "provider": "Alibaba",
+      "model": "qwen/qwen3.8-flash"
+    },
+    {
+      "id": "case_009",
+      "prompt_tokens": 8161,
+      "api_prompt_tokens": 8161,
+      "target_tokens": 64,
+      "api_target_tokens": 64,
+      "aligned": true,
+      "prompt_count_matches": true,
+      "provider": "Alibaba",
+      "model": "qwen/qwen3.8-flash"
+    },
+    {
+      "id": "case_010",
+      "prompt_tokens": 16349,
+      "api_prompt_tokens": 16349,
+      "target_tokens": 64,
+      "api_target_tokens": 64,
+      "aligned": true,
+      "prompt_count_matches": true,
+      "provider": "Alibaba",
+      "model": "qwen/qwen3.8-flash"
+    },
+    {
+      "id": "case_011",
+      "prompt_tokens": 23985,
+      "api_prompt_tokens": 23985,
+      "target_tokens": 64,
+      "api_target_tokens": 64,
+      "aligned": true,
+      "prompt_count_matches": true,
+      "provider": "Alibaba",
+      "model": "qwen/qwen3.8-flash"
+    }
+  ],
+  "alignment_note": "All 12 native prompt counts match the API, and every output token byte sequence matches the native tokenizer boundary."
+}

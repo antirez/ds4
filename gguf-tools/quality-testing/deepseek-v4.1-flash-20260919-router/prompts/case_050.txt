@@ -1,0 +1,1 @@
+A jar contains three red and two blue balls. Two are drawn without replacement. What is the probability both are red?

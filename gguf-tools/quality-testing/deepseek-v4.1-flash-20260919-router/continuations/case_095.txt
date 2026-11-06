@@ -1,0 +1,4 @@
+# HTTP Server Behavior When Body Length Exceeds Configured Maximum
+
+When a server receives a request declaring a `Content-Length` (or `Transfer-Encoding: chunked` body) larger than its configured maximum, it should **reject early** rather than reading the oversized body. Here's the recommended behavior:
+

@@ -1,0 +1,1 @@
+Write a Python function that returns the second largest distinct number, rejecting inputs with fewer than two distinct values.

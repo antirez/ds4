@@ -1,0 +1,5 @@
+Here is the pseudocode for the **Push** (also known as `Insert` or `Enqueue`) operation on a Binary Heap.
+
+### Logic Explanation
+1.  **Add to End**: The new element is placed at the very end of the underlying array (the next available leaf position).
+2.

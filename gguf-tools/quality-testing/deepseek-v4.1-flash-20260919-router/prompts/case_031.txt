@@ -1,0 +1,1 @@
+Explain why UTF-8 text cannot generally be truncated safely at an arbitrary byte offset.

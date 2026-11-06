@@ -1,0 +1,1 @@
+Checksums catch accidental corruption because they condense a block of data into a short value derived from every bit, so that any unintended change—whether from a

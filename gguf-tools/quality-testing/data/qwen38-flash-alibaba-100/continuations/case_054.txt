@@ -1,0 +1,1 @@
+Per verificare che un `mmap` su file non venga rimappato ripetutamente (ovvero, per assicurarsi che la mappatura sia stabile e non causi overhead di sistema o errori), è necessario combinare **monitoraggio delle chiamate di sistema**, **analisi della memoria** e **test funzionali**.

@@ -1,0 +1,11 @@
+Alright, let’s work through it step-by-step.
+
+---
+
+**Step 1: Find the flour per serving**  
+The recipe uses 450 grams of flour for 6 servings.
+
+\[
+\text{Flour per serving} = \frac{450}{6} = 75 \text{ grams}
+\]
+

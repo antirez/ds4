@@ -32,6 +32,8 @@
 #include <stdint.h>
 
 /* DS4 imports IRIS at commit 9873887d4aa0646c650adc5b86b986d2f653b7e0.
+ * Local changes include decode limits, centered 2x chroma interpolation,
+ * rounded YCbCr conversion, and retaining buffered progressive scan bits.
  * These limits make the memory decoder suitable for untrusted server input. */
 #ifndef JPEG_MAX_INPUT_BYTES
 #define JPEG_MAX_INPUT_BYTES (64u * 1024u * 1024u)
@@ -636,13 +638,45 @@ static void jpeg_ycbcr_to_rgb(uint8_t y, uint8_t cb, uint8_t cr, uint8_t *rgb) {
     int cbb = cb - 128;
     int crr = cr - 128;
 
-    int r = yy + ((crr * 359) >> 8);
-    int g = yy - ((cbb * 88 + crr * 183) >> 8);
-    int b = yy + ((cbb * 454) >> 8);
+    /* Round the full-precision color transform, avoiding a half-level bias
+     * from truncating each channel's contribution. */
+    int r = yy + ((crr * 91881 + 32768) >> 16);
+    int g = yy + ((-cbb * 22554 - crr * 46802 + 32768) >> 16);
+    int b = yy + ((cbb * 116130 + 32768) >> 16);
 
     rgb[0] = JPEG_CLAMP(r);
     rgb[1] = JPEG_CLAMP(g);
     rgb[2] = JPEG_CLAMP(b);
+}
+
+/* DS4: interpolate common subsampled chroma at pixel centers, matching the
+ * triangle filter used by libjpeg/Pillow. Clamp to the real component extent,
+ * not its padded MCU storage. Unusual sampling ratios retain replication. */
+static uint8_t jpeg_sample_chroma(const jpeg_decoder *dec, int component,
+                                  const uint8_t *plane, int stride, int x, int y) {
+    const int hs = dec->comp[component].h_samp;
+    const int vs = dec->comp[component].v_samp;
+    const int sx = x * hs / dec->max_h_samp;
+    const int sy = y * vs / dec->max_v_samp;
+    const int width = (dec->width * hs + dec->max_h_samp - 1) / dec->max_h_samp;
+    const int height = (dec->height * vs + dec->max_v_samp - 1) / dec->max_v_samp;
+    if (dec->max_h_samp != 2 * hs || width <= 2 ||
+        (dec->max_v_samp != vs && dec->max_v_samp != 2 * vs)) {
+        return plane[sy * stride + sx];
+    }
+    int nx = sx + ((x & 1) ? 1 : -1);
+    if (nx < 0) nx = 0;
+    if (nx >= width) nx = width - 1;
+    if (dec->max_v_samp == vs) {
+        return (uint8_t)((3 * plane[sy * stride + sx] + plane[sy * stride + nx] +
+                          ((x & 1) ? 2 : 1)) >> 2);
+    }
+    int ny = sy + ((y & 1) ? 1 : -1);
+    if (ny < 0) ny = 0;
+    if (ny >= height) ny = height - 1;
+    int near = 3 * plane[sy * stride + sx] + plane[ny * stride + sx];
+    int far = 3 * plane[sy * stride + nx] + plane[ny * stride + nx];
+    return (uint8_t)((3 * near + far + ((x & 1) ? 7 : 8)) >> 4);
 }
 
 /* Consume a restart marker at the current bitstream position.
@@ -892,6 +926,7 @@ static int jpeg_prog_decode_ac_refine(jpeg_decoder *dec, int comp_idx, int16_t *
             int run = rs >> 4;
             int size = rs & 0x0F;
 
+            int new_val = 0;
             if (size == 0) {
                 if (run != 15) {
                     /* EOBn */
@@ -906,16 +941,13 @@ static int jpeg_prog_decode_ac_refine(jpeg_decoder *dec, int comp_idx, int16_t *
                     }
                     break;
                 }
-                /* ZRL: skip 16 zeros while refining non-zeros */
-                run = 16;
+                /* ZRL: skip 15 zeros, then write a zero (16 zeros total).
+                 * Do not keep refining trailing non-zeros before the next
+                 * Huffman symbol; those correction bits come after it. */
             } else if (size != 1) {
                 if (dec->bs.eof) break;
                 return -1;  /* Invalid: size must be 1 for refinement */
-            }
-
-            /* Skip 'run' zero coefficients, refining any non-zero ones along the way */
-            int new_val = 0;
-            if (size == 1) {
+            } else {
                 int bit = jpeg_get_bits(&dec->bs, 1);
                 if (bit < 0) {
                     if (dec->bs.eof) break;
@@ -924,6 +956,8 @@ static int jpeg_prog_decode_ac_refine(jpeg_decoder *dec, int comp_idx, int16_t *
                 new_val = bit ? p1 : m1;
             }
 
+            /* Skip 'run' zeros, refining non-zeros along the way, then
+             * place new_val (0 for ZRL) at the next zero and stop. */
             while (k <= dec->se) {
                 int zk = jpeg_zigzag[k];
                 if (coef[zk] != 0) {
@@ -945,15 +979,15 @@ static int jpeg_prog_decode_ac_refine(jpeg_decoder *dec, int comp_idx, int16_t *
                     run--;
                     k++;
                 } else {
+                    coef[zk] = (int16_t)new_val;
+                    k++;
                     break;
                 }
             }
 
-            if (dec->bs.eof) goto refine_done;
-            if (size == 1 && k <= dec->se) {
-                coef[jpeg_zigzag[k]] = (int16_t)new_val;
-                k++;
-            }
+            /* Huffman lookahead may have reached the next marker while valid
+             * bits remain buffered. The new coefficient was already written
+             * in the skip loop; keep decoding this block. */
         }
     }
 
@@ -1087,17 +1121,11 @@ static int jpeg_decode_progressive_scan(jpeg_decoder *dec, int *scan_comps, int 
                     if (jpeg_prog_decode_ac_refine(dec, comp_idx, coef) < 0) return -1;
                 }
 
-                /* If we hit EOF, stop processing this scan */
-                if (dec->bs.eof) {
-                    goto ac_scan_done;
-                }
-
                 if (dec->restart_interval > 0) {
                     restart_count--;
                 }
             }
         }
-ac_scan_done:;
     }
 
     return 0;
@@ -1368,6 +1396,16 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
             dec.ah = file_data[sos_offset + 2] >> 4;
             dec.al = file_data[sos_offset + 2] & 0x0F;
 
+            if (dec.is_progressive) {
+                /* Validate spectral selection and successive approximation
+                 * (T.81 G.1.1.1.1). Se bounds the jpeg_zigzag[64] index in
+                 * the AC decoders. */
+                if (dec.se > 63 || dec.ss > dec.se) goto fail;
+                if (dec.ss == 0 && dec.se != 0) goto fail;  /* DC scan */
+                if (dec.ss > 0 && ns != 1) goto fail;       /* AC scan */
+                if (dec.ah > 13 || dec.al > 13) goto fail;
+            }
+
             /* Setup bitstream for scan data */
             size_t scan_data_start = pos + seg_len;
             dec.bs.data = file_data + scan_data_start;
@@ -1452,13 +1490,8 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
                     for (int y = 0; y < dec.height; y++) {
                         for (int x = 0; x < dec.width; x++) {
                             uint8_t yy = y_data[y * y_stride + x];
-                            int cb_x = x * dec.comp[1].h_samp / dec.max_h_samp;
-                            int cb_y = y * dec.comp[1].v_samp / dec.max_v_samp;
-                            int cr_x = x * dec.comp[2].h_samp / dec.max_h_samp;
-                            int cr_y = y * dec.comp[2].v_samp / dec.max_v_samp;
-
-                            uint8_t cb = cb_data[cb_y * cb_stride + cb_x];
-                            uint8_t cr = cr_data[cr_y * cr_stride + cr_x];
+                            uint8_t cb = jpeg_sample_chroma(&dec, 1, cb_data, cb_stride, x, y);
+                            uint8_t cr = jpeg_sample_chroma(&dec, 2, cr_data, cr_stride, x, y);
 
                             jpeg_ycbcr_to_rgb(yy, cb, cr, img->data + (y * dec.width + x) * 3);
                         }
@@ -1512,13 +1545,8 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
             for (int y = 0; y < dec.height; y++) {
                 for (int x = 0; x < dec.width; x++) {
                     uint8_t yy = planes[0][y * strides[0] + x];
-                    int cb_x = x * dec.comp[1].h_samp / dec.max_h_samp;
-                    int cb_y = y * dec.comp[1].v_samp / dec.max_v_samp;
-                    int cr_x = x * dec.comp[2].h_samp / dec.max_h_samp;
-                    int cr_y = y * dec.comp[2].v_samp / dec.max_v_samp;
-
-                    uint8_t cb = planes[1][cb_y * strides[1] + cb_x];
-                    uint8_t cr = planes[2][cr_y * strides[2] + cr_x];
+                    uint8_t cb = jpeg_sample_chroma(&dec, 1, planes[1], strides[1], x, y);
+                    uint8_t cr = jpeg_sample_chroma(&dec, 2, planes[2], strides[2], x, y);
 
                     jpeg_ycbcr_to_rgb(yy, cb, cr, img->data + (y * dec.width + x) * 3);
                 }

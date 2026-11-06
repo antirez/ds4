@@ -1,0 +1,9 @@
+Here is a brief, structured plan for testing long-context prompt chunking strategies.
+
+### **Objective**
+Evaluate the effectiveness of different chunking methods in preserving semantic integrity, retrieval accuracy, and response quality when processing documents exceeding model context limits.
+
+---
+
+### **1. Test Dataset Preparation**
+- **Source

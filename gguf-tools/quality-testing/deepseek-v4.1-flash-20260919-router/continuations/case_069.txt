@@ -1,0 +1,6 @@
+# Funzione Python per trovare tutte le posizioni di una sottostringa (incluse le sovrapposte)
+
+Ecco una soluzione che trova **tutte** le occorrenze, anche quelle che si sovrappongono:
+
+```python
+def trova_tutte_posizioni(testo

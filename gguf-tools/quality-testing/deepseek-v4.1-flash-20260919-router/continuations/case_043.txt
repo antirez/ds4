@@ -1,0 +1,5 @@
+The ice cream–drowning correlation is a classic example of why **correlation does not imply causation**. Here's why it doesn't establish that ice cream causes drowning:
+
+## The correlation is real—but spurious
+
+Ice cream sales and drowning deaths do tend to rise and fall together. But that doesn't mean one

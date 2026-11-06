@@ -16,6 +16,7 @@ from safetensors import safe_open
 
 
 SOURCE_REVISION = "e46e16bf6035c6f317eb2ac7458eb0362926d402"
+V41_SOURCE_REVISION = "df42c109f1defefcbfcedbe7d905718a12266e40"
 
 
 def parse_args():
@@ -63,15 +64,28 @@ def main():
     hf_dir = os.path.abspath(args.hf)
     with open(os.path.join(hf_dir, "config.json"), encoding="utf-8") as fp:
         config = json.load(fp)
-    if config.get("_commit_hash") not in (None, SOURCE_REVISION):
+    v41 = config.get("model_type") == "deepseek_v41"
+    revision = V41_SOURCE_REVISION if v41 else SOURCE_REVISION
+    if config.get("_commit_hash") not in (None, revision):
         raise SystemExit("config revision does not match the pinned checkpoint")
 
     inference_dir = os.path.join(hf_dir, "inference")
     sys.path.insert(0, inference_dir)
-    from image_processor import build_image_block, load_image
+    from image_processor import load_image
     from vision import Aligner, ViT, apply_rotary, get_vision_cos_sin
 
-    config["dim"] = config["hidden_size"]
+    if v41:
+        vision = config["vision_config"]
+        config = {"dim": config["text_config"]["hidden_size"], **{
+            "vision_" + target: vision[source] for target, source in (
+                ("n_layers", "num_hidden_layers"), ("dim", "hidden_size"),
+                ("n_heads", "num_attention_heads"), ("inter_dim", "intermediate_size"),
+                ("patch_size", "patch_size"), ("rope_theta", "rope_theta"),
+                ("downsample_ratio", "downsample_ratio"),
+                ("max_n_token", "max_image_tokens"), ("min_pixels", "min_pixels"),
+                ("max_wh_ratio", "max_wh_ratio"))}}
+    else:
+        config["dim"] = config["hidden_size"]
     model_args = SimpleNamespace(**config)
     torch.set_default_dtype(torch.bfloat16)
     torch.set_default_device(args.device)
@@ -86,7 +100,13 @@ def main():
     patches, n_vit_h, n_vit_w, n_llm_h, n_llm_w = load_image(
         {"url": os.path.abspath(args.image)}, model_args)
     patches = patches.to(args.device)
-    types, perm = build_image_block(n_llm_h, n_llm_w, 0)
+    if v41:
+        from image_processor import image_token_types
+        types = image_token_types(n_llm_h, n_llm_w)
+        perm = torch.arange(n_llm_h * n_llm_w)
+    else:
+        from image_processor import build_image_block
+        types, perm = build_image_block(n_llm_h, n_llm_w, 0)
 
     prefix = Path(args.out_prefix)
     prefix.parent.mkdir(parents=True, exist_ok=True)
@@ -144,7 +164,7 @@ def main():
     np.asarray(perm.cpu().numpy(), dtype="<i8").tofile(
         str(prefix) + ".perm.i64")
     metadata = {
-        "source_revision": SOURCE_REVISION,
+        "source_revision": revision,
         "image": os.path.basename(args.image),
         "n_vit_h": n_vit_h,
         "n_vit_w": n_vit_w,

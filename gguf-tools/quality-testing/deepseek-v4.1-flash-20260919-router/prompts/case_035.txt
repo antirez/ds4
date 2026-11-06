@@ -1,0 +1,1 @@
+Explain why comparing passwords with a function that stops at the first difference may leak information.

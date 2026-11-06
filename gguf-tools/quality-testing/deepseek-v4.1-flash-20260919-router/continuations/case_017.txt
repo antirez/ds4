@@ -1,0 +1,11 @@
+# Balanced Parentheses Counter
+
+```python
+def count_balanced_pairs(s: str) -> int:
+    """
+    Count the number of matched parenthesis pairs in a string.
+    
+    Returns the count of matched pairs if the string is fully balanced,
+    otherwise raises ValueError for malformed input.
+    
+    Only '('

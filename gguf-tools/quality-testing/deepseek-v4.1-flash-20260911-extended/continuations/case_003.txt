@@ -1,0 +1,7 @@
+The bug in this code is a bounds error in the array access condition.
+
+## The Bug
+
+The condition `if (index > n) return -1;` only checks whether `index` is greater than `n`, but it **should check `index >= n`**.
+
+In C, arrays are **zero-index

@@ -1,0 +1,6 @@
+# mmap vs. Private Buffer Copies for Model Weights on macOS
+
+## How each approach works
+
+**mmap (memory-mapped file)**
+-

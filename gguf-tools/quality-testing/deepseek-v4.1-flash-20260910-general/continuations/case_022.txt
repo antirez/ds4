@@ -1,0 +1,5 @@
+# Mutex vs. Atomic Counter
+
+Both are used to make concurrent code safe, but they operate at very different levels and are suited to different problems.
+
+##

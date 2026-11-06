@@ -1,0 +1,5 @@
+# The Role of Calibration Data in Neural Network Quantization
+
+## The Core Problem
+
+Quantizing a neural network means replacing high-precision values (typically FP

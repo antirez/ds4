@@ -1,0 +1,1 @@
+Spiega la differenza tra un errore di sintassi e un errore logico con un esempio semplice.

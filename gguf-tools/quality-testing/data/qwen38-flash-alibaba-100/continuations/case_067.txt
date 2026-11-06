@@ -1,0 +1,6 @@
+The difference between **mmap page residency** and **virtual address space size** arises from the fundamental design of virtual memory systems, specifically the concept of **lazy allocation** (or demand paging).
+
+Here’s a detailed breakdown:
+
+### 1. Virtual Address Space Size
+- **Definition**: The total amount of

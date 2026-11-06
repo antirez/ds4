@@ -1,0 +1,9 @@
+Here's a Python function that rotates a sequence to the right by k positions, handling negative k, empty input, and various edge cases:
+
+```python
+def rotate_right(seq, k):
+    """
+    Rotate a sequence to the right by k positions.
+    
+    Args:
+        seq: Any sliceable sequence

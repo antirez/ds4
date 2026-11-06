@@ -1,0 +1,7 @@
+# Ring Buffer (Circular Buffer) Mechanics
+
+## How a Ring Buffer Wraps
+
+A ring buffer is a fixed-size array used as a FIFO queue, where the end of the array logically connects back to the beginning. Two pointers (or indices) track positions:
+
+- **Head (write index)**: Where the

@@ -323,7 +323,8 @@ int ds4_mmq_iq2_xxs_moe_pair_soa(
  * assignment map once, runs the paired gate/up MMQs, computes clamp +
  * SwiGLU + router weighting in mid_f32, then gathers and quantizes those
  * rows for the Q2_K down MMQ through the same ids_dst/expert_bounds.  No
- * second mm_ids_helper; gate/up/mid/down keep the pair-major layout. */
+ * second mm_ids_helper; gate/up/mid/down keep the pair-major layout.
+ * preserve_reduction retains the raw MMQ accumulation order instead of D2R. */
 int ds4_mmq_iq2_xxs_q2_K_moe_fused_soa(
     const void    * W_gate_soa,
     const void    * W_up_soa,
@@ -342,6 +343,7 @@ int ds4_mmq_iq2_xxs_q2_K_moe_fused_soa(
     int             n_experts,
     int             n_expert_used,
     float           clamp,
+    int             preserve_reduction,
     cudaStream_t    stream);
 
 /* Aligned-artifact production fast path: gate/up stay in registers, weighted

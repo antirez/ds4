@@ -1,0 +1,1 @@
+Explain the distinction between the probability of evidence given a hypothesis and the probability of the hypothesis given evidence.

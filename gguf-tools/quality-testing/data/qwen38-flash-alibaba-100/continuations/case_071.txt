@@ -1,0 +1,2 @@
+Gli array ordinati rendono più veloce la ricerca di appartenenza (cioè verificare se un elemento esiste nell'array) perché permettono l'utilizzo dell'algoritmo di **ricerca binaria** (*binary search*), che ha una complessità temporale logaritmica, molto inferiore alla ricerca lineare.
+

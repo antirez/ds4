@@ -1,0 +1,11 @@
+# Safe String Copy with Explicit Truncation Reporting
+
+```c
+#include <stddef.h>
+#include <string.h>
+
+/**
+ * Copies a NUL-terminated string into a fixed-size buffer, always
+ * NUL-terminating the destination, and reports whether truncation occurred.
+ *
+ * @param dst       Destination

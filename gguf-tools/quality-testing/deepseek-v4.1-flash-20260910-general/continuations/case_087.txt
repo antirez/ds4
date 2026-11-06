@@ -1,0 +1,4 @@
+Here are three useful server metrics, each covering a different layer of the stack:
+
+**1. CPU Utilization (%)**
+The percentage of CPU capacity being used at a

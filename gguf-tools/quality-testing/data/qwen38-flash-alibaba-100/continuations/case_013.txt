@@ -1,0 +1,3 @@
+La derivazione di **RMSNorm** (Root Mean Square Normalization) parte dall'idea di normalizzare i vettori di attivazione in modo più efficiente rispetto a LayerNorm, eliminando la sottrazione della media e la divisione per la varianza.
+
+Ecco la derivazione passo-passo

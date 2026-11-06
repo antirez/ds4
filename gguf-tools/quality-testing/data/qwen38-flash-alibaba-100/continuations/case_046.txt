@@ -1,0 +1,3 @@
+In a Mixture-of-Experts (MoE) layer, the **Router** (also known as the Gating Network or Switch) acts as the intelligent dispatcher. Its primary role is to determine which specific "Expert" sub-networks should process a given input token.
+
+Here is a detailed breakdown of its functions

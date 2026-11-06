@@ -1,0 +1,1 @@
+In un server di rete, il **backpressure** (o "retropressione") è un meccanismo di controllo del flusso che consente al ricevitore (il server) di segnalare al mittente (il client o un altro nodo della rete) di rallentare o fermare temporaneamente l'inv

@@ -86,6 +86,8 @@ uint64_t ds4_test_glm_memory_guard_default_budget(uint64_t host_bytes,
                                                    uint64_t model_bytes,
                                                    bool glm53);
 int ds4_test_glm_memory_guard_disabled(void);
+int ds4_test_qwen4_placement(uint64_t budget, int sessions,
+                              size_t *weights, size_t *runtime);
 
 /* DS4_N_LAYER constant is private to ds4.c; for the test we use
  * the same value. (The packer header doesn't expose it.) */
@@ -703,6 +705,22 @@ static void test_cuda_tp_output_head_moves_to_lower_half(void) {
     restore_env_value("DS4_METAL_PREFILL_CHUNK", old_chunk);
 }
 
+static void test_qwen4_disk_ngram_accounting(void) {
+    fprintf(stderr, "RUN: test_qwen4_disk_ngram_accounting\n");
+    const uint64_t gib = UINT64_C(1073741824);
+    size_t weights = 0, one = 0, four = 0;
+    CHECK(ds4_test_qwen4_placement(80u * gib, 1, &weights, &one) == 1,
+          "Qwen fits without charging disk-only n-grams to VRAM");
+    CHECK(weights == 42u * gib + gib / 2u,
+          "Qwen entries contain resident text and vision weights, not DeepSeek KV");
+    CHECK(ds4_test_qwen4_placement(80u * gib, 4, &weights, &four) == 1,
+          "Qwen four-session configuration fits");
+    CHECK(one > 0 && four == 4u * one,
+          "Qwen reserves independent runtime memory for every session");
+    CHECK(ds4_test_qwen4_placement(40u * gib, 1, &weights, &one) == 0,
+          "Qwen still refuses a budget smaller than its resident weights");
+}
+
 int main(void) {
     test_tensor_to_entry();
     test_null_config();
@@ -717,6 +735,7 @@ int main(void) {
     test_glm_memory_guard_budget();
     test_cuda_tp_prefill_default_accounting();
     test_cuda_tp_output_head_moves_to_lower_half();
+    test_qwen4_disk_ngram_accounting();
 
     fprintf(stderr, "\ntest_engine_mgpu_placement: %d/%d checks passed (%d failed)\n",
             g_checks - g_failures, g_checks, g_failures);

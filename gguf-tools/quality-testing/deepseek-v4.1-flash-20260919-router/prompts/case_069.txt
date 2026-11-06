@@ -1,0 +1,1 @@
+Scrivi una funzione Python che restituisce tutte le posizioni di una sottostringa, incluse quelle sovrapposte.

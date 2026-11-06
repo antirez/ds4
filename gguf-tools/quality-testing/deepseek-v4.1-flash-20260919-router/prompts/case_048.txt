@@ -1,0 +1,1 @@
+Find the next two numbers in 2, 6, 12, 20, 30 and explain one rule that fits.

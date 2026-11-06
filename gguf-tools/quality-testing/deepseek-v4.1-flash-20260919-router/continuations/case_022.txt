@@ -1,0 +1,11 @@
+# Merging Two Sorted Iterators
+
+Here's a Python function that merges two sorted iterators lazily, without loading either one fully into memory:
+
+```python
+from heapq import merge
+
+
+def merge_sorted_iterators(iter1, iter2):
+    """
+    Lazily merge two sorted iterators into

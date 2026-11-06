@@ -1,0 +1,4 @@
+Here is a step-by-step explanation of B-tree insertion, covering the general algorithm, the mechanics of node splitting, and the specific handling of the root node.
+
+### 1. Prerequisites: The B-Tree Structure
+To understand insertion, we must first define the constraints of a B-Tree of **Order

@@ -1,0 +1,11 @@
+# Testing a Command-Line Parser with Edge Cases
+
+## Overview
+
+A robust command-line parser must handle not just typical inputs, but also malformed, ambiguous, and adversarial inputs. Here's a systematic approach to testing edge cases.
+
+---
+
+## 1. Categorize Edge Case Types
+
+### A. Empty &

@@ -1,0 +1,3 @@
+L'inserimento in un **B-tree** è un'operazione fondamentale che mantiene l'albero bilanciato, garantendo che tutte le foglie si trovino alla stessa profondità. Questo assicura operazioni di ricerca, inserimento e cancellazione in tempo logaritmico $O(\log n)$.
+
+Ecco

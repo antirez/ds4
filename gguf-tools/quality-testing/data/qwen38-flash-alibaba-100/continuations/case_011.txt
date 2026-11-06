@@ -1,0 +1,6 @@
+Ecco un progetto conciso per un server TCP Echo progettato specificamente per gestire client lenti (slow clients), evitando che un singolo client lento blocchi gli altri.
+
+### **Obiettivo**
+Creare un server TCP che:
+1. Accetti connessioni multiple.
+2. Risponda

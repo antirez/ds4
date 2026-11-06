@@ -1,0 +1,15 @@
+# Newest Event Per Account with Deterministic Tie-Break
+
+Here's a clean, portable query using a window function:
+
+```sql
+SELECT
+    account_id,
+    event_id,
+    event_type,
+    created_at
+FROM (
+    SELECT
+        account_id,
+        event_id,
+        event_type,

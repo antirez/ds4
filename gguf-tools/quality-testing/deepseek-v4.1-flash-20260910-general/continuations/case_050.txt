@@ -1,0 +1,3 @@
+# Decode lento a contesto lungo: 5 misure iniziali
+
+1. **Profilare il decode per fase** — Misurare

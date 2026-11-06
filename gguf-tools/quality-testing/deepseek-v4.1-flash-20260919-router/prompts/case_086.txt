@@ -1,0 +1,1 @@
+Describe how to test a parser against truncated messages without depending on random failures.

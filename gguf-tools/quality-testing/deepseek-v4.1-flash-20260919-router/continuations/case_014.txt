@@ -1,0 +1,5 @@
+# Condition Variables with Predicates and Mutexes
+
+A condition variable (`std::condition_variable` in C++) is a synchronization primitive that lets threads **wait until a shared predicate becomes true**. It must always be paired with a mutex, because the predicate reads shared state that must be protected.
+
+## The Three

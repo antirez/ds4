@@ -1,0 +1,4 @@
+Here are three invariants for a tokenizer special-token table:
+
+**1. Uniqueness of IDs and Surface Forms**
+Every special token maps to a

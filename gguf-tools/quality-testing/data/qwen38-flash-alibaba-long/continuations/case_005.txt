@@ -1,0 +1,3 @@
+Team_17 owns record 0017, and its revision is 294.
+
+I found this by locating the line starting with "Record 0017" in the archive list and reading the values associated with the `owner` and `revision` fields on that specific line.

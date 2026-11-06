@@ -1,0 +1,1 @@
+Record 17: owner R323, bin 629. Record 48: owner R912, bin 785. Record 93: owner R770, bin 468. I located each by finding the record with the matching record number in the archive and reading its owner and bin fields.

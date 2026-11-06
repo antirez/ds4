@@ -1,0 +1,1 @@
+Write a short C function that clamps an integer to a range.

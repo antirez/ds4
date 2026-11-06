@@ -1,0 +1,7 @@
+In plain language, a **confidence interval** is a range of values that you are reasonably sure contains the "true" answer to a question.
+
+Think of it as an **"educated guess with a safety net."**
+
+Here is a breakdown using simple analogies and examples:
+
+### 1. The Analogy

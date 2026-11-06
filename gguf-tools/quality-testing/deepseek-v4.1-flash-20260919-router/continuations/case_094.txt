@@ -1,0 +1,7 @@
+# Why Parallel Sums Differ from Sequential Sums
+
+## The Core Reason: Floating-Point Arithmetic Isn't Associative
+
+In mathematics, addition is associative: `(a + b) + c == a + (b + c)`. In floating-point arithmetic, **it usually isn't**.
+
+A floating-point number

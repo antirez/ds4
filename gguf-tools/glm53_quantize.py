@@ -39,6 +39,7 @@ QTYPE_Q8_K = 15
 QTYPE_IQ2_XXS = 16
 QTYPE_I8 = 24
 QTYPE_BF16 = 30
+QTYPE_MXFP4 = 39
 
 QTYPE_NAMES = {
     QTYPE_F32: "F32",
@@ -50,6 +51,7 @@ QTYPE_NAMES = {
     QTYPE_IQ2_XXS: "IQ2_XXS",
     QTYPE_I8: "I8",
     QTYPE_BF16: "BF16",
+    QTYPE_MXFP4: "MXFP4",
 }
 
 QTYPE_LAYOUT = {
@@ -62,6 +64,7 @@ QTYPE_LAYOUT = {
     QTYPE_IQ2_XXS: (256, 66),
     QTYPE_I8: (1, 1),
     QTYPE_BF16: (1, 2),
+    QTYPE_MXFP4: (32, 17),
 }
 
 LAYER_PREFIX = "model.language_model.layers"
@@ -294,11 +297,17 @@ class SourceDB:
         hf_dir,
         index_validator=validate_glm53_index,
         scale_validator=validate_fp8_scales,
+        tensor_prefix=None,
     ):
         self.hf_dir = hf_dir
         index_path = os.path.join(hf_dir, "model.safetensors.index.json")
         document, self.weight_map = load_index(index_path)
         index_validator(self.weight_map)
+        if tensor_prefix is not None:
+            self.weight_map = {name: shard for name, shard in self.weight_map.items()
+                               if name.startswith(tensor_prefix)}
+            if not self.weight_map:
+                fail(f"source index has no tensors matching {tensor_prefix!r}")
         self.declared_bytes = document.get("metadata", {}).get("total_size")
         self.tensors = {}
         self._fds = {}
@@ -309,6 +318,8 @@ class SourceDB:
             if not os.path.isfile(path):
                 fail(f"missing source shard {path}")
             for name, info in load_safetensors_header(path).items():
+                if tensor_prefix is not None and not name.startswith(tensor_prefix):
+                    continue
                 if self.weight_map.get(name) != shard:
                     fail(f"index assigns {name} to {self.weight_map.get(name)!r}, not {shard}")
                 if name in self.tensors:
@@ -913,7 +924,7 @@ def tensor_header(item):
     )
 
 
-def print_plan(plan, kv_records, tokenizer_records):
+def print_plan(plan, kv_records, tokenizer_records, alignment=GGUF_ALIGNMENT):
     by_type = {}
     by_role = {}
     for item in plan:
@@ -921,8 +932,8 @@ def print_plan(plan, kv_records, tokenizer_records):
         by_role[item.role] = by_role.get(item.role, 0) + item.nbytes
     kv_bytes = sum(map(len, kv_records)) + sum(map(len, tokenizer_records))
     tensor_info_bytes = sum(len(tensor_header(item)) for item in plan)
-    data_offset = align(4 + 4 + 8 + 8 + kv_bytes + tensor_info_bytes)
-    data_bytes = sum(align(item.nbytes) for item in plan)
+    data_offset = align(4 + 4 + 8 + 8 + kv_bytes + tensor_info_bytes, alignment)
+    data_bytes = sum(align(item.nbytes, alignment) for item in plan)
     print(f"tensors: {len(plan)}")
     print(f"metadata_records: {len(kv_records) + len(tokenizer_records)}")
     print(f"metadata_bytes: {data_offset}")

@@ -1,0 +1,1 @@
+L'errore di quantizzazione colpisce in modo sproporzionato gli "esperti rari" (o *rare experts*) nei modelli Mixture-of-Experts (MoE) a causa della natura intrinseca dei dati su cui questi esperti lavorano e del funzionamento degli algoritmi di compressione

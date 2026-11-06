@@ -1,0 +1,5 @@
+Record 17: owner R323, bin 629, revision 4.  
+Record 450: owner R574, bin 794, revision 3.  
+Record 897: owner R094, bin 486, revision 2.  
+
+I located each by matching the record number at the start of the

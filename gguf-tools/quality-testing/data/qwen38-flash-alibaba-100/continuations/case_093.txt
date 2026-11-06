@@ -1,0 +1,5 @@
+A page cache makes a second file read faster by storing the data from the first read in **RAM (Random Access Memory)** so that subsequent requests can be served directly from memory rather than accessing the slower physical disk.
+
+Here is the step-by-step logical deduction of how this mechanism works:
+
+### 1. The

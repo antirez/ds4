@@ -1,0 +1,3 @@
+La **consistenza eventuale** (in inglese *eventual consistency*) è un modello di consistenza utilizzato nei database distribuiti che garantisce che, se non vengono apportate nuove modifiche a un dato, tutti i nodi del sistema alla fine convergeranno verso lo stesso valore.
+
+### Spiegazione dettagli

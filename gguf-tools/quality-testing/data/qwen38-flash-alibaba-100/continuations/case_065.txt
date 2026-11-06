@@ -1,0 +1,1 @@
+A **Trie** (also known as a digital tree, prefix tree, or radix tree) represents a set of strings by storing the characters of the strings in the nodes of a tree structure. Unlike a binary search tree where keys are stored in nodes, in a Trie, the **path from the root to a

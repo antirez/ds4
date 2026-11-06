@@ -1,0 +1,3 @@
+Ecco tre invarianti fondamentali per una tabella di token speciali (ad esempio, in un contesto di elaborazione del linguaggio naturale o di compilatori):
+
+1. **Unicità dei Token**: Ogni token speciale nella tabella deve essere unico. Non devono esistere duplicati dello stesso token (es. `[CLS

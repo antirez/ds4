@@ -1,0 +1,1 @@
+Raggruppare gli esperti (Expert Grouping) nei modelli Mixture-of-Experts (MoE) accelera la fase di **prefill** principalmente ottimizzando l'accesso alla memoria e migliorando l'efficienza del calcolo parallelo. Ecco una spiegazione dettagliata dei meccanismi coinvolti:

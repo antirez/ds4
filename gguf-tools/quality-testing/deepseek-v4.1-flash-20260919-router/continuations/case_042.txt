@@ -1,0 +1,13 @@
+Let’s go step-by-step.
+
+---
+
+We’re told:
+
+1. The integer \( n \) leaves remainder 2 when divided by 5:
+\[
+n \equiv 2 \pmod{5}
+\]
+
+2. The integer \( n \) leaves remainder 1 when divided by 3:
+\[

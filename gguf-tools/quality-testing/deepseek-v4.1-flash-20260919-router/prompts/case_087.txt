@@ -1,0 +1,1 @@
+Write a short C example that uses memmove correctly when source and destination overlap.

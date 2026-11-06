@@ -1,0 +1,9 @@
+# Safe `size_t` Addition Check
+
+Here's a C function that checks whether adding two `size_t` values would overflow, without actually performing the addition:
+
+```c
+#include <stddef.h>
+#include <stdbool.h>
+
+bool size_t_add_would_overflow(size_t a, size_t b)

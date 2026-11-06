@@ -1,0 +1,294 @@
+{
+  "date": "2026-09-15",
+  "backend": "CUDA",
+  "gpu": "DGX Spark GB10",
+  "arch": "sm_121",
+  "source_commit": "3cae02295f003defca8bdf9db8043dde8f846c57",
+  "ctx": 4096,
+  "prefill_chunk": "default",
+  "effective_prefill_cap": 4096,
+  "models": {
+    "q2": {
+      "file": "Qwen3.8-Flash-Next-Q2.gguf",
+      "bytes": 147207127040,
+      "sha256": "b1b93fa69aca5f187b0fb813aca8f3ec1beb5cf8cf0bd38cf041b93e0b6ccac9"
+    },
+    "q4": {
+      "file": "Qwen3.8-Flash-Next-Q4.gguf",
+      "bytes": 177280286720,
+      "sha256": "680944460a8cbe93ba8b6d7b6107213ffb7e22320bd913000e563ca0a0f25a8a"
+    }
+  },
+  "mtp": false,
+  "validation": "All expected cases completed with finite logits; every prompt and target token ID matches the official HF tokenizer. API token bytes are checked separately.",
+  "bootstrap": "10000 paired case resamples, seed 20260915. Descriptive intervals for this suite, not population guarantees: some prompts are translations and long cases share two task families.",
+  "source_sha256": {
+    "ds4.c": "fce23d4c851d16b29e68aac11abea81ee7406f58e41692a1ef5f74a38fe4d5f3",
+    "ds4_cuda.cu": "c2184bb477b8589e329f33e4a7be301c1a287e4c1ba382d941377bef52b97230",
+    "ds4_qwen4_cuda.cuh": "4161b3c6d8c5df7bd70be62108f2857ecd3ffa8731ef41c97d62d0d72616df6d",
+    "gguf-tools/quality-testing/score_official.c": "091b8b874669ac2f709cf5d874068071d927d17b2dd6495395ec604953738c60"
+  },
+  "results": {
+    "suite": "short",
+    "runs": {
+      "q2-fast": {
+        "cases": 100,
+        "tokens": 5696,
+        "avg_nll": 0.35297997261534414,
+        "first_matches": 70,
+        "mean_greedy_prefix": 9.35,
+        "api_top1": 0.8890086206896551,
+        "api_top1_matches": 4950,
+        "api_top1_count": 5568,
+        "api_target_mae": 0.1743456821641523,
+        "confident_reference": {
+          "api_above_90pct": 3007,
+          "mismatches": [
+            {
+              "id": "case_067",
+              "position": 41,
+              "match": false,
+              "local_logprob": -0.773,
+              "api_logprob": -0.072
+            }
+          ]
+        }
+      },
+      "q2-quality": {
+        "cases": 100,
+        "tokens": 5696,
+        "avg_nll": 0.3529147900689958,
+        "first_matches": 71,
+        "mean_greedy_prefix": 9.64,
+        "api_top1": 0.8891882183908046,
+        "api_top1_matches": 4951,
+        "api_top1_count": 5568,
+        "api_target_mae": 0.17431633997180315,
+        "confident_reference": {
+          "api_above_90pct": 3007,
+          "mismatches": [
+            {
+              "id": "case_067",
+              "position": 41,
+              "match": false,
+              "local_logprob": -0.774,
+              "api_logprob": -0.072
+            }
+          ]
+        }
+      },
+      "q4-fast": {
+        "cases": 100,
+        "tokens": 5696,
+        "avg_nll": 0.29029748216327245,
+        "first_matches": 84,
+        "mean_greedy_prefix": 16.14,
+        "api_top1": 0.9207974137931034,
+        "api_top1_matches": 5127,
+        "api_top1_count": 5568,
+        "api_target_mae": 0.10625434455154453,
+        "confident_reference": {
+          "api_above_90pct": 3007,
+          "mismatches": [
+            {
+              "id": "case_019",
+              "position": 29,
+              "match": false,
+              "local_logprob": -0.751,
+              "api_logprob": -0.086
+            }
+          ]
+        }
+      },
+      "q4-quality": {
+        "cases": 100,
+        "tokens": 5696,
+        "avg_nll": 0.290538100808111,
+        "first_matches": 83,
+        "mean_greedy_prefix": 16.01,
+        "api_top1": 0.920617816091954,
+        "api_top1_matches": 5126,
+        "api_top1_count": 5568,
+        "api_target_mae": 0.10625722089349857,
+        "confident_reference": {
+          "api_above_90pct": 3007,
+          "mismatches": [
+            {
+              "id": "case_019",
+              "position": 29,
+              "match": false,
+              "local_logprob": -0.73,
+              "api_logprob": -0.086
+            }
+          ]
+        }
+      }
+    },
+    "comparisons": {
+      "q2-quality-to-fast": {
+        "delta_nll": 6.518254634831125e-05,
+        "paired_bootstrap_95_ci": [
+          -0.0004804741463414635,
+          0.0005974542761527867
+        ],
+        "case_wins_losses_ties": [
+          51,
+          49,
+          0
+        ],
+        "worst_deltas": [
+          {
+            "id": "case_032",
+            "delta": 0.011108749000000029,
+            "old": 0.330841397,
+            "new": 0.341950146
+          },
+          {
+            "id": "case_060",
+            "delta": 0.007104191999999995,
+            "old": 0.082322938,
+            "new": 0.08942713
+          },
+          {
+            "id": "case_061",
+            "delta": 0.0067694850000000195,
+            "old": 0.294015445,
+            "new": 0.30078493
+          },
+          {
+            "id": "case_001",
+            "delta": 0.005659364,
+            "old": 0.366631687,
+            "new": 0.372291051
+          },
+          {
+            "id": "case_009",
+            "delta": 0.005426111999999983,
+            "old": 0.258586872,
+            "new": 0.264012984
+          }
+        ]
+      },
+      "q4-quality-to-fast": {
+        "delta_nll": -0.0002406186448384837,
+        "paired_bootstrap_95_ci": [
+          -0.0005904496703577506,
+          8.43383721601183e-05
+        ],
+        "case_wins_losses_ties": [
+          53,
+          47,
+          0
+        ],
+        "worst_deltas": [
+          {
+            "id": "case_091",
+            "delta": 0.003796024000000009,
+            "old": 0.384435094,
+            "new": 0.388231118
+          },
+          {
+            "id": "case_055",
+            "delta": 0.0034334580000000003,
+            "old": 0.422083659,
+            "new": 0.425517117
+          },
+          {
+            "id": "case_046",
+            "delta": 0.0028336629999999863,
+            "old": 0.318305916,
+            "new": 0.321139579
+          },
+          {
+            "id": "case_075",
+            "delta": 0.0027763169999999726,
+            "old": 0.276688645,
+            "new": 0.279464962
+          },
+          {
+            "id": "case_094",
+            "delta": 0.0021353080000000007,
+            "old": 0.015246264,
+            "new": 0.017381572
+          }
+        ]
+      },
+      "q2-to-q4-fast": {
+        "delta_nll": -0.06268249045207162,
+        "paired_bootstrap_95_ci": [
+          -0.07210271861570178,
+          -0.05334319466570915
+        ],
+        "case_wins_losses_ties": [
+          92,
+          8,
+          0
+        ],
+        "worst_deltas": [
+          {
+            "id": "case_081",
+            "delta": 0.24029172399999998,
+            "old": 0.240628479,
+            "new": 0.480920203
+          },
+          {
+            "id": "case_080",
+            "delta": 0.017153167999999996,
+            "old": 0.380264063,
+            "new": 0.397417231
+          },
+          {
+            "id": "case_098",
+            "delta": 0.008438940000000006,
+            "old": 0.182897013,
+            "new": 0.191335953
+          },
+          {
+            "id": "case_087",
+            "delta": 0.0035515690000000044,
+            "old": 0.16803562,
+            "new": 0.171587189
+          },
+          {
+            "id": "case_068",
+            "delta": 0.00275137999999997,
+            "old": 0.279134971,
+            "new": 0.281886351
+          }
+        ]
+      }
+    }
+  },
+  "runs": {
+    "q2": {
+      "ok": true,
+      "started": 1789474121.4196985,
+      "runs": [
+        {
+          "mode": "fast",
+          "seconds": 338.8719744682312
+        },
+        {
+          "mode": "quality",
+          "seconds": 328.9914667606354
+        }
+      ],
+      "finished": 1789474789.8970737
+    },
+    "q4": {
+      "ok": true,
+      "started": 1789474152.5708365,
+      "runs": [
+        {
+          "mode": "fast",
+          "seconds": 340.28377771377563
+        },
+        {
+          "mode": "quality",
+          "seconds": 334.7453029155731
+        }
+      ],
+      "finished": 1789474828.2500265
+    }
+  }
+}

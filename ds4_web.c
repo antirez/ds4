@@ -1144,6 +1144,46 @@ static char *web_browser_ws_url(ds4_web *web, char *err, size_t err_len) {
     return ws;
 }
 
+/* Count page-type CDP targets. Once the last tab is closed a visible Chrome
+   has no window left, and a windowless Chrome rejects Target.createTarget
+   requests that ask for a background tab in the (now absent) window. */
+static int web_page_target_count(ds4_web *web) {
+    char err[160] = {0};
+    char *body = web_http_request("GET", web->port, "/json/list", err, sizeof(err));
+    if (!body) return -1;
+    int n = 0;
+    const char *p = body;
+    while ((p = strstr(p, "\"type\"")) != NULL) {
+        p += 6;
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+        if (*p++ != ':') continue;
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+        if (strncmp(p, "\"page\"", 6) == 0) n++;
+    }
+    free(body);
+    return n;
+}
+
+/* Fallback target creation over plain HTTP. PUT /json/new works even when
+   Chrome has no window, which is exactly when Target.createTarget fails.
+   The verb must be PUT: modern Chrome answers GET /json/new with 405. */
+static char *web_create_target_http(ds4_web *web, const char *url,
+                                    char *err, size_t err_len) {
+    char *enc = web_url_encode(url);
+    web_buf path = {0};
+    web_buf_puts(&path, "/json/new?");
+    web_buf_puts(&path, (enc && enc[0]) ? enc : "about%3Ablank");
+    free(enc);
+    char *path_s = web_buf_take(&path);
+    char *body = web_http_request("PUT", web->port, path_s, err, err_len);
+    free(path_s);
+    if (!body) return NULL;
+    char *id = web_json_get_string(body, "id");
+    free(body);
+    if (!id) web_set_err(err, err_len, "PUT /json/new returned no target id");
+    return id;
+}
+
 static bool web_open_tab(ds4_web *web, const char *url, web_tab *tab,
                          char *err, size_t err_len) {
     memset(tab, 0, sizeof(*tab));
@@ -1168,14 +1208,33 @@ static bool web_open_tab(ds4_web *web, const char *url, web_tab *tab,
                               params_s, err, err_len);
     free(params_s);
     web_ws_close(&browser);
-    if (!resp) return false;
 
-    tab->id = web_json_get_string(resp, "targetId");
-    free(resp);
+    if (resp) {
+        tab->id = web_json_get_string(resp, "targetId");
+        if (!tab->id) {
+            char *why = web_json_get_string(resp, "message");
+            web_log(web, why ? why : "Target.createTarget returned no target id");
+            free(why);
+        }
+        free(resp);
+    }
+
+    /* A windowless Chrome refuses Target.createTarget with newWindow:false,
+       which is the state we land in the moment a previous tab is closed.
+       Recover through the HTTP endpoint instead of failing the request. */
     if (!tab->id) {
-        web_tab_free(tab);
-        web_set_err(err, err_len, "Chrome did not return a page target id");
-        return false;
+        char herr[160] = {0};
+        tab->id = web_create_target_http(web, url, herr, sizeof(herr));
+        if (!tab->id) {
+            web_tab_free(tab);
+            if (herr[0])
+                web_set_err(err, err_len,
+                            "Chrome did not return a page target id (%s)", herr);
+            else
+                web_set_err(err, err_len, "Chrome did not return a page target id");
+            return false;
+        }
+        web_log(web, "recovered Chrome target creation over HTTP");
     }
 
     char ws_url[PATH_MAX + 128];
@@ -1187,6 +1246,16 @@ static bool web_open_tab(ds4_web *web, const char *url, web_tab *tab,
 
 static void web_close_tab(ds4_web *web, const web_tab *tab) {
     if (!web || !tab || !tab->id || !tab->id[0]) return;
+
+    /* Never leave Chrome with zero page targets: that means no window, and a
+       windowless browser is what breaks the next Target.createTarget. Keeping
+       one tab alive is enough to hold the window open. */
+    int remaining = web_page_target_count(web);
+    if (remaining >= 0 && remaining <= 1) {
+        web_log(web, "keeping last Chrome page target open");
+        return;
+    }
+
     char *enc = web_url_encode(tab->id);
     web_buf path = {0};
     web_buf_puts(&path, "/json/close/");

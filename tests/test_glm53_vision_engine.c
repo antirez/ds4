@@ -56,7 +56,7 @@ int main(int argc, char **argv) {
             ds4_engine_close(engine);
             return 1;
         }
-        const size_t count = (size_t)next.token_count * 4096u;
+        const size_t count = (size_t)next.token_count * (size_t)ds4_engine_embd_dim(engine);
         bool valid = next.data != NULL && count != 0;
         for (size_t j = 0; valid && j < count; j++)
             valid = isfinite(next.data[j]);
@@ -85,7 +85,7 @@ int main(int argc, char **argv) {
         ds4_engine_close(engine);
         return 1;
     }
-    size_t values = (size_t)embedding.token_count * 4096u;
+    size_t values = (size_t)embedding.token_count * (size_t)ds4_engine_embd_dim(engine);
     if (fwrite(embedding.data, sizeof(float), values, fp) != values ||
         fclose(fp) != 0) {
         fprintf(stderr, "cannot write %s\n", argv[4]);

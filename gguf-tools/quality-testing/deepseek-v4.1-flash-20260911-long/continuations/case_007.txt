@@ -1,0 +1,1 @@
+A TCP server must preserve a partially written reply when a client reads slowly because TCP flow control allows the receiver to advertise a shrinking window as its receive buffer fills, and the server’s `send()` call may accept only part of the data before blocking or returning a short write. The unsent remainder is not queued

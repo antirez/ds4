@@ -1,0 +1,5 @@
+# Why Monotonic Clocks Are Better for Timeouts
+
+## The core problem with wall-clock time
+
+A "wall clock" (or realtime clock) is meant to track civil time — the same time you'd see on your phone. It gets **adjusted**. Two things can change it while your code is

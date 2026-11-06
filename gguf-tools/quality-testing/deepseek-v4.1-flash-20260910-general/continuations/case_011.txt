@@ -1,0 +1,6 @@
+# Server TCP Echo con Gestione Client Lenti
+
+## 1. Obiettivo
+
+Implementare un server TCP echo che:
+- Accetti connessioni

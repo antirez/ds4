@@ -1,0 +1,11 @@
+Here's a C loop that safely frees every element of a linked list:
+
+```c
+typedef struct Node {
+    struct Node *next;
+    int data; // or whatever payload
+} Node;
+
+void free_list(Node *head) {
+    while (head != NULL) {
+        Node *next = head->

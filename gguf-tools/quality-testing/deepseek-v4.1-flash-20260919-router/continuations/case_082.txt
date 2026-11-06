@@ -1,0 +1,9 @@
+# Merging Overlapping Intervals
+
+## Approach
+
+1. **Sort** the intervals by their start value.
+   - `[1,4], [3,6], [8,10]` (already sorted)
+
+2. **Iterate** through the intervals, keeping a "current" interval:
+  

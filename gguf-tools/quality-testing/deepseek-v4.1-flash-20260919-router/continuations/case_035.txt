@@ -1,0 +1,12 @@
+# Timing Attacks: Why Early-Exit Password Comparison Leaks Information
+
+## The Core Problem
+
+A naive string comparison like this:
+
+```python
+def check_password(input, stored):
+    if len(input) != len(stored):
+        return False
+    for i in range(len(stored)):
+        if input[i]

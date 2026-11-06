@@ -1,0 +1,4 @@
+Ecco lo pseudocodice per inserire un elemento in un **heap binario** (assumendo un **max-heap**, dove il padre è sempre maggiore o uguale ai figli).
+
+### Concetti chiave:
+1. L'elemento viene inserito alla fine dell'array (ultimo livello,

@@ -1,0 +1,10 @@
+Ecco i dati richiesti:
+
+**Giorno 19:**
+- Deposito: 6
+- Pacchi registrati: 15
+- Pacchi ritirati: 9
+
+**Giorno 254:**
+- Deposito: 7
+- Pacchi registrati: 
