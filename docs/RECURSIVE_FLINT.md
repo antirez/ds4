@@ -39,7 +39,7 @@ rec reports more than 125 tok/s averaged over a 128K-token session.
 
 | Step | State |
 |---|---|
-| 0. Scaffolding: fork files from `bonsai2`; converter from rec's checkpoint (rec's tensor layout, per-expert packs); shape, loader, tokenizer, server id | open |
+| 0. Scaffolding: fork files from `bonsai2`; converter from rec's checkpoint (rec's tensor layout, per-expert packs); shape, loader, tokenizer, server id | family probe done: Qwen3.8 variant 202 (see Design); rest open |
 | 1. Decode megakernel ported: per-layer residual trace bit-identical to rec on identical KV; one token per launch, CPU sampling | open |
 | 2. Prefill (chunked, window attention, sorted-expert GEMM), sessions, live KV reuse, disk checkpoints; golden cases within rec's spread | open |
 | 3. Measure against rec: decode at 4K/32K/128K, prefill, launch overhead; decide on 8-token resident blocks | open |
@@ -259,24 +259,62 @@ hooks in upstream files, upstream merged, never rebased. rec's shader code
 is Apache 2.0: the ported kernels carry its notice in `licenses/` and in
 `metal/flint.metal`.
 
-### Family decision (step 0)
+### Family decision (step 0): Qwen3.8-family variant
 
-Bonsai 2 and the 27B run as variants of the Qwen3.8 family because their
-layer geometry matches it. Flint shares no layer type with any ds4 family.
-Two options:
+Probed 2026-11-07 by reading every shared Qwen3.8 path a variant inherits
+(upstream `b3f5018`). Flint runs as `DS4_VARIANT_FLINT = 202` inside
+`DS4_MODEL_FAMILY_QWEN4_EXP`, Bonsai's pattern, with its own graph, payload
+and templates behind one-line redirects. Why:
 
-1. **Qwen3.8-family variant** (`DS4_VARIANT_FLINT = 202`; 200 and 201 are Bonsai 2 and the 27B):
-   known contact points (about 45 lines in `ds4.c`), sessions, disk KV,
-   server and the SSD-streaming engine plumbing (`--ssd-streaming`, cache
-   budget options, the expert cache structure) come along. Risk: the shared
-   session and payload code may not accept zero-width recurrent state.
-2. **New family**: clean, but about 60 `ds4_model_is_qwen4()` sites need a
-   Flint branch, and the streaming plumbing would be duplicated.
+- **Layer typing is one shape field.** `ds4_qwen4_layer_is_linear(il)` is
+  `(il + 1) % n_full_attn_interval != 0`; with `n_full_attn_interval = 1` no
+  layer is linear. That alone skips the GDN state pool (it allocates only
+  for linear layers), the conv history, the GDN snapshots and every
+  `is_linear` branch. The remaining Qwen machinery goes inert through the
+  shape as for Bonsai: `n_hc = 1`, `n_ple_layer = DS4_MAX_LAYER`,
+  `n_nextn_predict = 0`, `n_indexer_head = 0`, `n_lin_* = 0`.
+- **The graph container fits.** `ds4_qwen4_gpu_graph` has per-layer
+  `layer_k_cache`/`layer_v_cache` slots that Flint fills with its rings and
+  banks; Bonsai's three redirects (`qwen4_graph_alloc`,
+  `qwen4_graph_forward_tokens_impl`, `qwen4_graph_encode_native_session_batch`)
+  and the `*_gpu_release()` hook cover allocation, forward and teardown.
+- **Rewind already replays.** A rewind sets `qwen4_rewound` and the session
+  replays the retained prefix, which is what a 513-row ring needs.
+- **The SSD plumbing is generic where it matters.** `--ssd-streaming`, the
+  cache budget options, `qwen4_streaming_memory_admit`,
+  `qwen4_streaming_staging_bytes`, the budget and lock code in `ds4_ssd.c`,
+  the Metal cache entries (`ds4_gpu_stream_expert_cache_*`), the `pread`
+  task runner and `ds4_gpu_buffer_address` are all reusable. Only the
+  per-expert byte derivation (it sums gate, up and down tensors) and the
+  Qwen read routine (three reads per expert) assume the Qwen layout;
+  Flint's one-pack-per-expert read is a fork copy of
+  `qwen4_stream_read_selected` behind the same cache entries.
 
-The streaming reuse tips this toward option 1. Probe it first in step 0
-(inert `n_lin_*`, `n_hc = 1`, `n_ple_layer = DS4_MAX_LAYER`; own KV cache
-in the fork graph; one session checkpoint round-trip); fall back to option
-2 only if more than a handful of hooks are needed. Record the outcome here.
+What does not fit, and the hook each needs (all one to three lines):
+
+| Shared code | Why it does not fit Flint | Hook |
+|---|---|---|
+| `qwen4_session_save_payload`, `qwen4_session_load_payload` | write one linear K/V span per attention layer plus indexer keys, block keys, PLE history and `pos3`; a 513-row ring has no linear span | first-line redirects to a fork payload with its own tag |
+| vocab setup (`ds4_model_is_qwen4()` branch at the ChatML ids) | sets `<\|im_start\|>`/`<\|im_end\|>`; Flint uses GLM-style role tokens | one `else if` to `flint_vocab_setup` |
+| `vocab_token_is_generation_stop` | role-token stops exist only for `GLM_DSA`; Flint stops on 150001/150003/150005/150018 | one predicate line |
+| `ds4_chat_begin/append_think_prefix/append_message/append_assistant_prefix` | ChatML for the Qwen family, `[gMASK]<sop>` for GLM | four redirects |
+| pre-tokenizer dispatch on `tokenizer.ggml.pre` | no `flint` entry | one case |
+| `streaming_layer_routed_expert_bytes`, `streaming_layer_gate_down_expert_bytes` | sum gate/up/down tensors | two redirects returning the pack size |
+| `model_map_span_vec_include_layer_decode_static`/`_decode` | walk named `ds4_layer_weights` fields; Flint's `.scales`/`.biases` have none | two lines adding the fork tensors to the static spans |
+| Qwen memory estimator (`n_attn * ctx * kv_row`) | counts every attention layer as linear-cached; 35 rings would be overestimated by 2 KB per position each | one line, or accept the over-reservation at first |
+| `ds4_server.c`: `server_model_syntax_for_engine`, `server_model_id_from_engine`, alias list, `send_models`, GLM renderer prefix and effort block | Flint is GLM syntax without `[gMASK]<sop>`, without the effort `<\|system\|>` block, with `<\|developer\|>`; `append_glm_arg` is already single-line | about five hooks |
+| `ds4_agent.c`: `agent_tool_syntax_for_engine`, compaction `<\|user\|>` choice | keyed on `is_glm_dsa` | two or three hooks |
+
+Together with Bonsai's existing contact points (variant id, shape include,
+tensor types, layout validation, arch dispatch, bind output/layer, graph
+redirects, `routed_quant_bits`, engine gate, release, batch redirect) that
+is about 35 hook sites. A new family would need every product-side hook in
+this table anyway, plus its own versions of the session driver, prefill
+chunking, live KV reuse, checkpoints and streaming admission (about 60
+`ds4_model_is_qwen4()` sites), so the variant route is the smaller change
+by far. Two things are new ground rather than proven by Bonsai: a Qwen
+variant with zero linear layers, and a fork payload. Both are exercised by
+step 2's checkpoint round trip.
 
 ### Fork-owned files
 
@@ -555,7 +593,6 @@ in-kernel sampling if step 3 says they pay, other quants.
 
 ## Open questions
 
-- Family variant or new family (step 0).
 - CPU-to-GPU visibility inside a running kernel (step 4's first
   experiment); the per-layer split is the fallback.
 - Whether reusing decode KV as a prefix changes Flint's probabilities
