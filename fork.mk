@@ -14,7 +14,7 @@ ds4_metal.o: ds4_metal_internal.h
 endif
 
 # ds4.c textually includes the fork engine code.
-ds4.o ds4_cpu.o: ds4_flint_shape.inc ds4_flint_model.inc
+ds4.o ds4_cpu.o: ds4_flint_shape.inc ds4_flint_model.inc ds4_flint_tokenizer.inc ds4_flint_unicode.inc
 
 .PHONY: fork-clean
 clean: fork-clean

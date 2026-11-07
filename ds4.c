@@ -2449,6 +2449,9 @@ static const gguf_type_info gguf_types[] = {
     [28] = {"f64",      1,   8},
     [29] = {"iq1_m",  256,  56},
     [30] = {"bf16",     1,   2},
+    [143] = {"flint_u4", 2,  1},   /* fork: Recursive Flint MLX int4 nibbles */
+    [144] = {"flint_u8", 1,  1},   /* fork: Recursive Flint MLX int8 bytes */
+    [145] = {"flint_pack", 1, 1},  /* fork: Recursive Flint per-expert pack */
     [39] = {"mxfp4",   32,  17},
 };
 
@@ -2467,6 +2470,9 @@ enum {
     DS4_TENSOR_I8       = 24,
     DS4_TENSOR_I32      = 26,
     DS4_TENSOR_BF16     = 30,
+    DS4_TENSOR_FLINT_U4 = 143,   /* fork: Recursive Flint (ds4_flint_model.inc) */
+    DS4_TENSOR_FLINT_U8 = 144,
+    DS4_TENSOR_FLINT_PACK = 145,
     DS4_TENSOR_MXFP4    = 39,
 };
 
@@ -45522,7 +45528,13 @@ static void bpe_tokenize_text_qwen35(const ds4_vocab *vocab, const char *text, t
  * word (for example ">;\n").  Splitting those newlines separately changes the
  * token stream for code prompts and produces wrong long-context logits.
  */
+#include "ds4_flint_tokenizer.inc"
+
 static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_vec *out) {
+    if (ds4_model_is_flint()) {
+        bpe_tokenize_text_flint(vocab, text, out);
+        return;
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         bpe_tokenize_text_glm4(vocab, text, out);
         return;
@@ -45654,6 +45666,10 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
     vocab->im_end_id = -1;
     vocab->endoftext_id = -1;
 
+    if (ds4_model_is_flint()) {
+        flint_vocab_setup(vocab);
+        return;
+    }
     if (ds4_model_is_qwen4()) {
         /* ChatML without BOS; <|endoftext|> is the document separator and a
          * second generation stop. */
@@ -45891,6 +45907,7 @@ void ds4_tokenize_text(ds4_engine *e, const char *text, ds4_tokens *out) {
 }
 
 static bool special_token_at(const ds4_vocab *vocab, const char *p, int *token, size_t *len) {
+    if (ds4_model_is_flint()) return flint_special_token_at(vocab, p, token, len);
     struct special {
         const char *text;
         int token;
