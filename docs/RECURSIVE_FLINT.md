@@ -11,71 +11,69 @@ upstream ds4; upstream issue
 [#1260](https://github.com/antirez/ds4/issues/1260) (2026-10-23, no comments,
 no PR) requests it.
 
+The port follows Recursive's own engine,
+[rec](https://github.com/recursive-oss/rec) (Apache 2.0, installed locally as
+`~/.local/bin/rec` 0.1.1), closely: its weight layout, its decode megakernel
+and its prefill schedule are the template, and rec is the ground truth for
+tokens, logits and speed. The point of having it in ds4 rather than using rec
+is **SSD streaming of the routed experts**: rec needs the whole 22.6 GB
+checkpoint resident and refuses Macs under 48 GB; ds4 already streams
+routed experts from disk through a bounded RAM cache for DeepSeek, GLM and
+Qwen, and gets sessions, disk KV checkpoints, the agent and the server with
+it.
+
 Scope, for now:
 
-- **One weight format**: Recursive's own 4-bit release,
+- **One weight format**: Recursive's 4-bit release
   [RecursiveSI/flint-int4](https://huggingface.co/RecursiveSI/flint-int4)
-  (`mlx-affine-int4`, 22.6 GB), the file `rec pull` downloads. ds4 loads
-  these exact weights, converted to GGUF without requantisation. No recipe
-  search, no Q4_K, no other quants until this one is done.
-- **Ground truth is rec**, Recursive's engine, installed locally
-  (`~/.local/bin/rec`, 0.1.1). Correctness means ds4 reproduces rec's
-  tokens and log-probabilities on the same weights; speed means ds4 is
-  measured against rec on the same machine. llama.cpp is not a reference
-  on this branch.
+  (`mlx-affine-int4`, the file `rec pull` downloads), loaded bit for bit.
+  No other quant until this is done.
+- **One reference**: rec. Decode must reproduce rec's megakernel bit for
+  bit on identical inputs; prefill within rec's own spread.
+- **Metal first.** CUDA is step 7.
 
-The goal is the fastest local decode on Apple Silicon at rec's quality. The
-reference machine is an M4 Pro with 48 GB (16-core GPU, 273 GB/s), where rec
-reports more than 125 tok/s averaged over a 128K-token session.
+The reference machine is an M4 Pro with 48 GB (16-core GPU, 273 GB/s), where
+rec reports more than 125 tok/s averaged over a 128K-token session.
 
 ## Status
 
 | Step | State |
 |---|---|
-| 0. Scaffolding: fork files from `bonsai2`; `flint` GGUF with the affine-int4 tensor types; converter from rec's checkpoint; shape, loader, tokenizer, server id | open |
-| 1. Decode graph: greedy tokens and logprobs match rec on the golden cases | open |
-| 2. Prefill graph, chunked prefill, sessions, live KV reuse, disk checkpoints | open |
-| 3. Measure: time outside weight streaming; decode at 4K/32K/128K against rec | open |
-| 4. Quality parity: KLD against rec's full logits, teacher-forced; official continuations from the hosted model for both engines | open |
-| 5. Fused decode: attention block and MoE block as single kernels; KV precision for the 14 full layers if long context needs it | open |
-| 6. Server and agent: Flint template, `<tool_call>` syntax, reasoning parsing, `ds4-agent` session | open |
+| 0. Scaffolding: fork files from `bonsai2`; converter from rec's checkpoint (rec's tensor layout, per-expert packs); shape, loader, tokenizer, server id | open |
+| 1. Decode megakernel ported: per-layer residual trace bit-identical to rec on identical KV; one token per launch, CPU sampling | open |
+| 2. Prefill (chunked, window attention, sorted-expert GEMM), sessions, live KV reuse, disk checkpoints; golden cases within rec's spread | open |
+| 3. Measure against rec: decode at 4K/32K/128K, prefill, launch overhead; decide on 8-token resident blocks | open |
+| 4. Expert streaming: routing-trace study, cache and address table, in-kernel slot wait (or per-layer split), prefill staging, budget; streamed output bit-identical to resident | open |
+| 5. Server and agent: Flint template, `<tool_call>` syntax, reasoning parsing, `ds4-agent` session | open |
+| 6. Streaming speed: prefetch and prediction, popularity preload, cache policy | open |
 | 7. Later: CUDA (DGX Spark), session batching, other quants | open |
 
 Each step records what it measured here when it lands. Steps 0-2 are
-correctness, 3-5 speed, 4 quality, 6 product. Nothing in 3-5 starts before
-the golden check of step 1 passes.
+correctness against rec, 3 the resident baseline, 4 the reason for the
+branch, 5 product, 6 streaming speed. Nothing in 3-6 starts before the
+trace check of step 1 passes.
 
 ## Model
 
 Published 2026-10-21 under Apache 2.0, trained from scratch, built with
 Recursive's "Eureka Machine" architecture search from a 35B/3B baseline. Text
-only; no vision tower, no MTP head. The BF16 checkpoint is 80 GB of
-safetensors with an SGLang kit and no Transformers code. Recursive's local
-engine [rec](https://github.com/recursive-oss/rec) is MLX-based Python with
-Metal megakernels for M4 Pro/Max and M5 Pro/Max (48 GB minimum); the Go CLI
-bundles the Python runtime and extracts it under
-`~/.local/share/rec/runtimes/` on first `rec serve`, which is also where a
-script can import `rec_mlx` to dump logits.
-
-From `config.json` and the model card:
+only; no vision tower, no MTP head. From `config.json` and the model card:
 
 - 49 layers: 2 dense SwiGLU layers (6144 wide) then 47 MoE layers. Hidden
   2048, vocabulary 150144, untied embedding and output head, RMSNorm
   eps 1e-6, no biases.
 - Attention: 32 query heads, 4 KV heads, head dim 128, scale 1/sqrt(128),
   per-head QK RMSNorm (weight of 128) before RoPE, and a learned per-head
-  attention sink (`softmax_offset`, 32 values: one extra logit in the
-  softmax whose probability mass is dropped).
+  attention sink (`softmax_offset`, 32 values: one extra softmax logit
+  whose mass is dropped).
 - 35 sliding-window layers (window 513: the token and 512 before it) with
   NeoX RoPE, theta 10000, full 128-dim rotation; 14 full-attention layers
   with **no positional encoding** (layers 0, 1, 5, 9, ..., 45, 48). From
-  layer 2 the pattern is three sliding, one full. Context 262144 documented,
-  512K claimed; the RoPE geometry is why extension costs nothing.
+  layer 2 the pattern is three sliding, one full. Context 262144.
 - MoE: 256 routed experts of width 512, 6 per token, plus one always-on
-  shared expert of width 1024. Router: `sigmoid(x W^T)` in fp32, top-6 by
-  score (plus a zero `expert_bias`), weights renormalised to sum 1
-  (`norm_topk_prob`), scale 1.0, no expert groups, no shared-expert gate.
-- Active parameters per token (computed from the shapes):
+  shared expert of width 1024. Router: `sigmoid(x W^T)`, top-6 (plus a zero
+  `expert_bias`), weights renormalised to sum 1, scale 1.0, no groups.
+- Active parameters per token (from the shapes):
 
 | Part | Params/token | Share |
 |---|---:|---:|
@@ -86,10 +84,11 @@ From `config.json` and the model card:
 | dense FFN (2 layers) + routers | 100M | 4% |
 | **total** | **2.52B** | |
 
-Routed experts are 95% of the 39.8B stored weights but only 35% of what a
-token reads. Decode speed is set by the attention projections, shared
-experts and head as much as by the experts, which is why the INT4 release
-quantises everything, the head included.
+Routed experts are 95% of the 39.8B stored weights (21.3 GB of the 22.6 GB
+file) but only 35% of what a token reads. Everything else, about 1.3 GB,
+is read every token and stays resident in every mode. This is the shape
+SSD streaming likes: a small hot set, a large cold set, 282 expert
+selections per token at 1.69 MiB each.
 
 Tokenizer: byte-level BPE, 150000 merged tokens plus 144 specials from
 150000 (`<|begin_of_text|>` 150000, `<|end_of_text|>` 150001, `<|system|>`,
@@ -99,392 +98,489 @@ Tokenizer: byte-level BPE, 150000 merged tokens plus 144 specials from
 End-of-generation ids: 150001, 150003, 150005, 150018; the model ends a turn
 by emitting the next role tag, as GLM does. The pre-tokenizer is three
 sequential splits (`\p{N}{1,3}`, CJK runs, then a GPT-4o-style word pattern
-with uppercase/lowercase alternation); llama.cpp's `tokenizer.ggml.pre =
-"flint"` holds the exact regexes, and rec's tokenizer (HF `tokenizers`) is
-the arbiter.
+with uppercase/lowercase alternation); rec's tokenizer (HF `tokenizers`) is
+the arbiter, llama.cpp's `tokenizer.ggml.pre = "flint"` lists the regexes.
 
-Chat template (`chat_template.jinja`, 2.3 KB): `<|system|>…`,
-`<|developer|>…`, `<|user|>…`, `<|assistant|>` followed by `<think>…</think>`
-and content, tool results as `<|observation|><tool_response>…</tool_response>`,
-generation prompt `<|assistant|>`. Tools go in a `<|system|># Tools` preamble
-with one JSON schema per line inside `<tools>`. Tool calls are single-line:
+Chat template (`chat_template.jinja`): `<|system|>…`, `<|developer|>…`,
+`<|user|>…`, `<|assistant|>` then `<think>…</think>` and content, tool
+results as `<|observation|><tool_response>…</tool_response>`, generation
+prompt `<|assistant|>`. Tools go in a `<|system|># Tools` preamble with one
+JSON schema per line inside `<tools>`. Tool calls are single-line:
 `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>…</tool_call>`,
 strings raw, other values JSON. User text has role tags HTML-escaped.
-Recommended sampling: temperature 1.0, top-p 0.95, top-k 20 (rec's
-defaults), at least 32K output tokens for hard problems.
+Sampling defaults: temperature 1.0, top-p 0.95, top-k 20.
 
 ### The INT4 checkpoint
 
-`rec pull` stores it under `~/.local/share/rec/models/<digest>/` with the
-HF file names (five `model-0000N.safetensors`, 4.4 + 3 × 4.4 + 3.5 GiB,
-`config.json`, tokenizer, template). `config.json` carries
-`quantization = {bits: 4, group_size: 64}` and `mlx_export = {bits: 4,
-embedding_bits: 8, routed_expert_bits: 4, scale_rule: "mse"}`; the manifest
-says `weight_format: mlx-affine-int4, kv_format: bf16`. The format is MLX
-affine quantisation:
+`rec pull` stores it under `~/.local/share/rec/models/<digest>/` with the HF
+file names (five `model-0000N.safetensors`, 22.6 GB, `config.json`,
+tokenizer, template). `config.json`: `quantization = {bits: 4, group_size:
+64}`, `mlx_export = {bits: 4, embedding_bits: 8, routed_expert_bits: 4,
+scale_rule: "mse"}`; the manifest: `weight_format: mlx-affine-int4,
+kv_format: bf16`. MLX affine quantisation:
 
 - `w = scale * q + bias` per group of 64 along the input dimension;
   `scales` and `biases` are BF16 `[out, in/64]`; `weight` is `U8 [out, in/2]`,
-  the view of MLX's packed `uint32 [out, in/8]`, element `i` of a word in
-  bits `4i..4i+3` (low nibble first). 4.5 bits per weight.
+  MLX's packed `uint32 [out, in/8]` viewed as bytes, element `i` of a word
+  in bits `4i..4i+3`. 4.5 bits per weight.
 - Every `nn.Linear` is 4-bit g64, including `lm_head` (`[150144, 1024]` U8)
-  and the routed experts (`switch_mlp.{gate,up,down}_proj.weight`,
+  and the routed experts (`switch_mlp.{gate,up,down}_proj.weight`
   `[256, 512, 1024]` and `[256, 2048, 256]` U8, scales `[256, 512, 32]` and
   `[256, 2048, 8]`).
 - `embed_tokens` is 8-bit g64 (`U8 [150144, 2048]`, scales `[150144, 32]`).
 - Norm weights, `softmax_offset` and the router (`mlp.gate.weight`
-  `[256, 2048]`) are BF16; rec casts the router and sinks to fp32 and bf16
-  respectively at load time.
-
-ds4 gets two fork tensor types for this, beside Bonsai's `PQ2_0 = 142`:
-`AFF4_64 = 143` (row = 64 nibbles + bf16 scale + bf16 bias, 36 bytes per
-64) and `AFF8_64 = 144` (64 bytes + 4, for the embedding). The converter
-(`gguf-tools/flint_int4_to_gguf.py`) interleaves scale and bias with each
-group's packed weights so a kernel reads one contiguous 36-byte block, keeps
-the values bit for bit, writes llama.cpp's tensor names and `flint.*`
-metadata, and records the checkpoint's SHA-256s. A `--check` mode
-dequantises every tensor with numpy and compares against MLX's
-`mx.dequantize` on the source file. Expert tensors are written as one
-3-D tensor per projection (`[256, rows, cols]`), as llama.cpp does.
-
-### What ds4 already has
-
-| Need | In the tree | Gap |
-|---|---|---|
-| GQA attention with sinks | `metal/flash_attn.metal` (ggml port) has `has_sinks` function constants in the prefill and decode kernels; the `vec` typedef is already written for head dim 128 | only 512/512 and 256/256 host instantiations exist; add `dk128_dv128` for both kernels |
-| Sliding window | `n_swa` in the shape (DeepSeek Flash uses 128) and banded masks in the DeepSeek graph | a 513-row ring KV cache per sliding layer and a window mask for prefill; decode reads at most 513 rows |
-| No-RoPE layers, QK norm | QK RMSNorm and NeoX RoPE kernels in the Qwen3.8 graph (head dim 256) | per-layer RoPE on/off; head dim 128 variants |
-| MoE routing and expert scheduling | Flash Next's routed-expert kernels (selected-slot gather, gate/up then down, ordered reduction) and DeepSeek's sigmoid top-k | kernels for `AFF4_64` experts at width 512 with 6 slots; the Flash Next kernels are the structural template, not reusable as is (Q4_K/MXFP4/IQ2 decoders) |
-| 4-bit dense matvec | `kernel_bonsai2_mv_q4k`/`q6k` and their half-activation multi-row variants on `qwen38-27b`; `kernel_mul_mv_ext_q4_f32_disp` | an `AFF4_64` matvec (simpler decode than Q4_K: one scale, one bias, no 6-bit sub-scales) and an 8-bit embedding gather |
-| Prefill GEMM | `ds4_metal_matmul_f16_buffer`, Bonsai's `kernel_bonsai2_gemm` family with decoded-fragment operands | an `AFF4_64` operand decoder in the Bonsai GEMM |
-| Tokenizer | GLM4, Qwen3.5 and DeepSeek pre-tokenizers in C with the Qwen unicode tables | `bpe_tokenize_text_flint` with the three-stage split |
-| Chat template, tool calls | GLM renderer and `<arg_key>/<arg_value>` parser (`SERVER_MODEL_SYNTAX_GLM`) | Flint variant: no `[gMASK]<sop>`, no newlines inside `<tool_call>`, `<|developer|>` role, no reasoning-effort preamble |
-| Sessions, live KV reuse, disk checkpoints, agent | family plumbing in `ds4.c` (per family) | see the family decision below |
-| Reference tooling | `tests/bonsai2/check_reference.py` (golden file), `tests/qwen38_27b/kld.c` (teacher-forced KLD), `gguf-tools/quality-testing` | rec as the source instead of llama.cpp |
-
-Nothing from Qwen3.8's recurrent state, hyper-connections, n-grams, indexer
-or MTP applies.
+  `[256, 2048]`) are BF16.
 
 ## How rec runs it
 
-What ds4 must reproduce, from `engine/src/rec_mlx/` (0.1.1):
+From `engine/src/rec_mlx/` at rec 0.1.1. This is the specification for
+steps 1 and 2; the source files are the reference when this summary is not
+enough.
 
-- `model.py`: the reference forward (360 lines). bf16 activations
-  throughout; router scores and the sink softmax in fp32; `RMSNorm` from
-  `mlx.nn`; `nn.RoPE(128, traditional=False, base=10000)` on sliding
-  layers; `scaled_dot_product_attention(..., sinks=softmax_offset)`;
-  `SwitchGLU` for the experts; weights `scores/(sum+1e-20)`.
-- `quantized.py`: loads the checkpoint with `nn.quantize(group_size=64,
-  mode="affine")`, keeps the router in fp32; `FixedKVCache` (bf16) for the
-  14 full layers and `FixedSlidingKVCache(window=513)` rings for the rest.
-- `kernels/megakernel.py` (1300 lines): one Metal kernel per decode step
-  over all 49 layers with bf16 workspaces, fp32 partials and statistics,
-  `router_bf16`, expert "teams" and KV "teams" of threadgroups.
-- Prefill in chunks (`prefill_chunk_size`), last-row logits, prompt-prefix
-  cache with rollback. Sampling defaults temperature 1.0, top-p 0.95,
-  top-k 20; `max_tokens` 1024 in chat.
-- The HTTP API (`rec serve`, port 11500, key from `rec auth token`) is
-  OpenAI chat completions plus Anthropic messages. `logprobs: true` with
-  `stream: false` returns the chosen token's logprob per generated token;
-  `top_logprobs` is not supported. Full logit vectors come from the runtime
-  directly: `Model.__call__(tokens, cache)` returns logits for all rows.
+### Weights (`kernels/megakernel.py`, `FullModel.__init__`)
 
-Arithmetic differences to expect against ds4's fp32 activations: bf16
-rounding in every projection input and in the KV cache (rec), fp32 in ds4.
-The 27B saw llama.cpp's half-rounded activations move top-5 logprobs by up
-to 0.32 while tokens stayed identical; rec's bf16 should be in the same
-range. The golden tolerance is therefore set from rec's own spread (step 1)
-rather than assumed.
+Thirteen "banks" of four layers each (the last also holds the final norm,
+embedding and head), each a flat byte buffer with every tensor 256-byte
+aligned in the order weight, scales, biases. A 64-word descriptor per layer
+gives, for each projection, the three offsets plus `n` (rows) and `k`
+(inputs); words 0-9 hold the bank id, `is_global`, `is_sparse`, the norm and
+sink offsets and the router; words 61-62 the KV cache offset and capacity.
+The router is kept as BF16 (`router_bf16`, checked to round-trip the fp32
+values). Routed experts live inside the bank as `[256][rows][k/2]`, indexed
+as `expert * n + row`. A `silu` lookup table over all 65536 bf16 bit
+patterns serves the shared expert's activation.
 
-## Speed model and prediction
+### Decode (`flint_decode`, `_HEADER` + `_BODY`)
 
-Bytes per decode step at 4.5 bits per weight for everything read:
-2.52B × 4.5 / 8 = 1.42 GB. An M4 Pro sustains about 226 GB/s in matvec
-kernels (measured on the 27B), so the weight stream alone allows about
-160 tok/s. Then:
+One persistent Metal kernel per token: grid `workers × 256` threads (M4
+Pro/Max, M5 Pro: 36 workers, 32 "MLP workers", 32 head workers; M5 Max:
+76/64/64), 8 simdgroups per threadgroup. Threadgroups synchronise with
+device-wide atomic barriers (`sync_all`, a monotonic counter with a
+10M-spin watchdog that aborts the kernel with a diagnostic instead of
+hanging). Every threadgroup keeps the residual `h` (8 bf16 per thread) in
+registers and recomputes each RMSNorm into threadgroup memory. Per layer:
 
-| Term | At 4K context | At 32K | At 128K |
-|---|---:|---:|---:|
-| weights | 6.3 ms | 6.3 ms | 6.3 ms |
-| KV reads, 14 full layers, bf16/F16 (2 KB per position per layer) | 0.5 ms | 4.2 ms | 16.6 ms |
-| KV reads, same at K8/V4 | 0.2 ms | 1.6 ms | 6.2 ms |
-| 35 sliding layers, 513 rows | <0.1 ms | <0.1 ms | <0.1 ms |
-| **bound, 16-bit KV** | **147 tok/s** | **95 tok/s** | **44 tok/s** |
-| **bound, K8/V4 KV** | **154 tok/s** | **127 tok/s** | **80 tok/s** |
+1. `rms_256_w4(h) → n` (threadgroup), fp32 statistics, bf16 output.
+2. Q/K/V: 40 units of one 128-row head each (32 q, 4 k, 4 v); `q4_local<2048>`
+   is the 4-bit matvec: each lane loads 16 bf16 activations as fp32
+   pre-scaled by 1, 1/16, 1/256, 1/4096 (`load16`), so a 16-bit word of
+   four nibbles multiplies without shifts (`dot16`: `s*Σ(x·masked) + b·Σx`);
+   fp32 accumulation per lane over k, `simd_sum`, bf16 store. Then QK
+   RMSNorm and, on sliding layers, RoPE with `theta = pos · 2^(-pair/64 ·
+   log2 10000)` in `fast::cos/sin`; K and V are written to the cache.
+   The "KV teams" transform (`kernels/kv_teams.py`) splits this across
+   `workers/4` teams with per-team barriers.
+3. Attention (`attention_partial_path_w53` + `attention_merge_vec4_w2`):
+   split-K over `parts` partitions (32 for sliding layers and short global
+   contexts; 64 to 1024 for global contexts of 1024 tokens and more, where
+   partial accumulators are rounded to bf16), one simdgroup per
+   (KV head, `HEADS` query heads, part), online softmax with the sink as
+   the initial max/denominator of part 0, bf16 K/V, fp32 scores, merge over
+   parts with fp32 statistics. `scale = 0.08838834764831845`.
+4. `q4<4096>` output projection, residual add in bf16, `rms_256_w4` again.
+5. Router: `route_dot_bf16` (bf16 weights, fp32 accumulate, the dot
+   rounded to bf16 before the sigmoid), then `w3_route_own_rank`: each
+   expert team computes its own rank of the top-6 (ties to the lower
+   index), renormalised weights `score/(Σ+1e-20)`.
+6. Expert teams (`kernels/expert_teams.py`): of the 32 MLP workers, four
+   threadgroups per routed role (6 × 4 = 24) and eight for the shared
+   expert. `expert_team_gateup` computes gate and up together (two rows
+   per simdgroup step), activation `bf16(bf16(g·σ(g))·u)` with the sigmoid
+   in `fast::exp` for routed experts and the lookup table for the shared
+   one; `expert_team_handoff` is a per-team barrier (the shared expert's
+   eight groups and each role's four groups wait only for themselves);
+   `expert_team_down` (`dot16_w197_bias23`, the exact-integer-float nibble
+   decode). Dense layers 0-1 use `q4_local` gate/up, a plain SiLU, `q4<6144>`
+   down.
+7. Mix: `Σ_r bf16(down_r · bf16(w_r))` with bf16 rounding after every
+   addition (MLX's order), plus the shared expert, plus the residual, all
+   in bf16. Group 0 writes the residual to `trace[(layer+1)·2048]`.
 
-rec's 125 tok/s "averaged over a 128K session" with a bf16 KV cache sits
-above the 16-bit-KV bound at 128K, so either its number is weighted toward
-the short part of the session or it reads less KV than this model assumes;
-step 3 measures rec at fixed contexts and settles it.
+After layer 48: final norm, `q4_local<2048>` over the 150144-row head by the
+head workers, bf16 logits. `resident_block.py` wraps the body in a loop of
+8 decode steps per launch with an in-kernel argmax (or the in-kernel
+samplers in `sampling.py`/`masked_sampling.py` for temperature, top-p,
+top-k, presence penalty and grammar masks), so the CPU sees tokens in
+packets of 8. The transforms in `kernels/*.py` (expert teams, KV teams,
+rank routing, mixed bits, fast activation, M4 Max loads) are string
+rewrites of the base shader; for the port they are resolved once, for the
+M4 Pro profile, into plain Metal.
 
-Dispatch overhead decides the rest. A straightforward ds4 graph runs 12-15
-kernels per layer (norms, q/k/v, QK norm and RoPE, attention, output,
-router, expert gate/up, expert down, shared expert, residual adds): 600-700
-dispatches per token. At the 5-10 µs each costs on Apple GPUs that is
-3-7 ms, as much as the weights. This is why rec fuses the whole decode pass
-into one kernel and why step 3 measures time outside weight streaming
-before any kernel work, as the 27B did. The prediction for this machine:
+### KV cache (`cache.py`, `m4_max.py`)
 
-| M4 Pro | Prediction |
-|---|---:|
-| step 1 graph, separate kernels | 80-100 tok/s at 4K |
-| fused attention and MoE blocks (step 5) | 120-140 tok/s at 4K |
-| K8/V4 cache for the full layers | about 125 tok/s averaged over 128K |
+bf16, layout `[kv_head][capacity][128]` per layer. Full-attention layers
+share banks of 65536 tokens (grown on demand; the kernel picks the bank by
+`position >> 16`); sliding layers are 513-row rings with `insert = pos mod
+513` once the ring is full. Metadata words 61-62 give each layer its offset
+and capacity.
 
-Prefill: 2.5B active parameters per token is small; the expert GEMMs are
-6 × 256-way scatter at width 512, where Flash Next's batched expert
-scheduling already runs. The sliding layers attend to at most 513 keys, so
-only 14 layers pay full attention cost. No prefill target until rec is
-measured (step 3).
+### Prefill (`quantized.py`, `m4_max_prefill.py`, `prefix.py`)
+
+Not fused: the native MLX graph (`model.py`) in chunks of 2048 tokens
+(4096 on M5), `SwitchGLU` (MLX `gather_qmm`) for experts, SDPA with sinks,
+last-row logits only. On M4 Max: a steel GEMM over tokens sorted by expert
+(`flint_prefill_gate_up`), dequantised dense GEMMs above 1024 rows, and
+window attention in 512-row blocks. The prompt cache keeps the last chunk
+boundary's sliding rings as a checkpoint for prefix divergence. **Decode KV
+is never reused as a prefix**: after a reply, rec re-prefills the generated
+tokens in the background (`prepare_prefix`) so the next turn's cached state
+has batched-prefill arithmetic ("its arithmetic differs ... and changes
+probabilities").
+
+### API
+
+`rec serve` (port 11500, key from `rec auth token`): OpenAI chat completions
+and Anthropic messages; `logprobs: true` with `stream: false` returns the
+chosen token's logprob; `top_logprobs` is unsupported. `--metrics FILE`
+appends per-request JSON with prefill and decode seconds, token ids and
+cache statistics. Full logits and the per-layer `trace` come from the
+runtime directly (`~/.local/share/rec/runtimes/<sha>/`, extracted on first
+serve): `FullModel.forward(state, token)` returns `(logits, trace)`.
+
+## What ds4 already has
+
+| Need | In the tree | Gap |
+|---|---|---|
+| mmap-backed GGUF weights as Metal buffers, model shape struct, fork variant pattern | upstream loader; Bonsai's `PQ2_0` type and fork files | `flint` metadata, three fork tensor types, per-layer descriptors built from GGUF offsets |
+| Persistent kernel with device-wide barriers | none; every ds4 graph is one dispatch per op | the megakernel is new ground for ds4; port rec's `sync_all` and team barriers as they are |
+| GQA attention with sinks, 128-wide | `flash_attn.metal` has sinks and a 128/128 typedef | not used: the port takes rec's split-K attention inside the megakernel; `flash_attn` 128/128 serves prefill |
+| Routed-expert SSD streaming | Qwen3.8's bounded expert cache, `pread` into owned buffers, GPU address tables (`qwen4_expert_rows`), selected-id readback through an `MTLSharedEvent` handshake (#1328), overlap of misses with cached work, per-layer prefill staging, budget sizing from RAM and the Metal working set, failure semantics (skip zero entries, exact retry) | the same mechanisms applied to one kernel instead of a per-layer dispatch sequence (see Streaming) |
+| Prefill GEMM | Bonsai's `kernel_bonsai2_gemm` family with decoded-fragment operands; `ds4_metal_matmul_f16_buffer` | an affine-int4 operand decoder; the sorted-expert GEMM from rec's M4 Max prefill |
+| Tokenizer | GLM4, Qwen3.5 and DeepSeek pre-tokenizers in C with the Qwen unicode tables | `bpe_tokenize_text_flint` |
+| Chat template, tool calls | GLM renderer and `<arg_key>/<arg_value>` parser | Flint variant (no `[gMASK]<sop>`, no newlines in `<tool_call>`, `<|developer|>`, no effort preamble) |
+| Sessions, live KV reuse, disk checkpoints, agent | per-family plumbing in `ds4.c` | family decision below; ring + linear caches in the payload |
+| Reference tooling | `tests/bonsai2/check_reference.py`, `tests/qwen38_27b/kld.c` | rec as the source; a trace comparison tool |
 
 ## Design
 
-Fork rules apply ([FORK_MAINTAINING.md](FORK_MAINTAINING.md), to be copied
-from `bonsai2` in step 0): Flint code lives in fork-owned files, upstream
-files get one- to three-line hooks, upstream is merged, never rebased.
+Fork rules apply ([FORK_MAINTAINING.md](FORK_MAINTAINING.md), copied from
+`bonsai2` in step 0): Flint code in fork-owned files, one- to three-line
+hooks in upstream files, upstream merged, never rebased. rec's shader code
+is Apache 2.0: the ported kernels carry its notice in `licenses/` and in
+`metal/flint.metal`.
 
 ### Family decision (step 0)
 
 Bonsai 2 and the 27B run as variants of the Qwen3.8 family because their
-layer geometry matches it; they reuse its sessions, payloads and kernels.
-Flint shares no layer type with any ds4 family: it is a plain GQA + MoE
-transformer. Two options:
+layer geometry matches it. Flint shares no layer type with any ds4 family.
+Two options:
 
-1. **Qwen3.8-family variant** (`DS4_VARIANT_FLINT = 201`, Bonsai's pattern).
-   Known contact points (about 45 lines in `ds4.c`); the session, disk-KV
-   and server plumbing come for free. Risk: the shared session and payload
-   code walks the Qwen graph struct (GDN state, conv history, indexer spans)
-   and may not accept zero-width recurrent state; Bonsai kept GDN layers,
-   Flint has none.
-2. **New family** (`DS4_MODEL_FAMILY_FLINT`). Clean, but every
-   `ds4_model_is_qwen4()` fork in `ds4.c` (about 60 sites: prefill
-   chunking, session payloads, server aliases, agent save) needs a Flint
-   branch or a shared predicate.
+1. **Qwen3.8-family variant** (`DS4_VARIANT_FLINT = 201`, Bonsai's pattern):
+   known contact points (about 45 lines in `ds4.c`), sessions, disk KV,
+   server and the SSD-streaming engine plumbing (`--ssd-streaming`, cache
+   budget options, the expert cache structure) come along. Risk: the shared
+   session and payload code may not accept zero-width recurrent state.
+2. **New family**: clean, but about 60 `ds4_model_is_qwen4()` sites need a
+   Flint branch, and the streaming plumbing would be duplicated.
 
-Recommendation: try option 1 first, as a time-boxed probe in step 0: set
-`n_lin_*`, `n_hc = 1`, `n_ple_layer = DS4_MAX_LAYER` inert as Bonsai does, give
-the fork graph its own KV cache, and see whether a session round-trips a
-checkpoint. Fall back to option 2 only if the shared code needs more than a
-handful of hooks to tolerate an attention-only model. Record the outcome here.
+The streaming reuse tips this toward option 1. Probe it first in step 0
+(inert `n_lin_*`, `n_hc = 1`, `n_ple_layer = DS4_MAX_LAYER`; own KV cache
+in the fork graph; one session checkpoint round-trip); fall back to option
+2 only if more than a handful of hooks are needed. Record the outcome here.
 
 ### Fork-owned files
 
 | File | Contents |
 |---|---|
-| `ds4_flint_shape.inc` | `DS4_SHAPE_FLINT`, `ds4_model_is_flint()`, the per-layer sliding/RoPE/dense tables |
-| `ds4_flint_model.inc` | `flint` metadata and tensor validation (types 143/144 and F32/BF16 only), weight binding, engine gate |
-| `ds4_flint.inc` | Metal forward graph: decode, prefill, KV cache (ring for sliding layers, linear for full), payload spans |
-| `ds4_flint_gpu.h`, `ds4_metal_flint.m`, `metal/flint.metal` | kernel API, wrappers, kernels: `AFF4_64` matvec and GEMM operand, `AFF8_64` gather, router, attention 128 with sinks and window, expert gate/up/down, fused blocks |
-| `ds4_flint_tokenizer.inc` | `bpe_tokenize_text_flint` |
-| `ds4_server_flint.inc` | template renderer, tool-call syntax, model ids `flint`, `recursive/flint` |
-| `gguf-tools/flint_int4_to_gguf.py` | rec checkpoint → GGUF, bit-exact, with `--check` |
-| `tests/flint/` | kernel tests (model-free), `golden.json` from rec, `check_reference.py`, `rec_logits.py`, `kld` |
+| `ds4_flint_shape.inc` | `DS4_SHAPE_FLINT`, `ds4_model_is_flint()`, per-layer global/sparse tables |
+| `ds4_flint_model.inc` | `flint` metadata and tensor validation, binding, the per-layer descriptor table, engine gate |
+| `ds4_flint.inc` | graph: decode launch, prefill schedule, KV cache (rings + banks), payload spans, streaming orchestration |
+| `ds4_flint_gpu.h`, `ds4_metal_flint.m`, `metal/flint.metal` | kernel API, wrappers, the ported megakernel and prefill kernels |
+| `ds4_flint_tokenizer.inc`, `ds4_server_flint.inc` | pre-tokenizer; template, tool syntax, model ids `flint`, `recursive/flint` |
+| `gguf-tools/flint_int4_to_gguf.py` | rec checkpoint → GGUF, bit-exact, `--check` against `mx.dequantize` |
+| `tests/flint/` | kernel tests, `trace_compare.py`, `golden.json`, `check_reference.py`, `rec_logits.py`, `route_trace.py`, `kld` |
 | `docs/RECURSIVE_FLINT.md` | this file |
 
-Contact points, to be listed exactly when they land: `gguf_types[143..144]`,
-arch dispatch in `config_validate_model`, `weights_bind_*`, graph
-alloc/forward redirects, `ds4_engine_routed_quant_bits` (4), tokenizer
-dispatch, server model id and syntax, `fork.mk` include,
-`ds4_gpu_full_source` kernel sources.
+### Weights in GGUF
 
-### Graph
+rec's layout is kept so the kernels port unchanged, with one change for
+streaming: routed experts are stored **one pack per expert**.
 
-Per token, per layer (decode):
+- Non-expert tensors keep MLX's three arrays: `*.weight` as the fork type
+  `FLINT_U4 = 143` (raw packed nibbles, `[out, in/2]` bytes) or `FLINT_U8 =
+  144` for the embedding, `*.scales` and `*.biases` as BF16 `[out, in/64]`.
+  llama.cpp's names (`blk.N.attn_q`, `ffn_gate_shexp`, ...) with the
+  suffixes `.weight`, `.scales`, `.biases`. `general.alignment = 256`, so
+  the mmap'd file is rec's bank. The per-layer 64-word descriptor is
+  computed at load from the tensor offsets; the GGUF carries no offsets of
+  its own.
+- Routed experts: `blk.N.ffn_exps.pack`, fork type `FLINT_EXPERT_PACK =
+  145`, shape `[256, 1769472]` bytes: per expert, in order, `gate.weight`
+  (524288), `gate.scales` (32768), `gate.biases` (32768), the same for `up`,
+  then `down.weight` (524288), `down.scales` (32768), `down.biases`
+  (32768). 1.6875 MiB, already 256-aligned. One `pread` per expert in
+  streaming mode; resident mode maps the same bytes.
+- Metadata: `flint.*` as llama.cpp writes it (block count, heads, window,
+  the two 49-entry patterns, expert counts, `expert_gating_func = 2`), plus
+  `flint.weight_format = mlx-affine-int4` and the checkpoint SHA-256s from
+  rec's manifest.
 
-```
-x    = rmsnorm(h) * attn_norm
-q,k,v = x Wq, x Wk, x Wv                         (4096, 512, 512 outputs)
-q,k  = rmsnorm_head(q) * q_norm, rmsnorm_head(k) * k_norm
-q,k  = rope_neox(q,k, pos)                        sliding layers only
-cache[l][pos % cap] = k, v                        cap = 513 sliding, ctx full
-a    = softmax([q·K / sqrt(128), sink_h]) V       mask: window or causal
-h   += a Wo
-x    = rmsnorm(h) * ffn_norm
-h   += dense_swiglu(x)                            layers 0, 1
-h   += sum_i w_i expert_i(x) + shared(x)          layers 2..48
-```
+The kernel's expert addressing changes from `bank + offset + expert·n·k/2`
+to `pack_base(expert) + fixed offset`, where `pack_base` comes from a
+per-layer table of 256 GPU addresses. In resident mode the table holds
+`mmap + tensor offset + expert · 1769472`; in streaming mode it holds cache
+slot addresses or zero. That table is the whole interface between the
+megakernel and the streaming code.
 
-then `output_norm` and the head. Decisions:
+### Decode
 
-- KV cache: F16 K and V, 4 heads × 128, as rec's bf16 cache in precision.
-  Sliding layers use a 513-row ring (37 MB for all 35 layers at any
-  context); full layers a linear cache (2 KB per position per layer; 7.3 GB
-  at 262K for all 14). Live KV reuse and disk checkpoints serialise both; a
-  rewind into a sliding ring older than 513 tokens replays the retained
-  prefix, as Qwen's recurrent state does.
-- Attention kernels: `kernel_flash_attn_ext_vec` at 128/128 with sinks for
-  decode, `kernel_flash_attn_ext` at 128/128 for prefill; both already take
-  sinks via function constants. The window is a mask in prefill and a row
-  range in decode. GQA ratio 8 maps to the kernel's head grouping.
-- Router: one kernel per layer, 256 sigmoids in fp32, top-6, renormalise;
-  writes slot ids and weights for the expert kernels.
-- Experts: `AFF4_64` gate/up and down kernels with 6 slots and width 512,
-  built on Flash Next's selected-slot scheduling; the shared expert is a
-  dense 2048→1024→2048 SwiGLU on the same activations. Step 5 fuses router,
-  gate/up, down and shared into one kernel per layer.
-- Dense projections: `AFF4_64` matvec, fp32 activations for single-row
-  decode (the 27B found half activations exact enough for multi-row verify,
-  which this model does not need).
-- Prefill: Bonsai's GEMM with an `AFF4_64` operand decoder for the dense
-  parts, Flash Next's batched expert path with the new decoder, chunked as
-  upstream does (`--prefill-chunk`).
+`metal/flint.metal` holds rec's `_HEADER` and `_BODY` with the M4 Pro
+profile's transforms applied once (expert teams for 32 MLP workers, KV
+teams for 36 workers, own-rank routing, mixed-bits rounding, fast
+activation), with the following deliberate differences, each checked by
+the trace test:
+
+- Weight addressing through the descriptor table built at load and the
+  expert address table (above).
+- One token per launch, logits read back, ds4's CPU samplers, grammar and
+  tool parsing as for every other model. rec's 8-token resident blocks are
+  a step 3 decision: at 7-8 ms per token a launch plus readback costs a few
+  percent; streaming wants the CPU between tokens anyway.
+- The `trace` and `diagnostic` outputs stay: the watchdog's diagnostic is
+  how a lost barrier surfaces, and the trace is the test interface.
+
+Launch envelope: 36 threadgroups of 256 must be co-resident or the barriers
+deadlock into the watchdog. rec's `DeviceProfile` encodes what each chip
+sustains; ds4 reads the same device name and refuses others until profiled.
+
+### KV cache and sessions
+
+bf16 as rec: 14 linear caches (2 KB per position per layer; 7.3 GB at 262K)
+and 35 rings of 513 rows (37 MB total). Disk checkpoints and live KV reuse
+serialise both. Following rec's rule that decode KV is not reused as a
+prefix is the open question of step 2: ds4's sessions reuse decode KV
+everywhere, and whether the bf16 difference between a decoded row and a
+prefilled one matters for Flint is measured, not assumed (gate 2).
+
+### Prefill
+
+Chunks of 2048 tokens as rec on M4 Pro. Dense projections through Bonsai's
+GEMM with an affine-int4 operand decoder; experts through a port of rec's
+sorted-token gate/up GEMM (`flint_prefill_gate_up`: tokens sorted by
+expert, binary-searched expert boundaries, a steel-style block MMA with
+`QuantizedBlockLoader` 4-bit g64 operands) and a matching down GEMM; sliding
+attention in 512-row blocks against the ring, global attention with
+`flash_attn` 128/128 and sinks; QK norm and RoPE as kernels. Prefill cannot
+be bit-identical to MLX's `gather_qmm`; it is held to rec's own spread.
+Short continuations (a few tokens after a long prefix) go through the
+decode kernel with all-row logits, as ds4's other models do.
+
+### Streaming (step 4)
+
+What ds4 does for Qwen3.8 on Metal, moved into the megakernel:
+
+1. **Cache.** Expert slots of 1.6875 MiB in owned buffers sized by the
+   existing budget logic (87.5% of RAM or the Metal working set, minus
+   context, prefill scratch, the 1.3 GB of resident weights and the
+   runtime reserve). The address table maps `(layer, expert)` to a slot or
+   zero. Eviction LRU with the layer's current selection pinned.
+2. **Decode miss handling.** Routing happens inside the kernel, so the
+   selected ids are known to the GPU first. The expert team of a missing
+   expert publishes its request (`layer, expert, slot`) to a shared buffer
+   and spins on the slot's ready word; the shared expert's eight groups and
+   the teams whose experts are cached run meanwhile, which is the overlap
+   the Qwen path gets from ordering kernels. A CPU thread polls the request
+   buffer, `pread`s the pack into a free slot, updates the address table
+   entry and the ready word. The spin reuses rec's watchdog so a failed
+   read ends the kernel with a diagnostic and ds4's existing exact-retry
+   path reruns the token.
+
+   This depends on a CPU store to a shared buffer becoming visible to a
+   running kernel's device-scope atomic loads. It is the first experiment
+   of step 4, a 50-line kernel and a thread, before anything else is built.
+   If it does not hold on Apple GPUs, the fallback is the per-layer split:
+   the megakernel body ends after routing, publishes the ids through the
+   `MTLSharedEvent` handshake of #1328, the CPU reads, and a second kernel
+   runs the experts and the rest of the layer. 49 launches a token cost
+   about half a millisecond, acceptable for streaming mode only.
+3. **Prefill staging.** A 2048-token chunk touches nearly every expert of a
+   layer, so prefill reads whole layers (432 MiB each) into staging while
+   the previous layer computes, as the Qwen and GLM paths do; the sorted
+   GEMM then runs from staging. Short appends use the cache.
+4. **Exactness.** Streamed and resident runs must produce bit-identical
+   logits: the kernels do the same arithmetic from different addresses.
+   `tests/flint/test_streaming` follows `test_qwen4_ssd_experts`: a sparse
+   temporary file, cold and warm selections, eviction, prefill staging,
+   failed reads with exact recovery, and a `pread` probe counting bytes.
+5. **Speed** (step 6). The miss cost is exposed: a layer's experts are
+   known only when that layer runs. Per token, 282 selections; a miss
+   fraction `m` costs `m × 0.5 GB` of reads. At the SSD's measured
+   bandwidth (to be measured; M4 Pro internal drives read 5-7 GB/s):
+
+| Miss fraction | Bytes/token | Added ms at 6 GB/s | tok/s with 7 ms compute |
+|---:|---:|---:|---:|
+| 0 (resident) | 0 | 0 | ~140 |
+| 0.05 | 25 MB | 4 | ~90 |
+| 0.1 | 50 MB | 8 | ~65 |
+| 0.25 | 125 MB | 21 | ~36 |
+| 0.5 | 250 MB | 42 | ~20 |
+| 1.0 (cold) | 500 MB | 83 | ~11 |
+
+   The miss fraction for a given cache size is a property of Flint's routing
+   on real agent transcripts, so step 4 starts with `route_trace.py`:
+   routing ids per layer from rec's runtime over a few long agent sessions,
+   then an offline LRU simulation per cache size (8, 12, 16, 20 GB). That
+   table decides whether plain LRU is enough or step 6 needs prefetch (issue
+   the next layer's likely reads from the previous token's routing, the
+   fork's expert-prediction work on Qwen) and popularity preload.
+
+Memory targets, with 1.3 GB resident weights, 2 GB runtime reserve and
+context at 8K (0.3 GB): a 16 GB Mac holds about an 8 GB cache (37% of
+experts), 24 GB about 14 GB (65%), 32 GB the whole 21.3 GB. On the 48 GB
+development machine streaming is tested with `--ssd-streaming-cache-experts`
+capped to those sizes.
+
+## Speed model
+
+Resident decode, bytes per step at 4.5 bits: 1.42 GB; at the 226 GB/s ds4's
+matvecs sustain on this chip, about 160 tok/s before attention and barrier
+costs. rec's megakernel on the same chip is the measured ceiling (step 3);
+the port should land within a few percent of it, since it runs the same
+kernel with one launch per token instead of one per eight.
+
+| Term | At 4K | At 32K | At 128K |
+|---|---:|---:|---:|
+| weights | 6.3 ms | 6.3 ms | 6.3 ms |
+| KV reads, 14 global layers, bf16 (2 KB/position/layer) | 0.5 ms | 4.2 ms | 16.6 ms |
+| 35 sliding layers, 513 rows | <0.1 ms | <0.1 ms | <0.1 ms |
+| **bound** | **147 tok/s** | **95 tok/s** | **44 tok/s** |
+
+rec's 125 tok/s "over a 128K session" is above this bound at 128K, so the
+number is either weighted toward the short part of the session or its
+split-K attention reads less than modelled; step 3 measures rec at fixed
+contexts and settles it.
 
 ## Verification
 
-- **Converter**: `flint_int4_to_gguf.py --check` dequantises every tensor
-  and matches `mx.dequantize` on the source bit for bit; the GGUF records
-  the checkpoint SHA-256s from rec's manifest.
-- **Kernel tests** against double-precision CPU references, model-free, in
-  `tests/flint/` (`make test-flint-kernels`): `AFF4_64` dequantisation and
-  matvec, QK-norm + RoPE, attention with sinks and window at several
-  lengths and ring wrap-around, router top-6 with ties, expert gate/up/down
-  at width 512, GEMM operand decode, fused kernels against the unfused ones
-  bit for bit.
-- **Golden reference** (`make test-flint-reference`): `tests/flint/golden.json`
-  holds rendered prompts, rec's prompt token ids, rec's greedy tokens and
-  per-token logprobs (from `rec serve` with `logprobs: true`,
-  `temperature 0`, `stream: false`; verify that rec samples greedily at 0)
-  on Bonsai's six case shapes (five short chats including a tool call, one
-  4K-token passage) plus one 20K-token case that crosses many window
-  boundaries. ds4 must tokenise identically and reproduce the tokens; the
-  logprob tolerance is set by rec's own spread, measured by running each
-  case twice with different prefill chunk sizes.
+- **Converter**: `--check` dequantises every tensor and matches
+  `mx.dequantize` on the source bit for bit; expert packs are checked
+  against the source slices byte for byte.
+- **Trace test** (`tests/flint/trace_compare.py`, step 1's gate): for a set
+  of tokens and positions, run rec's `FullModel.forward` in its runtime and
+  ds4's decode on the same KV contents (both caches written from the same
+  prefill, exported from rec), and compare the 50 × 2048 residual trace and
+  the logits. Decode must be bit-identical; a difference names the layer
+  and the phase.
+- **Kernel tests** (`make test-flint-kernels`), model-free: `dot16` and
+  `load16` against a double reference over all nibble patterns, RMSNorm,
+  head norm and RoPE, split-K attention with sinks at the part-count
+  boundaries (1023/1024, 8192, 32768), own-rank routing with ties, expert
+  teams against the unfused expert loop, the sorted GEMM against a plain
+  dequantised matmul, the barrier watchdog.
+- **Golden reference** (`make test-flint-reference`): `golden.json` from
+  `rec serve` (`temperature 0` is argmax in `engine.py`; `logprobs: true`,
+  `stream: false`): Bonsai's six case shapes plus a 20K case; tokens must
+  match, logprobs within rec's own spread across prefill chunk sizes.
+- **Streaming**: `tests/flint/test_streaming` as above; a full-model run
+  with a capped cache must reproduce the resident logits exactly.
 - **Sessions**: `ds4_test --server`, checkpoint save/restore and rewind
-  across a sliding-window wrap, live KV reuse on a multi-turn agent
-  transcript, server story test at 48K.
-- **Speed**: `ds4-bench` sweeps 2K-128K, back to back with `rec serve` on
-  the same machine (`--metrics` JSONL gives rec's per-request timings),
-  AC power, High Power Mode, no other model process
-  ([benchmark rules](../CONTRIBUTING.md#speed-regression-tests)). rec and
-  ds4 never run at the same time: both want the whole GPU and 22.6 GB.
+  across a ring wrap, the 48K story test.
+- **Speed**: `ds4-bench` 2K-128K against `rec serve --metrics`, same
+  machine, AC power, High Power Mode, never both engines at once.
 
 ## Quality
 
-Same weights, so quality is agreement with rec, not a quantisation bar.
+Same weights and, for decode, the same arithmetic. Gates:
 
-1. **KLD against rec** (`tests/flint/kld`, the 27B tool with rec as the
-   base): `tests/flint/rec_logits.py` runs inside rec's extracted runtime,
-   teacher-forces the same 3072 positions (Italian prose, an English story,
-   `rax.c`) through `Model.__call__` with rec's caches, and writes full
-   log-probabilities per position in the `kld` base format. ds4 runs the
-   positions through its single-token decode path. Report KL(rec || ds4)
-   mean, p99, max; top-1 agreement; perplexity of both. Pass: mean KLD and
-   top-1 within what rec shows against itself when prefill chunking changes
-   (measured first), and no position with a top-1 flip whose rec logprob
-   gap exceeds the tolerance.
-2. **Official continuations** (`gguf-tools/quality-testing`, the repo's
-   release gate): 100 short prompts and the 12 long archive/code prompts,
-   collected from the hosted model (OpenRouter
+1. **Trace and streaming exactness** as above, after every kernel change.
+2. **KLD against rec** (`tests/flint/kld`, rec's full logits from
+   `rec_logits.py` over 3072 teacher-forced positions) for everything that
+   is not bit-exact: the prefill path, and decode continuing from ds4's own
+   prefill or from reused decode KV. The tolerance is rec's own spread
+   between prefill chunk sizes, measured first.
+3. **Official continuations** (`gguf-tools/quality-testing`): the repo's
+   prompts collected from the hosted model (OpenRouter
    `recursive/flint-v1.0:free` if it returns top logprobs, else Recursive's
-   API), scored by ds4; rec cannot be scored by `score_official`, so its
-   greedy first tokens on the same prompts (via `rec serve`) are compared
-   instead. This gate catches template and tokenizer drift that gate 1,
-   which starts from token ids, cannot.
-3. **Exactness**: `make test-flint-reference` after every graph or kernel
-   change; a fused kernel must reproduce the unfused logits bit for bit or
-   state the arithmetic difference and re-pass gate 1.
-
-A speed number is only valid for a graph that passes these gates.
+   API), scored by ds4, with rec's greedy first tokens on the same prompts
+   as the comparison. This catches template and tokenizer drift that the
+   token-id-based gates cannot.
 
 ## Steps
 
 ### 0. Scaffolding and converter
 
 Copy `fork.mk`, `ds4_metal_internal.h`, `docs/FORK_MAINTAINING.md` and the
-CI workflow from `bonsai2`, renamed for Flint, so this branch and the other
-fork branches can later merge into one fork main. Write
-`flint_int4_to_gguf.py` and run it on rec's pulled checkpoint
-(`~/.local/share/rec/models/*/`), `--check` passing. Recognise the GGUF:
-shape, metadata validation (reject anything but types 143/144, F32, BF16),
-tensor binding, the pre-tokenizer, server model id `flint`. Decide the
-family question above and record it. Deliverable: `./ds4 -m
-gguf/flint/flint-int4.gguf --dump-tokens` matches rec's tokenizer on 20
-strings including CJK, digits, contractions, HTML-escaped role tags and the
-special tokens; `golden.json` collected from `rec serve`.
+CI workflow from `bonsai2`, renamed. Write `flint_int4_to_gguf.py` and run
+it on the pulled checkpoint; `--check` passes. Loader: shape, metadata
+validation (types 143-145, BF16, nothing else), binding, descriptor table,
+address table in resident mode, pre-tokenizer, server id. Family decision
+recorded. Deliverable: `--dump-tokens` matches rec's tokenizer on 20
+strings (CJK, digits, contractions, escaped role tags, specials);
+`golden.json` collected; rec's runtime found and `rec_logits.py` dumping
+logits and traces.
 
-### 1. Decode graph
+### 1. Decode megakernel
 
-Single-token forward on Metal: the `AFF4_64` matvec, 128-wide attention
-instantiations with sinks, router, ring-cache writes, `AFF4_64` expert
-kernels. Golden check passes on the short cases with the tolerance from
-rec's own spread.
+Port the resolved shader, the launch, the readback, the KV banks and rings.
+Deliverable: `trace_compare.py` reports zero differing elements on 64
+positions across sliding and global layers, at contexts below and above
+the 1024-part boundary.
 
 ### 2. Prefill and sessions
 
-GEMM operand decoder, chunked prefill with window masks, full-row logits
-for the long golden cases, sessions, live KV reuse, disk checkpoints with
-both cache kinds, rewind replay across the ring. Golden check passes on all
-cases; `ds4_test --server` passes; a 48K story test retrieves its facts.
+Deliverable: golden check passes on all cases; `ds4_test --server` passes;
+48K story test; the decode-KV-reuse question measured with gate 2.
 
-### 3. Measure
+### 3. Resident measurements
 
-`DS4_FLINT_TIMING` stage timing as `DS4_QWEN4_TIMING` does. Report ms per
-token at 4K/32K/128K split into weights, attention, overhead, and rec's
-decode and prefill at the same contexts from its `--metrics` file, both on
-AC power with nothing else on the GPU. This table decides how much of
-step 5 is needed and whether KV precision matters at the contexts the
-agent actually uses.
+ds4 and rec at 4K/32K/128K, prefill at 2K and 32K, launch and readback
+overhead; the resident-block decision. The numbers go here.
 
-### 4. Quality parity
+### 4. Streaming
 
-Gate 1 and gate 2 above on the step 2 graph; the numbers go in this file.
-Any later kernel change re-runs gate 1.
+The visibility experiment; routing traces and the LRU table; the cache,
+address table and in-kernel wait (or the split); prefill staging; budget
+sizing; `test_streaming`; capped-cache full-model exactness and speed at
+8/14/22 GB.
 
-### 5. Fused decode
+### 5. Server and agent
 
-In order of expected gain, each kept only with a measured win and
-bit-identical or re-gated output: (a) attention block kernel (norm, q/k/v,
-QK norm, RoPE, cache write, attention with sinks, output projection) per
-layer; (b) MoE block kernel (norm, router, gate/up, down, shared,
-residual); (c) K8/V4 cache for the full layers if the 32K-128K numbers from
-step 3 say so (gate 1 again: it changes arithmetic and moves away from
-rec's bf16 cache); (d) one persistent kernel for the whole layer loop only
-if (a)-(b) leave more than 1 ms of dispatch overhead.
+Flint renderer and tool syntax, reasoning in `reasoning_content`, thinking
+on by default with `<think></think>` prefill to disable (confirm against
+rec's `chat.py`), `/v1/models` aliases, `ds4-agent` session save, the
+model's sampling defaults, one Terminal-Bench style task end to end
+compared with `rec launch`.
 
-### 6. Server and agent
+### 6. Streaming speed
 
-Flint renderer and tool-call syntax, reasoning in `reasoning_content`,
-thinking on by default with `<think></think>` prefill to disable (check
-against rec's `chat.py` and the SGLang reasoning parser; the template has
-no switch), `/v1/models` aliases, `ds4-agent` session save with a sliding
-ring, `--temp 1.0 --top-p 0.95 --top-k 20` as the model defaults.
-Terminal-Bench style smoke: one agent task end to end, compared with the
-same task on `rec launch`.
+Prefetch from the previous token's routing, popularity preload at startup,
+cache policy variants, each kept only with a measured gain on the
+routing-trace workloads and unchanged logits.
 
 ### 7. Later
 
-CUDA on DGX Spark (Flash Next's expert kernels and `flash_attn` ports with
-the `AFF4_64` decoder), `--batched-session`, other quants (NVFP4 for
-Blackwell, Q4_K/unsloth files) once the INT4 path is complete. SSD
-streaming is not needed (the file fits); MTP does not exist for this model.
+CUDA on DGX Spark (the megakernel is Metal; CUDA would start from the Qwen
+expert kernels), `--batched-session`, 8-token resident blocks with
+in-kernel sampling if step 3 says they pay, other quants.
 
 ## Open questions
 
-- Family variant or new family (step 0 decides; see above).
-- Whether rec's `temperature: 0` is greedy or clamps (its `Sampling` class
-  validates ranges); if not, collect golden tokens with `top_k: 1`.
-- Where rec's 125 tok/s over 128K comes from with a bf16 cache (step 3).
-- Thinking control: the template has no `enable_thinking`; confirm the
-  `<think></think>` prefill convention before building the server switch
-  on it.
-- Context above 262144 (Recursive says 512K works, recommends 256K): ds4
-  needs no RoPE change, only cache memory; leave the cap at 262144.
-- Whether the batched expert prefill path can keep fp32 activations at
-  width 512 without losing bandwidth, or needs the half-activation variant
-  (then gate 1 decides).
+- Family variant or new family (step 0).
+- CPU-to-GPU visibility inside a running kernel (step 4's first
+  experiment); the per-layer split is the fallback.
+- Whether reusing decode KV as a prefix changes Flint's probabilities
+  enough to matter, given that rec refuses to (step 2, gate 2).
+- Where rec's 125 tok/s at 128K comes from with bf16 KV (step 3).
+- Thinking control without a template switch (step 5).
+- The M4 Pro's sustained SSD read bandwidth under the streaming access
+  pattern (1.7 MiB random reads), which sets the whole streaming table.
 
 ## References
 
 - Announcement: https://www.recursive.com/updates/introducing-recursive-flint
 - Model card and config: https://huggingface.co/RecursiveSI/flint;
   INT4 checkpoint: https://huggingface.co/RecursiveSI/flint-int4
-- Engine: https://github.com/recursive-oss/rec (`engine/src/rec_mlx/model.py`,
-  `quantized.py`, `cache.py`, `engine.py`, `server.py`, `kernels/megakernel.py`)
-- Other quants, out of scope for now: `RecursiveSI/flint-int4-gguf` (Q4_1,
-  24.2 GiB), `RecursiveSI/flint-nvfp4-gguf` (21.3 GiB), `unsloth/flint-GGUF`
-  (BF16, Q8_0 39.4 GiB, UD-Q4_K_XL 23.3 GiB, imatrix); llama.cpp PR #30928
-  (arch `flint`, b11803), #30929 (Jinja hex escapes), #30861
+- rec: https://github.com/recursive-oss/rec, `engine/src/rec_mlx/`:
+  `kernels/megakernel.py` (shader and packing), `kernels/{expert_teams,
+  kv_teams,rank_routing,mixed_bits,resident_block,activation_optimization,
+  m4_max,device}.py` (transforms and profiles), `quantized.py`, `cache.py`,
+  `m4_max.py`, `m4_max_prefill.py`, `kernels/m4_max_prefill.py`, `prefix.py`,
+  `engine.py`, `server.py`, `scheduler.py`
+- Out of scope for now: `RecursiveSI/flint-int4-gguf` (Q4_1),
+  `RecursiveSI/flint-nvfp4-gguf`, `unsloth/flint-GGUF`; llama.cpp PR #30928
 - Hosted: https://openrouter.ai/recursive/flint-v1.0:free
-- ds4: issue #1260; `docs/QWEN38_27B.md` (method), `docs/FORK_MAINTAINING.md`
-  (rules), `tests/qwen38_27b/kld.c`, `tests/bonsai2/check_reference.py`
-  (tooling to adapt)
+- ds4: issue #1260, PR #1328 (streamed decode handshake);
+  `docs/QWEN38_FLASH_NEXT.md` (SSD streaming behaviour and tests),
+  `docs/QWEN38_27B.md` (method), `docs/FORK_MAINTAINING.md` (rules),
+  `tests/test_qwen4_ssd_experts.c`, `tests/bonsai2/check_reference.py`,
+  `tests/qwen38_27b/kld.c` (tooling to adapt)
