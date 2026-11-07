@@ -220,8 +220,7 @@ needs the router's expert ids before it can load experts. The layer's expert
 work used to wait in the open command buffer until the next layer's drain
 committed it, so the GPU idled while the CPU encoded the reduce and the next
 layer's attention and router. That buffer is now committed as soon as the
-experts are encoded (`ds4_metal_stream_overlap.inc`;
-`DS4_QWEN4_STREAM_EARLY_COMMIT=0` restores the old behaviour).
+experts are encoded (`ds4_metal_stream_overlap.inc`).
 
 The decode handshake (`ds4_metal_stream_handshake.inc`) removes the drain
 itself for single-token layers. The router's ids are copied to a shared
