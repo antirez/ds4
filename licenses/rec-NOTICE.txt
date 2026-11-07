@@ -1,0 +1,5 @@
+metal/flint.metal is a port of the resolved decode shader of rec 0.1.1
+(rec_mlx/kernels/megakernel.py and its transforms), Copyright Recursive,
+licensed under the Apache License, Version 2.0 (licenses/Apache-2.0.txt).
+The port keeps rec's arithmetic and schedule; docs/RECURSIVE_FLINT.md and
+the header of metal/flint.metal list the deliberate changes.

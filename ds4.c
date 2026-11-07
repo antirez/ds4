@@ -73584,6 +73584,8 @@ static void tp_dspark_split_meta(const ds4_engine *e, uint8_t meta[DS4_TP_DSPARK
 
 static int engine_install_dspark_support_cache(ds4_engine *e);
 static int engine_install_gpu_placement(ds4_engine *e);
+#include "ds4_flint.inc"
+
 static int ds4_engine_open_internal(ds4_engine **out,
                                     const ds4_engine_options *opt,
                                     const ds4_gpu_config *gpu_cfg);
@@ -74207,6 +74209,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
         if (engine_warm_full_model(opt)) model_warm_weights(&e->model);
     }
 #endif
+    if (ds4_model_is_flint()) {
+        if (opt->inspect_only) { *out = e; return 0; }
+        return flint_engine_open_tail(e, opt, out);
+    }
     if (ds4_model_is_qwen4()) {
         if (opt->inspect_only) {
             *out = e;
@@ -76193,6 +76199,7 @@ void ds4_engine_close(ds4_engine *e) {
 #ifndef DS4_NO_GPU
 #ifdef DS4_HAS_QWEN4_GPU
     qwen4_state_pool_free(e);
+    flint_engine_close();
     if (e->qwen4_shared_workspace) {
         qwen4_graph_free(e->qwen4_shared_workspace);
         free(e->qwen4_shared_workspace);

@@ -7,14 +7,20 @@
 FORK_SAVED_DEFAULT_GOAL := $(.DEFAULT_GOAL)
 
 ifeq ($(UNAME_S),Darwin)
-# ds4_metal.m includes the internal header (trampolines for out-of-tree
-# kernel files); metal/flint.metal joins the library through the upstream
-# wildcard once it exists.  ds4_metal_flint.o is added here in step 1.
+CORE_OBJS += ds4_metal_flint.o
+FORK_METAL_OBJS := ds4_metal_flint.o
+
+# metal/flint.metal is compiled at run time by ds4_metal_flint.m into its own
+# strict-math library; it is deliberately not part of the shared library.
+ds4_metal_flint.o: ds4_metal_flint.m ds4_metal_internal.h ds4_flint_gpu.h ds4_gpu.h
+	$(CC) $(OBJCFLAGS) -c -o $@ ds4_metal_flint.m
+
+# ds4_metal.m includes the internal header (trampolines for out-of-tree kernel files).
 ds4_metal.o: ds4_metal_internal.h
 endif
 
 # ds4.c textually includes the fork engine code.
-ds4.o ds4_cpu.o: ds4_flint_shape.inc ds4_flint_weights.inc ds4_flint_model.inc ds4_flint_tokenizer.inc ds4_flint_unicode.inc
+ds4.o ds4_cpu.o: ds4_flint_shape.inc ds4_flint_weights.inc ds4_flint_model.inc ds4_flint_tokenizer.inc ds4_flint_unicode.inc ds4_flint.inc ds4_flint_gpu.h
 
 .PHONY: fork-clean
 clean: fork-clean

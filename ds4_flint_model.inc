@@ -64,14 +64,12 @@ static void config_validate_flint_model(const ds4_model *m) {
 }
 
 /* Engine gate, consulted right after config_validate_model (inspect-only
- * opens skip it).  Until step 1 lands a graph, every run is refused with a
- * pointer to the plan rather than falling into another family's driver. */
+ * opens skip it). */
 static bool flint_engine_supported(const ds4_engine_options *opt, ds4_backend backend) {
     const char *why = NULL;
     if (backend != DS4_BACKEND_METAL) why = "needs the Metal backend";
     else if (opt->first_token_test || opt->metal_graph_test) why = "has no CPU reference diagnostics";
     else if (opt->glm_mtp || (opt->mtp_path && opt->mtp_path[0])) why = "has no MTP weights";
-    else why = "has no decode graph yet (step 1 of docs/RECURSIVE_FLINT.md)";
     if (why) fprintf(stderr, "ds4: Recursive Flint %s\n", why);
     return why == NULL;
 }

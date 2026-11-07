@@ -13,9 +13,9 @@ small. They are the Bonsai fork's rules (branch `bonsai2`), applied here.
 |---|---|
 | `ds4_flint_shape.inc` | `DS4_SHAPE_FLINT`, `ds4_model_is_flint()`, the global-layer mask, Flint-only constants |
 | `ds4_flint_model.inc` | GGUF metadata validation, engine gate, `ds4_engine_is_flint()`; later weight binding, layout checks, the per-layer descriptor table |
-| `ds4_flint.inc` | graph, KV cache (rings and banks), payload spans, streaming orchestration (step 1 onwards) |
+| `ds4_flint.inc` | descriptor and expert-offset tables, silu table, engine open/close, the decode trace check; later sessions, payload spans, streaming orchestration |
 | `ds4_flint_session.inc` | session driver: create, free, prefill, decode, payload save/load, rewind (needs `struct ds4_session`, so it is included later than the graph) |
-| `ds4_flint_gpu.h`, `ds4_metal_flint.m`, `metal/flint.metal` | kernel API, wrappers, the ported megakernel and prefill kernels (Apache 2.0 notice for rec's shader code) |
+| `ds4_flint_gpu.h`, `ds4_metal_flint.m`, `metal/flint.metal` | GPU API; its own strict-math Metal library, model buffer, KV blocks, launch and readback; the ported decode megakernel (`licenses/rec-NOTICE.txt`) |
 | `ds4_flint_tokenizer.inc`, `ds4_server_flint.inc` | pre-tokenizer; chat template, tool syntax |
 | `ds4_metal_internal.h` | trampolines exposing `ds4_metal.m` statics to out-of-tree kernel files (identical to `bonsai2`'s) |
 | `fork.mk` | build rules and fork test targets (included from `Makefile`) |
@@ -47,10 +47,12 @@ each later step adds; this table tracks what is in the tree.
 | | `ds4_engine_open_internal`: `flint_engine_supported` gate after `config_validate_model` |
 | | `gguf_types[143..145]` and `DS4_TENSOR_FLINT_U4/U8/PACK` |
 | | `#include "ds4_flint_weights.inc"` before `weights_have_output_head`; first-line redirects in `weights_have_output_head`, `weights_have_partial_output_head`, `weights_layer_has_required`, `weights_validate_layout`, `weights_bind_output`, `weights_bind_layer` |
+| | `#include "ds4_flint.inc"` before `ds4_engine_open_internal`; a three-line Flint block before the Qwen block of `ds4_engine_open_internal` (inspect returns, else `flint_engine_open_tail`); `flint_engine_close()` after `qwen4_state_pool_free` in `ds4_engine_close` |
 | | `#include "ds4_flint_tokenizer.inc"` before `bpe_tokenize_text`, plus its first-line dispatch; `flint_vocab_setup` branch at the top of the family section of `vocab_load`; first-line redirect of `special_token_at` to `flint_special_token_at` (HF matches every added token literally, including the reserved ones) |
-| `ds4.h` | `ds4_engine_is_flint()` |
+| `ds4.h` | `ds4_engine_is_flint()`, `ds4_flint_trace_check()` |
 | `ds4_metal.m` | include of `ds4_metal_internal.h`, fork sources appended to `required_sources`, trampoline block at the end |
 | `ds4_server.c` | model id `flint` in `server_model_id_from_engine`, aliases `flint` and `recursive/flint` in `server_model_alias_known`, `send_models` |
+| `ds4_cli.c` | `--flint-trace IN OUT` (two config fields, the parse case, the dispatch line before the imatrix branch) |
 
 ## Coupling to upstream code
 

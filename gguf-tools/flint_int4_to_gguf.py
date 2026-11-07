@@ -311,8 +311,61 @@ def expert_pack(ck: Checkpoint, il: int) -> TensorPlan:
                       PACK_BYTES * N_EXPERT, produce)
 
 
-def build_tensors(ck: Checkpoint) -> list[TensorPlan]:
+def silu_table_bits(path: Path | None = None) -> tuple[np.ndarray, str]:
+    """silu(x) for every bf16 bit pattern, as rec builds it on the GPU with mlx
+    (swiglu(gates, ones) in mlx_lm): mlx's bf16 sigmoid rounds after each of
+    exp, add, divide and subtract, and the GPU flushes bf16 denormals.  The
+    CPU formula below reproduces all but one entry (a GPU exp rounding at
+    x = -6.84375), so the table is generated with mlx when it is installed
+    and stored in the GGUF; the kernel's shared-expert activation reads it."""
+    bits = np.arange(65536, dtype=np.uint32)
+    if path is not None:
+        table = np.load(path)
+        if table.shape != (65536,) or table.dtype != np.uint16:
+            sys.exit("%s is not a uint16[65536] silu table" % path)
+        return table, "rec"
+    try:
+        import mlx.core as mx
+        import mlx.nn as nn
+        gates = mx.array(bits.astype(np.uint16)).view(mx.bfloat16)
+        table = nn.silu(gates) * mx.ones_like(gates)
+        return np.array(table.view(mx.uint16)), "mlx"
+    except ImportError:
+        pass
+    x = (bits << 16).view(np.float32)
+
+    def ftz(f):
+        u = f.view(np.uint32)
+        den = ((u & 0x7F800000) == 0) & ((u & 0x7FFFFF) != 0)
+        out = f.copy()
+        out[den] = np.where(u[den] >> 31, -0.0, 0.0).astype(np.float32)
+        return out
+
+    def bf(f):
+        f = ftz(np.asarray(f, dtype=np.float32))
+        u = f.view(np.uint32)
+        nan = ((u & 0x7F800000) == 0x7F800000) & ((u & 0x7FFFFF) != 0)
+        out = ((u + (((u >> 16) & 1) + 0x7FFF)) >> 16).astype(np.uint16)
+        out[nan] = 0x7FC0
+        return out
+
+    def f32(b):
+        return (b.astype(np.uint32) << 16).view(np.float32)
+
+    xz = ftz(x)
+    with np.errstate(all="ignore"):
+        e = f32(bf(np.exp(np.abs(xz))))
+        tail = f32(bf(1.0 / f32(bf(1.0 + e))))
+        sig = np.where(xz < 0, tail, f32(bf(1.0 - tail))).astype(np.float32)
+        return bf(xz * sig), "cpu"
+
+
+def build_tensors(ck: Checkpoint, silu_path: Path | None = None) -> list[TensorPlan]:
     t: list[TensorPlan] = []
+    silu, silu_source = silu_table_bits(silu_path)
+    silu_bytes = silu.astype("<u2").tobytes()
+    ck.silu_source = silu_source
+    t.append(TensorPlan("flint.silu_table", GGML_BF16, [65536], len(silu_bytes), lambda b=silu_bytes: (b,)))
     t += quant_tensor(ck, "model.embed_tokens", "token_embd", N_VOCAB, N_EMBD, bits=8)
     for il in range(N_LAYER):
         p = "model.layers.%d." % il
@@ -447,6 +500,7 @@ def build_metadata(ck: Checkpoint) -> KV:
     kv.str("%s.expert_pack.layout" % ARCH, ",".join(n for n, _, _ in PACK_LAYOUT))
     kv.arr("%s.expert_pack.offsets" % ARCH, T_U32, PACK_OFFSETS)
     kv.u32("%s.expert_pack.bytes" % ARCH, PACK_BYTES)
+    kv.str("%s.silu_table.source" % ARCH, getattr(ck, "silu_source", "cpu"))
     kv.str("%s.checkpoint.model_id" % ARCH, ck.manifest["model_id"])
     for fname, digest in sorted(ck.manifest["checkpoint_files"].items()):
         kv.str("%s.checkpoint.sha256.%s" % (ARCH, fname), digest)
@@ -653,6 +707,8 @@ def main():
     ap.add_argument("--check-only", action="store_true", help="skip writing; check an existing --out")
     ap.add_argument("--samples", type=int, default=24, help="large tensors sampled by --check")
     ap.add_argument("--verify-shards", action="store_true", help="sha256 the safetensors against rec's manifest first")
+    ap.add_argument("--silu-table", type=Path, default=None,
+                    help="uint16[65536] .npy of rec's silu table (tests/flint/rec_logits.py --dump-silu); default: mlx, then CPU")
     ap.add_argument("--dry-run", action="store_true", help="print the tensor plan and exit")
     args = ap.parse_args()
 
@@ -666,7 +722,7 @@ def main():
     if args.verify_shards:
         verify_shards(ck)
 
-    tensors = build_tensors(ck)
+    tensors = build_tensors(ck, args.silu_table)
     total = sum(t.nbytes for t in tensors)
     print("source %s: %d tensors in %d shards, %.3f GB of weights" % (src, len(ck.info), len(ck.shards), total / 1e9),
           file=sys.stderr)

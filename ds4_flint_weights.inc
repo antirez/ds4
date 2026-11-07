@@ -24,6 +24,9 @@ typedef struct {
 static flint_layer_aux g_flint_layer_aux[DS4_MAX_LAYER];
 static flint_quant_aux g_flint_token_embd_aux;
 static flint_quant_aux g_flint_output_aux;
+/* 65536 bf16 silu values written by the converter (optional; the engine
+ * computes them when absent, with one entry off by a GPU exp rounding). */
+static ds4_tensor *g_flint_silu_table;
 
 static ds4_tensor *flint_tensor(const ds4_model *m, bool required, const char *fmt, ...) {
     char name[160];
@@ -59,6 +62,7 @@ static void weights_bind_flint_output(ds4_weights *w, const ds4_model *m, bool r
         w->output_norm = flint_tensor(m, required, "output_norm.weight");
         flint_bind_quant(m, required, "output", &w->output, &g_flint_output_aux);
     }
+    g_flint_silu_table = model_find_tensor(m, "flint.silu_table");
     if (optional && (w->output_norm || w->output) && !(w->output_norm && w->output)) {
         ds4_die("partial output head in GGUF");
     }
@@ -126,6 +130,7 @@ static void weights_validate_flint_layout(const ds4_weights *w, uint32_t layer_s
         flint_expect_quant(w->token_embd, &g_flint_token_embd_aux, DS4_TENSOR_FLINT_U8, DS4_N_EMBD, DS4_N_VOCAB);
     }
     if (require_output && !(w->output_norm && w->output)) ds4_die("required output head tensors are missing");
+    if (g_flint_silu_table) tensor_expect_layout(g_flint_silu_table, DS4_TENSOR_BF16, 1, 65536u, 0, 0);
     if (w->output_norm) tensor_expect_layout(w->output_norm, DS4_TENSOR_BF16, 1, DS4_N_EMBD, 0, 0);
     if (w->output) {
         flint_expect_quant(w->output, &g_flint_output_aux, DS4_TENSOR_FLINT_U4, DS4_N_EMBD, DS4_N_VOCAB);

@@ -62,6 +62,8 @@ def main():
     ap.add_argument("--steps", type=int, default=8)
     ap.add_argument("--context", type=int, default=8192)
     ap.add_argument("--dump-kv", action="store_true")
+    ap.add_argument("--dump-silu", type=Path, default=None,
+                    help="also save rec's 65536-entry bf16 silu table (uint16 .npy) for the converter")
     ap.add_argument("--out", type=Path, required=True)
     args = ap.parse_args()
 
@@ -85,6 +87,10 @@ def main():
     engine = Engine(src, src / "flint-int4.json", context_limit=args.context)
     print("engine loaded in %.1fs (device profile %s)" % (time.time() - t0, engine.startup["device_profile"]),
           file=sys.stderr)
+
+    if args.dump_silu is not None:
+        np.save(args.dump_silu, np.array(engine.runtime.silu.view(mx.uint16)))
+        print("wrote silu table %s" % args.dump_silu, file=sys.stderr)
 
     if args.text is not None:
         ids = engine.tokenizer.encode(args.text, add_special_tokens=False)
