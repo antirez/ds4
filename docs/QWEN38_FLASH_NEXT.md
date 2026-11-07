@@ -235,8 +235,12 @@ otherwise unchanged. A failed read behaves as on the ordinary path: the call
 fails, the cached and shared slots are computed, the missing slots stay
 untouched (their address entries are zero and the kernels skip them), the
 layer's entries are dropped and a retry is exact. The released experts'
-cache slots are marked in flight until the next layer's ids arrive, which
-in queue order means their kernels have finished. `DS4_QWEN4_STREAM_HANDSHAKE=0`
+cache slots are marked in flight; when the next layer's ids arrive, the
+buffer that published them and everything before it have finished, so the
+marks up to that buffer are retired before the load. If the device will not
+grant the budget's slabs, or the loader places an expert in an explicit
+buffer the encoded kernels cannot see, the handshake switches itself off with
+one message and the ordinary path serves every layer. `DS4_QWEN4_STREAM_HANDSHAKE=0`
 keeps the ordinary path; `DS4_QWEN4_STREAM_HANDSHAKE_PROFILE=1` prints the
 CPU wait and service time per layer. MTP verification steps (two or three
 tokens), Q4_K gate/up rows and a cache budget below the slot count keep the

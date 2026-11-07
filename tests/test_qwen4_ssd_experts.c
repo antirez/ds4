@@ -7,6 +7,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
+#include <strings.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -51,8 +53,16 @@ static struct { uint64_t layers, failed; } hs_probe;
  * rows take the grouped expert tables, and the diagnostics that disable the
  * early load or the slabs keep the ordinary path. Budgets here cover S. */
 static int handshake_expected(uint32_t T, uint32_t gate_type) {
+    /* Same reading as the engine's env parser: trimmed, case-insensitive. */
     const char *hs = getenv("DS4_QWEN4_STREAM_HANDSHAKE");
-    const int off = hs && (!strcmp(hs, "0") || !strcmp(hs, "false") || !strcmp(hs, "no") || !strcmp(hs, "off"));
+    char v[16] = "";
+    if (hs) {
+        while (isspace((unsigned char)*hs)) hs++;
+        size_t n = strlen(hs);
+        while (n > 0 && isspace((unsigned char)hs[n - 1])) n--;
+        snprintf(v, sizeof(v), "%.*s", (int)(n < sizeof(v) - 1 ? n : sizeof(v) - 1), hs);
+    }
+    const int off = !strcasecmp(v, "0") || !strcasecmp(v, "false") || !strcasecmp(v, "no") || !strcasecmp(v, "off");
     return T == 1 && gate_type != 12 && !off &&
            !getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_EARLY_LOAD") &&
            !getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_SLABS") &&

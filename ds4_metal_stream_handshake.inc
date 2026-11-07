@@ -22,12 +22,17 @@
  * - The expert kernels reach the cache only through the address table and
  *   the slab buffers, which are all made resident at encode time; the
  *   handshake first allocates every slab of the cache budget.
- * - When the CPU sees layer l's ids the GPU has finished everything that
- *   router(l) depends on, including layer l - 1's experts, so earlier layers'
- *   experts can be evicted; layer l's own experts are protected by its load.
- *   Handshake layers mark no entries in flight, and the first handshake layer
- *   after an ordinary one drains once, so no load ever waits for in-flight
- *   GPU work (which would wait on the GPU that waits on the CPU).
+ * - A layer's released experts are marked in flight with their command
+ *   buffer's sequence. When the CPU sees layer l's ids, the buffer that
+ *   signalled them and, in queue order, every buffer before it have
+ *   completed, so the service retires all sequences up to that buffer before
+ *   it loads. No load therefore waits for in-flight GPU work, which would
+ *   wait on the buffer parked at the release. Layer l's own experts are
+ *   protected by its load and then by their mark.
+ * - Anything the handshake cannot serve, such as a slab budget the device
+ *   will not grant or an expert the loader could only place in an explicit
+ *   buffer, switches it off for the process with one message; the ordinary
+ *   path then serves every layer.
  * - Failure is reported like the ordinary path's: the call returns 0 with the
  *   batch still open, the cached and shared slots computed, the missing slots
  *   untouched (their address entries stay zero and the kernels skip them),
@@ -39,8 +44,7 @@ static id<MTLSharedEvent> g_qwen4_hs_arrival;  /* GPU -> CPU: the ids are in mem
 static id<MTLSharedEvent> g_qwen4_hs_release;  /* CPU -> GPU: the experts are bound */
 static uint64_t g_qwen4_hs_arrival_value, g_qwen4_hs_release_value;
 static id<MTLBuffer> g_qwen4_hs_ids;           /* shared copy of the router's ids */
-static int g_qwen4_hs_dirty = 1;               /* an ordinary layer ran since the last drain */
-static uint64_t g_qwen4_hs_inflight_seq;       /* batch of the last layer's released experts */
+static const char *g_qwen4_hs_off;             /* why the handshake switched itself off */
 static struct { uint64_t layers; double wait_ms, service_ms; } g_qwen4_hs_stats;
 
 static void qwen4_handshake_report(void) {
@@ -62,8 +66,13 @@ static void qwen4_stream_handshake_reset(void) {
     g_qwen4_hs_arrival = nil;
     g_qwen4_hs_release = nil;
     g_qwen4_hs_ids = nil;
-    g_qwen4_hs_dirty = 1;
-    g_qwen4_hs_inflight_seq = 0;
+    g_qwen4_hs_off = NULL;
+}
+
+static void qwen4_handshake_switch_off(const char *why) {
+    if (g_qwen4_hs_off) return;
+    g_qwen4_hs_off = why;
+    fprintf(stderr, "ds4: Qwen decode handshake off: %s; streamed layers take the ordinary path\n", why);
 }
 
 /* Allocates the rest of the expert cache's slabs. Kernels encoded before a
@@ -151,16 +160,16 @@ static int qwen4_handshake_finish_load(void) {
  * one selected load, like the ordinary path. entry[] receives the layer's
  * cache entries. The release is signalled on every exit. */
 static int qwen4_handshake_service(const ds4_gpu_stream_expert_table *t, uint32_t n_slots, uint64_t arrival,
-                                   ds4_gpu_stream_expert_cache_entry **entry, uint32_t *n_entries) {
+                                   uint64_t router_seq, ds4_gpu_stream_expert_cache_entry **entry,
+                                   uint32_t *n_entries) {
     const double t0 = ds4_gpu_now_ms();
     int ok = [g_qwen4_hs_arrival waitUntilSignaledValue:arrival timeoutMS:60000];
     const double t1 = ds4_gpu_now_ms();
     g_qwen4_hs_stats.wait_ms += t1 - t0;
     if (!ok) fprintf(stderr, "ds4: timeout waiting for the Qwen router's expert ids\n");
-    /* The arrival follows the previous handshake layer's experts in queue
-     * order, so that layer's entries are free before this load may evict. */
-    if (ok && g_qwen4_hs_inflight_seq > g_stream_expert_cache_done_seq)
-        g_stream_expert_cache_done_seq = g_qwen4_hs_inflight_seq;
+    /* The router's buffer and every buffer before it have completed, so
+     * their in-flight marks are retired before this load may evict. */
+    if (ok && router_seq > g_stream_expert_cache_done_seq) g_stream_expert_cache_done_seq = router_seq;
 
     const int32_t *ids = (const int32_t *)[g_qwen4_hs_ids contents];
     int32_t unique[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
@@ -181,6 +190,8 @@ static int qwen4_handshake_service(const ds4_gpu_stream_expert_table *t, uint32_
     for (uint32_t i = 0; ok && i < n_unique; i++) {
         const uint32_t e = (uint32_t)unique[i];
         entry[i] = &g_stream_expert_cache[t->layer][e];
+        if (entry[i]->valid && !entry[i]->slab_backed)
+            qwen4_handshake_switch_off("an expert was loaded into an explicit buffer the kernels cannot see");
         ok = entry[i]->valid && entry[i]->slab_backed &&
              ds4_gpu_stream_expert_cache_set_addr_slot_raw(t->layer, e,
                  entry[i]->gate_buffer, entry[i]->gate_inner, entry[i]->up_buffer, entry[i]->up_inner,
@@ -195,7 +206,9 @@ static int qwen4_handshake_service(const ds4_gpu_stream_expert_table *t, uint32_
         (void)ds4_gpu_synchronize();
         ds4_gpu_stream_expert_cache_clear_layer(t->layer);
     }
-    g_qwen4_hs_stats.service_ms += ds4_gpu_now_ms() - t1;
+    const double service_ms = ds4_gpu_now_ms() - t1;
+    g_qwen4_hs_stats.service_ms += service_ms;
+    ds4_gpu_stream_expert_timing_note_selected(t1 - t0, 0.0, service_ms);
     return ok;
 }
 
@@ -211,17 +224,19 @@ static int qwen4_stream_handshake_layer(
         uint32_t shared_type, uint32_t shared_down_type) {
     const uint32_t budget = ds4_gpu_stream_expert_cache_configured_budget();
     /* Q4_K gate/up rows take the grouped expert tables, not the address table. */
-    if (!qwen4_stream_handshake_enabled() || !had_batch || !g_batch_cb || n_tokens != 1u ||
+    if (g_qwen4_hs_off || !qwen4_stream_handshake_enabled() || !had_batch || !g_batch_cb || n_tokens != 1u ||
         n_slots > DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED || gate_type == 12u ||
         !ds4_gpu_stream_expert_slab_enabled() ||
         !ds4_gpu_stream_expert_cache_note_expert_size(table->gate_expert_bytes, table->down_expert_bytes) ||
-        (g_stream_expert_cache_slab_total_slots < budget &&
-         !qwen4_handshake_reserve_slabs(table->gate_expert_bytes, table->down_expert_bytes)) ||
-        budget < n_slots || g_stream_expert_cache_slab_count == 0 ||
-        ds4_gpu_stream_expert_cache_effective_cap(table->layer, table->n_total_expert, n_slots) == 0) {
-        g_qwen4_hs_dirty = 1;
+        budget < n_slots ||
+        ds4_gpu_stream_expert_cache_effective_cap(table->layer, table->n_total_expert, n_slots) == 0)
+        return 0;
+    if (g_stream_expert_cache_slab_total_slots < budget &&
+        !qwen4_handshake_reserve_slabs(table->gate_expert_bytes, table->down_expert_bytes)) {
+        qwen4_handshake_switch_off("the device did not grant the expert cache budget's slabs");
         return 0;
     }
+    if (g_stream_expert_cache_slab_count == 0) return 0;
     if (!g_qwen4_hs_release) {
         g_qwen4_hs_arrival = [g_device newSharedEvent];
         g_qwen4_hs_release = [g_device newSharedEvent];
@@ -233,15 +248,11 @@ static int qwen4_stream_handshake_layer(
         }
         g_qwen4_hs_arrival_value = g_qwen4_hs_arrival.signaledValue;
         g_qwen4_hs_release_value = g_qwen4_hs_release.signaledValue;
-        if (getenv("DS4_QWEN4_STREAM_HANDSHAKE_PROFILE")) atexit(qwen4_handshake_report);
-    }
-    if (g_qwen4_hs_dirty) {
-        /* Join ordinary layers' in-flight experts before any handshake load. */
-        if (!ds4_gpu_synchronize() || (!g_batch_cb && !ds4_gpu_begin_commands())) {
-            *ok = 0;
-            return 1;
+        static int report_registered;
+        if (!report_registered && getenv("DS4_QWEN4_STREAM_HANDSHAKE_PROFILE")) {
+            report_registered = 1;
+            atexit(qwen4_handshake_report);
         }
-        g_qwen4_hs_dirty = 0;
     }
     if (!ds4_gpu_stream_expert_cache_ensure_addr_buffers(table->layer)) {
         *ok = 0;
@@ -257,6 +268,7 @@ static int qwen4_stream_handshake_layer(
     const uint64_t arrival = ++g_qwen4_hs_arrival_value;
     [g_batch_cb encodeSignalEvent:g_qwen4_hs_arrival value:arrival];
     g_batch_has_work = YES;
+    const uint64_t router_seq = g_stream_expert_cache_batch_seq;
     ds4_gpu_stream_expert_cache_entry *entries[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
     uint32_t n_entries = 0;
     uint64_t experts_seq = 0;
@@ -290,12 +302,11 @@ static int qwen4_stream_handshake_layer(
         ds4_gpu_commit_batch_commands();
     }
     /* The GPU now waits for the release; service whatever happened above. */
-    if (!qwen4_handshake_service(table, n_slots, arrival, entries, &n_entries)) *ok = 0;
+    if (!qwen4_handshake_service(table, n_slots, arrival, router_seq, entries, &n_entries)) *ok = 0;
     /* Like the ordinary path, return with the caller's batch open. */
     if (!g_batch_cb && !ds4_gpu_begin_commands()) *ok = 0;
     /* The released kernels read these slots until their buffer completes. */
     for (uint32_t i = 0; *ok && i < n_entries; i++) entries[i]->inflight_seq = experts_seq;
-    if (*ok && n_entries) g_qwen4_hs_inflight_seq = experts_seq;
 #ifdef DS4_TEST_QWEN4_HANDSHAKE
     DS4_TEST_QWEN4_HANDSHAKE(*ok);
 #endif
