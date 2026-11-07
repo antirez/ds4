@@ -20,7 +20,7 @@ small. They are the Bonsai fork's rules (branch `bonsai2`), applied here.
 | `ds4_metal_internal.h` | trampolines exposing `ds4_metal.m` statics to out-of-tree kernel files (identical to `bonsai2`'s) |
 | `fork.mk` | build rules and fork test targets (included from `Makefile`) |
 | `gguf-tools/flint_int4_to_gguf.py`, `gguf-tools/gen_flint_unicode.py` | rec's INT4 checkpoint to GGUF; the pre-tokenizer's Unicode class tables (`ds4_flint_unicode.inc`) |
-| `tests/flint/` | `check_tokenizer.py` (parity with HF tokenizers; needs the `tokenizers` package), later kernel tests, trace comparison, golden reference, reference checker |
+| `tests/flint/` | `check_tokenizer.py` (parity with HF tokenizers; needs the `tokenizers` package), `collect_golden.py` + `golden.json` (from `rec serve`), `rec_logits.py` (logits, traces and KV from rec's runtime; re-execs itself in `~/.local/share/rec/runtimes/<sha>/python`), later kernel tests, trace comparison, reference checker |
 | `.github/workflows/flint.yml` | build, warning check, model-free tests |
 | `docs/RECURSIVE_FLINT.md`, this file | |
 
@@ -46,6 +46,7 @@ each later step adds; this table tracks what is in the tree.
 | | `#include "ds4_flint_model.inc"` before `config_validate_model`, plus its `flint` arch dispatch |
 | | `ds4_engine_open_internal`: `flint_engine_supported` gate after `config_validate_model` |
 | | `gguf_types[143..145]` and `DS4_TENSOR_FLINT_U4/U8/PACK` |
+| | `#include "ds4_flint_weights.inc"` before `weights_have_output_head`; first-line redirects in `weights_have_output_head`, `weights_have_partial_output_head`, `weights_layer_has_required`, `weights_validate_layout`, `weights_bind_output`, `weights_bind_layer` |
 | | `#include "ds4_flint_tokenizer.inc"` before `bpe_tokenize_text`, plus its first-line dispatch; `flint_vocab_setup` branch at the top of the family section of `vocab_load`; first-line redirect of `special_token_at` to `flint_special_token_at` (HF matches every added token literally, including the reserved ones) |
 | `ds4.h` | `ds4_engine_is_flint()` |
 | `ds4_metal.m` | include of `ds4_metal_internal.h`, fork sources appended to `required_sources`, trampoline block at the end |

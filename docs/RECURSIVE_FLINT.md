@@ -39,7 +39,7 @@ rec reports more than 125 tok/s averaged over a 128K-token session.
 
 | Step | State |
 |---|---|
-| 0. Scaffolding: fork files from `bonsai2`; converter from rec's checkpoint (rec's tensor layout, per-expert packs); shape, loader, tokenizer, server id | family `DS4_MODEL_FAMILY_FLINT` scaffolded; converter done (22.574 GB, every tensor byte-identical, nibble layout confirmed against `mx.dequantize`); tokenizer bit-identical to HF tokenizers on 1069 cases; open: weight binding and descriptor table, `golden.json`, `rec_logits.py` |
+| 0. Scaffolding: fork files from `bonsai2`; converter from rec's checkpoint (rec's tensor layout, per-expert packs); shape, loader, tokenizer, server id | **done 2026-11-07.** Family `DS4_MODEL_FAMILY_FLINT = 200` / variant 202 with fork scaffolding; converter writes 22.574 GB in 56 s, `--check-all` byte-identical on all 1375 tensors and the nibble layout confirmed against `mx.dequantize`; `--inspect` opens, binds and validates the GGUF; tokenizer bit-identical to HF tokenizers on 1069 cases; `golden.json` has 8 rec cases (incl. a 20277-token story; rec decodes ~120 tok/s, prefill ~550 tok/s on the M4 Pro); `rec_logits.py` dumps prefill and per-step logits, 50×2048 bf16 traces and per-layer KV from rec's runtime (loads in 10 s). Descriptor and address tables move to step 1 with the kernel. |
 | 1. Decode megakernel ported: per-layer residual trace bit-identical to rec on identical KV; one token per launch, CPU sampling | open |
 | 2. Prefill (chunked, window attention, sorted-expert GEMM), sessions, live KV reuse, disk checkpoints; golden cases within rec's spread | open |
 | 3. Measure against rec: decode at 4K/32K/128K, prefill, launch overhead; decide on 8-token resident blocks | open |
