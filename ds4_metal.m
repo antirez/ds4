@@ -11954,11 +11954,13 @@ int ds4_gpu_synchronize(void) {
 static void qwen4_nax_release_scratch(void);
 static void qwen4_batch_release_scratch(void);
 
+static void qwen4_stream_handshake_reset(void);  /* ds4_metal_stream_handshake.inc */
 void ds4_gpu_cleanup(void) {
     if (!g_initialized) return;
     ds4_gpu_queue_keepalive_stop_thread();
 
     @autoreleasepool {
+        qwen4_stream_handshake_reset();
         ds4_gpu_decode_pipeline_fast_cache_reset();
         ds4_gpu_parallel_ffn_reset_state(YES);
         if (g_batch_cb) {
@@ -52761,7 +52763,7 @@ int ds4_gpu_qwen4_moe_down_tensor(
     const uint64_t experts_bytes = expert_bytes * n_total_expert;
     const uint64_t shared_bytes = (uint64_t)sh_row_bytes * out_dim;
     qwen4_moe_args args = { n_tokens, n_slots, ff_dim, out_dim, weight_type, row_bytes, expert_bytes,
-                            has_shared ? 1u : 0u, has_shared ? shared_type : 0u, sh_row_bytes, 0u,
+                            has_shared ? 1u : 0u, has_shared ? shared_type : 0u, sh_row_bytes, n_total_expert,
                             {0}, 0u, 0u, 0u };
     qwen4_bind b[5];
     if (n_tokens == 0 || n_slots == 0 || row_bytes == 0 || (ff_dim % 32u) != 0 ||
@@ -53652,6 +53654,9 @@ static int qwen4_stream_missing_gate_up_ready(
     return ok;
 }
 
+#include "ds4_metal_stream_overlap.inc"
+#include "ds4_metal_stream_handshake.inc"
+
 int ds4_gpu_qwen4_moe_stream_tensor(
         ds4_gpu_tensor *mid, ds4_gpu_tensor *part, const ds4_gpu_tensor *x,
         const ds4_gpu_tensor *selected, const ds4_gpu_tensor *lists, const ds4_gpu_tensor *counts,
@@ -53712,6 +53717,10 @@ int ds4_gpu_qwen4_moe_stream_tensor(
         }
     }
 
+    int handshake_ok = 0;
+    if (!mm && qwen4_stream_handshake_layer(&handshake_ok, g_batch_cb != nil, table, mid, part, x, selected,
+            gate_type, down_type, n_tokens, n_slots, in_dim, ff_dim, shared_gate_offset,
+            shared_up_offset, shared_down_offset, shared_type, shared_down_type)) return handshake_ok;
     int32_t *ids = malloc((size_t)n_ids * sizeof(*ids));
     if (!ids) return 0;
     qwen4_moe_half_pass half_pass = {0};
@@ -53876,6 +53885,7 @@ done:
     ds4_gpu_tensor_free(overlap.resident_counts);
     ds4_gpu_tensor_free(overlap.missing_counts);
     free(ids);
+    ok = qwen4_stream_early_commit(ok, had_batch, n_tokens);
     if (!had_batch && g_batch_cb && !ds4_gpu_end_commands()) ok = 0;
     if (had_batch && !g_batch_cb && !ds4_gpu_begin_commands()) ok = 0;
     return ok;

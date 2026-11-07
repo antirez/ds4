@@ -2725,6 +2725,16 @@ static inline device const char *qwen4_expert_base(device const char *base,
     }
     return base + (uint64_t)expert * bytes;
 }
+/* Decode rows through the address table: a zero entry (an expert the host
+ * could not load) or an id outside the table computes nothing, so the slot
+ * stays untouched like a missing slot of the ordinary streamed path. */
+static inline device const char *qwen4_expert_rows(device const char *base,
+                                                  uint expert, uint n_expert, uint64_t bytes) {
+    if (is_function_constant_defined(qwen4_expert_addresses) && qwen4_expert_addresses) {
+        return expert < n_expert ? (device const char *)((device const uint64_t *)base)[expert] : 0;
+    }
+    return base + (uint64_t)expert * bytes;
+}
 
 #define QWEN4_MOE_NSG 4
 #define QWEN4_MOE_NR0 2
@@ -2990,8 +3000,9 @@ kernel void kernel_qwen4_moe_mid(
     const uint type = shared ? st : wt;
     const uint row_bytes = shared ? args.shared_row_bytes : args.row_bytes;
     const uint expert = shared ? 0u : (uint)selected[(uint64_t)tok * args.n_slots + slot];
-    device const char *gb = shared ? sh_gate : qwen4_expert_base(gate_base, expert, args.expert_bytes);
-    device const char *ub = shared ? sh_up : qwen4_expert_base(up_base, expert, args.expert_bytes);
+    device const char *gb = shared ? sh_gate : qwen4_expert_rows(gate_base, expert, args.n_total_expert, args.expert_bytes);
+    device const char *ub = shared ? sh_up : qwen4_expert_rows(up_base, expert, args.n_total_expert, args.expert_bytes);
+    if (!gb) return;
     device const float *xt = x + (uint64_t)tok * args.in_dim;
     for (uint r = row0; r < row0 + nr && r < args.out_rows; r++) {
         const uint64_t off = (uint64_t)r * row_bytes;
@@ -3125,8 +3136,9 @@ kernel void kernel_qwen4_moe_mid_iq2(
         }
         return;
     }
-    device const char *gb = qwen4_expert_base(gate_base, (uint)expert, args.expert_bytes);
-    device const char *ub = qwen4_expert_base(up_base, (uint)expert, args.expert_bytes);
+    device const char *gb = qwen4_expert_rows(gate_base, (uint)expert, args.n_total_expert, args.expert_bytes);
+    device const char *ub = qwen4_expert_rows(up_base, (uint)expert, args.n_total_expert, args.expert_bytes);
+    if (!gb) return;
     const uint nb = args.in_dim / 256;
     const uint ib32 = tiisg / 4, j = tiisg % 4;
     float sumg[NR] = {0.0f}, sumu[NR] = {0.0f};
@@ -3222,8 +3234,9 @@ kernel void kernel_qwen4_moe_mid_q4k(
         }
         return;
     }
-    device const char *gb = qwen4_expert_base(gate_base, (uint)expert, args.expert_bytes);
-    device const char *ub = qwen4_expert_base(up_base, (uint)expert, args.expert_bytes);
+    device const char *gb = qwen4_expert_rows(gate_base, (uint)expert, args.n_total_expert, args.expert_bytes);
+    device const char *ub = qwen4_expert_rows(up_base, (uint)expert, args.n_total_expert, args.expert_bytes);
+    if (!gb) return;
     const uint nb = args.in_dim / 256;
     const uint group = tiisg / 4, l = (tiisg % 4) * 8;
     const uint shift = (group & 1u) * 4u;
@@ -3454,7 +3467,8 @@ kernel void kernel_qwen4_moe_down(
     const uint row_bytes = shared ? args.shared_row_bytes : args.row_bytes;
     const uint64_t pair = (uint64_t)tok * n_out + slot;
     const uint expert = shared ? 0u : (uint)selected[(uint64_t)tok * args.n_slots + slot];
-    device const char *db = shared ? sh_down : qwen4_expert_base(down_base, expert, args.expert_bytes);
+    device const char *db = shared ? sh_down : qwen4_expert_rows(down_base, expert, args.n_total_expert, args.expert_bytes);
+    if (!db) return;
     device const float *m = mid + pair * args.in_dim;
     for (uint r = row0; r < row0 + nr && r < args.out_rows; r++) {
         const float v = qwen4_row_dot(db + (uint64_t)r * row_bytes, m, type, dim, tiisg);
@@ -3565,8 +3579,9 @@ kernel void kernel_qwen4_moe_down_q2k(
         }
         return;
     }
-    device const char *db = qwen4_expert_base(down_base,
-        (uint)selected[(uint64_t)tok * args.n_slots + slot], args.expert_bytes);
+    device const char *db = qwen4_expert_rows(down_base,
+        (uint)selected[(uint64_t)tok * args.n_slots + slot], args.n_total_expert, args.expert_bytes);
+    if (!db) return;
     const uint group = tiisg / 2u, l = (tiisg % 2u) * 8u;
     const uint q_base = 32u * (group / 8u) + 16u * (group & 1u);
     const uint shift = ((group / 2u) & 3u) * 2u;
@@ -3684,8 +3699,9 @@ kernel void kernel_qwen4_moe_down_mxfp4_pf(
         }
         return;
     }
-    device const char *db = qwen4_expert_base(down_base,
-        (uint)selected[(uint64_t)tok * args.n_slots + slot], args.expert_bytes);
+    device const char *db = qwen4_expert_rows(down_base,
+        (uint)selected[(uint64_t)tok * args.n_slots + slot], args.n_total_expert, args.expert_bytes);
+    if (!db) return;
     const uint ix = tiisg / 8, it = tiisg % 8;
     const uint nb = dim / 32;
     if (pair_rows && nr == 2u) {
