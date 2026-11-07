@@ -9726,11 +9726,8 @@ int ds4_gpu_flush_encoder(void) {
     return 1;
 }
 
-int ds4_gpu_flush_commands(void) {
-    if (!g_initialized && !ds4_gpu_init()) return 0;
-    ds4_gpu_parallel_ffn_reset_state(YES);
-    if (!g_batch_cb) return 0;
-
+/* Commits the open batch without opening its successor. */
+static void ds4_gpu_commit_batch_commands(void) {
     ds4_gpu_close_batch_encoder();
     id<MTLCommandBuffer> cb = g_batch_cb;
     g_batch_cb = nil;
@@ -9738,6 +9735,14 @@ int ds4_gpu_flush_commands(void) {
     [cb commit];
     [g_pending_cbs addObject:cb];
     ds4_gpu_stream_expert_cache_note_batch_committed();
+}
+
+int ds4_gpu_flush_commands(void) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    ds4_gpu_parallel_ffn_reset_state(YES);
+    if (!g_batch_cb) return 0;
+
+    ds4_gpu_commit_batch_commands();
 
     g_batch_cb = ds4_gpu_new_command_buffer();
     g_batch_has_work = NO;

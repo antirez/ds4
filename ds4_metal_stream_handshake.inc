@@ -40,6 +40,7 @@ static id<MTLSharedEvent> g_qwen4_hs_release;  /* CPU -> GPU: the experts are bo
 static uint64_t g_qwen4_hs_arrival_value, g_qwen4_hs_release_value;
 static id<MTLBuffer> g_qwen4_hs_ids;           /* shared copy of the router's ids */
 static int g_qwen4_hs_dirty = 1;               /* an ordinary layer ran since the last drain */
+static uint64_t g_qwen4_hs_inflight_seq;       /* batch of the last layer's released experts */
 static struct { uint64_t layers; double wait_ms, service_ms; } g_qwen4_hs_stats;
 
 static void qwen4_handshake_report(void) {
@@ -62,6 +63,7 @@ static void qwen4_stream_handshake_reset(void) {
     g_qwen4_hs_release = nil;
     g_qwen4_hs_ids = nil;
     g_qwen4_hs_dirty = 1;
+    g_qwen4_hs_inflight_seq = 0;
 }
 
 /* Allocates the rest of the expert cache's slabs. Kernels encoded before a
@@ -146,13 +148,19 @@ static int qwen4_handshake_finish_load(void) {
 }
 
 /* Loads and binds the layer's experts once the GPU has published their ids:
- * one selected load, like the ordinary path. */
-static int qwen4_handshake_service(const ds4_gpu_stream_expert_table *t, uint32_t n_slots, uint64_t arrival) {
+ * one selected load, like the ordinary path. entry[] receives the layer's
+ * cache entries. The release is signalled on every exit. */
+static int qwen4_handshake_service(const ds4_gpu_stream_expert_table *t, uint32_t n_slots, uint64_t arrival,
+                                   ds4_gpu_stream_expert_cache_entry **entry, uint32_t *n_entries) {
     const double t0 = ds4_gpu_now_ms();
     int ok = [g_qwen4_hs_arrival waitUntilSignaledValue:arrival timeoutMS:60000];
     const double t1 = ds4_gpu_now_ms();
     g_qwen4_hs_stats.wait_ms += t1 - t0;
     if (!ok) fprintf(stderr, "ds4: timeout waiting for the Qwen router's expert ids\n");
+    /* The arrival follows the previous handshake layer's experts in queue
+     * order, so that layer's entries are free before this load may evict. */
+    if (ok && g_qwen4_hs_inflight_seq > g_stream_expert_cache_done_seq)
+        g_stream_expert_cache_done_seq = g_qwen4_hs_inflight_seq;
 
     const int32_t *ids = (const int32_t *)[g_qwen4_hs_ids contents];
     int32_t unique[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
@@ -162,7 +170,6 @@ static int qwen4_handshake_service(const ds4_gpu_stream_expert_table *t, uint32_
         if (ids[i] < 0 || (uint32_t)ids[i] >= t->n_total_expert) ok = 0;
         else if (frequency[ids[i]]++ == 0) unique[n_unique++] = ids[i];
     }
-    ds4_gpu_stream_expert_cache_entry *entry[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
     if (ok) {
         ds4_gpu_stream_expert_cache_note_token(t->layer);
         ds4_gpu_stream_expert_cache_note_frequency_hotness(t->layer, frequency, t->n_total_expert);
@@ -170,17 +177,16 @@ static int qwen4_handshake_service(const ds4_gpu_stream_expert_table *t, uint32_
         ok = ds4_gpu_stream_expert_cache_begin_selected_load(t, unique, n_unique) &&
              qwen4_handshake_finish_load();
     }
+    /* The loader counted the hits; read the entries as the ordinary path does. */
     for (uint32_t i = 0; ok && i < n_unique; i++) {
-        const uint64_t e = (uint64_t)(uint32_t)unique[i];
-        entry[i] = ds4_gpu_stream_expert_cache_peek(
-            t->model_map, t->model_size, t->layer, (uint32_t)e, t->n_total_expert, n_unique,
-            t->gate_offset + e * t->gate_expert_bytes, t->up_offset + e * t->gate_expert_bytes,
-            t->down_offset + e * t->down_expert_bytes, t->gate_expert_bytes, t->down_expert_bytes);
-        ok = entry[i] && entry[i]->slab_backed &&
-             ds4_gpu_stream_expert_cache_set_addr_slot_raw(t->layer, (uint32_t)e,
+        const uint32_t e = (uint32_t)unique[i];
+        entry[i] = &g_stream_expert_cache[t->layer][e];
+        ok = entry[i]->valid && entry[i]->slab_backed &&
+             ds4_gpu_stream_expert_cache_set_addr_slot_raw(t->layer, e,
                  entry[i]->gate_buffer, entry[i]->gate_inner, entry[i]->up_buffer, entry[i]->up_inner,
                  entry[i]->down_buffer, entry[i]->down_inner);
     }
+    *n_entries = ok ? n_unique : 0;
     g_qwen4_hs_release.signaledValue = g_qwen4_hs_release_value;
     if (!ok) {
         /* As after a failed batch read: the released kernels compute the
@@ -188,7 +194,6 @@ static int qwen4_handshake_service(const ds4_gpu_stream_expert_table *t, uint32_
          * zero), then the layer's entries are dropped so a retry reloads them. */
         (void)ds4_gpu_synchronize();
         ds4_gpu_stream_expert_cache_clear_layer(t->layer);
-        if (!g_batch_cb && !ds4_gpu_begin_commands()) return 0;
     }
     g_qwen4_hs_stats.service_ms += ds4_gpu_now_ms() - t1;
     return ok;
@@ -212,7 +217,7 @@ static int qwen4_stream_handshake_layer(
         !ds4_gpu_stream_expert_cache_note_expert_size(table->gate_expert_bytes, table->down_expert_bytes) ||
         (g_stream_expert_cache_slab_total_slots < budget &&
          !qwen4_handshake_reserve_slabs(table->gate_expert_bytes, table->down_expert_bytes)) ||
-        budget == 0 || g_stream_expert_cache_slab_count == 0 ||
+        budget < n_slots || g_stream_expert_cache_slab_count == 0 ||
         ds4_gpu_stream_expert_cache_effective_cap(table->layer, table->n_total_expert, n_slots) == 0) {
         g_qwen4_hs_dirty = 1;
         return 0;
@@ -252,34 +257,45 @@ static int qwen4_stream_handshake_layer(
     const uint64_t arrival = ++g_qwen4_hs_arrival_value;
     [g_batch_cb encodeSignalEvent:g_qwen4_hs_arrival value:arrival];
     g_batch_has_work = YES;
-    if (!ds4_gpu_flush_commands()) {
-        *ok = 0;
-        return 1;
+    ds4_gpu_stream_expert_cache_entry *entries[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
+    uint32_t n_entries = 0;
+    uint64_t experts_seq = 0;
+    *ok = ds4_gpu_flush_commands();
+    if (*ok) {
+        /* wait release | experts via the address table || commit */
+        [g_batch_cb encodeWaitForEvent:g_qwen4_hs_release value:++g_qwen4_hs_release_value];
+        g_batch_has_work = YES;
+        g_qwen4_hs_stats.layers++;
+        qwen4_stream_weights stream = {
+            .table = table,
+            .gate = g_stream_expert_cache_gate_addr_buffers[table->layer],
+            .up = g_stream_expert_cache_up_addr_buffers[table->layer],
+            .down = g_stream_expert_cache_down_addr_buffers[table->layer],
+            /* Every slab, including ones the cache replaced since the last layer. */
+            .pending = [NSSet setWithObjects:g_stream_expert_cache_slabs count:g_stream_expert_cache_slab_count],
+            .addresses = true,
+        };
+        g_qwen4_stream_weights = &stream;
+        *ok = ds4_gpu_qwen4_moe_mid_tensor(mid, x, selected, table->model_map, table->model_size,
+                table->gate_offset, table->up_offset, gate_type, table->n_total_expert,
+                n_tokens, n_slots, in_dim, ff_dim, shared_gate_offset, shared_up_offset, shared_type) &&
+              ds4_gpu_qwen4_moe_down_tensor(part, mid, selected, table->model_map, table->model_size,
+                table->down_offset, down_type, table->n_total_expert,
+                n_tokens, n_slots, ff_dim, in_dim, shared_down_offset, shared_down_type);
+        g_qwen4_stream_weights = NULL;
+        /* Commit without opening the successor: opening can fail and wait on
+         * this buffer, which parks at the release until the service signals it. */
+        experts_seq = g_stream_expert_cache_batch_seq;
+        ds4_gpu_parallel_ffn_reset_state(YES);
+        ds4_gpu_commit_batch_commands();
     }
-    /* wait release | experts via the address table || commit */
-    [g_batch_cb encodeWaitForEvent:g_qwen4_hs_release value:++g_qwen4_hs_release_value];
-    g_batch_has_work = YES;
-    g_qwen4_hs_stats.layers++;
-    qwen4_stream_weights stream = {
-        .table = table,
-        .gate = g_stream_expert_cache_gate_addr_buffers[table->layer],
-        .up = g_stream_expert_cache_up_addr_buffers[table->layer],
-        .down = g_stream_expert_cache_down_addr_buffers[table->layer],
-        /* Every slab, including ones the cache replaced since the last layer. */
-        .pending = [NSSet setWithObjects:g_stream_expert_cache_slabs count:g_stream_expert_cache_slab_count],
-        .addresses = true,
-    };
-    g_qwen4_stream_weights = &stream;
-    *ok = ds4_gpu_qwen4_moe_mid_tensor(mid, x, selected, table->model_map, table->model_size,
-            table->gate_offset, table->up_offset, gate_type, table->n_total_expert,
-            n_tokens, n_slots, in_dim, ff_dim, shared_gate_offset, shared_up_offset, shared_type) &&
-          ds4_gpu_qwen4_moe_down_tensor(part, mid, selected, table->model_map, table->model_size,
-            table->down_offset, down_type, table->n_total_expert,
-            n_tokens, n_slots, ff_dim, in_dim, shared_down_offset, shared_down_type) &&
-          ds4_gpu_flush_commands();
-    g_qwen4_stream_weights = NULL;
     /* The GPU now waits for the release; service whatever happened above. */
-    if (!qwen4_handshake_service(table, n_slots, arrival)) *ok = 0;
+    if (!qwen4_handshake_service(table, n_slots, arrival, entries, &n_entries)) *ok = 0;
+    /* Like the ordinary path, return with the caller's batch open. */
+    if (!g_batch_cb && !ds4_gpu_begin_commands()) *ok = 0;
+    /* The released kernels read these slots until their buffer completes. */
+    for (uint32_t i = 0; *ok && i < n_entries; i++) entries[i]->inflight_seq = experts_seq;
+    if (*ok && n_entries) g_qwen4_hs_inflight_seq = experts_seq;
 #ifdef DS4_TEST_QWEN4_HANDSHAKE
     DS4_TEST_QWEN4_HANDSHAKE(*ok);
 #endif

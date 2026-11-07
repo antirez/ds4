@@ -47,6 +47,17 @@ static void need(int ok, const char *what) {
 /* Single-token streamed rows take the decode handshake; count its layers
  * and failures so parity cannot pass with the path never selected. */
 static struct { uint64_t layers, failed; } hs_probe;
+/* Whether a streamed single-token call takes the handshake: Q4_K gate/up
+ * rows take the grouped expert tables, and the diagnostics that disable the
+ * early load or the slabs keep the ordinary path. Budgets here cover S. */
+static int handshake_expected(uint32_t T, uint32_t gate_type) {
+    const char *hs = getenv("DS4_QWEN4_STREAM_HANDSHAKE");
+    const int off = hs && (!strcmp(hs, "0") || !strcmp(hs, "false") || !strcmp(hs, "no") || !strcmp(hs, "off"));
+    return T == 1 && gate_type != 12 && !off &&
+           !getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_EARLY_LOAD") &&
+           !getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_SLABS") &&
+           !getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_COMBINED_BUFFER");
+}
 void ds4_test_qwen4_handshake(int ok) { hs_probe.layers++; hs_probe.failed += !ok; }
 
 /* Check dispatch decisions as well as outputs: parity alone also passes
@@ -378,8 +389,7 @@ static void check_case_impl(const weights *w, uint32_t T, unsigned route, int go
         check_mm_lists(ids, T, route, routing_reference[0], routing_reference[1]);
     }
     ds4_gpu_qwen4_set_verify_rows_exact(T == 3);
-    /* Q4_K gate/up rows take the grouped expert tables, not the handshake. */
-    const int handshake = T == 1 && w->gate_type != 12;
+    const int handshake = handshake_expected(T, w->gate_type);
     uint64_t hs_layers = hs_probe.layers, hs_failed = hs_probe.failed;
     if (w->gate_type == 16 && T == 1 && route == 0) {
         /* The handshake learns the ids after encoding, so only the ordinary
@@ -614,7 +624,7 @@ static void check_split_one(const weights *w, uint32_t T, uint32_t slots, int sh
     ds4_gpu_set_streaming_expert_cache_budget(budget);
     ds4_gpu_set_streaming_expert_cache_expert_bytes(2 * w->table.gate_expert_bytes + w->table.down_expert_bytes);
     need(ds4_gpu_set_model_fd(good_fd), "split source fd");
-    const int handshake = T == 1 && w->gate_type != 12;
+    const int handshake = handshake_expected(T, w->gate_type);
     uint64_t hs_layers = hs_probe.layers, hs_failed = hs_probe.failed;
     if (seed_count) need(ds4_gpu_stream_expert_cache_seed_experts(&w->table, seeds, NULL, seed_count), "split cache seed");
     need(ds4_gpu_stream_expert_cache_current_count() == seed_count, "split exact initial cache");
