@@ -39,7 +39,7 @@ rec reports more than 125 tok/s averaged over a 128K-token session.
 
 | Step | State |
 |---|---|
-| 0. Scaffolding: fork files from `bonsai2`; converter from rec's checkpoint (rec's tensor layout, per-expert packs); shape, loader, tokenizer, server id | family decided: new family `DS4_MODEL_FAMILY_FLINT` (see Design); rest open |
+| 0. Scaffolding: fork files from `bonsai2`; converter from rec's checkpoint (rec's tensor layout, per-expert packs); shape, loader, tokenizer, server id | family `DS4_MODEL_FAMILY_FLINT` scaffolded; converter done (22.574 GB, every tensor byte-identical, nibble layout confirmed against `mx.dequantize`); tokenizer bit-identical to HF tokenizers on 1069 cases; open: weight binding and descriptor table, `golden.json`, `rec_logits.py` |
 | 1. Decode megakernel ported: per-layer residual trace bit-identical to rec on identical KV; one token per launch, CPU sampling | open |
 | 2. Prefill (chunked, window attention, sorted-expert GEMM), sessions, live KV reuse, disk checkpoints; golden cases within rec's spread | open |
 | 3. Measure against rec: decode at 4K/32K/128K, prefill, launch overhead; decide on 8-token resident blocks | open |
