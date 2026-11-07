@@ -265,7 +265,7 @@ Bonsai 2 and the 27B run as variants of the Qwen3.8 family because their
 layer geometry matches it. Flint shares no layer type with any ds4 family.
 Two options:
 
-1. **Qwen3.8-family variant** (`DS4_VARIANT_FLINT = 201`, Bonsai's pattern):
+1. **Qwen3.8-family variant** (`DS4_VARIANT_FLINT = 202`; 200 and 201 are Bonsai 2 and the 27B):
    known contact points (about 45 lines in `ds4.c`), sessions, disk KV,
    server and the SSD-streaming engine plumbing (`--ssd-streaming`, cache
    budget options, the expert cache structure) come along. Risk: the shared
