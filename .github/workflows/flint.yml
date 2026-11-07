@@ -1,0 +1,29 @@
+# Fork CI (Recursive Flint).  Upstream ds4 has no workflows, so this file
+# never conflicts on upstream merges.  Model-backed checks need the 22.6 GB
+# GGUF, rec and real Metal and are run locally per docs/FORK_MAINTAINING.md.
+name: flint
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-test:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (no new warnings)
+        run: |
+          make -j"$(sysctl -n hw.ncpu)" 2>&1 | tee build.log
+          # ds4_metal.m carries two known upstream warnings; anything else fails.
+          if grep -E "warning:" build.log | grep -vE "metal4_disabled|ds4_gpu_compile_tensor_probe"; then
+            exit 1
+          fi
+      - name: Model-free tests
+        run: |
+          make ds4_test ds4_agent_test
+          ./ds4_test --server
+          ./ds4_agent_test
+      - name: CPU build
+        run: make clean && make cpu

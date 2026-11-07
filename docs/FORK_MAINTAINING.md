@@ -1,0 +1,112 @@
+# Maintaining the Flint fork
+
+[Recursive Flint](RECURSIVE_FLINT.md)
+
+This repository is a long-lived community fork of
+[antirez/ds4](https://github.com/antirez/ds4) that adds Recursive Flint as
+its own model family. The rules below keep the cost of following upstream
+small. They are the Bonsai fork's rules (branch `bonsai2`), applied here.
+
+## Layout rule: fork code lives in fork-owned files
+
+| File | Contents |
+|---|---|
+| `ds4_flint_shape.inc` | `DS4_SHAPE_FLINT`, `ds4_model_is_flint()`, the global-layer mask, Flint-only constants |
+| `ds4_flint_model.inc` | GGUF metadata validation, engine gate, `ds4_engine_is_flint()`; later weight binding, layout checks, the per-layer descriptor table |
+| `ds4_flint.inc` | graph, KV cache (rings and banks), payload spans, streaming orchestration (step 1 onwards) |
+| `ds4_flint_session.inc` | session driver: create, free, prefill, decode, payload save/load, rewind (needs `struct ds4_session`, so it is included later than the graph) |
+| `ds4_flint_gpu.h`, `ds4_metal_flint.m`, `metal/flint.metal` | kernel API, wrappers, the ported megakernel and prefill kernels (Apache 2.0 notice for rec's shader code) |
+| `ds4_flint_tokenizer.inc`, `ds4_server_flint.inc` | pre-tokenizer; chat template, tool syntax |
+| `ds4_metal_internal.h` | trampolines exposing `ds4_metal.m` statics to out-of-tree kernel files (identical to `bonsai2`'s) |
+| `fork.mk` | build rules and fork test targets (included from `Makefile`) |
+| `gguf-tools/flint_int4_to_gguf.py` | rec's INT4 checkpoint to GGUF |
+| `tests/flint/` | kernel tests, trace comparison, golden reference, reference checker |
+| `.github/workflows/flint.yml` | build, warning check, model-free tests |
+| `docs/RECURSIVE_FLINT.md`, this file | |
+
+Upstream files get only **contact points**: one- to three-line hooks that
+include or dispatch into the files above. When new Flint code is needed, put
+it in a fork file and add a hook. Never edit shared logic inline. Because
+Flint is its own family, a hook is almost always a first-line
+`if (ds4_model_is_flint()) return flint_...(...)`: no Flint code runs inside
+another family's driver.
+
+## Contact points
+
+Check this list after every upstream merge (`git diff upstream/main -- <file>`).
+If a hook's surrounding function was refactored upstream, re-place the hook.
+Don't fork the refactored code. The plan's Design section lists the sites
+each later step adds; this table tracks what is in the tree.
+
+| File | Hook |
+|---|---|
+| `Makefile` | `include fork.mk` after the platform `CORE_OBJS` lists |
+| `ds4.c` | `DS4_MODEL_FAMILY_FLINT = 200` and `DS4_VARIANT_FLINT = 202`. Fork families and variants start at 200 so they never collide with upstream additions or share a KV-cache model id (200 and 201 are other fork branches' variants). |
+| | `#include "ds4_flint_shape.inc"` after `ds4_qwen4_layer_is_nextn` |
+| | `#include "ds4_flint_model.inc"` before `config_validate_model`, plus its `flint` arch dispatch |
+| | `ds4_engine_open_internal`: `flint_engine_supported` gate after `config_validate_model` |
+| `ds4.h` | `ds4_engine_is_flint()` |
+| `ds4_metal.m` | include of `ds4_metal_internal.h`, fork sources appended to `required_sources`, trampoline block at the end |
+| `ds4_server.c` | model id `flint` in `server_model_id_from_engine`, aliases `flint` and `recursive/flint` in `server_model_alias_known`, `send_models` |
+
+## Coupling to upstream code
+
+Flint reuses these upstream pieces unchanged. An upstream change to any of
+them can break Flint silently: it still compiles, but produces wrong tokens
+or wrong streaming behaviour.
+
+- The GGUF reader and tensor types (`gguf_types`, `tensor_data`, the mmap).
+- The session and checkpoint containers (`struct ds4_session`, the
+  checkpoint token vector, `ds4_session_rewind` semantics, the KV disk store
+  payload framing in `ds4_kvstore.c`).
+- `ds4_ssd.c` budgets and locks, the Metal expert cache entries
+  (`ds4_gpu_stream_expert_cache_*`), the `pread` task runner and
+  `ds4_gpu_buffer_address`.
+- The tokenizer core (BPE merges, special-token matching) under
+  `bpe_tokenize_text_flint`.
+- The trampolines in `ds4_metal_internal.h`: `ds4_metal_matmul_f16_buffer`
+  copies the n_tok > 8 branch of `ds4_gpu_matmul_f16_tensor_impl`; if
+  upstream changes that branch, update the copy.
+
+The model-backed checks in `docs/RECURSIVE_FLINT.md` (trace comparison
+against rec, golden check, streamed-equals-resident) catch all of these, so
+run them after every merge once they exist.
+
+## Upstream sync procedure
+
+```sh
+git fetch upstream
+git switch recursive-flint
+git merge upstream/main          # merge, never rebase: rerere and history stay usable
+make
+make ds4_test ds4_agent_test && ./ds4_test --server && ./ds4_agent_test
+# model-backed checks per docs/RECURSIVE_FLINT.md once steps 1 and 2 land
+git push origin recursive-flint
+```
+
+`rerere.enabled` is set in this clone. Recorded conflict resolutions in
+contact points are replayed on later merges. Set it in new clones with
+`git config rerere.enabled true`.
+
+## Release checks
+
+1. Build with no new warnings (CI enforces this), `./ds4_test --server`,
+   `./ds4_agent_test`.
+2. The verification gates of `docs/RECURSIVE_FLINT.md`: trace comparison
+   against rec, the golden check, streamed output identical to resident.
+3. Speed, back to back with rec (never both processes at once), on AC power
+   in High Power Mode with no other model process on the GPU.
+4. A server smoke test covering `/v1/models`, a chat with reasoning, a tool
+   call, a follow-up turn (prefix cache hit), and a restart with
+   `--kv-disk-dir` (disk cache hit).
+
+## Regenerating the reference
+
+The reference is rec (`~/.local/bin/rec`) running the INT4 checkpoint it
+pulls. If Recursive publishes new weights or a new rec:
+
+1. Pin the new checkpoint digest and shard SHA-256s in
+   `flint_int4_to_gguf.py` and in `tests/flint/golden.json`.
+2. Re-run `rec serve` greedily on the cases in `golden.json` and rewrite it.
+3. Re-dump the traces and logits with `tests/flint/rec_logits.py` and re-run
+   the trace comparison.
