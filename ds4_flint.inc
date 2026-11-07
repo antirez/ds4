@@ -202,31 +202,38 @@ int ds4_flint_trace_check(ds4_engine *e, const char *in_path, const char *out_pa
     const uint32_t ctx_cap = prefill + n_tokens + 1;
     ds4_flint_gpu_session *s = ds4_flint_gpu_session_create(ctx_cap);
     if (!s) { free(tokens); fclose(in); return 1; }
+    /* The imported KV is kept so the warm passes below can restore it: a
+     * decode writes ring slots and positions the measured pass must see as
+     * prefill left them. */
+    uint16_t *kv_rows[DS4_FLINT_GPU_N_LAYER] = {0};
+    uint32_t kv_count[DS4_FLINT_GPU_N_LAYER] = {0};
     uint16_t *rows = NULL;
-    uint32_t rows_cap = 0;
     for (uint32_t il = 0; il < n_layers; il++) {
         uint32_t n_rows = 0;
         if (!flint_read_u32(in, &n_rows) || n_rows > ctx_cap) {
             fprintf(stderr, "ds4: bad KV row count in layer %u\n", il);
             goto fail;
         }
-        if (n_rows > rows_cap) {
-            rows = xrealloc(rows, (size_t)n_rows * 128u * sizeof(uint16_t));
-            rows_cap = n_rows;
-        }
-        for (int key = 1; key >= 0; key--) {
-            for (uint32_t head = 0; head < DS4_N_HEAD_KV; head++) {
-                if (n_rows && fread(rows, 128u * sizeof(uint16_t), n_rows, in) != n_rows) {
-                    fprintf(stderr, "ds4: short KV read in layer %u\n", il);
-                    goto fail;
-                }
-                if (n_rows && !ds4_flint_gpu_kv_write(s, il, key, head, 0, n_rows, rows)) {
-                    fprintf(stderr, "ds4: KV write failed in layer %u\n", il);
-                    goto fail;
-                }
+        kv_count[il] = n_rows;
+        if (n_rows) {
+            kv_rows[il] = xcalloc((size_t)n_rows * 8u * 128u, sizeof(uint16_t));   /* K then V, 4 heads each */
+            if (fread(kv_rows[il], 128u * sizeof(uint16_t), (size_t)n_rows * 8u, in) != (size_t)n_rows * 8u) {
+                fprintf(stderr, "ds4: short KV read in layer %u\n", il);
+                goto fail;
             }
         }
     }
+#define FLINT_TRACE_IMPORT_KV() \
+    for (uint32_t il = 0; il < n_layers; il++) { \
+        for (uint32_t slot = 0; slot < 8u && kv_count[il]; slot++) { \
+            if (!ds4_flint_gpu_kv_write(s, il, slot < 4u, slot % 4u, 0, kv_count[il], \
+                                        kv_rows[il] + (size_t)slot * kv_count[il] * 128u)) { \
+                fprintf(stderr, "ds4: KV write failed in layer %u\n", il); \
+                goto fail; \
+            } \
+        } \
+    }
+    FLINT_TRACE_IMPORT_KV();
     fclose(in);
     in = NULL;
     {
@@ -253,6 +260,7 @@ int ds4_flint_trace_check(ds4_engine *e, const char *in_path, const char *out_pa
                 fprintf(stderr, "ds4: warm step %u: %.1f ms\n", i, flint_now_ms() - s0);
             }
             fprintf(stderr, "ds4: warm pass: %.1f ms/token\n", (flint_now_ms() - w0) / n_tokens);
+            FLINT_TRACE_IMPORT_KV();
         }
         const double t0 = flint_now_ms();
         for (uint32_t i = 0; i < n_tokens; i++) {
@@ -270,13 +278,39 @@ int ds4_flint_trace_check(ds4_engine *e, const char *in_path, const char *out_pa
         fprintf(stderr, "ds4: Flint trace check: %u steps from position %u in %.1f ms (%.1f ms/token), wrote %s\n",
                 n_tokens, prefill, dt, dt / n_tokens, out_path);
         fclose(outf); free(logits); free(logits_f); free(trace);
+        /* DS4_FLINT_TRACE_KV_LAYER=L appends that layer's whole K and V
+         * (4 heads x slots x 128 bf16 each) to OUT.kv for comparison. */
+        const char *kv_env = getenv("DS4_FLINT_TRACE_KV_LAYER");
+        if (kv_env) {
+            const uint32_t il = (uint32_t)atoi(kv_env);
+            const uint32_t slots = ds4_flint_layer_is_global(il) ? prefill + n_tokens : DS4_FLINT_GPU_SWA;
+            char path[1024];
+            snprintf(path, sizeof(path), "%s.kv", out_path);
+            FILE *kf = fopen(path, "wb");
+            uint16_t *buf = xcalloc((size_t)slots * 128u, sizeof(uint16_t));
+            if (kf) {
+                fwrite(&slots, 4, 1, kf);
+                for (int key = 1; key >= 0; key--) {
+                    for (uint32_t head = 0; head < DS4_N_HEAD_KV; head++) {
+                        ds4_flint_gpu_kv_read(s, il, key, head, 0, slots, buf);
+                        fwrite(buf, sizeof(uint16_t), (size_t)slots * 128u, kf);
+                    }
+                }
+                fclose(kf);
+                fprintf(stderr, "ds4: wrote layer %u KV (%u slots) to %s\n", il, slots, path);
+            }
+            free(buf);
+        }
     }
+    for (uint32_t il = 0; il < n_layers; il++) free(kv_rows[il]);
     free(rows); free(tokens);
     ds4_flint_gpu_session_free(s);
     return 0;
 fail:
     if (in) fclose(in);
+    for (uint32_t il = 0; il < n_layers; il++) free(kv_rows[il]);
     free(rows); free(tokens);
     ds4_flint_gpu_session_free(s);
     return 1;
+#undef FLINT_TRACE_IMPORT_KV
 }

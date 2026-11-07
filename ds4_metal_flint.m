@@ -99,7 +99,8 @@ static int flint_compile(const char **why) {
         if (!source) return 0;
         MTLCompileOptions *options = [MTLCompileOptions new];
         if (@available(macOS 15.0, *)) {
-            options.mathMode = MTLMathModeSafe;
+            /* DS4_FLINT_FAST_MATH=1 is a diagnostic: rec compiles safe. */
+            options.mathMode = getenv("DS4_FLINT_FAST_MATH") ? MTLMathModeFast : MTLMathModeSafe;
         } else {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
@@ -399,7 +400,11 @@ int ds4_flint_gpu_decode(ds4_flint_gpu_session *s, uint32_t token, uint32_t posi
     @autoreleasepool {
         memset([s->control contents], 0, FLINT_CONTROL_WORDS * 4);
         memset([s->diagnostic contents], 0, FLINT_WORKERS * 4);
-        const uint32_t parameters[4] = { token, position, initial_position, DS4_FLINT_GPU_N_LAYER };
+        /* Diagnostics for the trace test: DS4_FLINT_LAYER_COUNT runs the first N
+         * layers only; DS4_FLINT_WORKSPACE_DUMP appends the workspace after each step. */
+        const char *lc_env = getenv("DS4_FLINT_LAYER_COUNT");
+        const uint32_t layer_count = lc_env ? (uint32_t)atoi(lc_env) : DS4_FLINT_GPU_N_LAYER;
+        const uint32_t parameters[4] = { token, position, initial_position, layer_count };
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_metal_command_buffer(&owned);
         if (!cb) {
@@ -441,6 +446,11 @@ int ds4_flint_gpu_decode(ds4_flint_gpu_session *s, uint32_t token, uint32_t posi
                 }
                 return 0;
             }
+        }
+        const char *ws_env = getenv("DS4_FLINT_WORKSPACE_DUMP");
+        if (ws_env) {
+            FILE *f = fopen(ws_env, "ab");
+            if (f) { fwrite([s->workspace contents], 2, FLINT_WORKSPACE_ELEMS, f); fclose(f); }
         }
         if (logits_bf16) memcpy(logits_bf16, [s->logits contents], DS4_FLINT_GPU_N_VOCAB * sizeof(uint16_t));
         if (trace_bf16) memcpy(trace_bf16, [s->trace contents], DS4_FLINT_GPU_TRACE_ELEMS * sizeof(uint16_t));

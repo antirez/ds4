@@ -11,6 +11,14 @@ in docs/RECURSIVE_FLINT.md is zero differing elements.
     rec stop
     tests/flint/rec_logits.py --text "..." --steps 16 --dump-kv --out case.npz
     tests/flint/trace_compare.py case.npz [--steps 16] [--model GGUF]
+
+Diagnostics read by ds4 (environment): DS4_FLINT_TRACE_WARM=N runs the
+steps N extra times first and restores the imported KV (steady-state
+timing); DS4_FLINT_LAYER_COUNT=L decodes the first L layers only;
+DS4_FLINT_WORKSPACE_DUMP=FILE appends the kernel workspace after each step
+(q, k, v, attention, o, gate, up, act, down of the last layer run);
+DS4_FLINT_FAST_MATH=1 compiles the kernel with fast math (it then differs
+from rec already in the embedding row).
 """
 
 from __future__ import annotations
