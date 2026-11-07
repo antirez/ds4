@@ -40,6 +40,9 @@ static const ds4_shape DS4_SHAPE_FLINT = {
 /* Shared-expert width differs from the routed one; the upstream shape has a
  * single expert width, so Flint carries its own constant. */
 #define DS4_FLINT_N_FF_SHARED 1024u
+/* One routed expert as stored: gate, up and down with their scales and
+ * biases, contiguous (gguf-tools/flint_int4_to_gguf.py, flint.expert_pack.*). */
+#define DS4_FLINT_EXPERT_PACK_BYTES 1769472u
 /* Full-attention (no RoPE, whole-context KV) layers: 0, 1, 5, 9, ..., 45, 48. */
 #define DS4_FLINT_N_GLOBAL_LAYER 14u
 #define DS4_FLINT_GLOBAL_LAYER_MASK \

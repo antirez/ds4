@@ -5450,7 +5450,10 @@ static void tensor_expect_routed_expert(
     }
 }
 
+#include "ds4_flint_weights.inc"
+
 static bool weights_have_output_head(const ds4_weights *w) {
+    if (ds4_model_is_flint()) return w && w->output_norm && w->output;
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ||
         DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
         return w && w->output_norm && w->output;
@@ -5467,6 +5470,7 @@ static bool weights_have_output_head(const ds4_weights *w) {
 }
 
 static bool weights_have_partial_output_head(const ds4_weights *w) {
+    if (ds4_model_is_flint()) return w && (w->output_norm || w->output);
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ||
         DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
         return w && (w->output_norm || w->output);
@@ -5747,6 +5751,7 @@ static void weights_validate_qwen4_layout(
 
 static bool weights_layer_has_required(const ds4_layer_weights *l, uint32_t il) {
     if (!l) return false;
+    if (ds4_model_is_flint()) return weights_flint_layer_has_required(l, il);
     if (ds4_model_is_qwen4()) {
         return weights_qwen4_layer_has_required(l, il);
     }
@@ -5997,6 +6002,10 @@ static void weights_validate_layout(
         uint32_t           layer_end,
         bool               require_token_embd,
         bool               require_output) {
+    if (ds4_model_is_flint()) {
+        weights_validate_flint_layout(w, layer_start, layer_end, require_token_embd, require_output);
+        return;
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         weights_validate_glm_dsa_layout(w,
                                         layer_start,
@@ -7761,6 +7770,10 @@ static void weights_bind_output(
         const ds4_model *m,
         bool             required,
         bool             optional) {
+    if (ds4_model_is_flint()) {
+        weights_bind_flint_output(w, m, required, optional);
+        return;
+    }
     if (ds4_model_is_qwen4()) {
         if (required) {
             w->output_hc_norm = required_tensor(m, "output_hc_norm.weight");
@@ -7940,6 +7953,10 @@ static void weights_bind_qwen4_layer(ds4_layer_weights *l, const ds4_model *m, u
 static void weights_bind_layer(ds4_layer_weights *l, const ds4_model *m, uint32_t il) {
     if (ds4_model_is_qwen4()) {
         weights_bind_qwen4_layer(l, m, il);
+        return;
+    }
+    if (ds4_model_is_flint()) {
+        weights_bind_flint_layer(l, m, il);
         return;
     }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
