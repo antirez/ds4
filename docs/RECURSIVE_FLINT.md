@@ -337,7 +337,9 @@ streaming: routed experts are stored **one pack per expert**.
 - Non-expert tensors keep MLX's three arrays: `*.weight` as the fork type
   `FLINT_U4 = 143` (raw packed nibbles, `[out, in/2]` bytes) or `FLINT_U8 =
   144` for the embedding, `*.scales` and `*.biases` as BF16 `[out, in/64]`.
-  llama.cpp's names (`blk.N.attn_q`, `ffn_gate_shexp`, ...) with the
+  llama.cpp's names (`blk.N.attn_q`, `attn_output`, `attn_q_norm`,
+  `attn_k_norm`, `attn_sinks`, `ffn_norm`, `ffn_gate_inp` for the router,
+  `ffn_gate_shexp`, ..., `token_embd`, `output_norm`, `output`) with the
   suffixes `.weight`, `.scales`, `.biases`. `general.alignment = 256`, so
   the mmap'd file is rec's bank. The per-layer 64-word descriptor is
   computed at load from the tensor offsets; the GGUF carries no offsets of
@@ -348,10 +350,20 @@ streaming: routed experts are stored **one pack per expert**.
   then `down.weight` (524288), `down.scales` (32768), `down.biases`
   (32768). 1.6875 MiB, already 256-aligned. One `pread` per expert in
   streaming mode; resident mode maps the same bytes.
-- Metadata: `flint.*` as llama.cpp writes it (block count, heads, window,
-  the two 49-entry patterns, expert counts, `expert_gating_func = 2`), plus
-  `flint.weight_format = mlx-affine-int4` and the checkpoint SHA-256s from
-  rec's manifest.
+- Metadata, written by `gguf-tools/flint_int4_to_gguf.py` and checked
+  field by field in `config_validate_flint_model`: `flint.block_count`,
+  `context_length`, `embedding_length`, `vocab_size`, the three
+  feed-forward lengths, expert counts, `leading_dense_block_count`, the
+  attention head counts and lengths, `attention.sliding_window`,
+  `attention.layer_norm_rms_epsilon`, `rope.dimension_count`,
+  `rope.freq_base`, `full_attention_layers` (the 14 global layers),
+  `eog_token_ids`, `weight_format = mlx-affine-int4`, `quant.bits`,
+  `quant.group_size`, `quant.embedding_bits`, `expert_pack.layout`,
+  `expert_pack.offsets`, `expert_pack.bytes`, and the checkpoint SHA-256s
+  from rec's manifest under `flint.checkpoint.sha256.<file>`. The tokenizer
+  is byte-level BPE from the checkpoint's `tokenizer.json` (150144 tokens,
+  149744 merges, `tokenizer.ggml.pre = flint`, no BOS, EOS 150001) and the
+  chat template travels along in `tokenizer.chat_template`.
 
 The kernel's expert addressing changes from `bank + offset + expert·n·k/2`
 to `pack_base(expert) + fixed offset`, where `pack_base` comes from a
