@@ -4554,6 +4554,44 @@ static const char *cuda_model_ptr(const void *model_map, uint64_t offset) {
     return (const char *)model_map + offset;
 }
 
+/* HIP rejects a host-to-device copy whose source straddles two pinned host
+ * registrations (hipErrorInvalidValue).  A requested span can do that when it
+ * covers the tail of one host-registered model range and the head of the
+ * next, e.g. when a model map is reused at the same address with different
+ * tensor boundaries.  Clip each chunk at registration edges so every copy's
+ * source lies inside one registration or none. */
+static uint64_t cuda_model_host_copy_clip(const char *src, uint64_t n) {
+    const uintptr_t h0 = (uintptr_t)src;
+    uintptr_t end = h0 + n;
+    for (const cuda_model_range &r : g_model_ranges) {
+        if (!r.host_registered || !r.registered_base) continue;
+        const uintptr_t r0 = (uintptr_t)r.registered_base;
+        const uintptr_t r1 = r0 + r.registered_bytes;
+        if (r0 > h0 && r0 < end) end = r0;
+        if (r1 > h0 && r1 < end) end = r1;
+    }
+    return (uint64_t)(end - h0);
+}
+
+static cudaError_t cuda_model_host_copy_to_device(
+        char *dev,
+        const char *src,
+        uint64_t bytes,
+        uint64_t *done_out) {
+    const uint64_t chunk = 64ull * 1024ull * 1024ull;
+    uint64_t done = 0;
+    cudaError_t err = cudaSuccess;
+    while (done < bytes) {
+        uint64_t n = bytes - done < chunk ? bytes - done : chunk;
+        n = cuda_model_host_copy_clip(src + done, n);
+        err = cudaMemcpy(dev + done, src + done, (size_t)n, cudaMemcpyHostToDevice);
+        if (err != cudaSuccess) break;
+        done += n;
+    }
+    if (done_out) *done_out = done;
+    return err;
+}
+
 static const char *cuda_model_range_copy_uncached(
         const void *model_map,
         uint64_t offset,
@@ -4568,7 +4606,7 @@ static const char *cuda_model_range_copy_uncached(
         return NULL;
     }
     const char *src = (const char *)model_map + offset;
-    err = cudaMemcpy(dev, src, (size_t)bytes, cudaMemcpyHostToDevice);
+    err = cuda_model_host_copy_to_device((char *)dev, src, bytes, NULL);
     if (err != cudaSuccess) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "model range copy failed for %s: %s\n",
                 what ? what : "weights", cudaGetErrorString(err));
@@ -4661,20 +4699,17 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
     }
 
     const char *src = (const char *)model_map + offset;
-    const uint64_t chunk = 64ull * 1024ull * 1024ull;
-    for (uint64_t done = 0; done < bytes; done += chunk) {
-        uint64_t n = bytes - done < chunk ? bytes - done : chunk;
-        err = cudaMemcpy((char *)dev + done, src + done, (size_t)n, cudaMemcpyHostToDevice);
-        if (err != cudaSuccess) {
-            fprintf(stderr, DS4_GPU_LOG_PREFIX "model range copy failed for %s at %.2f/%.2f MiB: %s\n",
-                    what ? what : "weights",
-                    (double)done / 1048576.0,
-                    (double)bytes / 1048576.0,
-                    cudaGetErrorString(err));
-            (void)cudaFree(dev);
-            (void)cudaGetLastError();
-            return NULL;
-        }
+    uint64_t done = 0;
+    err = cuda_model_host_copy_to_device((char *)dev, src, bytes, &done);
+    if (err != cudaSuccess) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "model range copy failed for %s at %.2f/%.2f MiB: %s\n",
+                what ? what : "weights",
+                (double)done / 1048576.0,
+                (double)bytes / 1048576.0,
+                cudaGetErrorString(err));
+        (void)cudaFree(dev);
+        (void)cudaGetLastError();
+        return NULL;
     }
     g_model_ranges.push_back({model_map, offset, bytes, (char *)dev, NULL, NULL, 0, 0, 0});
     g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
