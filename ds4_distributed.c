@@ -1135,34 +1135,54 @@ static int dist_set_socket_low_latency(int fd) {
 #define DIST_DEBUG(...) ((void)0)
 #endif
 
+/* Every byte of the pipeline protocol passes through these two helpers, so
+ * they are where cross-node traffic and blocking time are counted.  A read
+ * that waits for a RESULT frame also waits for the remote stage to compute,
+ * which the worker telemetry later separates out (NET_REMOTE_EVAL_NS). */
 static int dist_write_full(int fd, const void *buf, size_t len) {
     const unsigned char *p = buf;
+    const uint64_t t0 = ds4_metric_now_ns();
+    int rc = 0;
     while (len > 0) {
         ssize_t n = send(fd, p, len, 0);
         if (n < 0) {
             if (errno == EINTR) continue;
-            return -1;
+            rc = -1;
+            break;
         }
-        if (n == 0) return -1;
+        if (n == 0) {
+            rc = -1;
+            break;
+        }
+        ds4_metric_add(DS4_METRIC_NET_SEND_BYTES, (uint64_t)n);
         p += (size_t)n;
         len -= (size_t)n;
     }
-    return 0;
+    ds4_metric_add(DS4_METRIC_NET_SEND_NS, ds4_metric_now_ns() - t0);
+    return rc;
 }
 
 static int dist_read_full(int fd, void *buf, size_t len) {
     unsigned char *p = buf;
+    const uint64_t t0 = ds4_metric_now_ns();
+    int rc = 1;
     while (len > 0) {
         ssize_t n = recv(fd, p, len, 0);
         if (n < 0) {
             if (errno == EINTR) continue;
-            return -1;
+            rc = -1;
+            break;
         }
-        if (n == 0) return 0;
+        if (n == 0) {
+            rc = 0;
+            break;
+        }
+        ds4_metric_add(DS4_METRIC_NET_RECV_BYTES, (uint64_t)n);
         p += (size_t)n;
         len -= (size_t)n;
     }
-    return 1;
+    ds4_metric_add(DS4_METRIC_NET_RECV_NS, ds4_metric_now_ns() - t0);
+    return rc;
 }
 
 static bool dist_connect_trace_enabled(void) {
@@ -2527,42 +2547,42 @@ static int dist_recv_result_alloc(
         return 1;
     }
 
+    /* The telemetry chain is always read: it is a few dozen bytes per hop, and
+     * the per-hop compute time is what lets the coordinator's metrics separate
+     * transport latency from remote work. */
     if (result.telemetry_bytes != 0) {
-        if (dist_coordinator_debug_enabled(state)) {
-            ds4_dist_telemetry_fixed *telemetry = malloc(result.telemetry_bytes);
-            if (!telemetry) {
-                dist_discard_bytes(fd, result.telemetry_bytes);
-                if (errlen) snprintf(err, errlen, "out of memory reading distributed telemetry");
-                return 1;
-            }
-            rc = dist_read_full(fd, telemetry, result.telemetry_bytes);
-            if (rc <= 0) {
-                free(telemetry);
-                if (errlen) snprintf(err, errlen, "failed to read distributed result telemetry");
-                return 1;
-            }
-            for (uint32_t i = 0; i < result.telemetry_count; i++) {
-                dist_telemetry_from_wire(&telemetry[i]);
-                DIST_COORD_DEBUG(state,
-                                 "ds4: distributed telemetry: request=%llu hop=%u layers=%u:%u route=%u pos=%u tokens=%u eval=%.3fms downstream_wait=%.3fms forward_send=%.3fms input=%.2fMiB output=%.2fMiB\n",
-                                 (unsigned long long)got_request,
-                                 i,
-                                 telemetry[i].layer_start,
-                                 telemetry[i].layer_end,
-                                 telemetry[i].route_index,
-                                 telemetry[i].pos0,
-                                 telemetry[i].n_tokens,
-                                 (double)telemetry[i].eval_usec / 1000.0,
-                                 (double)telemetry[i].downstream_wait_usec / 1000.0,
-                                 (double)telemetry[i].forward_send_usec / 1000.0,
-                                 (double)telemetry[i].input_bytes / (1024.0 * 1024.0),
-                                 (double)telemetry[i].output_bytes / (1024.0 * 1024.0));
-            }
+        ds4_dist_telemetry_fixed *telemetry = malloc(result.telemetry_bytes);
+        if (!telemetry) {
+            dist_discard_bytes(fd, result.telemetry_bytes);
+            if (errlen) snprintf(err, errlen, "out of memory reading distributed telemetry");
+            return 1;
+        }
+        rc = dist_read_full(fd, telemetry, result.telemetry_bytes);
+        if (rc <= 0) {
             free(telemetry);
-        } else if (dist_discard_bytes(fd, result.telemetry_bytes) <= 0) {
             if (errlen) snprintf(err, errlen, "failed to read distributed result telemetry");
             return 1;
         }
+        for (uint32_t i = 0; i < result.telemetry_count; i++) {
+            dist_telemetry_from_wire(&telemetry[i]);
+            ds4_metric_add(DS4_METRIC_NET_REMOTE_EVAL_NS,
+                           (uint64_t)telemetry[i].eval_usec * 1000u);
+            DIST_COORD_DEBUG(state,
+                             "ds4: distributed telemetry: request=%llu hop=%u layers=%u:%u route=%u pos=%u tokens=%u eval=%.3fms downstream_wait=%.3fms forward_send=%.3fms input=%.2fMiB output=%.2fMiB\n",
+                             (unsigned long long)got_request,
+                             i,
+                             telemetry[i].layer_start,
+                             telemetry[i].layer_end,
+                             telemetry[i].route_index,
+                             telemetry[i].pos0,
+                             telemetry[i].n_tokens,
+                             (double)telemetry[i].eval_usec / 1000.0,
+                             (double)telemetry[i].downstream_wait_usec / 1000.0,
+                             (double)telemetry[i].forward_send_usec / 1000.0,
+                             (double)telemetry[i].input_bytes / (1024.0 * 1024.0),
+                             (double)telemetry[i].output_bytes / (1024.0 * 1024.0));
+        }
+        free(telemetry);
     }
 
     void *buf = NULL;
