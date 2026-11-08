@@ -31358,8 +31358,15 @@ __device__ __forceinline__ float2 glm_cache_value_pair_dev<float>(
  * head, which leaves more than half of an L40S idle. These stages preserve the
  * fused kernel's arithmetic order for every score, softmax lane, lora output,
  * and value-projection row while exposing independent rows/dimensions as
- * separate blocks. */
-template <typename CT, bool RANGE_TOK2 = false>
+ * separate blocks.
+ *
+ * The weights stage keeps its scores in shared memory while they fit in the
+ * 48 KiB every device grants without an opt-in attribute. The GLM 5.3 MTP
+ * draft attends to every position since drafting began, so its window grows
+ * with the context; past 12,032 rows the scores live in the global weights
+ * buffer the lora stage reads instead. Each thread reads back only the
+ * scores it wrote, in the same order, so both layouts produce the same bits. */
+template <typename CT, bool RANGE_TOK2 = false, bool SHARED_SCORES = true>
 __global__ static void glm_attention_decode_weights_staged_kernel(
         float *weights,
         float *denom,
@@ -31393,7 +31400,11 @@ __global__ static void glm_attention_decode_weights_staged_kernel(
     const uint32_t qk_dim = qk_nope + qk_rope;
     extern __shared__ float glm_dec_stage_sh[];
     float *red = glm_dec_stage_sh;
-    float *scores = glm_dec_stage_sh + 256u;
+    const uint64_t head_index = (uint64_t)token * n_head + head;
+    float *head_weights = weights + head_index * score_stride;
+    float *scores;
+    if constexpr (SHARED_SCORES) scores = glm_dec_stage_sh + 256u;
+    else scores = head_weights;
     const float *qh = q +
         ((uint64_t)token * n_head + head) * qk_dim;
     const float *low = qk_low +
@@ -31464,11 +31475,11 @@ __global__ static void glm_attention_decode_weights_staged_kernel(
         if (tid < step) red[tid] += red[tid + step];
         __syncthreads();
     }
-    const uint64_t head_index = (uint64_t)token * n_head + head;
     if (tid == 0u) denom[head_index] = fmaxf(red[0], 1.0e-20f);
-    float *head_weights = weights + head_index * score_stride;
-    for (uint32_t s = tid; s < row_count; s += nth) {
-        head_weights[s] = scores[s];
+    if constexpr (SHARED_SCORES) {
+        for (uint32_t s = tid; s < row_count; s += nth) {
+            head_weights[s] = scores[s];
+        }
     }
 }
 
@@ -31864,12 +31875,16 @@ extern "C" int ds4_gpu_glm_attention_indexed_decode_typed_tensor(
         if (!scratch) return 0;
         float *softmax_denom = scratch + score_count;
         float *lora_sum = softmax_denom + head_count;
-        const uint32_t weight_shmem =
-            (256u + score_stride) * (uint32_t)sizeof(float);
+        const bool shared_scores =
+            (256u + score_stride) * sizeof(float) <= 48u * 1024u;
+        const uint32_t weight_shmem = (uint32_t)sizeof(float) *
+            (256u + (shared_scores ? score_stride : 0u));
         const dim3 weight_grid(n_head, token_count, 1u);
         if (cache_f16 && range_tok2) {
-            glm_attention_decode_weights_staged_kernel<__half, true>
-                    <<<weight_grid, 256, weight_shmem>>>(
+            auto kernel = shared_scores ?
+                glm_attention_decode_weights_staged_kernel<__half, true, true> :
+                glm_attention_decode_weights_staged_kernel<__half, true, false>;
+            kernel<<<weight_grid, 256, weight_shmem>>>(
                     scratch, softmax_denom, (const float *)q->ptr,
                     (const float *)qk_low->ptr,
                     (const __half *)kv_lora_cache->ptr,
@@ -31880,8 +31895,10 @@ extern "C" int ds4_gpu_glm_attention_indexed_decode_typed_tensor(
                     freq_scale, ext_factor, attn_factor, beta_fast,
                     beta_slow, score_vec2);
         } else if (cache_f16) {
-            glm_attention_decode_weights_staged_kernel<__half>
-                    <<<weight_grid, 256, weight_shmem>>>(
+            auto kernel = shared_scores ?
+                glm_attention_decode_weights_staged_kernel<__half, false, true> :
+                glm_attention_decode_weights_staged_kernel<__half, false, false>;
+            kernel<<<weight_grid, 256, weight_shmem>>>(
                     scratch, softmax_denom, (const float *)q->ptr,
                     (const float *)qk_low->ptr,
                     (const __half *)kv_lora_cache->ptr,
@@ -31892,8 +31909,10 @@ extern "C" int ds4_gpu_glm_attention_indexed_decode_typed_tensor(
                     freq_scale, ext_factor, attn_factor, beta_fast,
                     beta_slow, score_vec2);
         } else if (range_tok2) {
-            glm_attention_decode_weights_staged_kernel<float, true>
-                    <<<weight_grid, 256, weight_shmem>>>(
+            auto kernel = shared_scores ?
+                glm_attention_decode_weights_staged_kernel<float, true, true> :
+                glm_attention_decode_weights_staged_kernel<float, true, false>;
+            kernel<<<weight_grid, 256, weight_shmem>>>(
                     scratch, softmax_denom, (const float *)q->ptr,
                     (const float *)qk_low->ptr,
                     (const float *)kv_lora_cache->ptr,
@@ -31904,8 +31923,10 @@ extern "C" int ds4_gpu_glm_attention_indexed_decode_typed_tensor(
                     freq_scale, ext_factor, attn_factor, beta_fast,
                     beta_slow, score_vec2);
         } else {
-            glm_attention_decode_weights_staged_kernel<float>
-                    <<<weight_grid, 256, weight_shmem>>>(
+            auto kernel = shared_scores ?
+                glm_attention_decode_weights_staged_kernel<float, false, true> :
+                glm_attention_decode_weights_staged_kernel<float, false, false>;
+            kernel<<<weight_grid, 256, weight_shmem>>>(
                     scratch, softmax_denom, (const float *)q->ptr,
                     (const float *)qk_low->ptr,
                     (const float *)kv_lora_cache->ptr,

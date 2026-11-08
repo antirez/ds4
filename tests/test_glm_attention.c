@@ -403,6 +403,110 @@ static void pooled_decode_cases(void) {
 #endif
 }
 
+/* Decode attention over one large selected window: the MTP draft attends to
+ * every retained position, so n_selected grows with the context (tens of
+ * thousands of rows) while the usual indexed decode stays at a few thousand.
+ * Checks a double-precision softmax reference and run-to-run determinism from
+ * the fused/staged dispatch boundary up to 65,536 rows. The caller's model
+ * holds Q8 value projections that are exactly 1 at offset 4096, so each of the
+ * V outputs is the sum over D of the softmax-weighted cache rows. */
+static void large_decode_window_cases(const unsigned char *model, size_t model_bytes) {
+    enum { D = 512, H = 8, V = 4, R = 64, NOPE = 32, CAP = 65536 };
+    static const uint32_t counts[] = {511, 512, 2051, 12032, 12033, 16384, 65536};
+    float *kv = malloc((size_t)CAP * D * sizeof(float));
+    float *rope = calloc((size_t)CAP * R, sizeof(float));
+    float *low = malloc((size_t)H * D * sizeof(float));
+    float *q = calloc((size_t)H * (NOPE + R), sizeof(float));
+    int32_t *ids = malloc((size_t)CAP * sizeof(int32_t));
+    double *scores = malloc((size_t)CAP * sizeof(double));
+    float out[H * V], repeat[H * V];
+    check(kv && rope && low && q && ids && scores, "window host allocation");
+    /* Exactly f16-valued caches keep the reference independent of the format. */
+    for (size_t i = 0; i < (size_t)CAP * D; i++)
+        kv[i] = ((int)((i % D) * 13 + (i / D) * 7) % 61 - 30) * 0.00390625f;
+    for (int i = 0; i < H * D; i++)
+        low[i] = ((i % D) * 3 + (i / D) * 5) % 17 * 0.015625f - 0.125f;
+    ds4_gpu_tensor *qg = upload(q, (size_t)H * (NOPE + R) * sizeof(float));
+    ds4_gpu_tensor *lg = upload(low, (size_t)H * D * sizeof(float));
+    ds4_gpu_tensor *rg = upload_cache(rope, (size_t)CAP * R, true);
+    ds4_gpu_tensor *ig = ds4_gpu_tensor_alloc((size_t)CAP * sizeof(int32_t));
+    ds4_gpu_tensor *og = ds4_gpu_tensor_alloc(sizeof(out));
+    check(ig && og, "window tensor allocation");
+    for (int f16 = 0; f16 < 2; f16++) {
+        ds4_gpu_tensor *cache = upload_cache(kv, (size_t)CAP * D, f16);
+        for (size_t c = 0; c < sizeof(counts) / sizeof(counts[0]); c++) {
+            const uint32_t count = counts[c];
+#ifdef __APPLE__
+            /* kernel_glm_attention_indexed_decode stages its scores in
+             * threadgroup memory, (256 + n_selected + kv_lora_dim) floats,
+             * beyond the 32 KiB Apple GPUs allow: API validation rejects the
+             * dispatch past 7,424 rows and an M1 returns wrong values from
+             * 16,384 rows. Skip until Metal keeps large windows in device
+             * memory as the CUDA path does. */
+            if ((256u + count + D) * sizeof(float) > 32768u) {
+                printf("large decode window count=%u f16=%d: SKIP (Metal threadgroup memory)\n",
+                       count, f16);
+                continue;
+            }
+#endif
+            /* A spread of distinct rows, with a few out-of-range and empty
+             * entries that the kernel must skip. */
+            for (uint32_t i = 0; i < count; i++)
+                ids[i] = (int32_t)((i * 2654435761u) % CAP);
+            ids[count / 3] = (int32_t)CAP;
+            ids[count / 2] = -1;
+            check(ds4_gpu_tensor_write(ig, 0, ids, count * sizeof(int32_t)), "window ids");
+            for (int run = 0; run < 3; run++) {
+                check(ds4_gpu_glm_attention_indexed_decode_typed_tensor(
+                      og, qg, lg, cache, rg, model, model_bytes, 4096, 8,
+                      ig, count, CAP, f16, H, D, NOPE, 0, V, 4096,
+                      10000, 1, 0, 1, 32, 1) && ds4_gpu_synchronize(),
+                      "window decode attention");
+                check(ds4_gpu_tensor_read(og, 0, run ? repeat : out, sizeof(out)),
+                      "window decode read");
+                if (run) check(memcmp(out, repeat, sizeof(out)) == 0,
+                               "window decode determinism");
+            }
+            for (int h = 0; h < H; h++) {
+                double max = -INFINITY, sum = 0, value = 0;
+                for (uint32_t i = 0; i < count; i++) {
+                    const uint32_t row = (uint32_t)ids[i];
+                    scores[i] = -INFINITY;
+                    if (row >= CAP) continue;
+                    double dot = 0;
+                    for (int d = 0; d < D; d++)
+                        dot += (double)low[h * D + d] * kv[(size_t)row * D + d];
+                    scores[i] = dot / sqrt(NOPE);
+                    if (scores[i] > max) max = scores[i];
+                }
+                for (uint32_t i = 0; i < count; i++) {
+                    const uint32_t row = (uint32_t)ids[i];
+                    if (row >= CAP) continue;
+                    const double w = exp(scores[i] - max);
+                    double row_sum = 0;
+                    for (int d = 0; d < D; d++) row_sum += kv[(size_t)row * D + d];
+                    sum += w;
+                    value += w * row_sum;
+                }
+                for (int v = 0; v < V; v++) {
+                    const float got = out[h * V + v];
+                    const double expected = value / sum;
+                    if (!isfinite(got) || fabs(got - expected) > 0.005) {
+                        fprintf(stderr, "large decode window count=%u f16=%d head=%d: "
+                                "%.9g != %.9g\n", count, f16, h, got, expected);
+                        exit(1);
+                    }
+                }
+            }
+            printf("large decode window count=%u f16=%d: PASS\n", count, f16);
+        }
+        ds4_gpu_tensor_free(cache);
+    }
+    ds4_gpu_tensor_free(og); ds4_gpu_tensor_free(ig); ds4_gpu_tensor_free(rg);
+    ds4_gpu_tensor_free(lg); ds4_gpu_tensor_free(qg);
+    free(scores); free(ids); free(q); free(low); free(rope); free(kv);
+}
+
 static void reduction_cases(void) {
     enum { D = 512, N = 128, T = 3, C = 521, H = 8, V = 4, R = 64, MODEL_BYTES = 65536 };
     unsigned char *model = mmap(NULL, MODEL_BYTES, PROT_READ | PROT_WRITE,
@@ -534,6 +638,7 @@ static void reduction_cases(void) {
     ds4_gpu_tensor_free(ig); ds4_gpu_tensor_free(lg); ds4_gpu_tensor_free(qg);
     ds4_gpu_tensor_free(rg); ds4_gpu_tensor_free(kg); free(kv);
 #endif
+    large_decode_window_cases(model, MODEL_BYTES);
     ds4_gpu_cleanup();
     munmap(model, MODEL_BYTES);
     puts("normalization and attention reductions: PASS");
