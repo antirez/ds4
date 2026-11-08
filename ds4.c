@@ -19841,9 +19841,13 @@ static bool metal_graph_alloc_raw_cap(
             g->batch_routed_down_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float));
             g->batch_routed_out_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * DS4_N_EMBD * sizeof(float));
         }
-        if (DS4_GPU_ATTN_COMP_CACHE_F16) {
-            g->batch_q_half = ds4_gpu_tensor_alloc(pc * q_dim * sizeof(uint16_t));
-        }
+        /* F16 staging for the F16-output projections (q_b, attention output,
+         * shared down).  Metal needs it with its F16 compressed cache; ROCm
+         * uses it so the hipBLASLt GEMMs can write F16 straight into the
+         * half-input norm and hyper-connection kernels. */
+#if defined(__APPLE__) || defined(DS4_ROCM_BUILD)
+        g->batch_q_half = ds4_gpu_tensor_alloc(pc * q_dim * sizeof(uint16_t));
+#endif
         g->prefill_seed_router_selected = ds4_gpu_tensor_alloc(
                 (uint64_t)DS4_N_LAYER * DS4_STREAMING_PREFILL_CACHE_SEED_MAX_TOKENS *
                 DS4_N_EXPERT_USED * sizeof(int32_t));
@@ -30779,7 +30783,7 @@ static bool metal_graph_hc_rms_scale_project(
                n_tokens,
                DS4_RMS_EPS) != 0;
 #else
-#if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+#if !defined(DS4_NO_GPU)
     if (weight->type == DS4_TENSOR_F16 &&
         ds4_gpu_matmul_f16_rms_fold_tensor(
             out,
