@@ -10456,6 +10456,12 @@ int ds4_gpu_commit_and_wait_selected_readback(uint64_t event_value, const char *
             [g_transient_buffers removeAllObjects];
             return 0;
         }
+        /* The batch just committed and signaled is fully drained here, so its
+         * transient buffer refs are dead: clear them on the success path too,
+         * exactly as every error branch above does. Without this, decode loops
+         * that drain entirely through these shared-event helpers accumulate
+         * the raw-buffer list until the next non-event drain. */
+        [g_transient_buffers removeAllObjects];
         return 1;
     }
 
@@ -11863,6 +11869,10 @@ static int ds4_gpu_signal_batch_and_wait_event(const char *label) {
             [g_transient_buffers removeAllObjects];
             return 0;
         }
+        /* Success path reaps like the error branches and like
+         * ds4_gpu_finish_command_buffer(): this command buffer is committed
+         * and fully signaled, so nothing it referenced is still live. */
+        [g_transient_buffers removeAllObjects];
         return 1;
     } else {
         ds4_gpu_close_batch_encoder();
