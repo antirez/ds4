@@ -6924,6 +6924,148 @@ static void append_cors_headers(buf *h) {
         "Access-Control-Allow-Headers: *\r\n");
 }
 
+/* =========================================================================
+ * Metrics.
+ * =========================================================================
+ *
+ * The engine counts its own phases (ds4_metrics.h).  The server adds the
+ * request view a deployment needs to size hardware: how long requests queue,
+ * how long until the first token, end-to-end latency, and how often the live
+ * and disk caches save a prefill.  Like the engine counters these are
+ * process-global; they are exported by GET /metrics (Prometheus text) and
+ * GET /metrics/json (with derived averages), and optionally logged as
+ * interval deltas by --metrics-log. */
+
+#define METRICS_HIST_BUCKETS 12
+static const double metrics_hist_bounds[METRICS_HIST_BUCKETS] =
+    {0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0};
+
+typedef struct {
+    uint64_t count[METRICS_HIST_BUCKETS + 1]; /* count[i] <= bounds[i]; the last is +Inf */
+    uint64_t total;
+    double sum;
+    double max;
+} metrics_hist;
+
+typedef enum {
+    METRICS_ENDPOINT_CHAT,
+    METRICS_ENDPOINT_COMPLETIONS,
+    METRICS_ENDPOINT_RESPONSES,
+    METRICS_ENDPOINT_MESSAGES,
+    METRICS_ENDPOINT_COUNT
+} metrics_endpoint;
+
+static const char *const metrics_endpoint_names[METRICS_ENDPOINT_COUNT] =
+    {"chat", "completions", "responses", "messages"};
+
+typedef enum {
+    METRICS_FINISH_STOP,
+    METRICS_FINISH_LENGTH,
+    METRICS_FINISH_ERROR,
+    METRICS_FINISH_CANCELLED,
+    METRICS_FINISH_COUNT
+} metrics_finish;
+
+static const char *const metrics_finish_names[METRICS_FINISH_COUNT] =
+    {"stop", "length", "error", "cancelled"};
+
+typedef struct {
+    pthread_mutex_t mu;
+    double t_start;
+    uint64_t requests[METRICS_ENDPOINT_COUNT];
+    uint64_t http_errors;
+    uint64_t finished[METRICS_FINISH_COUNT];
+    uint64_t prompt_tokens;
+    uint64_t cached_prompt_tokens;
+    uint64_t completion_tokens;
+    metrics_hist queue_wait;  /* arrival to worker start */
+    metrics_hist ttft;        /* arrival to first generated token */
+    metrics_hist duration;    /* arrival to response complete */
+    uint64_t kv_disk_lookups;
+    uint64_t kv_disk_hits;
+    uint64_t kv_disk_stores;
+    uint64_t image_cache_hits;
+    uint64_t image_encodes;
+} server_metrics;
+
+static server_metrics g_metrics = { .mu = PTHREAD_MUTEX_INITIALIZER };
+
+static void metrics_hist_add(metrics_hist *h, double v) {
+    int i = 0;
+    while (i < METRICS_HIST_BUCKETS && v > metrics_hist_bounds[i]) i++;
+    h->count[i]++;
+    h->total++;
+    h->sum += v;
+    if (v > h->max) h->max = v;
+}
+
+static metrics_endpoint metrics_endpoint_for(api_style api, req_kind kind) {
+    if (api == API_ANTHROPIC) return METRICS_ENDPOINT_MESSAGES;
+    if (api == API_RESPONSES) return METRICS_ENDPOINT_RESPONSES;
+    return kind == REQ_COMPLETION ? METRICS_ENDPOINT_COMPLETIONS : METRICS_ENDPOINT_CHAT;
+}
+
+static metrics_finish metrics_finish_for(const char *finish) {
+    if (!strcmp(finish, "length")) return METRICS_FINISH_LENGTH;
+    if (!strcmp(finish, "error")) return METRICS_FINISH_ERROR;
+    if (!strcmp(finish, "cancelled")) return METRICS_FINISH_CANCELLED;
+    return METRICS_FINISH_STOP; /* "stop" and "tool_calls" */
+}
+
+static void metrics_note_request(api_style api, req_kind kind) {
+    pthread_mutex_lock(&g_metrics.mu);
+    g_metrics.requests[metrics_endpoint_for(api, kind)]++;
+    pthread_mutex_unlock(&g_metrics.mu);
+}
+
+static void metrics_note_http_error(void) {
+    pthread_mutex_lock(&g_metrics.mu);
+    g_metrics.http_errors++;
+    pthread_mutex_unlock(&g_metrics.mu);
+}
+
+/* ttft < 0 means the request produced no token. */
+static void metrics_note_request_done(const char *finish, int prompt_tokens,
+                                      int cached_tokens, int completion_tokens,
+                                      double queue_wait, double ttft, double duration) {
+    pthread_mutex_lock(&g_metrics.mu);
+    g_metrics.finished[metrics_finish_for(finish)]++;
+    g_metrics.prompt_tokens += prompt_tokens > 0 ? (uint64_t)prompt_tokens : 0;
+    g_metrics.cached_prompt_tokens += cached_tokens > 0 ? (uint64_t)cached_tokens : 0;
+    g_metrics.completion_tokens += completion_tokens > 0 ? (uint64_t)completion_tokens : 0;
+    metrics_hist_add(&g_metrics.queue_wait, queue_wait > 0.0 ? queue_wait : 0.0);
+    if (ttft >= 0.0) metrics_hist_add(&g_metrics.ttft, ttft);
+    metrics_hist_add(&g_metrics.duration, duration > 0.0 ? duration : 0.0);
+    pthread_mutex_unlock(&g_metrics.mu);
+}
+
+static void metrics_note_kv_lookup(bool hit) {
+    pthread_mutex_lock(&g_metrics.mu);
+    g_metrics.kv_disk_lookups++;
+    if (hit) g_metrics.kv_disk_hits++;
+    pthread_mutex_unlock(&g_metrics.mu);
+}
+
+static void metrics_note_kv_store(void) {
+    pthread_mutex_lock(&g_metrics.mu);
+    g_metrics.kv_disk_stores++;
+    pthread_mutex_unlock(&g_metrics.mu);
+}
+
+static void metrics_note_image(bool cache_hit) {
+    pthread_mutex_lock(&g_metrics.mu);
+    if (cache_hit) g_metrics.image_cache_hits++;
+    else g_metrics.image_encodes++;
+    pthread_mutex_unlock(&g_metrics.mu);
+}
+
+static server_metrics metrics_copy(void) {
+    pthread_mutex_lock(&g_metrics.mu);
+    server_metrics copy = g_metrics;
+    pthread_mutex_unlock(&g_metrics.mu);
+    return copy;
+}
+
 static bool http_response(int fd, bool enable_cors, int code, const char *type, const char *body) {
     const char *reason = code == 200 ? "OK" :
                          code == 204 ? "No Content" :
@@ -6951,6 +7093,7 @@ static bool http_response(int fd, bool enable_cors, int code, const char *type, 
 }
 
 static bool http_error(int fd, bool enable_cors, int code, const char *msg) {
+    metrics_note_http_error();
     buf b = {0};
     buf_puts(&b, "{\"error\":{\"message\":");
     json_escape(&b, msg);
@@ -10224,6 +10367,7 @@ struct server {
     FILE *trace;
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
+    int metrics_log_interval; /* seconds between metrics log lines; 0 disables */
 };
 
 static ds4_think_mode server_default_effort(const server *s) {
@@ -10243,6 +10387,7 @@ static bool server_encode_image(server *s, const server_image_input *input,
                                 ds4_vision_embedding *out,
                                 char *err, size_t errlen) {
     if (server_image_cache_get(&s->image_cache, input, out)) {
+        metrics_note_image(true);
         server_log(DS4_LOG_KVCACHE, "ds4-server: vision embedding cache hit");
         return true;
     }
@@ -10255,6 +10400,7 @@ static bool server_encode_image(server *s, const server_image_input *input,
     server_image_cache_put(&s->image_cache, input, out,
                             (uint32_t)ds4_engine_embd_dim(s->engine),
                             SERVER_IMAGE_CACHE_BYTES);
+    metrics_note_image(false);
     server_log(DS4_LOG_KVCACHE, "ds4-server: vision embedding encoded; cache=%zu bytes",
                s->image_cache.bytes);
     return true;
@@ -10268,6 +10414,7 @@ struct job {
     request req;
     uint64_t id;      /* Request number for the scheduling trace. */
     double t_arrive;  /* now_sec() when the HTTP request was read. */
+    double t_start;   /* now_sec() when a worker picked the job up. */
     bool done;
     bool cancelled;
     pthread_mutex_t mu;
@@ -11339,6 +11486,7 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
                                                   &hooks, err, sizeof(err));
     pthread_mutex_unlock(&s->kv_mu);
     pthread_mutex_unlock(&s->inference_mu);
+    if (ok) metrics_note_kv_store();
     return ok;
 }
 
@@ -11500,6 +11648,7 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
                                            &hooks, responses_protocol);
     pthread_mutex_unlock(&s->kv_mu);
     pthread_mutex_unlock(&s->inference_mu);
+    if (s->kv.enabled) metrics_note_kv_lookup(loaded > 0);
     if (loaded > 0) {
         if (loaded_path_out && lr.path) *loaded_path_out = xstrdup(lr.path);
         if (loaded_ext_flags_out) *loaded_ext_flags_out = lr.ext_flags;
@@ -14143,6 +14292,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
 
     bool dsml_recovery_attempted = false;
     int recovery_completion = 0;
+    double t_first = 0.0; /* now_sec() of the first generated token */
     uint64_t rng = j->req.seed;
     if (!rng && !random_bytes(&rng, sizeof(rng))) {
         rng = ((uint64_t)time(NULL) << 32) ^ (uint64_t)(uintptr_t)j;
@@ -14299,6 +14449,7 @@ decode_again:
             char *piece = ds4_token_text(s->engine, token, &piece_len);
             completion++;
             kept++;
+            if (t_first == 0.0) t_first = now_sec();
 
             trace_piece(s, trace_id, piece, piece_len);
             buf_append(&text, piece, piece_len);
@@ -14517,6 +14668,10 @@ decode_again:
     if (job_cancelled(j)) {
         request_live_state_clear(s, slot);
         trace_event(s, trace_id, "cancelled during generation after %d tokens", completion);
+        metrics_note_request_done("cancelled", prompt_tokens, cached, completion,
+                                  j->t_start - j->t_arrive,
+                                  t_first > 0.0 ? t_first - j->t_arrive : -1.0,
+                                  now_sec() - j->t_arrive);
         anthropic_stream_free(&anthropic_live);
         openai_stream_free(&openai_live);
         responses_stream_free(&responses_live);
@@ -14984,6 +15139,10 @@ decode_again:
                        now_sec() - t0);
         }
     }
+    metrics_note_request_done(final_finish, prompt_tokens, cached, completion,
+                              j->t_start - j->t_arrive,
+                              t_first > 0.0 ? t_first - j->t_arrive : -1.0,
+                              now_sec() - j->t_arrive);
     free(parsed_content);
     free(parsed_reasoning);
     tool_calls_free(&parsed_calls);
@@ -15005,6 +15164,7 @@ static void generate_job(server *s, server_slot *slot, job *j) {
     slot->prefill_gate_wait = 0.0;
     slot->prefill_compute = 0.0;
     slot->prefill_remote = 0.0;
+    j->t_start = now_sec();
     server_log(DS4_LOG_DEFAULT,
                "sched t=%.3f req#%llu slot %d: worker started job "
                "(%.1f ms after arrival)",
@@ -15430,6 +15590,286 @@ static bool send_model(server *s, int fd, const char *id) {
     return ok;
 }
 
+/* ---- Metrics export ------------------------------------------------------ */
+
+static void metrics_prom_header(buf *b, const char *name, const char *type, const char *help) {
+    buf_printf(b, "# HELP %s %s\n# TYPE %s %s\n", name, help, name, type);
+}
+
+static void metrics_prom_u64(buf *b, const char *name, const char *type,
+                             const char *help, uint64_t v) {
+    metrics_prom_header(b, name, type, help);
+    buf_printf(b, "%s %llu\n", name, (unsigned long long)v);
+}
+
+static void metrics_prom_f64(buf *b, const char *name, const char *type,
+                             const char *help, double v) {
+    metrics_prom_header(b, name, type, help);
+    buf_printf(b, "%s %.6f\n", name, v);
+}
+
+static void metrics_prom_hist(buf *b, const char *name, const char *help,
+                              const metrics_hist *h) {
+    metrics_prom_header(b, name, "histogram", help);
+    uint64_t cumulative = 0;
+    for (int i = 0; i < METRICS_HIST_BUCKETS; i++) {
+        cumulative += h->count[i];
+        buf_printf(b, "%s_bucket{le=\"%g\"} %llu\n", name, metrics_hist_bounds[i],
+                   (unsigned long long)cumulative);
+    }
+    cumulative += h->count[METRICS_HIST_BUCKETS];
+    buf_printf(b, "%s_bucket{le=\"+Inf\"} %llu\n%s_sum %.6f\n%s_count %llu\n",
+               name, (unsigned long long)cumulative, name, h->sum, name,
+               (unsigned long long)cumulative);
+}
+
+/* Engine counters keep their ds4_metrics.h names; nanosecond counters become
+ * Prometheus-style _seconds_total. */
+static void metrics_engine_key(ds4_metric m, const char *prefix, const char *ns_suffix,
+                               char *out, size_t cap) {
+    const char *name = ds4_metric_name(m);
+    if (ds4_metric_is_ns(m))
+        snprintf(out, cap, "%s%.*s%s", prefix, (int)(strlen(name) - 3), name, ns_suffix);
+    else
+        snprintf(out, cap, "%s%s", prefix, name);
+}
+
+typedef struct {
+    int clients;
+    int queued;
+} metrics_live;
+
+static metrics_live metrics_live_state(server *s) {
+    metrics_live live = {0};
+    pthread_mutex_lock(&s->mu);
+    live.clients = s->clients;
+    for (const job *j = s->head; j; j = j->next) live.queued++;
+    pthread_mutex_unlock(&s->mu);
+    return live;
+}
+
+static uint64_t metrics_resident_bytes(void) {
+    FILE *fp = fopen("/proc/self/statm", "r");
+    if (!fp) return 0;
+    unsigned long pages = 0, resident = 0;
+    const int n = fscanf(fp, "%lu %lu", &pages, &resident);
+    fclose(fp);
+    return n == 2 ? (uint64_t)resident * (uint64_t)sysconf(_SC_PAGESIZE) : 0;
+}
+
+static void metrics_render_prometheus(server *s, buf *b) {
+    uint64_t v[DS4_METRIC_COUNT];
+    ds4_metrics_snapshot(v);
+    for (int i = 0; i < DS4_METRIC_COUNT; i++) {
+        char name[96];
+        metrics_engine_key((ds4_metric)i, "ds4_", "_seconds_total", name, sizeof(name));
+        if (ds4_metric_is_ns((ds4_metric)i))
+            metrics_prom_f64(b, name, "counter", ds4_metric_help((ds4_metric)i), (double)v[i] / 1e9);
+        else
+            metrics_prom_u64(b, name, "counter", ds4_metric_help((ds4_metric)i), v[i]);
+    }
+
+    const server_metrics m = metrics_copy();
+    metrics_prom_header(b, "ds4_server_requests_total", "counter", "Accepted API requests by endpoint.");
+    for (int i = 0; i < METRICS_ENDPOINT_COUNT; i++)
+        buf_printf(b, "ds4_server_requests_total{endpoint=\"%s\"} %llu\n",
+                   metrics_endpoint_names[i], (unsigned long long)m.requests[i]);
+    metrics_prom_u64(b, "ds4_server_http_errors_total", "counter",
+                     "Error responses sent, any status.", m.http_errors);
+    metrics_prom_header(b, "ds4_server_requests_finished_total", "counter",
+                        "Generations completed by finish reason.");
+    for (int i = 0; i < METRICS_FINISH_COUNT; i++)
+        buf_printf(b, "ds4_server_requests_finished_total{finish=\"%s\"} %llu\n",
+                   metrics_finish_names[i], (unsigned long long)m.finished[i]);
+    metrics_prom_u64(b, "ds4_server_prompt_tokens_total", "counter",
+                     "Prompt tokens received.", m.prompt_tokens);
+    metrics_prom_u64(b, "ds4_server_cached_prompt_tokens_total", "counter",
+                     "Prompt tokens served from live or disk KV state.", m.cached_prompt_tokens);
+    metrics_prom_u64(b, "ds4_server_completion_tokens_total", "counter",
+                     "Tokens generated for clients.", m.completion_tokens);
+    metrics_prom_hist(b, "ds4_server_queue_wait_seconds",
+                      "Arrival to worker start.", &m.queue_wait);
+    metrics_prom_hist(b, "ds4_server_time_to_first_token_seconds",
+                      "Arrival to first generated token.", &m.ttft);
+    metrics_prom_hist(b, "ds4_server_request_duration_seconds",
+                      "Arrival to response complete.", &m.duration);
+    metrics_prom_header(b, "ds4_server_kv_disk_lookups_total", "counter",
+                        "Disk KV cache lookups by result.");
+    buf_printf(b, "ds4_server_kv_disk_lookups_total{result=\"hit\"} %llu\n"
+                  "ds4_server_kv_disk_lookups_total{result=\"miss\"} %llu\n",
+               (unsigned long long)m.kv_disk_hits,
+               (unsigned long long)(m.kv_disk_lookups - m.kv_disk_hits));
+    metrics_prom_u64(b, "ds4_server_kv_disk_stores_total", "counter",
+                     "Disk KV cache checkpoints written.", m.kv_disk_stores);
+    metrics_prom_header(b, "ds4_server_image_embeddings_total", "counter",
+                        "Image embeddings by source.");
+    buf_printf(b, "ds4_server_image_embeddings_total{result=\"cache_hit\"} %llu\n"
+                  "ds4_server_image_embeddings_total{result=\"encoded\"} %llu\n",
+               (unsigned long long)m.image_cache_hits, (unsigned long long)m.image_encodes);
+
+    const metrics_live live = metrics_live_state(s);
+    metrics_prom_f64(b, "ds4_server_uptime_seconds", "gauge", "Seconds since the server started.",
+                     m.t_start > 0.0 ? now_sec() - m.t_start : 0.0);
+    metrics_prom_u64(b, "ds4_server_slots", "gauge", "Resident sessions.", (uint64_t)s->slot_count);
+    metrics_prom_u64(b, "ds4_server_context_tokens", "gauge", "Context size per session.",
+                     (uint64_t)s->ctx_size);
+    metrics_prom_u64(b, "ds4_server_active_clients", "gauge", "Open client connections.",
+                     (uint64_t)live.clients);
+    metrics_prom_u64(b, "ds4_server_queued_requests", "gauge", "Requests waiting for a slot.",
+                     (uint64_t)live.queued);
+    if (s->engine)
+        metrics_prom_u64(b, "ds4_model_bytes", "gauge", "Loaded model weight bytes.",
+                         ds4_engine_model_bytes(s->engine));
+    const uint64_t rss = metrics_resident_bytes();
+    if (rss) metrics_prom_u64(b, "ds4_process_resident_memory_bytes", "gauge",
+                              "Resident set size.", rss);
+}
+
+static void metrics_json_hist(buf *b, const char *key, const metrics_hist *h) {
+    buf_printf(b, "\"%s\":{\"count\":%llu,\"avg\":%.6f,\"max\":%.6f}", key,
+               (unsigned long long)h->total, h->total ? h->sum / (double)h->total : 0.0, h->max);
+}
+
+static double metrics_ratio(double num, double den) {
+    return den > 0.0 ? num / den : 0.0;
+}
+
+static void metrics_render_json(server *s, buf *b) {
+    uint64_t v[DS4_METRIC_COUNT];
+    ds4_metrics_snapshot(v);
+    const server_metrics m = metrics_copy();
+    const metrics_live live = metrics_live_state(s);
+    const double uptime = m.t_start > 0.0 ? now_sec() - m.t_start : 0.0;
+#define V(id) ((double)v[DS4_METRIC_##id])
+#define SEC(id) (V(id) / 1e9)
+    buf_printf(b, "{\"uptime_seconds\":%.3f,\"engine\":{", uptime);
+    for (int i = 0; i < DS4_METRIC_COUNT; i++) {
+        char key[96];
+        metrics_engine_key((ds4_metric)i, "", "_seconds", key, sizeof(key));
+        if (ds4_metric_is_ns((ds4_metric)i))
+            buf_printf(b, "\"%s\":%.6f,", key, (double)v[i] / 1e9);
+        else
+            buf_printf(b, "\"%s\":%llu,", key, (unsigned long long)v[i]);
+    }
+    /* Network waits sit inside prefill and decode time on a coordinator, so
+     * they are reported beside the shares rather than as another share. */
+    const double busy = SEC(PREFILL_NS) + SEC(DECODE_NS) + SEC(VISION_NS) +
+                        SEC(KV_SAVE_NS) + SEC(KV_LOAD_NS);
+    const double net_wait = SEC(NET_SEND_NS) + SEC(NET_RECV_NS);
+    const double transport = net_wait - SEC(NET_REMOTE_EVAL_NS);
+    buf_printf(b,
+        "\"derived\":{"
+        "\"prefill_tokens_per_second\":%.3f,"
+        "\"prefill_reuse_ratio\":%.4f,"
+        "\"decode_tokens_per_second\":%.3f,"
+        "\"decode_tokens_per_pass\":%.4f,"
+        "\"decode_rows_per_pass\":%.4f,"
+        "\"vision_seconds_per_image\":%.4f,"
+        "\"network_wait_seconds\":%.6f,"
+        "\"network_transport_seconds_estimate\":%.6f,"
+        "\"ssd_read_mib_per_second\":%.3f,"
+        "\"time_share\":{\"prefill\":%.4f,\"decode\":%.4f,\"vision\":%.4f,"
+        "\"kv_cache\":%.4f,\"idle\":%.4f}}}",
+        metrics_ratio(V(PREFILL_TOKENS), SEC(PREFILL_NS)),
+        metrics_ratio(V(PREFILL_REUSED_TOKENS), V(PREFILL_REUSED_TOKENS) + V(PREFILL_TOKENS)),
+        metrics_ratio(V(DECODE_TOKENS), SEC(DECODE_NS)),
+        metrics_ratio(V(DECODE_TOKENS), V(DECODE_PASSES)),
+        metrics_ratio(V(DECODE_ROWS), V(DECODE_PASSES)),
+        metrics_ratio(SEC(VISION_NS), V(VISION_IMAGES)),
+        net_wait,
+        transport > 0.0 ? transport : 0.0,
+        metrics_ratio(V(SSD_READ_BYTES) / (1024.0 * 1024.0), SEC(SSD_READ_NS)),
+        metrics_ratio(SEC(PREFILL_NS), uptime),
+        metrics_ratio(SEC(DECODE_NS), uptime),
+        metrics_ratio(SEC(VISION_NS), uptime),
+        metrics_ratio(SEC(KV_SAVE_NS) + SEC(KV_LOAD_NS), uptime),
+        uptime > busy ? (uptime - busy) / uptime : 0.0);
+#undef SEC
+#undef V
+
+    buf_puts(b, ",\"server\":{\"requests\":{");
+    for (int i = 0; i < METRICS_ENDPOINT_COUNT; i++)
+        buf_printf(b, "%s\"%s\":%llu", i ? "," : "", metrics_endpoint_names[i],
+                   (unsigned long long)m.requests[i]);
+    buf_printf(b, "},\"http_errors\":%llu,\"finished\":{", (unsigned long long)m.http_errors);
+    for (int i = 0; i < METRICS_FINISH_COUNT; i++)
+        buf_printf(b, "%s\"%s\":%llu", i ? "," : "", metrics_finish_names[i],
+                   (unsigned long long)m.finished[i]);
+    buf_printf(b, "},\"prompt_tokens\":%llu,\"cached_prompt_tokens\":%llu,"
+                  "\"completion_tokens\":%llu,",
+               (unsigned long long)m.prompt_tokens,
+               (unsigned long long)m.cached_prompt_tokens,
+               (unsigned long long)m.completion_tokens);
+    metrics_json_hist(b, "queue_wait_seconds", &m.queue_wait);
+    buf_putc(b, ',');
+    metrics_json_hist(b, "time_to_first_token_seconds", &m.ttft);
+    buf_putc(b, ',');
+    metrics_json_hist(b, "request_duration_seconds", &m.duration);
+    buf_printf(b, ",\"kv_disk\":{\"lookups\":%llu,\"hits\":%llu,\"stores\":%llu},"
+                  "\"image_cache\":{\"hits\":%llu,\"encodes\":%llu},"
+                  "\"slots\":%d,\"context_tokens\":%d,\"active_clients\":%d,"
+                  "\"queued_requests\":%d,\"model_bytes\":%llu,"
+                  "\"resident_memory_bytes\":%llu}}\n",
+               (unsigned long long)m.kv_disk_lookups,
+               (unsigned long long)m.kv_disk_hits,
+               (unsigned long long)m.kv_disk_stores,
+               (unsigned long long)m.image_cache_hits,
+               (unsigned long long)m.image_encodes,
+               s->slot_count, s->ctx_size, live.clients, live.queued,
+               (unsigned long long)(s->engine ? ds4_engine_model_bytes(s->engine) : 0),
+               (unsigned long long)metrics_resident_bytes());
+}
+
+static bool send_metrics(server *s, int fd, bool json) {
+    buf b = {0};
+    if (json) metrics_render_json(s, &b);
+    else metrics_render_prometheus(s, &b);
+    bool ok = http_response(fd, s->enable_cors, 200,
+                            json ? "application/json" : "text/plain; version=0.0.4; charset=utf-8",
+                            b.ptr ? b.ptr : "");
+    buf_free(&b);
+    return ok;
+}
+
+/* --metrics-log N: one line every N seconds with the interval's deltas, for
+ * deployments that keep logs rather than scrape. */
+static void *metrics_log_main(void *arg) {
+    server *s = arg;
+    uint64_t prev[DS4_METRIC_COUNT];
+    ds4_metrics_snapshot(prev);
+    server_metrics prev_srv = metrics_copy();
+    double t_prev = now_sec();
+    while (!g_stop_requested) {
+        for (int i = 0; i < s->metrics_log_interval && !g_stop_requested; i++) sleep(1);
+        if (g_stop_requested) break;
+        uint64_t now[DS4_METRIC_COUNT];
+        ds4_metrics_snapshot(now);
+        const server_metrics srv = metrics_copy();
+        const double t = now_sec();
+        char engine[512];
+        ds4_metrics_summary(now, prev, t - t_prev, engine, sizeof(engine));
+        uint64_t finished = 0, finished_prev = 0;
+        for (int i = 0; i < METRICS_FINISH_COUNT; i++) {
+            finished += srv.finished[i];
+            finished_prev += prev_srv.finished[i];
+        }
+        const uint64_t n_ttft = srv.ttft.total - prev_srv.ttft.total;
+        const uint64_t n_queue = srv.queue_wait.total - prev_srv.queue_wait.total;
+        server_log(DS4_LOG_TIMING,
+                   "ds4-server: metrics %ds: %s | requests %llu done, %llu tok out, "
+                   "ttft avg %.2fs, queue avg %.2fs",
+                   s->metrics_log_interval, engine,
+                   (unsigned long long)(finished - finished_prev),
+                   (unsigned long long)(srv.completion_tokens - prev_srv.completion_tokens),
+                   n_ttft ? (srv.ttft.sum - prev_srv.ttft.sum) / (double)n_ttft : 0.0,
+                   n_queue ? (srv.queue_wait.sum - prev_srv.queue_wait.sum) / (double)n_queue : 0.0);
+        memcpy(prev, now, sizeof(prev));
+        prev_srv = srv;
+        t_prev = t;
+    }
+    return NULL;
+}
+
 static bool send_models(server *s, int fd) {
     buf b = {0};
     buf_puts(&b, "{\"object\":\"list\",\"data\":[");
@@ -15592,6 +16032,13 @@ static void *client_main(void *arg) {
         goto done;
     }
 
+    if (!strcmp(hr.method, "GET") &&
+        (!strcmp(hr.path, "/metrics") || !strcmp(hr.path, "/metrics/json"))) {
+        send_metrics(s, fd, !strcmp(hr.path, "/metrics/json"));
+        http_request_free(&hr);
+        goto done;
+    }
+
     if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models")) {
         send_models(s, fd);
         http_request_free(&hr);
@@ -15630,6 +16077,7 @@ static void *client_main(void *arg) {
         goto done;
     }
     if (ok) req.raw_body = xstrndup(hr.body, hr.body_len);
+    if (ok) metrics_note_request(req.api, req.kind);
     http_request_free(&hr);
     if (!ok) {
         http_error(fd, s->enable_cors, 400, err);
@@ -15727,6 +16175,7 @@ typedef struct {
     ds4_think_mode default_effort;
     const char *chdir_path;
     const char *trace_path;
+    int metrics_log_interval;
     const char *kv_disk_dir;
     uint64_t kv_disk_space_mb;
     kv_cache_options kv_cache;
@@ -15984,6 +16433,8 @@ static server_config parse_options(int argc, char **argv) {
             c.enable_cors = true;
         } else if (!strcmp(arg, "--trace")) {
             c.trace_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--metrics-log")) {
+            c.metrics_log_interval = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--batched-session")) {
             c.batched_sessions = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mixed-prefill-quantum")) {
@@ -16266,6 +16717,7 @@ int main(int argc, char **argv) {
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
+    s.metrics_log_interval = cfg.metrics_log_interval;
     s.slots = xmalloc((size_t)slot_count * sizeof(*s.slots));
     memset(s.slots, 0, (size_t)slot_count * sizeof(*s.slots));
     if (s.batched_mode) {
@@ -16286,6 +16738,7 @@ int main(int argc, char **argv) {
     pthread_mutex_init(&s.model_mu, NULL);
     pthread_cond_init(&s.model_cv, NULL);
     g_sched_origin = now_sec();
+    g_metrics.t_start = g_sched_origin;
     pthread_mutex_init(&s.trace_mu, NULL);
 
     for (int i = 0; i < slot_count; i++) {
@@ -16384,6 +16837,14 @@ int main(int argc, char **argv) {
     }
     g_listen_fd = lfd;
     server_log(DS4_LOG_DEFAULT, "ds4-server: listening on http://%s:%d", cfg.host, cfg.port);
+    pthread_t metrics_thread;
+    bool metrics_thread_started = false;
+    if (s.metrics_log_interval > 0) {
+        metrics_thread_started =
+            pthread_create(&metrics_thread, NULL, metrics_log_main, &s) == 0;
+        if (!metrics_thread_started)
+            server_log(DS4_LOG_WARNING, "ds4-server: failed to start the metrics logger");
+    }
 
     while (!g_stop_requested) {
         int fd = accept(lfd, NULL, NULL);
@@ -16423,6 +16884,7 @@ int main(int argc, char **argv) {
     }
 
     server_log(DS4_LOG_DEFAULT, "ds4-server: shutdown requested, draining requests");
+    if (metrics_thread_started) pthread_join(metrics_thread, NULL);
     server_request_worker_stop(&s);
     if (s.batched_mode) {
         for (int i = 0; i < slot_threads_started; i++) {
@@ -23356,7 +23818,85 @@ static void test_deepseek41_live_result_order(void) {
     pthread_mutex_destroy(&s.tool_mu);
 }
 
+static void test_metrics_histogram(void) {
+    metrics_hist h = {0};
+    metrics_hist_add(&h, 0.01);
+    metrics_hist_add(&h, 0.3);
+    metrics_hist_add(&h, 500.0);
+    TEST_ASSERT(h.count[0] == 1 && h.count[4] == 1 && h.count[METRICS_HIST_BUCKETS] == 1);
+    TEST_ASSERT(h.total == 3 && h.max == 500.0);
+
+    buf b = {0};
+    metrics_prom_hist(&b, "ds4_test_seconds", "help", &h);
+    TEST_ASSERT(strstr(b.ptr, "# TYPE ds4_test_seconds histogram\n") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "ds4_test_seconds_bucket{le=\"0.25\"} 1\n") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "ds4_test_seconds_bucket{le=\"0.5\"} 2\n") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "ds4_test_seconds_bucket{le=\"+Inf\"} 3\n") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "ds4_test_seconds_count 3\n") != NULL);
+    buf_free(&b);
+}
+
+static int test_count_char(const char *s, char c) {
+    int n = 0;
+    for (; *s; s++) n += *s == c;
+    return n;
+}
+
+static void test_metrics_export(void) {
+    server s;
+    memset(&s, 0, sizeof(s));
+    pthread_mutex_init(&s.mu, NULL);
+    s.slot_count = 2;
+    s.ctx_size = 4096;
+
+    metrics_note_request(API_OPENAI, REQ_CHAT);
+    metrics_note_request(API_ANTHROPIC, REQ_CHAT);
+    metrics_note_request_done("tool_calls", 100, 40, 10, 0.5, 1.0, 2.0);
+    metrics_note_request_done("length", 10, 0, 0, 0.0, -1.0, 0.1);
+    metrics_note_kv_lookup(true);
+    metrics_note_kv_lookup(false);
+    metrics_note_image(false);
+    ds4_metric_add(DS4_METRIC_DECODE_TOKENS, 5);
+    ds4_metric_add(DS4_METRIC_DECODE_NS, 1000000000ull);
+
+    buf b = {0};
+    metrics_render_prometheus(&s, &b);
+    TEST_ASSERT(strstr(b.ptr, "# TYPE ds4_prefill_tokens_total counter\n") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "# TYPE ds4_decode_seconds_total counter\n") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "ds4_server_requests_total{endpoint=\"chat\"} 1\n") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "ds4_server_requests_total{endpoint=\"messages\"} 1\n") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "ds4_server_requests_finished_total{finish=\"stop\"} 1\n") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "ds4_server_requests_finished_total{finish=\"length\"} 1\n") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "ds4_server_cached_prompt_tokens_total 40\n") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "ds4_server_time_to_first_token_seconds_count 1\n") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "ds4_server_request_duration_seconds_count 2\n") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "ds4_server_kv_disk_lookups_total{result=\"miss\"} 1\n") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "ds4_server_image_embeddings_total{result=\"encoded\"} 1\n") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "ds4_server_slots 2\n") != NULL);
+    buf_free(&b);
+
+    metrics_render_json(&s, &b);
+    TEST_ASSERT(b.len > 2 && b.ptr[0] == '{' && b.ptr[b.len - 2] == '}' && b.ptr[b.len - 1] == '\n');
+    TEST_ASSERT(test_count_char(b.ptr, '{') == test_count_char(b.ptr, '}'));
+    TEST_ASSERT(strstr(b.ptr, "\"decode_seconds\":1.000000,") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"decode_tokens_per_second\":5.000,") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"time_share\":{") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"requests\":{\"chat\":1,\"completions\":0,\"responses\":0,\"messages\":1}") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"time_to_first_token_seconds\":{\"count\":1,\"avg\":1.000000,\"max\":1.000000}") != NULL);
+    buf_free(&b);
+
+    char line[512];
+    uint64_t v[DS4_METRIC_COUNT];
+    ds4_metrics_snapshot(v);
+    ds4_metrics_summary(v, NULL, 10.0, line, sizeof(line));
+    TEST_ASSERT(strstr(line, "decode 5 tok 1.0s 5.0 t/s") != NULL);
+    TEST_ASSERT(strstr(line, "decode 10%") != NULL);
+    pthread_mutex_destroy(&s.mu);
+}
+
 static void ds4_server_unit_tests_run(void) {
+    test_metrics_histogram();
+    test_metrics_export();
     test_deepseek41_server_stream();
     test_deepseek41_server_tools();
     test_deepseek41_anthropic_results();

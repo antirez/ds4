@@ -430,7 +430,15 @@ static int tp_tcp_exchange(ds4_tp *tp, ds4_tp_gate_header *header,
     const bool changed = !(flags & O_NONBLOCK);
     if (changed && fcntl(tp->data_fd, F_SETFL, flags | O_NONBLOCK) < 0) return 0;
 #endif
+    const uint64_t t0 = ds4_metric_now_ns();
     const int ok = tp_tcp_exchange_io(tp, header, peer_header, out, in, bytes);
+    /* A gate is a full-duplex exchange: both directions move `bytes`, and
+     * the whole wall time is time this rank could not compute. */
+    const uint64_t wire = bytes + (header ? sizeof(*header) : 0);
+    ds4_metric_add(DS4_METRIC_NET_GATES, 1);
+    ds4_metric_add(DS4_METRIC_NET_SEND_BYTES, wire);
+    ds4_metric_add(DS4_METRIC_NET_RECV_BYTES, wire);
+    ds4_metric_add(DS4_METRIC_NET_RECV_NS, ds4_metric_now_ns() - t0);
 #ifdef __APPLE__
     const int saved_errno = errno;
     if (changed && fcntl(tp->data_fd, F_SETFL, flags) < 0) return 0;
@@ -1921,6 +1929,7 @@ static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint
     ds4_tp_rdma *r = &tp->rdma;
     const uint32_t slot = layer * DS4_TP_GATES_PER_LAYER + gate;
     if (g_rdma_stat_enabled < 0) g_rdma_stat_enabled = getenv("DS4_TP_GATE_PROFILE") != NULL;
+    const uint64_t gate_t0 = ds4_metric_now_ns();
     const double st0 = g_rdma_stat_enabled ? tp_now_sec() : 0.0;
     double st1 = 0.0;
     if (getenv("DS4_TP_GATE_TRACE")) {
@@ -2004,6 +2013,10 @@ static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint
     if (ok) ok = tp_rdma_post_gate_recv(tp, seq + DS4_TP_RDMA_RECV_WINDOW);
     if (ok) r->last_gate_seq = seq;
     pthread_mutex_unlock(&r->post_lock);
+    ds4_metric_add(DS4_METRIC_NET_GATES, 1);
+    ds4_metric_add(DS4_METRIC_NET_SEND_BYTES, tp->vec_bytes);
+    ds4_metric_add(DS4_METRIC_NET_RECV_BYTES, tp->vec_bytes);
+    ds4_metric_add(DS4_METRIC_NET_RECV_NS, ds4_metric_now_ns() - gate_t0);
     return ok;
 }
 
