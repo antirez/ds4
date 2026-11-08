@@ -453,6 +453,63 @@ static void pool_update(ds4_glm_gpu_graph *g, ds4_gpu_tensor *x,
     assert(ds4_gpu_synchronize());
 }
 
+/* The pair starting at top_k - 1 previously reached the verifier with a
+ * one-row chunk and invalidated the session. Nearby pairs must still use
+ * MTP, and GLM 5.3's mixed attention path must remain eligible. */
+static void test_glm_mtp_boundary(void) {
+    const ds4_shape saved_shape = g_ds4_shape;
+    g_ds4_shape = DS4_SHAPE_GLM53;
+    ds4_glm_gpu_graph *g = calloc(1, sizeof(*g));
+    assert(g);
+    const uint32_t limit = glm_graph_indexer_top_k_limit();
+    for (uint32_t pos = limit - 2u; pos <= limit + 1u; pos++) {
+        g->glm53 = false;
+        const bool bridge = glm_graph_mtp_needs_boundary_step(g, pos);
+        assert(bridge == (pos == limit - 1u));
+        if (!bridge) assert(glm_graph_limit_indexed_prefill_chunk(g, pos, 2u) == 2u);
+        g->glm53 = true;
+        assert(!glm_graph_mtp_needs_boundary_step(g, pos));
+    }
+    free(g);
+    g_ds4_shape = saved_shape;
+}
+
+#ifdef __APPLE__
+static void test_glm_mixed_ssd_prefill(void) {
+    const char *flag = "DS4_METAL_DISABLE_GLM_MIXED_PREFILL";
+    const char *previous = getenv(flag);
+    char *saved = previous ? strdup(previous) : NULL;
+    assert(!previous || saved);
+    assert(unsetenv(flag) == 0);
+    const ds4_shape saved_shape = g_ds4_shape;
+    g_ds4_shape = DS4_SHAPE_GLM52;
+    ds4_glm_gpu_graph *g = calloc(1, sizeof(*g));
+    ds4_gpu_tensor *scratch = ds4_gpu_tensor_alloc(sizeof(float));
+    assert(g && scratch);
+    g->ssd_streaming = g->generic_routed_moe = true;
+    g->layer_count = glm_graph_normal_layer_count();
+    g->indexed_prefill_cap = g->indexed_prefill_score_cap = g->compact_cache_cap = 4096;
+    g->batch_indexer_q = g->batch_indexer_weights = g->batch_indexer_scores = scratch;
+    g->batch_indexer_selected = g->batch_qk_low = g->batch_attn_lora = scratch;
+    const uint32_t limit = glm_graph_indexer_top_k_limit();
+    assert(glm_graph_limit_indexed_prefill_chunk(g, 0, 4096) == 4096);
+    assert(glm_graph_limit_indexed_prefill_chunk(g, limit - 256, 512) == 512);
+    assert(glm_graph_limit_indexed_prefill_chunk(g, limit - 255, 512) == 255);
+    assert(glm_graph_limit_indexed_prefill_chunk(g, limit - 256, 511) == 256);
+    assert(glm_graph_mtp_needs_boundary_step(g, limit - 1));
+    g->tp_world = 2;
+    assert(glm_graph_limit_indexed_prefill_chunk(g, 0, 4096) == limit);
+    g->tp_world = 1;
+    assert(setenv(flag, "1", 1) == 0);
+    assert(glm_graph_limit_indexed_prefill_chunk(g, 0, 4096) == limit);
+    assert(saved ? setenv(flag, saved, 1) == 0 : unsetenv(flag) == 0);
+    free(saved);
+    ds4_gpu_tensor_free(scratch);
+    free(g);
+    g_ds4_shape = saved_shape;
+}
+#endif
+
 static void test_glm_spec_rollback(void) {
     const ds4_shape saved_shape = g_ds4_shape;
     g_ds4_shape = DS4_SHAPE_GLM53;
@@ -768,6 +825,10 @@ int main(void) {
     test_text_observations();
 #ifndef DS4_NO_GPU
     test_glm_attention_budget();
+    test_glm_mtp_boundary();
+#ifdef __APPLE__
+    test_glm_mixed_ssd_prefill();
+#endif
     test_glm_spec_rollback();
 #endif
 #if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)

@@ -85,11 +85,47 @@ static void check(uint32_t rows, uint32_t keys, uint32_t start, unsigned pattern
     ds4_gpu_tensor_free(qt);
 }
 
+/* Packing heads into a WMMA tile must reproduce the token-tiled kernel
+ * for both cache precisions, including partial tiles and tied score keys. */
+static void check_glm_one(uint32_t rows, bool half_keys) {
+    const unsigned heads = 32, dim = 128;
+    const float guard = -9182.0f, scale = 1.0f / 64.0f;
+    std::vector<float> q(heads * dim), w(heads), k((size_t)rows * dim);
+    std::vector<__half> half(k.size());
+    for (float &v : q) v = random_value();
+    for (float &v : w) v = random_value();
+    for (size_t i = 0; i < k.size(); i++) {
+        k[i] = i >= dim && (i / dim) % 3 == 0 ? k[i % dim] : random_value();
+        half[i] = __float2half(k[i]);
+    }
+    const size_t key_bytes = k.size() * (half_keys ? sizeof(__half) : sizeof(float));
+    ds4_gpu_tensor *qt = ds4_gpu_tensor_alloc(q.size() * sizeof(float));
+    ds4_gpu_tensor *wt = ds4_gpu_tensor_alloc(w.size() * sizeof(float));
+    ds4_gpu_tensor *kt = ds4_gpu_tensor_alloc(key_bytes);
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc((rows + 1u) * sizeof(float));
+    CHECK(qt && wt && kt && out && ds4_gpu_tensor_write(qt, 0, q.data(), q.size() * sizeof(float)) &&
+          ds4_gpu_tensor_write(wt, 0, w.data(), w.size() * sizeof(float)) &&
+          ds4_gpu_tensor_write(kt, 0, half_keys ? (const void *)half.data() : k.data(), key_bytes));
+    std::vector<float> expected(rows + 1), got(rows + 1);
+    CHECK(ds4_gpu_tensor_fill_f32(out, guard, rows + 1) &&
+          ds4_gpu_glm_indexer_scores_batch_tensor(out, qt, wt, kt, rows, 1, rows - 1, heads, dim, scale, half_keys) &&
+          ds4_gpu_tensor_read(out, 0, expected.data(), expected.size() * sizeof(float)));
+    CHECK(ds4_gpu_tensor_fill_f32(out, guard, rows + 1) &&
+          ds4_gpu_glm_indexer_score_one_tensor(out, qt, wt, kt, rows, heads, dim, scale, half_keys) &&
+          ds4_gpu_tensor_read(out, 0, got.data(), got.size() * sizeof(float)));
+    CHECK(got.back() == guard && !memcmp(expected.data(), got.data(), got.size() * sizeof(float)));
+    ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(kt); ds4_gpu_tensor_free(wt); ds4_gpu_tensor_free(qt);
+}
+
 int main() {
     CHECK(ds4_gpu_init());
     ds4_gpu_set_quality(false);
     for (const char *name : {"DS4_CUDA_NO_INDEXER_WMMA", "DS4_CUDA_NO_INDEXER_WMMA64",
                             "DS4_CUDA_NO_INDEXER_DIRECT_ONE"}) CHECK(unsetenv(name) == 0);
+    for (uint32_t keys : {1u, 15u, 16u, 63u, 64u, 65u, 2051u, 16385u}) {
+        check_glm_one(keys, false);
+        check_glm_one(keys, true);
+    }
     unsigned cases = 0;
     for (unsigned pattern = 0; pattern < 3; pattern++) {
         for (uint32_t keys : {1u, 15u, 16u, 17u, 513u, 1025u, 4096u, 4097u, 8195u}) {

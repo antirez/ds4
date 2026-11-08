@@ -60,6 +60,13 @@ bool ds4_engram_read(const ds4_engram_table *table, const uint32_t *rows,
 bool ds4_engram_read_batch(const ds4_engram_table *table, const uint32_t *rows,
                            size_t tokens, size_t stride, float *out);
 
+/* The same read on a worker: `rows` and `out` stay the caller's until finish,
+ * which joins the worker and returns its result. */
+typedef struct ds4_engram_prefetch ds4_engram_prefetch;
+ds4_engram_prefetch *ds4_engram_read_batch_start(const ds4_engram_table *table, const uint32_t *rows,
+                                                 size_t tokens, size_t stride, float *out);
+bool ds4_engram_read_batch_finish(ds4_engram_prefetch *prefetch);
+
 /* One reusable reader for a token's two tables. Tables/IDs are copied at
  * start; descriptors and output must remain valid until wait(reader, 1) or
  * free, even if wait(reader, 0) reports an error. No table data is cached.
@@ -70,5 +77,14 @@ bool ds4_engram_reader_start(ds4_engram_reader *reader,
     const ds4_engram_table tables[2], const uint32_t ids[2][DS4_ENGRAM_COLS], float *out);
 bool ds4_engram_reader_wait(ds4_engram_reader *reader, unsigned table);
 void ds4_engram_reader_free(ds4_engram_reader *reader);
+
+/* Background sequential read of [offset, offset + bytes) into the kernel page
+ * cache, so the uncached row readers above hit memory. No table allocation;
+ * stops early at memory pressure. Wait reports whether it covered the span. */
+typedef struct ds4_engram_warm ds4_engram_warm;
+uint64_t ds4_engram_physical_memory(void);
+ds4_engram_warm *ds4_engram_warm_start(const char *path, uint64_t offset, uint64_t bytes);
+bool ds4_engram_warm_wait(ds4_engram_warm *warm, double *seconds);
+void ds4_engram_warm_stop(ds4_engram_warm *warm);
 
 #endif

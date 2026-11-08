@@ -115,8 +115,9 @@ enum {
     DS4_TP_MODE_V41_DSPARK = 8u,
 };
 /* Call on both engines before binding the GPU slab. Resident layouts and
- * shared-expert ownership must match before either rank can reduce results. */
-int ds4_tp_agree_execution_mode(ds4_tp *tp, uint32_t flags, char *err, size_t errlen);
+ * shared-expert ownership must match before either rank can reduce results.
+ * full_experts is a local capability on entry, the intersection on return. */
+int ds4_tp_agree_execution_mode(ds4_tp *tp, uint32_t flags, bool *full_experts, char *err, size_t errlen);
 bool ds4_tp_failed(const ds4_tp *tp);
 void ds4_tp_mark_failed(ds4_tp *tp);
 

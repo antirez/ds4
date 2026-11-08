@@ -13,7 +13,7 @@ import sys
 
 from deepseek41_metadata import GGUF_ALIGNMENT
 from deepseek41_quantize import (SourceDB, NativeQuantizer, Imatrix, build_plan,
-                                  validate_scales, scale_name, QUANTIZATION)
+                                  validate_scales, scale_name, QUANTIZATION, QTYPE_MXFP4)
 from glm53_quantize import (align, read_exact, read_u32, read_u64,
                             read_gguf_string, skip_gguf_value)
 from glm53_validate_gguf import read_selected_metadata
@@ -37,9 +37,12 @@ def check_payload(fp, offset, item, db, quantizer, imatrix):
         selected = {0, (item.expert_layer * 17 + 41) % item.expert_count, item.expert_count - 1}
         stride = item.nbytes // item.expert_count
         for expert in sorted(selected):
-            values = quantizer.to_f32(db, item.source.format(expert=expert))
-            importance = imatrix.expert(item.name, expert, item.shape[0], item.expert_count)
-            expected = quantizer.encode(values, item.qtype, importance)
+            if item.qtype == QTYPE_MXFP4:
+                expected = quantizer.to_mxfp4(db, item.source.format(expert=expert))
+            else:
+                values = quantizer.to_f32(db, item.source.format(expert=expert))
+                importance = imatrix.expert(item.name, expert, item.shape[0], item.expert_count)
+                expected = quantizer.encode(values, item.qtype, importance)
             fp.seek(offset + expert * stride)
             if len(expected) != stride or read_exact(fp, stride, item.name) != expected:
                 raise ValueError(f"{item.name}: encoded expert {expert} differs from source recipe")

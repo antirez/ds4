@@ -1,0 +1,5 @@
+run,switch,ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,gen_first_ms,gen_steady_tokens,gen_steady_tps,kvcache_bytes
+1,0,2048,2048,57.20,512,10.48,415.628,511,10.56,0
+2,1,2048,2048,58.40,512,12.62,349.182,511,12.71,0
+3,1,2048,2048,54.56,512,12.29,372.023,511,12.38,0
+4,0,2048,2048,60.76,512,11.05,321.077,511,11.11,0

@@ -148,6 +148,8 @@ typedef struct ds4_gpu_stream_expert_table {
 } ds4_gpu_stream_expert_table;
 extern "C" int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
     const ds4_gpu_stream_expert_table *, const ds4_gpu_tensor *, uint32_t);
+static int cuda_stream_selected_cache_begin_load_tensor(
+    const ds4_gpu_stream_expert_table *, const ds4_gpu_tensor *, uint32_t, bool);
 extern "C" uint32_t ds4_gpu_stream_expert_cache_budget_for_expert_size(uint64_t, uint64_t);
 
 typedef struct {
@@ -13880,24 +13882,24 @@ __global__ static void indexer_score_one_direct_kernel(
         }
     }
 
-    __shared__ float krow[128];
-    __shared__ float partial[4];
-    if (tid < 128u) krow[tid] = index_comp[(uint64_t)c * 128u + tid];
-    __syncthreads();
-
-    float total = 0.0f;
-    for (uint32_t h0 = 0; h0 < 64u; h0 += 4u) {
-        const uint32_t h = h0 + warp;
+    /* Each warp can finish all its heads before the block reduces them.
+     * Keep the original four-head grouping and accumulation order. */
+    __shared__ float partial[64];
+    const float4 kv = ((const float4 *)(index_comp + (uint64_t)c * 128u))[lane];
+    for (uint32_t h = warp; h < 64u; h += 4u) {
         const float4 qv = ((const float4 *)(q + (uint64_t)h * 128u))[lane];
-        const float4 kv = ((const float4 *)krow)[lane];
         float dot = qv.x * kv.x + qv.y * kv.y + qv.z * kv.z + qv.w * kv.w;
         dot = warp_sum_f32(dot);
-        if (lane == 0) partial[warp] = fmaxf(dot, 0.0f) * weights[h] * scale;
-        __syncthreads();
-        if (tid == 0) total += partial[0] + partial[1] + partial[2] + partial[3];
-        __syncthreads();
+        if (lane == 0) partial[h] = fmaxf(dot, 0.0f) * weights[h] * scale;
     }
-    if (tid == 0) scores[c] = total;
+    __syncthreads();
+    if (tid == 0) {
+        float total = 0.0f;
+        #pragma unroll
+        for (uint32_t h = 0; h < 64u; h += 4u)
+            total += partial[h] + partial[h + 1u] + partial[h + 2u] + partial[h + 3u];
+        scores[c] = total;
+    }
 }
 
 __global__ static void indexer_scores_wmma_kernel(
@@ -26143,8 +26145,8 @@ static int routed_moe_launch(
             model_map, model_size, layer_index, n_total_expert,
             gate_offset, up_offset, down_offset, gate_expert_bytes, down_expert_bytes};
         if ((uint64_t)n_tokens * n_expert > UINT32_MAX ||
-            !ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
-                &table, selected, n_tokens * n_expert)) return 0;
+            !cuda_stream_selected_cache_begin_load_tensor(
+                &table, selected, n_tokens * n_expert, n_tokens > 1)) return 0;
         allow_streaming = 1;
     }
 
@@ -29013,7 +29015,8 @@ struct cuda_stream_upload_batch {
 static int cuda_stream_selected_cache_begin_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t *selected_ids,
-        uint32_t slot_count) {
+        uint32_t slot_count,
+        bool order_reads = false) {
     cuda_stream_prefetch_before_load(table);
     cuda_stream_selected_cache_invalidate();
     if (!g_ssd_streaming_mode) return 1;
@@ -29117,8 +29120,32 @@ static int cuda_stream_selected_cache_begin_load(
             slots[i] = (int32_t)found->second;
             slot.used = stamp;
         }
+        /* Route-driven staging: retain the router/remap order,
+         * but assign misses in file order so adjacent source and cache ranges
+         * can share a read. Apply this by default to batched prefill: small
+         * single-token loads can lose decode throughput with a tight cache.
+         * Keep both orders available for comparisons and failure tests. */
+        const bool ordered = getenv("DS4_CUDA_DISABLE_SSD_SORT_SELECTED_READS") == NULL &&
+            (order_reads || getenv("DS4_CUDA_SSD_SORT_SELECTED_READS") != NULL);
+        struct selected_copy {
+            char *destination;
+            uint64_t offset, bytes;
+            unsigned part;
+        };
+        std::vector<size_t> order, pending;
+        std::vector<selected_copy> copies;
+        if (ordered) {
+            order.reserve(unique.size());
+            pending.reserve(unique.size());
+            copies.reserve(unique.size() * 3u);
+            for (size_t i = 0; i < unique.size(); i++) order.push_back(i);
+            std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+                return unique[a] < unique[b];
+            });
+        }
         cuda_stream_upload_batch uploads;
-        for (size_t i = 0; i < unique.size(); i++) {
+        for (size_t at = 0; at < unique.size(); at++) {
+            const size_t i = ordered ? order[at] : at;
             if (slots[i] >= 0) continue;
             uint32_t victim = UINT32_MAX;
             uint64_t oldest = stamp;
@@ -29130,7 +29157,11 @@ static int cuda_stream_selected_cache_begin_load(
                     if (!oldest) break;
                 }
             }
-            if (victim == UINT32_MAX) return 0;
+            if (victim == UINT32_MAX) {
+                for (size_t index : pending)
+                    g_stream_expert_slots[slots[index]].used = 0;
+                return 0;
+            }
             auto &slot = g_stream_expert_slots[victim];
             if (slot.used) g_stream_expert_by_gate.erase(slot.gate);
             slot.used = 0;
@@ -29138,8 +29169,17 @@ static int cuda_stream_selected_cache_begin_load(
             const uint64_t gate = table->gate_offset + expert * table->gate_expert_bytes;
             const uint64_t up = table->up_offset + expert * table->gate_expert_bytes;
             const uint64_t down = table->down_offset + expert * table->down_expert_bytes;
-            uploads.active = true;
-            if (!cuda_model_copy_to_device_streamed(
+            if (ordered) {
+                copies.push_back({cache.gate_ptr + (uint64_t)victim * table->gate_expert_bytes,
+                    gate, table->gate_expert_bytes, 0});
+                copies.push_back({cache.up_ptr + (uint64_t)victim * table->gate_expert_bytes,
+                    up, table->gate_expert_bytes, 1});
+                copies.push_back({cache.down_ptr + (uint64_t)victim * table->down_expert_bytes,
+                    down, table->down_expert_bytes, 2});
+                pending.push_back(i);
+            } else {
+                uploads.active = true;
+                if (!cuda_model_copy_to_device_streamed(
                     cache.gate_ptr + (uint64_t)victim * table->gate_expert_bytes,
                     table->model_map, table->model_size, gate, table->gate_expert_bytes, "stream gate", uploads.chunks) ||
                 !cuda_model_copy_to_device_streamed(
@@ -29148,12 +29188,56 @@ static int cuda_stream_selected_cache_begin_load(
                 !cuda_model_copy_to_device_streamed(
                     cache.down_ptr + (uint64_t)victim * table->down_expert_bytes,
                     table->model_map, table->model_size, down, table->down_expert_bytes, "stream down", uploads.chunks))
-                return 0;
+                    return 0;
+            }
             slot = {gate, up, down, stamp};
-            g_stream_expert_by_gate[gate] = victim;
+            /* Ordered copies are still pending. Protect their slots, but do
+             * not advertise a cache hit until every upload has completed. */
+            if (!ordered) g_stream_expert_by_gate[gate] = victim;
             slots[i] = (int32_t)victim;
         }
+        if (ordered) {
+            std::sort(copies.begin(), copies.end(), [](const selected_copy &a, const selected_copy &b) {
+                return a.offset < b.offset;
+            });
+            size_t merged = 0;
+            for (const auto copy : copies) {
+                if (merged && copies[merged - 1u].part == copy.part &&
+                    copies[merged - 1u].offset + copies[merged - 1u].bytes == copy.offset &&
+                    copies[merged - 1u].destination + copies[merged - 1u].bytes == copy.destination)
+                    copies[merged - 1u].bytes += copy.bytes;
+                else copies[merged++] = copy;
+            }
+            uint64_t complete_until[3] = {0, 0, 0};
+            for (size_t i = 0; i < merged; i++) {
+                const auto &copy = copies[i];
+                uploads.active = true;
+                if (!cuda_model_copy_to_device_streamed(copy.destination,
+                        table->model_map, table->model_size, copy.offset, copy.bytes,
+                        "ordered selected experts", uploads.chunks)) {
+                    /* Preserve only experts whose three complete ranges
+                     * have actually reached the GPU. Drain before publishing
+                     * those hits or releasing any failed reservation. */
+                    if (!uploads.finish()) return 0;
+                    for (size_t index : pending) {
+                        const uint32_t slot_index = (uint32_t)slots[index];
+                        auto &slot = g_stream_expert_slots[slot_index];
+                        if (slot.gate + table->gate_expert_bytes <= complete_until[0] &&
+                            slot.up + table->gate_expert_bytes <= complete_until[1] &&
+                            slot.down + table->down_expert_bytes <= complete_until[2])
+                            g_stream_expert_by_gate[slot.gate] = slot_index;
+                        else slot.used = 0;
+                    }
+                    return 0;
+                }
+                complete_until[copy.part] = copy.offset + copy.bytes;
+            }
+        }
         if (!uploads.finish()) return 0;
+        if (ordered) for (size_t i : pending) {
+            const uint32_t slot = (uint32_t)slots[i];
+            g_stream_expert_by_gate[g_stream_expert_slots[slot].gate] = slot;
+        }
         g_stream_prefill_ids = remap;
         g_stream_prefill_slots = slots;
         for (auto &id : remap) id = slots[id];
@@ -32654,6 +32738,49 @@ __global__ static void glm_indexer_scores_wmma128_kernel(
 #endif
 }
 
+/* With one token the rows of a tensor-core tile can cover query heads.
+ * Each column is one key. The dot products retain the same eight MMA steps
+ * as batched scoring, then a lane sums that key's 32 heads in model order. */
+template<typename CT>
+__global__ static void glm_indexer_scores_one_wmma_kernel(float *scores, const float *q,
+        const float *weights, const CT *keys, uint32_t rows, float scale) {
+#if __CUDA_ARCH__ >= 700
+    namespace wmma = nvcuda::wmma;
+    const uint32_t tid = threadIdx.x, warp = tid / 32u, lane = tid % 32u;
+    const uint32_t base = blockIdx.x * 64u;
+    __shared__ __align__(32) __half queries[32u * 128u];
+    __shared__ __align__(32) __half cache[64u * 128u];
+    __shared__ __align__(32) float dots[4][16u * 16u];
+    for (uint32_t i = tid; i < 32u * 128u; i += 128u) queries[i] = __float2half(q[i]);
+    for (uint32_t i = tid; i < 64u * 128u; i += 128u)
+        cache[i] = base + i / 128u < rows ? __float2half((float)keys[(uint64_t)base * 128u + i]) :
+                                           __float2half(0.0f);
+    __syncthreads();
+
+    float total = 0.0f;
+    for (uint32_t h = 0; h < 32u; h += 16u) {
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> qa;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> kb;
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+        wmma::fill_fragment(acc, 0.0f);
+        for (uint32_t k = 0; k < 128u; k += 16u) {
+            wmma::load_matrix_sync(qa, queries + h * 128u + k, 128);
+            wmma::load_matrix_sync(kb, cache + warp * 16u * 128u + k, 128);
+            wmma::mma_sync(acc, qa, kb, acc);
+        }
+        wmma::store_matrix_sync(dots[warp], acc, 16, wmma::mem_row_major);
+        __syncwarp();
+        if (lane < 16u) {
+            for (uint32_t j = 0; j < 16u; j++)
+                total += fmaxf(dots[warp][j * 16u + lane], 0.0f) * weights[h + j];
+        }
+        __syncwarp();
+    }
+    const uint32_t row = base + warp * 16u + lane;
+    if (lane < 16u && row < rows) scores[row] = total * scale;
+#endif
+}
+
 static int glm_indexer_scores_launch(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,
@@ -32679,6 +32806,19 @@ static int glm_indexer_scores_launch(
         indexer_key_cache->bytes < (uint64_t)n_rows * head_dim * cache_elem ||
         scores->bytes < (uint64_t)n_tokens * n_rows * sizeof(float)) {
         return 0;
+    }
+    if (!g_quality_mode && !causal && n_tokens == 1u && n_head == 32u &&
+        ds4_gpu_device_is_spark() && !getenv("DS4_CUDA_DISABLE_GLM_INDEX_HEAD_TILE")) {
+        const uint32_t blocks = (n_rows - 1u) / 64u + 1u;
+        if (cache_f16)
+            glm_indexer_scores_one_wmma_kernel<<<blocks, 128>>>((float *)scores->ptr,
+                (const float *)q->ptr, (const float *)weights->ptr,
+                (const __half *)indexer_key_cache->ptr, n_rows, scale);
+        else
+            glm_indexer_scores_one_wmma_kernel<<<blocks, 128>>>((float *)scores->ptr,
+                (const float *)q->ptr, (const float *)weights->ptr,
+                (const float *)indexer_key_cache->ptr, n_rows, scale);
+        return cuda_ok(cudaGetLastError(), "GLM one-token index scores");
     }
     if (!g_quality_mode) {
         dim3 grid((n_rows + 127u) / 128u,
@@ -34773,10 +34913,11 @@ extern "C" int ds4_gpu_glm_store_indexer_k_tensor(
     return cuda_ok(cudaGetLastError(), "glm store indexer k launch");
 }
 
-extern "C" int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
+static int cuda_stream_selected_cache_begin_load_tensor(
         const ds4_gpu_stream_expert_table *table,
         const ds4_gpu_tensor              *selected,
-        uint32_t                           n_selected) {
+        uint32_t                           n_selected,
+        bool                               order_reads) {
     if (!g_ssd_streaming_mode) return 1;
     if (!table || !selected || n_selected == 0 ||
         selected->bytes < (uint64_t)n_selected * sizeof(int32_t)) {
@@ -34794,7 +34935,14 @@ extern "C" int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
                  "GLM streaming selected-id read")) {
         return 0;
     }
-    return cuda_stream_selected_cache_begin_load(table, ids.data(), n_selected);
+    return cuda_stream_selected_cache_begin_load(table, ids.data(), n_selected, order_reads);
+}
+
+extern "C" int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
+        const ds4_gpu_stream_expert_table *table,
+        const ds4_gpu_tensor *selected,
+        uint32_t n_selected) {
+    return cuda_stream_selected_cache_begin_load_tensor(table, selected, n_selected, false);
 }
 
 __global__ static void glm_value_project_q8_0_batch_heads_kernel(
@@ -35690,7 +35838,7 @@ extern "C" int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         return 0;
     }
     return cuda_stream_selected_cache_begin_load(
-            table, selected_ids, n_tokens * n_selected);
+            table, selected_ids, n_tokens * n_selected, n_tokens > 1);
 }
 
 extern "C" int ds4_gpu_stream_expert_cache_seed_experts(
