@@ -437,6 +437,12 @@ static char *json_minify_raw_value(const char *json) {
 
 #define SERVER_IMAGE_MARKER_BYTES 64
 
+/* The model has no image limit of its own: a request is bounded by how many
+ * image tokens fit the context window.  The ceiling only keeps a request that
+ * names millions of images from sizing heap arrays before that check runs;
+ * it is far above what any real context window holds. */
+#define SERVER_MAX_IMAGES 4096
+
 typedef struct {
     char marker[SERVER_IMAGE_MARKER_BYTES];
     uint8_t *encoded;
@@ -3658,9 +3664,6 @@ static DS4_SERVER_MAYBE_UNUSED char *render_chat_prompt_text(
                                               tool_orders, think_mode);
 }
 
-/* Per-request image cap; session and TP image state is sized dynamically. */
-#define SERVER_MAX_IMAGES 256
-
 static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
                                                request *r,
                                                const chat_msgs *msgs,
@@ -3670,6 +3673,11 @@ static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
     if (count == 0) {
         ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
         return true;
+    }
+    if (count > SERVER_MAX_IMAGES) {
+        snprintf(err, errlen, "too many images; at most %d are allowed",
+                 SERVER_MAX_IMAGES);
+        return false;
     }
     if (!e || !s || !ds4_engine_has_vision(e)) {
         snprintf(err, errlen, "image input requires starting ds4-server with --vision FILE");
@@ -9984,7 +9992,8 @@ static void visible_image_key_free(visible_image_key *images) {
 static char *visible_prompt_key(const request *req, const char *text,
                                  visible_image_key *images) {
     memset(images, 0, sizeof(*images));
-    if (!req || !text || (req->image_count && !req->image_markers)) return NULL;
+    if (!req || !text || req->image_count > SERVER_MAX_IMAGES ||
+        (req->image_count && !req->image_markers)) return NULL;
     char *key = xstrdup(text);
     if (req->image_count)
         images->offsets = xmalloc(req->image_count * sizeof(images->offsets[0]));
@@ -11530,7 +11539,8 @@ static bool build_live_prompt_suffix(server *s, server_slot *slot,
                                       const request *req, const char *suffix,
                                       ds4_tokens *out) {
     const ds4_tokens *live = ds4_session_tokens(slot->session);
-    if (!live || !suffix || (req->image_count && !req->image_markers)) return false;
+    if (!live || !suffix || req->image_count > SERVER_MAX_IMAGES ||
+        (req->image_count && !req->image_markers)) return false;
     ds4_vision_span *spans = req->image_count ?
         xmalloc(req->image_count * sizeof(spans[0])) : NULL;
     size_t old_count = req->image_count;
@@ -15335,6 +15345,7 @@ static bool read_http_request(int fd, http_request *r) {
     ssize_t hend = -1;
     const size_t max_header = 64 * 1024;
     const size_t max_body = (size_t)4 << 30;
+    const size_t body_chunk = 1 << 20;
 
     while (hend < 0 && b.len < max_header) {
         char tmp[4096];
@@ -15360,13 +15371,22 @@ static bool read_http_request(int fd, http_request *r) {
     long long clen = content_length(b.ptr, (size_t)hend);
     if (clen < 0 || (unsigned long long)clen > max_body) goto fail;
     r->body_len = (size_t)clen;
-    r->body = xmalloc(r->body_len + 1);
     size_t got = b.len - (size_t)hend;
     if (got > r->body_len) got = r->body_len;
+    /* Content-Length is a claim, not a receipt: a client could advertise
+     * gigabytes and never send them.  Grow the buffer one chunk ahead of the
+     * bytes actually received instead of reserving the whole body up front. */
+    size_t cap = got + 1;
+    r->body = xmalloc(cap);
     memcpy(r->body, b.ptr + hend, got);
     buf_free(&b);
     while (got < r->body_len) {
-        ssize_t n = recv(fd, r->body + got, r->body_len - got, 0);
+        if (got + 1 == cap) {
+            cap = got + body_chunk + 1;
+            if (cap > r->body_len + 1) cap = r->body_len + 1;
+            r->body = xrealloc(r->body, cap);
+        }
+        ssize_t n = recv(fd, r->body + got, cap - 1 - got, 0);
         if (n < 0 && errno == EINTR) continue;
         if (n <= 0) {
             free(r->body);
@@ -23113,6 +23133,122 @@ static void test_visible_image_key(void) {
     free(visible);
 }
 
+/* A request may name far more images than any context window holds; the
+ * ceiling must turn it away before image_count sizes a heap array, and
+ * without needing an engine, so the check runs ahead of the vision check. */
+static void test_image_count_ceiling(void) {
+    chat_msg over = {.role = "user", .content = "x"};
+    over.images.len = SERVER_MAX_IMAGES + 1;
+    chat_msgs msgs = {.v = &over, .len = 1};
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.prompt_text = xstrdup("x");
+    char err[256] = "";
+    TEST_ASSERT(!request_tokenize_multimodal_prompt(NULL, NULL, &r, &msgs,
+                                                    err, sizeof(err)));
+    TEST_ASSERT(strstr(err, "too many images") != NULL);
+    TEST_ASSERT(r.image_count == 0 && r.images == NULL && r.prompt.len == 0);
+    request_free(&r);
+
+    /* The same count at the ceiling passes the ceiling and fails only on the
+     * missing vision tower. */
+    over.images.len = SERVER_MAX_IMAGES;
+    request_init(&r, REQ_CHAT, 128);
+    r.prompt_text = xstrdup("x");
+    err[0] = '\0';
+    TEST_ASSERT(!request_tokenize_multimodal_prompt(NULL, NULL, &r, &msgs,
+                                                    err, sizeof(err)));
+    TEST_ASSERT(strstr(err, "--vision") != NULL);
+    request_free(&r);
+
+    char markers[1][SERVER_IMAGE_MARKER_BYTES] = {"nonce_A"};
+    request wide = {.image_count = SERVER_MAX_IMAGES + 1, .image_markers = markers};
+    visible_image_key key;
+    TEST_ASSERT(visible_prompt_key(&wide, "xnonce_Ay", &key) == NULL);
+    TEST_ASSERT(key.offsets == NULL && key.count == 0);
+}
+
+static void write_all_fd(int fd, const char *p, size_t n) {
+    while (n) {
+        ssize_t w = write(fd, p, n);
+        if (w < 0 && errno == EINTR) continue;
+        TEST_ASSERT(w > 0);
+        if (w <= 0) return;
+        p += (size_t)w;
+        n -= (size_t)w;
+    }
+}
+
+static void *test_http_body_writer(void *arg) {
+    int fd = *(int *)arg;
+    const char *hdr = "POST /v1/chat/completions HTTP/1.1\r\n"
+                      "Content-Length: 5000000\r\n\r\n";
+    write_all_fd(fd, hdr, strlen(hdr));
+    size_t total = 5000000, sent = 0;
+    char chunk[65536];
+    while (sent < total) {
+        size_t n = total - sent < sizeof(chunk) ? total - sent : sizeof(chunk);
+        for (size_t i = 0; i < n; i++) chunk[i] = (char)('a' + (sent + i) % 26);
+        write_all_fd(fd, chunk, n);
+        sent += n;
+    }
+    shutdown(fd, SHUT_WR);
+    return NULL;
+}
+
+static void test_http_body_limits(void) {
+    int sv[2];
+
+    /* Content-Length above 4 GiB is refused from the header alone: the body
+     * is never read and the client sees the connection fail. */
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] >= 0 && sv[1] >= 0) {
+        const char *hdr = "POST /v1/chat/completions HTTP/1.1\r\n"
+                          "Content-Length: 4294967297\r\n\r\n{";
+        write_all_fd(sv[1], hdr, strlen(hdr));
+        http_request hr = {0};
+        TEST_ASSERT(!read_http_request(sv[0], &hr));
+        TEST_ASSERT(hr.body == NULL);
+        close(sv[0]);
+        close(sv[1]);
+    }
+
+    /* An accepted length whose body never arrives fails on EOF without the
+     * server having reserved the advertised size. */
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] >= 0 && sv[1] >= 0) {
+        const char *hdr = "POST /v1/chat/completions HTTP/1.1\r\n"
+                          "Content-Length: 3000000000\r\n\r\nabc";
+        write_all_fd(sv[1], hdr, strlen(hdr));
+        shutdown(sv[1], SHUT_WR);
+        http_request hr = {0};
+        TEST_ASSERT(!read_http_request(sv[0], &hr));
+        TEST_ASSERT(hr.body == NULL);
+        close(sv[0]);
+        close(sv[1]);
+    }
+
+    /* A body larger than one grow chunk arrives intact across many reads. */
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] >= 0 && sv[1] >= 0) {
+        pthread_t th;
+        TEST_ASSERT(pthread_create(&th, NULL, test_http_body_writer, &sv[1]) == 0);
+        http_request hr = {0};
+        TEST_ASSERT(read_http_request(sv[0], &hr));
+        TEST_ASSERT(!strcmp(hr.method, "POST") &&
+                    !strcmp(hr.path, "/v1/chat/completions"));
+        TEST_ASSERT(hr.body_len == 5000000 && hr.body && hr.body[hr.body_len] == '\0');
+        bool intact = hr.body != NULL;
+        for (size_t i = 0; intact && i < hr.body_len; i++)
+            intact = hr.body[i] == (char)('a' + i % 26);
+        TEST_ASSERT(intact);
+        http_request_free(&hr);
+        pthread_join(th, NULL);
+        close(sv[0]);
+        close(sv[1]);
+    }
+}
+
 static void test_anthropic_tool_image_output(void) {
     buf json = {0};
     buf_puts(&json, "[{\"content\":[{\"type\":\"tool_result\","
@@ -23408,6 +23544,8 @@ static void ds4_server_unit_tests_run(void) {
     test_deepseek41_anthropic_results();
     test_deepseek41_live_result_order();
     test_visible_image_key();
+    test_image_count_ceiling();
+    test_http_body_limits();
     test_anthropic_tool_image_output();
     test_responses_tool_image_output();
     test_server_image_embedding_cache();
