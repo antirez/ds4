@@ -23,6 +23,18 @@ Objective-C only where Metal requires it and Metal kernels under `metal/`.
 - Do not add permanent semantic variants behind flags. Diagnostic switches are fine when they validate the one release path.
 - Do not introduce C++.
 
+## Development Environment
+
+- This machine is a development environment, not production. No service here
+  needs to be kept up or kept available for anyone.
+- Already running containers (e.g. a `ds4-server` left over from an earlier
+  session) are safe to stop or remove, as long as no test is actively using
+  that container at the moment. Check first (e.g. `docker ps`, the process list
+  inside it, recent logs); if nothing is running against it, stop it.
+- After you stop a container or server to free the GPU or memory for your own
+  work, do not restart or restore it when you are done. Leave it stopped
+  unless the user explicitly asks for it to be brought back.
+
 ## Safety
 
 - Avoid large CPU inference runs on macOS; the CPU path has previously exposed kernel VM failures with very large mappings.
