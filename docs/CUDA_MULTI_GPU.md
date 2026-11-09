@@ -36,6 +36,21 @@ This is also the multi-GPU placement mode for GLM. Startup refuses a layout
 that would require unsupported CPU execution; reduce context or choose a
 smaller model if necessary.
 
+## One GPU
+
+With a single card, DwarfStar copies the model tensors into its memory at
+startup when they fit next to the context buffers, and reports what it did:
+
+```text
+ds4: CUDA copying 89.87 GiB of model tensors into device memory (2.97 GiB context planned, 139.81 GiB free)
+```
+
+A model larger than the card stays mapped in host memory and is read over
+PCIe on every token, which is correct but slow; the startup line says so and
+shows the numbers. `DS4_CUDA_NO_MODEL_COPY=1` keeps the mapping on purpose,
+to compare the two on the same machine. DGX Spark is unified memory and does
+not copy.
+
 ## Flash tensor parallelism
 
 `--cuda-tensor-parallel` pairs GPUs and divides routed-expert work inside

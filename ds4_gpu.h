@@ -303,6 +303,11 @@ int ds4_gpu_set_aux_model_map_range(const void *model_map,
                                     uint64_t map_offset,
                                     uint64_t map_size);
 int ds4_gpu_set_model_map_spans(const void *model_map, uint64_t model_size, const uint64_t *offsets, const uint64_t *sizes, uint32_t count, uint64_t max_tensor_bytes);
+/* Before the startup walk over the tensor spans of model_map: decide whether
+ * a discrete GPU copies them into device memory. span_bytes is their total,
+ * context_bytes what the engine allocates afterwards. Returns 1 when the walk
+ * will copy. */
+int ds4_gpu_plan_model_cache(const void *model_map, uint64_t span_bytes, uint64_t context_bytes);
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
 int ds4_gpu_q8_cache_suppressed(void);
