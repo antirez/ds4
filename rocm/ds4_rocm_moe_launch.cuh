@@ -1218,7 +1218,8 @@ static int routed_moe_launch(
                     (uint64_t)token0 * n_expert;
                 const uint64_t out_offset =
                     pair_offset * expert_mid_dim;
-                mmq_rc = ds4_mmq_iq2_xxs_moe_pair(
+                /* moe_swiglu_weighted_f32_kernel drops non-finite gate/up values. */
+                mmq_rc = ds4_mmq_iq2_xxs_moe_pair_unsanitized(
                     gate_w, up_w,
                     (const float *)x->ptr + x_offset,
                     (const int32_t *)selected_exec->ptr + pair_offset,
