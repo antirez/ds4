@@ -17,14 +17,21 @@ ds4_metal_flint.o: ds4_metal_flint.m ds4_metal_internal.h ds4_flint_gpu.h ds4_gp
 
 # ds4_metal.m includes the internal header (trampolines for out-of-tree kernel files).
 ds4_metal.o: ds4_metal_internal.h
+
+# Model-free kernel tests for the prefill shader (CPU references, random data).
+.PHONY: test-flint-kernels
+test-flint-kernels: tests/flint/test_flint_kernels
+	./tests/flint/test_flint_kernels metal/flint_prefill.metal
+tests/flint/test_flint_kernels: tests/flint/test_flint_kernels.m
+	$(CC) -fobjc-arc -O2 -framework Metal -framework Foundation -o $@ tests/flint/test_flint_kernels.m
 endif
 
 # ds4.c textually includes the fork engine code.
-ds4.o ds4_cpu.o: ds4_flint_shape.inc ds4_flint_weights.inc ds4_flint_model.inc ds4_flint_tokenizer.inc ds4_flint_unicode.inc ds4_flint.inc ds4_flint_gpu.h
+ds4.o ds4_cpu.o: ds4_flint_shape.inc ds4_flint_weights.inc ds4_flint_model.inc ds4_flint_tokenizer.inc ds4_flint_unicode.inc ds4_flint.inc ds4_flint_session.inc ds4_flint_gpu.h
 
 .PHONY: fork-clean
 clean: fork-clean
 fork-clean:
-	rm -f ds4_metal_flint.o
+	rm -f ds4_metal_flint.o tests/flint/test_flint_kernels
 
 .DEFAULT_GOAL := $(FORK_SAVED_DEFAULT_GOAL)

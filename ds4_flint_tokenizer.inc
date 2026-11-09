@@ -336,3 +336,44 @@ static void bpe_tokenize_text_flint(const ds4_vocab *vocab, const char *text, to
     }
     if (gap_start != UINT64_MAX) flint_split_cjk(vocab, text + gap_start, len - gap_start, out);
 }
+
+/* ---- chat template (rec_mlx/chat_template.jinja), the parts step 2 needs ----
+ * No BOS.  <|system|>text, <|developer|>text, <|user|>text, <|assistant|>text,
+ * <|observation|><tool_response>text</tool_response>; the generation prompt is
+ * <|assistant|>.  The tool preamble and thinking control follow in step 5. */
+static void flint_encode_chat_prompt(const ds4_vocab *vocab, const char *system, const char *prompt, token_vec *out) {
+    if (system && system[0]) {
+        token_vec_push(out, vocab->system_id);
+        bpe_tokenize_text_flint(vocab, system, out);
+    }
+    token_vec_push(out, vocab->user_id);
+    bpe_tokenize_text_flint(vocab, prompt, out);
+    token_vec_push(out, vocab->assistant_id);
+}
+
+static void flint_chat_append_message(const ds4_vocab *vocab, token_vec *out, const char *role, const char *content) {
+    if (!strcmp(role, "system")) {
+        token_vec_push(out, vocab->system_id);
+        bpe_tokenize_text_flint(vocab, content, out);
+    } else if (!strcmp(role, "developer")) {
+        token_vec_push(out, g_flint_developer_id >= 0 ? g_flint_developer_id : vocab->system_id);
+        bpe_tokenize_text_flint(vocab, content, out);
+    } else if (!strcmp(role, "assistant")) {
+        token_vec_push(out, vocab->assistant_id);
+        bpe_tokenize_text_flint(vocab, content, out);
+    } else if (!strcmp(role, "tool") || !strcmp(role, "function")) {
+        token_vec_push(out, vocab->observation_id);
+        token_vec_push(out, vocab->tool_response_start_id);
+        bpe_tokenize_text_flint(vocab, content, out);
+        token_vec_push(out, vocab->tool_response_end_id);
+    } else {
+        token_vec_push(out, vocab->user_id);
+        bpe_tokenize_text_flint(vocab, content, out);
+    }
+}
+
+/* config.json eos_token_id: <|end_of_text|>, <|user|>, <|observation|>, <|developer|>. */
+static bool flint_token_is_generation_stop(const ds4_vocab *vocab, int token) {
+    return token == vocab->eos_id || token == vocab->user_id || token == vocab->observation_id ||
+           (g_flint_developer_id >= 0 && token == g_flint_developer_id);
+}

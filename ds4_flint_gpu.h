@@ -74,6 +74,26 @@ int ds4_flint_gpu_decode(ds4_flint_gpu_session *s, uint32_t token, uint32_t posi
                          uint32_t initial_position, uint16_t *logits_bf16, uint16_t *trace_bf16,
                          char *err, size_t errlen);
 
+/* Prefill of one chunk (docs/RECURSIVE_FLINT.md step 2): tokens[0..n) sit at
+ * positions position..position+n-1; the KV of earlier positions is already
+ * in the session (global rows by position; sliding rings laid out for
+ * ring_initial, the value the last prefill ended at, 0 for a fresh
+ * session).  Writes the new KV, re-lays every sliding ring for position+n
+ * (which the caller then uses as ring_initial / decode's initial_position)
+ * and returns the last row's 150144 bf16 logits.  n <= DS4_FLINT_GPU_PREFILL_CAP;
+ * position + n must stay inside the first KV block (65536).
+ *
+ * Test hooks: hidden_bf16, when not NULL, receives the residual after the
+ * embedding and after every layer ((49 + 1) x n x 2048 bf16, synchronizing
+ * per layer); all_logits_bf16, when not NULL, receives logits of every row
+ * (n x 150144) computed with the batched GEMM. */
+#define DS4_FLINT_GPU_PREFILL_CAP 2048u
+int ds4_flint_gpu_prefill(ds4_flint_gpu_session *s, const int32_t *tokens, uint32_t n,
+                          uint32_t position, uint32_t ring_initial, uint16_t *last_logits_bf16,
+                          uint16_t *hidden_bf16, uint16_t *all_logits_bf16, char *err, size_t errlen);
+/* Bytes of the engine-wide prefill scratch (allocated at the first prefill). */
+uint64_t ds4_flint_gpu_prefill_scratch_bytes(void);
+
 #ifdef __cplusplus
 }
 #endif

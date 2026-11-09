@@ -311,6 +311,9 @@ bool ds4_engine_is_qwen4(ds4_engine *e);
 bool ds4_engine_is_flint(ds4_engine *e);   /* fork: Recursive Flint (its own family) */
 /* fork: Flint decode trace check against rec (tests/flint/trace_compare.py) */
 int ds4_flint_trace_check(ds4_engine *e, const char *in_path, const char *out_path);
+/* fork: Flint prefill trace and session generation checks (tests/flint/) */
+int ds4_flint_prefill_trace(ds4_engine *e, const char *in_path, const char *out_path);
+int ds4_flint_generate_check(ds4_engine *e, const char *in_path, const char *out_path);
 /* Qwen3.8 reasoning-effort system instruction for a think mode (NULL when none) */
 const char *ds4_qwen4_reasoning_effort_text(ds4_think_mode mode);
 const char *ds4_backend_name(ds4_backend backend);
