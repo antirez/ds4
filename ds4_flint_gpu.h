@@ -81,7 +81,7 @@ int ds4_flint_gpu_decode(ds4_flint_gpu_session *s, uint32_t token, uint32_t posi
  * session).  Writes the new KV, re-lays every sliding ring for position+n
  * (which the caller then uses as ring_initial / decode's initial_position)
  * and returns the last row's 150144 bf16 logits.  n <= DS4_FLINT_GPU_PREFILL_CAP;
- * position + n must stay inside the first KV block (65536).
+ * position + n <= the session's capacity (global KV spans rec's 65536-token blocks).
  *
  * Test hooks: hidden_bf16, when not NULL, receives the residual after the
  * embedding and after every layer ((49 + 1) x n x 2048 bf16, synchronizing

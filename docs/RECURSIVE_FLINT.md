@@ -41,7 +41,7 @@ rec reports more than 125 tok/s averaged over a 128K-token session.
 |---|---|
 | 0. Scaffolding: fork files from `bonsai2`; converter from rec's checkpoint (rec's tensor layout, per-expert packs); shape, loader, tokenizer, server id | **done 2026-11-07.** Family `DS4_MODEL_FAMILY_FLINT = 200` / variant 202 with fork scaffolding; converter writes 22.574 GB in 56 s, `--check-all` byte-identical on all 1375 tensors and the nibble layout confirmed against `mx.dequantize`; `--inspect` opens, binds and validates the GGUF; tokenizer bit-identical to HF tokenizers on 1069 cases; `golden.json` has 8 rec cases (incl. a 20277-token story; rec decodes ~120 tok/s, prefill ~550 tok/s on the M4 Pro); `rec_logits.py` dumps prefill and per-step logits, 50×2048 bf16 traces and per-layer KV from rec's runtime (loads in 10 s). Descriptor and address tables move to step 1 with the kernel. |
 | 1. Decode megakernel ported: per-layer residual trace bit-identical to rec on identical KV; one token per launch, CPU sampling | **done 2026-11-07.** `metal/flint.metal` + `ds4_metal_flint.m` + `ds4_flint.inc`; `trace_compare.py` reports every trace row (50 × 2048) and all 150144 logits identical to rec on 56 decode steps over four prefills: 5 tokens, 559 (ring wrapped), 1401 (above the 1024-part boundary, 8-head path, 128 parts) and 8445 (256 parts). Warm decode 7.3 ms/token at 5 tokens, 8.0 at 559, 8.4 at 1401, 10.0 at 8445 (one token per launch with logits readback); a cold first step pays about 200 ms of page-ins. Not yet exercised: count exactly 1024 (64 parts), 512 parts, and contexts past 65536 (multi-block KV). |
-| 2. Prefill (chunked, window attention, sorted-expert GEMM), sessions, live KV reuse, disk checkpoints; golden cases within rec's spread | open |
+| 2. Prefill (chunked, window attention, sorted-expert GEMM), sessions, live KV reuse, disk checkpoints; golden cases within rec's spread | **done 2026-11-09.** `metal/flint_prefill.metal` (own kernels, see Design: Prefill), `ds4_flint_session.inc`; `make test-flint-kernels` passes. Against rec (`prefill_compare.py`): the last row's logits agree to KL 1e-8 to 1e-9 on 12-, 578- and 2556-token prompts; per-layer error grows like rounding noise (relative mean 0.003 to 0.12 by layer 48) with a few rows diverging at routing near-ties (578-token prompt: 55 of 578 rows have a sixth/seventh expert margin under 1%). Golden teacher-forced (`check_golden.py`, 128 tokens): argmax = rec's 94.5 to 100%, abs delta logprob mean 0.011 to 0.039, max 0.60; rec's own decode-vs-prefill at identical positions is mean 0.05 to 0.32, max 4.5, agreement 88 to 100% (3 dumps, 40 positions). Greedy paths part after 15 to 66 tokens on the short cases and run 64/64 on the tool case. Gate 2 (`reuse_check.py`): a follow-up turn on decode KV versus a fresh prefill differs along 64 steps by KL mean 0.001 to 0.005, max 0.064, abs delta logprob mean 0.011 to 0.032, top-1 same 97 to 100%: reuse stays. `ds4_test --server`, `--session-snapshot` and `--long-context` (29624 tokens, 100K context, two KV blocks) pass. Speed (not tuned): prefill 170 tok/s at 20K (rec 410 to 425 on this Mac), the first-cut GEMM; decode through sessions 10.3 to 11.4 ms/token short, 21.3 at 20K. |
 | 3. Measure against rec: decode at 4K/32K/128K, prefill, launch overhead; decide on 8-token resident blocks | open |
 | 4. Expert streaming: routing-trace study, cache and address table, in-kernel slot wait (or per-layer split), prefill staging, budget; streamed output bit-identical to resident | open |
 | 5. Server and agent: Flint template, `<tool_call>` syntax, reasoning parsing, `ds4-agent` session | open |
@@ -404,16 +404,52 @@ prefilled one matters for Flint is measured, not assumed (gate 2).
 
 ### Prefill
 
-Chunks of 2048 tokens as rec on M4 Pro. Dense projections through Bonsai's
-GEMM with an affine-int4 operand decoder; experts through a port of rec's
-sorted-token gate/up GEMM (`flint_prefill_gate_up`: tokens sorted by
-expert, binary-searched expert boundaries, a steel-style block MMA with
-`QuantizedBlockLoader` 4-bit g64 operands) and a matching down GEMM; sliding
-attention in 512-row blocks against the ring, global attention with
-`flash_attn` 128/128 and sinks; QK norm and RoPE as kernels. Prefill cannot
-be bit-identical to MLX's `gather_qmm`; it is held to rec's own spread.
-Short continuations (a few tokens after a long prefix) go through the
-decode kernel with all-row logits, as ds4's other models do.
+Chunks of 2048 tokens as rec on M4 Pro, through Flint's own kernels in
+`metal/flint_prefill.metal` rather than Bonsai's GEMM (the fork rules want
+Flint out of ds4_metal.m, and the MLX arithmetic to follow is specific):
+
+- `flint_gemm` (templated): 64 x 64 x 32 tiles, four simdgroups of 32 x 32,
+  bf16 simdgroup matrices with f32 accumulation; the int4-affine operand is
+  dequantized to bf16 with one rounding (`bf16(scale * q + bias)`, MLX's
+  `QuantizedBlockLoader`) and a bf16 variant serves the router. Epilogues:
+  store, residual add, GLU (`bf16(silu(bf16(g)) * bf16(u))` with the silu
+  table) and the routed combine (sequential bf16 sum of the six weighted
+  expert outputs, then the shared expert, then the residual: MLX's `sum`
+  over a bf16 axis rounds after every add, as the decode kernel does).
+- Routed experts: `flint_route_topk` (sigmoid, own-rank top-6 with ties to
+  the lower index, weights `bf16(p / (sum + 1e-20))`, per-expert counts),
+  `flint_route_offsets` (prefix sums, a tile table of 64 rows per expert,
+  indirect dispatch arguments), `flint_route_scatter`, then
+  `flint_moe_gateup` and `flint_moe_down` over the tile table, reading each
+  expert's pack through the same GPU-address table the decode kernel uses
+  (the model buffer must be made resident with `useResource`).
+- `flint_attention`: 64 queries x 1 head per threadgroup, key tiles of 32,
+  f32 online softmax in base 2 with the scale folded in, sinks as the
+  initial running maximum with sum 1, probabilities rounded to bf16 before
+  the PV product, as `mx.fast.scaled_dot_product_attention`'s steel kernel;
+  masks causal or the 513 window; keys from up to four KV blocks (global
+  layers) or from a window buffer (sliding layers: the previous 512
+  positions gathered from the ring, then the chunk).
+- `flint_head_norm_rope`, `flint_rmsnorm`, `flint_embed`, `flint_ring_copy`
+  (ring gather before, scatter after a chunk: the ring is re-laid for
+  position + n, which becomes rec's `initial`), `flint_head_row` (the
+  last row's logits with the decode kernel's vector arithmetic).
+
+The MLX facts these follow were measured in the venv: `sum` over a bf16
+axis rounds per add; `quantized_matmul` with 64 rows matches an f32
+reference with single-rounded bf16 weights on 99.99% of elements (max 1
+ulp); the hardware lane layout of 8 x 8 simdgroup matrices is MLX's
+`BaseMMAFrag::get_coord` (the epilogues depend on it; the kernel test
+checks it through the GEMM). Prefill cannot be bit-identical to MLX's
+tiles; it is held to rec's own spread (Status, step 2). Short continuations
+go through the same chunk path (rows pad to 64 inside the tiles).
+
+Session state beyond the token checkpoint: the KV blocks, `ring_initial`
+(the prefill length the rings are laid out for), and the previous step's
+logits so a one-token rewind is exact; longer rewinds invalidate and the
+next sync rebuilds (rings hold only the last 513 positions). Payloads carry
+the header (tag `FLNT`), tokens, logits, `ring_initial`, the global layers'
+rows and the whole rings.
 
 ### Streaming (step 4)
 
@@ -570,6 +606,8 @@ the 1024-part boundary.
 
 Deliverable: golden check passes on all cases; `ds4_test --server` passes;
 48K story test; the decode-KV-reuse question measured with gate 2.
+Done (Status). Left for later: prefill speed (step 3), the tool preamble
+and thinking control of the template (step 5), batching (step 7).
 
 ### 3. Resident measurements
 
@@ -607,8 +645,9 @@ in-kernel sampling if step 3 says they pay, other quants.
 
 - CPU-to-GPU visibility inside a running kernel (step 4's first
   experiment); the per-layer split is the fallback.
-- Whether reusing decode KV as a prefix changes Flint's probabilities
-  enough to matter, given that rec refuses to (step 2, gate 2).
+- Resolved (step 2, gate 2): reusing decode KV as a prefix moves the
+  distribution by an order of magnitude less than rec's own decode-vs-
+  prefill difference; ds4 keeps reusing it.
 - Where rec's 125 tok/s at 128K comes from with bf16 KV (step 3).
 - Thinking control without a template switch (step 5).
 - The M4 Pro's sustained SSD read bandwidth under the streaming access

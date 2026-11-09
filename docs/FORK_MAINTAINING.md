@@ -13,14 +13,14 @@ small. They are the Bonsai fork's rules (branch `bonsai2`), applied here.
 |---|---|
 | `ds4_flint_shape.inc` | `DS4_SHAPE_FLINT`, `ds4_model_is_flint()`, the global-layer mask, Flint-only constants |
 | `ds4_flint_model.inc` | GGUF metadata validation, engine gate, `ds4_engine_is_flint()`; later weight binding, layout checks, the per-layer descriptor table |
-| `ds4_flint.inc` | descriptor and expert-offset tables, silu table, engine open/close, the decode trace check; later sessions, payload spans, streaming orchestration |
-| `ds4_flint_session.inc` | session driver: create, free, prefill, decode, payload save/load, rewind (needs `struct ds4_session`, so it is included later than the graph) |
-| `ds4_flint_gpu.h`, `ds4_metal_flint.m`, `metal/flint.metal` | GPU API; its own strict-math Metal library, model buffer, KV blocks, launch and readback; the ported decode megakernel (`licenses/rec-NOTICE.txt`) |
-| `ds4_flint_tokenizer.inc`, `ds4_server_flint.inc` | pre-tokenizer; chat template, tool syntax |
+| `ds4_flint.inc` | descriptor and expert-offset tables, silu table, engine open/close, the decode trace check; later streaming orchestration |
+| `ds4_flint_session.inc` | session driver: create, free, chunked prefill (sync), decode (eval), one-token rewind, payload save/load (disk checkpoints and snapshots), and the `--flint-prefill-trace` / `--flint-generate` check modes |
+| `ds4_flint_gpu.h`, `ds4_metal_flint.m`, `metal/flint.metal`, `metal/flint_prefill.metal` | GPU API; its own strict-math Metal libraries, model buffer, KV blocks, launch and readback; the ported decode megakernel (`licenses/rec-NOTICE.txt`); the prefill kernels (GEMM, grouped expert GEMMs, routing, attention, norms, RoPE, embedding, head) and the chunk orchestration with its engine-wide scratch |
+| `ds4_flint_tokenizer.inc` | pre-tokenizer; the chat template's roles and stop tokens (tool preamble and thinking control come with step 5) |
 | `ds4_metal_internal.h` | trampolines exposing `ds4_metal.m` statics to out-of-tree kernel files (identical to `bonsai2`'s) |
 | `fork.mk` | build rules and fork test targets (included from `Makefile`) |
 | `gguf-tools/flint_int4_to_gguf.py`, `gguf-tools/gen_flint_unicode.py` | rec's INT4 checkpoint to GGUF; the pre-tokenizer's Unicode class tables (`ds4_flint_unicode.inc`) |
-| `tests/flint/` | `check_tokenizer.py` (parity with HF tokenizers; needs the `tokenizers` package), `collect_golden.py` + `golden.json` (from `rec serve`), `rec_logits.py` (logits, traces and KV from rec's runtime; re-execs itself in `~/.local/share/rec/runtimes/<sha>/python`), later kernel tests, trace comparison, reference checker |
+| `tests/flint/` | `check_tokenizer.py` (parity with HF tokenizers; needs the `tokenizers` package), `collect_golden.py` + `golden.json` (from `rec serve`; `golden_prompt_ids.py` adds rec's prompt ids), `rec_logits.py` / `rec_prefill_dump.py` (logits, traces, KV and prefill activations from rec's runtime; they re-exec themselves in `~/.local/share/rec/runtimes/<sha>/python`), `trace_compare.py` (decode, bit-exact), `prefill_compare.py` (prefill, layer by layer), `check_golden.py` (teacher-forced and greedy against rec serve), `reuse_check.py` (gate 2), `test_flint_kernels.m` (`make test-flint-kernels`, model-free) |
 | `.github/workflows/flint.yml` | build, warning check, model-free tests |
 | `docs/RECURSIVE_FLINT.md`, this file | |
 
@@ -48,11 +48,13 @@ each later step adds; this table tracks what is in the tree.
 | | `gguf_types[143..145]` and `DS4_TENSOR_FLINT_U4/U8/PACK` |
 | | `#include "ds4_flint_weights.inc"` before `weights_have_output_head`; first-line redirects in `weights_have_output_head`, `weights_have_partial_output_head`, `weights_layer_has_required`, `weights_validate_layout`, `weights_bind_output`, `weights_bind_layer` |
 | | `#include "ds4_flint.inc"` before `ds4_engine_open_internal`; a three-line Flint block before the Qwen block of `ds4_engine_open_internal` (inspect returns, else `flint_engine_open_tail`); `flint_engine_close()` after `qwen4_state_pool_free` in `ds4_engine_close` |
-| | `#include "ds4_flint_tokenizer.inc"` before `bpe_tokenize_text`, plus its first-line dispatch; `flint_vocab_setup` branch at the top of the family section of `vocab_load`; first-line redirect of `special_token_at` to `flint_special_token_at` (HF matches every added token literally, including the reserved ones) |
-| `ds4.h` | `ds4_engine_is_flint()`, `ds4_flint_trace_check()` |
+| | `#include "ds4_flint_tokenizer.inc"` before `bpe_tokenize_text`, plus its first-line dispatch; `flint_vocab_setup` branch at the top of the family section of `vocab_load`; first-line redirect of `special_token_at` to `flint_special_token_at` (HF matches every added token literally, including the reserved ones); first-line Flint branches in `encode_chat_prompt`, `ds4_chat_append_message`, `ds4_chat_append_assistant_prefix`, `chat_push_think_prefix` (no effort prefix) and `vocab_token_is_generation_stop` |
+| | sessions: `void *flint` in `struct ds4_session` with three static forward declarations after it; `#include "ds4_flint_session.inc"` right after `ds4_flint.inc`; `ds4_session_create` (CPU refusal, and `return flint_session_create(...)` after the graph-path allocation), `ds4_session_free` (first branch of the GPU chain), `ds4_session_sync_internal` (after the distributed branch), `ds4_session_eval_internal` (after `e` is taken), `ds4_session_eval_argmax`, `ds4_session_payload_bytes`, `ds4_session_save_payload`, `ds4_session_load_payload` (before the V4.1 branch), `ds4_session_rewind` (`state_ok` from `flint_session_rewind`), `ds4_sessions_eval_batch_metal_supported` (false), `ds4_session_eval_speculative_argmax_impl` (plain eval, with the CPU branch), `ds4_engine_generate_argmax` (sessions path) |
+| `ds4.h` | `ds4_engine_is_flint()`, `ds4_flint_trace_check()`, `ds4_flint_prefill_trace()`, `ds4_flint_generate_check()` |
 | `ds4_metal.m` | include of `ds4_metal_internal.h`, fork sources appended to `required_sources`, trampoline block at the end |
 | `ds4_server.c` | model id `flint` in `server_model_id_from_engine`, aliases `flint` and `recursive/flint` in `server_model_alias_known`, `send_models` |
-| `ds4_cli.c` | `--flint-trace IN OUT` (two config fields, the parse case, the dispatch line before the imatrix branch) |
+| `ds4_cli.c` | `--flint-trace`, `--flint-prefill-trace`, `--flint-generate` `IN OUT` (config fields, parse cases, dispatch lines before the imatrix branch) |
+| `tests/ds4_test.c` | the long-context story's token-count threshold (29000 for Flint's tokenizer, 30000 otherwise) |
 
 ## Coupling to upstream code
 

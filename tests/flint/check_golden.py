@@ -41,7 +41,7 @@ def run_generate(ds4, model, prompt_ids, expected, max_new, tmpdir, tag):
     out = tmpdir / ("%s.out" % tag)
     with open(inp, "wb") as f:
         f.write(b"FLGN")
-        f.write(struct.pack("<IIIII", 1, len(prompt_ids), len(expected), max_new, 0))
+        f.write(struct.pack("<IIIIII", 2, len(prompt_ids), len(expected), max_new, 0, 0))
         f.write(np.asarray(prompt_ids, np.int32).tobytes())
         f.write(np.asarray(expected, np.int32).tobytes())
     r = subprocess.run([str(ds4), "-m", str(model), "--flint-generate", str(inp), str(out)], capture_output=True, text=True)
@@ -54,6 +54,7 @@ def run_generate(ds4, model, prompt_ids, expected, max_new, tmpdir, tag):
         (n_steps,) = struct.unpack("<I", f.read(4))
         rows = np.frombuffer(f.read(n_steps * 16), dtype=np.dtype([("fed", "<i4"), ("argmax", "<i4"), ("lp_fed", "<f4"), ("lp_arg", "<f4")]))
         prefill_ms, decode_ms = struct.unpack("<dd", f.read(16))
+        # v2 trailer (has_follow and the reuse logits) is read by reuse_check.py only
     inp.unlink(missing_ok=True)
     out.unlink(missing_ok=True)
     return rows, prefill_ms, decode_ms, timing[-1] if timing else ""

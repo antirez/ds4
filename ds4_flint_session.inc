@@ -44,9 +44,8 @@ static int flint_session_create(ds4_session *s, ds4_engine *e, int ctx_size, ds4
         free(s);
         return 1;
     }
-    if ((uint32_t)ctx_size > DS4_FLINT_GPU_BLOCK_TOKENS) {
-        fprintf(stderr, "ds4: Flint contexts above %u tokens are not supported yet (step 2 covers one KV block)\n",
-                DS4_FLINT_GPU_BLOCK_TOKENS);
+    if ((uint32_t)ctx_size > DS4_FLINT_GPU_MAX_CTX) {
+        fprintf(stderr, "ds4: Flint contexts above %u tokens are not supported\n", DS4_FLINT_GPU_MAX_CTX);
         free(s);
         return 1;
     }
@@ -353,12 +352,20 @@ static float flint_logsumexp(const float *x, uint32_t n) {
 }
 
 /* Generation through the session API, as the server would drive it.
- * IN: "FLGN", u32 version 1, u32 n_prompt, u32 n_expected, u32 max_new,
- * u32 ctx (0: prompt + max_new + 1), i32 prompt[], i32 expected[].  With
- * expected tokens the run is teacher-forced (each expected token is fed
- * whatever ds4's argmax was); without, greedy until a stop token.
+ * IN: "FLGN", u32 version 2, u32 n_prompt, u32 n_expected, u32 max_new,
+ * u32 ctx (0: prompt + max_new + 1), u32 n_follow, i32 prompt[],
+ * i32 expected[], i32 follow[].  With expected tokens the run is
+ * teacher-forced (each expected token is fed whatever ds4's argmax was);
+ * without, greedy until a stop token.  With follow tokens (teacher-forced
+ * runs only) the session then syncs prompt + expected + follow, reusing its
+ * decode KV as the prefix (gate 2 of the plan), and a fresh session prefills
+ * the same tokens; both logits vectors are written.
  * OUT: "FLGO", u32 n_steps, per step {i32 fed, i32 argmax, f32 logprob(fed),
- * f32 logprob(argmax)}, f64 prefill_ms, f64 decode_ms. */
+ * f32 logprob(argmax)}, f64 prefill_ms, f64 decode_ms, u32 has_follow,
+ * [f32 reused[V], f32 fresh[V], f64 reuse_prefill_ms, f64 fresh_prefill_ms,
+ *  u32 n2, per step {f32 kl(fresh||reused), f32 dlp(fed), u32 top1_same}]:
+ * the fresh session's greedy continuation of n2 = 64 tokens after the
+ * follow-up, fed to both sessions, so the comparison runs along a reply. */
 int ds4_flint_generate_check(ds4_engine *e, const char *in_path, const char *out_path) {
     if (!e || !g_flint_gpu_open) {
         fprintf(stderr, "ds4: the Flint generate check needs an open Flint engine\n");
@@ -367,10 +374,12 @@ int ds4_flint_generate_check(ds4_engine *e, const char *in_path, const char *out
     FILE *in = fopen(in_path, "rb");
     if (!in) { perror(in_path); return 1; }
     char magic[4];
-    uint32_t version = 0, n_prompt = 0, n_expected = 0, max_new = 0, ctx = 0;
-    if (fread(magic, 1, 4, in) != 4 || memcmp(magic, "FLGN", 4) != 0 || !flint_read_u32(in, &version) || version != 1 ||
+    uint32_t version = 0, n_prompt = 0, n_expected = 0, max_new = 0, ctx = 0, n_follow = 0;
+    if (fread(magic, 1, 4, in) != 4 || memcmp(magic, "FLGN", 4) != 0 || !flint_read_u32(in, &version) ||
+        (version != 1 && version != 2) ||
         !flint_read_u32(in, &n_prompt) || !flint_read_u32(in, &n_expected) || !flint_read_u32(in, &max_new) ||
-        !flint_read_u32(in, &ctx) || n_prompt == 0 || n_prompt > 65536 || n_expected > 65536) {
+        !flint_read_u32(in, &ctx) || (version == 2 && !flint_read_u32(in, &n_follow)) ||
+        n_prompt == 0 || n_prompt > 262144 || n_expected > 65536 || n_follow > 65536) {
         fprintf(stderr, "ds4: %s is not a Flint generate input\n", in_path);
         fclose(in);
         return 1;
@@ -383,8 +392,10 @@ int ds4_flint_generate_check(ds4_engine *e, const char *in_path, const char *out
     }
     int32_t *expected = n_expected ? xcalloc(n_expected, 4) : NULL;
     if (n_expected && fread(expected, 4, n_expected, in) != n_expected) { fclose(in); free(expected); ds4_tokens_free(&prompt); return 1; }
+    int32_t *follow = n_follow ? xcalloc(n_follow, 4) : NULL;
+    if (n_follow && fread(follow, 4, n_follow, in) != n_follow) { fclose(in); free(expected); free(follow); ds4_tokens_free(&prompt); return 1; }
     fclose(in);
-    if (ctx == 0) ctx = n_prompt + max_new + 1;
+    if (ctx == 0) ctx = n_prompt + max_new + n_follow + 65;   /* room for the 64-step reuse continuation */
     ds4_session *s = NULL;
     if (ds4_session_create(&s, e, (int)ctx) != 0) { free(expected); ds4_tokens_free(&prompt); return 1; }
     char err[256] = {0};
@@ -423,6 +434,55 @@ int ds4_flint_generate_check(ds4_engine *e, const char *in_path, const char *out
     const double t2 = flint_now_ms();
     const double times[2] = { t1 - t0, t2 - t1 };
     fwrite(times, 8, 2, outf);
+    const uint32_t has_follow = (rc == 0 && n_follow && n_expected) ? 1u : 0u;
+    fwrite(&has_follow, 4, 1, outf);
+    if (has_follow) {
+        /* the session holds prompt + the fed tokens (decode KV); sync the full
+         * sequence on it and on a fresh session */
+        ds4_tokens full = {0};
+        for (int i = 0; i < prompt.len; i++) token_vec_push(&full, prompt.v[i]);
+        for (uint32_t i = 0; i + 1 < n_steps; i++) token_vec_push(&full, expected[i]);
+        token_vec_push(&full, expected[n_steps - 1]);
+        for (uint32_t i = 0; i < n_follow; i++) token_vec_push(&full, follow[i]);
+        const double r0 = flint_now_ms();
+        if (ds4_session_sync(s, &full, err, sizeof(err)) != 0) { fprintf(stderr, "ds4: reuse sync failed: %s\n", err); rc = 1; }
+        const double r1 = flint_now_ms();
+        fwrite(s->logits, 4, DS4_N_VOCAB, outf);
+        ds4_session *fresh = NULL;
+        if (rc == 0 && ds4_session_create(&fresh, e, (int)ctx) != 0) rc = 1;
+        if (rc == 0 && ds4_session_sync(fresh, &full, err, sizeof(err)) != 0) { fprintf(stderr, "ds4: fresh sync failed: %s\n", err); rc = 1; }
+        const double r2 = flint_now_ms();
+        if (fresh) fwrite(fresh->logits, 4, DS4_N_VOCAB, outf);
+        const double rtimes[2] = { r1 - r0, r2 - r1 };
+        fwrite(rtimes, 8, 2, outf);
+        fprintf(stderr, "ds4: Flint reuse check: %d tokens; reused-KV sync %.0f ms, fresh prefill %.0f ms\n", full.len, r1 - r0, r2 - r1);
+        uint32_t n2 = rc == 0 ? 64u : 0u;
+        if (n2 && (uint32_t)full.len + n2 + 1 > ctx) n2 = 0;
+        fwrite(&n2, 4, 1, outf);
+        float *lpa = xmalloc((size_t)DS4_N_VOCAB * 4), *lpb = xmalloc((size_t)DS4_N_VOCAB * 4);
+        for (uint32_t i = 0; i < n2; i++) {
+            const float la = flint_logsumexp(s->logits, DS4_N_VOCAB), lb = flint_logsumexp(fresh->logits, DS4_N_VOCAB);
+            double kl = 0.0;
+            for (uint32_t v = 0; v < DS4_N_VOCAB; v++) {
+                lpa[v] = s->logits[v] - la; lpb[v] = fresh->logits[v] - lb;
+                kl += exp((double)lpb[v]) * ((double)lpb[v] - (double)lpa[v]);
+            }
+            const int fed = ds4_session_argmax(fresh);
+            const float rec[2] = { (float)kl, fabsf(lpa[fed] - lpb[fed]) };
+            const uint32_t same = ds4_session_argmax(s) == fed;
+            fwrite(rec, 4, 2, outf);
+            fwrite(&same, 4, 1, outf);
+            if (i + 1 == n2) break;
+            if (ds4_session_eval(s, fed, err, sizeof(err)) != 0 || ds4_session_eval(fresh, fed, err, sizeof(err)) != 0) {
+                fprintf(stderr, "ds4: reuse continuation failed: %s\n", err);
+                rc = 1;
+                break;
+            }
+        }
+        free(lpa); free(lpb);
+        ds4_session_free(fresh);
+        ds4_tokens_free(&full);
+    }
     fseek(outf, 4, SEEK_SET);
     fwrite(&n_steps, 4, 1, outf);
     fclose(outf);
@@ -430,6 +490,7 @@ int ds4_flint_generate_check(ds4_engine *e, const char *in_path, const char *out
             n_prompt, t1 - t0, n_steps, t2 - t1, n_steps > 1 ? (t2 - t1) / (n_steps - 1) : 0.0);
     ds4_session_free(s);
     free(expected);
+    free(follow);
     ds4_tokens_free(&prompt);
     return rc;
 }

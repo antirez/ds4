@@ -25,5 +25,7 @@ jobs:
           make ds4_test ds4_agent_test
           ./ds4_test --server
           ./ds4_agent_test
+      - name: Flint prefill kernel tests (CPU references, random data)
+        run: make test-flint-kernels
       - name: CPU build
         run: make clean && make cpu

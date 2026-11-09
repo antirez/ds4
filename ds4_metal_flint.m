@@ -665,13 +665,8 @@ int ds4_flint_gpu_prefill(ds4_flint_gpu_session *s, const int32_t *tokens, uint3
         if (err && errlen) snprintf(err, errlen, "prefill chunk of %u tokens is outside 1..%u", n, FLINT_PF_CAP);
         return 0;
     }
-    if ((uint64_t)position + n > s->cap_global) {
-        if (err && errlen) snprintf(err, errlen, "prefill to position %u exceeds this session's first KV block (%u)",
-                                    position + n, s->cap_global);
-        return 0;
-    }
-    if (s->n_blocks != 1) {
-        if (err && errlen) snprintf(err, errlen, "prefill beyond one KV block (65536 positions) is not implemented yet");
+    if ((uint64_t)position + n > s->ctx_cap) {
+        if (err && errlen) snprintf(err, errlen, "prefill to position %u exceeds the session capacity %u", position + n, s->ctx_cap);
         return 0;
     }
     @autoreleasepool {
@@ -738,13 +733,18 @@ int ds4_flint_gpu_prefill(ds4_flint_gpu_session *s, const int32_t *tokens, uint3
                 [enc setBuffer:g_flint_model offset:flint_moff(d[5]) atIndex:3];
                 [enc setBuffer:g_flint_model offset:flint_moff(d[6]) atIndex:4];
                 if (global) {
-                    [enc setBuffer:s->kv[0] offset:kv_k_off atIndex:5];
-                    [enc setBuffer:s->kv[0] offset:kv_v_off atIndex:6];
+                    const uint32_t b0 = position >> 16, b1 = (position + n - 1) >> 16;
+                    [enc setBuffer:s->kv[b0] offset:kv_k_off atIndex:5];
+                    [enc setBuffer:s->kv[b1] offset:kv_k_off atIndex:6];
+                    [enc setBuffer:s->kv[b0] offset:kv_v_off atIndex:7];
+                    [enc setBuffer:s->kv[b1] offset:kv_v_off atIndex:8];
                 } else {
                     [enc setBuffer:g_pf.win_k offset:0 atIndex:5];
-                    [enc setBuffer:g_pf.win_v offset:0 atIndex:6];
+                    [enc setBuffer:g_pf.win_k offset:0 atIndex:6];
+                    [enc setBuffer:g_pf.win_v offset:0 atIndex:7];
+                    [enc setBuffer:g_pf.win_v offset:0 atIndex:8];
                 }
-                [enc setBytes:&ha length:sizeof(ha) atIndex:7];
+                [enc setBytes:&ha length:sizeof(ha) atIndex:9];
                 [enc dispatchThreadgroups:MTLSizeMake((n * 40u + 7) / 8, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             }
             {
@@ -757,16 +757,16 @@ int ds4_flint_gpu_prefill(ds4_flint_gpu_session *s, const int32_t *tokens, uint3
                 }
                 [enc setComputePipelineState:flint_pipe("flint_attention")];
                 [enc setBuffer:g_pf.q offset:0 atIndex:0];
-                if (global) {
-                    [enc setBuffer:s->kv[0] offset:kv_k_off atIndex:1];
-                    [enc setBuffer:s->kv[0] offset:kv_v_off atIndex:2];
-                } else {
-                    [enc setBuffer:g_pf.win_k offset:0 atIndex:1];
-                    [enc setBuffer:g_pf.win_v offset:0 atIndex:2];
+                for (uint32_t b = 0; b < DS4_FLINT_GPU_MAX_BLOCKS; b++) {
+                    /* blocks past n_blocks are never read; bind block 0 so the offset stays in range */
+                    id<MTLBuffer> kb = global ? s->kv[b < s->n_blocks ? b : 0] : g_pf.win_k;
+                    id<MTLBuffer> vb = global ? s->kv[b < s->n_blocks ? b : 0] : g_pf.win_v;
+                    [enc setBuffer:kb offset:global ? kv_k_off : 0 atIndex:1 + b];
+                    [enc setBuffer:vb offset:global ? kv_v_off : 0 atIndex:5 + b];
                 }
-                [enc setBuffer:g_flint_model offset:flint_moff(d[7]) atIndex:3];
-                [enc setBuffer:g_pf.attn offset:0 atIndex:4];
-                [enc setBytes:&aa length:sizeof(aa) atIndex:5];
+                [enc setBuffer:g_flint_model offset:flint_moff(d[7]) atIndex:9];
+                [enc setBuffer:g_pf.attn offset:0 atIndex:10];
+                [enc setBytes:&aa length:sizeof(aa) atIndex:11];
                 [enc dispatchThreadgroups:MTLSizeMake((n + 63) / 64, 32, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
             }
             flint_enc_gemm(enc, "flint_gemm_q4_residual", g_pf.attn, 4096, d + 25, g_pf.x, 2048, g_pf.x, 2048, NULL, nil, n);

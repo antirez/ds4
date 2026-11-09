@@ -227,7 +227,7 @@ static void test_moe(void) {
     const uint32_t *gid = ids.contents; const uint16_t *gw = wts.contents; const uint32_t *gc = counts.contents, *gs = starts.contents, *gr = rows.contents;
     size_t bad = 0;
     for (uint32_t i = 0; i < M * 6; i++) { if (gid[i] != ref_ids[i]) bad++; if (fabsf(bf2f(gw[i]) - ref_w[i]) > 1.0f / 128 * ref_w[i] + 1e-6f) bad++; }
-    for (uint32_t e = 0; e < E; e++) if (gc[e] != ref_counts[e]) bad++;
+    for (uint32_t e = 0; e < E; e++) if (gc[e] != 0 || gs[e + 1] - gs[e] != ref_counts[e]) bad++;   /* offsets zero counts for the next layer */
     uint32_t acc = 0; for (uint32_t e = 0; e < E; e++) { if (gs[e] != acc) bad++; acc += ref_counts[e]; } if (gs[256] != M * 6) bad++;
     /* rows: each entry once, inside its expert's segment */
     uint8_t *seen = calloc(M * 8, 1);
@@ -303,7 +303,7 @@ static void attention_case(const char *name, uint32_t M, uint32_t q_pos0, uint32
     id<MTLBuffer> Q = buf_bf16_random((size_t)cap_rows * 4096, 1.0f), K = buf_bf16_random((size_t)4 * n_keys * 128, 1.0f);
     id<MTLBuffer> V = buf_bf16_random((size_t)4 * n_keys * 128, 1.0f), O = buf((size_t)cap_rows * 4096 * 2);
     id<MTLBuffer> sinks = buf_bf16_random(32, 2.0f), args = buf_struct(&a, sizeof a);
-    run("flint_attention", @[Q, K, V, sinks, O, args], MTLSizeMake((M + 63) / 64, 32, 1), MTLSizeMake(128, 1, 1), nil, 0);
+    run("flint_attention", @[Q, K, K, K, K, V, V, V, V, sinks, O, args], MTLSizeMake((M + 63) / 64, 32, 1), MTLSizeMake(128, 1, 1), nil, 0);
     const uint16_t *q = Q.contents, *k = K.contents, *v = V.contents, *o = O.contents, *sk = sinks.contents;
     double maxd = 0; size_t bad = 0, n = 0;
     double *sc = malloc(n_keys * sizeof(double));
@@ -359,7 +359,7 @@ static void test_small(void) {
         memcpy(q.contents, q_in, (size_t)M * 4096 * 2);
         HeadArgs ha = { M, 1234, (uint32_t)rotary, dst_row0, dst_rows * 128 };
         id<MTLBuffer> args = buf_struct(&ha, sizeof ha);
-        run("flint_head_norm_rope", @[q, k, v, qw, kw, kd, vd, args], MTLSizeMake((M * 40 + 7) / 8, 1, 1), MTLSizeMake(256, 1, 1), nil, 0);
+        run("flint_head_norm_rope", @[q, k, v, qw, kw, kd, kd, vd, vd, args], MTLSizeMake((M * 40 + 7) / 8, 1, 1), MTLSizeMake(256, 1, 1), nil, 0);
         const uint16_t *qo = q.contents, *ko = kd.contents, *vo = vd.contents, *kp = k.contents, *vp = v.contents, *qwp = qw.contents, *kwp = kw.contents;
         double maxd = 0; size_t bad = 0, n = 0;
         for (uint32_t t = 0; t < M; t++)

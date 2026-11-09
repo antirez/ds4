@@ -439,9 +439,12 @@ kernel void flint_moe_down(const device bfloat16_t* act [[buffer(0)]],
 // of 32, f32 online softmax in base 2 with the scale folded in, sinks as the
 // initial running maximum (sum 1), probabilities rounded to bf16 before the
 // PV product, as mx.fast.scaled_dot_product_attention's steel kernel.
-// Keys/values: [4 kv heads][n_keys][128] rows (stride kv_head_stride between
-// heads), key j at absolute position key_pos0 + j.  Query i is at position
-// q_pos0 + i.  window: 0 = causal, else keys with q - k >= window are masked.
+// Keys/values: [4 kv heads][rows][128] per block (stride kv_head_stride
+// between heads), key j at absolute position key_pos0 + j and in block
+// j >> 16 at row j & 65535 (global layers span rec's 65536-token KV blocks;
+// the sliding window buffer is passed as every block).  Query i is at
+// position q_pos0 + i.  window: 0 = causal, else keys with q - k >= window
+// are masked.  Key tiles of 32 never straddle a block boundary.
 // ---------------------------------------------------------------------------
 
 struct FpAttnArgs {
@@ -459,11 +462,17 @@ constant constexpr uint FP_ATT_BK = 32;
 constant constexpr uint FP_ATT_LDK = 136;   // 128 + 8 pad
 
 kernel void flint_attention(const device bfloat16_t* Q [[buffer(0)]],        // [M][4096]
-                            const device bfloat16_t* K [[buffer(1)]],
-                            const device bfloat16_t* V [[buffer(2)]],
-                            const device bfloat16_t* sinks [[buffer(3)]],    // [32] bf16
-                            device bfloat16_t* O [[buffer(4)]],              // [M][4096]
-                            constant FpAttnArgs& args [[buffer(5)]],
+                            const device bfloat16_t* K0 [[buffer(1)]],
+                            const device bfloat16_t* K1 [[buffer(2)]],
+                            const device bfloat16_t* K2 [[buffer(3)]],
+                            const device bfloat16_t* K3 [[buffer(4)]],
+                            const device bfloat16_t* V0 [[buffer(5)]],
+                            const device bfloat16_t* V1 [[buffer(6)]],
+                            const device bfloat16_t* V2 [[buffer(7)]],
+                            const device bfloat16_t* V3 [[buffer(8)]],
+                            const device bfloat16_t* sinks [[buffer(9)]],    // [32] bf16
+                            device bfloat16_t* O [[buffer(10)]],             // [M][4096]
+                            constant FpAttnArgs& args [[buffer(11)]],
                             uint2 tg [[threadgroup_position_in_grid]],
                             ushort tid [[thread_index_in_threadgroup]],
                             ushort sg [[simdgroup_index_in_threadgroup]],
@@ -474,8 +483,6 @@ kernel void flint_attention(const device bfloat16_t* Q [[buffer(0)]],        // 
     const uint qt0 = tg.x * FP_ATT_BQ;
     if (qt0 >= args.M) return;
     const uint qrow0 = qt0 + sg * 16;             // this simdgroup's 16 query rows
-    const device bfloat16_t* Kh = K + (size_t)kv_head * args.kv_head_stride;
-    const device bfloat16_t* Vh = V + (size_t)kv_head * args.kv_head_stride;
     const float scale = (1.0f / 11.313708498984761f) * FP_LOG2E;   // 1/sqrt(128) * log2(e)
 
     // Q fragments: 2 row frags x 16 d frags.  Rows past M are read anyway (the
@@ -507,6 +514,9 @@ kernel void flint_attention(const device bfloat16_t* Q [[buffer(0)]],        // 
 
     for (uint kt0 = k_lo; kt0 < k_hi; kt0 += FP_ATT_BK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        const uint blk = kt0 >> 16;
+        const device bfloat16_t* Kh = (blk == 0 ? K0 : blk == 1 ? K1 : blk == 2 ? K2 : K3) + (size_t)kv_head * args.kv_head_stride;
+        const device bfloat16_t* Vh = (blk == 0 ? V0 : blk == 1 ? V1 : blk == 2 ? V2 : V3) + (size_t)kv_head * args.kv_head_stride;
         // 32 keys x 128 dims = 4096 elements per tile: each thread copies 4 x 8 of K and of V.
         for (ushort c = 0; c < 4; c++) {
             const ushort idx = tid + c * FP_THREADS;      // 0..511 vectors of 8
@@ -514,8 +524,8 @@ kernel void flint_attention(const device bfloat16_t* Q [[buffer(0)]],        // 
             const uint j = kt0 + r;
             vec<bfloat16_t, 8> kv8 = vec<bfloat16_t, 8>(bfloat16_t(0.0f)), vv8 = kv8;
             if (j < k_hi) {
-                kv8 = *(const device vec<bfloat16_t, 8>*)(Kh + (size_t)j * 128 + col);
-                vv8 = *(const device vec<bfloat16_t, 8>*)(Vh + (size_t)j * 128 + col);
+                kv8 = *(const device vec<bfloat16_t, 8>*)(Kh + (size_t)(j & 65535u) * 128 + col);
+                vv8 = *(const device vec<bfloat16_t, 8>*)(Vh + (size_t)(j & 65535u) * 128 + col);
             }
             *(threadgroup vec<bfloat16_t, 8>*)(Ks + r * FP_ATT_LDK + col) = kv8;
             *(threadgroup vec<bfloat16_t, 8>*)(Vs + r * FP_ATT_LDK + col) = vv8;
@@ -652,7 +662,9 @@ kernel void flint_rmsnorm(const device bfloat16_t* x [[buffer(0)]],
 // Per (token, head): RMS norm over 128 with the head's weight, RoPE when
 // rotary, exactly as the decode kernel's head_norm.  Grid: one simdgroup per
 // (token, head) over heads 0..31 (q, in place) and 32..35 (k, written to
-// kdst rows) ; v rows are copied to vdst by heads 36..39.
+// kdst rows) ; v rows are copied to vdst by heads 36..39.  Destination row
+// dst_row0 + token lands in block (row >> 16) - (dst_row0 >> 16) (0 or 1:
+// kdst0/kdst1) at row & 65535, so a chunk may cross a KV block boundary.
 struct FpHeadArgs {
     uint M;
     uint pos0;          // position of token 0
@@ -666,19 +678,26 @@ kernel void flint_head_norm_rope(device bfloat16_t* q [[buffer(0)]],          //
                                  const device bfloat16_t* v [[buffer(2)]],    // [M][512]
                                  const device bfloat16_t* qw [[buffer(3)]],
                                  const device bfloat16_t* kw [[buffer(4)]],
-                                 device bfloat16_t* kdst [[buffer(5)]],
-                                 device bfloat16_t* vdst [[buffer(6)]],
-                                 constant FpHeadArgs& args [[buffer(7)]],
+                                 device bfloat16_t* kdst0 [[buffer(5)]],
+                                 device bfloat16_t* kdst1 [[buffer(6)]],
+                                 device bfloat16_t* vdst0 [[buffer(7)]],
+                                 device bfloat16_t* vdst1 [[buffer(8)]],
+                                 constant FpHeadArgs& args [[buffer(9)]],
                                  uint tg [[threadgroup_position_in_grid]],
                                  ushort sg [[simdgroup_index_in_threadgroup]],
                                  ushort lane [[thread_index_in_simdgroup]]) {
     const uint job = tg * 8 + sg;            // 8 simdgroups per threadgroup
     const uint token = job / 40, head = job % 40;
     if (token >= args.M) return;
+    const uint dst_row = args.dst_row0 + token;
+    const bool second = (dst_row >> 16) != (args.dst_row0 >> 16);
+    device bfloat16_t* kdst = second ? kdst1 : kdst0;
+    device bfloat16_t* vdst = second ? vdst1 : vdst0;
+    const uint dst_local = dst_row & 65535u;
     if (head >= 36) {
         const uint h = head - 36;
         const device bfloat16_t* src = v + (size_t)token * 512u + h * 128u;
-        device bfloat16_t* dst = vdst + (size_t)h * args.dst_head_stride + (size_t)(args.dst_row0 + token) * 128u;
+        device bfloat16_t* dst = vdst + (size_t)h * args.dst_head_stride + (size_t)dst_local * 128u;
         for (uint j = 0; j < 4; j++) dst[lane * 4 + j] = src[lane * 4 + j];
         return;
     }
@@ -686,7 +705,7 @@ kernel void flint_head_norm_rope(device bfloat16_t* q [[buffer(0)]],          //
     const device bfloat16_t* src = is_q ? q + (size_t)token * 4096u + head * 128u
                                         : k + (size_t)token * 512u + (head - 32) * 128u;
     device bfloat16_t* dst = is_q ? q + (size_t)token * 4096u + head * 128u
-                                  : kdst + (size_t)(head - 32) * args.dst_head_stride + (size_t)(args.dst_row0 + token) * 128u;
+                                  : kdst + (size_t)(head - 32) * args.dst_head_stride + (size_t)dst_local * 128u;
     const device bfloat16_t* w = is_q ? qw : kw;
     float xv[4];
     float squared = 0.0f;

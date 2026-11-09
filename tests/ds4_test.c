@@ -5671,7 +5671,7 @@ static void test_long_story_fact_recall(void) {
 
     ds4_tokens prompt = {0};
     ds4_tokenize_rendered_chat(engine, prompt_text, &prompt);
-    TEST_ASSERT(prompt.len > 30000);
+    TEST_ASSERT(prompt.len > (ds4_engine_is_flint(engine) ? 29000 : 30000));   /* fork: Flint's tokenizer yields 29624 */
 
     ds4_session *session = NULL;
     TEST_ASSERT(ds4_session_create(&session, engine, 100000) == 0);
