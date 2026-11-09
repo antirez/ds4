@@ -29,7 +29,6 @@ enum {
 };
 static int g_rocblas_f16_solution_set;
 static int g_rocblas_f16_solutions_disabled;
-static int g_rocblas_attention_b_solution_disabled;
 #include "ds4_rocm_hipblaslt.cuh"
 #endif
 static int g_quality_mode;
@@ -75,15 +74,6 @@ struct cuda_model_image {
 };
 
 struct cuda_q8_f16_range {
-    const void *host_base;
-    uint64_t offset;
-    uint64_t weight_bytes;
-    uint64_t in_dim;
-    uint64_t out_dim;
-    __half *device_ptr;
-};
-
-struct cuda_q8_f16_transpose_range {
     const void *host_base;
     uint64_t offset;
     uint64_t weight_bytes;
@@ -279,8 +269,6 @@ static std::vector<cuda_model_image> g_model_images;
 static std::unordered_map<uint64_t, size_t> g_model_range_by_offset;
 static std::vector<cuda_q8_f16_range> g_q8_f16_ranges;
 static std::unordered_map<uint64_t, size_t> g_q8_f16_by_offset;
-static std::vector<cuda_q8_f16_transpose_range> g_q8_f16_transpose_ranges;
-static std::unordered_map<uint64_t, size_t> g_q8_f16_transpose_by_offset;
 static uint64_t g_model_range_bytes;
 static uint64_t g_q8_f16_bytes;
 static int g_q8_f16_disabled_after_oom;
@@ -565,12 +553,6 @@ __global__ static void dequant_q8_0_to_f16_kernel(
         uint64_t blocks);
 __global__ static void dequant_q8_0_to_f32_kernel(
         float *out,
-        const unsigned char *w,
-        uint64_t in_dim,
-        uint64_t out_dim,
-        uint64_t blocks);
-__global__ static void dequant_q8_0_to_f16_transpose_kernel(
-        __half *out,
         const unsigned char *w,
         uint64_t in_dim,
         uint64_t out_dim,
@@ -4762,14 +4744,9 @@ static int cuda_model_range_is_cached(const void *model_map, uint64_t offset, ui
 }
 
 static void cuda_q8_f16_cache_release_all(void) {
-    for (const cuda_q8_f16_transpose_range &r : g_q8_f16_transpose_ranges) {
-        (void)cudaFree(r.device_ptr);
-    }
     for (const cuda_q8_f16_range &r : g_q8_f16_ranges) {
         (void)cudaFree(r.device_ptr);
     }
-    g_q8_f16_transpose_ranges.clear();
-    g_q8_f16_transpose_by_offset.clear();
     g_q8_f16_ranges.clear();
     g_q8_f16_by_offset.clear();
     g_q8_f16_bytes = 0;
@@ -4800,7 +4777,6 @@ struct ds4_rocm_runtime_config {
     int disable_splitk_attn_out_low;
     int disable_shared_gate_up_fused_w32;
     int attention_output_cublas_all;
-    int shared_down_cublas;
     int glm_grouped_value_project;
     int glm_grouped_qk_low;
     int q8_decode_sharedx_64k;
@@ -4832,7 +4808,6 @@ static const ds4_rocm_runtime_config *cuda_runtime_config(void) {
         g_rocm_cfg.disable_splitk_attn_out_low = !g_quality_mode;
         g_rocm_cfg.disable_shared_gate_up_fused_w32 = !g_quality_mode;
         g_rocm_cfg.attention_output_cublas_all = !g_quality_mode;
-        g_rocm_cfg.shared_down_cublas = !g_quality_mode;
         const char *glm_grouped_value_project_env =
             getenv("DS4_ROCM_GLM_GROUPED_VALUE_PROJECT");
         /*
@@ -5026,7 +5001,7 @@ static void cuda_q8_f16_cache_disable_after_failure(const char *what, uint64_t r
                 (double)g_q8_f16_bytes / 1073741824.0);
     }
     g_q8_f16_disabled_after_oom = 1;
-    if (!g_q8_f16_ranges.empty() || !g_q8_f16_transpose_ranges.empty()) {
+    if (!g_q8_f16_ranges.empty()) {
         (void)cudaDeviceSynchronize();
         cuda_q8_f16_cache_release_all();
     }
@@ -5138,61 +5113,6 @@ static const __half *cuda_q8_f16_ptr(
     return dev;
 }
 
-static const __half *cuda_q8_f16_transpose_ptr(
-        const void *model_map,
-        uint64_t offset,
-        uint64_t weight_bytes,
-        uint64_t in_dim,
-        uint64_t out_dim,
-        const char *label) {
-    auto exact = g_q8_f16_transpose_by_offset.find(offset);
-    if (exact != g_q8_f16_transpose_by_offset.end()) {
-        const cuda_q8_f16_transpose_range &r = g_q8_f16_transpose_ranges[exact->second];
-        if (r.host_base == model_map && r.weight_bytes == weight_bytes &&
-            r.in_dim == in_dim && r.out_dim == out_dim) {
-            return r.device_ptr;
-        }
-    }
-    for (const cuda_q8_f16_transpose_range &r : g_q8_f16_transpose_ranges) {
-        if (r.host_base == model_map && r.offset == offset &&
-            r.weight_bytes == weight_bytes &&
-            r.in_dim == in_dim && r.out_dim == out_dim) {
-            return r.device_ptr;
-        }
-    }
-    if (!cuda_q8_f16_cache_allowed(label, in_dim, out_dim)) return NULL;
-    uint64_t out_bytes = 0;
-    if (in_dim == 0u || out_dim == 0u ||
-        !cuda_u64_mul3_checked(in_dim, out_dim, sizeof(__half), &out_bytes)) return NULL;
-    if (!cuda_q8_f16_cache_has_budget(out_bytes, label)) return NULL;
-    const char *q8 = cuda_model_range_ptr(model_map, offset, weight_bytes, "q8_0");
-    if (!q8) return NULL;
-    __half *dev = NULL;
-    cudaError_t err = cudaMalloc(&dev, (size_t)out_bytes);
-    if (err != cudaSuccess) {
-        fprintf(stderr, DS4_GPU_LOG_PREFIX "q8 fp16 transpose cache alloc failed (%.2f MiB): %s\n",
-                (double)out_bytes / 1048576.0, cudaGetErrorString(err));
-        cuda_q8_f16_cache_disable_after_failure("transpose allocation failure", out_bytes);
-        return NULL;
-    }
-    const uint64_t blocks = (in_dim + 31u) / 32u;
-    const uint64_t n = in_dim * out_dim;
-    dequant_q8_0_to_f16_transpose_kernel<<<(n + 255u) / 256u, 256>>>(dev,
-                                                                     (const unsigned char *)q8,
-                                                                     in_dim,
-                                                                     out_dim,
-                                                                     blocks);
-    if (!cuda_ok(cudaGetLastError(), "q8 fp16 transpose dequant launch")) {
-        (void)cudaFree(dev);
-        cuda_q8_f16_cache_disable_after_failure("transpose launch failure", out_bytes);
-        return NULL;
-    }
-    g_q8_f16_transpose_ranges.push_back({model_map, offset, weight_bytes, in_dim, out_dim, dev});
-    g_q8_f16_transpose_by_offset[offset] = g_q8_f16_transpose_ranges.size() - 1u;
-    g_q8_f16_bytes += out_bytes;
-    return dev;
-}
-
 static uint32_t cuda_prefill_warmup_tokens(void) {
     uint32_t n_tok = 2048u;
     const char *chunk_env = getenv("DS4_METAL_PREFILL_CHUNK");
@@ -5204,14 +5124,15 @@ static uint32_t cuda_prefill_warmup_tokens(void) {
     return n_tok;
 }
 
+/* Running the attention output GEMMs once at load time picks their hipBLASLt
+ * algorithms (and loads the kernels) before the first prompt arrives. */
 static void cuda_q8_f16_warmup_attention_output_a_gemm(const __half *out_a_f16,
                                                        uint64_t group_dim,
                                                        uint64_t rank,
                                                        uint32_t n_groups) {
     static int warmed = 0;
-    if (warmed || !g_cublas_ready || !out_a_f16 || group_dim == 0 || rank == 0 || n_groups == 0) return;
-    const ds4_rocm_runtime_config *cfg = cuda_runtime_config();
-    if (!cfg->attention_output_cublas_all) return;
+    if (warmed || !g_hipblaslt_ready || !out_a_f16 || group_dim == 0 || rank == 0 || n_groups == 0) return;
+    if (!cuda_runtime_config()->attention_output_cublas_all) return;
     warmed = 1;
     const uint32_t n_tok = cuda_prefill_warmup_tokens();
     const uint64_t heads_h_count = (uint64_t)n_groups * n_tok * group_dim;
@@ -5224,39 +5145,19 @@ static void cuda_q8_f16_warmup_attention_output_a_gemm(const __half *out_a_f16,
     __half *heads_h = (__half *)tmp;
     __half *low_h = (__half *)((char *)tmp + low_h_off);
     if (cudaMemset(heads_h, 0, (size_t)heads_h_bytes) != cudaSuccess) return;
-    const float alpha = 1.0f;
-    const float beta = 0.0f;
-    cublasStatus_t st = cublasGemmStridedBatchedEx(g_cublas,
-                                                   CUBLAS_OP_T,
-                                                   CUBLAS_OP_N,
-                                                   (int)rank,
-                                                   (int)n_tok,
-                                                   (int)group_dim,
-                                                   &alpha,
-                                                   out_a_f16,
-                                                   CUDA_R_16F,
-                                                   (int)group_dim,
-                                                   (long long)rank * (long long)group_dim,
-                                                   heads_h,
-                                                   CUDA_R_16F,
-                                                   (int)group_dim,
-                                                   (long long)n_tok * (long long)group_dim,
-                                                   &beta,
-                                                   low_h,
-                                                   CUDA_R_16F,
-                                                   (int)(n_groups * rank),
-                                                   (long long)rank,
-                                                   (int)n_groups,
-                                                   CUBLAS_COMPUTE_32F,
-                                                   CUBLAS_GEMM_DEFAULT);
-    if (st == CUBLAS_STATUS_SUCCESS) (void)cudaDeviceSynchronize();
+    if (hipblaslt_gemm_batched(low_h, HIP_R_16F, (uint32_t)(n_groups * rank), out_a_f16, heads_h,
+                               (uint32_t)rank, n_tok, (uint32_t)group_dim,
+                               n_groups, (int64_t)rank * group_dim,
+                               (int64_t)n_tok * group_dim, (int64_t)rank, "attn_output_a")) {
+        (void)cudaDeviceSynchronize();
+    }
 }
 
-static void cuda_q8_f16_warmup_attention_output_b_gemm(const __half *out_b_f16_t,
+static void cuda_q8_f16_warmup_attention_output_b_gemm(const __half *out_b_f16,
                                                        uint64_t low_dim,
                                                        uint64_t out_dim) {
     static int warmed = 0;
-    if (warmed || !g_cublas_ready || !out_b_f16_t || low_dim == 0 || out_dim == 0) return;
+    if (warmed || !g_hipblaslt_ready || !out_b_f16 || low_dim == 0 || out_dim == 0) return;
     if (!cuda_runtime_config()->attention_output_cublas_all) return;
     warmed = 1;
     const uint32_t n_tok = cuda_prefill_warmup_tokens();
@@ -5270,28 +5171,10 @@ static void cuda_q8_f16_warmup_attention_output_b_gemm(const __half *out_b_f16_t
     __half *low_h = (__half *)tmp;
     float *out = (float *)((char *)tmp + out_off);
     if (cudaMemset(low_h, 0, (size_t)low_h_bytes) != cudaSuccess) return;
-    const float alpha = 1.0f;
-    const float beta = 0.0f;
-    cublasStatus_t st = cublasGemmEx(g_cublas,
-                                     CUBLAS_OP_N,
-                                     CUBLAS_OP_N,
-                                     (int)out_dim,
-                                     (int)n_tok,
-                                     (int)low_dim,
-                                     &alpha,
-                                     out_b_f16_t,
-                                     CUDA_R_16F,
-                                     (int)out_dim,
-                                     low_h,
-                                     CUDA_R_16F,
-                                     (int)low_dim,
-                                     &beta,
-                                     out,
-                                     CUDA_R_32F,
-                                     (int)out_dim,
-                                     CUBLAS_COMPUTE_32F,
-                                     CUBLAS_GEMM_DEFAULT);
-    if (st == CUBLAS_STATUS_SUCCESS) (void)cudaDeviceSynchronize();
+    if (hipblaslt_gemm_f32(out, out_b_f16, low_h, (uint32_t)out_dim, n_tok, (uint32_t)low_dim,
+                           "attn_output_b")) {
+        (void)cudaDeviceSynchronize();
+    }
 }
 
 static int cuda_ok(cudaError_t err, const char *what) {
@@ -5882,7 +5765,6 @@ extern "C" int ds4_gpu_init(void) {
             }
         }
         __atomic_store_n(&g_rocblas_f16_solutions_disabled, 0, __ATOMIC_RELAXED);
-        __atomic_store_n(&g_rocblas_attention_b_solution_disabled, 0, __ATOMIC_RELAXED);
         g_rocblas_ready = 1;
     }
     if (!g_hipblaslt_ready) {
@@ -5914,7 +5796,6 @@ extern "C" void ds4_gpu_cleanup(void) {
         g_rocblas = NULL;
         g_rocblas_f16_solution_set = DS4_ROCBLAS_F16_SOLUTIONS_NONE;
         __atomic_store_n(&g_rocblas_f16_solutions_disabled, 0, __ATOMIC_RELAXED);
-        __atomic_store_n(&g_rocblas_attention_b_solution_disabled, 0, __ATOMIC_RELAXED);
     }
     if (g_hipblaslt_ready) {
         (void)hipblasLtDestroy(g_hipblaslt);
@@ -6395,24 +6276,14 @@ extern "C" int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_
     if (optional_q8_preload_disabled) return 1;
     const char *cache_label = label ? label : "q8_0";
     if (!cuda_q8_f16_preload_allowed(cache_label, in_dim, out_dim)) return 1;
-    const int preload_transposed_b = !g_quality_mode &&
-                                     strstr(cache_label, "attn_output_b") != NULL;
-    if (preload_transposed_b) {
-        const __half *f16_t = cuda_q8_f16_transpose_ptr(model_map, offset, bytes, in_dim, out_dim, cache_label);
-        if (f16_t) {
-            if (strstr(cache_label, "attn_output_b") != NULL && in_dim == 8192u && out_dim == 4096u) {
-                cuda_q8_f16_warmup_attention_output_b_gemm(f16_t, in_dim, out_dim);
-            }
-            return 1;
+    const __half *f16 = cuda_q8_f16_ptr(model_map, offset, bytes, in_dim, out_dim, cache_label);
+    if (f16) {
+        if (strstr(cache_label, "attn_output_a") != NULL && in_dim == 4096u && out_dim == 8192u) {
+            cuda_q8_f16_warmup_attention_output_a_gemm(f16, in_dim, 1024u, 8u);
+        } else if (strstr(cache_label, "attn_output_b") != NULL && in_dim == 8192u && out_dim == 4096u) {
+            cuda_q8_f16_warmup_attention_output_b_gemm(f16, in_dim, out_dim);
         }
-    } else {
-        const __half *f16 = cuda_q8_f16_ptr(model_map, offset, bytes, in_dim, out_dim, cache_label);
-        if (f16) {
-            if (strstr(cache_label, "attn_output_a") != NULL && in_dim == 4096u && out_dim == 8192u) {
-                cuda_q8_f16_warmup_attention_output_a_gemm(f16, in_dim, 1024u, 8u);
-            }
-            return 1;
-        }
+        return 1;
     }
     optional_q8_preload_disabled = 1;
     return 1;

@@ -634,6 +634,18 @@ __global__ static void matmul_q8_0_f32_batch_sharedx_exact8_kernel(
 typedef _Float16 __attribute__((ext_vector_type(16))) ds4_q8_half16_t;
 typedef float    __attribute__((ext_vector_type(8)))  ds4_q8_float8_t;
 
+/* Two 16-byte LDS reads for a WMMA operand; the vector type's natural 32-byte
+ * alignment is not guaranteed by the padded tile strides. */
+__device__ __forceinline__ static ds4_q8_half16_t lds_load_half16(const half *p) {
+    union {
+        uint4 u[2];
+        ds4_q8_half16_t v;
+    } r;
+    r.u[0] = *reinterpret_cast<const uint4 *>(p);
+    r.u[1] = *reinterpret_cast<const uint4 *>(p + 8);
+    return r.v;
+}
+
 /* Configurable wave-row Q8_0 batched GEMM experiment for gfx1151.
  * This is the hipfire/llama.cpp-style MMQ shape adapted to DS4's existing
  * F32 activation buffers: each block stages a 64-token x 32-K activation tile
@@ -1404,25 +1416,6 @@ __global__ static void dequant_q8_0_to_f32_kernel(
     const float scale = q8_0_scale_scalar(blk);
     const int8_t q = *(const int8_t *)(blk + 2 + j);
     out[gid] = scale * (float)q;
-}
-
-__global__ static void dequant_q8_0_to_f16_transpose_kernel(
-        __half *out,
-        const unsigned char *w,
-        uint64_t in_dim,
-        uint64_t out_dim,
-        uint64_t blocks) {
-    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    const uint64_t n = in_dim * out_dim;
-    if (gid >= n) return;
-    const uint64_t row = gid / in_dim;
-    const uint64_t i = gid - row * in_dim;
-    const uint64_t b = i / 32u;
-    const uint64_t j = i - b * 32u;
-    const unsigned char *blk = w + (row * blocks + b) * 34u;
-    const __half scale = *(const __half *)blk;
-    const int8_t q = *(const int8_t *)(blk + 2u + j);
-    out[i * out_dim + row] = __hmul(scale, __float2half((float)q));
 }
 
 __global__ static void grouped_q8_0_a_preq_warp8_kernel(

@@ -125,7 +125,12 @@ __global__ static void indexer_score_one_direct_kernel(
     if (tid == 0) scores[c] = total;
 }
 
-__global__ static void indexer_scores_wmma128_kernel(
+/* Indexer scores for a 16-token x 128-key tile: score(t, c) = sum over heads of
+ * w[t][h] * relu(q[t][h] . k[c]).  The key tile is staged once; the query rows
+ * are staged four heads at a time, and every wave keeps its 16x16 score tile
+ * in the WMMA accumulator layout (row = 2i + lane / 16, col = lane % 16) so the
+ * ReLU-weighted head sum runs in registers without a trip through LDS. */
+__global__ static void __launch_bounds__(256, 1) indexer_scores_wmma128_kernel(
         float *scores,
         const float *q,
         const float *weights,
@@ -138,17 +143,16 @@ __global__ static void indexer_scores_wmma128_kernel(
         uint32_t ratio,
         float scale,
         int causal) {
-#if __CUDA_ARCH__ >= 700 || defined(__HIP_DEVICE_COMPILE__)
-#ifdef __HIP_PLATFORM_AMD__
-    namespace wmma = rocwmma;
-#else
-    namespace wmma = nvcuda::wmma;
-#endif
+    constexpr uint32_t HEAD_GROUP = 4u;
+    constexpr uint32_t STRIDE = 128u + 8u;
     const uint32_t tile_c = blockIdx.x * 128u;
     const uint32_t tile_t = blockIdx.y * 16u;
     const uint32_t tid = threadIdx.x;
-    const uint32_t warp = tid >> 5u;
-    if (tid >= 256u || head_dim != 128u) return;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t lane = tid & 31u;
+    const uint32_t lane16 = lane & 15u;
+    const uint32_t lane_hi = lane >> 4u;
+    if (head_dim != 128u || (n_head % HEAD_GROUP) != 0u) return;
 
     if (causal) {
         const uint32_t last_token = min(tile_t + 16u, n_tokens);
@@ -169,78 +173,91 @@ __global__ static void indexer_scores_wmma128_kernel(
         }
     }
 
-    __shared__ __half a_sh[16 * 128];
-    __shared__ __half b_sh[128 * 128];
-    __shared__ float c_sh[8 * 16 * 16];
+    __shared__ __align__(16) half a_sh[HEAD_GROUP * 16u * STRIDE];
+    __shared__ __align__(16) half b_sh[128u * STRIDE];
+    __shared__ float w_sh[HEAD_GROUP * 16u];
+
+#pragma unroll
+    for (uint32_t step = 0; step < 16u; step++) {
+        const uint32_t i = tid + step * 256u;
+        const uint32_t c = i >> 5u;
+        const uint32_t d = (i & 31u) * 4u;
+        const uint32_t comp = tile_c + c;
+        float4 f = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if (comp < n_comp) f = *reinterpret_cast<const float4 *>(index_comp + (uint64_t)comp * 128u + d);
+        half2 *dst = reinterpret_cast<half2 *>(b_sh + c * STRIDE + d);
+        dst[0] = __floats2half2_rn(f.x, f.y);
+        dst[1] = __floats2half2_rn(f.z, f.w);
+    }
 
     float acc[8];
 #pragma unroll
-    for (uint32_t i = 0; i < 8u; i++) acc[i] = 0.0f;
+    for (uint32_t j = 0; j < 8u; j++) acc[j] = 0.0f;
 
-    for (uint32_t i = tid; i < 128u * 128u; i += 256u) {
-        const uint32_t c = i >> 7u;
-        const uint32_t d = i & 127u;
-        const uint32_t comp = tile_c + c;
-        float v = 0.0f;
-        if (comp < n_comp) v = index_comp[(uint64_t)comp * head_dim + d];
-        b_sh[d + c * 128u] = __float2half(v);
-    }
-    __syncthreads();
-
-    for (uint32_t h = 0; h < n_head; h++) {
-        for (uint32_t i = tid; i < 16u * 128u; i += 256u) {
-            const uint32_t r = i >> 7u;
-            const uint32_t d = i & 127u;
+    /* The next head group's query rows are fetched into registers while the
+     * current group runs its MMAs. */
+    float4 q_pre[8];
+    float w_pre = 0.0f;
+    auto load_group = [&](uint32_t h0) {
+#pragma unroll
+        for (uint32_t step = 0; step < 8u; step++) {
+            const uint32_t i = tid + step * 256u;
+            const uint32_t hl = i >> 9u;
+            const uint32_t r = (i >> 5u) & 15u;
+            const uint32_t d = (i & 31u) * 4u;
             const uint32_t token = tile_t + r;
-            float v = 0.0f;
+            float4 f = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
             if (token < n_tokens) {
-                v = q[((uint64_t)token * n_head + h) * head_dim + d];
+                f = *reinterpret_cast<const float4 *>(q + ((uint64_t)token * n_head + h0 + hl) * 128u + d);
             }
-            a_sh[i] = __float2half(v);
+            q_pre[step] = f;
         }
-        __syncthreads();
-
-        wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a_frag;
-        wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> b_frag;
-        wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
-        wmma::fill_fragment(c_frag, 0.0f);
-        const uint32_t col0 = warp * 16u;
-        for (uint32_t k0 = 0; k0 < 128u; k0 += 16u) {
-            wmma::load_matrix_sync(a_frag, a_sh + k0, 128);
-            wmma::load_matrix_sync(b_frag, b_sh + col0 * 128u + k0, 128);
-            wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+        if (tid < HEAD_GROUP * 16u) {
+            const uint32_t token = tile_t + (tid & 15u);
+            w_pre = token < n_tokens ? weights[(uint64_t)token * n_head + h0 + (tid >> 4u)] : 0.0f;
         }
-        wmma::store_matrix_sync(c_sh + warp * 16u * 16u, c_frag, 16, wmma::mem_row_major);
-        __syncthreads();
+    };
+    load_group(0u);
 
-        const uint32_t local0 = tid & 255u;
-        const uint32_t token0 = tile_t + (local0 >> 4u);
-        const float w0 = token0 < n_tokens ? weights[(uint64_t)token0 * n_head + h] : 0.0f;
-        uint32_t slot = 0;
-        for (uint32_t i = tid; i < 8u * 16u * 16u; i += 256u, slot++) {
-            const uint32_t wtile = i >> 8u;
-            const uint32_t local = i & 255u;
-            const uint32_t r = local >> 4u;
-            const uint32_t c = local & 15u;
-            const uint32_t token = tile_t + r;
-            const uint32_t comp = tile_c + wtile * 16u + c;
-            if (token < n_tokens && comp < n_comp) {
-                acc[slot] += fmaxf(c_sh[i], 0.0f) * w0;
+    for (uint32_t h0 = 0; h0 < n_head; h0 += HEAD_GROUP) {
+        __syncthreads();
+#pragma unroll
+        for (uint32_t step = 0; step < 8u; step++) {
+            const uint32_t i = tid + step * 256u;
+            const uint32_t hl = i >> 9u;
+            const uint32_t r = (i >> 5u) & 15u;
+            const uint32_t d = (i & 31u) * 4u;
+            half2 *dst = reinterpret_cast<half2 *>(a_sh + (hl * 16u + r) * STRIDE + d);
+            dst[0] = __floats2half2_rn(q_pre[step].x, q_pre[step].y);
+            dst[1] = __floats2half2_rn(q_pre[step].z, q_pre[step].w);
+        }
+        if (tid < HEAD_GROUP * 16u) w_sh[tid] = w_pre;
+        if (h0 + HEAD_GROUP < n_head) load_group(h0 + HEAD_GROUP);
+        __syncthreads();
+#pragma unroll
+        for (uint32_t hl = 0; hl < HEAD_GROUP; hl++) {
+            ds4_q8_float8_t c;
+#pragma unroll
+            for (uint32_t j = 0; j < 8u; j++) c[j] = 0.0f;
+#pragma unroll
+            for (uint32_t k0 = 0; k0 < 128u; k0 += 16u) {
+                const ds4_q8_half16_t a = lds_load_half16(a_sh + (hl * 16u + lane16) * STRIDE + k0);
+                const ds4_q8_half16_t b = lds_load_half16(b_sh + (wave * 16u + lane16) * STRIDE + k0);
+                c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
+            }
+#pragma unroll
+            for (uint32_t j = 0; j < 8u; j++) {
+                acc[j] += fmaxf(c[j], 0.0f) * w_sh[hl * 16u + 2u * j + lane_hi];
             }
         }
-        __syncthreads();
     }
 
-    uint32_t slot = 0;
-    for (uint32_t i = tid; i < 8u * 16u * 16u; i += 256u, slot++) {
-        const uint32_t wtile = i >> 8u;
-        const uint32_t local = i & 255u;
-        const uint32_t r = local >> 4u;
-        const uint32_t c = local & 15u;
-        const uint32_t token = tile_t + r;
-        const uint32_t comp = tile_c + wtile * 16u + c;
+#pragma unroll
+    for (uint32_t j = 0; j < 8u; j++) {
+        const uint32_t token = tile_t + 2u * j + lane_hi;
+        const uint32_t comp = tile_c + wave * 16u + lane16;
         if (token < n_tokens && comp < n_comp) {
-            float out = acc[slot] * scale;
+            float out = acc[j] * scale;
             if (causal) {
                 const uint32_t visible = (pos0 + token + 1u) / ratio;
                 if (comp >= visible) out = -INFINITY;
@@ -248,7 +265,6 @@ __global__ static void indexer_scores_wmma128_kernel(
             scores[(uint64_t)token * n_comp + comp] = out;
         }
     }
-#endif
 }
 
 __global__ static void argmax_kernel(int32_t *out_idx, const float *logits, uint32_t n_vocab) {
