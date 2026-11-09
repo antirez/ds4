@@ -39,6 +39,9 @@ tests/flint/test_flint_kernels: tests/flint/test_flint_kernels.m
 	$(CC) -fobjc-arc -O2 -framework Metal -framework Foundation -o $@ tests/flint/test_flint_kernels.m
 endif
 
+# ds4_server.c (and the server tests inside ds4_test) include the Flint renderer.
+ds4_server.o ds4_server_cpu.o ds4_test.o: ds4_flint_server.inc ds4_flint_server_test.inc
+
 # ds4.c textually includes the fork engine code.
 ds4.o ds4_cpu.o: ds4_flint_shape.inc ds4_flint_weights.inc ds4_flint_model.inc ds4_flint_tokenizer.inc ds4_flint_unicode.inc ds4_flint.inc ds4_flint_session.inc ds4_flint_gpu.h ds4_flint_stream.h
 

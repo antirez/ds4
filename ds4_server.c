@@ -1184,7 +1184,14 @@ static bool parse_output_config_effort(const char **p, ds4_think_mode *effort) {
     return true;
 }
 
+/* fork: Recursive Flint renderer (ds4_flint_server.inc, included later) */
+static bool g_flint_server;
+static bool flint_model_alias_disables_thinking(const char *model);
+static bool flint_model_alias_enables_thinking(const char *model);
+static bool flint_model_alias_known(const char *id);
+
 static bool model_alias_disables_thinking(const char *model) {
+    if (flint_model_alias_disables_thinking(model)) return true;   /* fork */
     return model &&
            (!strcmp(model, "deepseek-chat") ||
             !strcmp(model, "qwen3.8-flash-next-chat") ||
@@ -1202,6 +1209,7 @@ static bool model_alias_disables_thinking(const char *model) {
 }
 
 static bool model_alias_enables_thinking(const char *model) {
+    if (flint_model_alias_enables_thinking(model)) return true;   /* fork */
     return model &&
            (!strcmp(model, "deepseek-reasoner") ||
             !strcmp(model, "qwen3.8-flash-next-reasoner") ||
@@ -1213,6 +1221,7 @@ static bool model_alias_enables_thinking(const char *model) {
 }
 
 static server_model_syntax server_model_syntax_for_engine(ds4_engine *engine) {
+    if (ds4_engine_is_flint(engine)) { g_flint_server = true; return SERVER_MODEL_SYNTAX_GLM; }   /* fork: GLM tool syntax, own renderer */
     if (ds4_engine_is_qwen4(engine)) return SERVER_MODEL_SYNTAX_QWEN;
     return ds4_engine_is_glm_dsa(engine) ?
            SERVER_MODEL_SYNTAX_GLM : ds4_engine_is_deepseek41(engine) ?
@@ -1230,6 +1239,7 @@ static const char *server_model_id_from_engine(ds4_engine *engine) {
 }
 
 static bool server_model_alias_known(const char *id) {
+    if (flint_model_alias_known(id)) return true;   /* fork */
     return id &&
            (!strcmp(id, "deepseek-v4-flash") ||
             !strcmp(id, "deepseek-v4.1-flash") ||
@@ -3632,11 +3642,14 @@ static char *render_qwen_chat_prompt_text(const chat_msgs *msgs,
     return buf_take(&out);
 }
 
+#include "ds4_flint_server.inc"   /* fork: Recursive Flint renderer */
+
 static char *render_chat_prompt_text_for_syntax(server_model_syntax syntax,
                                                 const chat_msgs *msgs,
                                                 const char *tool_schemas,
                                                 const tool_schema_orders *tool_orders,
                                                 ds4_think_mode think_mode) {
+    if (g_flint_server) return render_flint_chat_prompt_text(msgs, tool_schemas, tool_orders, think_mode);   /* fork */
     if (syntax == SERVER_MODEL_SYNTAX_GLM) {
         return render_glm_chat_prompt_text(msgs, tool_schemas,
                                            tool_orders, think_mode);
@@ -3867,6 +3880,7 @@ static char *render_live_tool_tail_for_syntax(server_model_syntax syntax,
                                               const chat_msgs *msgs, int start,
                                               const tool_schema_orders *tool_orders,
                                               ds4_think_mode think_mode) {
+    if (g_flint_server) return render_flint_live_tool_tail(msgs, start, tool_orders, think_mode);   /* fork */
     if (syntax == SERVER_MODEL_SYNTAX_GLM) {
         return render_glm_live_tool_tail(msgs, start, tool_orders, think_mode);
     }
@@ -13982,6 +13996,7 @@ decode_again:
             if (!j->req.top_p_set) top_p = DS4_DEFAULT_TOP_P;
             if (!j->req.min_p_set) min_p = DS4_DEFAULT_MIN_P;
         }
+        if (g_flint_server) flint_server_sampling_defaults(&j->req, &temperature, &top_k, &top_p);   /* fork */
         const bool greedy_tool_syntax = !thinking.inside && in_tool_call &&
             !dsml_decode_state_uses_payload_sampling(dsml_state);
         const float payload_temperature = temperature;
@@ -15176,8 +15191,14 @@ static bool send_model(server *s, int fd, const char *id) {
 static bool send_models(server *s, int fd) {
     buf b = {0};
     buf_puts(&b, "{\"object\":\"list\",\"data\":[");
-    if (ds4_engine_is_deepseek41(s->engine) || ds4_engine_is_flint(s->engine)) {
+    if (ds4_engine_is_deepseek41(s->engine)) {
         append_model_json(&b, s, server_model_id_from_engine(s->engine));
+    } else if (ds4_engine_is_flint(s->engine)) {   /* fork */
+        append_model_json(&b, s, "flint");
+        buf_putc(&b, ',');
+        append_model_json(&b, s, "flint-chat");
+        buf_putc(&b, ',');
+        append_model_json(&b, s, "flint-reasoner");
     } else if (ds4_engine_is_qwen4(s->engine)) {
         append_model_json(&b, s, "qwen3.8-flash-next");
         buf_putc(&b, ',');
@@ -18242,6 +18263,8 @@ static void test_reasoning_effort_mapping(void) {
     TEST_ASSERT(ds4_think_mode_for_context(DS4_THINK_MAX,
                                            (int)ds4_think_max_min_context()) == DS4_THINK_MAX);
 }
+
+#include "ds4_flint_server_test.inc"   /* fork */
 
 static void test_model_alias_thinking_controls(void) {
     TEST_ASSERT(model_alias_disables_thinking("deepseek-chat"));
@@ -23095,6 +23118,7 @@ static void ds4_server_unit_tests_run(void) {
     test_openai_chat_stream_splits_reasoning_without_tools();
     test_openai_tool_stream_sends_partial_arguments();
     test_openai_glm_tool_stream_suppresses_raw_tool_call();
+    test_flint_render_prompt();   /* fork */
     test_openai_tool_stream_waits_for_incomplete_tool_tags();
     test_openai_tool_stream_sends_partial_raw_arguments();
     test_openai_tool_stream_preserves_literal_entities();

@@ -44,7 +44,7 @@ rec reports more than 125 tok/s averaged over a 128K-token session.
 | 2. Prefill (chunked, window attention, sorted-expert GEMM), sessions, live KV reuse, disk checkpoints; golden cases within rec's spread | **done 2026-11-09.** `metal/flint_prefill.metal` (own kernels, see Design: Prefill), `ds4_flint_session.inc`; `make test-flint-kernels` passes. Against rec (`prefill_compare.py`): the last row's logits agree to KL 1e-8 to 1e-9 on 12-, 578- and 2556-token prompts; per-layer error grows like rounding noise (relative mean 0.003 to 0.12 by layer 48) with a few rows diverging at routing near-ties (578-token prompt: 55 of 578 rows have a sixth/seventh expert margin under 1%). Golden teacher-forced (`check_golden.py`, 128 tokens): argmax = rec's 94.5 to 100%, abs delta logprob mean 0.011 to 0.039, max 0.60; rec's own decode-vs-prefill at identical positions is mean 0.05 to 0.32, max 4.5, agreement 88 to 100% (3 dumps, 40 positions). Greedy paths part after 15 to 66 tokens on the short cases and run 64/64 on the tool case. Gate 2 (`reuse_check.py`): a follow-up turn on decode KV versus a fresh prefill differs along 64 steps by KL mean 0.001 to 0.005, max 0.064, abs delta logprob mean 0.011 to 0.032, top-1 same 97 to 100%: reuse stays. `ds4_test --server`, `--session-snapshot` and `--long-context` (29624 tokens, 100K context, two KV blocks) pass. Speed (not tuned): prefill 170 tok/s at 20K (rec 410 to 425 on this Mac), the first-cut GEMM; decode through sessions 10.3 to 11.4 ms/token short, 21.3 at 20K. |
 | 3. Measure against rec: decode at 4K/32K/128K, prefill, launch overhead; decide on 8-token resident blocks | open |
 | 4. Expert streaming: routing-trace study, cache and address table, in-kernel slot wait (or per-layer split), prefill staging, budget; streamed output bit-identical to resident | **done 2026-11-09** (`ds4_flint_stream.c`, see Design: Streaming). The visibility experiment failed usefully: a CPU store reaches a running kernel only after 0.3 to 10.7 s and a GPU store reaches the CPU about 30 ms after launch (caches flush at command-buffer boundaries), so misses are handled by **abort and resume**: the megakernel aborts at the first layer whose expert is not cached, publishes the layer's ids, the host reads the packs and relaunches from that layer. Hits are the unchanged resident path. `stream_check.py`: streamed and resident outputs are bit-identical on `short_01`, `multi_01` and `tool_01` with a 1 GB cache (606 slots; every decode layer misses, 4.8 of 6 experts), under all three prefill policies. `make test-flint-stream` (model-free, sparse file) passes; `ds4_test --server` and `--session-snapshot` pass with `DS4_TEST_SSD_STREAMING=1` and a 2 GB cache. Cost of a relaunch about 0.3 ms plus the reads (35 ms/token with a 1 GB cache and the file in the page cache, against 9 resident). Routing logs over 1197 decoded tokens (`route_sim.py`, plain LRU): miss fraction 0.65 at 2 GB, 0.21 at 8 GB, 0.09 at 12 GB, 0.03 at 16 GB, 0.007 at 20 GB. Not measured: cold-SSD bandwidth (the file sits in this Mac's page cache and `purge` needs root) and the 20K case in streaming mode (deferred to an AC-powered session). |
-| 5. Server and agent: Flint template, `<tool_call>` syntax, reasoning parsing, `ds4-agent` session | open |
+| 5. Server and agent: Flint template, `<tool_call>` syntax, reasoning parsing, `ds4-agent` session | **done 2026-11-09.** `ds4_flint_server.inc`: the server renders Flint prompts from rec's `chat_template.jinja` (roles in order, `flint_text` escaping, the `# Tools` preamble before the first non-system turn, `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value></tool_call>` with string values raw and other values as Python JSON, `<|observation|><tool_response>` results); `tests/flint/check_template.py` renders nine message sets through the live server and through rec's template under HF's jinja settings: all byte-identical, and a live request with tools returns a structured `tool_calls` entry plus `reasoning_content`. Flint reports GLM's tool syntax, so the GLM reply parser and the live tool-call tracker are reused unchanged. Thinking: rec's grammar forces `<think>` as the first token, so the generation prompt is `<|assistant|><think>`; `enable_thinking: false`, `reasoning_effort: none` and the `flint-chat` / `flint-no-think` aliases prefill `<think></think>` instead (`flint-reasoner` forces it on); `/v1/models` lists `flint`, `flint-chat`, `flint-reasoner`. Sampling defaults from `generation_config.json` (temperature 1.0, top-p 0.95, top-k 20) for knobs a request leaves out; the agent uses 1.0 / 0.95. `ds4-agent` with Flint: thinking, bash and read tool calls and the final answer work in one turn on a file task; its KV save needed `ds4_engine_routed_quant_bits` to report 4 for the packs. Not done: the Terminal-Bench style comparison with `rec launch` (needs the AC-powered session). |
 | 6. Streaming speed: prefetch and prediction, popularity preload, cache policy | open |
 | 7. Later: CUDA (DGX Spark), session batching, other quants | open |
 
@@ -643,11 +643,11 @@ streaming mode, and prefetch (step 6).
 
 ### 5. Server and agent
 
-Flint renderer and tool syntax, reasoning in `reasoning_content`, thinking
-on by default with `<think></think>` prefill to disable (confirm against
-rec's `chat.py`), `/v1/models` aliases, `ds4-agent` session save, the
-model's sampling defaults, one Terminal-Bench style task end to end
-compared with `rec launch`.
+Done (Status). rec's `chat.py` has no thinking switch: the model always
+thinks (the grammar forces `<think>`), so ds4's `<think></think>` prefill
+is ds4's addition; the empty think block is what the template renders for
+an assistant turn without reasoning content, so it is in distribution.
+Left: the Terminal-Bench style task against `rec launch`.
 
 ### 6. Streaming speed
 
@@ -670,7 +670,8 @@ in-kernel sampling if step 3 says they pay, other quants.
   distribution by an order of magnitude less than rec's own decode-vs-
   prefill difference; ds4 keeps reusing it.
 - Where rec's 125 tok/s at 128K comes from with bf16 KV (step 3).
-- Thinking control without a template switch (step 5).
+- Resolved (step 5): thinking off prefills the template's empty think
+  block; rec itself cannot switch thinking off.
 - The M4 Pro's sustained SSD read bandwidth under the streaming access
   pattern (1.7 MiB random reads), which sets the whole streaming table.
 

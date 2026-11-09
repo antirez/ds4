@@ -372,6 +372,15 @@ static void flint_chat_append_message(const ds4_vocab *vocab, token_vec *out, co
     }
 }
 
+/* Generation prompt: <|assistant|> then <think> (rec's grammar forces the
+ * first token to <think>, so prefilling it leaves the distribution of the
+ * rest unchanged) or, with thinking off, the template's empty think block. */
+static void flint_chat_append_assistant_prefix(const ds4_vocab *vocab, ds4_think_mode think_mode, token_vec *out) {
+    token_vec_push(out, vocab->assistant_id);
+    token_vec_push(out, vocab->think_start_id);
+    if (!ds4_think_mode_enabled(think_mode)) token_vec_push(out, vocab->think_end_id);
+}
+
 /* config.json eos_token_id: <|end_of_text|>, <|user|>, <|observation|>, <|developer|>. */
 static bool flint_token_is_generation_stop(const ds4_vocab *vocab, int token) {
     return token == vocab->eos_id || token == vocab->user_id || token == vocab->observation_id ||

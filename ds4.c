@@ -46140,7 +46140,7 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
 }
 
 void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode think_mode) {
-    if (ds4_model_is_flint()) { token_vec_push(tokens, e->vocab.assistant_id); return; }
+    if (ds4_model_is_flint()) { flint_chat_append_assistant_prefix(&e->vocab, think_mode, tokens); return; }   /* fork */
     if (ds4_model_is_qwen4()) {
         qwen4_chat_assistant_prefix(&e->vocab, think_mode, tokens);
         return;
@@ -65053,6 +65053,7 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
 
 int ds4_engine_routed_quant_bits(ds4_engine *e) {
     if (!e) return 0;
+    if (ds4_model_is_flint()) return 4;   /* fork: MLX affine int4 packs (no per-matrix expert tensors) */
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const ds4_tensor *gate = e->weights.layer[il].ffn_gate_exps;
         if (!gate) continue;
