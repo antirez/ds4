@@ -542,6 +542,16 @@ inline bool kv_team_sync(device atomic_uint* control,uint tid,thread uint& phase
 //  14 partials     2097152 float
 //  15 statistics   65536 float
 //  16 routing      1280 uint
+//  17 requests     49 x 8 + 1 uint, zero on entry: per sparse layer the six
+//                  selected expert ids [0..5] and a miss mask [6]; word 392
+//                  is 1 + layer when the launch aborted on a cache miss
+//
+// parameters: {token, position, initial_position, layer_count, layer_start,
+// streaming, 0, 0}.  layer_start > 0 resumes a launch from that layer: the
+// residual is read back from the trace row the previous layer wrote.  With
+// streaming set, a zero expert-table entry for a selected expert aborts the
+// launch (every group leaves through the abort word) after publishing the
+// layer's ids; the host fetches the packs and relaunches from the layer.
 kernel void flint_decode(
         const device uchar* bank [[buffer(0)]],
         const device uint* metadata [[buffer(1)]],
@@ -560,6 +570,7 @@ kernel void flint_decode(
         device float* partials [[buffer(14)]],
         device float* statistics [[buffer(15)]],
         device uint* routing [[buffer(16)]],
+        device uint* requests [[buffer(17)]],
         uint thread_index_in_threadgroup [[thread_index_in_threadgroup]],
         uint thread_index_in_simdgroup [[thread_index_in_simdgroup]],
         uint simdgroup_index_in_threadgroup [[simdgroup_index_in_threadgroup]],
@@ -568,6 +579,7 @@ kernel void flint_decode(
 #define SYNC() if(!sync_all(control,tid,phase,ready,group)){if(tid==0)diagnostic[group]=atomic_load_explicit(control+2,memory_order_relaxed);return;}
 
     uint token=parameters[0], position=parameters[1], initial_position=parameters[2], layer_count=parameters[3];
+    uint layer_start=parameters[4], streaming=parameters[5];
     uint tid=thread_index_in_threadgroup,lane=thread_index_in_simdgroup;
     uint group=threadgroup_position_in_grid.x,sg=group*8+simdgroup_index_in_threadgroup;
     uint index=group*256+tid;
@@ -591,16 +603,22 @@ kernel void flint_decode(
     device bfloat16_t* act=workspace+48128;
     device bfloat16_t* down=workspace+64512;
     const device uint* final=metadata+49*64;
-    Matrix embedding=weight_matrix(bank,final+10);
-    for(uint j=0;j<8;++j) {
-        uint i=(tid+(j/4)*256)*4+j%4;
-        size_t row=uint(token);uint code=embedding.w[row*2048+i];
-        uint gi=row*32+i/64;
-        h[j]=bfloat16_t(embedding.s[gi]*bfloat16_t(code)+embedding.b[gi]);
-        if(group==0)trace[i]=h[j];
+    if(layer_start==0) {
+        Matrix embedding=weight_matrix(bank,final+10);
+        for(uint j=0;j<8;++j) {
+            uint i=(tid+(j/4)*256)*4+j%4;
+            size_t row=uint(token);uint code=embedding.w[row*2048+i];
+            uint gi=row*32+i/64;
+            h[j]=bfloat16_t(embedding.s[gi]*bfloat16_t(code)+embedding.b[gi]);
+            if(group==0)trace[i]=h[j];
+        }
+    } else {
+        // Resume: the residual entering layer_start is the trace row the
+        // previous launch wrote at the end of layer_start-1.
+        for(uint j=0;j<8;++j){uint i=(tid+(j/4)*256)*4+j%4;h[j]=trace[layer_start*2048+i];}
     }
     SYNC();
-    for(uint layer=0;layer<uint(layer_count);++layer) {
+    for(uint layer=layer_start;layer<uint(layer_count);++layer) {
         if(tid<64)layer_descriptor[tid]=metadata[layer*64+tid];
         threadgroup_barrier(mem_flags::mem_threadgroup);
         const threadgroup uint* d=layer_descriptor;
@@ -665,6 +683,26 @@ kernel void flint_decode(
             SYNC();
             w3_route_own_rank(statistics,(device float*)(routing+8),ids,lane,simdgroup_index_in_threadgroup,group);
             // The local route_top device fence publishes this group's ids and scores.
+            if(group<24) {
+                // Publish the selection (one group per role) and, when streaming,
+                // abort on a pack that is not resident.  The abort word makes
+                // every other group leave at its next barrier; the host reads
+                // requests[392], fetches, and relaunches from this layer.
+                uint role=group/4,e=ids[role];
+                bool miss=streaming!=0 && experts[e]==0;
+                if(tid==0 && (group%4)==0) {
+                    requests[layer*8+role]=e;
+                    if(miss)atomic_fetch_or_explicit((device atomic_uint*)(requests+layer*8+6),1u<<role,memory_order_relaxed);
+                }
+                if(miss) {
+                    if(tid==0) {
+                        atomic_store_explicit((device atomic_uint*)(requests+392),layer+1u,memory_order_relaxed);
+                        atomic_thread_fence(mem_flags::mem_device,memory_order_seq_cst,thread_scope_device);
+                        atomic_store_explicit(control+2,0x40000000u|layer,memory_order_relaxed);
+                    }
+                    return;
+                }
+            }
             if(group<FLINT_MLP_WORKERS) {
                 expert_team_gateup(bank,d,experts,n,ids,silu_table,act,lane,simdgroup_index_in_threadgroup,group);
                 if(!expert_team_handoff(routing,control,tid,group,layer,phase,ready)) {

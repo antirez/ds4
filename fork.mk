@@ -6,13 +6,26 @@
 # Rules below must not steal the upstream default goal ("all").
 FORK_SAVED_DEFAULT_GOAL := $(.DEFAULT_GOAL)
 
+# SSD streaming of Flint's routed experts (plain C, every backend links it).
+CORE_OBJS += ds4_flint_stream.o
+CPU_CORE_OBJS += ds4_flint_stream.o
+ds4_flint_stream.o: ds4_flint_stream.c ds4_flint_stream.h
+	$(CC) $(CFLAGS) -c -o $@ ds4_flint_stream.c
+
+# Model-free test of the expert cache over a sparse temporary file.
+.PHONY: test-flint-stream
+test-flint-stream: tests/flint/test_flint_stream
+	./tests/flint/test_flint_stream
+tests/flint/test_flint_stream: tests/flint/test_flint_stream.c ds4_flint_stream.c ds4_flint_stream.h tests/flint/flint_pread_probe.h
+	$(CC) -O2 -Wall -Wextra -std=c99 -D_GNU_SOURCE -D_DARWIN_C_SOURCE -include tests/flint/flint_pread_probe.h -o $@ tests/flint/test_flint_stream.c ds4_flint_stream.c -lpthread
+
 ifeq ($(UNAME_S),Darwin)
 CORE_OBJS += ds4_metal_flint.o
 FORK_METAL_OBJS := ds4_metal_flint.o
 
 # metal/flint.metal is compiled at run time by ds4_metal_flint.m into its own
 # strict-math library; it is deliberately not part of the shared library.
-ds4_metal_flint.o: ds4_metal_flint.m ds4_metal_internal.h ds4_flint_gpu.h ds4_gpu.h
+ds4_metal_flint.o: ds4_metal_flint.m ds4_metal_internal.h ds4_flint_gpu.h ds4_flint_stream.h ds4_gpu.h
 	$(CC) $(OBJCFLAGS) -c -o $@ ds4_metal_flint.m
 
 # ds4_metal.m includes the internal header (trampolines for out-of-tree kernel files).
@@ -27,11 +40,11 @@ tests/flint/test_flint_kernels: tests/flint/test_flint_kernels.m
 endif
 
 # ds4.c textually includes the fork engine code.
-ds4.o ds4_cpu.o: ds4_flint_shape.inc ds4_flint_weights.inc ds4_flint_model.inc ds4_flint_tokenizer.inc ds4_flint_unicode.inc ds4_flint.inc ds4_flint_session.inc ds4_flint_gpu.h
+ds4.o ds4_cpu.o: ds4_flint_shape.inc ds4_flint_weights.inc ds4_flint_model.inc ds4_flint_tokenizer.inc ds4_flint_unicode.inc ds4_flint.inc ds4_flint_session.inc ds4_flint_gpu.h ds4_flint_stream.h
 
 .PHONY: fork-clean
 clean: fork-clean
 fork-clean:
-	rm -f ds4_metal_flint.o tests/flint/test_flint_kernels
+	rm -f ds4_metal_flint.o ds4_flint_stream.o tests/flint/test_flint_kernels tests/flint/test_flint_stream
 
 .DEFAULT_GOAL := $(FORK_SAVED_DEFAULT_GOAL)

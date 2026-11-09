@@ -43,7 +43,7 @@ rec reports more than 125 tok/s averaged over a 128K-token session.
 | 1. Decode megakernel ported: per-layer residual trace bit-identical to rec on identical KV; one token per launch, CPU sampling | **done 2026-11-07.** `metal/flint.metal` + `ds4_metal_flint.m` + `ds4_flint.inc`; `trace_compare.py` reports every trace row (50 × 2048) and all 150144 logits identical to rec on 56 decode steps over four prefills: 5 tokens, 559 (ring wrapped), 1401 (above the 1024-part boundary, 8-head path, 128 parts) and 8445 (256 parts). Warm decode 7.3 ms/token at 5 tokens, 8.0 at 559, 8.4 at 1401, 10.0 at 8445 (one token per launch with logits readback); a cold first step pays about 200 ms of page-ins. Not yet exercised: count exactly 1024 (64 parts), 512 parts, and contexts past 65536 (multi-block KV). |
 | 2. Prefill (chunked, window attention, sorted-expert GEMM), sessions, live KV reuse, disk checkpoints; golden cases within rec's spread | **done 2026-11-09.** `metal/flint_prefill.metal` (own kernels, see Design: Prefill), `ds4_flint_session.inc`; `make test-flint-kernels` passes. Against rec (`prefill_compare.py`): the last row's logits agree to KL 1e-8 to 1e-9 on 12-, 578- and 2556-token prompts; per-layer error grows like rounding noise (relative mean 0.003 to 0.12 by layer 48) with a few rows diverging at routing near-ties (578-token prompt: 55 of 578 rows have a sixth/seventh expert margin under 1%). Golden teacher-forced (`check_golden.py`, 128 tokens): argmax = rec's 94.5 to 100%, abs delta logprob mean 0.011 to 0.039, max 0.60; rec's own decode-vs-prefill at identical positions is mean 0.05 to 0.32, max 4.5, agreement 88 to 100% (3 dumps, 40 positions). Greedy paths part after 15 to 66 tokens on the short cases and run 64/64 on the tool case. Gate 2 (`reuse_check.py`): a follow-up turn on decode KV versus a fresh prefill differs along 64 steps by KL mean 0.001 to 0.005, max 0.064, abs delta logprob mean 0.011 to 0.032, top-1 same 97 to 100%: reuse stays. `ds4_test --server`, `--session-snapshot` and `--long-context` (29624 tokens, 100K context, two KV blocks) pass. Speed (not tuned): prefill 170 tok/s at 20K (rec 410 to 425 on this Mac), the first-cut GEMM; decode through sessions 10.3 to 11.4 ms/token short, 21.3 at 20K. |
 | 3. Measure against rec: decode at 4K/32K/128K, prefill, launch overhead; decide on 8-token resident blocks | open |
-| 4. Expert streaming: routing-trace study, cache and address table, in-kernel slot wait (or per-layer split), prefill staging, budget; streamed output bit-identical to resident | open |
+| 4. Expert streaming: routing-trace study, cache and address table, in-kernel slot wait (or per-layer split), prefill staging, budget; streamed output bit-identical to resident | **done 2026-11-09** (`ds4_flint_stream.c`, see Design: Streaming). The visibility experiment failed usefully: a CPU store reaches a running kernel only after 0.3 to 10.7 s and a GPU store reaches the CPU about 30 ms after launch (caches flush at command-buffer boundaries), so misses are handled by **abort and resume**: the megakernel aborts at the first layer whose expert is not cached, publishes the layer's ids, the host reads the packs and relaunches from that layer. Hits are the unchanged resident path. `stream_check.py`: streamed and resident outputs are bit-identical on `short_01`, `multi_01` and `tool_01` with a 1 GB cache (606 slots; every decode layer misses, 4.8 of 6 experts), under all three prefill policies. `make test-flint-stream` (model-free, sparse file) passes; `ds4_test --server` and `--session-snapshot` pass with `DS4_TEST_SSD_STREAMING=1` and a 2 GB cache. Cost of a relaunch about 0.3 ms plus the reads (35 ms/token with a 1 GB cache and the file in the page cache, against 9 resident). Routing logs over 1197 decoded tokens (`route_sim.py`, plain LRU): miss fraction 0.65 at 2 GB, 0.21 at 8 GB, 0.09 at 12 GB, 0.03 at 16 GB, 0.007 at 20 GB. Not measured: cold-SSD bandwidth (the file sits in this Mac's page cache and `purge` needs root) and the 20K case in streaming mode (deferred to an AC-powered session). |
 | 5. Server and agent: Flint template, `<tool_call>` syntax, reasoning parsing, `ds4-agent` session | open |
 | 6. Streaming speed: prefetch and prediction, popularity preload, cache policy | open |
 | 7. Later: CUDA (DGX Spark), session batching, other quants | open |
@@ -453,68 +453,87 @@ rows and the whole rings.
 
 ### Streaming (step 4)
 
-What ds4 does for Qwen3.8 on Metal, moved into the megakernel:
+What ds4 does for Qwen3.8 on Metal, adapted to a megakernel that cannot
+be told anything while it runs. Built in `ds4_flint_stream.c` (plain C, no
+Metal) with the GPU side in `ds4_metal_flint.m`:
 
-1. **Cache.** Expert slots of 1.6875 MiB in owned buffers sized by the
-   existing budget logic (87.5% of RAM or the Metal working set, minus
-   context, prefill scratch, the 1.3 GB of resident weights and the
-   runtime reserve). The address table maps `(layer, expert)` to a slot or
-   zero. Eviction LRU with the layer's current selection pinned.
-2. **Decode miss handling.** Routing happens inside the kernel, so the
-   selected ids are known to the GPU first. The expert team of a missing
-   expert publishes its request (`layer, expert, slot`) to a shared buffer
-   and spins on the slot's ready word; the shared expert's eight groups and
-   the teams whose experts are cached run meanwhile, which is the overlap
-   the Qwen path gets from ordering kernels. A CPU thread polls the request
-   buffer, `pread`s the pack into a free slot, updates the address table
-   entry and the ready word. The spin reuses rec's watchdog so a failed
-   read ends the kernel with a diagnostic and ds4's existing exact-retry
-   path reruns the token.
+1. **Resident bank.** In streaming mode every tensor the descriptors
+   reference except the expert packs (1.19 GiB) is copied into an owned
+   Metal buffer with compact offsets, and the tensor region of the file
+   mapping is unmapped; the file is reopened for `pread` with `F_NOCACHE`
+   (`DS4_FLINT_STREAM_CACHED=1` keeps the page cache). Streaming is on
+   with `--ssd-streaming`, or automatically when the file is larger than
+   the GPU's recommended working set.
+2. **Cache.** Expert slots of 1.6875 MiB in shared buffers of up to 1024
+   slots, reached through GPU addresses (every encoder marks them
+   resident). The kernel's `(layer, expert)` table holds the slot's address
+   or zero. Exact LRU over the slots; the selection being fetched is
+   pinned. Budget: `--ssd-streaming-cache-experts N|<GB>`, else ds4's plan
+   (86% of the recommended working set minus the bank, the prefill
+   scratch, the two staging buffers, the sessions' KV at the requested
+   context and a 1 GiB reserve). At least 64 slots.
+3. **Decode misses: abort and resume.** The first experiment of the step
+   settled the in-kernel wait: a kernel spinning on a shared word sees a
+   CPU store only after 0.3 to 10.7 s, and the CPU sees a GPU store about
+   30 ms after launch (10 of 10 runs, checksums correct, 36 threadgroups);
+   Apple's GPU caches flush at command-buffer boundaries, not before. So
+   after routing each routed team looks its expert up in the table; a zero
+   entry publishes the layer's six ids in the request buffer, sets rec's
+   abort word and returns, and every other group leaves at its next
+   barrier. The host reads the request words, has the stream module
+   `pread` the missing packs (a pool of 6 threads, in parallel) into free or
+   evicted slots, writes the addresses, and relaunches the kernel with
+   `layer_start = L`: the residual entering layer L is the trace row the
+   previous layer wrote, the layer's KV rows are rewritten identically.
+   Hits run the unchanged resident code, so streamed logits equal resident
+   logits bit for bit. A relaunch costs about 0.3 ms on top of the reads.
+   The request buffer also records every sparse layer's selection, which
+   `DS4_FLINT_ROUTE_LOG=FILE` appends per token for the cache studies.
+4. **Prefill staging** (policy by chunk length, `DS4_FLINT_PREFILL_CACHE_MAX`
+   32 and `DS4_FLINT_PREFILL_FULL_MIN` 128). After a sparse layer's routing
+   the host waits, reads the per-expert counts, and fills a per-parity
+   table of 256 addresses for the layer's grouped GEMMs: chunks under 32
+   tokens take the needed experts through the cache (unless they would
+   fill more than half of it); longer chunks stage the needed experts in
+   one of two layer-sized buffers (432 MiB each); from 128 tokens the whole
+   layer is read as one contiguous range split across the pool, and the
+   next layer is read in the background while this one computes (the
+   routing wait proves the buffer's previous user has finished).
+5. **Exactness.** `make test-flint-stream` runs the module over a sparse
+   temporary file shaped like the pack region (signatures at both ends of
+   every pack): cold misses, hits without reads, LRU with pins, touch, the
+   three prefill policies and the read-ahead, a failed read returning its
+   slot, dense-layer requests, a too-small cache. `tests/flint/stream_check.py`
+   runs the golden cases resident and streamed with a capped cache and
+   compares every step's argmax and log-probabilities exactly.
+6. **Speed** (step 6). Routing logs of three 400-token generations
+   (code, prose, an agent-style debugging answer), replayed through an
+   exact LRU (`route_sim.py`, warm-up a quarter of the tokens; the three
+   logs touch 98% of all experts):
 
-   This depends on a CPU store to a shared buffer becoming visible to a
-   running kernel's device-scope atomic loads. It is the first experiment
-   of step 4, a 50-line kernel and a thread, before anything else is built.
-   If it does not hold on Apple GPUs, the fallback is the per-layer split:
-   the megakernel body ends after routing, publishes the ids through the
-   `MTLSharedEvent` handshake of #1328, the CPU reads, and a second kernel
-   runs the experts and the rest of the layer. 49 launches a token cost
-   about half a millisecond, acceptable for streaming mode only.
-3. **Prefill staging.** A 2048-token chunk touches nearly every expert of a
-   layer, so prefill reads whole layers (432 MiB each) into staging while
-   the previous layer computes, as the Qwen and GLM paths do; the sorted
-   GEMM then runs from staging. Short appends use the cache.
-4. **Exactness.** Streamed and resident runs must produce bit-identical
-   logits: the kernels do the same arithmetic from different addresses.
-   `tests/flint/test_streaming` follows `test_qwen4_ssd_experts`: a sparse
-   temporary file, cold and warm selections, eviction, prefill staging,
-   failed reads with exact recovery, and a `pread` probe counting bytes.
-5. **Speed** (step 6). The miss cost is exposed: a layer's experts are
-   known only when that layer runs. Per token, 282 selections; a miss
-   fraction `m` costs `m × 0.5 GB` of reads. At the SSD's measured
-   bandwidth (to be measured; M4 Pro internal drives read 5-7 GB/s):
+| Cache | Slots | Miss fraction | MB/token | Layers that relaunch | tok/s at 5 GB/s |
+|---:|---:|---:|---:|---:|---:|
+| 2 GB | 1213 | 0.645 | 322 | 46.9 | ~12 |
+| 4 GB | 2427 | 0.437 | 218 | 45.5 | ~15 |
+| 8 GB | 4854 | 0.206 | 103 | 35.2 | ~26 |
+| 12 GB | 7281 | 0.089 | 45 | 20.2 | ~44 |
+| 16 GB | 9709 | 0.030 | 15 | 7.8 | ~78 |
+| 20 GB | 12136 | 0.007 | 3.5 | 1.9 | ~114 |
 
-| Miss fraction | Bytes/token | Added ms at 6 GB/s | tok/s with 7 ms compute |
-|---:|---:|---:|---:|
-| 0 (resident) | 0 | 0 | ~140 |
-| 0.05 | 25 MB | 4 | ~90 |
-| 0.1 | 50 MB | 8 | ~65 |
-| 0.25 | 125 MB | 21 | ~36 |
-| 0.5 | 250 MB | 42 | ~20 |
-| 1.0 (cold) | 500 MB | 83 | ~11 |
+   The estimate is 7.5 ms compute plus the read time plus 0.3 ms per
+   relaunching layer. A 16 GB Mac (about 8 GB of cache) lands near 26
+   tok/s with plain LRU, a 24 GB Mac (14 GB) near 60, a 32 GB Mac holds
+   everything after warm-up. The miss fraction is what step 6's prefetch
+   (predict the next layers' experts from the previous token, fill slots
+   that were free at launch) and popularity preload have to cut; the SSD's
+   cold random-read bandwidth is still unmeasured here because the file
+   lives in the page cache of the 48 GB development machine.
 
-   The miss fraction for a given cache size is a property of Flint's routing
-   on real agent transcripts, so step 4 starts with `route_trace.py`:
-   routing ids per layer from rec's runtime over a few long agent sessions,
-   then an offline LRU simulation per cache size (8, 12, 16, 20 GB). That
-   table decides whether plain LRU is enough or step 6 needs prefetch (issue
-   the next layer's likely reads from the previous token's routing, the
-   fork's expert-prediction work on Qwen) and popularity preload.
-
-Memory targets, with 1.3 GB resident weights, 2 GB runtime reserve and
-context at 8K (0.3 GB): a 16 GB Mac holds about an 8 GB cache (37% of
-experts), 24 GB about 14 GB (65%), 32 GB the whole 21.3 GB. On the 48 GB
-development machine streaming is tested with `--ssd-streaming-cache-experts`
-capped to those sizes.
+Memory targets, with 1.19 GiB of resident weights, 0.84 GiB of staging,
+2 GB runtime reserve and context at 8K (0.3 GB): a 16 GB Mac holds about
+an 8 GB cache (37% of experts), 24 GB about 14 GB (65%), 32 GB the whole
+21.3 GB. On the 48 GB development machine streaming is tested with
+`--ssd-streaming-cache-experts` capped to those sizes.
 
 ## Speed model
 
@@ -616,10 +635,11 @@ overhead; the resident-block decision. The numbers go here.
 
 ### 4. Streaming
 
-The visibility experiment; routing traces and the LRU table; the cache,
-address table and in-kernel wait (or the split); prefill staging; budget
-sizing; `test_streaming`; capped-cache full-model exactness and speed at
-8/14/22 GB.
+Done (Status and Design: Streaming). The visibility experiment ruled out
+the in-kernel wait; abort-and-resume replaced both it and the per-layer
+split. Left for later: cold-SSD measurements and the capped-cache speed
+table at 8/14/22 GB (needs the page cache purged, root), the 20K case in
+streaming mode, and prefetch (step 6).
 
 ### 5. Server and agent
 
@@ -643,8 +663,9 @@ in-kernel sampling if step 3 says they pay, other quants.
 
 ## Open questions
 
-- CPU-to-GPU visibility inside a running kernel (step 4's first
-  experiment); the per-layer split is the fallback.
+- Resolved (step 4): CPU-to-GPU visibility inside a running kernel takes
+  seconds on Apple GPUs; the kernel aborts on a miss and resumes from the
+  layer instead.
 - Resolved (step 2, gate 2): reusing decode KV as a prefix moves the
   distribution by an order of magnitude less than rec's own decode-vs-
   prefill difference; ds4 keeps reusing it.

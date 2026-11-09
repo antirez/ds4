@@ -133,3 +133,4 @@ __pycache__/
 /tests/test_metal_qwen4_moe_half
 /tests/test_qwen4_resident_arithmetic
 /tests/flint/test_flint_kernels
+/tests/flint/test_flint_stream

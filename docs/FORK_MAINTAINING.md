@@ -13,15 +13,16 @@ small. They are the Bonsai fork's rules (branch `bonsai2`), applied here.
 |---|---|
 | `ds4_flint_shape.inc` | `DS4_SHAPE_FLINT`, `ds4_model_is_flint()`, the global-layer mask, Flint-only constants |
 | `ds4_flint_model.inc` | GGUF metadata validation, engine gate, `ds4_engine_is_flint()`; later weight binding, layout checks, the per-layer descriptor table |
-| `ds4_flint.inc` | descriptor and expert-offset tables, silu table, engine open/close, the decode trace check; later streaming orchestration |
+| `ds4_flint.inc` | descriptor and expert-offset tables, silu table, engine open/close (resident, or streaming: the owned bank of resident weights, the cache budget, the unmapping of the expert region), the decode trace check |
+| `ds4_flint_stream.h`, `ds4_flint_stream.c` | SSD streaming of the routed experts (plain C, linked on every backend): slot cache with exact LRU and pins, pread pool, decode fetch for the abort-and-resume loop, prefill staging with whole-layer read-ahead, statistics (`DS4_FLINT_STREAM_STATS=1`) |
 | `ds4_flint_session.inc` | session driver: create, free, chunked prefill (sync), decode (eval), one-token rewind, payload save/load (disk checkpoints and snapshots), and the `--flint-prefill-trace` / `--flint-generate` check modes |
 | `ds4_flint_gpu.h`, `ds4_metal_flint.m`, `metal/flint.metal`, `metal/flint_prefill.metal` | GPU API; its own strict-math Metal libraries, model buffer, KV blocks, launch and readback; the ported decode megakernel (`licenses/rec-NOTICE.txt`); the prefill kernels (GEMM, grouped expert GEMMs, routing, attention, norms, RoPE, embedding, head) and the chunk orchestration with its engine-wide scratch |
 | `ds4_flint_tokenizer.inc` | pre-tokenizer; the chat template's roles and stop tokens (tool preamble and thinking control come with step 5) |
 | `ds4_metal_internal.h` | trampolines exposing `ds4_metal.m` statics to out-of-tree kernel files (identical to `bonsai2`'s) |
 | `fork.mk` | build rules and fork test targets (included from `Makefile`) |
 | `gguf-tools/flint_int4_to_gguf.py`, `gguf-tools/gen_flint_unicode.py` | rec's INT4 checkpoint to GGUF; the pre-tokenizer's Unicode class tables (`ds4_flint_unicode.inc`) |
-| `tests/flint/` | `check_tokenizer.py` (parity with HF tokenizers; needs the `tokenizers` package), `collect_golden.py` + `golden.json` (from `rec serve`; `golden_prompt_ids.py` adds rec's prompt ids), `rec_logits.py` / `rec_prefill_dump.py` (logits, traces, KV and prefill activations from rec's runtime; they re-exec themselves in `~/.local/share/rec/runtimes/<sha>/python`), `trace_compare.py` (decode, bit-exact), `prefill_compare.py` (prefill, layer by layer), `check_golden.py` (teacher-forced and greedy against rec serve), `reuse_check.py` (gate 2), `test_flint_kernels.m` (`make test-flint-kernels`, model-free) |
-| `.github/workflows/flint.yml` | build, warning check, model-free tests |
+| `tests/flint/` | `check_tokenizer.py` (parity with HF tokenizers; needs the `tokenizers` package), `collect_golden.py` + `golden.json` (from `rec serve`; `golden_prompt_ids.py` adds rec's prompt ids), `rec_logits.py` / `rec_prefill_dump.py` (logits, traces, KV and prefill activations from rec's runtime; they re-exec themselves in `~/.local/share/rec/runtimes/<sha>/python`), `trace_compare.py` (decode, bit-exact), `prefill_compare.py` (prefill, layer by layer), `check_golden.py` (teacher-forced and greedy against rec serve), `reuse_check.py` (gate 2), `stream_check.py` (streamed output identical to resident), `route_sim.py` (LRU miss fractions from `DS4_FLINT_ROUTE_LOG` logs), `test_flint_kernels.m` (`make test-flint-kernels`, model-free), `test_flint_stream.c` + `flint_pread_probe.h` (`make test-flint-stream`, model-free) |
+| `.github/workflows/flint.yml` | build, warning check, model-free tests (kernels, streaming module) |
 | `docs/RECURSIVE_FLINT.md`, this file | |
 
 Upstream files get only **contact points**: one- to three-line hooks that

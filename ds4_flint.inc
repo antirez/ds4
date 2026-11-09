@@ -9,17 +9,46 @@
  * generation follow in later steps of docs/RECURSIVE_FLINT.md. */
 
 #include "ds4_flint_gpu.h"
+#include "ds4_flint_stream.h"
+#include "ds4_ssd.h"
 
 static uint32_t g_flint_meta[DS4_FLINT_GPU_META_WORDS];
 static uint64_t g_flint_pack_offsets[DS4_FLINT_GPU_N_LAYER * DS4_FLINT_GPU_N_EXPERT];
 static uint16_t g_flint_silu[DS4_FLINT_GPU_SILU_ENTRIES];
 static bool g_flint_gpu_open;
+static ds4_flint_stream *g_flint_stream_host;   /* SSD streaming cache, NULL when resident */
+
+/* Streaming mode copies every tensor the descriptors reference (all but the
+ * expert packs, 1.3 GB) into an owned GPU bank so the 22.6 GB file mapping
+ * can be dropped.  While `active`, flint_off256 assigns compact offsets and
+ * records the tensors to copy. */
+static struct {
+    bool active;
+    struct { const ds4_tensor *t; uint64_t off; } *v;
+    size_t len, cap;
+    uint64_t total;
+} g_flint_bank;
 
 static uint32_t flint_off256(const ds4_tensor *t) {
     if (!t) ds4_die("flint: descriptor references a missing tensor");
     if (t->abs_offset % 256u != 0) {
         fprintf(stderr, "ds4: flint tensor %.*s is not 256-byte aligned\n", (int)t->name.len, t->name.ptr);
         exit(1);
+    }
+    if (g_flint_bank.active) {
+        for (size_t i = 0; i < g_flint_bank.len; i++) {
+            if (g_flint_bank.v[i].t == t) return (uint32_t)(g_flint_bank.v[i].off >> 8);
+        }
+        if (g_flint_bank.len == g_flint_bank.cap) {
+            g_flint_bank.cap = g_flint_bank.cap ? g_flint_bank.cap * 2 : 256;
+            g_flint_bank.v = xrealloc(g_flint_bank.v, g_flint_bank.cap * sizeof(g_flint_bank.v[0]));
+        }
+        const uint64_t off = g_flint_bank.total;
+        g_flint_bank.v[g_flint_bank.len].t = t;
+        g_flint_bank.v[g_flint_bank.len].off = off;
+        g_flint_bank.len++;
+        g_flint_bank.total += (t->bytes + 255u) & ~UINT64_C(255);
+        return (uint32_t)(off >> 8);
     }
     if ((t->abs_offset >> 8) > UINT32_MAX) ds4_die("flint: tensor offset exceeds the descriptor range");
     return (uint32_t)(t->abs_offset >> 8);
@@ -129,14 +158,120 @@ static void flint_build_silu(const ds4_model *m) {
     }
 }
 
+/* Streaming decision: --ssd-streaming, or a file larger than the GPU's
+ * recommended working set (the Macs rec refuses). */
+static bool flint_wants_streaming(const ds4_engine *e, const ds4_engine_options *opt, const char **note) {
+    if (opt->ssd_streaming) return true;
+    const uint64_t recommended = ds4_gpu_recommended_working_set_size();
+    if (recommended && e->model.file_size > recommended) {
+        *note = "the model is larger than the GPU working set";
+        return true;
+    }
+    return false;
+}
+
+static double flint_gib(uint64_t bytes) { return (double)bytes / 1073741824.0; }
+
+/* Drop the file mapping of the tensor data; the resident weights are in the
+ * bank and the experts are read with pread.  Leaves the header mapped (the
+ * vocabulary strings and metadata live there). */
+static void flint_unmap_tensor_data(ds4_model *m) {
+    const long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0) return;
+    const uint64_t start = (m->tensor_data_pos + (uint64_t)page - 1) / (uint64_t)page * (uint64_t)page;
+    if (start >= m->size) return;
+    if (munmap((void *)(m->map + start), (size_t)(m->size - start)) != 0) return;
+    m->size = start;
+}
+
+static int flint_open_streaming(ds4_engine *e, const ds4_engine_options *opt, const char **why) {
+    g_flint_bank.active = true;
+    flint_build_metadata(&e->weights);
+    flint_build_silu(&e->model);
+    const uint64_t bank_bytes = g_flint_bank.total ? g_flint_bank.total : 256;
+    uint8_t *bank = ds4_flint_gpu_bank_alloc(bank_bytes);
+    if (!bank) {
+        *why = "could not allocate the resident weight bank";
+        return 0;
+    }
+    for (size_t i = 0; i < g_flint_bank.len; i++) {
+        memcpy(bank + g_flint_bank.v[i].off, tensor_data(&e->model, g_flint_bank.v[i].t), g_flint_bank.v[i].t->bytes);
+    }
+    uint64_t *no_packs = xcalloc(DS4_FLINT_GPU_N_LAYER * DS4_FLINT_GPU_N_EXPERT, sizeof(uint64_t));
+    const int opened = ds4_flint_gpu_engine_open(bank, bank_bytes, g_flint_meta, no_packs, g_flint_silu, why);
+    free(no_packs);
+    if (!opened) return 0;
+
+    /* Cache budget: an explicit --ssd-streaming-cache-experts, else ds4's
+     * plan over the recommended working set minus what else is resident:
+     * the bank, the prefill scratch, the two staging buffers, the sessions'
+     * KV for the requested context, and a runtime reserve. */
+    const uint64_t pack = DS4_FLINT_STREAM_PACK_BYTES;
+    const uint64_t max_experts = (uint64_t)(DS4_N_LAYER - DS4_N_LEADING_DENSE) * DS4_N_EXPERT;
+    const uint32_t ctx = opt->context_size > 0 ? (uint32_t)opt->context_size : 4096u;
+    const uint64_t sessions = opt->placement_session_count_hint > 0 ? (uint64_t)opt->placement_session_count_hint : 1u;
+    const uint64_t kv_bytes = sessions * ds4_flint_gpu_session_bytes(ctx > DS4_FLINT_GPU_MAX_CTX ? DS4_FLINT_GPU_MAX_CTX : ctx);
+    const uint64_t fixed = bank_bytes + ds4_flint_gpu_prefill_scratch_bytes() + ds4_flint_stream_staging_bytes() +
+                           kv_bytes + (UINT64_C(1) << 30);
+    uint64_t cache_bytes = 0;
+    if (opt->ssd_streaming_cache_bytes) {
+        cache_bytes = opt->ssd_streaming_cache_bytes;
+    } else if (opt->ssd_streaming_cache_experts) {
+        cache_bytes = (uint64_t)opt->ssd_streaming_cache_experts * pack;
+    } else {
+        const uint64_t recommended = ds4_gpu_recommended_working_set_size();
+        ds4_ssd_cache_plan plan;
+        if (!ds4_ssd_auto_cache_plan(recommended, 86, 0, fixed, pack, max_experts, &plan)) {
+            *why = "cannot size the expert cache (set --ssd-streaming-cache-experts N or NGB)";
+            return 0;
+        }
+        cache_bytes = plan.effective_cache_bytes;
+    }
+    uint64_t n_slots = cache_bytes / pack;
+    if (n_slots > max_experts) n_slots = max_experts;
+    if (n_slots < DS4_FLINT_STREAM_MIN_SLOTS) {
+        fprintf(stderr, "ds4: Flint streaming needs at least %u cached experts (%.2f GiB); the budget allows %llu\n",
+                DS4_FLINT_STREAM_MIN_SLOTS, flint_gib(DS4_FLINT_STREAM_MIN_SLOTS * pack), (unsigned long long)n_slots);
+        *why = "has no memory left for the expert cache";
+        return 0;
+    }
+    ds4_flint_stream_config cfg = {0};
+    cfg.path = opt->model_path;
+    cfg.pack_offsets = g_flint_pack_offsets;
+    cfg.n_slots = (uint32_t)n_slots;
+    cfg.gpu_table = ds4_flint_gpu_expert_table();
+    cfg.alloc = ds4_flint_gpu_region_alloc;
+    cfg.cached_io = getenv("DS4_FLINT_STREAM_CACHED") != NULL;
+    char err[256] = {0};
+    g_flint_stream_host = ds4_flint_stream_open(&cfg, err, sizeof(err));
+    if (!g_flint_stream_host) {
+        fprintf(stderr, "ds4: Flint streaming: %s\n", err);
+        *why = "could not open the expert cache";
+        return 0;
+    }
+    ds4_flint_gpu_set_stream(g_flint_stream_host);
+    flint_unmap_tensor_data(&e->model);
+    fprintf(stderr,
+            "ds4: Flint SSD streaming: resident weights %.2f GiB in an owned bank, expert cache %.2f GiB "
+            "(%u of %llu experts), staging %.2f GiB, KV reserve %.2f GiB for %llu session%s of %u tokens\n",
+            flint_gib(bank_bytes), flint_gib(n_slots * pack), (uint32_t)n_slots, (unsigned long long)max_experts,
+            flint_gib(ds4_flint_stream_staging_bytes()), flint_gib(kv_bytes), (unsigned long long)sessions,
+            sessions == 1 ? "" : "s", ctx);
+    return 1;
+}
+
 static int flint_engine_open_tail(ds4_engine *e, const ds4_engine_options *opt, ds4_engine **out) {
-    (void)opt;
     vocab_load(&e->vocab, &e->model);
     const char *why = NULL;
+    const char *note = NULL;
     if (e->backend != DS4_BACKEND_METAL) {
         why = "needs the Metal backend";
     } else if (!ds4_gpu_init()) {
         why = "could not initialize Metal";
+    } else if (flint_wants_streaming(e, opt, &note)) {
+        if (note) fprintf(stderr, "ds4: Flint: %s; streaming the routed experts from disk\n", note);
+        e->ssd_streaming = true;
+        if (flint_open_streaming(e, opt, &why)) g_flint_gpu_open = true;
     } else {
         flint_build_metadata(&e->weights);
         flint_build_silu(&e->model);
@@ -158,7 +293,27 @@ static int flint_engine_open_tail(ds4_engine *e, const ds4_engine_options *opt, 
 
 static void flint_engine_close(void) {
     if (!g_flint_gpu_open) return;
+    if (g_flint_stream_host) {
+        if (getenv("DS4_FLINT_STREAM_STATS")) {
+            ds4_flint_stream_stats st;
+            ds4_flint_stream_get_stats(g_flint_stream_host, &st);
+            fprintf(stderr,
+                    "ds4: Flint streaming: decode %llu layers, %llu hits, %llu misses in %llu relaunches, "
+                    "%.2f GiB read in %.0f ms; prefill %llu layers via cache, %llu staged, %.2f GiB read "
+                    "(%.0f ms foreground, %.0f ms waiting); %llu evictions; %u/%u slots used\n",
+                    (unsigned long long)st.decode_layers, (unsigned long long)(st.decode_hits - st.decode_misses),
+                    (unsigned long long)st.decode_misses, (unsigned long long)st.decode_relaunches,
+                    flint_gib(st.decode_bytes), st.decode_read_ms, (unsigned long long)st.prefill_layers_cache,
+                    (unsigned long long)st.prefill_layers_staged, flint_gib(st.prefill_bytes), st.prefill_read_ms,
+                    st.prefill_wait_ms, (unsigned long long)st.evictions, st.used, st.slots);
+        }
+        ds4_flint_gpu_set_stream(NULL);
+        ds4_flint_stream_close(g_flint_stream_host);
+        g_flint_stream_host = NULL;
+    }
     ds4_flint_gpu_engine_release();
+    free(g_flint_bank.v);
+    memset(&g_flint_bank, 0, sizeof(g_flint_bank));
     g_flint_gpu_open = false;
 }
 

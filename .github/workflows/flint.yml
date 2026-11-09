@@ -27,5 +27,7 @@ jobs:
           ./ds4_agent_test
       - name: Flint prefill kernel tests (CPU references, random data)
         run: make test-flint-kernels
+      - name: Flint streaming module test (sparse file, counted preads)
+        run: make test-flint-stream
       - name: CPU build
         run: make clean && make cpu

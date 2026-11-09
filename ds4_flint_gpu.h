@@ -94,6 +94,20 @@ int ds4_flint_gpu_prefill(ds4_flint_gpu_session *s, const int32_t *tokens, uint3
 /* Bytes of the engine-wide prefill scratch (allocated at the first prefill). */
 uint64_t ds4_flint_gpu_prefill_scratch_bytes(void);
 
+/* SSD streaming (ds4_flint_stream.h).  In streaming mode the resident
+ * weights live in an owned bank instead of the file mapping: allocate it
+ * before ds4_flint_gpu_engine_open (which then wraps nothing) and pass the
+ * bank as the model map with descriptor offsets relative to it.  The
+ * expert cache and staging buffers come from ds4_flint_gpu_region_alloc
+ * (the stream module's allocator); the kernel's expert table is the one
+ * ds4_flint_gpu_expert_table returns, which the stream module fills. */
+void *ds4_flint_gpu_bank_alloc(uint64_t bytes);
+struct ds4_flint_stream_region;
+int ds4_flint_gpu_region_alloc(void *ud, uint64_t bytes, const char *label, struct ds4_flint_stream_region *out);
+uint64_t *ds4_flint_gpu_expert_table(void);
+struct ds4_flint_stream;
+void ds4_flint_gpu_set_stream(struct ds4_flint_stream *st);
+
 #ifdef __cplusplus
 }
 #endif
