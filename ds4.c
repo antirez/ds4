@@ -75543,6 +75543,11 @@ int ds4_prompt_append_vision(
     return 1;
 }
 
+int ds4_engine_vision_wrapper_tokens(ds4_engine *e) {
+    return e && (e->vision_kind == DS4_VISION_GLM53 ||
+                 e->vision_kind == DS4_VISION_QWEN4);
+}
+
 int ds4_chat_append_multimodal_message(
         ds4_engine             *e,
         ds4_tokens             *tokens,
@@ -78526,6 +78531,43 @@ bool ds4_session_rebase_vision_state(const ds4_session *s,
 
 bool ds4_session_has_vision_state(const ds4_session *s) {
     return s && (s->checkpoint_image_count != 0 || s->sync_image_count != 0);
+}
+
+int ds4_session_vision_identities(const ds4_session *s,
+                                  ds4_vision_span *out, size_t cap) {
+    if (!s || !s->checkpoint_valid) return -1;
+    /* checkpoint_images describes the last completed sync. While a multimodal
+     * sync runs, the frontier advances through the images of its own prompt,
+     * whose historical part was already verified against the checkpoint. */
+    const bool syncing = s->sync_image_count != 0;
+    const size_t count = syncing ? s->sync_image_count :
+                                   s->checkpoint_image_count;
+    const uint64_t frontier = (uint64_t)s->checkpoint.len;
+    size_t n = 0;
+    for (size_t i = 0; i < count; i++) {
+        uint32_t start, rows;
+        const uint8_t *fingerprint;
+        if (syncing) {
+            start = s->sync_images[i].token_start;
+            rows = s->sync_images[i].embedding.token_count;
+            fingerprint = s->sync_images[i].embedding.fingerprint;
+        } else {
+            start = s->checkpoint_images[i].token_start;
+            rows = s->checkpoint_images[i].token_count;
+            fingerprint = s->checkpoint_images[i].fingerprint;
+        }
+        if (start >= frontier) break;
+        if ((uint64_t)start + rows > frontier) return -1;
+        if (n < cap) {
+            memset(&out[n], 0, sizeof(out[n]));
+            out[n].token_start = start;
+            out[n].embedding.token_count = rows;
+            memcpy(out[n].embedding.fingerprint, fingerprint,
+                   sizeof(out[n].embedding.fingerprint));
+        }
+        n++;
+    }
+    return (int)n;
 }
 
 static bool ds4_session_vision_range_overlaps(

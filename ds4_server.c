@@ -435,7 +435,22 @@ static char *json_minify_raw_value(const char *json) {
     return buf_take(&b);
 }
 
-#define SERVER_IMAGE_MARKER_BYTES 64
+/* An image stands in rendered prompt text as a fixed-width marker:
+ *
+ *   \036 DS4_IMAGE_ <72 hex digits> \x1f
+ *
+ * A request fills the digits with a random nonce, so that literal text cannot
+ * impersonate an image. Text that must match across requests (the live text
+ * tier, disk cache keys) overwrites them in place with the image identity:
+ * the fingerprint and the row count, which together are what a live session
+ * checks before reusing image rows. Renaming in place keeps every byte offset
+ * of the rendered text. */
+#define SERVER_IMAGE_MARKER_PREFIX "\036" "DS4_IMAGE_"
+#define SERVER_IMAGE_ID_BYTES \
+    (sizeof(((ds4_vision_embedding *)0)->fingerprint) + sizeof(uint32_t))
+#define SERVER_IMAGE_MARKER_LEN \
+    (sizeof(SERVER_IMAGE_MARKER_PREFIX) - 1 + 2 * SERVER_IMAGE_ID_BYTES + 1)
+#define SERVER_IMAGE_MARKER_BYTES (SERVER_IMAGE_MARKER_LEN + 1)
 
 typedef struct {
     char marker[SERVER_IMAGE_MARKER_BYTES];
@@ -454,6 +469,37 @@ static void server_image_inputs_free(server_image_inputs *images) {
     for (size_t i = 0; i < images->len; i++) free(images->v[i].encoded);
     free(images->v);
     memset(images, 0, sizeof(*images));
+}
+
+/* Write one marker, without a terminating NUL, around the given bytes. */
+static void server_image_marker_write(char *dst,
+                                      const uint8_t id[SERVER_IMAGE_ID_BYTES]) {
+    static const char hex[] = "0123456789abcdef";
+    const size_t prefix = sizeof(SERVER_IMAGE_MARKER_PREFIX) - 1;
+    memcpy(dst, SERVER_IMAGE_MARKER_PREFIX, prefix);
+    for (size_t i = 0; i < SERVER_IMAGE_ID_BYTES; i++) {
+        dst[prefix + 2 * i] = hex[id[i] >> 4];
+        dst[prefix + 2 * i + 1] = hex[id[i] & 15];
+    }
+    dst[SERVER_IMAGE_MARKER_LEN - 1] = '\x1f';
+}
+
+static void server_image_identity_marker(char *dst, const ds4_vision_span *image) {
+    uint8_t id[SERVER_IMAGE_ID_BYTES];
+    const size_t fp = sizeof(image->embedding.fingerprint);
+    memcpy(id, image->embedding.fingerprint, fp);
+    for (size_t i = 0; i < sizeof(uint32_t); i++)
+        id[fp + i] = (uint8_t)(image->embedding.token_count >> (8 * i));
+    server_image_marker_write(dst, id);
+}
+
+static size_t server_image_marker_count(const char *text) {
+    size_t n = 0;
+    while ((text = strstr(text, SERVER_IMAGE_MARKER_PREFIX)) != NULL) {
+        text += sizeof(SERVER_IMAGE_MARKER_PREFIX) - 1;
+        n++;
+    }
+    return n;
 }
 
 static int base64_value(unsigned char c) {
@@ -510,7 +556,7 @@ static bool server_image_inputs_push_base64(server_image_inputs *images,
     server_image_input image = {0};
     if (!server_decode_base64(base64, &image.encoded, &image.encoded_len))
         return false;
-    unsigned char nonce[12];
+    uint8_t nonce[SERVER_IMAGE_ID_BYTES];
     if (!random_bytes(nonce, sizeof(nonce))) {
         uint64_t fallback = (uint64_t)time(NULL) ^
                             ((uint64_t)getpid() << 32) ^
@@ -518,15 +564,8 @@ static bool server_image_inputs_push_base64(server_image_inputs *images,
         memcpy(nonce, &fallback, sizeof(fallback));
         memset(nonce + sizeof(fallback), 0, sizeof(nonce) - sizeof(fallback));
     }
-    static const char hex[] = "0123456789abcdef";
-    size_t pos = (size_t)snprintf(image.marker, sizeof(image.marker),
-                                  "\036" "DS4_IMAGE_");
-    for (size_t i = 0; i < sizeof(nonce) && pos + 2 < sizeof(image.marker); i++) {
-        image.marker[pos++] = hex[nonce[i] >> 4];
-        image.marker[pos++] = hex[nonce[i] & 15];
-    }
-    image.marker[pos++] = '\x1f';
-    image.marker[pos] = '\0';
+    server_image_marker_write(image.marker, nonce);
+    image.marker[SERVER_IMAGE_MARKER_LEN] = '\0';
     if (images->len == images->cap) {
         size_t cap = images->cap ? images->cap * 2 : 2;
         images->v = xrealloc(images->v, cap * sizeof(images->v[0]));
@@ -808,6 +847,9 @@ typedef struct {
     stop_list stops;
     char *raw_body;
     char *prompt_text;
+    /* prompt_text with image markers renamed to identities; NULL without
+     * images. See request_cache_text(). */
+    char *cache_text;
     tool_schema_orders tool_orders;
     int max_tokens;
     int top_k;
@@ -1019,6 +1061,7 @@ static void request_free(request *r) {
     free(r->stops.v);
     free(r->raw_body);
     free(r->prompt_text);
+    free(r->cache_text);
     stop_list_clear(&r->responses_live_call_ids);
     free(r->responses_live_call_ids.v);
     free(r->responses_live_suffix_text);
@@ -3660,6 +3703,32 @@ static DS4_SERVER_MAYBE_UNUSED char *render_chat_prompt_text(
 /* Per-request image cap; session and TP image state is sized dynamically. */
 #define SERVER_MAX_IMAGES 256
 
+/* The prompt text as cache lookups see it: every image marker renamed from
+ * its nonce to the image identity. Returns NULL when the request has no
+ * images, and when literal text spells a marker prefix: a key names images
+ * only where the prompt holds them, so equal bytes always mean equal images at
+ * equal positions. */
+static char *request_cache_text(const request *r) {
+    if (!r->image_count || !r->image_markers || !r->prompt_text) return NULL;
+    char *key = xstrdup(r->prompt_text);
+    const char *cursor = r->prompt_text;
+    for (size_t i = 0; i < r->image_count; i++) {
+        const char *marker = strstr(cursor, r->image_markers[i]);
+        if (!marker || strlen(r->image_markers[i]) != SERVER_IMAGE_MARKER_LEN) {
+            free(key);
+            return NULL;
+        }
+        server_image_identity_marker(key + (marker - r->prompt_text),
+                                     &r->images[i]);
+        cursor = marker + SERVER_IMAGE_MARKER_LEN;
+    }
+    if (server_image_marker_count(key) != r->image_count) {
+        free(key);
+        return NULL;
+    }
+    return key;
+}
+
 static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
                                                request *r,
                                                const chat_msgs *msgs,
@@ -3723,7 +3792,10 @@ static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
         memcpy(r->image_markers[i], inputs[i]->marker, sizeof(r->image_markers[i]));
         cursor = marker + strlen(inputs[i]->marker);
     }
-    if (ok) ds4_tokenize_rendered_chat(e, cursor, &r->prompt);
+    if (ok) {
+        ds4_tokenize_rendered_chat(e, cursor, &r->prompt);
+        r->cache_text = request_cache_text(r);
+    }
 
 done:
     for (size_t i = 0; i < count; i++)
@@ -10037,9 +10109,10 @@ struct server_slot {
     /* Wall time of the last completed job on this slot, stamped by the slot
      * worker; drives the staleness tiers in job_slot_score(). */
     time_t last_used;
-    /* Cached rendered text of the checkpoint, refreshed by the slot worker
-     * after each job; lets the reuse probe (slot_probe_reuse_locked) answer
-     * the memory-text question with a memcmp instead of a detokenization. */
+    /* Cached rendered text of the checkpoint (checkpoint_cache_text),
+     * refreshed by the slot worker after each job; lets the reuse probe
+     * (slot_probe_reuse_locked) answer the memory-text question with a memcmp
+     * instead of a detokenization. */
     char *live_text;
     size_t live_text_len;
     int live_text_pos;              /* checkpoint.len at render time; 0 = stale */
@@ -11196,6 +11269,55 @@ static bool byte_prefix_match(const char *text, size_t text_len,
     return ds4_kvstore_byte_prefix_match(text, text_len, prefix, prefix_len);
 }
 
+static void buf_put_tokens_text(buf *b, ds4_engine *engine,
+                                const ds4_tokens *tokens, int from, int to) {
+    ds4_tokens range = {.v = tokens->v + from, .len = to - from};
+    size_t len = 0;
+    char *text = render_tokens_text(engine, &range, &len);
+    buf_append(b, text, len);
+    free(text);
+}
+
+/* The checkpoint-side counterpart of request_cache_text(): the rendered text
+ * of the live tokens with every image block replaced by its identity marker,
+ * under the same rule that only images spell a marker prefix. Without images
+ * this is the plain rendered text. Returns NULL when the images cannot be
+ * named, for instance while the frontier stands inside a block. */
+static char *checkpoint_cache_text(server *s, ds4_session *session,
+                                   size_t *len_out) {
+    const ds4_tokens *live = ds4_session_tokens(session);
+    ds4_vision_span images[SERVER_MAX_IMAGES];
+    const int n = ds4_session_vision_identities(session, images,
+                                                SERVER_MAX_IMAGES);
+    if (!live || n < 0 || n > SERVER_MAX_IMAGES) return NULL;
+    if (n == 0) return render_tokens_text(s->engine, live, len_out);
+
+    const int wrapper = ds4_engine_vision_wrapper_tokens(s->engine);
+    buf b = {0};
+    int pos = 0;
+    for (int i = 0; i < n; i++) {
+        const int64_t start = (int64_t)images[i].token_start - wrapper;
+        const int64_t end = (int64_t)images[i].token_start +
+                            images[i].embedding.token_count + wrapper;
+        if (start < pos || end > live->len) {
+            buf_free(&b);
+            return NULL;
+        }
+        char marker[SERVER_IMAGE_MARKER_LEN];
+        server_image_identity_marker(marker, &images[i]);
+        buf_put_tokens_text(&b, s->engine, live, pos, (int)start);
+        buf_append(&b, marker, sizeof(marker));
+        pos = (int)end;
+    }
+    buf_put_tokens_text(&b, s->engine, live, pos, live->len);
+    if (server_image_marker_count(b.ptr) != (size_t)n) {
+        buf_free(&b);
+        return NULL;
+    }
+    if (len_out) *len_out = b.len;
+    return buf_take(&b);
+}
+
 
 static void tokens_copy_prefix(ds4_tokens *dst, const ds4_tokens *src, int n) {
     ds4_kvstore_tokens_copy_prefix(dst, src, n);
@@ -11506,7 +11628,7 @@ static bool build_live_prompt_suffix(server *s, server_slot *slot,
     ds4_tokens prompt = {0};
     ds4_tokens_copy(&prompt, live);
     const char *cursor = suffix;
-    const int wrapper = ds4_engine_is_glm_dsa(s->engine) ? 1 : 0;
+    const int wrapper = ds4_engine_vision_wrapper_tokens(s->engine);
     for (size_t i = old_count; i < req->image_count; i++) {
         const char *marker = strstr(cursor, req->image_markers[i]);
         int64_t start = (int64_t)req->images[i].token_start - wrapper;
@@ -11584,7 +11706,9 @@ static bool build_live_prompt_suffix(server *s, server_slot *slot,
  *   tokenization need not reproduce the sampled token ids; the live graph
  *   is authoritative, so the checkpoint tokens are kept verbatim and only
  *   the suffix text is tokenized (full-prompt BPE may have merged across
- *   the byte boundary).
+ *   the byte boundary).  Both texts name images by identity (see
+ *   SERVER_IMAGE_MARKER_PREFIX), so the tier also holds once an image is
+ *   part of the checkpoint.
  *
  * Locking: slot_probe_reuse_locked() requires tool_mu held (dispatch holds
  * it while scoring); slot_probe_reuse() is the worker-path wrapper.
@@ -11734,9 +11858,12 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
         }
     }
 
-    if (ptext && slot->live_text && slot->live_text_pos == live_pos &&
+    /* Images are compared by identity, not by request-local nonce. Renaming
+     * keeps byte offsets, so suffix_off still applies to the raw prompt_text. */
+    const char *ctext = req->cache_text ? req->cache_text : ptext;
+    if (ctext && slot->live_text && slot->live_text_pos == live_pos &&
         slot->live_text_len <= plen &&
-        byte_prefix_match(ptext, plen, slot->live_text, slot->live_text_len))
+        byte_prefix_match(ctext, plen, slot->live_text, slot->live_text_len))
     {
         pr.kind = REUSE_MEMORY_TEXT;
         pr.reuse_tokens = live_pos;
@@ -11785,7 +11912,8 @@ static void slot_refresh_live_text(server *s, server_slot *slot) {
     }
     const ds4_tokens *live = ds4_session_tokens(slot->session);
     if (!live || live->len <= 0) return;
-    slot->live_text = render_tokens_text(s->engine, live, &slot->live_text_len);
+    slot->live_text = checkpoint_cache_text(s, slot->session,
+                                            &slot->live_text_len);
     if (slot->live_text) slot->live_text_pos = live->len;
 }
 
@@ -16710,6 +16838,56 @@ static void test_slot_probe_vision_tiers(void) {
         TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &j.req).kind ==
                     REUSE_NONE);
         visible_live_free(&slot.thinking_live);
+        ds4_session_free_test_checkpoint(slot.session);
+        request_free(&j.req);
+    }
+
+    /* 4. memory-text survives an image inside the checkpoint: the cached
+     *    live text names the image by identity, so a replay binds under a
+     *    new nonce even when its tokens were re-spelled. Before, the first
+     *    image turned every later text-tier request into a full prefill.
+     *    The same pixels at another text position still do not bind. */
+    {
+        server_slot slot = {0};
+        slot.session = ds4_session_new_test_checkpoint(ckpt_tok, 10);
+        ds4_vision_span image = {.token_start = 2,
+            .embedding = {.token_count = 2, .fingerprint = {7}}};
+        ds4_session_set_test_images(slot.session, &image, 1);
+        job j = {0};
+        j.req.images = calloc(1, sizeof(*j.req.images));
+        j.req.images[0] = image;
+        j.req.image_count = 1;
+        j.req.image_markers = calloc(1, sizeof(*j.req.image_markers));
+        uint8_t nonce[SERVER_IMAGE_ID_BYTES] = {1};
+        server_image_marker_write(j.req.image_markers[0], nonce);
+        buf text = {0};
+        buf_printf(&text, "see %s now", j.req.image_markers[0]);
+        j.req.prompt_text = buf_take(&text);
+        /* What checkpoint_cache_text() renders once this turn is live. */
+        slot.live_text = request_cache_text(&j.req);
+        slot.live_text_len = strlen(slot.live_text);
+        slot.live_text_pos = 10;
+
+        nonce[0] = 2;
+        server_image_marker_write(j.req.image_markers[0], nonce);
+        free(j.req.prompt_text);
+        buf_printf(&text, "see %s now and more", j.req.image_markers[0]);
+        j.req.prompt_text = buf_take(&text);
+        j.req.cache_text = request_cache_text(&j.req);
+        ds4_tokens_push(&j.req.prompt, 999);  /* force text tier */
+        slot_reuse pr = slot_probe_reuse_locked(&s, &slot, &j.req);
+        TEST_ASSERT(pr.kind == REUSE_MEMORY_TEXT);
+        TEST_ASSERT(pr.reuse_tokens == 10);
+        TEST_ASSERT(pr.suffix_off == slot.live_text_len);
+
+        free(j.req.prompt_text);
+        free(j.req.cache_text);
+        buf_printf(&text, "see now %s and more", j.req.image_markers[0]);
+        j.req.prompt_text = buf_take(&text);
+        j.req.cache_text = request_cache_text(&j.req);
+        TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &j.req).kind ==
+                    REUSE_NONE);
+        free(slot.live_text);
         ds4_session_free_test_checkpoint(slot.session);
         request_free(&j.req);
     }
@@ -22725,6 +22903,65 @@ static void test_visible_image_key(void) {
     free(visible);
 }
 
+/* A cache key names each image by pixels and row count, never by the nonce
+ * of the request that carried it, and refuses text that spells a marker. */
+static void test_image_cache_text(void) {
+    ds4_vision_span images[2] = {
+        {.embedding = {.token_count = 16, .fingerprint = {7}}},
+        {.embedding = {.token_count = 16, .fingerprint = {8}}},
+    };
+    char markers[2][SERVER_IMAGE_MARKER_BYTES] = {{0}};
+    request req = {.image_count = 2, .image_markers = markers, .images = images};
+    char *keys[2];
+    for (int turn = 0; turn < 2; turn++) {
+        uint8_t nonce[SERVER_IMAGE_ID_BYTES] = {(uint8_t)(1 + turn)};
+        server_image_marker_write(markers[0], nonce);
+        nonce[1] = 1;
+        server_image_marker_write(markers[1], nonce);
+        buf text = {0};
+        buf_printf(&text, "look %s then %s done", markers[0], markers[1]);
+        req.prompt_text = text.ptr;
+        keys[turn] = request_cache_text(&req);
+        TEST_ASSERT(keys[turn] && strlen(keys[turn]) == text.len);
+        TEST_ASSERT(strcmp(keys[turn], text.ptr));
+        TEST_ASSERT(!strncmp(keys[turn], "look ", 5));
+        if (turn == 0) buf_free(&text);
+    }
+    TEST_ASSERT(keys[0] && keys[1] && !strcmp(keys[0], keys[1]));
+
+    images[1].embedding.fingerprint[31] ^= 1;
+    char *other = request_cache_text(&req);
+    TEST_ASSERT(other && strcmp(other, keys[0]));
+    /* The keys part exactly where the second image starts. */
+    const size_t second = strstr(req.prompt_text, markers[1]) - req.prompt_text;
+    TEST_ASSERT(other && !memcmp(other, keys[0], second +
+                                 sizeof(SERVER_IMAGE_MARKER_PREFIX) - 1));
+    free(other);
+    images[1].embedding.fingerprint[31] ^= 1;
+    images[1].embedding.token_count++;
+    other = request_cache_text(&req);
+    TEST_ASSERT(other && strcmp(other, keys[0]));
+    free(other);
+    images[1].embedding.token_count--;
+
+    /* A literal marker, here a copied identity, would let text stand where
+     * an image is expected. */
+    buf forged = {0};
+    buf_printf(&forged, "%s and %.*s", req.prompt_text,
+               (int)SERVER_IMAGE_MARKER_LEN, keys[0] + 5);
+    char *prompt_text = req.prompt_text;
+    req.prompt_text = forged.ptr;
+    TEST_ASSERT(request_cache_text(&req) == NULL);
+    req.prompt_text = prompt_text;
+    buf_free(&forged);
+
+    req.image_count = 0;
+    TEST_ASSERT(request_cache_text(&req) == NULL);
+    free(prompt_text);
+    free(keys[0]);
+    free(keys[1]);
+}
+
 static void test_anthropic_tool_image_output(void) {
     buf json = {0};
     buf_puts(&json, "[{\"content\":[{\"type\":\"tool_result\","
@@ -23020,6 +23257,7 @@ static void ds4_server_unit_tests_run(void) {
     test_deepseek41_anthropic_results();
     test_deepseek41_live_result_order();
     test_visible_image_key();
+    test_image_cache_text();
     test_anthropic_tool_image_output();
     test_responses_tool_image_output();
     test_server_image_embedding_cache();

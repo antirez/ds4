@@ -117,6 +117,60 @@ static void test_vision_fingerprint_prefix(void) {
     free(s);
 }
 
+/* The identities a checkpoint can be named by are the images whose rows the
+ * token frontier fully contains: a frontier inside an image has no name, and
+ * a running multimodal sync is described by its own prompt. */
+static void test_vision_identities(void) {
+    ds4_session *s = calloc(1, sizeof(*s));
+    assert(s);
+    s->checkpoint_valid = true;
+    s->checkpoint.len = 100;
+    ds4_vision_span out[2];
+    assert(ds4_session_vision_identities(s, out, 2) == 0);
+    ds4_vision_identity held[2] = {
+        {.token_start = 10, .token_count = 20, .fingerprint = {1}},
+        {.token_start = 60, .token_count = 40, .fingerprint = {2}},
+    };
+    s->checkpoint_images = held;
+    s->checkpoint_image_count = 2;
+    assert(ds4_session_vision_identities(s, out, 2) == 2);
+    assert(out[0].token_start == 10 && out[0].embedding.token_count == 20 &&
+           out[0].embedding.fingerprint[0] == 1 && !out[0].embedding.data);
+    assert(out[1].token_start == 60 && out[1].embedding.token_count == 40 &&
+           out[1].embedding.fingerprint[0] == 2);
+    /* The count does not depend on how many entries the caller can take. */
+    memset(out, 0, sizeof(out));
+    assert(ds4_session_vision_identities(s, out, 1) == 2);
+    assert(out[0].token_start == 10 && out[1].token_start == 0);
+    assert(ds4_session_vision_identities(s, NULL, 0) == 2);
+    s->checkpoint.len = 99;
+    assert(ds4_session_vision_identities(s, out, 2) == -1);
+    s->checkpoint.len = 60;
+    assert(ds4_session_vision_identities(s, out, 2) == 1);
+
+    /* Mid-sync the completed-sync record is stale: only the first image of
+     * the prompt being synchronized is behind the frontier. */
+    ds4_vision_span syncing[2] = {
+        {.token_start = 5, .embedding = {.token_count = 30, .fingerprint = {3}}},
+        {.token_start = 50, .embedding = {.token_count = 30, .fingerprint = {4}}},
+    };
+    s->sync_images = syncing;
+    s->sync_image_count = 2;
+    s->checkpoint.len = 50;
+    assert(ds4_session_vision_identities(s, out, 2) == 1);
+    assert(out[0].token_start == 5 && out[0].embedding.token_count == 30 &&
+           out[0].embedding.fingerprint[0] == 3);
+    s->checkpoint.len = 64;
+    assert(ds4_session_vision_identities(s, out, 2) == -1);
+    s->checkpoint.len = 80;
+    assert(ds4_session_vision_identities(s, out, 2) == 2);
+
+    s->checkpoint_valid = false;
+    assert(ds4_session_vision_identities(s, out, 2) == -1);
+    assert(ds4_session_vision_identities(NULL, out, 2) == -1);
+    free(s);
+}
+
 static void test_rewind(void) {
     ds4_engine e = { .backend = DS4_BACKEND_CPU };
     ds4_session *s = calloc(1, sizeof(*s));
@@ -818,6 +872,7 @@ int main(void) {
     test_dspark_tp_split_reserve();
     test_vision_prefix();
     test_vision_fingerprint_prefix();
+    test_vision_identities();
     test_rewind();
     test_session_memory();
     test_payload_tokens();

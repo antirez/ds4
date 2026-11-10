@@ -280,6 +280,10 @@ int ds4_prompt_append_vision(ds4_engine *e,
                              ds4_vision_embedding *embedding,
                              char *error,
                              size_t error_cap);
+/* Tokens that ds4_prompt_append_vision() adds on each side of the span: GLM
+ * and Qwen bracket the image rows with one start and one end token, while a
+ * DeepSeek span already covers the whole block. */
+int ds4_engine_vision_wrapper_tokens(ds4_engine *e);
 /* Append one user or tool message whose text parts alternate with images.
  * text_parts must contain image_count + 1 entries. On success ownership of
  * each embedding is transferred to the corresponding output span. */
@@ -470,6 +474,14 @@ bool ds4_session_rebase_vision_state(const ds4_session *s,
 /* True while a session contains, or is actively syncing, image-conditioned
  * state. Such state must not be written to the text-keyed disk KV cache. */
 bool ds4_session_has_vision_state(const ds4_session *s);
+/* Identities of the images whose rows lie inside the live token frontier, in
+ * prompt order: token_start, row count and fingerprint, with embedding.data
+ * left NULL. During a multimodal sync they come from the prompt being
+ * synchronized, so a progress callback sees the frontier it stands on.
+ * Returns the image count, writing at most cap entries to out, or -1 when the
+ * checkpoint is invalid or the frontier cuts through an image. */
+int ds4_session_vision_identities(const ds4_session *s,
+                                  ds4_vision_span *out, size_t cap);
 bool ds4_session_rewrite_requires_rebuild(int live_len, int canonical_len, int common);
 ds4_session_rewrite_result ds4_session_rewrite_from_common(
         ds4_session *s, const ds4_tokens *prompt, int common,
