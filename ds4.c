@@ -65449,6 +65449,13 @@ void ds4_session_payload_file_free(ds4_session_payload_file *payload) {
     memset(payload, 0, sizeof(*payload));
 }
 
+/* Tensor-parallel loads rebuild both ranks by replaying the saved tokens as
+ * text, and distributed workers take no image rows at all: for these sessions
+ * a payload cannot bring image-conditioned state back. */
+static bool ds4_session_payload_loses_vision(const ds4_session *s) {
+    return s->distributed || (s->engine && s->engine->tp.active);
+}
+
 int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
                               char *err, size_t errlen) {
     if (!out) {
@@ -65458,6 +65465,18 @@ int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
     memset(out, 0, sizeof(*out));
     if (!s || !s->checkpoint_valid) {
         payload_set_err(err, errlen, "session has no valid checkpoint to stage");
+        return 1;
+    }
+    /* A staged payload is restored later, together with the identities of
+     * the images it holds. Refuse the states that restore could not rebuild. */
+    const int images = ds4_session_vision_identities(s, NULL, 0);
+    if (images < 0) {
+        payload_set_err(err, errlen, "checkpoint ends inside an image");
+        return 1;
+    }
+    if (images > 0 && ds4_session_payload_loses_vision(s)) {
+        payload_set_err(err, errlen,
+                        "this session cannot restore image checkpoints");
         return 1;
     }
 
@@ -66747,6 +66766,54 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
     metal_graph_dspark_cache_reset(g);
     return 0;
 #endif
+}
+
+int ds4_session_load_payload_multimodal(
+        ds4_session           *s,
+        FILE                  *fp,
+        uint64_t               payload_bytes,
+        const ds4_vision_span *images,
+        size_t                 image_count,
+        char                  *err,
+        size_t                 errlen) {
+    if (image_count != 0 &&
+        (!s || !images || ds4_session_payload_loses_vision(s))) {
+        payload_set_err(err, errlen,
+                        "this session cannot restore image checkpoints");
+        return 1;
+    }
+    const int rc = ds4_session_load_payload(s, fp, payload_bytes, err, errlen);
+    if (rc != 0) return rc;
+
+    /* The identities are trusted to describe the payload, but not to be well
+     * formed: every later image check indexes the checkpoint through them. */
+    ds4_vision_identity *held = image_count ?
+        calloc(image_count, sizeof(held[0])) : NULL;
+    uint64_t previous_end = 0;
+    bool ok = !image_count || held;
+    for (size_t i = 0; ok && i < image_count; i++) {
+        const uint64_t end = (uint64_t)images[i].token_start +
+                             images[i].embedding.token_count;
+        ok = images[i].embedding.token_count != 0 &&
+             images[i].token_start >= previous_end &&
+             end <= (uint64_t)s->checkpoint.len;
+        held[i].token_start = images[i].token_start;
+        held[i].token_count = images[i].embedding.token_count;
+        memcpy(held[i].fingerprint, images[i].embedding.fingerprint,
+               sizeof(held[i].fingerprint));
+        previous_end = end;
+    }
+    if (!ok) {
+        free(held);
+        ds4_session_invalidate(s);
+        payload_set_err(err, errlen,
+                        "image identities do not fit the restored checkpoint");
+        return 1;
+    }
+    free(s->checkpoint_images);
+    s->checkpoint_images = held;
+    s->checkpoint_image_count = image_count;
+    return 0;
 }
 
 int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *err, size_t errlen) {

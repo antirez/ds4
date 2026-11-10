@@ -32,7 +32,8 @@ def main():
         data = base64.b64encode((fixtures / name).read_bytes()).decode()
         return {"type": "image_url", "image_url": {"url": "data:image/png;base64," + data}}
 
-    def ask(label, history, expected_cache=None, tools=None, thinking=False):
+    def ask(label, history, expected_cache=None, tools=None, thinking=False,
+            changed=None):
         previous_frontier = results[-1]["usage"]["total_tokens"] if expected_cache and results else 0
         body = {"model": args.model, "messages": history, "temperature": 0,
                 "reasoning_effort": "low" if thinking else "none",
@@ -63,7 +64,12 @@ def main():
                 assert cached > 0 and cached >= previous_frontier, \
                     label + ": lost part of the live image/text prefix"
             else:
-                assert cached == 0, label + ": reused an incompatible image prefix"
+                # The history before the changed image may still come from a
+                # disk cache. Nothing from the request that introduced that
+                # image onward may.
+                limit = next(r for r in results if r["label"] == changed)
+                assert cached < limit["usage"]["prompt_tokens"], \
+                    label + ": reused an incompatible image prefix"
         return result["message"]
 
     def thinking_replay():
@@ -93,7 +99,8 @@ def main():
         assert "482" in answer.get("content", "")
         changed = copy.deepcopy(history)
         changed[0]["content"][1] = image("spatial.png")
-        ask("thinking-changed-image", changed, False, thinking=True)
+        ask("thinking-changed-image", changed, False, thinking=True,
+            changed="thinking-image")
 
     if args.thinking_only:
         thinking_replay()
@@ -126,14 +133,14 @@ def main():
     # The text/token placeholders can stay identical while pixels change.
     changed = copy.deepcopy(history[:-1])
     changed[5]["content"][1] = image("spatial.png")
-    ask("changed-old-image", changed, False)
+    ask("changed-old-image", changed, False, changed="first-image")
     removed = copy.deepcopy(changed)
     removed[5]["content"] = [{"type": "text", "text": "No image was supplied."}]
-    ask("removed-old-image", removed, False)
+    ask("removed-old-image", removed, False, changed="first-image")
     reordered = copy.deepcopy(history[:-1])
     reordered[5]["content"][1], reordered[9]["content"][1] = (
         reordered[9]["content"][1], reordered[5]["content"][1])
-    ask("reordered-images", reordered, False)
+    ask("reordered-images", reordered, False, changed="first-image")
 
     # A real tool-call exchange, with an image added in the following turn.
     tools = [{"type": "function", "function": {

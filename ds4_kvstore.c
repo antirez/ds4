@@ -886,6 +886,68 @@ static bool kv_trailer_write(const ds4_kvstore_trailer_hooks *hooks,
     return hooks->write(hooks->ud, fp, text, written_bytes);
 }
 
+/* Image identity section, present with DS4_KVSTORE_EXT_VISION: a u32 image
+ * count, then token start, row count and fingerprint of each image whose rows
+ * the payload holds. It sits in front of the engine payload and is counted in
+ * the header's payload bytes, so code that only skips a payload to reach the
+ * trailer needs no knowledge of it. */
+#define KV_VISION_IMAGE_BYTES \
+    (8u + sizeof(((ds4_vision_embedding *)0)->fingerprint))
+
+static uint64_t kv_vision_bytes(int count) {
+    return count > 0 ? 4u + (uint64_t)count * KV_VISION_IMAGE_BYTES : 0;
+}
+
+static bool kv_vision_write(FILE *fp, const ds4_session *session, int count) {
+    if (count <= 0) return true;
+    ds4_vision_span *images = kv_xmalloc((size_t)count * sizeof(images[0]));
+    uint8_t b[8];
+    ds4_kvstore_le_put32(b, (uint32_t)count);
+    bool ok = ds4_session_vision_identities(session, images,
+                                            (size_t)count) == count &&
+              fwrite(b, 1, 4, fp) == 4;
+    for (int i = 0; ok && i < count; i++) {
+        const ds4_vision_embedding *image = &images[i].embedding;
+        ds4_kvstore_le_put32(b, images[i].token_start);
+        ds4_kvstore_le_put32(b + 4, image->token_count);
+        ok = fwrite(b, 1, 8, fp) == 8 &&
+             fwrite(image->fingerprint, 1, sizeof(image->fingerprint), fp) ==
+                 sizeof(image->fingerprint);
+    }
+    free(images);
+    return ok;
+}
+
+/* Read the section and shrink *payload_bytes to the engine payload behind
+ * it. Every image has at least one row, which bounds a corrupt count. */
+static ds4_vision_span *kv_vision_read(FILE *fp, uint32_t tokens,
+                                       uint64_t *payload_bytes,
+                                       uint32_t *count_out) {
+    uint8_t b[8];
+    if (*payload_bytes < 4 || fread(b, 1, 4, fp) != 4) return NULL;
+    const uint32_t count = ds4_kvstore_le_get32(b);
+    if (count == 0 || count > tokens ||
+        (*payload_bytes - 4) / KV_VISION_IMAGE_BYTES < count)
+        return NULL;
+    ds4_vision_span *images = calloc(count, sizeof(images[0]));
+    if (!images) return NULL;
+    for (uint32_t i = 0; i < count; i++) {
+        ds4_vision_embedding *image = &images[i].embedding;
+        if (fread(b, 1, 8, fp) != 8 ||
+            fread(image->fingerprint, 1, sizeof(image->fingerprint), fp) !=
+                sizeof(image->fingerprint))
+        {
+            free(images);
+            return NULL;
+        }
+        images[i].token_start = ds4_kvstore_le_get32(b);
+        image->token_count = ds4_kvstore_le_get32(b + 4);
+    }
+    *payload_bytes -= kv_vision_bytes((int)count);
+    *count_out = count;
+    return images;
+}
+
 static void kv_cache_rewrite_trailer(ds4_kvstore *kc, const char *path,
                                      const char *text,
                                      const ds4_kvstore_trailer_hooks *hooks) {
@@ -971,6 +1033,17 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     size_t text_len = 0;
     char *text = NULL;
     const bool text_override = cache_text_override && cache_text_override[0];
+    /* Rendered text spells an image as placeholder tokens, the same for any
+     * pixels. A checkpoint holding image rows needs a caller key that names
+     * the images; staging below rejects frontiers that cannot name them. */
+    const int image_count = ds4_session_vision_identities(session, NULL, 0);
+    if (image_count > 0 && !text_override) {
+        kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                "%s: kv cache skipped tokens=%d reason=%s because rendered text cannot name its images",
+                kv_log_name(kc), store_tokens.len, reason);
+        ds4_tokens_free(&store_tokens);
+        return false;
+    }
     if (text_override) {
         text = kv_xstrdup(cache_text_override);
         text_len = strlen(text);
@@ -1026,7 +1099,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         ds4_tokens_free(&store_tokens);
         return false;
     }
-    uint64_t payload_bytes = staged.bytes;
+    const uint64_t payload_bytes = kv_vision_bytes(image_count) + staged.bytes;
 
     uint64_t est_file_bytes = 0, est_required_bytes = 0;
     if (!ds4_kvstore_file_size_fits(kc, (uint64_t)text_len, payload_bytes,
@@ -1079,6 +1152,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     uint8_t h[DS4_KVSTORE_FIXED_HEADER];
     uint8_t ext_flags = trailer_est_bytes > 0 && hooks ? hooks->ext_flag : 0;
     if (text_override) ext_flags |= cache_text_ext;
+    if (image_count > 0) ext_flags |= DS4_KVSTORE_EXT_VISION;
     ds4_kvstore_fill_header(h, (uint8_t)model_id, (uint8_t)quant_bits,
                             reason_code, ext_flags,
                             (uint32_t)store_tokens.len, 0,
@@ -1091,6 +1165,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     bool ok = fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
               fwrite(tb, 1, sizeof(tb), fp) == sizeof(tb) &&
               fwrite(text, 1, text_len, fp) == text_len &&
+              kv_vision_write(fp, session, image_count) &&
               ds4_session_write_staged_payload(&staged, fp,
                                                save_err, sizeof(save_err)) == 0 &&
               kv_trailer_write(hooks, fp, text, &trailer_bytes) &&
@@ -1277,10 +1352,24 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
             }
         }
     }
+    ds4_vision_span *images = NULL;
+    uint32_t image_count = 0;
+    uint64_t payload_bytes = hdr.payload_bytes;
+    if (header_ok && (hdr.ext_flags & DS4_KVSTORE_EXT_VISION)) {
+        images = kv_vision_read(fp, hdr.tokens, &payload_bytes, &image_count);
+        if (!images) {
+            header_ok = false;
+            fail_reason = "invalid image identities";
+        }
+    }
     char err[160] = {0};
     int loaded = 0;
+    /* Loading also replaces the image identities of the session: a text
+     * checkpoint must not inherit images from the state it overwrites. */
     if (header_ok &&
-        ds4_session_load_payload(session, fp, hdr.payload_bytes, err, sizeof(err)) == 0)
+        ds4_session_load_payload_multimodal(session, fp, payload_bytes,
+                                            images, image_count,
+                                            err, sizeof(err)) == 0)
     {
         const ds4_tokens *loaded_tokens = ds4_session_tokens(session);
         if (loaded_tokens && loaded_tokens->len == (int)hdr.tokens) {
@@ -1340,6 +1429,7 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
             result->path = kv_xstrdup(path);
         }
     }
+    free(images);
     free(cached_text);
     free(path);
     return loaded;
