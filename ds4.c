@@ -14420,6 +14420,23 @@ static uint32_t ds4_default_raw_cap(uint32_t ctx_size) {
 }
 
 #define DS4_CUDA_TP_DEFAULT_PREFILL_CHUNK 2048u
+#define DS4_DEFAULT_PREFILL_CHUNK 4096u
+#define DS4_PRO_DEFAULT_PREFILL_CHUNK 8192u
+
+size_t ds4_test_default_prefill_caps(uint32_t *out, size_t max) {
+    /* Keep in sync with ds4_effective_prefill_chunk() and
+     * ds4_prefill_cap_for_prompt() below.  The KV disk cache only observes
+     * prefill at these chunk boundaries, so its continued-checkpoint step
+     * must divide evenly by each of them. */
+    static const uint32_t caps[] = {
+        DS4_CUDA_TP_DEFAULT_PREFILL_CHUNK,
+        DS4_DEFAULT_PREFILL_CHUNK,
+        DS4_PRO_DEFAULT_PREFILL_CHUNK,
+    };
+    const size_t n = sizeof(caps) / sizeof(caps[0]);
+    for (size_t i = 0; out && i < n && i < max; i++) out[i] = caps[i];
+    return n;
+}
 
 static uint32_t ds4_effective_prefill_chunk(bool cuda_tensor_parallel,
                                             uint32_t requested_chunk) {
@@ -14444,7 +14461,9 @@ static uint32_t ds4_prefill_cap_for_prompt(int prompt_len,
                 cap = (uint32_t)v;
             }
         } else if (prompt_len > 4096) {
-            cap = DS4_MODEL_VARIANT == DS4_VARIANT_PRO ? 8192u : 4096u;
+            cap = DS4_MODEL_VARIANT == DS4_VARIANT_PRO ?
+                  DS4_PRO_DEFAULT_PREFILL_CHUNK :
+                  DS4_DEFAULT_PREFILL_CHUNK;
         }
     }
 

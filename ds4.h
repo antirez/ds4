@@ -485,6 +485,10 @@ void ds4_session_free_test_checkpoint(ds4_session *s);
  * token_start/row-count/fingerprint per span).  Not usable for inference. */
 void ds4_session_set_test_images(ds4_session *s,
                                  const ds4_vision_span *images, size_t n);
+/* Test helper (ds4-test): the distinct default prefill chunk sizes a backend
+ * may pick for long prompts, so a test can replay each chunk schedule against
+ * the KV disk cache.  Writes up to max into out and returns the total count. */
+size_t ds4_test_default_prefill_caps(uint32_t *out, size_t max);
 int ds4_session_argmax(ds4_session *s);
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id);
 int ds4_session_argmax_ignoring_eos(ds4_session *s,
