@@ -21,6 +21,31 @@ __global__ static void rms_norm_plain_kernel(float *out, const float *x, uint32_
     }
 }
 
+/* Same reduction as rms_norm_plain_kernel, written as the F16 activations of
+ * the following GEMM so the hyper-connection stream is read once. */
+__global__ static void rms_norm_plain_f16_kernel(__half *out, const float *x, uint32_t n, uint32_t rows, float eps) {
+    uint32_t row = blockIdx.x;
+    if (row >= rows) return;
+    const float *xr = x + (uint64_t)row * n;
+    __half *orow = out + (uint64_t)row * n;
+    float sum = 0.0f;
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+        float v = xr[i];
+        sum += v * v;
+    }
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    float scale = rsqrtf(partial[0] / (float)n + eps);
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+        orow[i] = __float2half(xr[i] * scale);
+    }
+}
+
 __global__ static void rms_norm_weight_kernel(float *out, const float *x, const float *w, uint32_t n, uint32_t rows, float eps) {
     uint32_t row = blockIdx.x;
     if (row >= rows) return;
@@ -552,7 +577,8 @@ extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
         float                 beta_fast,
         float                 beta_slow,
         float                 eps) {
-    if (!g_cublas_ready || !out || !q_half || !x || !model_map || n_tok == 0 ||
+    if (!g_cublas_ready || !out || !q_half || !x || !model_map ||
+        n_tok < DS4_ROCM_F16_GEMM_MIN_TOKENS ||
         n_rot > head_dim || (n_rot & 1u) || out_dim != (uint64_t)n_head * head_dim ||
         x->bytes < (uint64_t)n_tok * in_dim * sizeof(float) ||
         out->bytes < (uint64_t)n_tok * out_dim * sizeof(float) ||
@@ -568,30 +594,33 @@ extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
     if (!xh) return 0;
     f32_to_f16_kernel<<<(xh_count + 255u) / 256u, 256>>>(xh, (const float *)x->ptr, xh_count);
     if (!cuda_ok(cudaGetLastError(), "attn q_b f16 activation convert launch")) return 0;
-    const float alpha = 1.0f;
-    const float beta = 0.0f;
-    cublasStatus_t st = cublasGemmEx(g_cublas,
-                                     CUBLAS_OP_T,
-                                     CUBLAS_OP_N,
-                                     (int)out_dim,
-                                     (int)n_tok,
-                                     (int)in_dim,
-                                     &alpha,
-                                     w_f16,
-                                     CUDA_R_16F,
-                                     (int)in_dim,
-                                     xh,
-                                     CUDA_R_16F,
-                                     (int)in_dim,
-                                     &beta,
-                                     q_half->ptr,
-                                     CUDA_R_16F,
-                                     (int)out_dim,
-                                     CUBLAS_COMPUTE_32F,
-                                     CUBLAS_GEMM_DEFAULT);
-    if (st != CUBLAS_STATUS_SUCCESS) {
-        fprintf(stderr, "ds4: " DS4_GPU_BLAS_NAME " attn q_b f16-out matmul failed: status %d\n", (int)st);
-        return 0;
+    if (!hipblaslt_gemm_f16((__half *)q_half->ptr, w_f16, xh, (uint32_t)out_dim, n_tok,
+                            (uint32_t)in_dim, "attn_q_b")) {
+        const float alpha = 1.0f;
+        const float beta = 0.0f;
+        cublasStatus_t st = cublasGemmEx(g_cublas,
+                                         CUBLAS_OP_T,
+                                         CUBLAS_OP_N,
+                                         (int)out_dim,
+                                         (int)n_tok,
+                                         (int)in_dim,
+                                         &alpha,
+                                         w_f16,
+                                         CUDA_R_16F,
+                                         (int)in_dim,
+                                         xh,
+                                         CUDA_R_16F,
+                                         (int)in_dim,
+                                         &beta,
+                                         q_half->ptr,
+                                         CUDA_R_16F,
+                                         (int)out_dim,
+                                         CUBLAS_COMPUTE_32F,
+                                         CUBLAS_GEMM_DEFAULT);
+        if (st != CUBLAS_STATUS_SUCCESS) {
+            fprintf(stderr, "ds4: " DS4_GPU_BLAS_NAME " attn q_b f16-out matmul failed: status %d\n", (int)st);
+            return 0;
+        }
     }
     head_rms_norm_rope_tail_from_half_kernel<<<n_tok * n_head, 256>>>(
             (float *)out->ptr, (const __half *)q_half->ptr, n_tok, n_head, head_dim, n_rot,

@@ -27,6 +27,27 @@ __global__ static void moe_swiglu_weighted_f32_kernel(
     mid[i] = (g / (1.0f + expf(-g))) * u * weights[pair];
 }
 
+/* Same SwiGLU, written as the F16 activations of the tiled down kernel. */
+__global__ static void moe_swiglu_weighted_f16_kernel(
+        half * __restrict__ mid_h,
+        const float * __restrict__ gate,
+        const float * __restrict__ up,
+        const float * __restrict__ weights,
+        uint64_t n,
+        uint32_t expert_mid_dim,
+        float clamp) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const uint64_t pair = i / expert_mid_dim;
+    float g = isfinite(gate[i]) ? gate[i] : 0.0f;
+    float u = isfinite(up[i]) ? up[i] : 0.0f;
+    if (clamp > 1.0e-6f) {
+        g = fminf(g, clamp);
+        u = fminf(fmaxf(u, -clamp), clamp);
+    }
+    mid_h[i] = __float2half((g / (1.0f + expf(-g))) * u * weights[pair]);
+}
+
 __device__ static float dev_f16_to_f32(uint16_t v) {
     return __half2float(*reinterpret_cast<const __half *>(&v));
 }
@@ -1301,12 +1322,34 @@ __global__ static void moe_scatter_sorted_pairs_deterministic_kernel(
         uint32_t pair_count,
         uint32_t n_total_expert) {
     const uint32_t expert = (uint32_t)blockIdx.x;
-    if (expert >= n_total_expert || threadIdx.x != 0u) return;
+    if (expert >= n_total_expert) return;
+    __shared__ uint32_t wave_counts[8];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t lane = tid & 31u;
     uint32_t pos = offsets[expert];
-    for (uint32_t pair = 0; pair < pair_count; pair++) {
-        int32_t expert_i = selected[pair];
-        if (expert_i < 0) expert_i = 0;
-        if ((uint32_t)expert_i == expert) sorted_pairs[pos++] = pair;
+    for (uint32_t base = 0; base < pair_count; base += blockDim.x) {
+        const uint32_t pair = base + tid;
+        bool match = false;
+        if (pair < pair_count) {
+            int32_t expert_i = selected[pair];
+            if (expert_i < 0) expert_i = 0;
+            match = (uint32_t)expert_i == expert;
+        }
+        const unsigned long long ballot = __ballot(match);
+        if (lane == 0u) wave_counts[wave] = (uint32_t)__popcll(ballot);
+        __syncthreads();
+        uint32_t wave_base = 0u, total = 0u;
+        for (uint32_t w = 0; w < (blockDim.x >> 5u); w++) {
+            if (w < wave) wave_base += wave_counts[w];
+            total += wave_counts[w];
+        }
+        if (match) {
+            const uint32_t before = (uint32_t)__popcll(ballot & ((1ull << lane) - 1ull));
+            sorted_pairs[pos + wave_base + before] = pair;
+        }
+        pos += total;
+        __syncthreads();
     }
 }
 
@@ -5078,6 +5121,185 @@ __global__ static void moe_down_q2K_hotlist_wmma_kernel(
         if (bucket_row < count && row < out_dim) {
             const uint32_t pair = pairs[first + bucket_row];
             down_out[(uint64_t)pair * out_dim + row] = shC[j];
+        }
+    }
+}
+
+/* Q2_K down projection for resident prefill: one block computes a 64-token x
+ * 64-row tile of one expert over the whole reduction in 64-wide K chunks.  Each
+ * chunk stages both operands once as F16 (activations straight from the
+ * pair-major F16 mid buffer, weights dequantized from the raw Q2_K superblock
+ * held in LDS) and then eight waves run the 4x4 grid of 16x16 WMMA tiles, so
+ * there are two barriers per chunk instead of two per 16-wide slice.  A
+ * 128-row tile measured slower: it halves the blocks per CU.
+ * Operand layout of the w32 instruction: see attention_mixed_heads32. */
+template <bool OUT_F16>
+__global__ static void __launch_bounds__(256, 2) moe_down_q2K_tile_wmma_kernel(
+        float *down_out,
+        half *down_out_h,
+        const char *down_base,
+        const half *mid_h,
+        const uint32_t *counts,
+        const uint32_t *offsets,
+        const uint32_t *pairs,
+        const uint32_t *active_experts,
+        uint32_t active_count,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes) {
+    constexpr uint32_t BM = 64u, BN = 64u, BK = 64u;
+    constexpr uint32_t ROW_TILES = BN / 32u;   /* 16-row tiles per wave */
+    constexpr uint32_t A_STRIDE = BK + 8u;
+    constexpr uint32_t B_STRIDE = BK + 8u;
+    constexpr uint32_t RAW_DWORDS = 84u / 4u;
+    constexpr uint32_t W_WORDS = (BN * RAW_DWORDS + 255u) / 256u;
+    const uint32_t active = (uint32_t)blockIdx.z;
+    if (active >= active_count) return;
+    const uint32_t expert = active_experts[active];
+    const uint32_t count = counts[expert];
+    const uint32_t m0 = (uint32_t)blockIdx.y * BM;
+    if (m0 >= count) return;
+    const uint32_t n0 = (uint32_t)blockIdx.x * BN;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t lane = tid & 31u;
+    const uint32_t lane16 = lane & 15u;
+    const uint32_t lane_hi = lane >> 4u;
+
+    __shared__ __align__(16) half shA[BM * A_STRIDE];
+    __shared__ __align__(16) half shB[BN * B_STRIDE];
+    __shared__ uint32_t shW[BN * RAW_DWORDS];
+    __shared__ uint32_t shPair[BM];
+
+    if (tid < BM) {
+        const uint32_t bucket_row = m0 + tid;
+        shPair[tid] = bucket_row < count ? pairs[offsets[expert] + bucket_row] : UINT32_MAX;
+    }
+    __syncthreads();
+    const uint32_t tok_tile = wave & 3u;
+    const uint32_t row_tile0 = (wave >> 2u) * ROW_TILES;
+    const uint32_t stage_row = tid >> 2u;
+    const uint32_t stage_q = tid & 3u;
+    const uint32_t stage_pair = shPair[stage_row];
+    ds4_q8_float8_t acc[ROW_TILES];
+#pragma unroll
+    for (uint32_t r = 0; r < ROW_TILES; r++) {
+#pragma unroll
+        for (uint32_t j = 0; j < 8u; j++) acc[r][j] = 0.0f;
+    }
+    const unsigned char *w_expert = (const unsigned char *)down_base + (uint64_t)expert * down_expert_bytes;
+
+    /* Global loads for the next chunk are issued before the current chunk's
+     * barrier and MMAs so their latency overlaps the compute. */
+    uint4 a_pre[2];
+    uint32_t w_pre[W_WORDS];
+    auto load_a = [&](uint32_t k0) {
+        a_pre[0] = make_uint4(0u, 0u, 0u, 0u);
+        a_pre[1] = a_pre[0];
+        if (stage_pair != UINT32_MAX) {
+            const uint4 *src = reinterpret_cast<const uint4 *>(
+                    mid_h + (uint64_t)stage_pair * expert_mid_dim + k0 + stage_q * 16u);
+            a_pre[0] = src[0];
+            a_pre[1] = src[1];
+        }
+    };
+    auto load_w = [&](uint32_t kb) {
+#pragma unroll
+        for (uint32_t i = 0; i < W_WORDS; i++) {
+            const uint32_t j = tid + i * 256u;
+            uint32_t v = 0u;
+            if (j < BN * RAW_DWORDS) {
+                const uint32_t row_local = j / RAW_DWORDS;
+                const uint32_t word = j - row_local * RAW_DWORDS;
+                const uint32_t row = n0 + row_local;
+                if (row < out_dim) {
+                    v = *reinterpret_cast<const uint32_t *>(
+                            w_expert + (uint64_t)row * down_row_bytes + (uint64_t)(kb >> 8u) * 84u + word * 4u);
+                }
+            }
+            w_pre[i] = v;
+        }
+    };
+    load_w(0u);
+    load_a(0u);
+
+    for (uint32_t kb = 0; kb < expert_mid_dim; kb += 256u) {
+#pragma unroll
+        for (uint32_t i = 0; i < W_WORDS; i++) {
+            const uint32_t j = tid + i * 256u;
+            if (j < BN * RAW_DWORDS) shW[j] = w_pre[i];
+        }
+        __syncthreads();
+        if (kb + 256u < expert_mid_dim) load_w(kb + 256u);
+        for (uint32_t kc = 0; kc < 4u && kb + kc * BK < expert_mid_dim; kc++) {
+            const uint32_t k0 = kb + kc * BK;
+            {
+                uint4 *dst = reinterpret_cast<uint4 *>(shA + stage_row * A_STRIDE + stage_q * 16u);
+                dst[0] = a_pre[0];
+                dst[1] = a_pre[1];
+            }
+            if (k0 + BK < expert_mid_dim) load_a(k0 + BK);
+            /* Sub-block g of the superblock: 16 values sharing one 4-bit scale
+             * and min; its 2-bit codes sit in 16 consecutive qs bytes. */
+            const uint32_t g = (kc * BK + stage_q * 16u) >> 4u;
+            const uint32_t within = g & 7u;
+            const uint32_t qbase = (g >> 3u) * 32u + (within & 1u) * 16u;
+            const uint32_t shift = (within >> 1u) * 2u;
+#pragma unroll
+            for (uint32_t rb = 0; rb < BN; rb += 64u) {
+                const uint32_t row_local = rb + stage_row;
+                const unsigned char *blk = reinterpret_cast<const unsigned char *>(shW + row_local * RAW_DWORDS);
+                const float d = dev_f16_to_f32((uint16_t)blk[80] | ((uint16_t)blk[81] << 8));
+                const float dm = dev_f16_to_f32((uint16_t)blk[82] | ((uint16_t)blk[83] << 8));
+                const float ds = d * (float)(blk[g] & 0x0fu);
+                const float dmm = dm * (float)(blk[g] >> 4u);
+                const uint32_t *qs = reinterpret_cast<const uint32_t *>(blk + 16u + qbase);
+                union {
+                    uint4 u[2];
+                    half h[16];
+                } out;
+#pragma unroll
+                for (uint32_t w = 0; w < 4u; w++) {
+                    const uint32_t word = qs[w];
+#pragma unroll
+                    for (uint32_t b = 0; b < 4u; b++) {
+                        const float q = (float)(((word >> (8u * b)) >> shift) & 3u);
+                        out.h[w * 4u + b] = __float2half(ds * q - dmm);
+                    }
+                }
+                uint4 *dst = reinterpret_cast<uint4 *>(shB + row_local * B_STRIDE + stage_q * 16u);
+                dst[0] = out.u[0];
+                dst[1] = out.u[1];
+            }
+            __syncthreads();
+#pragma unroll
+            for (uint32_t ks = 0; ks < BK / 16u; ks++) {
+                const ds4_q8_half16_t a = lds_load_half16(shA + (tok_tile * 16u + lane16) * A_STRIDE + ks * 16u);
+#pragma unroll
+                for (uint32_t r = 0; r < ROW_TILES; r++) {
+                    const ds4_q8_half16_t b = lds_load_half16(
+                            shB + ((row_tile0 + r) * 16u + lane16) * B_STRIDE + ks * 16u);
+                    acc[r] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, acc[r]);
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+#pragma unroll
+    for (uint32_t j = 0; j < 8u; j++) {
+        const uint32_t pair = shPair[tok_tile * 16u + 2u * j + lane_hi];
+        if (pair == UINT32_MAX) continue;
+#pragma unroll
+        for (uint32_t r = 0; r < ROW_TILES; r++) {
+            const uint32_t row = n0 + (row_tile0 + r) * 16u + lane16;
+            if (row >= out_dim) continue;
+            if (OUT_F16) {
+                down_out_h[(uint64_t)pair * out_dim + row] = __float2half(acc[r][j]);
+            } else {
+                down_out[(uint64_t)pair * out_dim + row] = acc[r][j];
+            }
         }
     }
 }

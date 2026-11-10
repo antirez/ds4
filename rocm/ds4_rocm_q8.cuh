@@ -35,6 +35,23 @@ __device__ __forceinline__ static int32_t dot_i8_block(const int8_t *a, const in
     return dot;
 }
 
+/* One Q8_0 block's contribution to a decode dot product.  The build uses
+ * -ffast-math, which lets the compiler reassociate a three-way product
+ * differently in each kernel (the pair kernels hoist the shared activation
+ * term, so they computed (x_scale * dot) * w_scale while the single-matrix
+ * kernel computed (w_scale * dot) * x_scale).  Pin the order with an explicit
+ * FMA so every single and paired Q8_0 decode kernel rounds identically. */
+__device__ __forceinline__ static float q8_0_preq_block_fma(
+        float acc, float w_scale, float x_scale, int dot) {
+    return fmaf(w_scale * (float)dot, x_scale, acc);
+}
+
+__device__ __forceinline__ static float q8_0_f32_lane_fma(
+        float acc, float w_scale, int8_t q, float x) {
+    /* w_scale * q is exact (11-bit by 8-bit mantissas), so only the FMA rounds. */
+    return fmaf(w_scale * (float)q, x, acc);
+}
+
 __global__ static void quantize_q8_0_f32_kernel(
         int8_t *xq,
         float *xscale,
@@ -153,7 +170,7 @@ __global__ static void matmul_q8_0_preq_rows_w32_kernel(
         const int8_t *qs = (const int8_t *)(wr + b * 34u + 2u);
         const int8_t *xqb = xq + b * 32u;
         const int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
-        acc += __half2float(*scale_h) * xscale[b] * (float)dot;
+        acc = q8_0_preq_block_fma(acc, __half2float(*scale_h), xscale[b], dot);
     }
     acc = warp_sum_f32(acc);
     if (lane == 0u) out[row] = acc;
@@ -187,13 +204,13 @@ __global__ static void matmul_q8_0_pair_preq_warp8_kernel(
             const __half *scale_h = (const __half *)(wr0 + b * 34);
             const int8_t *qs = (const int8_t *)(wr0 + b * 34 + 2);
             int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
-            acc0 += __half2float(*scale_h) * xs * (float)dot;
+            acc0 = q8_0_preq_block_fma(acc0, __half2float(*scale_h), xs, dot);
         }
         if (wr1) {
             const __half *scale_h = (const __half *)(wr1 + b * 34);
             const int8_t *qs = (const int8_t *)(wr1 + b * 34 + 2);
             int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
-            acc1 += __half2float(*scale_h) * xs * (float)dot;
+            acc1 = q8_0_preq_block_fma(acc1, __half2float(*scale_h), xs, dot);
         }
     }
     acc0 = warp_sum_f32(acc0);
@@ -335,7 +352,7 @@ __global__ static void matmul_q8_0_f32_warp8_kernel(
             const unsigned char *blk = wr + b * 34u;
             const float d = q8_0_scale_broadcast_w32(blk);
             const int8_t q = ((const int8_t *)(blk + 2u))[lane];
-            acc += d * (float)q * x[i];
+            acc = q8_0_f32_lane_fma(acc, d, q, x[i]);
         }
     }
     acc = warp_sum_f32(acc);
@@ -366,7 +383,7 @@ __global__ static void matmul_q8_0_f32_sharedx_warp_rows_w32_kernel(
         const unsigned char *blk = wr + (uint64_t)b * 34u;
         const float d = q8_0_scale_broadcast_w32(blk);
         const int8_t q = ((const int8_t *)(blk + 2u))[lane];
-        acc += d * (float)q * shx[(b << 5u) + lane];
+        acc = q8_0_f32_lane_fma(acc, d, q, shx[(b << 5u) + lane]);
     }
     acc = warp_sum_f32(acc);
     if (lane == 0u) out[row] = acc;
@@ -617,6 +634,18 @@ __global__ static void matmul_q8_0_f32_batch_sharedx_exact8_kernel(
 typedef _Float16 __attribute__((ext_vector_type(16))) ds4_q8_half16_t;
 typedef float    __attribute__((ext_vector_type(8)))  ds4_q8_float8_t;
 
+/* Two 16-byte LDS reads for a WMMA operand; the vector type's natural 32-byte
+ * alignment is not guaranteed by the padded tile strides. */
+__device__ __forceinline__ static ds4_q8_half16_t lds_load_half16(const half *p) {
+    union {
+        uint4 u[2];
+        ds4_q8_half16_t v;
+    } r;
+    r.u[0] = *reinterpret_cast<const uint4 *>(p);
+    r.u[1] = *reinterpret_cast<const uint4 *>(p + 8);
+    return r.v;
+}
+
 /* Configurable wave-row Q8_0 batched GEMM experiment for gfx1151.
  * This is the hipfire/llama.cpp-style MMQ shape adapted to DS4's existing
  * F32 activation buffers: each block stages a 64-token x 32-K activation tile
@@ -753,13 +782,13 @@ __global__ static void matmul_q8_0_pair_f32_warp8_kernel(
                 const unsigned char *blk = wr0 + b * 34u;
                 const float d = q8_0_scale_broadcast_w32(blk);
                 const int8_t q = ((const int8_t *)(blk + 2u))[lane];
-                acc0 += d * (float)q * x[i];
+                acc0 = q8_0_f32_lane_fma(acc0, d, q, x[i]);
             }
             if (wr1) {
                 const unsigned char *blk = wr1 + b * 34u;
                 const float d = q8_0_scale_broadcast_w32(blk);
                 const int8_t q = ((const int8_t *)(blk + 2u))[lane];
-                acc1 += d * (float)q * x[i];
+                acc1 = q8_0_f32_lane_fma(acc1, d, q, x[i]);
             }
         }
     }
@@ -802,13 +831,13 @@ __global__ static void matmul_q8_0_pair_f32_sharedx_warp_rows_w32_kernel(
             const unsigned char *blk = wr0 + (uint64_t)b * 34u;
             const float d = q8_0_scale_broadcast_w32(blk);
             const int8_t q = ((const int8_t *)(blk + 2u))[lane];
-            acc0 += d * (float)q * xv;
+            acc0 = q8_0_f32_lane_fma(acc0, d, q, xv);
         }
         if (wr1) {
             const unsigned char *blk = wr1 + (uint64_t)b * 34u;
             const float d = q8_0_scale_broadcast_w32(blk);
             const int8_t q = ((const int8_t *)(blk + 2u))[lane];
-            acc1 += d * (float)q * xv;
+            acc1 = q8_0_f32_lane_fma(acc1, d, q, xv);
         }
     }
     acc0 = warp_sum_f32(acc0);
@@ -1387,25 +1416,6 @@ __global__ static void dequant_q8_0_to_f32_kernel(
     const float scale = q8_0_scale_scalar(blk);
     const int8_t q = *(const int8_t *)(blk + 2 + j);
     out[gid] = scale * (float)q;
-}
-
-__global__ static void dequant_q8_0_to_f16_transpose_kernel(
-        __half *out,
-        const unsigned char *w,
-        uint64_t in_dim,
-        uint64_t out_dim,
-        uint64_t blocks) {
-    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    const uint64_t n = in_dim * out_dim;
-    if (gid >= n) return;
-    const uint64_t row = gid / in_dim;
-    const uint64_t i = gid - row * in_dim;
-    const uint64_t b = i / 32u;
-    const uint64_t j = i - b * 32u;
-    const unsigned char *blk = w + (row * blocks + b) * 34u;
-    const __half scale = *(const __half *)blk;
-    const int8_t q = *(const int8_t *)(blk + 2u + j);
-    out[i * out_dim + row] = __hmul(scale, __float2half((float)q));
 }
 
 __global__ static void grouped_q8_0_a_preq_warp8_kernel(

@@ -1,9 +1,5 @@
 // DS4 ROCm attention kernels (prefill/decode, raw/mixed KV).
 
-#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
-#include <rocwmma/rocwmma.hpp>
-#endif
-
 /* Non-causal attention used by the small DSpark draft block. Each query row
  * sees the complete raw-KV ring rather than a causal prefix. */
 __global__ static void attention_noncausal_raw_batch_heads_kernel(
@@ -78,67 +74,6 @@ __global__ static void attention_noncausal_raw_batch_heads_kernel(
         oh[d] = acc / denom;
     }
 }
-
-#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
-/* Shape-specialized attention-output-B GEMM for DSV4 prefill.
- * A is the cached transposed F16 weight [4096,8192] in column-major form,
- * B is the packed F16 activation [8192,n_tokens], and C is F32
- * [4096,n_tokens].  Sixteen wave32 waves cooperatively stage a 64x16 A tile
- * and a 16x64 B tile, then each wave owns one 16x16 output tile. */
-__global__ static void attention_output_b_f16_wmma_64x64_kernel(
-        float *out,
-        const half *weight_t,
-        const half *low_h,
-        uint32_t n_tokens) {
-    constexpr uint32_t M = 4096u;
-    constexpr uint32_t K = 8192u;
-    constexpr uint32_t BLOCK_M = 64u;
-    constexpr uint32_t BLOCK_N = 64u;
-    constexpr uint32_t WAVES = 16u;
-    __shared__ half sh_a[BLOCK_M * 16u];
-    __shared__ half sh_b[16u * BLOCK_N];
-
-    const uint32_t tid = threadIdx.x;
-    const uint32_t wave = tid >> 5u;
-    const uint32_t wave_m = wave & 3u;
-    const uint32_t wave_n = wave >> 2u;
-    const uint32_t m0 = (uint32_t)blockIdx.x * BLOCK_M;
-    const uint32_t n0 = (uint32_t)blockIdx.y * BLOCK_N;
-
-    using frag_a = rocwmma::fragment<rocwmma::matrix_a, 16, 16, 16, half, rocwmma::col_major>;
-    using frag_b = rocwmma::fragment<rocwmma::matrix_b, 16, 16, 16, half, rocwmma::col_major>;
-    using frag_c = rocwmma::fragment<rocwmma::accumulator, 16, 16, 16, float>;
-    frag_a a;
-    frag_b b;
-    frag_c acc;
-    rocwmma::fill_fragment(acc, 0.0f);
-
-    for (uint32_t k0 = 0; k0 < K; k0 += 16u) {
-        const uint32_t ja = tid * 2u;
-        const uint32_t a_row = ja & 63u;
-        const uint32_t a_k = ja >> 6u;
-        *reinterpret_cast<uint32_t *>(sh_a + ja) =
-            *reinterpret_cast<const uint32_t *>(weight_t + m0 + a_row + (uint64_t)(k0 + a_k) * M);
-
-        const uint32_t jb = tid * 2u;
-        const uint32_t b_k = jb & 15u;
-        const uint32_t b_col = jb >> 4u;
-        *reinterpret_cast<uint32_t *>(sh_b + jb) =
-            *reinterpret_cast<const uint32_t *>(low_h + k0 + b_k + (uint64_t)(n0 + b_col) * K);
-        __syncthreads();
-        rocwmma::load_matrix_sync(a, sh_a + wave_m * 16u, BLOCK_M);
-        rocwmma::load_matrix_sync(b, sh_b + wave_n * 16u * 16u, 16u);
-        rocwmma::mma_sync(acc, a, b, acc);
-        __syncthreads();
-    }
-
-    rocwmma::store_matrix_sync(
-        out + m0 + wave_m * 16u + (uint64_t)(n0 + wave_n * 16u) * M,
-        acc,
-        M,
-        rocwmma::mem_col_major);
-}
-#endif
 //
 // Included from ds4_cuda.cu in the same translation unit to keep launch/API
 // glue unchanged while kernel implementations are split into modules.
@@ -1258,8 +1193,22 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
     }
 }
 
-template <int MODE, uint32_t HEADS, bool F32_VEC2 = false>
-__global__ static void attention_mixed_heads16_wmma_kernel(
+/* Sparse attention for one token and 32 heads over the mixed raw/compressed
+ * key list, built on the wave32 16x16x16 WMMA instruction directly so the
+ * accumulators can be rescaled per head row by the online softmax.
+ *
+ * Operand layout of the w32 instruction (lane l, element i):
+ *   A[row = l % 16][k = i]      B[k = i][col = l % 16]      C[row = 2i + l / 16][col = l % 16]
+ * with the A and B halves of the wave replicated.
+ *
+ * Per 32-key tile the block stages the keys once (K == V for this MQA layout),
+ * all 16 waves share the Q.K^T work as a 4-way split over the 512 dims, the
+ * partial scores are reduced through LDS, and every wave then owns four
+ * 16-dim output tiles of P.V across the key tiles.  Q lives in registers for
+ * the whole block.  Padded keys past the visible count stage zeros and get a
+ * zero probability, so they never enter the max, the sum or the output. */
+template <int MODE>
+__global__ static void __launch_bounds__(512, 1) attention_mixed_heads32_wmma_kernel(
         float *heads,
         const float *sinks,
         const float *q,
@@ -1277,25 +1226,25 @@ __global__ static void attention_mixed_heads16_wmma_kernel(
         uint32_t ratio,
         uint32_t n_head,
         uint32_t head_dim) {
-    constexpr uint32_t KEYS = 80u;
-    constexpr uint32_t DIMS = 64u;
-    constexpr uint32_t TILE = 16u;
-    constexpr uint32_t STRIDE = KEYS;
-    constexpr uint32_t HEAD_TILES = HEADS / TILE;
-    constexpr uint32_t KEY_TILES = KEYS / TILE;
-    constexpr uint32_t WORKGROUP = HEADS * 16u;
+    constexpr uint32_t HEADS = 32u;
+    constexpr uint32_t KEYS = 32u;
+    constexpr uint32_t KV_STRIDE = 512u + 8u;   /* halfs; staggers LDS banks */
+    constexpr uint32_t P_STRIDE = KEYS + 8u;
     const uint32_t t = (uint32_t)blockIdx.x;
     const uint32_t head_base = (uint32_t)blockIdx.y * HEADS;
     if (t >= n_tokens || head_dim != 512u) return;
     const uint32_t tid = (uint32_t)threadIdx.x;
     const uint32_t wave = tid >> 5u;
+    const uint32_t lane = tid & 31u;
+    const uint32_t lane16 = lane & 15u;
+    const uint32_t lane_hi = lane >> 4u;
 
-    __shared__ half sh_qp[HEADS * STRIDE];
-    __shared__ half sh_kv[KEYS * STRIDE];
-    __shared__ float sh_matrix[HEADS * STRIDE];
+    __shared__ __align__(16) half sh_kv[KEYS * KV_STRIDE];
+    __shared__ float sh_scores[4u * HEADS * KEYS];
+    __shared__ __align__(16) half sh_p[HEADS * P_STRIDE];
     __shared__ float row_max[HEADS];
     __shared__ float row_sum[HEADS];
-    __shared__ float old_scale[HEADS];
+    __shared__ float row_scale[HEADS];
     __shared__ uint32_t indexed_raw_rows[256];
     __shared__ uint32_t indexed_comp_rows[DS4_ROCM_ATTENTION_INDEXED_TOPK_CAP];
     __shared__ uint32_t indexed_raw_count;
@@ -1346,7 +1295,6 @@ __global__ static void attention_mixed_heads16_wmma_kernel(
         for (uint32_t r = tid; r < indexed_raw_count; r += blockDim.x) {
             indexed_raw_rows[r] = (raw_ring_start + indexed_raw_first + r) % raw_cap;
         }
-        __syncthreads();
         raw_count = indexed_raw_count;
         raw_first = 0u;
         comp_count = indexed_comp_count;
@@ -1382,7 +1330,6 @@ __global__ static void attention_mixed_heads16_wmma_kernel(
         for (uint32_t r = tid; r < indexed_raw_count; r += blockDim.x) {
             indexed_raw_rows[r] = (raw_ring_start + indexed_raw_first + r) % raw_cap;
         }
-        __syncthreads();
         raw_count = indexed_raw_count;
         raw_first = 0u;
         comp_count = indexed_comp_count;
@@ -1397,9 +1344,38 @@ __global__ static void attention_mixed_heads16_wmma_kernel(
     const uint32_t n_score = raw_count + comp_count;
     const float scale = rsqrtf((float)head_dim);
 
-    float accum[32];
+    /* Wave roles: Q.K^T wave w covers head tile (w & 1), key tile ((w >> 1) & 1)
+     * and dims [(w >> 2) * 128, +128); P.V wave w covers head tile (w & 1) and
+     * dim tiles (w >> 1) + 8 * i. */
+    const uint32_t qk_head_tile = wave & 1u;
+    const uint32_t qk_key_tile = (wave >> 1u) & 1u;
+    const uint32_t qk_dim0 = (wave >> 2u) * 128u;
+    const uint32_t pv_head_tile = wave & 1u;
+    const uint32_t pv_dim_tile0 = wave >> 1u;
+
+    ds4_q8_half16_t qf[8];
+    {
+        const uint32_t head = head_base + qk_head_tile * 16u + lane16;
+        const float *qrow = q + ((uint64_t)t * n_head + head) * 512u + qk_dim0;
 #pragma unroll
-    for (uint32_t i = 0; i < 32u; i++) accum[i] = 0.0f;
+        for (uint32_t s = 0; s < 8u; s++) {
+#pragma unroll
+            for (uint32_t i = 0; i < 16u; i += 4u) {
+                float4 f = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                if (head < n_head) f = *reinterpret_cast<const float4 *>(qrow + s * 16u + i);
+                qf[s][i] = (_Float16)f.x;
+                qf[s][i + 1u] = (_Float16)f.y;
+                qf[s][i + 2u] = (_Float16)f.z;
+                qf[s][i + 3u] = (_Float16)f.w;
+            }
+        }
+    }
+    ds4_q8_float8_t acc[4];
+#pragma unroll
+    for (uint32_t i = 0; i < 4u; i++) {
+#pragma unroll
+        for (uint32_t j = 0; j < 8u; j++) acc[i][j] = 0.0f;
+    }
     if (tid < HEADS) {
         const uint32_t head = head_base + tid;
         row_max[tid] = head < n_head ? sinks[head] : -INFINITY;
@@ -1407,244 +1383,143 @@ __global__ static void attention_mixed_heads16_wmma_kernel(
     }
     __syncthreads();
 
-    using frag_a = rocwmma::fragment<rocwmma::matrix_a, 16, 16, 16, half, rocwmma::row_major>;
-    using frag_b_col = rocwmma::fragment<rocwmma::matrix_b, 16, 16, 16, half, rocwmma::col_major>;
-    using frag_b_row = rocwmma::fragment<rocwmma::matrix_b, 16, 16, 16, half, rocwmma::row_major>;
-    using frag_c = rocwmma::fragment<rocwmma::accumulator, 16, 16, 16, float>;
+    /* Each thread owns eight float4 of every 32-key tile; the loads for the
+     * next tile are issued before this tile's barriers and MMAs. */
+    float4 kv_pre[8];
+    auto load_tile = [&](uint32_t kb) {
+#pragma unroll
+        for (uint32_t step = 0; step < 8u; step++) {
+            const uint32_t idx = tid + step * 512u;
+            const uint32_t kl = idx >> 7u;
+            const uint32_t d = (idx & 127u) * 4u;
+            const uint32_t score_idx = kb + kl;
+            float4 f = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            if (score_idx < n_score) {
+                const float *src;
+                if (score_idx < raw_count) {
+                    const uint32_t row = MODE != 0 ? indexed_raw_rows[score_idx] : raw_first + score_idx;
+                    src = raw_kv + (uint64_t)row * 512u;
+                } else {
+                    const uint32_t comp_local = score_idx - raw_count;
+                    const uint32_t row = MODE == 1 ? indexed_comp_rows[comp_local] : comp_local;
+                    src = comp_kv + (uint64_t)row * 512u;
+                }
+                f = *reinterpret_cast<const float4 *>(src + d);
+            }
+            kv_pre[step] = f;
+        }
+    };
+    if (n_score != 0u) load_tile(0u);
 
     for (uint32_t kb = 0; kb < n_score; kb += KEYS) {
-        frag_a qa;
-        frag_b_col kk;
-        frag_c score_acc;
-        if (wave < HEAD_TILES * KEY_TILES) rocwmma::fill_fragment(score_acc, 0.0f);
-
-        for (uint32_t d0 = 0; d0 < 512u; d0 += TILE) {
-            if (tid < HEADS * TILE) {
-                const uint32_t hl = tid / TILE;
-                const uint32_t d = tid - hl * TILE;
-                const uint32_t head = head_base + hl;
-                sh_qp[hl * STRIDE + d] = head < n_head
-                    ? __float2half(q[((uint64_t)t * n_head + head) * 512u + d0 + d])
-                    : __float2half(0.0f);
-            }
-            if constexpr (F32_VEC2) {
-                for (uint32_t idx = tid; idx < KEYS * (TILE / 2u); idx += blockDim.x) {
-                    const uint32_t kl = idx / (TILE / 2u);
-                    const uint32_t d = (idx - kl * (TILE / 2u)) * 2u;
-                    const uint32_t score_idx = kb + kl;
-                    half2 v = __floats2half2_rn(0.0f, 0.0f);
-                    if (score_idx < n_score) {
-                        float2 f;
-                        if (score_idx < raw_count) {
-                            const uint32_t row = MODE != 0
-                                ? indexed_raw_rows[score_idx]
-                                : raw_first + score_idx;
-                            f = *reinterpret_cast<const float2 *>(
-                                    raw_kv + (uint64_t)row * 512u + d0 + d);
-                        } else {
-                            const uint32_t comp_local = score_idx - raw_count;
-                            const uint32_t row = MODE == 1
-                                ? indexed_comp_rows[comp_local]
-                                : comp_local;
-                            f = *reinterpret_cast<const float2 *>(
-                                    comp_kv + (uint64_t)row * 512u + d0 + d);
-                        }
-                        v = __floats2half2_rn(f.x, f.y);
-                    }
-                    *reinterpret_cast<half2 *>(sh_kv + kl * STRIDE + d) = v;
-                }
-            } else {
-                for (uint32_t idx = tid; idx < KEYS * TILE; idx += blockDim.x) {
-                    const uint32_t kl = idx / TILE;
-                    const uint32_t d = idx - kl * TILE;
-                    const uint32_t score_idx = kb + kl;
-                    float v = 0.0f;
-                    if (score_idx < n_score) {
-                        if (score_idx < raw_count) {
-                            const uint32_t row = MODE != 0
-                                ? indexed_raw_rows[score_idx]
-                                : raw_first + score_idx;
-                            v = raw_kv[(uint64_t)row * 512u + d0 + d];
-                        } else {
-                            const uint32_t comp_local = score_idx - raw_count;
-                            const uint32_t row = MODE == 1
-                                ? indexed_comp_rows[comp_local]
-                                : comp_local;
-                            v = comp_kv[(uint64_t)row * 512u + d0 + d];
-                        }
-                    }
-                    sh_kv[kl * STRIDE + d] = __float2half(v);
-                }
-            }
-            __syncthreads();
-            if (wave < HEAD_TILES * KEY_TILES) {
-                const uint32_t head_tile = wave / KEY_TILES;
-                const uint32_t key_tile = wave - head_tile * KEY_TILES;
-                rocwmma::load_matrix_sync(qa,
-                        sh_qp + head_tile * TILE * STRIDE, STRIDE);
-                rocwmma::load_matrix_sync(kk,
-                        sh_kv + key_tile * TILE * STRIDE, STRIDE);
-                rocwmma::mma_sync(score_acc, qa, kk, score_acc);
-            }
-            __syncthreads();
+#pragma unroll
+        for (uint32_t step = 0; step < 8u; step++) {
+            const uint32_t idx = tid + step * 512u;
+            const uint32_t kl = idx >> 7u;
+            const uint32_t d = (idx & 127u) * 4u;
+            half2 *dst = reinterpret_cast<half2 *>(sh_kv + kl * KV_STRIDE + d);
+            dst[0] = __floats2half2_rn(kv_pre[step].x, kv_pre[step].y);
+            dst[1] = __floats2half2_rn(kv_pre[step].z, kv_pre[step].w);
         }
-        if (wave < HEAD_TILES * KEY_TILES) {
-            const uint32_t head_tile = wave / KEY_TILES;
-            const uint32_t key_tile = wave - head_tile * KEY_TILES;
-            rocwmma::store_matrix_sync(
-                                       sh_matrix + head_tile * TILE * STRIDE + key_tile * TILE,
-                                       score_acc,
-                                       STRIDE, rocwmma::mem_row_major);
+        if (kb + KEYS < n_score) load_tile(kb + KEYS);
+        __syncthreads();
+
+        /* Q.K^T partial over this wave's 128 dims. */
+        {
+            ds4_q8_float8_t s_acc;
+#pragma unroll
+            for (uint32_t j = 0; j < 8u; j++) s_acc[j] = 0.0f;
+            const half *krow = sh_kv + (qk_key_tile * 16u + lane16) * KV_STRIDE + qk_dim0;
+#pragma unroll
+            for (uint32_t s = 0; s < 8u; s++) {
+                const ds4_q8_half16_t kf = lds_load_half16(krow + s * 16u);
+                s_acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(qf[s], kf, s_acc);
+            }
+            float *part = sh_scores + (wave >> 2u) * (HEADS * KEYS);
+#pragma unroll
+            for (uint32_t j = 0; j < 8u; j++) {
+                const uint32_t hl = qk_head_tile * 16u + 2u * j + lane_hi;
+                const uint32_t kl = qk_key_tile * 16u + lane16;
+                part[hl * KEYS + kl] = s_acc[j];
+            }
         }
         __syncthreads();
 
-        const uint32_t hl = tid >> 4u;
-        const uint32_t lane16 = tid & 15u;
-        float block_max = -INFINITY;
+        /* Online softmax: 16 lanes per head, two keys per lane. */
+        {
+            const uint32_t hl = tid >> 4u;
+            const uint32_t k0 = lane16;
+            const uint32_t k1 = lane16 + 16u;
+            float s0 = 0.0f, s1 = 0.0f;
 #pragma unroll
-        for (uint32_t i = 0; i < KEY_TILES; i++) {
-            const uint32_t kl = lane16 + i * 16u;
-            if (kb + kl < n_score) {
-                block_max = fmaxf(block_max, sh_matrix[hl * STRIDE + kl] * scale);
+            for (uint32_t part = 0; part < 4u; part++) {
+                s0 += sh_scores[part * (HEADS * KEYS) + hl * KEYS + k0];
+                s1 += sh_scores[part * (HEADS * KEYS) + hl * KEYS + k1];
             }
-        }
+            s0 *= scale;
+            s1 *= scale;
+            const bool v0 = kb + k0 < n_score;
+            const bool v1 = kb + k1 < n_score;
+            float block_max = fmaxf(v0 ? s0 : -INFINITY, v1 ? s1 : -INFINITY);
 #pragma unroll
-        for (uint32_t delta = 1u; delta < 16u; delta <<= 1u) {
-            block_max = fmaxf(block_max,
-                              __shfl_xor_sync(FULL_WARP_MASK, block_max, delta, 32));
-        }
-        const float prev_max = row_max[hl];
-        const float prev_sum = row_sum[hl];
-        const float next_max = fmaxf(prev_max, block_max);
-        const float prev_scale = prev_sum == 0.0f ? 0.0f : expf(prev_max - next_max);
-        float block_sum = 0.0f;
-#pragma unroll
-        for (uint32_t i = 0; i < KEY_TILES; i++) {
-            const uint32_t kl = lane16 + i * 16u;
-            float p = 0.0f;
-            if (kb + kl < n_score) {
-                p = expf(sh_matrix[hl * STRIDE + kl] * scale - next_max);
-                block_sum += p;
+            for (uint32_t delta = 1u; delta < 16u; delta <<= 1u) {
+                block_max = fmaxf(block_max, __shfl_xor_sync(FULL_WARP_MASK, block_max, delta, 32));
             }
-            sh_qp[hl * STRIDE + kl] = __float2half(p);
-        }
+            const float prev_max = row_max[hl];
+            const float prev_sum = row_sum[hl];
+            const float next_max = fmaxf(prev_max, block_max);
+            const float prev_scale = prev_sum == 0.0f ? 0.0f : expf(prev_max - next_max);
+            const float p0 = v0 ? expf(s0 - next_max) : 0.0f;
+            const float p1 = v1 ? expf(s1 - next_max) : 0.0f;
+            float block_sum = p0 + p1;
 #pragma unroll
-        for (uint32_t delta = 1u; delta < 16u; delta <<= 1u) {
-            block_sum += __shfl_xor_sync(FULL_WARP_MASK, block_sum, delta, 32);
-        }
-        if (lane16 == 0u) {
-            row_max[hl] = next_max;
-            row_sum[hl] = prev_sum * prev_scale + block_sum;
-            old_scale[hl] = prev_scale;
+            for (uint32_t delta = 1u; delta < 16u; delta <<= 1u) {
+                block_sum += __shfl_xor_sync(FULL_WARP_MASK, block_sum, delta, 32);
+            }
+            sh_p[hl * P_STRIDE + k0] = __float2half(p0);
+            sh_p[hl * P_STRIDE + k1] = __float2half(p1);
+            if (lane16 == 0u) {
+                row_max[hl] = next_max;
+                row_sum[hl] = prev_sum * prev_scale + block_sum;
+                row_scale[hl] = prev_scale;
+            }
         }
         __syncthreads();
 
+        /* P.V: rescale the running output rows, then two 16-key steps. */
 #pragma unroll
-        for (uint32_t i = 0; i < 32u; i++) {
-            const uint32_t out_idx = tid + i * WORKGROUP;
-            accum[i] *= old_scale[out_idx / 512u];
+        for (uint32_t j = 0; j < 8u; j++) {
+            const float a = row_scale[pv_head_tile * 16u + 2u * j + lane_hi];
+#pragma unroll
+            for (uint32_t i = 0; i < 4u; i++) acc[i][j] *= a;
         }
-
-        for (uint32_t dim0 = 0; dim0 < 512u; dim0 += DIMS) {
-            if constexpr (F32_VEC2) {
-                for (uint32_t idx = tid; idx < KEYS * (DIMS / 2u); idx += blockDim.x) {
-                    const uint32_t kl = idx / (DIMS / 2u);
-                    const uint32_t d = (idx - kl * (DIMS / 2u)) * 2u;
-                    const uint32_t score_idx = kb + kl;
-                    half2 v = __floats2half2_rn(0.0f, 0.0f);
-                    if (score_idx < n_score) {
-                        float2 f;
-                        if (score_idx < raw_count) {
-                            const uint32_t row = MODE != 0
-                                ? indexed_raw_rows[score_idx]
-                                : raw_first + score_idx;
-                            f = *reinterpret_cast<const float2 *>(
-                                    raw_kv + (uint64_t)row * 512u + dim0 + d);
-                        } else {
-                            const uint32_t comp_local = score_idx - raw_count;
-                            const uint32_t row = MODE == 1
-                                ? indexed_comp_rows[comp_local]
-                                : comp_local;
-                            f = *reinterpret_cast<const float2 *>(
-                                    comp_kv + (uint64_t)row * 512u + dim0 + d);
-                        }
-                        v = __floats2half2_rn(f.x, f.y);
-                    }
-                    *reinterpret_cast<half2 *>(sh_kv + kl * STRIDE + d) = v;
-                }
-            } else {
-                for (uint32_t idx = tid; idx < KEYS * DIMS; idx += blockDim.x) {
-                    const uint32_t kl = idx / DIMS;
-                    const uint32_t d = idx - kl * DIMS;
-                    const uint32_t score_idx = kb + kl;
-                    float v = 0.0f;
-                    if (score_idx < n_score) {
-                        if (score_idx < raw_count) {
-                            const uint32_t row = MODE != 0
-                                ? indexed_raw_rows[score_idx]
-                                : raw_first + score_idx;
-                            v = raw_kv[(uint64_t)row * 512u + dim0 + d];
-                        } else {
-                            const uint32_t comp_local = score_idx - raw_count;
-                            const uint32_t row = MODE == 1
-                                ? indexed_comp_rows[comp_local]
-                                : comp_local;
-                            v = comp_kv[(uint64_t)row * 512u + dim0 + d];
-                        }
-                    }
-                    sh_kv[kl * STRIDE + d] = __float2half(v);
-                }
-            }
-            __syncthreads();
-
-            frag_c pv_acc;
-            if (wave < HEAD_TILES * 4u) rocwmma::fill_fragment(pv_acc, 0.0f);
 #pragma unroll
-            for (uint32_t kc = 0; kc < KEY_TILES; kc++) {
-                frag_a pp;
-                frag_b_row vv;
-                if (wave < HEAD_TILES * 4u) {
-                    const uint32_t head_tile = wave >> 2u;
-                    const uint32_t dim_tile = wave & 3u;
-                    rocwmma::load_matrix_sync(pp,
-                            sh_qp + head_tile * TILE * STRIDE + kc * TILE, STRIDE);
-                    rocwmma::load_matrix_sync(vv,
-                            sh_kv + kc * TILE * STRIDE + dim_tile * TILE, STRIDE);
-                    rocwmma::mma_sync(pv_acc, pp, vv, pv_acc);
-                }
-            }
-            if (wave < HEAD_TILES * 4u) {
-                const uint32_t head_tile = wave >> 2u;
-                const uint32_t dim_tile = wave & 3u;
-                rocwmma::store_matrix_sync(
-                                           sh_matrix + head_tile * TILE * STRIDE + dim_tile * TILE,
-                                           pv_acc,
-                                           STRIDE, rocwmma::mem_row_major);
-            }
-            __syncthreads();
-
+        for (uint32_t ks = 0; ks < 2u; ks++) {
+            const ds4_q8_half16_t pf = lds_load_half16(
+                    sh_p + (pv_head_tile * 16u + lane16) * P_STRIDE + ks * 16u);
 #pragma unroll
-            for (uint32_t i = 0; i < 32u; i++) {
-                const uint32_t out_idx = tid + i * WORKGROUP;
-                const uint32_t head_local = out_idx / 512u;
-                const uint32_t dim = out_idx - head_local * 512u;
-                if (dim >= dim0 && dim < dim0 + DIMS) {
-                    accum[i] += sh_matrix[head_local * STRIDE + dim - dim0];
-                }
+            for (uint32_t i = 0; i < 4u; i++) {
+                const uint32_t dim = (pv_dim_tile0 + 8u * i) * 16u + lane16;
+                const half *vcol = sh_kv + (ks * 16u) * KV_STRIDE + dim;
+                ds4_q8_half16_t vf;
+#pragma unroll
+                for (uint32_t k = 0; k < 16u; k++) vf[k] = (_Float16)vcol[k * KV_STRIDE];
+                acc[i] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(pf, vf, acc[i]);
             }
-            __syncthreads();
         }
+        __syncthreads();
     }
 
 #pragma unroll
-    for (uint32_t i = 0; i < 32u; i++) {
-        const uint32_t out_idx = tid + i * WORKGROUP;
-        const uint32_t head_local = out_idx / 512u;
-        const uint32_t head = head_base + head_local;
-        const uint32_t dim = out_idx - head_local * 512u;
-        if (head < n_head) {
-            const float inv = row_sum[head_local] == 0.0f ? 0.0f : 1.0f / row_sum[head_local];
-            heads[((uint64_t)t * n_head + head) * 512u + dim] = accum[i] * inv;
+    for (uint32_t j = 0; j < 8u; j++) {
+        const uint32_t hl = pv_head_tile * 16u + 2u * j + lane_hi;
+        const uint32_t head = head_base + hl;
+        if (head >= n_head) continue;
+        const float inv = row_sum[hl] == 0.0f ? 0.0f : 1.0f / row_sum[hl];
+        float *out = heads + ((uint64_t)t * n_head + head) * 512u;
+#pragma unroll
+        for (uint32_t i = 0; i < 4u; i++) {
+            out[(pv_dim_tile0 + 8u * i) * 16u + lane16] = acc[i][j] * inv;
         }
     }
 }

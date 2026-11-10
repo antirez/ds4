@@ -2472,6 +2472,20 @@ extern "C" int ds4_mmq_iq2_xxs_moe_pair(
         M, K, n_tokens, n_experts, n_expert_used, stream);
 }
 
+/* Same as ds4_mmq_iq2_xxs_moe_pair without the whole-buffer sanitize pass,
+ * for callers whose SwiGLU consumer already drops non-finite gate/up values
+ * at read (see ds4_mmq_q2_K_moe_soa). */
+extern "C" int ds4_mmq_iq2_xxs_moe_pair_unsanitized(
+        const void * W_a, const void * W_b,
+        const float * X, const int32_t * ids, float * out_a, float * out_b,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        cudaStream_t stream) {
+    return ds4_mmq_moe_pair_impl<GGML_TYPE_IQ2_XXS>(
+        "ds4_mmq_iq2_xxs_moe_pair_unsanitized", W_a, W_b, X, ids, out_a, out_b,
+        M, K, n_tokens, n_experts, n_expert_used, stream,
+        NULL, NULL, 0, /*sanitize_out=*/false);
+}
+
 /* ds4 (P4 Inc3): paired mmq MoE over the aligned-SoA IQ2_XXS gate/up
  * artifacts (weight server --repack-iq2-aligned); same contract as
  * ds4_mmq_q2_K_moe_soa. */
