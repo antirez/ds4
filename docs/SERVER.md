@@ -103,8 +103,19 @@ Start with the matching language GGUF and `--vision FILE`; see
 
 OpenAI chat and Responses accept inline PNG/JPEG data URIs. Anthropic accepts
 base64 image sources. Remote URLs and server-side file paths are rejected.
-Image blocks preserve their order in the request. The limit is 16 images and
+Image blocks preserve their order in the request. The limit is 256 images and
 a 64 MiB HTTP body.
+
+A client that resends the conversation sends every image again with each
+request. The server keeps the encoder output of the images in RAM, so that it
+does not encode them again. An image takes its token count times the embedding
+width times four bytes, about 84 MiB for a 5346-token GLM 5.3 image.
+
+This cache can hold every image that the resident sessions can name: 256
+images for each session, within the image rows that fit its context plus
+64 MiB of image files. That is 1626.5 MiB at `--ctx 100000` with a 4096-wide
+model. The cache uses RAM only for the images it has received, and the server
+logs the budget when it starts with `--vision`.
 
 ## Disk KV cache
 
