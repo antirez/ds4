@@ -1,6 +1,7 @@
 /* Exercise private session bookkeeping without loading a model. The GPU build
  * also runs speculative rollback through the real pooled-indexer kernel. */
 #include "../ds4.c"
+#include "../ds4_kvstore.h"
 #include <assert.h>
 
 static void test_vision_prefix(void) {
@@ -114,6 +115,60 @@ static void test_vision_fingerprint_prefix(void) {
     s->checkpoint_valid = false;
     assert(!ds4_session_vision_fingerprint_prefix_matches(s, images, 2));
     assert(!ds4_session_vision_fingerprint_prefix_matches(NULL, images, 2));
+    free(s);
+}
+
+/* The identities a checkpoint can be named by are the images whose rows the
+ * token frontier fully contains: a frontier inside an image has no name, and
+ * a running multimodal sync is described by its own prompt. */
+static void test_vision_identities(void) {
+    ds4_session *s = calloc(1, sizeof(*s));
+    assert(s);
+    s->checkpoint_valid = true;
+    s->checkpoint.len = 100;
+    ds4_vision_span out[2];
+    assert(ds4_session_vision_identities(s, out, 2) == 0);
+    ds4_vision_identity held[2] = {
+        {.token_start = 10, .token_count = 20, .fingerprint = {1}},
+        {.token_start = 60, .token_count = 40, .fingerprint = {2}},
+    };
+    s->checkpoint_images = held;
+    s->checkpoint_image_count = 2;
+    assert(ds4_session_vision_identities(s, out, 2) == 2);
+    assert(out[0].token_start == 10 && out[0].embedding.token_count == 20 &&
+           out[0].embedding.fingerprint[0] == 1 && !out[0].embedding.data);
+    assert(out[1].token_start == 60 && out[1].embedding.token_count == 40 &&
+           out[1].embedding.fingerprint[0] == 2);
+    /* The count does not depend on how many entries the caller can take. */
+    memset(out, 0, sizeof(out));
+    assert(ds4_session_vision_identities(s, out, 1) == 2);
+    assert(out[0].token_start == 10 && out[1].token_start == 0);
+    assert(ds4_session_vision_identities(s, NULL, 0) == 2);
+    s->checkpoint.len = 99;
+    assert(ds4_session_vision_identities(s, out, 2) == -1);
+    s->checkpoint.len = 60;
+    assert(ds4_session_vision_identities(s, out, 2) == 1);
+
+    /* Mid-sync the completed-sync record is stale: only the first image of
+     * the prompt being synchronized is behind the frontier. */
+    ds4_vision_span syncing[2] = {
+        {.token_start = 5, .embedding = {.token_count = 30, .fingerprint = {3}}},
+        {.token_start = 50, .embedding = {.token_count = 30, .fingerprint = {4}}},
+    };
+    s->sync_images = syncing;
+    s->sync_image_count = 2;
+    s->checkpoint.len = 50;
+    assert(ds4_session_vision_identities(s, out, 2) == 1);
+    assert(out[0].token_start == 5 && out[0].embedding.token_count == 30 &&
+           out[0].embedding.fingerprint[0] == 3);
+    s->checkpoint.len = 64;
+    assert(ds4_session_vision_identities(s, out, 2) == -1);
+    s->checkpoint.len = 80;
+    assert(ds4_session_vision_identities(s, out, 2) == 2);
+
+    s->checkpoint_valid = false;
+    assert(ds4_session_vision_identities(s, out, 2) == -1);
+    assert(ds4_session_vision_identities(NULL, out, 2) == -1);
     free(s);
 }
 
@@ -277,6 +332,119 @@ static void test_snapshot_bytes(void) {
         fclose(fp);
     }
     ds4_session_snapshot_free(&snapshot);
+    ds4_session_free(s);
+    g_ds4_shape = saved_shape;
+    g_ds4_compress_ratios[0] = saved_ratio;
+}
+
+/* Image rows come back from a payload only together with their identities:
+ * staging refuses a frontier that cannot name its images and a session that
+ * could not rebuild them, and loading installs exactly the identities given. */
+static void test_vision_payload(void) {
+    const ds4_shape saved_shape = g_ds4_shape;
+    const uint32_t saved_ratio = g_ds4_compress_ratios[0];
+    g_ds4_shape = DS4_SHAPE_FLASH;
+    g_ds4_shape.n_layer = 1;
+    g_ds4_shape.n_head_dim = 4;
+    g_ds4_shape.n_vocab = 8;
+    g_ds4_compress_ratios[0] = 0;
+    ds4_engine e = {.backend = DS4_BACKEND_CPU};
+    ds4_session *s = calloc(1, sizeof(*s));
+    assert(s);
+    s->engine = &e;
+    s->ctx_size = 8;
+    s->prefill_cap = 1;
+    s->checkpoint_valid = true;
+    s->logits = calloc(DS4_N_VOCAB, sizeof(float));
+    assert(s->logits);
+    kv_cache_init(&s->cpu_cache, 8, 0);
+    for (int i = 0; i < 6; i++) ds4_tokens_push(&s->checkpoint, i);
+    s->checkpoint_images = calloc(2, sizeof(*s->checkpoint_images));
+    assert(s->checkpoint_images);
+    s->checkpoint_images[0] = (ds4_vision_identity){
+        .token_start = 1, .token_count = 2, .fingerprint = {1}};
+    s->checkpoint_images[1] = (ds4_vision_identity){
+        .token_start = 4, .token_count = 2, .fingerprint = {2}};
+    s->checkpoint_image_count = 2;
+
+    char err[192] = "";
+    ds4_session_payload_file staged = {0};
+    s->checkpoint.len = 5;
+    assert(ds4_session_stage_payload(s, &staged, err, sizeof(err)) != 0);
+    assert(strstr(err, "inside an image") && !staged.path);
+    s->checkpoint.len = 6;
+    s->cpu_cache.layer[0].n_raw = 6;
+    e.tp.active = true;
+    assert(ds4_session_stage_payload(s, &staged, err, sizeof(err)) != 0);
+    assert(strstr(err, "cannot restore image") && !staged.path);
+    e.tp.active = false;
+    assert(ds4_session_stage_payload(s, &staged, err, sizeof(err)) == 0);
+    ds4_vision_span saved[2], loaded[2];
+    assert(ds4_session_vision_identities(s, saved, 2) == 2);
+    FILE *fp = fopen(staged.path, "rb");
+    assert(fp);
+
+    /* A text payload replaces whatever images the session held. */
+    assert(ds4_session_load_payload_multimodal(s, fp, staged.bytes, NULL, 0,
+                                               err, sizeof(err)) == 0);
+    assert(s->checkpoint_valid && s->checkpoint.len == 6);
+    assert(ds4_session_vision_identities(s, loaded, 2) == 0);
+    rewind(fp);
+    assert(ds4_session_load_payload_multimodal(s, fp, staged.bytes, saved, 2,
+                                               err, sizeof(err)) == 0);
+    assert(ds4_session_vision_identities(s, loaded, 2) == 2);
+    assert(!memcmp(saved, loaded, sizeof(saved)));
+
+    /* Token replay cannot rebuild image rows: refuse before reading. */
+    e.tp.active = true;
+    rewind(fp);
+    assert(ds4_session_load_payload_multimodal(s, fp, staged.bytes, saved, 2,
+                                               err, sizeof(err)) != 0);
+    assert(ftell(fp) == 0 && s->checkpoint_valid);
+    e.tp.active = false;
+
+    /* The disk store saves such a checkpoint only under a key that names its
+     * images, and gives the identities back with the payload. */
+    ds4_tensor gate = {.type = DS4_TENSOR_Q2_K};
+    e.weights.layer[0].ffn_gate_exps = &gate;
+    char dir[] = "/tmp/ds4-test-kv.XXXXXX";
+    assert(mkdtemp(dir));
+    ds4_kvstore_options opt = ds4_kvstore_default_options();
+    opt.min_tokens = 1;
+    ds4_kvstore kc;
+    assert(ds4_kvstore_open(&kc, dir, 1, false, opt, NULL, NULL, NULL));
+    assert(!ds4_kvstore_store_live_prefix(&kc, &e, s, &s->checkpoint, 6,
+                                          "cold", NULL, err, sizeof(err)));
+    assert(ds4_kvstore_store_live_prefix_text(&kc, &e, s, &s->checkpoint, 6,
+                                              "cold", "named", 0, "token-text",
+                                              NULL, err, sizeof(err)));
+    ds4_session_invalidate(s);
+    ds4_kvstore_load_result hit;
+    assert(ds4_kvstore_try_load_text(&kc, &e, s, "named and more", NULL,
+                                     &hit, NULL, false) == 6);
+    assert(hit.text_bytes == 5 && (hit.ext_flags & DS4_KVSTORE_EXT_VISION));
+    assert(ds4_session_vision_identities(s, loaded, 2) == 2);
+    assert(!memcmp(saved, loaded, sizeof(saved)));
+    assert(unlink(hit.path) == 0 && rmdir(dir) == 0);
+    ds4_kvstore_load_result_free(&hit);
+    ds4_kvstore_close(&kc);
+
+    /* Identities that do not fit the checkpoint leave nothing reusable. */
+    const ds4_vision_span bad[3][2] = {
+        {saved[0], {.token_start = 2, .embedding = {.token_count = 2}}},
+        {saved[0], {.token_start = 5, .embedding = {.token_count = 2}}},
+        {saved[0], {.token_start = 4}},
+    };
+    for (int i = 0; i < 3; i++) {
+        rewind(fp);
+        assert(ds4_session_load_payload_multimodal(s, fp, staged.bytes,
+                                                   bad[i], 2,
+                                                   err, sizeof(err)) != 0);
+        assert(!s->checkpoint_valid);
+        assert(ds4_session_vision_identities(s, loaded, 2) == -1);
+    }
+    fclose(fp);
+    ds4_session_payload_file_free(&staged);
     ds4_session_free(s);
     g_ds4_shape = saved_shape;
     g_ds4_compress_ratios[0] = saved_ratio;
@@ -818,10 +986,12 @@ int main(void) {
     test_dspark_tp_split_reserve();
     test_vision_prefix();
     test_vision_fingerprint_prefix();
+    test_vision_identities();
     test_rewind();
     test_session_memory();
     test_payload_tokens();
     test_snapshot_bytes();
+    test_vision_payload();
     test_text_observations();
 #ifndef DS4_NO_GPU
     test_glm_attention_budget();

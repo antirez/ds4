@@ -120,6 +120,13 @@ the live token prefix, then compatible rendered-text prefixes from disk, and
 prefills the new suffix. With multiple slots, each slot has its own live state;
 disk is the additional persistence layer, not the only way to retain sessions.
 
+Prefixes that contain images are saved too. Such a prefix is reused only by a
+request with the same images at the same places. Images are compared by their
+decoded pixels: a different picture makes the request miss from that picture
+on, while the history before it still hits. Clear the directory after changing
+the `--vision` file. TP and pipeline servers do not save prefixes that contain
+images.
+
 TP cache loading rebuilds the saved token prefix on both ranks. It is not an
 instantaneous restoration of both GPUs. Pipeline loading redistributes the
 saved layer state over its route.

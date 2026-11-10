@@ -1112,6 +1112,12 @@ Disk KV cache bugs are high impact for server users.
   not evicted and useful anchors are retained.
 - Test rejection of incompatible checkpoints when model, quantization, context,
   or raw/compressed KV layout changes.
+- With vision enabled, run `python3 tests/test_server_vision_disk.py MODEL.gguf
+  --vision ENCODER.gguf --output /tmp/vision-disk-qa`. It restarts its own
+  server between steps: an image conversation must come back from disk, with
+  and without hidden reasoning, and take a further image. A changed picture
+  must reuse only the history before it. A checkpoint written while a long
+  prompt is still being read must hold the image of that prompt.
 - Test stripped agent sessions: `/strip <id>` then `/switch <id>` should rebuild
   by prefill and render sane history.
 

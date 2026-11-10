@@ -280,6 +280,10 @@ int ds4_prompt_append_vision(ds4_engine *e,
                              ds4_vision_embedding *embedding,
                              char *error,
                              size_t error_cap);
+/* Tokens that ds4_prompt_append_vision() adds on each side of the span: GLM
+ * and Qwen bracket the image rows with one start and one end token, while a
+ * DeepSeek span already covers the whole block. */
+int ds4_engine_vision_wrapper_tokens(ds4_engine *e);
 /* Append one user or tool message whose text parts alternate with images.
  * text_parts must contain image_count + 1 entries. On success ownership of
  * each embedding is transferred to the corresponding output span. */
@@ -468,8 +472,16 @@ bool ds4_session_vision_fingerprint_prefix_matches(const ds4_session *s,
 bool ds4_session_rebase_vision_state(const ds4_session *s,
                                      ds4_vision_span *images, size_t image_count);
 /* True while a session contains, or is actively syncing, image-conditioned
- * state. Such state must not be written to the text-keyed disk KV cache. */
+ * state. Such state is saved to disk only with its image identities. */
 bool ds4_session_has_vision_state(const ds4_session *s);
+/* Identities of the images whose rows lie inside the live token frontier, in
+ * prompt order: token_start, row count and fingerprint, with embedding.data
+ * left NULL. During a multimodal sync they come from the prompt being
+ * synchronized, so a progress callback sees the frontier it stands on.
+ * Returns the image count, writing at most cap entries to out, or -1 when the
+ * checkpoint is invalid or the frontier cuts through an image. */
+int ds4_session_vision_identities(const ds4_session *s,
+                                  ds4_vision_span *out, size_t cap);
 bool ds4_session_rewrite_requires_rebuild(int live_len, int canonical_len, int common);
 ds4_session_rewrite_result ds4_session_rewrite_from_common(
         ds4_session *s, const ds4_tokens *prompt, int common,
@@ -656,6 +668,18 @@ int ds4_session_write_staged_payload(const ds4_session_payload_file *payload,
 void ds4_session_payload_file_free(ds4_session_payload_file *payload);
 int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen);
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen);
+/* A payload holds tokens and graph state, not image identities. A session
+ * with images is persisted as a staged payload plus the identities reported
+ * by ds4_session_vision_identities(), and comes back through this function:
+ * it restores the payload, then makes the given identities the image state of
+ * the session (none clears it). Staging refuses what this could not rebuild:
+ * a checkpoint that ends inside an image, and tensor-parallel or distributed
+ * sessions, which cannot restore image rows from a payload. */
+int ds4_session_load_payload_multimodal(ds4_session *s, FILE *fp,
+                                        uint64_t payload_bytes,
+                                        const ds4_vision_span *images,
+                                        size_t image_count,
+                                        char *err, size_t errlen);
 int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *err, size_t errlen);
 int ds4_session_load_snapshot(ds4_session *s, const ds4_session_snapshot *snap, char *err, size_t errlen);
 void ds4_session_snapshot_free(ds4_session_snapshot *snap);
