@@ -829,6 +829,7 @@ typedef struct {
     ds4_think_mode think_mode;
     bool has_tools;
     bool prompt_preserves_reasoning;
+    bool client_replays_reasoning;
     /* For /v1/responses: emit reasoning_summary_* events / fields only when the
      * client opted in via reasoning.summary. Other APIs leave this false; the
      * field is ignored on those code paths. */
@@ -3103,6 +3104,20 @@ static bool chat_history_uses_tool_context(const chat_msgs *msgs,
     return false;
 }
 
+/* True when the latest assistant message came with reasoning: the sign of a
+ * client that sends reasoning back. Reasoning on older messages alone is not,
+ * because the client may have stopped sending it. */
+static bool chat_last_assistant_has_reasoning(const chat_msgs *msgs) {
+    for (int i = msgs->len - 1; i >= 0; i--) {
+        const chat_msg *m = &msgs->v[i];
+        if (strcmp(m->role, "assistant")) continue;
+        const char *p = m->reasoning;
+        while (p && isspace((unsigned char)*p)) p++;
+        return p && *p;
+    }
+    return false;
+}
+
 static char *render_deepseek_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
                                               const tool_schema_orders *tool_orders,
                                               ds4_think_mode think_mode) {
@@ -4293,6 +4308,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
+    r->client_replays_reasoning = chat_last_assistant_has_reasoning(&msgs);
     r->prompt_text = render_chat_prompt_text_for_syntax(
         r->model_syntax, &msgs, active_tool_schemas,
         &r->tool_orders, r->think_mode);
@@ -12977,11 +12993,22 @@ static bool remember_qwen_tool_turn_visible_checkpoint(server *s, server_slot *s
                                                        const char *finish,
                                                        bool inside_thinking,
                                                        const char *content,
-                                                       const tool_calls *calls) {
+                                                       const tool_calls *calls,
+                                                       bool visible_continuation) {
     char *visible = build_qwen_tool_turn_visible_text(&j->req, finish,
                                                      inside_thinking, content, calls);
     if (!visible) return false;
     thinking_live_remember(s, slot, visible, &j->req);
+    /* The visible key leaves the reasoning of this turn out. A client that
+     * sends reasoning back renders it into its next request, where that key
+     * is no longer a byte prefix: save the checkpoint under its token text
+     * instead, as remember_thinking_checkpoint() does. A first tool turn has
+     * no earlier assistant message to tell the two clients apart, and keeps
+     * the visible key. */
+    pthread_mutex_lock(&s->tool_mu);
+    slot->thinking_live.token_text_disk_key =
+        j->req.client_replays_reasoning && !visible_continuation;
+    pthread_mutex_unlock(&s->tool_mu);
     server_log(DS4_LOG_KVCACHE,
                "ds4-server: qwen tool-turn visible checkpoint remembered ctx=%s live=%d visible=%zu",
                ctx, ds4_session_pos(slot->session),
@@ -14621,7 +14648,9 @@ decode_again:
         if (!remember_qwen_tool_turn_visible_checkpoint(
                 s, slot, j, ctx_span, finish, thinking.inside,
                 parsed_content ? parsed_content : "",
-                &parsed_calls))
+                &parsed_calls,
+                thinking_live_continuation ||
+                (disk_cache_ext_flags & KV_EXT_THINKING_VISIBLE)))
         {
             thinking_live_clear(s, slot);
         }
@@ -18595,6 +18624,68 @@ static void test_qwen_tool_visible_checkpoint_boundary(void) {
             chat_msgs_free(&msgs);
         }
     }
+}
+
+static void test_qwen_tool_turn_disk_key(void) {
+    /* Only reasoning on the latest assistant message counts. */
+    chat_msgs msgs = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("run it");
+    chat_msgs_push(&msgs, user);
+    TEST_ASSERT(!chat_last_assistant_has_reasoning(&msgs));
+    chat_msg older = {0};
+    older.role = xstrdup("assistant");
+    older.reasoning = xstrdup("plan");
+    chat_msgs_push(&msgs, older);
+    chat_msg tool = {0};
+    tool.role = xstrdup("tool");
+    tool.content = xstrdup("ok");
+    chat_msgs_push(&msgs, tool);
+    TEST_ASSERT(chat_last_assistant_has_reasoning(&msgs));
+    chat_msg latest = {0};
+    latest.role = xstrdup("assistant");
+    latest.reasoning = xstrdup(" \n");
+    chat_msgs_push(&msgs, latest);
+    TEST_ASSERT(!chat_last_assistant_has_reasoning(&msgs));
+
+    /* The tool turn is saved under its token text for a client that sends
+     * reasoning back, unless this turn itself continued a visible key. */
+    server s = {0};
+    pthread_mutex_init(&s.tool_mu, NULL);
+    int live[4] = {1, 2, 3, 4};
+    server_slot slot = {0};
+    slot.session = ds4_session_new_test_checkpoint(live, 4);
+    job j = {0};
+    j.req.kind = REQ_CHAT;
+    j.req.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
+    j.req.think_mode = DS4_THINK_HIGH;
+    j.req.prompt_text = render_qwen_chat_prompt_text(&msgs, NULL, NULL,
+                                                     j.req.think_mode);
+    tool_calls calls = {0};
+    tool_call call = {0};
+    call.name = xstrdup("bash");
+    call.arguments = xstrdup("{}");
+    tool_calls_push(&calls, call);
+    calls.raw_tool_text = xstrdup(
+        "\n\n<tool_call>\n<function=bash>\n</function>\n</tool_call>");
+    for (int replays = 0; replays < 2; replays++) {
+        for (int visible = 0; visible < 2; visible++) {
+            j.req.client_replays_reasoning = replays;
+            TEST_ASSERT(remember_qwen_tool_turn_visible_checkpoint(
+                &s, &slot, &j, "test", "tool_calls", false, "Running.",
+                &calls, visible));
+            TEST_ASSERT(slot.thinking_live.valid);
+            TEST_ASSERT(slot.thinking_live.token_text_disk_key ==
+                        (replays && !visible));
+        }
+    }
+    visible_live_free(&slot.thinking_live);
+    ds4_session_free_test_checkpoint(slot.session);
+    tool_calls_free(&calls);
+    free(j.req.prompt_text);
+    chat_msgs_free(&msgs);
+    pthread_mutex_destroy(&s.tool_mu);
 }
 
 static void test_render_qwen_tool_round_trip(void) {
@@ -23048,6 +23139,7 @@ static void ds4_server_unit_tests_run(void) {
     test_render_qwen_chat_prompt_text();
     test_render_qwen_tool_round_trip();
     test_qwen_tool_visible_checkpoint_boundary();
+    test_qwen_tool_turn_disk_key();
     test_qwen_decode_tracker_markers();
     test_parse_qwen_tool_call_message();
     test_qwen_literal_tool_end_in_argument();
