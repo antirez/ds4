@@ -13638,6 +13638,9 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             cached = disk_cached;
             cache_source = "disk-text";
             prompt_for_sync = &effective_prompt;
+            /* The loaded entry already covers its step bucket; the next
+             * continued frontier is the first chunk past the next step. */
+            kv_cache_slot_note_store(slot, disk_cached);
         }
     }
     const bool responses_reasoning_state_preserved =
@@ -21687,6 +21690,72 @@ static void test_kv_cache_continued_uses_aligned_frontiers(void) {
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 30000) == 30000);
 }
 
+/* Feed the chunk boundaries a backend actually emits through the continued
+ * store target the way kv_cache_maybe_store_continued() does, and count the
+ * frontiers per step bucket. */
+static void replay_continued_schedule(kv_disk_cache *kc, const int *events, int n_events,
+                                      int step, int *per_bucket, int n_buckets) {
+    memset(per_bucket, 0, (size_t)n_buckets * sizeof(per_bucket[0]));
+    for (int i = 0; i < n_events; i++) {
+        const int target = kv_cache_continued_store_target(kc, events[i]);
+        if (target == 0) continue;
+        TEST_ASSERT(target == events[i]);
+        const int bucket = target / step;
+        if (bucket < n_buckets) per_bucket[bucket]++;
+        kc->continued_last_store_tokens = target;
+    }
+}
+
+static void test_kv_cache_continued_store_enters_each_step_bucket(void) {
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.opt = kv_cache_default_options();
+    const int step = 10240; /* round_up(10000, 2048) */
+    int per_bucket[8];
+
+    /* Metal chunk schedules: every chunk boundary, nothing else. */
+    static const int caps[] = {2048, 4096, 8192};
+    for (size_t c = 0; c < sizeof(caps) / sizeof(caps[0]); c++) {
+        int events[64];
+        int n = 0;
+        for (int pos = caps[c]; pos < 4 * step && n < 64; pos += caps[c]) events[n++] = pos;
+        kc.continued_last_store_tokens = 0;
+        replay_continued_schedule(&kc, events, n, step, per_bucket, 8);
+        for (int b = 1; b < 4; b++) {
+            if (per_bucket[b] != 1) {
+                fprintf(stderr, "cap %d: bucket %d has %d frontiers\n", caps[c], b, per_bucket[b]);
+            }
+            TEST_ASSERT(per_bucket[b] == 1);
+        }
+    }
+
+    /* V4.1 SSD streaming: one sweep for most of the prompt, then a token-major
+     * tail.  The sweep boundary must become a frontier; the tail must not add
+     * one per token. */
+    {
+        int events[64];
+        int n = 0;
+        events[n++] = 1039;
+        events[n++] = 25615;
+        for (int pos = 25616; pos <= 25813 && n < 64; pos += 1) events[n++] = pos;
+        kc.continued_last_store_tokens = 1039;
+        replay_continued_schedule(&kc, events, n, step, per_bucket, 8);
+        TEST_ASSERT(per_bucket[2] == 1);
+        TEST_ASSERT(kc.continued_last_store_tokens == 25615);
+    }
+
+    /* A disk hit seeds the frontier, so resuming inside its bucket does not
+     * re-store, and the next bucket still gets exactly one frontier. */
+    {
+        static const int events[] = {20480, 24576, 28672, 32768, 36864};
+        kc.continued_last_store_tokens = 20480;
+        replay_continued_schedule(&kc, events, 5, step, per_bucket, 8);
+        TEST_ASSERT(per_bucket[2] == 0);
+        TEST_ASSERT(per_bucket[3] == 1);
+        TEST_ASSERT(kc.continued_last_store_tokens == 32768);
+    }
+}
+
 static void test_kv_cache_cold_store_suppresses_duplicate_continued_boundary(void) {
     kv_disk_cache kc = {0};
     kc.enabled = true;
@@ -23171,6 +23240,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_chat_anchor_uses_last_user_before_assistant();
     test_kv_cache_chat_anchor_ignores_multiturn_tail();
     test_kv_cache_continued_uses_aligned_frontiers();
+    test_kv_cache_continued_store_enters_each_step_bucket();
     test_kv_cache_cold_store_suppresses_duplicate_continued_boundary();
     test_kv_cache_file_size_must_fit_budget();
     test_sha1_bytes_hex_matches_known_vector();
