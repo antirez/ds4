@@ -752,6 +752,40 @@ static int flint_pf_finish(id<MTLCommandBuffer> cb, int owned, const char *what,
     return 1;
 }
 
+/* DS4_FLINT_PREFILL_PROFILE=1: GPU time per kernel group.  Every group then
+ * runs in its own command buffer (a breakdown, not a speed: the gaps between
+ * buffers are not counted) and the running table is printed after each chunk. */
+enum { PFP_NORM, PFP_QKV, PFP_HEAD, PFP_ATTN, PFP_OPROJ, PFP_DENSE, PFP_ROUTE, PFP_GATEUP, PFP_DOWN, PFP_SHARED, PFP_FINAL, PFP_N };
+static const char *const g_pfp_name[PFP_N] = {
+    "rmsnorm x2", "q/k/v gemm", "head norm, rope, ring", "attention", "o proj gemm", "dense glu + down",
+    "router gemm, topk, scatter", "moe gate/up", "moe down", "shared glu + combine", "final norm + head"
+};
+static double g_pfp_ms[PFP_N], g_pfp_attn_global_ms;
+static uint64_t g_pfp_tokens;
+static int g_pfp_on = -1;
+
+static int flint_pf_mark(id<MTLCommandBuffer> __strong *cb, id<MTLComputeCommandEncoder> __strong *enc, int *owned,
+                         int cat, char *err, size_t errlen) {
+    if (g_pfp_on <= 0 || !*owned) return 1;
+    ds4_metal_end_compute_encoder(*cb, *enc);
+    if (!flint_pf_finish(*cb, *owned, "flint_prefill_profile", err, errlen)) return 0;
+    g_pfp_ms[cat] += ((*cb).GPUEndTime - (*cb).GPUStartTime) * 1e3;
+    *cb = ds4_metal_command_buffer(owned);
+    *enc = ds4_metal_compute_encoder(*cb);
+    flint_use_resources(*enc);
+    return 1;
+}
+
+static void flint_pf_profile_print(uint32_t n, uint32_t position) {
+    double total = 0;
+    for (int i = 0; i < PFP_N; i++) total += g_pfp_ms[i];
+    fprintf(stderr, "ds4: Flint prefill profile after %llu tokens (last chunk %u at %u): %.1f ms GPU, %.3f ms/token\n",
+            (unsigned long long)g_pfp_tokens, n, position, total, total / (double)g_pfp_tokens);
+    for (int i = 0; i < PFP_N; i++)
+        fprintf(stderr, "ds4:   %-28s %9.1f ms %5.1f%%%s\n", g_pfp_name[i], g_pfp_ms[i], 100.0 * g_pfp_ms[i] / (total > 0 ? total : 1),
+                i == PFP_ATTN ? [[NSString stringWithFormat:@"  (global layers %.1f ms)", g_pfp_attn_global_ms] UTF8String] : "");
+}
+
 int ds4_flint_gpu_prefill(ds4_flint_gpu_session *s, const int32_t *tokens, uint32_t n,
                           uint32_t position, uint32_t ring_initial, uint16_t *last_logits_bf16,
                           uint16_t *hidden_bf16, uint16_t *all_logits_bf16, char *err, size_t errlen) {
@@ -780,6 +814,7 @@ int ds4_flint_gpu_prefill(ds4_flint_gpu_session *s, const int32_t *tokens, uint3
             g_pf.logits_all_rows = n;
         }
         memcpy([g_pf.tokens contents], tokens, (size_t)n * 4);
+        if (g_pfp_on < 0) g_pfp_on = getenv("DS4_FLINT_PREFILL_PROFILE") ? 1 : 0;
         const uint32_t n_prev = position < 512u ? position : 512u;
         const uint32_t *final_row = g_flint_meta + 49 * 64;
         int owned = 0;
@@ -813,9 +848,11 @@ int ds4_flint_gpu_prefill(ds4_flint_gpu_session *s, const int32_t *tokens, uint3
 
             /* attention */
             flint_enc_rmsnorm(enc, g_pf.x, d[3], g_pf.xn, 0, n);
+            if (!flint_pf_mark(&cb, &enc, &owned, PFP_NORM, err, errlen)) return 0;
             flint_enc_gemm(enc, "flint_gemm_q4_store", g_pf.xn, 2048, d + 10, g_pf.q, 4096, nil, 0, NULL, nil, n);
             flint_enc_gemm(enc, "flint_gemm_q4_store", g_pf.xn, 2048, d + 15, g_pf.k, 512, nil, 0, NULL, nil, n);
             flint_enc_gemm(enc, "flint_gemm_q4_store", g_pf.xn, 2048, d + 20, g_pf.v, 512, nil, 0, NULL, nil, n);
+            if (!flint_pf_mark(&cb, &enc, &owned, PFP_QKV, err, errlen)) return 0;
             if (!global) {
                 /* previous positions from the ring into the window */
                 const FpRingArgs gather = { n_prev, 513u * 128u, FLINT_PF_WIN * 128u, position - n_prev, ring_initial, 0, 0 };
@@ -845,6 +882,7 @@ int ds4_flint_gpu_prefill(ds4_flint_gpu_session *s, const int32_t *tokens, uint3
                 [enc setBytes:&ha length:sizeof(ha) atIndex:9];
                 [enc dispatchThreadgroups:MTLSizeMake((n * 40u + 7) / 8, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             }
+            if (!flint_pf_mark(&cb, &enc, &owned, PFP_HEAD, err, errlen)) return 0;
             {
                 FpAttnArgs aa;
                 aa.M = n; aa.q_pos0 = position; aa.ldq = 4096; aa.ldo = 4096;
@@ -865,7 +903,12 @@ int ds4_flint_gpu_prefill(ds4_flint_gpu_session *s, const int32_t *tokens, uint3
                 [enc setBuffer:g_flint_model offset:flint_moff(d[7]) atIndex:9];
                 [enc setBuffer:g_pf.attn offset:0 atIndex:10];
                 [enc setBytes:&aa length:sizeof(aa) atIndex:11];
-                [enc dispatchThreadgroups:MTLSizeMake((n + 63) / 64, 32, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                [enc dispatchThreadgroups:MTLSizeMake((n + 63) / 64, 32, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            }
+            if (g_pfp_on > 0) {
+                const double before = g_pfp_ms[PFP_ATTN];
+                if (!flint_pf_mark(&cb, &enc, &owned, PFP_ATTN, err, errlen)) return 0;
+                if (global) g_pfp_attn_global_ms += g_pfp_ms[PFP_ATTN] - before;
             }
             flint_enc_gemm(enc, "flint_gemm_q4_residual", g_pf.attn, 4096, d + 25, g_pf.x, 2048, g_pf.x, 2048, NULL, nil, n);
             if (!global) {
@@ -877,12 +920,15 @@ int ds4_flint_gpu_prefill(ds4_flint_gpu_session *s, const int32_t *tokens, uint3
                                              first_pos - (position - n_prev) };
                 flint_enc_ring_copy(enc, g_pf.win_k, 0, g_pf.win_v, 0, s->kv[0], kv_k_off, s->kv[0], kv_v_off, &scatter);
             }
+            if (!flint_pf_mark(&cb, &enc, &owned, PFP_OPROJ, err, errlen)) return 0;
 
             /* feed-forward */
             flint_enc_rmsnorm(enc, g_pf.x, d[4], g_pf.xn, 0, n);
+            if (!flint_pf_mark(&cb, &enc, &owned, PFP_NORM, err, errlen)) return 0;
             if (!sparse) {
                 flint_enc_gemm(enc, "flint_gemm_q4_glu", g_pf.xn, 2048, d + 30, g_pf.act, 6144, nil, 0, d + 35, nil, n);
                 flint_enc_gemm(enc, "flint_gemm_q4_residual", g_pf.act, 6144, d + 40, g_pf.x, 2048, g_pf.x, 2048, NULL, nil, n);
+                if (!flint_pf_mark(&cb, &enc, &owned, PFP_DENSE, err, errlen)) return 0;
             } else {
                 const uint32_t router[5] = { d[60], 0, 0, 256u, 2048u };
                 flint_enc_gemm(enc, "flint_gemm_bf16_store", g_pf.xn, 2048, router, g_pf.router, 256, nil, 0, NULL, nil, n);
@@ -907,6 +953,7 @@ int ds4_flint_gpu_prefill(ds4_flint_gpu_session *s, const int32_t *tokens, uint3
                 [enc setBuffer:g_pf.rows offset:0 atIndex:3];
                 [enc setBytes:&n length:4 atIndex:4];
                 [enc dispatchThreadgroups:MTLSizeMake((n * 6 + 255) / 256, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                if (!flint_pf_mark(&cb, &enc, &owned, PFP_ROUTE, err, errlen)) return 0;
                 id<MTLBuffer> experts_buf = g_flint_experts;
                 NSUInteger experts_off = (NSUInteger)il * 256 * 8;
                 if (g_flint_stream) {
@@ -936,6 +983,7 @@ int ds4_flint_gpu_prefill(ds4_flint_gpu_session *s, const int32_t *tokens, uint3
                 [enc setBuffer:g_flint_silu offset:0 atIndex:4];
                 [enc setBuffer:g_pf.act_sorted offset:0 atIndex:5];
                 [enc dispatchThreadgroupsWithIndirectBuffer:g_pf.dispatch indirectBufferOffset:0 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                if (!flint_pf_mark(&cb, &enc, &owned, PFP_GATEUP, err, errlen)) return 0;
                 [enc setComputePipelineState:flint_pipe("flint_moe_down")];
                 [enc setBuffer:g_pf.act_sorted offset:0 atIndex:0];
                 [enc setBuffer:g_pf.rows offset:0 atIndex:1];
@@ -944,8 +992,10 @@ int ds4_flint_gpu_prefill(ds4_flint_gpu_session *s, const int32_t *tokens, uint3
                 [enc setBuffer:g_pf.wts offset:0 atIndex:4];
                 [enc setBuffer:g_pf.y6 offset:0 atIndex:5];
                 [enc dispatchThreadgroupsWithIndirectBuffer:g_pf.dispatch indirectBufferOffset:12 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                if (!flint_pf_mark(&cb, &enc, &owned, PFP_DOWN, err, errlen)) return 0;
                 flint_enc_gemm(enc, "flint_gemm_q4_glu", g_pf.xn, 2048, d + 45, g_pf.act_sh, 1024, nil, 0, d + 50, nil, n);
                 flint_enc_gemm(enc, "flint_gemm_q4_combine", g_pf.act_sh, 1024, d + 55, g_pf.x, 2048, g_pf.x, 2048, NULL, g_pf.y6, n);
+                if (!flint_pf_mark(&cb, &enc, &owned, PFP_SHARED, err, errlen)) return 0;
             }
             if (hidden_bf16) {
                 ds4_metal_end_compute_encoder(cb, enc);
@@ -990,6 +1040,11 @@ int ds4_flint_gpu_prefill(ds4_flint_gpu_session *s, const int32_t *tokens, uint3
         }
         ds4_metal_end_compute_encoder(cb, enc);
         if (!flint_pf_finish(cb, owned, "flint_prefill", err, errlen)) return 0;
+        if (g_pfp_on > 0 && owned) {
+            g_pfp_ms[PFP_FINAL] += (cb.GPUEndTime - cb.GPUStartTime) * 1e3;
+            g_pfp_tokens += n;
+            flint_pf_profile_print(n, position);
+        }
         if (last_logits_bf16) memcpy(last_logits_bf16, [g_pf.logits contents], DS4_FLINT_GPU_N_VOCAB * 2);
         if (all_logits_bf16) memcpy(all_logits_bf16, [g_pf.logits_all contents], (size_t)n * DS4_FLINT_GPU_N_VOCAB * 2);
         return 1;

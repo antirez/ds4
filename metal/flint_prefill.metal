@@ -457,111 +457,133 @@ struct FpAttnArgs {
     uint ldq, ldo;         // 4096
 };
 
-constant constexpr uint FP_ATT_BQ = 64;
-constant constexpr uint FP_ATT_BK = 32;
-constant constexpr uint FP_ATT_LDK = 136;   // 128 + 8 pad
+constant constexpr uint FP_ATT_LDK = 136;   // 128 + 8 pad: K, V and Q tile row stride
 
-kernel void flint_attention(const device bfloat16_t* Q [[buffer(0)]],        // [M][4096]
-                            const device bfloat16_t* K0 [[buffer(1)]],
-                            const device bfloat16_t* K1 [[buffer(2)]],
-                            const device bfloat16_t* K2 [[buffer(3)]],
-                            const device bfloat16_t* K3 [[buffer(4)]],
-                            const device bfloat16_t* V0 [[buffer(5)]],
-                            const device bfloat16_t* V1 [[buffer(6)]],
-                            const device bfloat16_t* V2 [[buffer(7)]],
-                            const device bfloat16_t* V3 [[buffer(8)]],
-                            const device bfloat16_t* sinks [[buffer(9)]],    // [32] bf16
-                            device bfloat16_t* O [[buffer(10)]],             // [M][4096]
-                            constant FpAttnArgs& args [[buffer(11)]],
-                            uint2 tg [[threadgroup_position_in_grid]],
-                            ushort tid [[thread_index_in_threadgroup]],
-                            ushort sg [[simdgroup_index_in_threadgroup]],
-                            ushort lane [[thread_index_in_simdgroup]]) {
-    threadgroup bfloat16_t Ks[FP_ATT_BK * FP_ATT_LDK];
-    threadgroup bfloat16_t Vs[FP_ATT_BK * FP_ATT_LDK];
+// One threadgroup: NSG simdgroups x ROWS query rows of one head (BQ = NSG *
+// ROWS queries), key tiles of BK.  Q lives in registers (QREG) or in threadgroup
+// memory and is re-read per d step (MLX's steel attention: O and S are the
+// only persistent fragments, so the kernel stays within the register file).
+// KV_SHARED: K and V share one tile buffer (V is loaded after the softmax).
+template <int NSG, int ROWS, bool QREG, int BK, bool KV_SHARED>
+inline void fp_attention_body(const device bfloat16_t* Q, const device bfloat16_t* K0, const device bfloat16_t* K1,
+                              const device bfloat16_t* K2, const device bfloat16_t* K3, const device bfloat16_t* V0,
+                              const device bfloat16_t* V1, const device bfloat16_t* V2, const device bfloat16_t* V3,
+                              const device bfloat16_t* sinks, device bfloat16_t* O, constant FpAttnArgs& args,
+                              threadgroup bfloat16_t* Qs, threadgroup bfloat16_t* Ks, threadgroup bfloat16_t* Vs,
+                              uint2 tg, ushort tid, ushort sg, ushort lane) {
+    constexpr uint BQ = NSG * ROWS;
+    constexpr ushort NT = 32 * NSG;       // threads per threadgroup
+    constexpr ushort RF = ROWS / 8;       // row fragments per simdgroup
+    constexpr ushort KF = BK / 8;         // key fragments per tile
     const uint head = tg.y, kv_head = head >> 3;
-    const uint qt0 = tg.x * FP_ATT_BQ;
+    const uint qt0 = tg.x * BQ;
     if (qt0 >= args.M) return;
-    const uint qrow0 = qt0 + sg * 16;             // this simdgroup's 16 query rows
+    const uint qrow0 = qt0 + sg * ROWS;
     const float scale = (1.0f / 11.313708498984761f) * FP_LOG2E;   // 1/sqrt(128) * log2(e)
-
-    // Q fragments: 2 row frags x 16 d frags.  Rows past M are read anyway (the
-    // host pads the Q buffer to a multiple of 64 rows); their outputs are dropped
-    // and rows do not mix inside the products.
-    simdgroup_matrix<bfloat16_t, 8, 8> qf[2][16];
-    for (ushort i = 0; i < 2; i++) {
-        const device bfloat16_t* qp = Q + (size_t)(qrow0 + 8 * i) * args.ldq + head * 128;
-        for (ushort d = 0; d < 16; d++) simdgroup_load(qf[i][d], qp + d * 8, args.ldq);
-    }
-    simdgroup_matrix<float, 8, 8> of[2][16];
-    for (ushort i = 0; i < 2; i++)
-        for (ushort d = 0; d < 16; d++) of[i][d] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
     const short2 fc = fp_frag_coord(lane);
-    float m_run[2], l_run[2];
-    const float sink = float(sinks[head]) * FP_LOG2E;
-    for (ushort i = 0; i < 2; i++) { m_run[i] = sink; l_run[i] = 1.0f; }
 
-    // Key range for this query tile.
-    const uint q_last = min(qt0 + FP_ATT_BQ, args.M) - 1 + args.q_pos0;
+    // Q: rows past M are read anyway (the host pads the Q buffer to a multiple
+    // of 64 rows); their outputs are dropped and rows do not mix.
+    simdgroup_matrix<bfloat16_t, 8, 8> qf[QREG ? RF : 1][QREG ? 16 : 1];
+    if (QREG) {
+        for (ushort i = 0; i < RF; i++) {
+            const device bfloat16_t* qp = Q + (size_t)(qrow0 + 8 * i) * args.ldq + head * 128;
+            for (ushort d = 0; d < 16; d++) simdgroup_load(qf[i][d], qp + d * 8, args.ldq);
+        }
+    } else {
+        for (ushort c = 0; c < BQ * 16 / NT; c++) {
+            const ushort idx = tid + c * NT;      // BQ * 16 vectors of 8
+            const ushort r = idx >> 4, col = (idx & 15) * 8;
+            *(threadgroup vec<bfloat16_t, 8>*)(Qs + r * FP_ATT_LDK + col) =
+                *(const device vec<bfloat16_t, 8>*)(Q + (size_t)(qt0 + r) * args.ldq + head * 128 + col);
+        }
+    }
+    simdgroup_matrix<float, 8, 8> of[RF][16];
+    for (ushort i = 0; i < RF; i++)
+        for (ushort d = 0; d < 16; d++) of[i][d] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    float m_run[RF], l_run[RF];
+    const float sink = float(sinks[head]) * FP_LOG2E;
+    for (ushort i = 0; i < RF; i++) { m_run[i] = sink; l_run[i] = 1.0f; }
+
+    // Key range for this query tile, and this simdgroup's query positions
+    // (masks are evaluated only on tiles that can touch the causal or window edge).
+    const uint q_last = min(qt0 + BQ, args.M) - 1 + args.q_pos0;
     uint k_lo = 0;
     if (args.window) {
         const uint q_first = qt0 + args.q_pos0;
         const uint lowest = q_first + 1 >= args.window ? q_first + 1 - args.window : 0;
         k_lo = lowest > args.key_pos0 ? lowest - args.key_pos0 : 0;
     }
-    k_lo &= ~(FP_ATT_BK - 1);
+    k_lo &= ~(uint(BK) - 1);
     const uint k_hi = min(args.n_keys, q_last + 1 - args.key_pos0);
+    const uint qpos_lo = args.q_pos0 + qrow0, qpos_hi = qpos_lo + ROWS - 1;
 
-    for (uint kt0 = k_lo; kt0 < k_hi; kt0 += FP_ATT_BK) {
+    for (uint kt0 = k_lo; kt0 < k_hi; kt0 += BK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         const uint blk = kt0 >> 16;
         const device bfloat16_t* Kh = (blk == 0 ? K0 : blk == 1 ? K1 : blk == 2 ? K2 : K3) + (size_t)kv_head * args.kv_head_stride;
         const device bfloat16_t* Vh = (blk == 0 ? V0 : blk == 1 ? V1 : blk == 2 ? V2 : V3) + (size_t)kv_head * args.kv_head_stride;
-        // 32 keys x 128 dims = 4096 elements per tile: each thread copies 4 x 8 of K and of V.
-        for (ushort c = 0; c < 4; c++) {
-            const ushort idx = tid + c * FP_THREADS;      // 0..511 vectors of 8
+        // BK keys x 128 dims = BK * 16 vectors of 8 for K (and V).
+        for (ushort c = 0; c < BK * 16 / NT; c++) {
+            const ushort idx = tid + c * NT;
             const ushort r = idx >> 4, col = (idx & 15) * 8;
             const uint j = kt0 + r;
-            vec<bfloat16_t, 8> kv8 = vec<bfloat16_t, 8>(bfloat16_t(0.0f)), vv8 = kv8;
-            if (j < k_hi) {
-                kv8 = *(const device vec<bfloat16_t, 8>*)(Kh + (size_t)(j & 65535u) * 128 + col);
-                vv8 = *(const device vec<bfloat16_t, 8>*)(Vh + (size_t)(j & 65535u) * 128 + col);
-            }
+            vec<bfloat16_t, 8> kv8 = vec<bfloat16_t, 8>(bfloat16_t(0.0f));
+            if (j < k_hi) kv8 = *(const device vec<bfloat16_t, 8>*)(Kh + (size_t)(j & 65535u) * 128 + col);
             *(threadgroup vec<bfloat16_t, 8>*)(Ks + r * FP_ATT_LDK + col) = kv8;
-            *(threadgroup vec<bfloat16_t, 8>*)(Vs + r * FP_ATT_LDK + col) = vv8;
+            if (!KV_SHARED) {
+                vec<bfloat16_t, 8> vv8 = vec<bfloat16_t, 8>(bfloat16_t(0.0f));
+                if (j < k_hi) vv8 = *(const device vec<bfloat16_t, 8>*)(Vh + (size_t)(j & 65535u) * 128 + col);
+                *(threadgroup vec<bfloat16_t, 8>*)(Vs + r * FP_ATT_LDK + col) = vv8;
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        // S = Q K^T for 16 x 32.
-        simdgroup_matrix<float, 8, 8> sf[2][4];
-        for (ushort i = 0; i < 2; i++)
-            for (ushort kj = 0; kj < 4; kj++) sf[i][kj] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        // S = Q K^T for ROWS x BK.
+        simdgroup_matrix<float, 8, 8> sf[RF][KF];
+        for (ushort i = 0; i < RF; i++)
+            for (ushort kj = 0; kj < KF; kj++) sf[i][kj] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
         for (ushort d = 0; d < 16; d++) {
-            simdgroup_matrix<bfloat16_t, 8, 8> kf[4];
-            for (ushort kj = 0; kj < 4; kj++)
+            simdgroup_matrix<bfloat16_t, 8, 8> kf[KF];
+            for (ushort kj = 0; kj < KF; kj++)
                 simdgroup_load(kf[kj], Ks + kj * 8 * FP_ATT_LDK + d * 8, FP_ATT_LDK, ulong2(0, 0), true);
-            for (ushort i = 0; i < 2; i++)
-                for (ushort kj = 0; kj < 4; kj++) simdgroup_multiply_accumulate(sf[i][kj], qf[i][d], kf[kj], sf[i][kj]);
+            for (ushort i = 0; i < RF; i++) {
+                simdgroup_matrix<bfloat16_t, 8, 8> q;
+                if (QREG) q = qf[i][d];
+                else simdgroup_load(q, Qs + (sg * ROWS + 8 * i) * FP_ATT_LDK + d * 8, FP_ATT_LDK);
+                for (ushort kj = 0; kj < KF; kj++) simdgroup_multiply_accumulate(sf[i][kj], q, kf[kj], sf[i][kj]);
+            }
         }
-        // Scale, mask, online softmax per row.
-        for (ushort i = 0; i < 2; i++) {
-            const uint qpos = qrow0 + 8 * i + fc.y + args.q_pos0;
+        // Scale, mask (edge tiles only), online softmax per row.
+        const uint kpos0 = args.key_pos0 + kt0;
+        const bool edge = (kt0 + BK > k_hi) || (kpos0 + BK - 1 > qpos_lo) || (args.window && kpos0 + args.window <= qpos_hi);
+        for (ushort i = 0; i < RF; i++) {
+            const uint qpos = qpos_lo + 8 * i + fc.y;
             float rmax = FP_NEG_INF;
-            for (ushort kj = 0; kj < 4; kj++) {
-                thread vec<float, 2>& e = fp_elems(sf[i][kj]);
-                for (ushort t = 0; t < 2; t++) {
-                    const uint j = kt0 + kj * 8 + fc.x + t;
-                    const uint kpos = args.key_pos0 + j;
-                    bool ok = j < k_hi && kpos <= qpos;
-                    if (args.window && ok) ok = qpos - kpos < args.window;
-                    e[t] = ok ? e[t] * scale : FP_NEG_INF;
-                    rmax = max(rmax, e[t]);
+            if (edge) {
+                for (ushort kj = 0; kj < KF; kj++) {
+                    thread vec<float, 2>& e = fp_elems(sf[i][kj]);
+                    for (ushort t = 0; t < 2; t++) {
+                        const uint j = kt0 + kj * 8 + fc.x + t;
+                        const uint kpos = args.key_pos0 + j;
+                        bool ok = j < k_hi && kpos <= qpos;
+                        if (args.window && ok) ok = qpos - kpos < args.window;
+                        e[t] = ok ? e[t] * scale : FP_NEG_INF;
+                        rmax = max(rmax, e[t]);
+                    }
+                }
+            } else {
+                for (ushort kj = 0; kj < KF; kj++) {
+                    thread vec<float, 2>& e = fp_elems(sf[i][kj]);
+                    e[0] *= scale;
+                    e[1] *= scale;
+                    rmax = max(rmax, max(e[0], e[1]));
                 }
             }
             rmax = fp_row_max(rmax);
             const float m_new = max(m_run[i], rmax);
             const float alpha = metal::fast::exp2(m_run[i] - m_new);
             float rsum = 0.0f;
-            for (ushort kj = 0; kj < 4; kj++) {
+            for (ushort kj = 0; kj < KF; kj++) {
                 thread vec<float, 2>& e = fp_elems(sf[i][kj]);
                 for (ushort t = 0; t < 2; t++) {
                     const float p = e[t] == FP_NEG_INF ? 0.0f : metal::fast::exp2(e[t] - m_new);
@@ -578,23 +600,37 @@ kernel void flint_attention(const device bfloat16_t* Q [[buffer(0)]],        // 
                 o[1] *= alpha;
             }
         }
-        // O += P V with P in bf16.
-        simdgroup_matrix<bfloat16_t, 8, 8> pf[2][4];
-        for (ushort i = 0; i < 2; i++)
-            for (ushort kj = 0; kj < 4; kj++) {
+        // P in bf16.
+        simdgroup_matrix<bfloat16_t, 8, 8> pf[RF][KF];
+        for (ushort i = 0; i < RF; i++)
+            for (ushort kj = 0; kj < KF; kj++) {
                 const thread vec<float, 2>& e = fp_elems(sf[i][kj]);
                 thread vec<bfloat16_t, 2>& p = fp_elems(pf[i][kj]);
                 p[0] = bfloat16_t(e[0]);
                 p[1] = bfloat16_t(e[1]);
             }
-        for (ushort kj = 0; kj < 4; kj++) {
-            simdgroup_matrix<bfloat16_t, 8, 8> vf[16];
-            for (ushort d = 0; d < 16; d++) simdgroup_load(vf[d], Vs + kj * 8 * FP_ATT_LDK + d * 8, FP_ATT_LDK);
-            for (ushort i = 0; i < 2; i++)
-                for (ushort d = 0; d < 16; d++) simdgroup_multiply_accumulate(of[i][d], pf[i][kj], vf[d], of[i][d]);
+        if (KV_SHARED) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (ushort c = 0; c < BK * 16 / NT; c++) {
+                const ushort idx = tid + c * NT;
+                const ushort r = idx >> 4, col = (idx & 15) * 8;
+                const uint j = kt0 + r;
+                vec<bfloat16_t, 8> vv8 = vec<bfloat16_t, 8>(bfloat16_t(0.0f));
+                if (j < k_hi) vv8 = *(const device vec<bfloat16_t, 8>*)(Vh + (size_t)(j & 65535u) * 128 + col);
+                *(threadgroup vec<bfloat16_t, 8>*)(Vs + r * FP_ATT_LDK + col) = vv8;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        // O += P V.
+        for (ushort kj = 0; kj < KF; kj++) {
+            for (ushort d = 0; d < 16; d++) {
+                simdgroup_matrix<bfloat16_t, 8, 8> vf;
+                simdgroup_load(vf, Vs + kj * 8 * FP_ATT_LDK + d * 8, FP_ATT_LDK);
+                for (ushort i = 0; i < RF; i++) simdgroup_multiply_accumulate(of[i][d], pf[i][kj], vf, of[i][d]);
+            }
         }
     }
-    for (ushort i = 0; i < 2; i++) {
+    for (ushort i = 0; i < RF; i++) {
         const uint row = qrow0 + 8 * i + fc.y;
         if (row >= args.M) continue;
         const float inv = 1.0f / l_run[i];
@@ -608,6 +644,30 @@ kernel void flint_attention(const device bfloat16_t* Q [[buffer(0)]],        // 
         }
     }
 }
+
+#define FP_ATTENTION_KERNEL(NAME, NSG, ROWS, QREG, BK, SHARED, QS_ROWS, VS_ROWS)                              \
+    [[max_total_threads_per_threadgroup(32 * (NSG))]]                                                         \
+    kernel void NAME(const device bfloat16_t* Q [[buffer(0)]], const device bfloat16_t* K0 [[buffer(1)]],    \
+                     const device bfloat16_t* K1 [[buffer(2)]], const device bfloat16_t* K2 [[buffer(3)]],    \
+                     const device bfloat16_t* K3 [[buffer(4)]], const device bfloat16_t* V0 [[buffer(5)]],    \
+                     const device bfloat16_t* V1 [[buffer(6)]], const device bfloat16_t* V2 [[buffer(7)]],    \
+                     const device bfloat16_t* V3 [[buffer(8)]], const device bfloat16_t* sinks [[buffer(9)]], \
+                     device bfloat16_t* O [[buffer(10)]], constant FpAttnArgs& args [[buffer(11)]],           \
+                     uint2 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],   \
+                     ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]]) { \
+        threadgroup bfloat16_t Qs[(QS_ROWS) * FP_ATT_LDK];                                                    \
+        threadgroup bfloat16_t Ks[(BK) * FP_ATT_LDK];                                                         \
+        threadgroup bfloat16_t Vs[(VS_ROWS) * FP_ATT_LDK];                                                    \
+        fp_attention_body<NSG, ROWS, QREG, BK, SHARED>(Q, K0, K1, K2, K3, V0, V1, V2, V3, sinks, O, args, Qs, \
+                                                       Ks, SHARED ? Ks : Vs, tg, tid, sg, lane);              \
+    }
+
+// Production kernel: 64 queries x 1 head per threadgroup of 8 simdgroups (8
+// rows each: a 16-row output tile spills registers and runs 5x slower),
+// Q in threadgroup memory, K and V sharing one 32-key tile.
+FP_ATTENTION_KERNEL(flint_attention, 8, 8, false, 32, true, 64, 1)
+// tests/flint/flint_attention_variants.metal instantiates the alternatives
+// the micro-benchmark compares.
 
 // ---------------------------------------------------------------------------
 // Small kernels: embedding, RMS norm, head norm + RoPE + KV placement, KV

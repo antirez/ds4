@@ -303,7 +303,7 @@ static void attention_case(const char *name, uint32_t M, uint32_t q_pos0, uint32
     id<MTLBuffer> Q = buf_bf16_random((size_t)cap_rows * 4096, 1.0f), K = buf_bf16_random((size_t)4 * n_keys * 128, 1.0f);
     id<MTLBuffer> V = buf_bf16_random((size_t)4 * n_keys * 128, 1.0f), O = buf((size_t)cap_rows * 4096 * 2);
     id<MTLBuffer> sinks = buf_bf16_random(32, 2.0f), args = buf_struct(&a, sizeof a);
-    run("flint_attention", @[Q, K, K, K, K, V, V, V, V, sinks, O, args], MTLSizeMake((M + 63) / 64, 32, 1), MTLSizeMake(128, 1, 1), nil, 0);
+    run("flint_attention", @[Q, K, K, K, K, V, V, V, V, sinks, O, args], MTLSizeMake((M + 63) / 64, 32, 1), MTLSizeMake(256, 1, 1), nil, 0);
     const uint16_t *q = Q.contents, *k = K.contents, *v = V.contents, *o = O.contents, *sk = sinks.contents;
     double maxd = 0; size_t bad = 0, n = 0;
     double *sc = malloc(n_keys * sizeof(double));

@@ -37,6 +37,14 @@ test-flint-kernels: tests/flint/test_flint_kernels
 	./tests/flint/test_flint_kernels metal/flint_prefill.metal
 tests/flint/test_flint_kernels: tests/flint/test_flint_kernels.m
 	$(CC) -fobjc-arc -O2 -framework Metal -framework Foundation -o $@ tests/flint/test_flint_kernels.m
+# Model-free micro-benchmarks of the prefill attention and GEMM kernels
+# (GPU timestamps; run them alone on the GPU, on mains, in High Power Mode).
+.PHONY: bench-flint-kernels
+bench-flint-kernels: tests/flint/bench_flint_attention tests/flint/bench_flint_gemm
+tests/flint/bench_flint_attention: tests/flint/bench_flint_attention.m
+	$(CC) -fobjc-arc -O2 -framework Metal -framework Foundation -o $@ tests/flint/bench_flint_attention.m
+tests/flint/bench_flint_gemm: tests/flint/bench_flint_gemm.m
+	$(CC) -fobjc-arc -O2 -framework Metal -framework Foundation -o $@ tests/flint/bench_flint_gemm.m
 endif
 
 # ds4_server.c (and the server tests inside ds4_test) include the Flint renderer.
@@ -48,6 +56,7 @@ ds4.o ds4_cpu.o: ds4_flint_shape.inc ds4_flint_weights.inc ds4_flint_model.inc d
 .PHONY: fork-clean
 clean: fork-clean
 fork-clean:
-	rm -f ds4_metal_flint.o ds4_flint_stream.o tests/flint/test_flint_kernels tests/flint/test_flint_stream
+	rm -f ds4_metal_flint.o ds4_flint_stream.o tests/flint/test_flint_kernels tests/flint/test_flint_stream \
+	      tests/flint/bench_flint_attention tests/flint/bench_flint_gemm
 
 .DEFAULT_GOAL := $(FORK_SAVED_DEFAULT_GOAL)
