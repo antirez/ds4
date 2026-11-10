@@ -21668,18 +21668,24 @@ static void test_kv_cache_continued_uses_aligned_frontiers(void) {
     kc.enabled = true;
     kc.opt = kv_cache_default_options();
 
-    TEST_ASSERT(kv_cache_continued_store_target(&kc, 10239) == 0);
-    TEST_ASSERT(kv_cache_continued_store_target(&kc, 10240) == 10240);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 8191) == 0);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 8192) == 8192);
 
     kc.continued_last_store_tokens = 4096;
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 8192) == 8192);
+
+    kc.continued_last_store_tokens = 16384;
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 24576) == 24576);
+
+    kc.continued_last_store_tokens = 8192;
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 12288) == 0);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 16384) == 16384);
+
+    /* An unaligned interval is rounded up to the alignment. */
+    kc.opt.continued_interval_tokens = 10000;
+    kc.continued_last_store_tokens = 0;
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 10000) == 0);
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 10240) == 10240);
-
-    kc.continued_last_store_tokens = 24576;
-    TEST_ASSERT(kv_cache_continued_store_target(&kc, 30720) == 30720);
-
-    kc.continued_last_store_tokens = 10240;
-    TEST_ASSERT(kv_cache_continued_store_target(&kc, 18432) == 0);
-    TEST_ASSERT(kv_cache_continued_store_target(&kc, 20480) == 20480);
 
     kc.opt.boundary_align_tokens = 0;
     kc.continued_last_store_tokens = 20480;
@@ -21687,19 +21693,83 @@ static void test_kv_cache_continued_uses_aligned_frontiers(void) {
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 30000) == 30000);
 }
 
+/* The smallest positive store target is the continued step the cache expects
+ * live prefill to land on. */
+static int probe_continued_step(void) {
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.opt = kv_cache_default_options();
+    kc.opt.min_tokens = 1;
+    for (int n = 1; n <= (1 << 20); n++) {
+        if (kv_cache_continued_store_target(&kc, n) == n) return n;
+    }
+    return 0;
+}
+
+/* Continued checkpoints are written from the prefill_chunk listener, so the
+ * only positions the cache ever sees are the chunk boundaries the backend
+ * emits: the resume point, every absolute multiple of its prefill cap, and
+ * the prompt end.  Replay that schedule for every default cap and require
+ * the ladder to reach each multiple of its own step; a step that does not
+ * divide by a cap silently skips rungs (lcm(10240, 4096) == 20480). */
+static void test_kv_cache_continued_step_lands_on_every_prefill_cap(void) {
+    const int step = probe_continued_step();
+    TEST_ASSERT(step > 0);
+
+    uint32_t caps[8];
+    const size_t n_caps = ds4_test_default_prefill_caps(caps, sizeof(caps) / sizeof(caps[0]));
+    TEST_ASSERT(n_caps > 0 && n_caps <= sizeof(caps) / sizeof(caps[0]));
+
+    for (size_t c = 0; c < n_caps; c++) {
+        const int cap = (int)caps[c];
+        const int prompt_len = 4 * step + cap / 2;
+        kv_disk_cache kc = {0};
+        kc.enabled = true;
+        kc.opt = kv_cache_default_options();
+
+        int stored[8] = {0};
+        int n_stored = 0;
+        int pos = 0;
+        while (pos < prompt_len) {
+            const int next = pos + cap - (pos % cap);
+            pos = next < prompt_len ? next : prompt_len;
+            const int target = kv_cache_continued_store_target(&kc, pos);
+            if (target > 0) {
+                TEST_ASSERT(target == pos);
+                if (n_stored < 8) stored[n_stored] = target;
+                n_stored++;
+                kc.continued_last_store_tokens = target;
+            }
+        }
+
+        for (int k = 1; k * step < prompt_len; k++) {
+            bool hit = false;
+            for (int i = 0; i < n_stored && i < 8; i++) {
+                if (stored[i] == k * step) hit = true;
+            }
+            if (!hit) {
+                fprintf(stderr,
+                        "continued step %d never reached rung %d with prefill cap %d (events only at multiples of %d)\n",
+                        step, k * step, cap, cap);
+            }
+            TEST_ASSERT(hit);
+        }
+    }
+}
+
 static void test_kv_cache_cold_store_suppresses_duplicate_continued_boundary(void) {
     kv_disk_cache kc = {0};
     kc.enabled = true;
     kc.opt = kv_cache_default_options();
 
-    int old = kv_cache_suppress_continued_store(&kc, 10240);
+    int old = kv_cache_suppress_continued_store(&kc, 8192);
     TEST_ASSERT(old == 0);
-    TEST_ASSERT(kc.continued_last_store_tokens == 10240);
-    TEST_ASSERT(kv_cache_continued_store_target(&kc, 10240) == 0);
+    TEST_ASSERT(kc.continued_last_store_tokens == 8192);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 8192) == 0);
 
-    kv_cache_restore_suppressed_continued(&kc, old, 10240);
+    kv_cache_restore_suppressed_continued(&kc, old, 8192);
     TEST_ASSERT(kc.continued_last_store_tokens == 0);
-    TEST_ASSERT(kv_cache_continued_store_target(&kc, 10240) == 10240);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 8192) == 8192);
 }
 
 static void test_kv_cache_file_size_must_fit_budget(void) {
@@ -23171,6 +23241,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_chat_anchor_uses_last_user_before_assistant();
     test_kv_cache_chat_anchor_ignores_multiturn_tail();
     test_kv_cache_continued_uses_aligned_frontiers();
+    test_kv_cache_continued_step_lands_on_every_prefill_cap();
     test_kv_cache_cold_store_suppresses_duplicate_continued_boundary();
     test_kv_cache_file_size_must_fit_budget();
     test_sha1_bytes_hex_matches_known_vector();

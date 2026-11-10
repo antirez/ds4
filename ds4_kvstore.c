@@ -35,11 +35,15 @@
 /* Tokenizers may merge text across the prompt boundary. Trimming a small tail
  * still improves the cheap token-prefix path, while text-prefix lookup handles
  * cases where canonical prompt tokenization spells the same bytes differently.
- * The 2048 alignment also matches the backend prefill chunk schedule, which
- * keeps compressor row finalization identical to a cold full prompt. */
+ * Resumed prefill re-aligns itself to the backend's absolute chunk schedule,
+ * so compressor row finalization matches a cold full prompt from any cut. */
 #define KV_CACHE_DEFAULT_BOUNDARY_TRIM_TOKENS 32
 #define KV_CACHE_DEFAULT_BOUNDARY_ALIGN_TOKENS 2048
-#define KV_CACHE_DEFAULT_CONTINUED_INTERVAL_TOKENS 10000
+/* Continued checkpoints are written from the prefill_chunk listener, so the
+ * step must be a multiple of every default prefill chunk (2048 CUDA TP, 4096
+ * graph, 8192 PRO graph); a step that is not lands only on lcm(step, chunk).
+ * 8192 is the smallest value that every current chunk divides. */
+#define KV_CACHE_DEFAULT_CONTINUED_INTERVAL_TOKENS 8192
 /* Disk-hit counts are evidence that a checkpoint was useful, but only while
  * the workload still resembles the one that produced those hits. */
 #define KV_CACHE_MIN_EFFECTIVE_HITS 0.01
