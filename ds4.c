@@ -79107,8 +79107,15 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             decoder_pending = defer_decoder;
             pending_logits = true;
             s->checkpoint_valid = false;
-            if (s->progress)
+            if (s->progress) {
+                /* A listener can save this chunk boundary, so it needs its
+                 * logits.  Deferred-decoder chunks keep incomplete KV, and
+                 * token-major steps would pay a sync per token, so both
+                 * stay unsaveable. */
+                s->checkpoint_valid = !decoder_pending && count > 1u &&
+                                      ds41_graph_logits(g, &e->model, &e->weights, s->logits);
                 s->progress(s->progress_ud, "prefill_chunk", i, prompt->len);
+            }
         }
         ds41_encoder_release(g, &e->model, &encoder);
         if (decoder_pending) {
