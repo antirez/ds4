@@ -10162,8 +10162,20 @@ struct server_slot {
     char decode_err[160];
 };
 
-#define SERVER_IMAGE_CACHE_ENTRIES 32
-#define SERVER_IMAGE_CACHE_BYTES (128u * 1024u * 1024u)
+/* Vision embedding cache (server-global LRU, exact encoded bytes as key).
+ * Sized to hold the full history the DS4_VISION_KEEP_IMAGES opt-in allows:
+ * measured on a long-running agent-loop session, one image costs ~11.6 MB
+ * of embedding plus its encoded copy, so the old 32-entry/128 MiB cap
+ * retained only ~11 images and any KEEP >= 13 re-encoded every image every
+ * turn (encoder duty reached ~2/3 of request time at 30 images) even while
+ * text-KV prefix reuse stayed ~99% effective. 128 entries * ~11.8 MB
+ * ~= 1.6 GiB; 2 GiB is headroom.  KEEP above 128 (or larger images that
+ * bind the byte cap first) is still served correctly -- retention is
+ * min(128 entries, budget per image), oldest re-encoded.  A follow-up can
+ * skip the encode for spans the KV cache attests to; that would demote this
+ * cache to a fallback rather than the work path. */
+#define SERVER_IMAGE_CACHE_ENTRIES 128
+#define SERVER_IMAGE_CACHE_BYTES ((size_t)2u * 1024u * 1024u * 1024u)
 
 typedef struct {
     uint8_t *encoded;
