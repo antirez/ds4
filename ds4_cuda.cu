@@ -106,6 +106,7 @@ static int g_model_direct_fd = -1;
 static uint64_t g_model_direct_align = 1;
 static uint64_t g_model_file_size;
 static int g_model_cache_full;
+static int g_model_startup_copy;
 static bool g_network_tp_async_copy;
 static int g_network_tp_rank = -1;
 static bool g_network_tp_sharding_suspended;
@@ -815,6 +816,45 @@ static const char *cuda_model_ptr(const void *model_map, uint64_t offset) {
     return (const char *)model_map + offset;
 }
 
+/* Device copy of one model range, read from the host mapping. */
+static const char *cuda_model_range_copy_device(const void *model_map, uint64_t offset, uint64_t bytes, const char *what) {
+    void *dev = NULL;
+    cudaError_t err = cudaMalloc(&dev, (size_t)bytes);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        fprintf(stderr, "ds4: CUDA model range alloc failed for %s (%.2f MiB): %s\n",
+                what ? what : "weights", (double)bytes / 1048576.0, cudaGetErrorString(err));
+        return NULL;
+    }
+
+    const char *src = (const char *)model_map + offset;
+    const uint64_t chunk = 64ull * 1024ull * 1024ull;
+    for (uint64_t done = 0; done < bytes; done += chunk) {
+        uint64_t n = bytes - done < chunk ? bytes - done : chunk;
+        err = cudaMemcpy((char *)dev + done, src + done, (size_t)n, cudaMemcpyHostToDevice);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "ds4: CUDA model range copy failed for %s at %.2f/%.2f MiB: %s\n",
+                    what ? what : "weights",
+                    (double)done / 1048576.0,
+                    (double)bytes / 1048576.0,
+                    cudaGetErrorString(err));
+            (void)cudaFree(dev);
+            (void)cudaGetLastError();
+            return NULL;
+        }
+    }
+    g_model_ranges.push_back({model_map, offset, bytes, (char *)dev, NULL, NULL, 0, 0, 0});
+    g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
+    g_model_range_bytes += bytes;
+    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+        fprintf(stderr, "ds4: CUDA cached %s %.2f MiB (total %.2f GiB)\n",
+                what ? what : "weights",
+                (double)bytes / 1048576.0,
+                (double)g_model_range_bytes / 1073741824.0);
+    }
+    return (const char *)dev;
+}
+
 static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what) {
     if (bytes == 0) return cuda_model_ptr(model_map, offset);
     const uint64_t end = offset + bytes;
@@ -896,41 +936,7 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
         }
     }
 
-    void *dev = NULL;
-    err = cudaMalloc(&dev, (size_t)bytes);
-    if (err != cudaSuccess) {
-        (void)cudaGetLastError();
-        fprintf(stderr, "ds4: CUDA model range alloc failed for %s (%.2f MiB): %s\n",
-                what ? what : "weights", (double)bytes / 1048576.0, cudaGetErrorString(err));
-        return NULL;
-    }
-
-    const char *src = (const char *)model_map + offset;
-    const uint64_t chunk = 64ull * 1024ull * 1024ull;
-    for (uint64_t done = 0; done < bytes; done += chunk) {
-        uint64_t n = bytes - done < chunk ? bytes - done : chunk;
-        err = cudaMemcpy((char *)dev + done, src + done, (size_t)n, cudaMemcpyHostToDevice);
-        if (err != cudaSuccess) {
-            fprintf(stderr, "ds4: CUDA model range copy failed for %s at %.2f/%.2f MiB: %s\n",
-                    what ? what : "weights",
-                    (double)done / 1048576.0,
-                    (double)bytes / 1048576.0,
-                    cudaGetErrorString(err));
-            (void)cudaFree(dev);
-            (void)cudaGetLastError();
-            return NULL;
-        }
-    }
-    g_model_ranges.push_back({model_map, offset, bytes, (char *)dev, NULL, NULL, 0, 0, 0});
-    g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
-    g_model_range_bytes += bytes;
-    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
-        fprintf(stderr, "ds4: CUDA cached %s %.2f MiB (total %.2f GiB)\n",
-                what ? what : "weights",
-                (double)bytes / 1048576.0,
-                (double)g_model_range_bytes / 1073741824.0);
-    }
-    return (const char *)dev;
+    return cuda_model_range_copy_device(model_map, offset, bytes, what);
 }
 
 /* Per-tier cuBLAS handle. Used by kernel-dispatch wrappers; returns the
@@ -3080,6 +3086,7 @@ extern "C" void ds4_gpu_cleanup(void) {
     g_model_direct_align = 1;
     g_model_file_size = 0;
     g_model_cache_full = 0;
+    g_model_startup_copy = 0;
     if (g_model_prefetch_stream) {
         (void)cudaStreamDestroy(g_model_prefetch_stream);
         g_model_prefetch_stream = NULL;
@@ -4004,6 +4011,7 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
     g_model_range_mapping_supported = 1;
     g_model_hmm_direct = 0;
     g_model_cache_full = 0;
+    g_model_startup_copy = 0;
     if (g_model_fd >= 0 && g_model_fd_host_base == NULL) {
         g_model_fd_host_base = model_map;
     }
@@ -4181,6 +4189,7 @@ static int cuda_register_model_map(const void *model_map, uint64_t model_size,
     g_model_range_mapping_supported = 1;
     g_model_hmm_direct = 0;
     g_model_cache_full = 0;
+    g_model_startup_copy = 0;
     if (g_model_fd >= 0 && g_model_fd_host_base == NULL) {
         g_model_fd_host_base = model_map;
     }
@@ -5319,10 +5328,82 @@ extern "C" int ds4_gpu_model_range_replaced(
     return 0;
 }
 
+/* Device memory the engine allocates after the startup walk and outside its
+ * context estimate: CUDA graphs, cuBLAS workspaces, transient activation and
+ * quantization buffers, the driver's own. 1 GiB holds them on the cards
+ * measured so far; 2% scales the margin with the card. */
+static uint64_t cuda_model_copy_reserve_bytes(uint64_t total_bytes) {
+    const uint64_t min_reserve = 1024ull * 1048576ull;
+    const uint64_t pct_reserve = total_bytes / 50u;
+    return pct_reserve > min_reserve ? pct_reserve : min_reserve;
+}
+
+/* The startup walk resolves every tensor span of a registered model mapping
+ * once. On GB10 the mapping is device memory, so resolving is all it has to
+ * do. A discrete GPU reads the same mapping over PCIe on every token; there
+ * the walk copies the spans into device memory instead, when they fit next
+ * to the context buffers the engine allocates afterwards. Decided once per
+ * mapping, before the walk, and only for the mapping that is registered: a
+ * support model registered after the main one leaves the main model to the
+ * fd cache, as before. Anything the walk does not copy still resolves to the
+ * mapping. */
+extern "C" int ds4_gpu_plan_model_cache(const void *model_map, uint64_t span_bytes, uint64_t context_bytes) {
+    g_model_startup_copy = 0;
+    if (!model_map || span_bytes == 0 || g_ssd_streaming_mode || g_model_device_owned ||
+        model_map != g_model_host_base || !g_model_registered ||
+        getenv("DS4_CUDA_NO_MODEL_COPY") != NULL) {
+        return 0;
+    }
+    int device = 0;
+    int integrated = 0;
+    if (cudaGetDevice(&device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, device) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    if (integrated) return 0;
+    size_t free_b = 0;
+    size_t total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    const uint64_t reserve = cuda_model_copy_reserve_bytes((uint64_t)total_b);
+    uint64_t need = span_bytes;
+    need = context_bytes > UINT64_MAX - need ? UINT64_MAX : need + context_bytes;
+    need = reserve > UINT64_MAX - need ? UINT64_MAX : need + reserve;
+    if (need > (uint64_t)free_b) {
+        fprintf(stderr,
+                "ds4: CUDA model stays host-mapped: %.2f GiB tensors + %.2f GiB context "
+                "+ %.2f GiB reserve exceed %.2f GiB free device memory\n",
+                (double)span_bytes / 1073741824.0,
+                (double)context_bytes / 1073741824.0,
+                (double)reserve / 1073741824.0,
+                (double)free_b / 1073741824.0);
+        return 0;
+    }
+    g_model_startup_copy = 1;
+    fprintf(stderr,
+            "ds4: CUDA copying %.2f GiB of model tensors into device memory "
+            "(%.2f GiB context planned, %.2f GiB free)\n",
+            (double)span_bytes / 1073741824.0,
+            (double)context_bytes / 1073741824.0,
+            (double)free_b / 1073741824.0);
+    return 1;
+}
+
 extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label) {
     if (!model_map || bytes == 0) return 1;
     if (offset > model_size || bytes > model_size - offset) return 0;
     if (cuda_span_fully_replaced(model_map, offset, bytes)) return 1;
+    if (g_model_startup_copy && model_map == g_model_host_base) {
+        /* Copies are found before the mapping in cuda_model_range_ptr. The
+         * source is the registered mapping, so this is one pinned DMA. */
+        if (cuda_model_range_copy_device(model_map, offset, bytes, label ? label : "model_tensor")) return 1;
+        fprintf(stderr, "ds4: CUDA remaining model tensors stay host-mapped\n");
+        g_model_startup_copy = 0;
+        return 1;
+    }
     if (!cuda_model_range_ptr(model_map, offset, bytes, label ? label : "model_tensor")) return 0;
     return cuda_model_range_is_cached(model_map, offset, bytes);
 }

@@ -649,6 +649,16 @@ tests/test_cuda_copy_spans.o: tests/test_cuda_copy_spans.cu ds4_gpu.h ds4_gpu_co
 tests/test_cuda_copy_spans: tests/test_cuda_copy_spans.o ds4_cuda.o ds4_image.o $(MMQ_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
+tests/test_cuda_model_copy.o: tests/test_cuda_model_copy.cu ds4_gpu.h
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -I. -c -o $@ $<
+
+tests/test_cuda_model_copy: tests/test_cuda_model_copy.o ds4_cuda.o ds4_image.o $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+.PHONY: test-cuda-model-copy
+test-cuda-model-copy: tests/test_cuda_model_copy
+	./tests/test_cuda_model_copy
+
 .PHONY: test-cuda-copy-spans
 test-cuda-copy-spans: tests/test_cuda_copy_spans
 	./tests/test_cuda_copy_spans
@@ -1570,6 +1580,7 @@ clean:
 	rm -f tests/test_cuda_tp
 	rm -f tests/test_cuda_tp_repack
 	rm -f tests/test_cuda_pool
+	rm -f tests/test_cuda_model_copy
 	rm -f tests/test_cuda_dspark
 	rm -f tests/test_cuda_verify_head
 	rm -f tests/test_cuda_shared_side

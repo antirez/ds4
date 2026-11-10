@@ -3466,6 +3466,7 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
                                                    const uint64_t *span_offsets,
                                                    const uint64_t *span_sizes,
                                                    uint32_t span_count,
+                                                   uint64_t context_bytes,
                                                    uint64_t *prepared_out) {
     uint64_t cap = m->n_tensors;
     if (cap == 0) {
@@ -3529,6 +3530,16 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
     }
 
     qsort(spans, (size_t)nspan, sizeof(spans[0]), accelerator_tensor_span_cmp);
+
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    /* The backend decides once, from the total, whether the walk below
+     * copies the spans into device memory or only resolves the mapping. */
+    uint64_t span_bytes = 0;
+    for (uint64_t i = 0; i < nspan; i++) span_bytes += spans[i].end - spans[i].off;
+    (void)ds4_gpu_plan_model_cache(m->map, span_bytes, context_bytes);
+#else
+    (void)context_bytes;
+#endif
 
     const uint64_t max_span = accelerator_cuda_preload_span_bytes();
     const int tty = ds4_log_is_tty(stderr);
@@ -3627,7 +3638,8 @@ static bool accelerator_cache_model_tensors(ds4_backend backend,
                                             const ds4_model *m,
                                             const uint64_t *span_offsets,
                                             const uint64_t *span_sizes,
-                                            uint32_t span_count) {
+                                            uint32_t span_count,
+                                            uint64_t context_bytes) {
     if (backend != DS4_BACKEND_CUDA) return true;
     if (!m || !m->map || m->size == 0) return false;
 #ifndef DS4_ROCM_BUILD
@@ -3638,7 +3650,8 @@ static bool accelerator_cache_model_tensors(ds4_backend backend,
 
     const double t0 = now_sec();
     uint64_t prepared = 0;
-    if (!accelerator_prepare_model_tensor_spans(m, span_offsets, span_sizes, span_count, &prepared)) {
+    if (!accelerator_prepare_model_tensor_spans(m, span_offsets, span_sizes, span_count,
+                                                context_bytes, &prepared)) {
         return false;
     }
 #ifndef DS4_ROCM_BUILD
@@ -3663,12 +3676,14 @@ static bool accelerator_cache_model_tensors(ds4_backend backend,
                                             const ds4_model *m,
                                             const uint64_t *span_offsets,
                                             const uint64_t *span_sizes,
-                                            uint32_t span_count) {
+                                            uint32_t span_count,
+                                            uint64_t context_bytes) {
     (void)backend;
     (void)m;
     (void)span_offsets;
     (void)span_sizes;
     (void)span_count;
+    (void)context_bytes;
     return true;
 }
 #endif
@@ -44682,6 +44697,23 @@ static uint64_t ds4_engine_streaming_transient_guard_bytes(
     return total;
 }
 
+#ifndef DS4_NO_GPU
+/* KV caches and graph scratch for every planned session: what the engine
+ * allocates after the model, and what the CUDA startup walk keeps free when
+ * it decides whether the model can be copied into device memory. */
+static uint64_t ds4_engine_planned_context_bytes(const ds4_engine *e, int ctx_size) {
+    if (!e) return 0;
+    const ds4_context_memory mem = ds4_context_memory_estimate_with_prefill_mode(
+            e->backend,
+            ctx_size > 0 ? ctx_size : 4096,
+            e->prefill_chunk,
+            e->ssd_streaming);
+    const uint32_t sessions = e->placement_session_count_hint > 1 ?
+        (uint32_t)e->placement_session_count_hint : 1u;
+    return ds4_mul_sat_u64(mem.total_bytes, sessions);
+}
+#endif
+
 static void ds4_engine_print_startup_memory(
         const ds4_engine *e,
         int               ctx_size) {
@@ -74180,7 +74212,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
                     (void)ds4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
                     ready = accelerator_cache_model_tensors(e->backend,
                                                              &e->model,
-                                                             NULL, NULL, 0);
+                                                             NULL, NULL, 0, 0);
                 }
                 if (!ready) {
                     fprintf(stderr, "ds4: Qwen3.8 test model map setup failed\n");
@@ -75083,9 +75115,12 @@ static int ds4_engine_open_internal(ds4_engine **out,
             return 1;
         }
         (void)ds4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
+        const uint64_t planned_context_bytes =
+            ds4_engine_planned_context_bytes(e, opt->context_size);
         if (!accelerator_cache_model_tensors(e->backend, &e->model,
                                              load_offsets, load_sizes,
-                                             load_span_count)) {
+                                             load_span_count,
+                                             planned_context_bytes)) {
             fprintf(stderr, "ds4: %s failed to prepare optional model cache\n",
                     ds4_backend_name(e->backend));
             free(load_offsets);
@@ -75101,7 +75136,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
         if (support_model_runtime_ready) {
             (void)ds4_gpu_set_model_fd_for_map(e->mtp_model.fd, e->mtp_model.map);
             if (!accelerator_cache_model_tensors(e->backend, &e->mtp_model,
-                                                 NULL, NULL, 0)) {
+                                                 NULL, NULL, 0,
+                                                 planned_context_bytes)) {
                 fprintf(stderr, "ds4: %s failed to prepare optional support model cache\n",
                         ds4_backend_name(e->backend));
                 ds4_engine_close(e);
