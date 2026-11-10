@@ -423,13 +423,25 @@ Flint out of ds4_metal.m, and the MLX arithmetic to follow is specific):
   `flint_moe_gateup` and `flint_moe_down` over the tile table, reading each
   expert's pack through the same GPU-address table the decode kernel uses
   (the model buffer must be made resident with `useResource`).
-- `flint_attention`: 64 queries x 1 head per threadgroup, key tiles of 32,
-  f32 online softmax in base 2 with the scale folded in, sinks as the
-  initial running maximum with sum 1, probabilities rounded to bf16 before
-  the PV product, as `mx.fast.scaled_dot_product_attention`'s steel kernel;
-  masks causal or the 513 window; keys from up to four KV blocks (global
-  layers) or from a window buffer (sliding layers: the previous 512
-  positions gathered from the ring, then the chunk).
+- `flint_attention`: 64 queries x 1 head per threadgroup of 8 simdgroups
+  (8 query rows each), Q in threadgroup memory and re-read per d step, K
+  and V sharing one 32-key tile, f32 online softmax in base 2 with the
+  scale folded in, sinks as the initial running maximum with sum 1,
+  probabilities rounded to bf16 before the PV product, as
+  `mx.fast.scaled_dot_product_attention`'s steel kernel; masks causal or
+  the 513 window, evaluated only on tiles touching an edge; keys from up to
+  four KV blocks (global layers) or from a window buffer (sliding layers:
+  the previous 512 positions gathered from the ring, then the chunk). The
+  kernel is a template (`fp_attention_body<simdgroups, rows, Q in
+  registers, key tile, shared K/V>`); the first instance, 4 simdgroups of
+  16 rows with Q in registers, ran at 0.7 TFLOPS because its 16-row output
+  tile spills registers, the production instance runs at 4.6 TFLOPS (MLX's
+  sdpa on the same shape: 4.7). `tests/flint/bench_flint_attention` times
+  the instances in `tests/flint/flint_attention_variants.metal` against
+  each other; `bench_flint_gemm` does the same for the projections
+  (`flint_gemm` 5.0 TFLOPS, `mx.quantized_matmul` 5.0).
+  `DS4_FLINT_PREFILL_PROFILE=1` prints the GPU time per kernel group of a
+  prefill (each group then runs in its own command buffer).
 - `flint_head_norm_rope`, `flint_rmsnorm`, `flint_embed`, `flint_ring_copy`
   (ring gather before, scatter after a chunk: the ring is re-laid for
   position + n, which becomes rec's `initial`), `flint_head_row` (the
@@ -632,12 +644,36 @@ and thinking control of the template (step 5), batching (step 7).
 
 Done (Status). Decode is settled: ds4 is within 5% of rec at every
 context up to 28K and the one-launch-per-token floor is 0.9 ms, so the
-8-token resident blocks stay out. Prefill is the open gap: 1.5x at 4K
-growing to 2.8x at 28K. Order of work: the attention kernel (larger key
-tiles, two heads or more queries per threadgroup, double-buffered loads),
-then the GEMM (double buffering, 128-wide tiles), measured with the same
-harness after each change. 128K needs a longer prompt file
-(`tests/generate_long_context_story_prompt.py`).
+8-token resident blocks stay out.
+
+Prefill was 1.5x behind rec at 4K and 2.8x at 28K. The model-free
+micro-benchmarks (`make bench-flint-kernels`, GPU timestamps, one
+2048-query chunk) located all of it in the attention kernel: 0.70 TFLOPS
+against 16K keys (700 ms per global layer and chunk) where MLX's sdpa
+does 4.7, while `flint_gemm` already matched `mx.quantized_matmul` (5.0
+TFLOPS both on every projection shape). The cause was the output tile:
+four simdgroups of 16 rows hold 64 f32 output fragments per lane plus Q
+in registers and spill. Variants measured on the same harness (M4 Max,
+eval traffic on the GPU, so absolute numbers are a little low):
+
+| Variant (64 queries x 1 head unless noted) | 16K keys | TFLOPS |
+|---|---:|---:|
+| old: 4 simdgroups x 16 rows, Q in registers | 731 ms | 0.70 |
+| 4 x 16 rows, Q in threadgroup memory | 678 ms | 0.76 |
+| 4 x 16 rows, Q in registers, masks on edge tiles only | 717 ms | 0.72 |
+| 4 x 8 rows (32 queries), Q in registers | 141 ms | 3.66 |
+| 4 x 8 rows (32 queries), Q in threadgroup memory | 117 ms | 4.40 |
+| 4 x 8 rows (32 queries), 64-key tiles | 119 ms | 4.35 |
+| 8 x 8 rows, Q in registers | 130 ms | 3.97 |
+| 8 x 8 rows, Q in registers, 64-key tiles | 126 ms | 4.09 |
+| **8 x 8 rows, Q in threadgroup memory, shared 32-key K/V tile** | **113 ms** | **4.57** |
+| MLX `scaled_dot_product_attention`, same shape | 109 ms | 4.73 |
+
+The winner is bit-identical to the old kernel (same fragment order), also
+at 4K keys (22 ms, 4.72 TFLOPS) and on the 513 window (4.0 ms, 4.28; MLX
+with an explicit window mask takes 17.6 ms there). `make
+test-flint-kernels` passes. 128K prompt: five copies of the story file
+(148K tokens) serve the benchmark through `--prompt-file`.
 
 ### 4. Streaming
 
