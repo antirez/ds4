@@ -42,7 +42,7 @@ rec reports more than 125 tok/s averaged over a 128K-token session.
 | 0. Scaffolding: fork files from `bonsai2`; converter from rec's checkpoint (rec's tensor layout, per-expert packs); shape, loader, tokenizer, server id | **done 2026-11-07.** Family `DS4_MODEL_FAMILY_FLINT = 200` / variant 202 with fork scaffolding; converter writes 22.574 GB in 56 s, `--check-all` byte-identical on all 1375 tensors and the nibble layout confirmed against `mx.dequantize`; `--inspect` opens, binds and validates the GGUF; tokenizer bit-identical to HF tokenizers on 1069 cases; `golden.json` has 8 rec cases (incl. a 20277-token story; rec decodes ~120 tok/s, prefill ~550 tok/s on the M4 Pro); `rec_logits.py` dumps prefill and per-step logits, 50×2048 bf16 traces and per-layer KV from rec's runtime (loads in 10 s). Descriptor and address tables move to step 1 with the kernel. |
 | 1. Decode megakernel ported: per-layer residual trace bit-identical to rec on identical KV; one token per launch, CPU sampling | **done 2026-11-07.** `metal/flint.metal` + `ds4_metal_flint.m` + `ds4_flint.inc`; `trace_compare.py` reports every trace row (50 × 2048) and all 150144 logits identical to rec on 56 decode steps over four prefills: 5 tokens, 559 (ring wrapped), 1401 (above the 1024-part boundary, 8-head path, 128 parts) and 8445 (256 parts). Warm decode 7.3 ms/token at 5 tokens, 8.0 at 559, 8.4 at 1401, 10.0 at 8445 (one token per launch with logits readback); a cold first step pays about 200 ms of page-ins. Not yet exercised: count exactly 1024 (64 parts), 512 parts, and contexts past 65536 (multi-block KV). |
 | 2. Prefill (chunked, window attention, sorted-expert GEMM), sessions, live KV reuse, disk checkpoints; golden cases within rec's spread | **done 2026-11-09.** `metal/flint_prefill.metal` (own kernels, see Design: Prefill), `ds4_flint_session.inc`; `make test-flint-kernels` passes. Against rec (`prefill_compare.py`): the last row's logits agree to KL 1e-8 to 1e-9 on 12-, 578- and 2556-token prompts; per-layer error grows like rounding noise (relative mean 0.003 to 0.12 by layer 48) with a few rows diverging at routing near-ties (578-token prompt: 55 of 578 rows have a sixth/seventh expert margin under 1%). Golden teacher-forced (`check_golden.py`, 128 tokens): argmax = rec's 94.5 to 100%, abs delta logprob mean 0.011 to 0.039, max 0.60; rec's own decode-vs-prefill at identical positions is mean 0.05 to 0.32, max 4.5, agreement 88 to 100% (3 dumps, 40 positions). Greedy paths part after 15 to 66 tokens on the short cases and run 64/64 on the tool case. Gate 2 (`reuse_check.py`): a follow-up turn on decode KV versus a fresh prefill differs along 64 steps by KL mean 0.001 to 0.005, max 0.064, abs delta logprob mean 0.011 to 0.032, top-1 same 97 to 100%: reuse stays. `ds4_test --server`, `--session-snapshot` and `--long-context` (29624 tokens, 100K context, two KV blocks) pass. Speed (not tuned): prefill 170 tok/s at 20K (rec 410 to 425 on this Mac), the first-cut GEMM; decode through sessions 10.3 to 11.4 ms/token short, 21.3 at 20K. |
-| 3. Measure against rec: decode at 4K/32K/128K, prefill, launch overhead; decide on 8-token resident blocks | **done 2026-11-10** (mains, High Power Mode, M4 Pro 48 GB, `tests/flint/bench_vs_rec.py`: both servers through one streaming client, 128 new tokens, thinking on). Decode ms/token rec vs ds4: 7.3 vs 7.6 at 256 tokens, 8.5 vs 8.8 at 4K, 10.9 vs 11.5 at 16K, 13.3 vs 13.9 at 28K (ds4 within 4 to 5% everywhere). The launch floor (`DS4_FLINT_LAYER_COUNT=0`: embedding, head and readback only) is 0.92 ms per step, so one launch per token costs what the gap shows; **8-token resident blocks would buy at most 5% and are not worth the in-kernel sampling: decision no.** Prefill tok/s rec vs ds4: 398 vs 201 at 256 (warm), 659 vs 433 at 4K, 569 vs 234 at 16K, 463 vs 164 at 28K: ds4's prefill falls 2.6x from 4K to 28K where rec's falls 1.4x, which names the attention kernel (64 x 32 tiles, one head per threadgroup, no double buffering) as the first target; the GEMM gap at 4K is 1.5x. A cold first prefill pays about 8 s of page-ins for the 22.6 GB mapping. 128K not measured (no 128K prompt file yet; rec's 75 tok/s at 28K says its "125 tok/s over a 128K session" is weighted toward the short part). |
+| 3. Measure against rec: decode at 4K/32K/128K, prefill, launch overhead; decide on 8-token resident blocks | **done 2026-11-11** (mains, High Power Mode, M4 Pro 48 GB, `tests/flint/bench_vs_rec.py`: both servers through one streaming client, thinking on). Decode ms/token rec vs ds4: 7.3 vs 7.6 at 256 tokens, 8.5 vs 8.8 at 4K, 10.9 vs 11.5 at 16K, 13.3 vs 13.9 at 28K (ds4 within 4 to 5%); at 64K and 128K (148K-token prompt, 64 new tokens) rec 20.5 vs ds4 22.9 and rec 34.8 vs ds4 38.1. The launch floor (`DS4_FLINT_LAYER_COUNT=0`) is 0.92 ms per step, so **8-token resident blocks would buy at most 5%: decision no.** Prefill tok/s rec vs ds4 after the attention rewrite (step 3): 398 vs 212 at 256 (warm), 659 vs 758 at 4K, 569 vs 634 at 16K, 463 vs 543 at 28K, 348 vs 370 at 64K, 226 vs 239 at 128K: ds4 is 6 to 17% ahead of rec from 4K up with output bit-identical to the old kernel; decode at 64K and 128K is 10 to 12% behind rec (the KV read, see Speed model). Left at 256 tokens: about 1 s of fixed cost per request on ds4 (256 tokens take 1.21 s, 1024 take 1.67 s) against rec's 0.64 s. A cold first prefill pays about 8 s of page-ins for the 22.6 GB mapping. |
 | 4. Expert streaming: routing-trace study, cache and address table, in-kernel slot wait (or per-layer split), prefill staging, budget; streamed output bit-identical to resident | **done 2026-11-09** (`ds4_flint_stream.c`, see Design: Streaming). The visibility experiment failed usefully: a CPU store reaches a running kernel only after 0.3 to 10.7 s and a GPU store reaches the CPU about 30 ms after launch (caches flush at command-buffer boundaries), so misses are handled by **abort and resume**: the megakernel aborts at the first layer whose expert is not cached, publishes the layer's ids, the host reads the packs and relaunches from that layer. Hits are the unchanged resident path. `stream_check.py`: streamed and resident outputs are bit-identical on `short_01`, `multi_01` and `tool_01` with a 1 GB cache (606 slots; every decode layer misses, 4.8 of 6 experts), under all three prefill policies. `make test-flint-stream` (model-free, sparse file) passes; `ds4_test --server` and `--session-snapshot` pass with `DS4_TEST_SSD_STREAMING=1` and a 2 GB cache. Cost of a relaunch about 0.3 ms plus the reads (35 ms/token with a 1 GB cache and the file in the page cache, against 9 resident). Routing logs over 1197 decoded tokens (`route_sim.py`, plain LRU): miss fraction 0.65 at 2 GB, 0.21 at 8 GB, 0.09 at 12 GB, 0.03 at 16 GB, 0.007 at 20 GB. Not measured: cold-SSD bandwidth (the file sits in this Mac's page cache and `purge` needs root) and the 20K case in streaming mode (deferred to an AC-powered session). |
 | 5. Server and agent: Flint template, `<tool_call>` syntax, reasoning parsing, `ds4-agent` session | **done 2026-11-09.** `ds4_flint_server.inc`: the server renders Flint prompts from rec's `chat_template.jinja` (roles in order, `flint_text` escaping, the `# Tools` preamble before the first non-system turn, `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value></tool_call>` with string values raw and other values as Python JSON, `<|observation|><tool_response>` results); `tests/flint/check_template.py` renders nine message sets through the live server and through rec's template under HF's jinja settings: all byte-identical, and a live request with tools returns a structured `tool_calls` entry plus `reasoning_content`. Flint reports GLM's tool syntax, so the GLM reply parser and the live tool-call tracker are reused unchanged. Thinking: rec's grammar forces `<think>` as the first token, so the generation prompt is `<|assistant|><think>`; `enable_thinking: false`, `reasoning_effort: none` and the `flint-chat` / `flint-no-think` aliases prefill `<think></think>` instead (`flint-reasoner` forces it on); `/v1/models` lists `flint`, `flint-chat`, `flint-reasoner`. Sampling defaults from `generation_config.json` (temperature 1.0, top-p 0.95, top-k 20) for knobs a request leaves out; the agent uses 1.0 / 0.95. `ds4-agent` with Flint: thinking, bash and read tool calls and the final answer work in one turn on a file task; its KV save needed `ds4_engine_routed_quant_bits` to report 4 for the packs. Not done: the Terminal-Bench style comparison with `rec launch` (needs the AC-powered session). |
 | 6. Streaming speed: prefetch and prediction, popularity preload, cache policy | open |
@@ -565,7 +565,13 @@ kernel with one launch per token instead of one per eight.
 rec's 125 tok/s "over a 128K session" is above this bound at 128K; step 3
 measured rec at 137 tok/s at 256 tokens, 118 at 4K, 91 at 16K and 75 at
 28K (ds4 within 5% of each), so the figure is weighted toward the short
-part of a session. The bound above is roughly right.
+part of a session. At 128K itself (step 3, 2026-11-11) ds4 decodes at
+38.1 ms/token (26 tok/s) and rec at 34.8 ms (29 tok/s), both below the
+44 tok/s bound: the KV read of 3.8 GB per token runs at about 120 GB/s
+on ds4 (rec about 135), half the matvec rate. ds4 is within 5% of rec
+up to 28K but 10 to 12% behind at 64K and 128K, so the decode
+attention's KV read is the term to look at if long-context decode
+matters.
 
 ## Verification
 
@@ -672,16 +678,48 @@ eval traffic on the GPU, so absolute numbers are a little low):
 The winner is bit-identical to the old kernel (same fragment order), also
 at 4K keys (22 ms, 4.72 TFLOPS) and on the 513 window (4.0 ms, 4.28; MLX
 with an explicit window mask takes 17.6 ms there). `make
-test-flint-kernels` passes. 128K prompt: five copies of the story file
-(148K tokens) serve the benchmark through `--prompt-file`.
+test-flint-kernels` passes.
+
+On the model (2026-11-11, mains, High Power Mode, GPU otherwise idle,
+`bench_vs_rec.py`, 128 new tokens, best of 2; 64K and 128K from five
+copies of the story file, 148K tokens, 64 new tokens, one run):
+
+| Prompt tokens | rec prefill tok/s | ds4 before | ds4 after | rec decode ms | ds4 decode ms |
+|---:|---:|---:|---:|---:|---:|
+| 256 | 398 | 201 | 212 | 7.3 | 7.6 |
+| 4096 | 659 | 433 | 758 | 8.5 | 8.8 |
+| 16384 | 569 | 234 | 634 | 10.9 | 11.6 |
+| 28000 | 463 | 164 | 543 | 13.3 | 14.0 |
+| 65536 | 348 | | 370 | 20.5 | 22.9 |
+| 131072 | 226 | | 239 | 34.8 | 38.1 |
+
+ds4's prefill went from 1.5 to 2.8x behind rec to 6 to 17% ahead from
+4K up, with the model output unchanged: `prefill_compare.py` on rec's
+2556-token dump prints the same table as before the rewrite (argmax
+agreement 92.25%, mean KL 0.153), and `stream_check.py` reports all eight
+cases identical between resident and streaming, the 20K story included
+(resident prefill 33.8 s, streaming 34.4 s, was about 100 s). The profile
+of that 2556-token prefill (`DS4_FLINT_PREFILL_PROFILE=1`, 4.06 s GPU in
+total): MoE gate/up 36%, MoE down 16%, q/k/v GEMM 13%, o proj 10%,
+attention 8% (global layers half of it), shared GLU 7%, head 7%. The
+next prefill target, if one is wanted, is the MoE GEMM (6 of 256 experts
+per token gives about 48 rows per expert per 2048-token chunk, fewer
+with uneven routing, against 64-row tiles of width 512), not attention.
+
+Short prompts: at 256 tokens ds4 takes 1.21 s where rec takes 0.64 s,
+and 1024 tokens take 1.67 s, so about 1 s of each ds4 request is fixed
+cost outside the chunk loop (server-side prompt handling, not the
+kernels; the CLI prefills 12 tokens in 0.42 s). Not yet located.
 
 ### 4. Streaming
 
 Done (Status and Design: Streaming). The visibility experiment ruled out
 the in-kernel wait; abort-and-resume replaced both it and the per-layer
 split. Left for later: cold-SSD measurements and the capped-cache speed
-table at 8/14/22 GB (needs the page cache purged, root), the 20K case in
-streaming mode, and prefetch (step 6).
+table at 8/14/22 GB (needs the page cache purged, root) and prefetch
+(step 6). The 20K case in streaming mode is identical to resident
+(`stream_check.py`, 2026-11-11: 34.4 s streaming vs 33.8 s resident
+prefill, decode 41.8 vs 12.9 ms/token with the 1 GB cache).
 
 ### 5. Server and agent
 
@@ -711,7 +749,8 @@ in-kernel sampling if step 3 says they pay, other quants.
 - Resolved (step 2, gate 2): reusing decode KV as a prefix moves the
   distribution by an order of magnitude less than rec's own decode-vs-
   prefill difference; ds4 keeps reusing it.
-- Where rec's 125 tok/s at 128K comes from with bf16 KV (step 3).
+- Resolved (step 3): rec's 125 tok/s at 128K is a session average; at
+  128K rec decodes at 34.8 ms/token and ds4 at 38.1 (Speed model).
 - Resolved (step 5): thinking off prefills the template's empty think
   block; rec itself cannot switch thinking off.
 - The M4 Pro's sustained SSD read bandwidth under the streaming access
