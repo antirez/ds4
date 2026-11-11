@@ -45072,36 +45072,6 @@ static uint32_t utf8_peek_one(const char *s, uint64_t len, uint64_t pos, uint64_
            ((uint32_t)((uint8_t)s[pos + 3] & 0x3f));
 }
 
-static bool joyai_letter_like_at(const char *s, uint64_t len, uint64_t pos) {
-    (void)len;
-    uint8_t c = (uint8_t)s[pos];
-    if (c < 128) return ascii_alpha(c);
-
-    /*
-     * The JoyAI tokenizer maps Unicode letters into a collapsed regex alphabet before
-     * applying the JoyAI pre-tokenizer.  The prompts we care about are mostly
-     * ASCII, but treating non-ASCII non-control bytes as letters preserves the
-     * useful behavior for ordinary UTF-8 text such as Italian accents.  CJK and
-     * kana are isolated by the JoyAI pre-tokenizer before the generic letter
-     * rule, below.
-     */
-    return true;
-}
-
-static uint64_t joyai_consume_letters(const char *s, uint64_t len, uint64_t pos) {
-    while (pos < len && joyai_letter_like_at(s, len, pos)) {
-        pos = next_utf8_char(s, len, pos);
-    }
-    return pos;
-}
-
-static bool joyai_cjk_at(const char *s, uint64_t len, uint64_t pos) {
-    if ((uint8_t)s[pos] < 128) return false;
-    uint64_t next = pos;
-    uint32_t cp = utf8_peek_one(s, len, pos, &next);
-    return utf8_is_cjk_hira_kata(cp);
-}
-
 typedef struct {
     uint32_t cp;
     uint64_t next;
@@ -45494,24 +45464,187 @@ static void bpe_tokenize_text_qwen35(const ds4_vocab *vocab, const char *text, t
     }
 }
 
+typedef struct {
+    uint32_t cp;
+    uint64_t next;
+    bool valid;
+    bool letter_mark;
+    bool punct_symbol;
+    bool space;
+} joyai_char_info;
+
+static joyai_char_info joyai_char_at(const char *s, uint64_t len, uint64_t pos) {
+    joyai_char_info c;
+    memset(&c, 0, sizeof(c));
+    if (pos >= len) return c;
+    c.valid = true;
+    c.cp = utf8_peek_one(s, len, pos, &c.next);
+    if (c.cp < 128) {
+        c.letter_mark = ascii_alpha((uint8_t)c.cp);
+        c.punct_symbol = joyai_ascii_punct_symbol((uint8_t)c.cp);
+        c.space = ascii_space((uint8_t)c.cp);
+    } else {
+        c.letter_mark = DS4_QWEN4_CLASS(letter, c.cp) || DS4_QWEN4_CLASS(mark, c.cp);
+        c.punct_symbol = DS4_QWEN4_CLASS(punct_symbol, c.cp);
+        c.space = DS4_QWEN4_CLASS(space, c.cp);
+    }
+    return c;
+}
+
+enum { JOYAI_RUN_NONE, JOYAI_RUN_NUMBER, JOYAI_RUN_CJK };
+
+/* Runs the first two HF splits isolate. */
+static int joyai_run_class(uint32_t cp) {
+    if (cp < 128) return ascii_digit((uint8_t)cp) ? JOYAI_RUN_NUMBER : JOYAI_RUN_NONE;
+    if (DS4_QWEN4_CLASS(number, cp)) return JOYAI_RUN_NUMBER;
+    if (utf8_is_cjk_hira_kata(cp)) return JOYAI_RUN_CJK;
+    return JOYAI_RUN_NONE;
+}
+
+/* End of the third JoyAI split regex matched at pos, with lookahead bounded by
+ * the segment end; returns pos when no alternative matches there. */
+static uint64_t joyai_match_at(const char *s, uint64_t end, uint64_t pos) {
+    joyai_char_info c = joyai_char_at(s, end, pos);
+    if (!c.valid) return pos;
+
+    /* [!-/:-@[-`{-~][A-Za-z]+ */
+    if (c.cp < 128 && c.punct_symbol && c.next < end && ascii_alpha((uint8_t)s[c.next])) {
+        uint64_t p = c.next;
+        while (p < end && ascii_alpha((uint8_t)s[p])) p++;
+        return p;
+    }
+
+    /* [^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+ */
+    {
+        uint64_t p = UINT64_MAX;
+        if (c.letter_mark) {
+            p = c.next;
+        } else if (c.cp != '\r' && c.cp != '\n' && !c.punct_symbol) {
+            joyai_char_info n1 = joyai_char_at(s, end, c.next);
+            if (n1.valid && n1.letter_mark) p = n1.next;
+        }
+        if (p != UINT64_MAX) {
+            while (p < end) {
+                joyai_char_info scan = joyai_char_at(s, end, p);
+                if (!scan.letter_mark) break;
+                p = scan.next;
+            }
+            return p;
+        }
+    }
+
+    /*  ?[\p{P}\p{S}]+[\r\n]* */
+    {
+        joyai_char_info punct = c.cp == ' ' ? joyai_char_at(s, end, c.next) : c;
+        if (punct.valid && punct.punct_symbol) {
+            uint64_t p = punct.next;
+            while (p < end) {
+                joyai_char_info scan = joyai_char_at(s, end, p);
+                if (!scan.punct_symbol) break;
+                p = scan.next;
+            }
+            while (p < end && ascii_newline((uint8_t)s[p])) p++;
+            return p;
+        }
+    }
+
+    /* \s*[\r\n]+ | \s+(?!\S) | \s+ */
+    if (c.space) {
+        uint64_t p = pos;
+        uint64_t last_newline_end = 0;
+        uint64_t last_ws_start = pos;
+        int nspace = 0;
+        while (p < end) {
+            joyai_char_info scan = joyai_char_at(s, end, p);
+            if (!scan.space) break;
+            last_ws_start = p;
+            if (scan.cp == '\r' || scan.cp == '\n') last_newline_end = scan.next;
+            p = scan.next;
+            nspace++;
+        }
+        if (last_newline_end) return last_newline_end;
+        /* Before a non-space the last space is left to join what follows,
+         * so "    int" splits as "   " then " int". */
+        if (nspace > 1 && p < end) return last_ws_start;
+        return p;
+    }
+    return pos;
+}
+
+typedef void (*joyai_piece_fn)(void *ud, ds4_str piece);
+
+static void joyai_split_segment(const char *text, uint64_t start, uint64_t end,
+                                joyai_piece_fn emit, void *ud) {
+    uint64_t pos = start;
+    while (pos < end) {
+        uint64_t match = joyai_match_at(text, end, pos);
+        if (match == pos) {
+            /* Characters no alternative matches stay together, as the
+             * Isolated split behavior keeps the text between matches. */
+            do {
+                match = next_utf8_char(text, end, match);
+            } while (match < end && joyai_match_at(text, end, match) == match);
+        }
+        emit(ud, (ds4_str){ text + pos, match - pos });
+        pos = match;
+    }
+}
+
 /*
- * DeepSeek V4 Flash declares tokenizer.ggml.pre = "joyai-llm".  The split
- * below mirrors the JoyAI BPE pre-tokenizer for the cases this model
- * uses in normal text and source-code prompts:
+ * DeepSeek V4 Flash declares tokenizer.ggml.pre = "joyai-llm".  The HF
+ * tokenizer applies three Split pre-tokenizers in sequence, each one to the
+ * pieces left by the previous:
  *
  *   \p{N}{1,3}
  *   [CJK/Hiragana/Katakana]+
- *   [P/S][A-Za-z]+
- *   [^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+
- *    ?[\p{P}\p{S}]+[\r\n]*
- *   \s*[\r\n]+
- *   \s+(?!\S)
- *   \s+
+ *   [P/S][A-Za-z]+ | [^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+ |
+ *    ?[\p{P}\p{S}]+[\r\n]* | \s*[\r\n]+ | \s+(?!\S) | \s+
  *
- * The punctuation rule intentionally keeps trailing newlines in the same BPE
- * word (for example ">;\n").  Splitting those newlines separately changes the
- * token stream for code prompts and produces wrong long-context logits.
+ * so the last regex never looks past a number or CJK run: "。   多" keeps
+ * the three spaces together.  It also runs inside each run: the kana ranges
+ * hold punctuation such as "・" and "゛", so "ア゛ア" is three pieces, not
+ * one.  The punctuation rule keeps trailing newlines in
+ * the same BPE word (">;\n", "：\n"); splitting them changes the token stream
+ * for code prompts and produces wrong long-context logits.
  */
+static void joyai_pretokenize(const char *text, uint64_t len, joyai_piece_fn emit, void *ud) {
+    uint64_t pos = 0;
+    uint64_t seg = 0;
+
+    while (pos < len) {
+        uint64_t next;
+        const int run = joyai_run_class(utf8_peek_one(text, len, pos, &next));
+        if (run == JOYAI_RUN_NONE) {
+            pos = next;
+            continue;
+        }
+
+        if (pos > seg) joyai_split_segment(text, seg, pos, emit, ud);
+        uint64_t run_end = next;
+        int nchars = 1;
+        while (run_end < len) {
+            uint64_t scan_next;
+            if (run == JOYAI_RUN_NUMBER && nchars == 3) break;
+            if (joyai_run_class(utf8_peek_one(text, len, run_end, &scan_next)) != run) break;
+            run_end = scan_next;
+            nchars++;
+        }
+        joyai_split_segment(text, pos, run_end, emit, ud);
+        pos = seg = run_end;
+    }
+    if (len > seg) joyai_split_segment(text, seg, len, emit, ud);
+}
+
+typedef struct {
+    const ds4_vocab *vocab;
+    token_vec *out;
+} joyai_bpe_ctx;
+
+static void joyai_emit_bpe(void *ud, ds4_str piece) {
+    joyai_bpe_ctx *ctx = ud;
+    bpe_emit_piece(ctx->vocab, piece, ctx->out);
+}
+
 static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_vec *out) {
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         bpe_tokenize_text_glm4(vocab, text, out);
@@ -45521,74 +45654,8 @@ static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_ve
         bpe_tokenize_text_qwen35(vocab, text, out);
         return;
     }
-
-    const uint64_t len = strlen(text);
-    uint64_t pos = 0;
-
-    while (pos < len) {
-        uint64_t start = pos;
-        uint8_t c = (uint8_t)text[pos];
-
-        if (ascii_digit(c)) {
-            int ndigits = 0;
-            while (pos < len && ascii_digit((uint8_t)text[pos]) && ndigits < 3) {
-                pos++;
-                ndigits++;
-            }
-        } else if (joyai_cjk_at(text, len, pos)) {
-            do {
-                pos = next_utf8_char(text, len, pos);
-            } while (pos < len && joyai_cjk_at(text, len, pos));
-        } else if (joyai_ascii_punct_symbol(c) &&
-                   pos + 1 < len &&
-                   ascii_alpha((uint8_t)text[pos + 1])) {
-            pos++;
-            while (pos < len && ascii_alpha((uint8_t)text[pos])) pos++;
-        } else if (joyai_letter_like_at(text, len, pos)) {
-            pos = joyai_consume_letters(text, len, pos);
-        } else if (!ascii_newline(c) &&
-                   !joyai_ascii_punct_symbol(c) &&
-                   pos + 1 < len &&
-                   joyai_letter_like_at(text, len, pos + 1)) {
-            pos++;
-            pos = joyai_consume_letters(text, len, pos);
-        } else if (c == ' ' &&
-                   pos + 1 < len &&
-                   joyai_ascii_punct_symbol((uint8_t)text[pos + 1])) {
-            pos++;
-            while (pos < len && joyai_ascii_punct_symbol((uint8_t)text[pos])) pos++;
-            while (pos < len && ascii_newline((uint8_t)text[pos])) pos++;
-        } else if (joyai_ascii_punct_symbol(c)) {
-            while (pos < len && joyai_ascii_punct_symbol((uint8_t)text[pos])) pos++;
-            while (pos < len && ascii_newline((uint8_t)text[pos])) pos++;
-        } else if (ascii_space(c)) {
-            uint64_t p = pos;
-            uint64_t last_newline_end = 0;
-            while (p < len && ascii_space((uint8_t)text[p])) {
-                uint8_t sc = (uint8_t)text[p++];
-                if (ascii_newline(sc)) last_newline_end = p;
-            }
-            if (last_newline_end) {
-                pos = last_newline_end;
-            } else if (p < len && p > pos + 1 &&
-                       (joyai_letter_like_at(text, len, p) ||
-                        joyai_ascii_punct_symbol((uint8_t)text[p]))) {
-                /*
-                 * JoyAI lets a single leading space join the following word or
-                 * punctuation run.  For "    int", the pre-tokenizer therefore emits
-                 * "   " then " int", not "    " then "int".
-                 */
-                pos = p - 1;
-            } else {
-                pos = p;
-            }
-        } else {
-            pos = next_utf8_char(text, len, pos);
-        }
-
-        if (pos == start) pos = next_utf8_char(text, len, pos);
-        bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
-    }
+    joyai_bpe_ctx ctx = { vocab, out };
+    joyai_pretokenize(text, strlen(text), joyai_emit_bpe, &ctx);
 }
 
 static int vocab_lookup(const ds4_vocab *vocab, const char *text) {

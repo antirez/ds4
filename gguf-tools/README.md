@@ -375,7 +375,7 @@ projections, kept at the released BF16 by default), `--no-mtp` and
 N-grams always retain the original BF16 bytes. The converter finishes through
 the native packer above; its temporary main-weight file is removed on success.
 `gen_qwen4_unicode.py` regenerates `ds4_qwen4_unicode.inc` for the `qwen35`
-pre-tokenizer from a current `regex` release.
+and `joyai-llm` pre-tokenizers from a current `regex` release.
 
 `make test-qwen4-kernels` runs the Metal kernel tests and
 `make test-qwen4-vision` checks the vision tower against the HF implementation

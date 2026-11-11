@@ -17,6 +17,7 @@
 /tests/test_engine_mgpu_refusal
 /tests/test_engine_correctness
 /tests/test_gpu_args
+/tests/test_joyai_pretokenizer
 /tests/test_gpu_lookup_cache_strict
 /tests/test_gpu_model_cache
 /tests/test_gpu_xdev
