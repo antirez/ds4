@@ -64,7 +64,8 @@ run_tests() {
     run ./tests/test_gpu_args_cli.sh
 
     for bin in ds4 ds4-server ds4-agent; do
-        run "./$bin" --help >/dev/null
+        echo "--- ./$bin --help"
+        "./$bin" --help >/dev/null
     done
 }
 
