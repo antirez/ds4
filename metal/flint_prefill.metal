@@ -290,38 +290,65 @@ kernel void flint_route_topk(const device bfloat16_t* logits [[buffer(0)]],
 }
 
 // One threadgroup of 256 threads: exclusive prefix of the 256 counts ->
-// starts[257]; tiles per expert -> tile table; indirect dispatch arguments
-// {tiles, 8, 1} for gate/up and {tiles, 32, 1} for down; cursors zeroed.
+// starts[257]; tiles per expert -> four tile tables, one per tile height;
+// indirect dispatch arguments {tiles, 8, 1} for gate/up and {tiles, 32, 1}
+// for down, per height; cursors zeroed.
+//
+// An expert with c rows gets c / 64 tiles of 64 rows and one tile for the
+// remainder, of the smallest height (64, 32, 16, 8) that holds it, so an
+// expert with 6 rows (the usual case below 1K tokens, 6 of 256 experts per
+// token) costs an 8-row tile instead of a 64-row one: the tile's MMA work
+// is proportional to its height while its weight reads are not.  The tables
+// live in one buffer: height 64 at tile 0 (capacity cfg.x), then 32, 16 and
+// 8 at cfg.x, cfg.x + 256 and cfg.x + 512 (at most one remainder tile per
+// expert).  cfg.y == 0 puts every remainder in a 64-row tile.
 kernel void flint_route_offsets(device uint* counts [[buffer(0)]],             // zeroed again for the next layer
                                 device uint* starts [[buffer(1)]],
                                 device FpTile* tiles [[buffer(2)]],
-                                device uint* dispatch [[buffer(3)]],    // 2 x 3 words
+                                device uint* dispatch [[buffer(3)]],    // 2 x 4 x 3 words
                                 device uint* cursors [[buffer(4)]],
+                                constant uint2& cfg [[buffer(5)]],      // {capacity of the 64-row table, classes on}
                                 ushort tid [[thread_index_in_threadgroup]],
                                 ushort sg [[simdgroup_index_in_threadgroup]],
                                 ushort lane [[thread_index_in_simdgroup]]) {
-    threadgroup uint part[8], tpart[8];
+    threadgroup uint part[8], tpart[4][8];
     const uint c = counts[tid];
-    const uint nt = (c + 63u) >> 6;
+    const uint n64 = c >> 6, rem = c & 63u;
+    // remainder class: 0 none, 1 = 64 rows, 2 = 32, 3 = 16, 4 = 8
+    uint cls = 0;
+    if (rem) cls = (cfg.y == 0u || rem > 32u) ? 1u : rem > 16u ? 2u : rem > 8u ? 3u : 4u;
+    const uint nt0 = n64 + (cls == 1u ? 1u : 0u), nt1 = cls == 2u ? 1u : 0u, nt2 = cls == 3u ? 1u : 0u, nt3 = cls == 4u ? 1u : 0u;
     const uint ex = simd_prefix_exclusive_sum(c);
-    const uint tex = simd_prefix_exclusive_sum(nt);
-    if (lane == 31) { part[sg] = ex + c; tpart[sg] = tex + nt; }
+    const uint tex0 = simd_prefix_exclusive_sum(nt0), tex1 = simd_prefix_exclusive_sum(nt1);
+    const uint tex2 = simd_prefix_exclusive_sum(nt2), tex3 = simd_prefix_exclusive_sum(nt3);
+    if (lane == 31) {
+        part[sg] = ex + c;
+        tpart[0][sg] = tex0 + nt0; tpart[1][sg] = tex1 + nt1; tpart[2][sg] = tex2 + nt2; tpart[3][sg] = tex3 + nt3;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    uint base = 0, tbase = 0;
-    for (ushort s = 0; s < sg; s++) { base += part[s]; tbase += tpart[s]; }
-    const uint start = base + ex, tstart = tbase + tex;
+    uint base = 0, tb0 = 0, tb1 = 0, tb2 = 0, tb3 = 0;
+    for (ushort s = 0; s < sg; s++) { base += part[s]; tb0 += tpart[0][s]; tb1 += tpart[1][s]; tb2 += tpart[2][s]; tb3 += tpart[3][s]; }
+    const uint start = base + ex;
     starts[tid] = start;
     cursors[tid] = 0;
     counts[tid] = 0;
-    for (uint t = 0; t < nt; t++) {
-        FpTile tile = {tid, start + t * 64u, min(64u, c - t * 64u), 0u};
-        tiles[tstart + t] = tile;
+    const uint t0 = tb0 + tex0;
+    for (uint t = 0; t < n64; t++) {
+        FpTile tile = {tid, start + t * 64u, 64u, 0u};
+        tiles[t0 + t] = tile;
+    }
+    if (cls) {
+        FpTile tile = {tid, start + n64 * 64u, rem, 0u};
+        const uint at = cls == 1u ? t0 + n64 : cls == 2u ? cfg.x + tb1 + tex1 : cls == 3u ? cfg.x + 256u + tb2 + tex2 : cfg.x + 512u + tb3 + tex3;
+        tiles[at] = tile;
     }
     if (tid == 255) {
         starts[256] = start + c;
-        const uint total = tstart + nt;
-        dispatch[0] = total; dispatch[1] = 8;  dispatch[2] = 1;
-        dispatch[3] = total; dispatch[4] = 32; dispatch[5] = 1;
+        const uint total[4] = {t0 + nt0, tb1 + tex1 + nt1, tb2 + tex2 + nt2, tb3 + tex3 + nt3};
+        for (uint k = 0; k < 4; k++) {
+            dispatch[k * 3 + 0] = total[k]; dispatch[k * 3 + 1] = 8;  dispatch[k * 3 + 2] = 1;
+            dispatch[12 + k * 3 + 0] = total[k]; dispatch[12 + k * 3 + 1] = 32; dispatch[12 + k * 3 + 2] = 1;
+        }
     }
 }
 
@@ -337,7 +364,48 @@ kernel void flint_route_scatter(const device uint* ids [[buffer(0)]],
     rows[pos] = (gid / 6) * 8 + (gid % 6);
 }
 
-// Gate/up GLU over one 64-row tile of one expert: act_sorted[pos][512].
+// MoE tiles of BM rows (64, 32, 16 or 8) x 64 columns.  BM = 64: 2 x 2
+// simdgroups of 32 x 32 (fp_mma); smaller: 1 x 4 simdgroups of BM x 16.
+// Each output element accumulates its k products in the same order in every
+// height, so an expert's rows come out bit-identical whichever tile holds them.
+template <int BM>
+inline void fp_moe_load_a(threadgroup bfloat16_t* As, FpRowsGather src, uint k0, ushort tid) {
+    for (uint i = tid; i < BM * 4u; i += FP_THREADS) {
+        const uint r = i >> 2, c = (i & 3u) * 8u;
+        const device bfloat16_t* p = src.row(r);
+        threadgroup vec<bfloat16_t, 8>* dst = (threadgroup vec<bfloat16_t, 8>*)(As + r * FP_LDS + c);
+        *dst = p ? *(const device vec<bfloat16_t, 8>*)(p + k0 + c) : vec<bfloat16_t, 8>(bfloat16_t(0.0f));
+    }
+}
+template <int BM>
+inline void fp_moe_load_a(threadgroup bfloat16_t* As, FpRowsSorted src, uint k0, ushort tid) {
+    for (uint i = tid; i < BM * 4u; i += FP_THREADS) {
+        const uint r = i >> 2, c = (i & 3u) * 8u;
+        const device bfloat16_t* p = src.row(r);
+        threadgroup vec<bfloat16_t, 8>* dst = (threadgroup vec<bfloat16_t, 8>*)(As + r * FP_LDS + c);
+        *dst = p ? *(const device vec<bfloat16_t, 8>*)(p + k0 + c) : vec<bfloat16_t, 8>(bfloat16_t(0.0f));
+    }
+}
+
+template <int FR, int FC>
+inline void fp_mma_t(thread simdgroup_matrix<float, 8, 8> (&acc)[FR][FC], const threadgroup bfloat16_t* As,
+                     const threadgroup bfloat16_t* Bs, ushort sm, ushort sn) {
+    for (ushort kk = 0; kk < FP_BK; kk += 8) {
+        simdgroup_matrix<bfloat16_t, 8, 8> a[FR], b[FC];
+        for (ushort i = 0; i < FR; i++) simdgroup_load(a[i], As + (sm + 8 * i) * FP_LDS + kk, FP_LDS);
+        for (ushort j = 0; j < FC; j++) simdgroup_load(b[j], Bs + (sn + 8 * j) * FP_LDS + kk, FP_LDS, ulong2(0, 0), true);
+        for (ushort i = 0; i < FR; i++)
+            for (ushort j = 0; j < FC; j++) simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
+    }
+}
+template <int FR, int FC>
+inline void fp_zero_t(thread simdgroup_matrix<float, 8, 8> (&acc)[FR][FC]) {
+    for (ushort i = 0; i < FR; i++)
+        for (ushort j = 0; j < FC; j++) acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+}
+
+// Gate/up GLU over one tile of one expert: act_sorted[pos][512].
+template <int BM>
 kernel void flint_moe_gateup(const device bfloat16_t* X [[buffer(0)]],        // normed tokens [M][2048]
                              const device uint* rows [[buffer(1)]],
                              const device FpTile* tiles [[buffer(2)]],
@@ -348,33 +416,35 @@ kernel void flint_moe_gateup(const device bfloat16_t* X [[buffer(0)]],        //
                              ushort tid [[thread_index_in_threadgroup]],
                              ushort sg [[simdgroup_index_in_threadgroup]],
                              ushort lane [[thread_index_in_simdgroup]]) {
-    threadgroup bfloat16_t As[FP_BM * FP_LDS];
+    constexpr int RM = BM >= 64 ? 32 : BM, CN = BM >= 64 ? 32 : 16;
+    constexpr int FR = RM / 8, FC = CN / 8;
+    threadgroup bfloat16_t As[BM * FP_LDS];
     threadgroup bfloat16_t Bs[FP_BN * FP_LDS];
     threadgroup bfloat16_t Bs2[FP_BN * FP_LDS];
     const FpTile tile = tiles[tg.x];
     const device uchar* pack = (const device uchar*)experts[tile.expert];
     const uint n0 = tg.y * FP_BN;
-    const ushort sm = (sg >> 1) * 32, sn = (sg & 1) * 32;
-    simdgroup_matrix<float, 8, 8> acc[4][4], acc2[4][4];
-    fp_zero(acc);
-    fp_zero(acc2);
+    const ushort sm = BM >= 64 ? (sg >> 1) * 32 : 0, sn = BM >= 64 ? (sg & 1) * 32 : sg * 16;
+    simdgroup_matrix<float, 8, 8> acc[FR][FC], acc2[FR][FC];
+    fp_zero_t(acc);
+    fp_zero_t(acc2);
     FpRowsGather src = {X, rows, 2048u, tile.begin, tile.count};
     for (uint k0 = 0; k0 < 2048u; k0 += FP_BK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        fp_load_a(As, src, k0, tid);
+        fp_moe_load_a<BM>(As, src, k0, tid);
         fp_load_b_q4(Bs, pack + FP_PACK_GATE_W, (const device bfloat16_t*)(pack + FP_PACK_GATE_S),
                      (const device bfloat16_t*)(pack + FP_PACK_GATE_B), n0, k0, 2048u, tid);
         fp_load_b_q4(Bs2, pack + FP_PACK_UP_W, (const device bfloat16_t*)(pack + FP_PACK_UP_S),
                      (const device bfloat16_t*)(pack + FP_PACK_UP_B), n0, k0, 2048u, tid);
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        fp_mma(acc, As, Bs, sm, sn);
-        fp_mma(acc2, As, Bs2, sm, sn);
+        fp_mma_t(acc, As, Bs, sm, sn);
+        fp_mma_t(acc2, As, Bs2, sm, sn);
     }
     const short2 fc = fp_frag_coord(lane);
-    for (ushort i = 0; i < 4; i++) {
+    for (ushort i = 0; i < FR; i++) {
         const uint r = sm + 8 * i + fc.y;
         if (r >= tile.count) continue;
-        for (ushort j = 0; j < 4; j++) {
+        for (ushort j = 0; j < FC; j++) {
             const uint col = n0 + sn + 8 * j + fc.x;
             const thread vec<float, 2>& g = fp_elems(acc[i][j]);
             const thread vec<float, 2>& u = fp_elems(acc2[i][j]);
@@ -389,6 +459,7 @@ kernel void flint_moe_gateup(const device bfloat16_t* X [[buffer(0)]],        //
 }
 
 // Down projection of one tile: y6[token][slot][2048] = bf16(bf16(acc) * weight).
+template <int BM>
 kernel void flint_moe_down(const device bfloat16_t* act [[buffer(0)]],
                            const device uint* rows [[buffer(1)]],
                            const device FpTile* tiles [[buffer(2)]],
@@ -399,32 +470,34 @@ kernel void flint_moe_down(const device bfloat16_t* act [[buffer(0)]],
                            ushort tid [[thread_index_in_threadgroup]],
                            ushort sg [[simdgroup_index_in_threadgroup]],
                            ushort lane [[thread_index_in_simdgroup]]) {
-    threadgroup bfloat16_t As[FP_BM * FP_LDS];
+    constexpr int RM = BM >= 64 ? 32 : BM, CN = BM >= 64 ? 32 : 16;
+    constexpr int FR = RM / 8, FC = CN / 8;
+    threadgroup bfloat16_t As[BM * FP_LDS];
     threadgroup bfloat16_t Bs[FP_BN * FP_LDS];
     const FpTile tile = tiles[tg.x];
     const device uchar* pack = (const device uchar*)experts[tile.expert];
     const uint n0 = tg.y * FP_BN;
-    const ushort sm = (sg >> 1) * 32, sn = (sg & 1) * 32;
-    simdgroup_matrix<float, 8, 8> acc[4][4];
-    fp_zero(acc);
+    const ushort sm = BM >= 64 ? (sg >> 1) * 32 : 0, sn = BM >= 64 ? (sg & 1) * 32 : sg * 16;
+    simdgroup_matrix<float, 8, 8> acc[FR][FC];
+    fp_zero_t(acc);
     FpRowsSorted src = {act, 512u, tile.begin, tile.count};
     for (uint k0 = 0; k0 < 512u; k0 += FP_BK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        fp_load_a(As, src, k0, tid);
+        fp_moe_load_a<BM>(As, src, k0, tid);
         fp_load_b_q4(Bs, pack + FP_PACK_DOWN_W, (const device bfloat16_t*)(pack + FP_PACK_DOWN_S),
                      (const device bfloat16_t*)(pack + FP_PACK_DOWN_B), n0, k0, 512u, tid);
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        fp_mma(acc, As, Bs, sm, sn);
+        fp_mma_t(acc, As, Bs, sm, sn);
     }
     const short2 fc = fp_frag_coord(lane);
-    for (ushort i = 0; i < 4; i++) {
+    for (ushort i = 0; i < FR; i++) {
         const uint r = sm + 8 * i + fc.y;
         if (r >= tile.count) continue;
         const uint entry = rows[tile.begin + r];
         const uint token = entry >> 3, slot = entry & 7u;
         const float w = float(weights[token * 6 + slot]);
         device bfloat16_t* dst = y6 + ((size_t)token * 6 + slot) * 2048u;
-        for (ushort j = 0; j < 4; j++) {
+        for (ushort j = 0; j < FC; j++) {
             const uint col = n0 + sn + 8 * j + fc.x;
             const thread vec<float, 2>& e = fp_elems(acc[i][j]);
             vec<bfloat16_t, 2> out;
@@ -433,6 +506,15 @@ kernel void flint_moe_down(const device bfloat16_t* act [[buffer(0)]],
         }
     }
 }
+
+template [[host_name("flint_moe_gateup_64")]] [[kernel]] decltype(flint_moe_gateup<64>) flint_moe_gateup<64>;
+template [[host_name("flint_moe_gateup_32")]] [[kernel]] decltype(flint_moe_gateup<32>) flint_moe_gateup<32>;
+template [[host_name("flint_moe_gateup_16")]] [[kernel]] decltype(flint_moe_gateup<16>) flint_moe_gateup<16>;
+template [[host_name("flint_moe_gateup_8")]] [[kernel]] decltype(flint_moe_gateup<8>) flint_moe_gateup<8>;
+template [[host_name("flint_moe_down_64")]] [[kernel]] decltype(flint_moe_down<64>) flint_moe_down<64>;
+template [[host_name("flint_moe_down_32")]] [[kernel]] decltype(flint_moe_down<32>) flint_moe_down<32>;
+template [[host_name("flint_moe_down_16")]] [[kernel]] decltype(flint_moe_down<16>) flint_moe_down<16>;
+template [[host_name("flint_moe_down_8")]] [[kernel]] decltype(flint_moe_down<8>) flint_moe_down<8>;
 
 // ---------------------------------------------------------------------------
 // Attention: 64 queries x 32 heads per threadgroup grid cell, keys in tiles

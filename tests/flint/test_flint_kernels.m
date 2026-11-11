@@ -62,13 +62,15 @@ static id<MTLComputePipelineState> pso(const char *name) {
     return p;
 }
 
-/* Runs one kernel.  bufs: NULL-terminated list; indices are positional. */
-static void run(const char *name, NSArray<id<MTLBuffer>> *bufs, MTLSize grid, MTLSize tg, id<MTLBuffer> indirect, NSUInteger indirect_off) {
+/* Runs one kernel.  bufs: NULL-terminated list; indices are positional;
+ * buffer off_index (if >= 0) is bound at byte offset off. */
+static void run_off(const char *name, NSArray<id<MTLBuffer>> *bufs, int off_index, NSUInteger off, MTLSize grid, MTLSize tg,
+                    id<MTLBuffer> indirect, NSUInteger indirect_off) {
     @autoreleasepool {
         id<MTLCommandBuffer> cb = [queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
         [enc setComputePipelineState:pso(name)];
-        for (NSUInteger i = 0; i < bufs.count; i++) [enc setBuffer:bufs[i] offset:0 atIndex:i];
+        for (NSUInteger i = 0; i < bufs.count; i++) [enc setBuffer:bufs[i] offset:((int)i == off_index ? off : 0) atIndex:i];
         if (indirect_resource) [enc useResource:indirect_resource usage:MTLResourceUsageRead];
         if (indirect) [enc dispatchThreadgroupsWithIndirectBuffer:indirect indirectBufferOffset:indirect_off threadsPerThreadgroup:tg];
         else [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
@@ -77,6 +79,9 @@ static void run(const char *name, NSArray<id<MTLBuffer>> *bufs, MTLSize grid, MT
         [cb waitUntilCompleted];
         if (cb.error) { fprintf(stderr, "%s: %s\n", name, cb.error.localizedDescription.UTF8String); exit(1); }
     }
+}
+static void run(const char *name, NSArray<id<MTLBuffer>> *bufs, MTLSize grid, MTLSize tg, id<MTLBuffer> indirect, NSUInteger indirect_off) {
+    run_off(name, bufs, -1, 0, grid, tg, indirect, indirect_off);
 }
 
 typedef struct { uint32_t M, N, K, lda, ldc, ldr; } GemmArgs;
@@ -199,14 +204,29 @@ static void test_gemm(void) {
 
 static void test_moe(void) {
     printf("routing and experts\n");
-    const uint32_t M = 70, E = 256, NPACK = 8;
+    const uint32_t M = 100, E = 256, NPACK = 8;
     id<MTLBuffer> logits = buf_bf16_random((size_t)M * E, 2.0f);
+    /* force expert 0 on every token (100 rows: a 64-row tile and a 64-row
+     * remainder), expert 1 on 24 (a 32-row tile), experts 2 and 3 on 12 and
+     * 9 (16-row tiles with the random picks); the rest of the routing is
+     * random and lands in 8-row tiles */
+    {
+        uint16_t *lg0 = logits.contents;
+        for (uint32_t t = 0; t < M; t++) {
+            lg0[(size_t)t * E + 0] = f2bf(10.0f);
+            if (t < 24) lg0[(size_t)t * E + 1] = f2bf(10.0f);
+            if (t < 12) lg0[(size_t)t * E + 2] = f2bf(10.0f);
+            if (t < 9) lg0[(size_t)t * E + 3] = f2bf(10.0f);
+        }
+    }
     id<MTLBuffer> ids = buf((size_t)M * 6 * 4), wts = buf((size_t)M * 6 * 2), counts = buf(E * 4), starts = buf(257 * 4);
-    id<MTLBuffer> tiles = buf(512 * sizeof(Tile)), dispatch = buf(24), cursors = buf(E * 4), rows = buf((size_t)M * 6 * 4);
-    uint32_t Mv = M;
-    id<MTLBuffer> Mb = buf_struct(&Mv, 4);
+    /* tile tables: 64-row tiles at 0 (capacity CAP64), then one 32-, 16- and 8-row table of 256 */
+    const uint32_t CAP64 = 256;
+    id<MTLBuffer> tiles = buf((CAP64 + 768) * sizeof(Tile)), dispatch = buf(96), cursors = buf(E * 4), rows = buf((size_t)M * 6 * 4);
+    uint32_t Mv = M, cfg[2] = {CAP64, 1};
+    id<MTLBuffer> Mb = buf_struct(&Mv, 4), cfgB = buf_struct(cfg, 8);
     run("flint_route_topk", @[logits, ids, wts, counts, Mb], MTLSizeMake((M + 3) / 4, 1, 1), MTLSizeMake(128, 1, 1), nil, 0);
-    run("flint_route_offsets", @[counts, starts, tiles, dispatch, cursors], MTLSizeMake(1, 1, 1), MTLSizeMake(256, 1, 1), nil, 0);
+    run("flint_route_offsets", @[counts, starts, tiles, dispatch, cursors, cfgB], MTLSizeMake(1, 1, 1), MTLSizeMake(256, 1, 1), nil, 0);
     run("flint_route_scatter", @[ids, starts, cursors, rows, Mb], MTLSizeMake((M * 6 + 255) / 256, 1, 1), MTLSizeMake(256, 1, 1), nil, 0);
     /* CPU routing reference */
     const uint16_t *lg = logits.contents;
@@ -237,11 +257,28 @@ static void test_moe(void) {
             if (t >= M || slot >= 6 || gid[t * 6 + slot] != e || seen[entry]) bad++;
             seen[entry] = 1;
         }
+    /* tiles: per height, the expected count; every row of every expert covered exactly once */
     const Tile *tl = tiles.contents; const uint32_t *dp = dispatch.contents;
-    uint32_t ntiles = 0; for (uint32_t e = 0; e < E; e++) ntiles += (ref_counts[e] + 63) / 64;
-    if (dp[0] != ntiles || dp[1] != 8 || dp[3] != ntiles || dp[4] != 32) bad++;
-    for (uint32_t i = 0; i < ntiles; i++) if (tl[i].count == 0 || tl[i].count > 64 || tl[i].begin < gs[tl[i].expert] || tl[i].begin + tl[i].count > gs[tl[i].expert + 1]) bad++;
-    printf("  %-34s %s (%u tiles)\n", "topk/offsets/scatter", bad ? "FAIL" : "ok", ntiles);
+    const uint32_t hbase[4] = {0, CAP64, CAP64 + 256, CAP64 + 512}, height[4] = {64, 32, 16, 8};
+    uint32_t ntiles[4] = {0, 0, 0, 0}, ntotal = 0;
+    for (uint32_t e = 0; e < E; e++) {
+        const uint32_t c = ref_counts[e], rem = c % 64;
+        ntiles[0] += c / 64;
+        if (rem) ntiles[rem > 32 ? 0 : rem > 16 ? 1 : rem > 8 ? 2 : 3]++;
+    }
+    uint8_t *covered = calloc(M * 6, 1);
+    for (int h = 0; h < 4; h++) {
+        ntotal += ntiles[h];
+        if (dp[h * 3] != ntiles[h] || dp[h * 3 + 1] != 8 || dp[12 + h * 3] != ntiles[h] || dp[12 + h * 3 + 1] != 32) bad++;
+        for (uint32_t i = 0; i < ntiles[h]; i++) {
+            const Tile t = tl[hbase[h] + i];
+            if (t.count == 0 || t.count > height[h] || t.begin < gs[t.expert] || t.begin + t.count > gs[t.expert + 1]) { bad++; continue; }
+            for (uint32_t r = t.begin; r < t.begin + t.count; r++) { if (covered[r]) bad++; covered[r] = 1; }
+        }
+    }
+    for (uint32_t r = 0; r < M * 6; r++) if (!covered[r]) bad++;
+    free(covered);
+    printf("  %-34s %s (%u tiles: %u x 64, %u x 32, %u x 16, %u x 8)\n", "topk/offsets/scatter", bad ? "FAIL" : "ok", ntotal, ntiles[0], ntiles[1], ntiles[2], ntiles[3]);
     if (bad) failures++;
 
     /* experts: 8 fake packs, table entries point to pack e % 8 */
@@ -263,8 +300,12 @@ static void test_moe(void) {
     uint16_t *silu = silu_table();
     id<MTLBuffer> siluB = buf_struct(silu, 65536 * 2);
     indirect_resource = packs;
-    run("flint_moe_gateup", @[X, rows, tiles, table, siluB, act], MTLSizeMake(1, 1, 1), MTLSizeMake(128, 1, 1), dispatch, 0);
-    run("flint_moe_down", @[act, rows, tiles, table, wts, y6], MTLSizeMake(1, 1, 1), MTLSizeMake(128, 1, 1), dispatch, 12);
+    static const char *const gateup_k[4] = {"flint_moe_gateup_64", "flint_moe_gateup_32", "flint_moe_gateup_16", "flint_moe_gateup_8"};
+    static const char *const down_k[4] = {"flint_moe_down_64", "flint_moe_down_32", "flint_moe_down_16", "flint_moe_down_8"};
+    for (int h = 0; h < 4; h++)
+        run_off(gateup_k[h], @[X, rows, tiles, table, siluB, act], 2, hbase[h] * sizeof(Tile), MTLSizeMake(1, 1, 1), MTLSizeMake(128, 1, 1), dispatch, h * 12);
+    for (int h = 0; h < 4; h++)
+        run_off(down_k[h], @[act, rows, tiles, table, wts, y6], 2, hbase[h] * sizeof(Tile), MTLSizeMake(1, 1, 1), MTLSizeMake(128, 1, 1), dispatch, 48 + h * 12);
     indirect_resource = nil;
     const uint16_t *Xp = X.contents, *ap = act.contents, *yp = y6.contents;
     /* reference for a sample of sorted rows (full reference is slow) */

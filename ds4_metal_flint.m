@@ -338,6 +338,10 @@ uint64_t ds4_flint_gpu_session_bytes(uint32_t ctx_cap) {
     return bytes;
 }
 
+static double ds4_flint_now_s(void) {
+    return (double)clock_gettime_nsec_np(CLOCK_MONOTONIC) * 1e-9;
+}
+
 static id<MTLBuffer> flint_buffer(uint64_t bytes, const char *label, int zero) {
     id<MTLBuffer> b = [g_flint_device newBufferWithLength:(NSUInteger)(bytes ? bytes : 16)
                                                   options:MTLResourceStorageModeShared];
@@ -471,7 +475,15 @@ int ds4_flint_gpu_decode(ds4_flint_gpu_session *s, uint32_t token, uint32_t posi
         uint32_t relaunches = 0;
         uint32_t ids_seen[DS4_FLINT_GPU_N_LAYER * 8];
         memset(ids_seen, 0, sizeof(ids_seen));
+        /* DS4_FLINT_DECODE_PROFILE=1: GPU time of the launch against the wall
+         * time of the step (command buffer creation to completion), averaged
+         * over 64 steps and printed with the position. */
+        static int dprof = -1;
+        static double dprof_gpu = 0, dprof_wall = 0;
+        static uint32_t dprof_n = 0;
+        if (dprof < 0) dprof = getenv("DS4_FLINT_DECODE_PROFILE") ? 1 : 0;
         for (;;) {
+            const double t_wall0 = dprof ? ds4_flint_now_s() : 0;
             memset([s->control contents], 0, FLINT_CONTROL_WORDS * 4);
             memset([s->diagnostic contents], 0, FLINT_WORKERS * 4);
             memset([s->requests contents], 0, FLINT_REQUEST_WORDS * 4);
@@ -509,6 +521,16 @@ int ds4_flint_gpu_decode(ds4_flint_gpu_session *s, uint32_t token, uint32_t posi
             if (!ds4_metal_finish_command_buffer(cb, owned, "flint_decode")) {
                 if (err && errlen) snprintf(err, errlen, "flint_decode command buffer failed");
                 return 0;
+            }
+            if (dprof) {
+                dprof_gpu += (cb.GPUEndTime - cb.GPUStartTime) * 1e3;
+                dprof_wall += (ds4_flint_now_s() - t_wall0) * 1e3;
+                if (++dprof_n == 64) {
+                    fprintf(stderr, "ds4: Flint decode profile at position %u: GPU %.2f ms, wall %.2f ms per step (64 steps)\n",
+                            position, dprof_gpu / 64, dprof_wall / 64);
+                    dprof_gpu = dprof_wall = 0;
+                    dprof_n = 0;
+                }
             }
             const uint32_t *req = (const uint32_t *)[s->requests contents];
             const uint32_t miss = req[FLINT_MISS_WORD];
@@ -566,7 +588,8 @@ int ds4_flint_gpu_decode(ds4_flint_gpu_session *s, uint32_t token, uint32_t posi
 
 #define FLINT_PF_CAP DS4_FLINT_GPU_PREFILL_CAP
 #define FLINT_PF_WIN (512u + FLINT_PF_CAP)          /* sliding window rows: previous 512 + chunk */
-#define FLINT_PF_MAX_TILES (FLINT_PF_CAP * 6u / 64u + 256u)
+#define FLINT_PF_MAX_TILES (FLINT_PF_CAP * 6u / 64u + 256u)   /* 64-row tiles */
+#define FLINT_PF_TILES_TOTAL (FLINT_PF_MAX_TILES + 3u * 256u)  /* plus one 32/16/8-row remainder tile per expert */
 
 static id<MTLLibrary> g_flint_prefill_lib;
 static NSMutableDictionary<NSString *, id<MTLComputePipelineState>> *g_flint_pipes;
@@ -644,7 +667,7 @@ static id<MTLComputePipelineState> flint_pipe(const char *name) {
 uint64_t ds4_flint_gpu_prefill_scratch_bytes(void) {
     const uint64_t cap = FLINT_PF_CAP;
     return cap * 4 + cap * 2048 * 2 * 2 + cap * 4096 * 2 * 2 + cap * 512 * 2 * 2 + cap * 6144 * 2 + cap * 1024 * 2 +
-           cap * 256 * 2 + cap * 6 * (4 + 2 + 4) + 257 * 4 * 3 + FLINT_PF_MAX_TILES * 16 + cap * 6 * 512 * 2 +
+           cap * 256 * 2 + cap * 6 * (4 + 2 + 4) + 257 * 4 * 3 + FLINT_PF_TILES_TOTAL * 16 + 96 + cap * 6 * 512 * 2 +
            cap * 6 * 2048 * 2 + 2ull * 4 * FLINT_PF_WIN * 128 * 2 + DS4_FLINT_GPU_N_VOCAB * 2;
 }
 
@@ -666,8 +689,8 @@ static int flint_prefill_scratch(void) {
     g_pf.counts = flint_buffer(256 * 4, "ds4_flint_pf_counts", 1);
     g_pf.starts = flint_buffer(257 * 4, "ds4_flint_pf_starts", 1);
     g_pf.cursors = flint_buffer(256 * 4, "ds4_flint_pf_cursors", 1);
-    g_pf.tiles = flint_buffer(FLINT_PF_MAX_TILES * 16, "ds4_flint_pf_tiles", 1);
-    g_pf.dispatch = flint_buffer(24, "ds4_flint_pf_dispatch", 1);
+    g_pf.tiles = flint_buffer(FLINT_PF_TILES_TOTAL * 16, "ds4_flint_pf_tiles", 1);
+    g_pf.dispatch = flint_buffer(96, "ds4_flint_pf_dispatch", 1);
     g_pf.rows = flint_buffer(cap * 6 * 4, "ds4_flint_pf_rows", 1);
     g_pf.act_sorted = flint_buffer(cap * 6 * 512 * 2, "ds4_flint_pf_act_sorted", 1);
     g_pf.y6 = flint_buffer(cap * 6 * 2048 * 2, "ds4_flint_pf_y6", 1);
@@ -763,6 +786,9 @@ static const char *const g_pfp_name[PFP_N] = {
 static double g_pfp_ms[PFP_N], g_pfp_attn_global_ms;
 static uint64_t g_pfp_tokens;
 static int g_pfp_on = -1;
+/* DS4_FLINT_MOE_TILES=64: every expert remainder in a 64-row tile (the
+ * pre-2026-11-11 behaviour, for A/B runs); default: 64/32/16/8-row tiles. */
+static int g_pf_moe_classes = -1;
 
 static int flint_pf_mark(id<MTLCommandBuffer> __strong *cb, id<MTLComputeCommandEncoder> __strong *enc, int *owned,
                          int cat, char *err, size_t errlen) {
@@ -815,6 +841,10 @@ int ds4_flint_gpu_prefill(ds4_flint_gpu_session *s, const int32_t *tokens, uint3
         }
         memcpy([g_pf.tokens contents], tokens, (size_t)n * 4);
         if (g_pfp_on < 0) g_pfp_on = getenv("DS4_FLINT_PREFILL_PROFILE") ? 1 : 0;
+        if (g_pf_moe_classes < 0) {
+            const char *mt = getenv("DS4_FLINT_MOE_TILES");
+            g_pf_moe_classes = (mt && atoi(mt) == 64) ? 0 : 1;
+        }
         const uint32_t n_prev = position < 512u ? position : 512u;
         const uint32_t *final_row = g_flint_meta + 49 * 64;
         int owned = 0;
@@ -945,6 +975,8 @@ int ds4_flint_gpu_prefill(ds4_flint_gpu_session *s, const int32_t *tokens, uint3
                 [enc setBuffer:g_pf.tiles offset:0 atIndex:2];
                 [enc setBuffer:g_pf.dispatch offset:0 atIndex:3];
                 [enc setBuffer:g_pf.cursors offset:0 atIndex:4];
+                const uint32_t tile_cfg[2] = {FLINT_PF_MAX_TILES, (uint32_t)g_pf_moe_classes};
+                [enc setBytes:tile_cfg length:8 atIndex:5];
                 [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
                 [enc setComputePipelineState:flint_pipe("flint_route_scatter")];
                 [enc setBuffer:g_pf.ids offset:0 atIndex:0];
@@ -975,23 +1007,32 @@ int ds4_flint_gpu_prefill(ds4_flint_gpu_session *s, const int32_t *tokens, uint3
                     experts_buf = g_pf.exp_table;
                     experts_off = (NSUInteger)(il & 1u) * 256 * 8;
                 }
-                [enc setComputePipelineState:flint_pipe("flint_moe_gateup")];
+                /* The four tile heights: table k at tile offset tile_base[k],
+                 * dispatch arguments at word 3k (gate/up) and 12 + 3k (down). */
+                static const char *const gateup_kernels[4] = {"flint_moe_gateup_64", "flint_moe_gateup_32", "flint_moe_gateup_16", "flint_moe_gateup_8"};
+                static const char *const down_kernels[4] = {"flint_moe_down_64", "flint_moe_down_32", "flint_moe_down_16", "flint_moe_down_8"};
+                const NSUInteger tile_base[4] = {0, FLINT_PF_MAX_TILES, FLINT_PF_MAX_TILES + 256, FLINT_PF_MAX_TILES + 512};
                 [enc setBuffer:g_pf.xn offset:0 atIndex:0];
                 [enc setBuffer:g_pf.rows offset:0 atIndex:1];
-                [enc setBuffer:g_pf.tiles offset:0 atIndex:2];
                 [enc setBuffer:experts_buf offset:experts_off atIndex:3];
                 [enc setBuffer:g_flint_silu offset:0 atIndex:4];
                 [enc setBuffer:g_pf.act_sorted offset:0 atIndex:5];
-                [enc dispatchThreadgroupsWithIndirectBuffer:g_pf.dispatch indirectBufferOffset:0 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                for (int k = 0; k < (g_pf_moe_classes ? 4 : 1); k++) {
+                    [enc setComputePipelineState:flint_pipe(gateup_kernels[k])];
+                    [enc setBuffer:g_pf.tiles offset:tile_base[k] * 16 atIndex:2];
+                    [enc dispatchThreadgroupsWithIndirectBuffer:g_pf.dispatch indirectBufferOffset:(NSUInteger)k * 12 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                }
                 if (!flint_pf_mark(&cb, &enc, &owned, PFP_GATEUP, err, errlen)) return 0;
-                [enc setComputePipelineState:flint_pipe("flint_moe_down")];
                 [enc setBuffer:g_pf.act_sorted offset:0 atIndex:0];
                 [enc setBuffer:g_pf.rows offset:0 atIndex:1];
-                [enc setBuffer:g_pf.tiles offset:0 atIndex:2];
                 [enc setBuffer:experts_buf offset:experts_off atIndex:3];
                 [enc setBuffer:g_pf.wts offset:0 atIndex:4];
                 [enc setBuffer:g_pf.y6 offset:0 atIndex:5];
-                [enc dispatchThreadgroupsWithIndirectBuffer:g_pf.dispatch indirectBufferOffset:12 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                for (int k = 0; k < (g_pf_moe_classes ? 4 : 1); k++) {
+                    [enc setComputePipelineState:flint_pipe(down_kernels[k])];
+                    [enc setBuffer:g_pf.tiles offset:tile_base[k] * 16 atIndex:2];
+                    [enc dispatchThreadgroupsWithIndirectBuffer:g_pf.dispatch indirectBufferOffset:48 + (NSUInteger)k * 12 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                }
                 if (!flint_pf_mark(&cb, &enc, &owned, PFP_DOWN, err, errlen)) return 0;
                 flint_enc_gemm(enc, "flint_gemm_q4_glu", g_pf.xn, 2048, d + 45, g_pf.act_sh, 1024, nil, 0, d + 50, nil, n);
                 flint_enc_gemm(enc, "flint_gemm_q4_combine", g_pf.act_sh, 1024, d + 55, g_pf.x, 2048, g_pf.x, 2048, NULL, g_pf.y6, n);
