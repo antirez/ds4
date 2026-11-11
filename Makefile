@@ -1323,6 +1323,16 @@ tests/test_session_state.o: tests/test_session_state.c ds4.c ds4.h ds4_gpu.h ds4
 tests/test_session_state: tests/test_session_state.o $(filter-out ds4_cpu.o,$(CPU_CORE_OBJS))
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
+tests/test_joyai_pretokenizer.o: tests/test_joyai_pretokenizer.c tests/joyai_pretokenizer_vectors.inc ds4.c ds4.h ds4_gpu.h ds4_image.h ds4_tp.h ds4_qwen4_unicode.inc
+	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_NO_GPU -I. -c -o $@ $<
+
+tests/test_joyai_pretokenizer: tests/test_joyai_pretokenizer.o $(filter-out ds4_cpu.o,$(CPU_CORE_OBJS))
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+.PHONY: test-joyai-pretokenizer
+test-joyai-pretokenizer: tests/test_joyai_pretokenizer
+	./tests/test_joyai_pretokenizer
+
 tests/test_session_state_gpu.o: tests/test_session_state.c ds4.c ds4.h ds4_gpu.h ds4_image.h ds4_tp.h
 	$(CC) $(CFLAGS) -Wno-unused-function -I. -c -o $@ $<
 
@@ -1465,7 +1475,7 @@ test-web-recovery: tests/test_web_recovery
 tests/test_web_recovery: tests/test_web_recovery.c ds4_web.c ds4_web.h
 	$(CC) $(CFLAGS) -Wno-unused-function -o $@ tests/test_web_recovery.c
 
-test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test test-session-state test-linux-memory test-engram test-web-recovery \
+test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test test-session-state test-joyai-pretokenizer test-linux-memory test-engram test-web-recovery \
 	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
 	tests/test_deepseek4_vision_image tests/test_image_decode tests/test_prompt_prefix $(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
 	./ds4-eval --validate-cases
@@ -1590,6 +1600,7 @@ clean:
 	rm -f tests/test_ssd_cache tests/test_engram
 	rm -f tests/test_metal_device_policy
 	rm -f tests/test_session_state tests/test_session_state_gpu tests/test_tp_commands
+	rm -f tests/test_joyai_pretokenizer
 	rm -f tests/test_deepseek_indexer
 	rm -f tests/test_tp_rdma tests/test_tp_link tests/test_tp_tcp tests/test_cuda_tp_link
 	rm -f tests/test_metal_tp_spec
