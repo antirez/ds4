@@ -13,6 +13,10 @@ once: 48 GB), then compare the two tables.
     ./ds4-server -m flint-int4.gguf --ctx 40000 --port 18089 &  ...  --engine ds4
 
 Prefill times include the chat template and the first token's decode step.
+rec sends its tokens in bursts of 8 (one event per token, eight events a few
+ms apart, then a step gap of 8 decode steps), so the first event arrives 7
+decode steps after the first token: the decode rate counts from the end of
+the first burst, and the prefill time has the burst's extra steps taken out.
 """
 
 from __future__ import annotations
@@ -48,10 +52,14 @@ def auth_headers(engine):
     return h
 
 
-def stream_once(url, model, text, max_tokens, think, headers, tok):
-    """Returns (prefill_s, completion_tokens, decode_s).  Tokens are counted
-    by re-tokenizing the streamed text (rec streams 8-token blocks, so events
-    are not tokens); usage.completion_tokens wins when the server sends it."""
+def stream_once(url, model, text, max_tokens, think, headers, tok, burst_s):
+    """Returns (prefill_s, completion_tokens, decode_s_per_token).  Tokens are
+    counted by re-tokenizing the streamed text (events are not tokens);
+    usage.completion_tokens wins when the server sends it.  The decode rate is
+    the time from the first burst's last event to the last event over the
+    tokens after the first burst (a burst: events within burst_s of the
+    first; 10 ms for rec, whose eight events arrive within about 5 ms, 0 for
+    ds4, which sends one event per decode step)."""
     body = {"model": model, "messages": [{"role": "user", "content": text}], "max_tokens": max_tokens,
             "temperature": 0, "stream": True, "stream_options": {"include_usage": True}}
     if not think:
@@ -59,6 +67,8 @@ def stream_once(url, model, text, max_tokens, think, headers, tok):
     req = urllib.request.Request(url + "/v1/chat/completions", data=json.dumps(body).encode(), headers=headers)
     t0 = time.perf_counter()
     t_first = None
+    t_burst = None          # last event of the first burst
+    burst_pieces = []
     pieces = []
     usage_tokens = None
     with urllib.request.urlopen(req, timeout=3600) as resp:
@@ -79,13 +89,20 @@ def stream_once(url, model, text, max_tokens, think, headers, tok):
             text_part = (delta.get("content") or "") + (delta.get("reasoning_content") or "") + (delta.get("reasoning") or "")
             if text_part:
                 pieces.append(text_part)
+                now = time.perf_counter()
                 if t_first is None:
-                    t_first = time.perf_counter()
+                    t_first = now
+                if now - t_first <= burst_s:
+                    t_burst = now
+                    burst_pieces.append(text_part)
     t_end = time.perf_counter()
     if t_first is None:
         return None
     n = usage_tokens or len(tok.encode("".join(pieces), add_special_tokens=False).ids)
-    return t_first - t0, n, t_end - t_first
+    n_burst = max(1, len(tok.encode("".join(burst_pieces), add_special_tokens=False).ids))
+    per_token = (t_end - t_burst) / max(1, n - n_burst)
+    first_token = t_first - t0 - (n_burst - 1) * per_token
+    return first_token, n, per_token
 
 
 def main():
@@ -130,12 +147,12 @@ def main():
         first = None
         best_dec = None
         for _ in range(args.repeat):
-            r = stream_once(url, model, piece, args.max_tokens, args.think, headers, tok)
+            r = stream_once(url, model, piece, args.max_tokens, args.think, headers, tok, 0.010 if args.engine == "rec" else 0.0)
             if r is None:
                 continue
             if first is None:
                 first = r
-            per = r[2] / max(1, r[1] - 1)
+            per = r[2]
             if best_dec is None or per < best_dec:
                 best_dec = per
         if first is None:
