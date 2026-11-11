@@ -163,6 +163,10 @@ static int flint_compile(const char **why) {
             options.fastMathEnabled = NO;
 #pragma clang diagnostic pop
         }
+        /* DS4_FLINT_KV_PREFETCH=N overrides the kernel's KV prefetch depth
+         * (metal/flint.metal, FLINT_KV_PREFETCH) for timing sweeps. */
+        const char *pf_env = getenv("DS4_FLINT_KV_PREFETCH");
+        if (pf_env && atoi(pf_env) > 0) options.preprocessorMacros = @{ @"FLINT_KV_PREFETCH": @(atoi(pf_env)) };
         NSError *error = nil;
         g_flint_library = [g_flint_device newLibraryWithSource:source options:options error:&error];
         if (!g_flint_library) {
@@ -186,6 +190,10 @@ static int flint_compile(const char **why) {
             if (why) *why = "flint_decode cannot run 256 threads per threadgroup";
             return 0;
         }
+        if (getenv("DS4_FLINT_DECODE_PROFILE") || getenv("DS4_FLINT_KV_PREFETCH"))
+            fprintf(stderr, "ds4: flint_decode pipeline: max %lu threads per threadgroup, %lu bytes of threadgroup memory\n",
+                    (unsigned long)g_flint_decode.maxTotalThreadsPerThreadgroup,
+                    (unsigned long)g_flint_decode.staticThreadgroupMemoryLength);
         return 1;
     }
 }

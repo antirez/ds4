@@ -57,6 +57,18 @@ flint_bf16_math(__METAL_PRECISE_MATH__)
 #define FLINT_MLP_WORKERS 32u
 #define FLINT_HEAD_WORKERS 32u
 #define FLINT_KV_TEAMS 4u
+// Tokens of K and V each lane keeps in flight ahead of the running token in
+// the partial attention path (one 8-byte vector of K and one of V per lane
+// per token): 1 (rec's), 2 or 4; the host sets it from DS4_FLINT_KV_PREFETCH.
+// The loads do not change the arithmetic, so every depth is bit-identical;
+// measured (docs/RECURSIVE_FLINT.md, step 3) depths 2 and 4 are no faster,
+// the loop is issue-bound, not latency-bound.
+#ifndef FLINT_KV_PREFETCH
+#define FLINT_KV_PREFETCH 1
+#endif
+#if FLINT_KV_PREFETCH!=1 && FLINT_KV_PREFETCH!=2 && FLINT_KV_PREFETCH!=4
+#error "FLINT_KV_PREFETCH must be 1, 2 or 4"
+#endif
 #define FLINT_KV_TEAM_SIZE 9u
 
 // One routed expert pack (gguf-tools/flint_int4_to_gguf.py, flint.expert_pack.offsets).
@@ -320,36 +332,55 @@ inline void attention_partial_path_w53(const device bfloat16_t* q,KVView k,
             }
             token+=parts;
         }
-        bfloat16_t next_key[4],next_value[4];
-        if(token<count)for(uint j=0;j<4;++j) {
-            uint at=uint(token)*128+j;
-            next_key[j]=key_base[at];next_value[j]=value_base[at];
+        // FLINT_KV_PREFETCH tokens in flight per lane: slot i holds token+i*parts
+        // (named slots expanded by the preprocessor: an indexed ring, even fully
+        // unrolled, went to private memory and ran 2 to 4x slower).
+        constexpr uint D=FLINT_KV_PREFETCH;
+        bfloat16_t nk0[4],nv0[4],nk1[4],nv1[4],nk2[4],nv2[4],nk3[4],nv3[4];
+#define FLINT_KV_LOAD(K,V,T) {uint t_=(T);if(t_<count){ \
+            vec<bfloat16_t,4> k_=*(const device vec<bfloat16_t,4>*)key_base.address(t_*128); \
+            vec<bfloat16_t,4> v_=*(const device vec<bfloat16_t,4>*)value_base.address(t_*128); \
+            for(uint j=0;j<4;++j){K[j]=k_[j];V[j]=v_[j];}}}
+#define FLINT_KV_STEP(K,V) if(token<count) { \
+            float key[4];bfloat16_t value[4]; \
+            for(uint j=0;j<4;++j){key[j]=float(K[j]);value[j]=V[j];} \
+            FLINT_KV_LOAD(K,V,token+D*parts); \
+            float scores[HEADS]; \
+            for(uint h=0;h<HEADS;++h) { \
+                float score=0.0f;for(uint j=0;j<4;++j)score+=query[h][j]*key[j]; \
+                scores[h]=simd_sum(score); \
+            } \
+            float old=0.0f,add=0.0f; \
+            if(lane<HEADS) { \
+                float score=scores[lane],next=max(hi,score),low=metal::fast::exp(-metal::abs(score-hi)); \
+                bool wins=score>hi;old=wins?low:1.0f;add=wins?1.0f:low; \
+                z=z*old+add;hi=next; \
+            } \
+            for(uint h=0;h<HEADS;++h) { \
+                float factor=simd_shuffle(old,ushort(h)),weight=simd_shuffle(add,ushort(h)); \
+                for(uint j=0;j<4;++j)acc[h][j]=acc[h][j]*factor+weight*float(value[j]); \
+            } \
+            token+=parts; \
         }
+        FLINT_KV_LOAD(nk0,nv0,token);
+#if FLINT_KV_PREFETCH>=2
+        FLINT_KV_LOAD(nk1,nv1,token+parts);
+#endif
+#if FLINT_KV_PREFETCH>=4
+        FLINT_KV_LOAD(nk2,nv2,token+2*parts);FLINT_KV_LOAD(nk3,nv3,token+3*parts);
+#endif
         #pragma clang loop unroll_count(1)
-        for(;token<count;token+=parts) {
-            uint at=uint(token)*128;
-            float key[4];bfloat16_t value[4];
-            for(uint j=0;j<4;++j){key[j]=float(next_key[j]);value[j]=next_value[j];}
-            if(token+parts<count)for(uint j=0;j<4;++j) {
-                uint next=at+parts*128+j;
-                next_key[j]=key_base[next];next_value[j]=value_base[next];
-            }
-            float scores[HEADS];
-            for(uint h=0;h<HEADS;++h) {
-                float score=0.0f;for(uint j=0;j<4;++j)score+=query[h][j]*key[j];
-                scores[h]=simd_sum(score);
-            }
-            float old=0.0f,add=0.0f;
-            if(lane<HEADS) {
-                float score=scores[lane],next=max(hi,score),low=metal::fast::exp(-metal::abs(score-hi));
-                bool wins=score>hi;old=wins?low:1.0f;add=wins?1.0f:low;
-                z=z*old+add;hi=next;
-            }
-            for(uint h=0;h<HEADS;++h) {
-                float factor=simd_shuffle(old,ushort(h)),weight=simd_shuffle(add,ushort(h));
-                for(uint j=0;j<4;++j)acc[h][j]=acc[h][j]*factor+weight*float(value[j]);
-            }
+        for(;token<count;) {
+            FLINT_KV_STEP(nk0,nv0)
+#if FLINT_KV_PREFETCH>=2
+            FLINT_KV_STEP(nk1,nv1)
+#endif
+#if FLINT_KV_PREFETCH>=4
+            FLINT_KV_STEP(nk2,nv2)FLINT_KV_STEP(nk3,nv3)
+#endif
         }
+#undef FLINT_KV_LOAD
+#undef FLINT_KV_STEP
         if(lane<HEADS) {
             device float* stat_out=stats+(first*parts+part)*2+lane*parts*2;
             stat_out[0]=hi;stat_out[1]=z;
