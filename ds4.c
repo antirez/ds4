@@ -43175,6 +43175,15 @@ static bool ds41_graph_decode_layer(ds41_gpu_graph *g, const ds4_model *m,
         metal_graph_debug_get_config()->prefix ||
         !ds4_gpu_decode_graphs_supported())
         return ds41_graph_layer(g, m, l, il, token);
+    /* The fused island path below has no before-MoE/MoE/after-MoE split, so
+     * DS4_V41_LAYER_TIMING cannot report on it. Say so once rather than
+     * silently producing no layer reports; DS4_V41_STEP_TIMING still works. */
+    static bool lt_island_warned;
+    if (!lt_island_warned && getenv("DS4_V41_LAYER_TIMING")) {
+        lt_island_warned = true;
+        fprintf(stderr, "ds4: DS4_V41_LAYER_TIMING is unavailable on the resident TP2 decode path "
+                "(fused islands); use DS4_V41_STEP_TIMING for a step-level breakdown\n");
+    }
     return ds41_decode_island(g, m, l, il, 0) &&
         ds41_attention(g, m, l, il, true) && ds41_decode_island(g, m, l, il, 2) &&
         ds41_sum_partial(g, g->block, il, DS4_TP_GATE_ATTN) &&
@@ -43448,8 +43457,13 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         const bool tp_inline_gates = false;
 #endif
         if (ok && queue_layers && !drain && (g->tp_world != 2 || tp_inline_gates) && flush_layers &&
-            (il == 0 || (il + 1u) % flush_layers == 0))
+            (il == 0 || (il + 1u) % flush_layers == 0)) {
+            /* ds4_gpu_flush_commands() synchronizes the device on ROCm, so its
+             * wait belongs in the sync bucket, not the residual submit bucket. */
+            const double st_fl0 = step_timing ? now_sec() * 1000.0 : 0.0;
             ok = ds4_gpu_flush_commands() != 0;
+            if (step_timing) st_sync_acc += now_sec() * 1000.0 - st_fl0;
+        }
     }
     g->score_selected_blocks = false;
     g->scalar_decode = false;
@@ -43475,8 +43489,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         st_total += now - st_t0;
         if (++st_count % 16 == 0) {
             fprintf(stderr, "ds4: step timing n=%u total=%.1fms (submit=%.1f sync=%.1f engram=%.1f logits=%.1f)\n",
-                    st_count, st_total/st_count, st_submit/st_count, st_sync/st_count,
-                    st_engram/st_count, st_logits/st_count);
+                    st_count, st_total/16.0, st_submit/16.0, st_sync/16.0,
+                    st_engram/16.0, st_logits/16.0);
+            st_total = st_submit = st_sync = st_engram = st_logits = 0.0;
         }
     }
     /* Even a failed GPU layer must finish the reader before this graph (or
