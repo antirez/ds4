@@ -45,7 +45,7 @@ rec reports more than 125 tok/s averaged over a 128K-token session.
 | 3. Measure against rec: decode at 4K/32K/128K, prefill, launch overhead; decide on 8-token resident blocks | **done 2026-11-11** (mains, High Power Mode, M4 Pro 48 GB, `tests/flint/bench_vs_rec.py`: both servers through one streaming client, thinking on; the harness accounts for rec sending its tokens in bursts of 8, which had undercounted rec's decode time by 5% and overcounted its prefill by 7 decode steps). Decode ms/token rec vs ds4: 7.7 vs 7.6 at 256 tokens, 9.0 vs 8.8 at 4K, 11.6 vs 11.6 at 16K, 14.0 vs 14.0 at 28K, 23.7 vs 23.0 at 64K, 39.4 vs 38.1 at 128K (148K-token prompt, 64 new tokens): the same kernel at the same speed. The launch floor (`DS4_FLINT_LAYER_COUNT=0`) is 0.92 ms per step; a 64K step is 23.2 ms GPU against 23.4 ms wall (`DS4_FLINT_DECODE_PROFILE=1`), so **8-token resident blocks would buy at most 1 to 4%: decision no.** Prefill tok/s rec vs ds4 after the attention rewrite and the MoE tile heights (step 3): 449 vs 589 at 256 (warm), 684 vs 852 at 1K, 671 vs 856 at 4K, 573 vs 708 at 16K, 501 vs 578 at 28K, 349 vs 400 at 64K, 220 vs 239 at 128K: ds4 is 9 to 31% ahead at every length, with prefill output bit-identical to the first kernels. A cold first prefill pays about 8 s of page-ins for the 22.6 GB mapping. **Decode attention loads (2026-11-11):** one 8-byte vector load per lane for K and for V per token instead of eight scalars (bit-identical on all four trace dumps) takes decode to 7.6 / 8.6 / 13.2 / 21.4 / 34.2 ms at 256 / 4K / 28K / 64K / 128K (rec 7.7 / 9.0 / 14.0 / 23.7 / 39.4); deeper prefetch, launch overlap and MoE register prefetch measured no gain (step 3). |
 | 4. Expert streaming: routing-trace study, cache and address table, in-kernel slot wait (or per-layer split), prefill staging, budget; streamed output bit-identical to resident | **done 2026-11-09** (`ds4_flint_stream.c`, see Design: Streaming). The visibility experiment failed usefully: a CPU store reaches a running kernel only after 0.3 to 10.7 s and a GPU store reaches the CPU about 30 ms after launch (caches flush at command-buffer boundaries), so misses are handled by **abort and resume**: the megakernel aborts at the first layer whose expert is not cached, publishes the layer's ids, the host reads the packs and relaunches from that layer. Hits are the unchanged resident path. `stream_check.py`: streamed and resident outputs are bit-identical on `short_01`, `multi_01` and `tool_01` with a 1 GB cache (606 slots; every decode layer misses, 4.8 of 6 experts), under all three prefill policies. `make test-flint-stream` (model-free, sparse file) passes; `ds4_test --server` and `--session-snapshot` pass with `DS4_TEST_SSD_STREAMING=1` and a 2 GB cache. Cost of a relaunch about 0.3 ms plus the reads (35 ms/token with a 1 GB cache and the file in the page cache, against 9 resident). Routing logs over 1197 decoded tokens (`route_sim.py`, plain LRU): miss fraction 0.65 at 2 GB, 0.21 at 8 GB, 0.09 at 12 GB, 0.03 at 16 GB, 0.007 at 20 GB. Not measured: cold-SSD bandwidth (the file sits in this Mac's page cache and `purge` needs root) and the 20K case in streaming mode (deferred to an AC-powered session). |
 | 5. Server and agent: Flint template, `<tool_call>` syntax, reasoning parsing, `ds4-agent` session | **done 2026-11-09.** `ds4_flint_server.inc`: the server renders Flint prompts from rec's `chat_template.jinja` (roles in order, `flint_text` escaping, the `# Tools` preamble before the first non-system turn, `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value></tool_call>` with string values raw and other values as Python JSON, `<|observation|><tool_response>` results); `tests/flint/check_template.py` renders nine message sets through the live server and through rec's template under HF's jinja settings: all byte-identical, and a live request with tools returns a structured `tool_calls` entry plus `reasoning_content`. Flint reports GLM's tool syntax, so the GLM reply parser and the live tool-call tracker are reused unchanged. Thinking: rec's grammar forces `<think>` as the first token, so the generation prompt is `<|assistant|><think>`; `enable_thinking: false`, `reasoning_effort: none` and the `flint-chat` / `flint-no-think` aliases prefill `<think></think>` instead (`flint-reasoner` forces it on); `/v1/models` lists `flint`, `flint-chat`, `flint-reasoner`. Sampling defaults from `generation_config.json` (temperature 1.0, top-p 0.95, top-k 20) for knobs a request leaves out; the agent uses 1.0 / 0.95. `ds4-agent` with Flint: thinking, bash and read tool calls and the final answer work in one turn on a file task; its KV save needed `ds4_engine_routed_quant_bits` to report 4 for the packs. Not done: the Terminal-Bench style comparison with `rec launch` (needs the AC-powered session). |
-| 6. Streaming speed: prefetch and prediction, popularity preload, cache policy | open |
+| 6. Streaming speed: prefetch and prediction, popularity preload, cache policy | **done 2026-11-11** (Design: Streaming, point 6). The listed ideas were studied on routing traces first and none pays: consecutive tokens share 16% of a layer's experts (the previous token's experts are already cached), popularity preload only helps the cold start, SLRU saves at most 4% of misses and LFU loses, and lookahead prediction of later layers from the current residual (recall 0.84 of the six at P=8 one layer ahead) is a wash at 8 GB in simulation (the wrong reads cost the bandwidth the avoided relaunches save) and about 10% at 14 GB. The measured cost was elsewhere: per-launch profiling (`DS4_FLINT_STREAM_PROFILE=1|2|3`) showed every streaming launch running 1.7x slower than the same layers in resident decode, with commit-to-start and completion latencies doubled, because the fetch gaps (0.3 to 1 ms, about 30 per token at 8 GB) let the GPU power manager drop the clocks. A keep-alive like ds4's TP one (`flint_keepalive`: one threadgroup, 2000 FMA pairs, back-to-back on a side queue while a streaming session decodes) fixes it: 300-token agent-style generation, greedy, 8 GB cache 23 -> 36 tok/s, 14 GB 27 -> 41, 22 GB (no steady-state misses) 22 -> 38; per-launch GPU time back to the resident 0.142 ms/layer, queue 0.07 -> 0.04 ms, wake 0.06 -> 0.04 ms. Output bit-identical with and without it (`stream_check.py`). Not kept: a same-queue heater sized to the fetch (restores GPU speed but slows the reads), long keep-alive dispatches (command buffers on two queues do not overlap on this Mac: 30000 iterations cost 5 tok/s, 1.2M made each launch wait 10 to 15 ms). Open: lookahead prefetch for caches of 14 GB and up (in-kernel prediction from the residual, ~10% simulated). |
 | 7. Later: CUDA (DGX Spark), session batching, other quants | open |
 
 Each step records what it measured here when it lands. Steps 0-2 are
@@ -548,14 +548,66 @@ Metal) with the GPU side in `ds4_metal_flint.m`:
 | 16 GB | 9709 | 0.030 | 15 | 7.8 | ~78 |
 | 20 GB | 12136 | 0.007 | 3.5 | 1.9 | ~114 |
 
-   The estimate is 7.5 ms compute plus the read time plus 0.3 ms per
-   relaunching layer. A 16 GB Mac (about 8 GB of cache) lands near 26
-   tok/s with plain LRU, a 24 GB Mac (14 GB) near 60, a 32 GB Mac holds
-   everything after warm-up. The miss fraction is what step 6's prefetch
-   (predict the next layers' experts from the previous token, fill slots
-   that were free at launch) and popularity preload have to cut; the SSD's
-   cold random-read bandwidth is still unmeasured here because the file
-   lives in the page cache of the 48 GB development machine.
+   That estimate (7.5 ms compute plus reads plus 0.3 ms per relaunch) was
+   wrong about where the time goes. Measured on 2026-11-11 (M4 Pro 48 GB,
+   mains, High Power Mode, F_NOCACHE reads, 300-token greedy generation of
+   an agent-style answer, caches capped to what 16 / 24 / 32 GB Macs hold):
+
+   - **SSD.** Random 1.77 MB `pread`s run at 2.6 to 3.6 GB/s on one
+     thread (0.34 to 0.5 ms per pack) and plateau at 6.5 to 6.8 GB/s from
+     6 threads; a batch of 2 packs takes 0.5 ms, 6 packs 1.1 ms; splitting
+     a pack into slices gains nothing. Read time varies by run (8 to 17 ms
+     per token at 8 GB for the same tokens), so timed runs are bracketed
+     with a read benchmark.
+   - **Launch anatomy** (resident decode, probe launches): 0.133 ms per
+     layer, 0.09 ms for a layer that aborts after routing, no fixed cost
+     for the launch, residency or prologue; commit-to-start 0.06 ms,
+     completion-to-wake 0.05 ms. The misses of a token spread over about
+     30 layers at 8 GB (48 misses in 30 relaunches), 13 at 14 GB, 8 at
+     22 GB warm.
+   - **The clock.** Per-launch logging (`DS4_FLINT_STREAM_PROFILE=3`)
+     showed streaming launches at 0.21 to 0.31 ms per layer plus 0.25 to
+     0.6 ms per launch, 1.7x the resident cost, intermittent (the fastest
+     tenth of launches ran at resident speed), with queue and wake
+     latencies doubled. A standalone test reproduced it: a memory-bound
+     kernel launched after 0.4 to 1 ms of GPU idleness runs 2x slower,
+     with or without `pread`s in the gap. ds4's tensor-parallel path
+     documents the same effect ("the GPU power manager halves the clocks
+     within a second") and runs a keep-alive kernel on a side queue.
+   - **Keep-alive** (`flint_keepalive`, `ds4_metal_flint.m`): one
+     threadgroup of 2000 FMA pairs (about 30 us) dispatched back-to-back
+     on its own queue by its own thread while a streaming session decodes,
+     paused during prefill. Streaming decode tok/s without / with it:
+     8 GB cache 23.0 / 36.3, 14 GB 26.7 / 40.9, 22 GB 21.7 / 37.9; GPU
+     time per token 24.8 / 11.8 ms at 8 GB (resident decode is 7.2),
+     per-launch cost back to 0.13 + 0.142 ms/layer, queue 0.04 ms, wake
+     0.04 ms. 500 to 8000 iterations are equivalent; 30000 cost 5 tok/s and
+     ds4's 1.2M made every launch wait 10 to 15 ms, because command
+     buffers on different queues do not overlap on this Mac (a long spinner
+     on a second queue serialised the main queue in an earlier test); four
+     threadgroups gain nothing. A same-queue heater committed before each
+     fetch and sized to its expected length restored the GPU speed but
+     slowed the reads by 4 ms per token (not kept).
+     CPU cost: the process goes from about 35% to 70% of one core while
+     decoding (the keep-alive thread and Metal's completion threads), a
+     few GPU watts. `DS4_FLINT_STREAM_KEEPALIVE=0` turns it off, `=N` sets
+     threadgroups, `DS4_FLINT_STREAM_KEEPALIVE_ITERS` the loop.
+   - **Prefetch and policy studies** (`DS4_FLINT_ROUTE_LOG`, six 399-token
+     generations: code, prose, agent, math, chat, JSON; `DS4_FLINT_TRACE_DUMP`
+     for the residual rows): consecutive tokens share 16% of a layer's
+     experts, so prefetching the previous token's selection adds nothing
+     (they are the cache's most recent entries); the most popular 40% of
+     experts cover 76% of selections, so a popularity preload only
+     shortens the cold start; SLRU saves at most 4% of misses, LFU loses.
+     Predicting layer L+k's routing from the residual entering layer L
+     (the router of L+k applied to it): recall of the true six among the
+     top 8 is 0.94 at k=0, 0.84 at k=1, 0.77 at k=2, 0.72 at k=3 (all six
+     predicted: 0.71 / 0.38 / 0.23 / 0.15). Simulated with the measured
+     read costs, fetching the predicted misses of the next layer together
+     with the current ones is a wash at 8 GB (relaunches 32 -> 22 per
+     token, reads 61 -> 89 packs) and about 10% at 14 GB; not built.
+   - **Prefill** in streaming mode reads the union of the prompt's experts
+     (10 GiB for a short agent prompt) through the staging path; unchanged.
 
 Memory targets, with 1.19 GiB of resident weights, 0.84 GiB of staging,
 2 GB runtime reserve and context at 8K (0.3 GB): a 16 GB Mac holds about
@@ -825,9 +877,18 @@ Left: the Terminal-Bench style task against `rec launch`.
 
 ### 6. Streaming speed
 
-Prefetch from the previous token's routing, popularity preload at startup,
-cache policy variants, each kept only with a measured gain on the
-routing-trace workloads and unchanged logits.
+Done (Status and Design: Streaming, point 6). The listed ideas (prefetch
+from the previous token, popularity preload, cache policy variants) were
+measured on routing traces and none pays; the gain came from keeping the
+GPU clocked through the fetch gaps (23 -> 36 tok/s at 8 GB, 27 -> 41 at
+14 GB), with logits unchanged. Instrumentation kept:
+`DS4_FLINT_STREAM_PROFILE=1` (per token), `=2` (per launch: host, encode,
+queue, GPU, wake, fetch; GPU split by aborted and final launches), `=3`
+(one line per launch), `DS4_FLINT_TRACE_DUMP=FILE` (the 50 x 2048 bf16
+residual rows per token), `DS4_FLINT_STREAM_THREADS`. Left: lookahead
+prefetch from in-kernel prediction for caches of 14 GB and up (about 10%
+simulated), and a check of the keep-alive on a 16 GB Mac (here it costs
+about a third of a CPU core and a few GPU watts).
 
 ### 7. Later
 

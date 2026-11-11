@@ -794,3 +794,15 @@ kernel void flint_decode(
 #undef SYNC
 #undef KV_TEAM_SYNC
 }
+
+// Streaming decode keep-alive (ds4's kernel_dsv4_tp_keepalive, same idea):
+// a few threadgroups of dependent FMAs dispatched back-to-back on a side
+// queue while SSD streaming decode runs.  Each relaunch waits for a fetch, so
+// the GPU looks idle to the power manager, which lowers the clocks and makes
+// every launch run about 1.7x slower; this holds them up for a few watts.
+kernel void flint_keepalive(device float* out [[buffer(0)]], constant uint& iters [[buffer(1)]],
+                            uint tid [[thread_position_in_grid]]) {
+    float a=out[tid];const float b=1.000001f;
+    for(uint i=0;i<iters;i++){a=fma(a,b,0.000001f);a=fma(a,b,-0.000001f);}
+    out[tid]=a;
+}

@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <pthread.h>
 
 #include "ds4_metal_internal.h"
 #include "ds4_flint_gpu.h"
@@ -49,6 +50,77 @@ static ds4_flint_stream *g_flint_stream;
 static NSMutableArray<id<MTLBuffer>> *g_flint_stream_bufs;
 #define FLINT_REQUEST_WORDS 393u
 #define FLINT_MISS_WORD 392u
+
+/* Keep-alive for streaming decode (flint_keepalive in flint.metal, after
+ * ds4's TP keep-alive): one threadgroup of 2000 FMA pairs (about 30 us)
+ * dispatched back-to-back on its own queue while a streaming session
+ * decodes.  Every relaunch waits 0.3 to 1 ms for its fetch, which makes the
+ * GPU look idle to the power manager; without this every launch runs
+ * 1.7x slower and commit-to-start and completion latencies double.
+ * Measured 2026-11-11 (M4 Pro 48 GB, 300 tokens): 23 -> 36 tok/s with an
+ * 8 GB cache, 27 -> 41 at 14 GB, 22 -> 38 at 22 GB.  Long dispatches hurt
+ * (30000 iterations: 31 tok/s) because command buffers on two queues do not
+ * overlap here, so a launch waits for the keep-alive in flight; more
+ * threadgroups gain nothing.  DS4_FLINT_STREAM_KEEPALIVE=0 turns it off,
+ * =N uses N threadgroups, DS4_FLINT_STREAM_KEEPALIVE_ITERS sets the loop. */
+static id<MTLComputePipelineState> g_flint_keepalive;
+static id<MTLCommandQueue> g_flint_keepalive_queue;
+static id<MTLBuffer> g_flint_keepalive_buffer;
+static pthread_t g_flint_keepalive_thread;
+static int g_flint_keepalive_running;
+static volatile int g_flint_keepalive_stop, g_flint_keepalive_active;
+static uint32_t g_flint_keepalive_tgs = 1, g_flint_keepalive_iters = 2000;
+
+static void *flint_keepalive_thread(void *arg) {
+    (void)arg;
+    while (!g_flint_keepalive_stop) {
+        if (!g_flint_keepalive_active) { usleep(200); continue; }
+        @autoreleasepool {
+            id<MTLCommandBuffer> cb = [g_flint_keepalive_queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            [enc setComputePipelineState:g_flint_keepalive];
+            [enc setBuffer:g_flint_keepalive_buffer offset:0 atIndex:0];
+            [enc setBytes:&g_flint_keepalive_iters length:sizeof(g_flint_keepalive_iters) atIndex:1];
+            [enc dispatchThreadgroups:MTLSizeMake(g_flint_keepalive_tgs, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+        }
+    }
+    return NULL;
+}
+
+/* Called at the start of every streaming decode step; the thread spins up
+ * once and stays until the engine is released.  Prefill marks it inactive. */
+static void flint_keepalive_set_active(int active) {
+    if (!g_flint_keepalive_running) {
+        if (!active || !g_flint_keepalive) return;
+        const char *env = getenv("DS4_FLINT_STREAM_KEEPALIVE");
+        if (env && atoi(env) <= 0) return;
+        if (env) g_flint_keepalive_tgs = (uint32_t)atoi(env) > 64u ? 64u : (uint32_t)atoi(env);
+        if (getenv("DS4_FLINT_STREAM_KEEPALIVE_ITERS")) g_flint_keepalive_iters = (uint32_t)atoi(getenv("DS4_FLINT_STREAM_KEEPALIVE_ITERS"));
+        g_flint_keepalive_queue = [g_flint_device newCommandQueue];
+        g_flint_keepalive_buffer = [g_flint_device newBufferWithLength:(NSUInteger)g_flint_keepalive_tgs * 256u * sizeof(float)
+                                                               options:MTLResourceStorageModeShared];
+        if (!g_flint_keepalive_queue || !g_flint_keepalive_buffer) return;
+        memset([g_flint_keepalive_buffer contents], 0, (size_t)g_flint_keepalive_tgs * 256u * sizeof(float));
+        g_flint_keepalive_stop = 0;
+        g_flint_keepalive_active = 1;
+        if (pthread_create(&g_flint_keepalive_thread, NULL, flint_keepalive_thread, NULL) != 0) return;
+        g_flint_keepalive_running = 1;
+        return;
+    }
+    g_flint_keepalive_active = active;
+}
+
+static void flint_keepalive_release(void) {
+    if (!g_flint_keepalive_running) return;
+    g_flint_keepalive_stop = 1;
+    pthread_join(g_flint_keepalive_thread, NULL);
+    g_flint_keepalive_running = 0;
+    g_flint_keepalive_queue = nil;
+    g_flint_keepalive_buffer = nil;
+}
 
 static void flint_use_resources(id<MTLComputeCommandEncoder> enc) {
     [enc useResource:g_flint_model usage:MTLResourceUsageRead];
@@ -186,6 +258,9 @@ static int flint_compile(const char **why) {
             if (why) *why = "flint_decode pipeline creation failed";
             return 0;
         }
+        g_flint_keepalive = nil;
+        id<MTLFunction> ka = [g_flint_library newFunctionWithName:@"flint_keepalive"];
+        if (ka) g_flint_keepalive = [g_flint_device newComputePipelineStateWithFunction:ka error:&error];
         if (g_flint_decode.maxTotalThreadsPerThreadgroup < FLINT_THREADS) {
             if (why) *why = "flint_decode cannot run 256 threads per threadgroup";
             return 0;
@@ -284,6 +359,8 @@ int ds4_flint_gpu_engine_open(const void *model_map, uint64_t model_size,
 
 static void flint_prefill_scratch_release(void);
 void ds4_flint_gpu_engine_release(void) {
+    flint_keepalive_release();
+    g_flint_keepalive = nil;
     flint_prefill_scratch_release();
     g_flint_stream = NULL;
     g_flint_stream_bufs = nil;
@@ -474,8 +551,9 @@ int ds4_flint_gpu_decode(ds4_flint_gpu_session *s, uint32_t token, uint32_t posi
     @autoreleasepool {
         /* Diagnostics for the trace test: DS4_FLINT_LAYER_COUNT runs the first N
          * layers only; DS4_FLINT_WORKSPACE_DUMP appends the workspace after each
-         * step; DS4_FLINT_ROUTE_LOG appends the position and the 49 x 8 request
-         * words (the routing of every sparse layer) per token. */
+         * step; DS4_FLINT_TRACE_DUMP appends the residual trace and
+         * DS4_FLINT_ROUTE_LOG the position and the 49 x 8 request words (the
+         * routing of every sparse layer) per token. */
         const char *lc_env = getenv("DS4_FLINT_LAYER_COUNT");
         const uint32_t layer_count = lc_env ? (uint32_t)atoi(lc_env) : DS4_FLINT_GPU_N_LAYER;
         const uint32_t streaming = g_flint_stream ? 1u : 0u;
@@ -490,8 +568,23 @@ int ds4_flint_gpu_decode(ds4_flint_gpu_session *s, uint32_t token, uint32_t posi
         static double dprof_gpu = 0, dprof_wall = 0;
         static uint32_t dprof_n = 0;
         if (dprof < 0) dprof = getenv("DS4_FLINT_DECODE_PROFILE") ? 1 : 0;
+        /* DS4_FLINT_STREAM_PROFILE=1: per token (all launches), averaged over
+         * 64 tokens: wall ms, launches, misses and read ms. */
+        static int sprof = -1;
+        static double sprof_wall = 0, sprof_read = 0;
+        static double sprof_prep = 0, sprof_queue = 0, sprof_gpu = 0, sprof_wake = 0, sprof_fetch = 0, sprof_host = 0;
+        static double sprof_gpu_abort = 0, sprof_gpu_final = 0;
+        static uint64_t sprof_layers_abort = 0, sprof_layers_final = 0, sprof_n_abort = 0;
+        static uint64_t sprof_launch = 0, sprof_miss = 0, sprof_n = 0, sprof_last_fetch = 0;
+        if (sprof < 0) sprof = getenv("DS4_FLINT_STREAM_PROFILE") && g_flint_stream ? atoi(getenv("DS4_FLINT_STREAM_PROFILE")) : 0;
+        ds4_flint_stream_stats sst0;
+        const double t_tok0 = sprof ? ds4_flint_now_s() : 0;
+        sprof_last_fetch = 0;
+        if (sprof) ds4_flint_stream_get_stats(g_flint_stream, &sst0);
+        double t_prev_end = sprof ? ds4_flint_now_s() : 0;
+        if (g_flint_stream) flint_keepalive_set_active(1);
         for (;;) {
-            const double t_wall0 = dprof ? ds4_flint_now_s() : 0;
+            const double t_wall0 = (dprof || sprof) ? ds4_flint_now_s() : 0;
             memset([s->control contents], 0, FLINT_CONTROL_WORDS * 4);
             memset([s->diagnostic contents], 0, FLINT_WORKERS * 4);
             memset([s->requests contents], 0, FLINT_REQUEST_WORDS * 4);
@@ -526,9 +619,22 @@ int ds4_flint_gpu_decode(ds4_flint_gpu_session *s, uint32_t token, uint32_t posi
             [enc setBuffer:s->requests offset:0 atIndex:17];
             [enc dispatchThreadgroups:MTLSizeMake(FLINT_WORKERS, 1, 1) threadsPerThreadgroup:MTLSizeMake(FLINT_THREADS, 1, 1)];
             ds4_metal_end_compute_encoder(cb, enc);
+            const double t_commit = sprof ? ds4_flint_now_s() : 0;
             if (!ds4_metal_finish_command_buffer(cb, owned, "flint_decode")) {
                 if (err && errlen) snprintf(err, errlen, "flint_decode command buffer failed");
                 return 0;
+            }
+            if (sprof) {
+                /* GPUStartTime/GPUEndTime share mach_absolute_time's base; so does CLOCK_UPTIME_RAW */
+                const double t_done = ds4_flint_now_s();
+                const double up_now = (double)clock_gettime_nsec_np(CLOCK_UPTIME_RAW) * 1e-9;
+                const double skew = up_now - t_done;
+                sprof_host += t_wall0 - t_prev_end;
+                sprof_prep += t_commit - t_wall0;
+                sprof_queue += (cb.GPUStartTime - skew) - t_commit;
+                sprof_gpu += cb.GPUEndTime - cb.GPUStartTime;
+                sprof_wake += t_done - (cb.GPUEndTime - skew);
+                t_prev_end = t_done;
             }
             if (dprof) {
                 dprof_gpu += (cb.GPUEndTime - cb.GPUStartTime) * 1e3;
@@ -543,6 +649,18 @@ int ds4_flint_gpu_decode(ds4_flint_gpu_session *s, uint32_t token, uint32_t posi
             const uint32_t *req = (const uint32_t *)[s->requests contents];
             const uint32_t miss = req[FLINT_MISS_WORD];
             const uint32_t ran_to = miss ? miss - 1 : layer_count;
+            if (sprof) {
+                const double g = cb.GPUEndTime - cb.GPUStartTime;
+                if (miss) { sprof_gpu_abort += g; sprof_layers_abort += ran_to + 1 - layer_start; sprof_n_abort++; }
+                else { sprof_gpu_final += g; sprof_layers_final += ran_to - layer_start; }
+                if (sprof >= 3) {
+                    const double up2 = (double)clock_gettime_nsec_np(CLOCK_UPTIME_RAW) * 1e-9 - ds4_flint_now_s();
+                    fprintf(stderr, "ds4: L pos %u start %u ran_to %u miss %u gpu %.4f queue %.4f wake %.4f prev_fetch %u\n",
+                            position, layer_start, ran_to, miss ? __builtin_popcount(req[(miss - 1) * 8 + 6]) : 0,
+                            g * 1e3, ((cb.GPUStartTime - up2) - t_commit) * 1e3, (t_prev_end - (cb.GPUEndTime - up2)) * 1e3,
+                            (unsigned)sprof_last_fetch);
+                }
+            }
             for (uint32_t il = layer_start; il < ran_to && il < DS4_FLINT_GPU_N_LAYER; il++) {
                 memcpy(ids_seen + il * 8, req + il * 8, 8 * 4);
                 if (g_flint_stream && g_flint_meta[il * 64 + 2]) ds4_flint_stream_touch(g_flint_stream, il, req + il * 8, 6);
@@ -555,9 +673,38 @@ int ds4_flint_gpu_decode(ds4_flint_gpu_session *s, uint32_t token, uint32_t posi
                     return 0;
                 }
                 memcpy(ids_seen + il * 8, req + il * 8, 8 * 4);
+                const double t_f0 = sprof ? ds4_flint_now_s() : 0;
                 if (!ds4_flint_stream_fetch(g_flint_stream, il, req + il * 8, 6, err, errlen)) return 0;
+                if (sprof) { sprof_fetch += ds4_flint_now_s() - t_f0; sprof_last_fetch = (uint32_t)__builtin_popcount(req[il * 8 + 6] & 63u); }
                 layer_start = il;
                 continue;
+            }
+            if (sprof) {
+                ds4_flint_stream_stats sst1;
+                ds4_flint_stream_get_stats(g_flint_stream, &sst1);
+                sprof_wall += (ds4_flint_now_s() - t_tok0) * 1e3;
+                sprof_launch += relaunches + 1;
+                sprof_miss += sst1.decode_misses - sst0.decode_misses;
+                sprof_read += sst1.decode_read_ms - sst0.decode_read_ms;
+                if (++sprof_n == 64) {
+                    fprintf(stderr, "ds4: Flint streaming profile at position %u: %.2f ms/token, %.1f launches, %.1f misses, "
+                            "%.2f ms reading per token (64 tokens)\n",
+                            position, sprof_wall / 64, sprof_launch / 64.0, sprof_miss / 64.0, sprof_read / 64);
+                    if (sprof > 1) {
+                        fprintf(stderr, "ds4:   per launch: host %.3f ms, encode %.3f, queue %.3f, GPU %.3f, wake %.3f; fetch %.3f ms per launch\n",
+                                sprof_host * 1e3 / sprof_launch, sprof_prep * 1e3 / sprof_launch, sprof_queue * 1e3 / sprof_launch,
+                                sprof_gpu * 1e3 / sprof_launch, sprof_wake * 1e3 / sprof_launch, sprof_fetch * 1e3 / sprof_launch);
+                        fprintf(stderr, "ds4:   GPU per launch: aborted %.3f ms over %.1f layers (%.3f ms/layer, incl. the aborted one); "
+                                "final %.3f ms over %.1f layers (%.3f ms/layer)\n",
+                                sprof_gpu_abort * 1e3 / (sprof_n_abort ? sprof_n_abort : 1), (double)sprof_layers_abort / (sprof_n_abort ? sprof_n_abort : 1),
+                                sprof_gpu_abort * 1e3 / (sprof_layers_abort ? sprof_layers_abort : 1),
+                                sprof_gpu_final * 1e3 / 64, (double)sprof_layers_final / 64, sprof_gpu_final * 1e3 / (sprof_layers_final ? sprof_layers_final : 1));
+                    }
+                    sprof_wall = sprof_read = sprof_prep = sprof_queue = sprof_gpu = sprof_wake = sprof_fetch = sprof_host = 0;
+                    sprof_gpu_abort = sprof_gpu_final = 0;
+                    sprof_layers_abort = sprof_layers_final = sprof_n_abort = 0;
+                    sprof_launch = sprof_miss = sprof_n = 0;
+                }
             }
             const uint32_t *diag = (const uint32_t *)[s->diagnostic contents];
             for (uint32_t g = 0; g < FLINT_WORKERS; g++) {
@@ -575,6 +722,11 @@ int ds4_flint_gpu_decode(ds4_flint_gpu_session *s, uint32_t token, uint32_t posi
         if (ws_env) {
             FILE *f = fopen(ws_env, "ab");
             if (f) { fwrite([s->workspace contents], 2, FLINT_WORKSPACE_ELEMS, f); fclose(f); }
+        }
+        const char *td_env = getenv("DS4_FLINT_TRACE_DUMP");   /* the 50 x 2048 bf16 residual trace per token */
+        if (td_env) {
+            FILE *f = fopen(td_env, "ab");
+            if (f) { fwrite([s->trace contents], 2, DS4_FLINT_GPU_TRACE_ELEMS, f); fclose(f); }
         }
         const char *rl_env = getenv("DS4_FLINT_ROUTE_LOG");
         if (rl_env) {
@@ -831,6 +983,7 @@ int ds4_flint_gpu_prefill(ds4_flint_gpu_session *s, const int32_t *tokens, uint3
         if (err && errlen) snprintf(err, errlen, "prefill chunk of %u tokens is outside 1..%u", n, FLINT_PF_CAP);
         return 0;
     }
+    flint_keepalive_set_active(0);   /* prefill keeps the GPU busy by itself */
     if ((uint64_t)position + n > s->ctx_cap) {
         if (err && errlen) snprintf(err, errlen, "prefill to position %u exceeds the session capacity %u", position + n, s->ctx_cap);
         return 0;
