@@ -896,6 +896,135 @@ CUDA on DGX Spark (the megakernel is Metal; CUDA would start from the Qwen
 expert kernels), `--batched-session`, 8-token resident blocks with
 in-kernel sampling if step 3 says they pay, other quants.
 
+## Field measurements (how to help)
+
+Everything above was measured on one M4 Pro with 48 GB, where streaming
+is only ever simulated with a capped cache and the SSD is the one Apple
+ships in that machine. What the branch needs now are numbers from other
+Macs, above all the 16, 24 and 32 GB ones streaming was built for. Each
+contribution is one row in the table at the end of this section plus the
+raw log lines, sent as a PR against `recursive-flint` on
+`github.com/mschneider/ds4` (or an issue there with the logs attached).
+
+### Setup
+
+1. `git clone -b recursive-flint git@github.com:mschneider/ds4.git && cd ds4
+   && make ds4 ds4-server ds4-bench` (Xcode command line tools). Run every
+   binary from the repo directory: the Metal sources are found relative to
+   the working directory.
+2. The model: `rec pull` (rec 0.1.1, https://github.com/recursive-oss/rec)
+   downloads the INT4 checkpoint to `~/.local/share/rec/models/<digest>/`
+   on any Mac, whether or not rec will run there; then
+   `python3 gguf-tools/flint_int4_to_gguf.py --out gguf/flint/flint-int4.gguf`
+   (numpy; `--check` also needs mlx) writes the 22.6 GB GGUF in about a
+   minute. Copying a converted `flint-int4.gguf` from another machine is
+   equivalent (the converter is bit-exact).
+3. Smoke test, which also shows the plan ds4 made for your memory:
+
+   ```
+   ./ds4 -m gguf/flint/flint-int4.gguf --ssd-streaming -n 64 --temp 0 -p "Write a haiku about SSDs."
+   ```
+
+   The line `ds4: Flint SSD streaming: resident weights ... expert cache
+   X GiB (N of 12032 experts) ... KV reserve ...` is the first thing to
+   report. Streaming switches itself on when the file is larger than the
+   GPU's recommended working set, so on Macs under 48 GB `--ssd-streaming`
+   is redundant but harmless.
+4. Python for the exactness check: a venv with `numpy` (`tokenizers` as well
+   for `bench_vs_rec.py`).
+
+### Rules for a timed run
+
+- Mains power and High Power Mode: `pmset -g batt | head -1` says
+  `AC Power`, `pmset -g | awk '/powermode/ {print $2}'` prints `2` (on
+  Macs without the setting, note that). Charging from a low battery
+  throttles the GPU by 10 to 20x.
+- Nothing else on the GPU or the SSD: no other model process (`pgrep -fl
+  'ds4|rec|llama|mlx'`), no Time Machine or Spotlight indexing run in
+  progress, no browser video. One ds4 process at a time (the single-instance
+  lock refuses a second); never rec and ds4 together.
+- Watch for swapping: `sysctl vm.swapusage` before and after a run; a cache
+  that pushes the machine into swap is not a valid measurement, shrink it.
+- Every run prints its own `Flint SSD streaming:` line; keep it with the
+  numbers. Run each configuration twice and report the second (the first
+  pays the cold-start reads).
+
+### What to measure
+
+**A. Streaming decode against cache size.** The 300-token agent-style
+greedy generation used in step 6, with the per-token profile on:
+
+```
+DS4_FLINT_STREAM_PROFILE=1 ./ds4 -m gguf/flint/flint-int4.gguf --ssd-streaming \
+    --ssd-streaming-cache-experts 8GB -n 300 --seed 1 --temp 0 \
+    -p "You are debugging a Rust web service that returns 502 errors under load. Walk through, step by step, which commands you would run, what the likely causes are, and how you would fix each one."
+```
+
+Once with ds4's own plan (no `--ssd-streaming-cache-experts`), then at
+8 GB and 14 GB where they fit, then at the largest cap the machine takes
+without swapping (grow in 2 GB steps). Report the last `Flint streaming
+profile at position ...` line (ms/token, launches, misses, ms reading per
+token) and the `prefill: ... generation: ... t/s` line. The reading time
+per token is the SSD measurement; nothing else is needed for it.
+
+**B. The keep-alive on a small Mac.** Same command at the 8 GB (or auto)
+cap with `DS4_FLINT_STREAM_KEEPALIVE=0`, and the generation tok/s of both.
+On the 48 GB machine the keep-alive is worth 23 -> 36 tok/s at 8 GB and
+costs a third of a CPU core; whether the GPU clock behaves the same on an
+M1/M2/M3 or a base M4, and what it does to a 16 GB machine's fan, is not
+known. If you can, note the package power from `sudo powermetrics
+--samplers gpu_power -i 1000 -n 10` during decode with and without it.
+
+**C. Long context.** `ds4-bench` runs Flint in streaming mode and sweeps
+prompt lengths; `tests/long_context_story_prompt.txt` holds about 40K
+tokens, so concatenate copies for the long frontiers:
+
+```
+for i in 1 2 3 4; do cat tests/long_context_story_prompt.txt; done > /tmp/story_x4.txt
+./ds4-bench -m gguf/flint/flint-int4.gguf --ssd-streaming --prompt-file /tmp/story_x4.txt \
+    --ctx-start 2048 --ctx-max 131072 --step-mul 2 --gen-tokens 128 --csv flint_field.csv
+```
+
+Add `--ssd-streaming-cache-experts` when you want a fixed cache; without it
+the plan shrinks the cache as `--ctx-max` grows, because the KV reserve
+takes 28 KB per token of context (0.9 GiB at 32K, 3.5 GiB at 128K) and is
+the right thing to see on a small machine. Report the CSV (`prefill_tps`,
+`gen_steady_tps` per frontier) and the streaming banner. 128K needs
+`--ctx-max 131072` plus the KV to fit; on 16 GB stop where the plan
+refuses (`cannot size the expert cache`) and say where that was.
+
+**D. Exactness, once per machine.** Streamed output must equal resident
+output bit for bit, and the model-free module test must pass:
+
+```
+make test-flint-stream
+venv/bin/python tests/flint/stream_check.py --model gguf/flint/flint-int4.gguf --cache 1GB --max-tokens 32
+```
+
+The resident run of `stream_check.py` needs 48 GB; on a smaller Mac the
+"resident" side streams too, under ds4's own plan, so the check becomes
+auto plan against a 1 GB cache. That is still the test that matters
+(every decode layer misses at 1 GB): the two must be IDENTICAL on all
+eight golden cases, the 20K story included. Also `diff` the stdout of two
+runs of A at different caps: greedy decode must give the same text.
+
+**E. Against rec (48 GB and up).** `tests/flint/bench_vs_rec.py` as in
+step 3: `rec serve --context 40000`, then `--engine rec`; `rec stop`; then
+`./ds4-server -m gguf/flint/flint-int4.gguf --ctx 40000 --port 18089` and
+`--engine ds4`. The frontiers default to 256 / 4K / 16K / 28K.
+
+### What to report
+
+One row here, plus the raw lines in the PR description:
+
+| Date | Mac (chip, GPU cores, RAM, SSD model) | macOS | Commit | Cache (plan / caps) | A: tok/s at each cap, ms reading per token | B: keep-alive off / on | C: gen tok/s at 4K / 32K / 128K | D |
+|---|---|---|---|---|---|---|---|---|
+| 2026-11-11 | M4 Pro 16c GPU, 48 GB, AP2048Z | 26.7 | 35a0428 | caps 8 / 14 / 22 GB | 36 / 41 / 38, 8 to 17 ms at 8 GB | 23 / 36 at 8 GB | see step 3 (resident) | identical |
+
+`sysctl -n hw.memsize machdep.cpu.brand_string`, `system_profiler
+SPDisplaysDataType | grep Cores`, `system_profiler SPNVMeDataType | grep
+Model` and `sw_vers -productVersion` give the machine columns.
+
 ## Open questions
 
 - Resolved (step 4): CPU-to-GPU visibility inside a running kernel takes
