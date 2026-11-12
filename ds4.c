@@ -2098,7 +2098,7 @@ static const char *ds4_log_color_code(ds4_log_type type) {
 }
 
 bool ds4_log_is_tty(FILE *fp) {
-    int fd = fileno(fp);
+    int fd = fp == stdout ? STDOUT_FILENO : fp == stderr ? STDERR_FILENO : fileno(fp);
     return fd >= 0 && isatty(fd) != 0;
 }
 

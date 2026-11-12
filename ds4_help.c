@@ -2,6 +2,7 @@
 
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -17,7 +18,9 @@ typedef struct {
 } help_colors;
 
 static help_colors help_make_colors(FILE *fp) {
-    bool color = isatty(fileno(fp));
+    const char *term = getenv("TERM");
+    bool color = isatty(fileno(fp)) && getenv("NO_COLOR") == NULL &&
+                 (!term || strcmp(term, "dumb") != 0);
     help_colors c = {0};
     if (!color) return c;
     c.off = "\x1b[0m";
@@ -269,6 +272,7 @@ static void print_cli_specific(FILE *fp, const help_colors *c, bool full) {
     opt(fp, c, "ds4", "Start the interactive prompt.");
     opt(fp, c, "ds4 -p TEXT", "Run one prompt and exit.");
     opt(fp, c, "ds4 --prompt-file FILE", "Run a long prompt from a file and exit.");
+    opt(fp, c, "--no-alt-screen", "Keep the interactive UI inline in the normal terminal buffer.");
     opt(fp, c, "--prefix-file FILE", "Preload complete alternating USER:/ASSISTANT: turns before the live conversation.");
     fputc('\n', fp);
     if (full) {
@@ -302,12 +306,15 @@ static void print_cli_diagnostics(FILE *fp, const help_colors *c) {
 static void print_cli_commands(FILE *fp, const help_colors *c) {
     title_red(fp, c, "Interactive Commands");
     opt(fp, c, "/help", "Show interactive commands.");
+    opt(fp, c, "/status", "Show the current model and session setup.");
     opt(fp, c, "/think [N], /think-max, /nothink", "Switch thinking mode; V4.1 accepts effort 0..100.");
     opt(fp, c, "/ctx N", "Restart the interactive session with a new context size.");
     opt(fp, c, "/power N", "Set GPU duty cycle percentage, 1..100.");
+    opt(fp, c, "/steer F", "Set FFN steering for subsequent tokens; omit F to show it.");
     opt(fp, c, "/read FILE", "Submit a text file, PNG, or JPEG as the next user message.");
     opt(fp, c, "/quit, /exit", "Leave the prompt.");
-    opt(fp, c, "Ctrl+C", "Stop current generation and return to ds4>.");
+    opt(fp, c, "Ctrl+C", "Stop current generation and return to the input box.");
+    opt(fp, c, "Shift+Enter", "Insert a newline; Ctrl+J also works on legacy terminals.");
     fputc('\n', fp);
 }
 
@@ -317,6 +324,7 @@ static void print_agent_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "--prompt-file FILE", "Read the initial prompt from FILE.");
     opt(fp, c, "--prefix-file FILE", "Preload complete alternating USER:/ASSISTANT: turns before the live task.");
     opt(fp, c, "--non-interactive", "Run without TUI. With an initial prompt: one turn; otherwise: repeated stdin prompts.");
+    opt(fp, c, "--no-alt-screen", "Keep the interactive UI inline in the normal terminal buffer.");
     opt(fp, c, "--raw-prompt", "Non-interactive initial prompt only: omit agent chat/tool text.");
     opt(fp, c, "--edit-upto", "Enable anchored [upto] edits and automatic marker insertion.");
     opt(fp, c, "-sys, --system TEXT", "Extra system prompt. Empty disables extra text.");
@@ -339,6 +347,7 @@ static void print_agent_sessions(FILE *fp, const help_colors *c) {
     opt(fp, c, "/power N", "Set GPU duty cycle percentage, 1..100.");
     opt(fp, c, "/new", "Start a fresh session from the system prompt.");
     opt(fp, c, "/quit, /exit", "Exit.");
+    opt(fp, c, "Shift+Enter", "Insert a newline; Ctrl+J also works on legacy terminals.");
     fputc('\n', fp);
 }
 

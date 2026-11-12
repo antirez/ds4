@@ -124,8 +124,13 @@ root; use `--chdir /path/to/ds4` when launching elsewhere.
 The server listens at `http://127.0.0.1:8000` by default; see [serving](docs/SERVER.md)
 for API access and multiple sessions.
 
-The interactive CLI keeps a multi-turn conversation. Use `/help`, `/read FILE`,
-`/ctx N`, and `/quit`. Ctrl+C interrupts generation and returns to the prompt.
+The interactive CLI keeps a multi-turn conversation. Use `/help`, `/status`,
+`/read FILE`, `/ctx N`, and `/quit`. Ctrl+C interrupts generation and returns to
+the input box.
+
+Interactive sessions in `ds4` and `ds4-agent` use an alternate screen by default;
+pass `--no-alt-screen` to stay in the normal terminal buffer. Enter submits a
+message; Shift+Enter inserts a newline, with Ctrl+J as a fallback.
 Run each binary with `--help` for its full options.
 
 ### Native coding agent

@@ -426,6 +426,37 @@ static void test_fragmented_terminal_input(void) {
     AGENT_TEST_ASSERT(!l.in_completion && !strcmp(l.buf, "e") && l.len == 1);
     l.buflen = sizeof(buffer) - 1;
     linenoiseSetCompletionCallback(NULL);
+    const char *newlines[] = {"\x1b[13;2u", "\x1b[27;2;13~", "\x1b[106;5u", "\x1b[57414;2u"};
+    for (size_t i = 0; i < sizeof(newlines) / sizeof(*newlines); i++) {
+        linenoiseEditClear(&l);
+        for (size_t j = 0; newlines[i][j]; j++)
+            AGENT_TEST_ASSERT(linenoiseEditFeedByte(&l, newlines[i][j]) == linenoiseEditMore);
+        AGENT_TEST_ASSERT(!strcmp(l.buf, "\n"));
+    }
+    const char released[] = "\x1b[13;2:3u";
+    for (size_t i = 0; i < sizeof(released) - 1; i++) linenoiseEditFeedByte(&l, released[i]);
+    AGENT_TEST_ASSERT(!strcmp(l.buf, "\n"));
+    const char cancel[] = "\x1b[99;5u";
+    for (size_t i = 0; i < sizeof(cancel) - 2; i++)
+        AGENT_TEST_ASSERT(linenoiseEditFeedByte(&l, cancel[i]) == linenoiseEditMore);
+    AGENT_TEST_ASSERT(linenoiseEditFeedByte(&l, 'u') == NULL && errno == EAGAIN);
+    agent_editor wheel = {0};
+    wheel.edit = (struct linenoiseState){.ifd = input[0], .ofd = fileno(sink),
+        .buf = buffer, .buflen = sizeof(buffer) - 1, .cols = 80, .prompt = ""};
+    buffer[0] = '\0';
+    editor_queue_bytes(&wheel, "\x1b", 1);
+    AGENT_TEST_ASSERT(!editor_take_bare_escape(&wheel));
+    const char mouse[] = "[<64;20;10M";
+    editor_queue_bytes(&wheel, mouse, sizeof(mouse) - 1);
+    while (linenoiseEditQueuedInput(&wheel.edit))
+        AGENT_TEST_ASSERT(linenoiseEditFeed(&wheel.edit) == linenoiseEditMore);
+    AGENT_TEST_ASSERT(wheel.edit.len == 0);
+    editor_queue_bytes(&wheel, "\x1b", 1);
+    wheel.cpr_started -= .2;
+    AGENT_TEST_ASSERT(editor_take_bare_escape(&wheel));
+    editor_queue_bytes(&wheel, "\x1b[27;1u", 7);
+    AGENT_TEST_ASSERT(editor_take_bare_escape(&wheel));
+    free(wheel.edit.queued_input);
     free(l.queued_input);
     free(l.paste_buf);
     close(input[0]); close(input[1]); fclose(sink);
@@ -515,6 +546,35 @@ static char *test_hint_capture(const char *text, size_t split, bool markdown,
     } else AGENT_TEST_ASSERT(parser.calls.len == 0);
     agent_dsml_parser_free(&parser);
     return agent_tail_capture_take(&capture, NULL);
+}
+
+static void test_thinking_spacing(void) {
+    const char *gaps[] = {"", "\n", "\n\n", "\n\n\n"};
+    for (size_t before = 0; before < 4; before++) {
+        for (size_t after = 0; after < 4; after++) {
+            char text[256];
+            snprintf(text, sizeof(text), "<think>first\n\nlast%s</think>%sanswer\n\nparagraph",
+                     gaps[before], gaps[after]);
+            for (size_t split = 0; split <= strlen(text) + 1; split++) {
+                char *out = test_hint_capture(text, split, true, false, AGENT_TOOL_SYNTAX_DSML, NULL);
+                AGENT_TEST_ASSERT(!strcmp(out, "first\n\nlast\n\nanswer\n\nparagraph\n\n"));
+                free(out);
+                agent_tail_capture capture = {.cap = 4096};
+                agent_token_renderer r = {.capture = &capture, .format_thinking = true,
+                    .format_markdown = true, .last_output_newline = true};
+                if (split <= strlen(text)) {
+                    renderer_process(&r, text, split, false);
+                    renderer_process(&r, text + split, strlen(text) - split, false);
+                } else {
+                    for (size_t i = 0; text[i]; i++) renderer_process(&r, text + i, 1, false);
+                }
+                renderer_finish(&r);
+                out = agent_tail_capture_take(&capture, NULL);
+                AGENT_TEST_ASSERT(!strcmp(out, "first\n\nlast\n\nanswer\n\nparagraph\n\n"));
+                free(out);
+            }
+        }
+    }
 }
 
 static void test_hint_rendering(void) {
@@ -692,10 +752,23 @@ static void test_tool_contracts(void) {
 }
 
 /* Model-free real-PTY driver for tests/ds4_agent_terminal_test.py. */
-static int test_terminal_driver(void) {
+static int test_terminal_driver(bool shared, bool inline_screen, bool show_help) {
     agent_editor ed = {0};
+    agent_status st = {.state = AGENT_WORKER_GENERATING, .ctx_size = 32768, .think_mode = DS4_THINK_HIGH};
+    char footer[4096] = "ready";
+    char directory[PATH_MAX];
+    agent_prompt_queue queue = {0};
+    if (shared) {
+        ds4_cli_ui_start(&ed.ui, inline_screen, "DwarfStar Agent");
+        agent_ui = &ed.ui;
+        ed.ui.state.model = "Preview agent";
+        ed.ui.state.directory = getcwd(directory, sizeof(directory)) ? directory : ".";
+        build_footer_text(&st, NULL, 120, footer, sizeof(footer));
+    }
     linenoiseSetMultiLine(1);
-    if (editor_start(&ed, "ds4-agent> ", "ready", NULL)) return 2;
+    const char *prompt = shared ? "  " : "ds4-agent> ";
+    if (editor_start(&ed, prompt, footer, NULL)) return 2;
+    if (show_help) runtime_help();
     double start = now_sec(), next = start;
     char *answer = NULL;
     unsigned tick = 0;
@@ -711,21 +784,39 @@ static int test_terminal_driver(void) {
             break;
         }
         if (now_sec() >= next) {
-            char status[80];
-            snprintf(status, sizeof(status), "generation %u", ++tick);
-            if (tick % 4 == 0) {
+            char status[4096];
+            if (shared) {
+                st.ctx_used = (int)tick;
+                if (tick == 10) agent_prompt_queue_push(&queue, "pending task");
+                build_footer_text(&st, &queue, (int)ed.edit.cols, status, sizeof(status));
+            } else snprintf(status, sizeof(status), "generation %u", tick);
+            ++tick;
+            if (shared && ed.edit.len) {
+                char output[80];
+                int n = snprintf(output, sizeof(output), "model output %u \xe4\xb8\xad\n", tick);
+                editor_write_async(&ed, output, (size_t)n, prompt, status, false);
+            } else if (!shared && tick % 4 == 0) {
                 const char output[] = "model output \xe4\xb8\xad\n";
-                editor_write_async(&ed, output, sizeof(output) - 1, "ds4-agent> ", status, false);
-            } else editor_set_prompt_status(&ed, "ds4-agent> ", status);
+                editor_write_async(&ed, output, sizeof(output) - 1, prompt, status, false);
+            } else editor_set_prompt_status(&ed, prompt, status);
             next = now_sec() + 0.05;
         }
     }
     editor_stop(&ed);
     editor_restore_terminal_layout(&ed);
+    agent_prompt_queue_free(&queue);
     if (!answer) return 3;
-    printf("\nRESULT:");
-    for (size_t i = 0; i < strlen(answer); i++) printf("%02x", (unsigned char)answer[i]);
-    puts("");
+    agent_buf result = {0};
+    agent_buf_puts(&result, "\nRESULT:");
+    for (size_t i = 0; i < strlen(answer); i++) {
+        char byte[3];
+        snprintf(byte, sizeof(byte), "%02x", (unsigned char)answer[i]);
+        agent_buf_puts(&result, byte);
+    }
+    agent_buf_puts(&result, "\n");
+    write_all(STDOUT_FILENO, result.ptr, result.len);
+    free(result.ptr);
+    if (shared) { ds4_cli_ui_stop(&ed.ui); agent_ui = NULL; }
     free(answer);
     return 0;
 }
@@ -1007,10 +1098,31 @@ static int test_full_context_save(const char *model) {
     return agent_test_failures ? 1 : 0;
 }
 
+static int test_shared_confirmation(bool timeout_expected) {
+    ds4_cli_ui ui;
+    ds4_cli_ui_start(&ui, false, "DwarfStar Agent");
+    agent_ui = &ui;
+    ui.state.model = "Preview agent";
+    ui.state.thinking = "high";
+    ui.state.ctx_size = 32768;
+    agent_yes_no_options options = {.timeout_sec = 1, .timeout_answer = AGENT_YES_NO_AUTO_NO};
+    bool timed_out = false;
+    bool answer = agent_prompt_yes_no_ex("Allow test action? (y/n) ", &options, &timed_out);
+    ds4_cli_ui_stop(&ui);
+    agent_ui = NULL;
+    return timeout_expected ? (timed_out && !answer ? 0 : 1) : (answer && !timed_out ? 0 : 1);
+}
+
 int main(int argc, char **argv) {
     if (argc == 3 && !strcmp(argv[1], "--full-context-save")) return test_full_context_save(argv[2]);
     if (argc == 3 && !strcmp(argv[1], "--think-fixture")) return test_v41_thinking(argv[2]);
-    if (argc == 2 && !strcmp(argv[1], "--terminal-driver")) return test_terminal_driver();
+    if (argc == 2 && !strcmp(argv[1], "--terminal-driver")) return test_terminal_driver(false, false, false);
+    if (argc >= 2 && !strcmp(argv[1], "--shared-terminal-driver"))
+        return test_terminal_driver(true, argc == 3 && !strcmp(argv[2], "--no-alt-screen"), false);
+    if (argc >= 2 && !strcmp(argv[1], "--shared-help"))
+        return test_terminal_driver(true, argc == 3 && !strcmp(argv[2], "--no-alt-screen"), true);
+    if (argc == 3 && !strcmp(argv[1], "--shared-confirmation"))
+        return test_shared_confirmation(!strcmp(argv[2], "timeout"));
     if (argc == 3 && !strcmp(argv[1], "--terminal-fixtures")) test_output_dir = argv[2];
     char *options[] = {"ds4-agent", "--model", "qwen.gguf",
                     "--vision", "mmproj.gguf", "--non-interactive", "-p", "test"};
@@ -1029,6 +1141,7 @@ int main(int argc, char **argv) {
     test_fragmented_terminal_input();
     test_shell_terminal_controls();
     test_markdown_literals();
+    test_thinking_spacing();
     test_hint_rendering();
     test_unicode_output_and_footer();
     test_footer_only_updates();
