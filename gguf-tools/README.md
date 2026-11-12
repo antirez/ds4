@@ -224,7 +224,9 @@ python3 gguf-tools/deepseek41_quantize.py \
 
 Omit `--dry-run` to write the file. Add `--resume` after an interrupted conversion.
 Use `libds4quants.so` on Linux. Gate/up experts use IQ2_XXS and down experts use
-Q2_K; attention, shared experts and the output head use Q8_0. Engram rows retain
+Q2_K; attention, shared experts and the output head use Q8_0. `--quant q4` uses
+Q4_K experts instead and `--quant mxfp4` keeps the released MXFP4 experts
+unchanged, repacked into GGUF blocks without calibration. Engram rows retain
 their original FP8 values and scales, packed together at the end of the GGUF for
 disk lookups. Vision and DSpark weights are not included.
 

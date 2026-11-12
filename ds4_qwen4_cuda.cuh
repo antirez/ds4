@@ -1147,7 +1147,7 @@ __global__ void matvec_q8(float *out, const char *w, const float *x,
     if (row >= M) return;
     const char *wr = w+(uint64_t)row*stride;
     float acc[ROWS] = {};
-    for (unsigned i = lane*4; i < K; i += 128) {
+    auto accumulate = [&](unsigned i) {
         const char *b = wr+(i/32)*34;
         const float scale = __half2float(*(const __half *)b);
         const uint16_t *q = (const uint16_t *)(b+2+i%32);
@@ -1161,6 +1161,13 @@ __global__ void matvec_q8(float *out, const char *w, const float *x,
             part += (float)(int8_t)(q23>>8)*v.w;
             acc[t] += part*scale;
         }
+    };
+    if constexpr (ROWS == 1) {
+        /* Issue independent weight loads ahead without reordering the sum. */
+        #pragma unroll 4
+        for (unsigned i = lane*4; i < K; i += 128) accumulate(i);
+    } else {
+        for (unsigned i = lane*4; i < K; i += 128) accumulate(i);
     }
     #pragma unroll
     for (unsigned t = 0; t < ROWS; t++) if (t < T) {
@@ -2037,6 +2044,11 @@ extern "C" int ds4_gpu_qwen4_dense_mm_tensor(ds4_gpu_tensor *out, const ds4_gpu_
         return dense_blas((float *)out->ptr,(const float *)x->ptr,w,type,T,K,M);
     return matrix_dispatch((float *)out->ptr, (const float *)x->ptr, w, NULL, NULL, NULL,
                            type, 1, T, 1, 1, K, M, 0, false);
+}
+
+extern "C" int ds4_gpu_qwen4_dense_mm_prefill_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const void *map, uint64_t size, uint64_t off, uint32_t type, uint32_t T, uint32_t K, uint32_t M) {
+    return ds4_gpu_qwen4_dense_mm_tensor(out, x, map, size, off, type, T, K, M);
 }
 
 extern "C" int ds4_gpu_qwen4_matmul_q8_0_tensor(ds4_gpu_tensor *out, const void *map,

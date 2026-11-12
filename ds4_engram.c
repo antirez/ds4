@@ -10,10 +10,14 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 #ifdef __APPLE__
 #include <dispatch/dispatch.h>
+#include <pthread/qos.h>
+#include <sys/sysctl.h>
 #endif
 
 bool ds4_engram_layout_valid(const ds4_engram_layout *l) {
@@ -293,7 +297,7 @@ bool ds4_engram_read_batch(const ds4_engram_table *t, const uint32_t *rows,
         /* Fixed concurrency hides random-read latency without caching the table.
          * Each worker owns disjoint output rows; all finish before GPU use. */
         if (count >= ENGRAM_PARALLEL_MIN_ROWS) {
-            batch.readers = ENGRAM_READERS;
+            batch.readers = count < ENGRAM_READERS ? count : ENGRAM_READERS;
 #ifdef __APPLE__
             dispatch_apply_f(batch.readers,
                 dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &batch, read_batch_part);
@@ -327,6 +331,209 @@ bool ds4_engram_read_batch(const ds4_engram_table *t, const uint32_t *rows,
     int saved = errno;
     free(request);
     errno = saved;
+    return ok;
+}
+
+struct ds4_engram_prefetch {
+    const ds4_engram_table *table;
+    const uint32_t *rows;
+    size_t tokens, stride;
+    float *out;
+    bool ok;
+    int error;
+#ifdef __APPLE__
+    dispatch_group_t group;
+#else
+    pthread_t thread;
+    bool threaded;
+#endif
+};
+
+static void prefetch_run(void *context) {
+    ds4_engram_prefetch *p = context;
+    p->ok = ds4_engram_read_batch(p->table, p->rows, p->tokens, p->stride, p->out);
+    if (!p->ok) p->error = errno ? errno : EIO;
+}
+
+#ifndef __APPLE__
+static void *prefetch_thread(void *context) {
+    prefetch_run(context);
+    return NULL;
+}
+#endif
+
+ds4_engram_prefetch *ds4_engram_read_batch_start(const ds4_engram_table *table, const uint32_t *rows,
+                                                 size_t tokens, size_t stride, float *out) {
+    ds4_engram_prefetch *p = calloc(1, sizeof(*p));
+    if (!p) return NULL;
+    *p = (ds4_engram_prefetch){.table = table, .rows = rows, .tokens = tokens, .stride = stride, .out = out};
+#ifdef __APPLE__
+    p->group = dispatch_group_create();
+    dispatch_group_async_f(p->group, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), p, prefetch_run);
+#else
+    p->threaded = pthread_create(&p->thread, NULL, prefetch_thread, p) == 0;
+    if (!p->threaded) prefetch_run(p);
+#endif
+    return p;
+}
+
+/* Page-cache warmer.  Sequential reads fill the kernel's cache with the table
+ * once; the uncached row readers then hit it instead of the device.  Spread
+ * prefill rows are the worst access pattern for external SSDs: a USB drive
+ * served ~6K random rows/s over the 189 GiB span, ~12 s per 2K prefill, but
+ * streams the whole span at ~1 GB/s.  Clean cached pages stay reclaimable, so
+ * the warmer is a hint, never a reservation: it stops at memory pressure. */
+enum { WARM_THREADS = 4 };
+#define WARM_CHUNK ((uint64_t)8 << 20)
+
+struct ds4_engram_warm {
+    int fd;
+    uint64_t begin, end, next;
+    _Atomic bool stop;
+    bool done, ok;
+    double started, seconds;
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+    unsigned running;
+    pthread_t thread[WARM_THREADS];
+    unsigned threads;
+};
+
+static double warm_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
+static bool warm_pressure(void) {
+#ifdef __APPLE__
+    int level = 0;
+    size_t len = sizeof(level);
+    /* 1 normal, 2 warn, 4 critical. */
+    return sysctlbyname("kern.memorystatus_vm_pressure_level", &level, &len, NULL, 0) == 0 &&
+           level > 1;
+#else
+    return false;
+#endif
+}
+
+static void *warm_thread(void *arg) {
+    ds4_engram_warm *w = arg;
+#ifdef __APPLE__
+    pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+#endif
+    uint8_t *buf = malloc(WARM_CHUNK);
+    bool ok = buf != NULL;
+    for (unsigned n = 0; ok && !w->stop; n++) {
+        const uint64_t off = __atomic_fetch_add(&w->next, WARM_CHUNK, __ATOMIC_RELAXED);
+        if (off >= w->end) break;
+        if (!(n & 63) && warm_pressure()) {
+            w->stop = true;
+            ok = false;
+            break;
+        }
+        size_t left = (size_t)(w->end - off < WARM_CHUNK ? w->end - off : WARM_CHUNK);
+        const uint64_t end = off + left;
+        while (left) {
+            /* A short read still warms those pages; only the file offset advances. */
+            const ssize_t got = pread(w->fd, buf, left, (off_t)(end - left));
+            if (got < 0 && errno == EINTR) continue;
+            if (got <= 0 || (size_t)got > left) {
+                ok = false;
+                break;
+            }
+            left -= (size_t)got;
+        }
+    }
+    free(buf);
+    pthread_mutex_lock(&w->lock);
+    if (!ok) w->ok = false;
+    if (--w->running == 0) {
+        w->done = true;
+        w->seconds = warm_now() - w->started;
+        pthread_cond_broadcast(&w->cond);
+    }
+    pthread_mutex_unlock(&w->lock);
+    return NULL;
+}
+
+uint64_t ds4_engram_physical_memory(void) {
+#ifdef __APPLE__
+    uint64_t bytes = 0;
+    size_t len = sizeof(bytes);
+    return sysctlbyname("hw.memsize", &bytes, &len, NULL, 0) == 0 ? bytes : 0;
+#else
+    const long pages = sysconf(_SC_PHYS_PAGES), page = sysconf(_SC_PAGESIZE);
+    return pages > 0 && page > 0 ? (uint64_t)pages * (uint64_t)page : 0;
+#endif
+}
+
+ds4_engram_warm *ds4_engram_warm_start(const char *path, uint64_t offset, uint64_t bytes) {
+    if (!path || !bytes || offset > INT64_MAX || bytes > INT64_MAX - offset) return NULL;
+    ds4_engram_warm *w = calloc(1, sizeof(*w));
+    if (!w) return NULL;
+    w->fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (w->fd < 0) {
+        free(w);
+        return NULL;
+    }
+    w->begin = w->next = offset;
+    w->end = offset + bytes;
+    w->ok = true;
+    w->started = warm_now();
+    pthread_mutex_init(&w->lock, NULL);
+    pthread_cond_init(&w->cond, NULL);
+    for (unsigned i = 0; i < WARM_THREADS; i++) {
+        pthread_mutex_lock(&w->lock);
+        w->running++;
+        pthread_mutex_unlock(&w->lock);
+        if (pthread_create(&w->thread[i], NULL, warm_thread, w)) {
+            pthread_mutex_lock(&w->lock);
+            w->running--;
+            pthread_mutex_unlock(&w->lock);
+            break;
+        }
+        w->threads++;
+    }
+    if (!w->threads) {
+        ds4_engram_warm_stop(w);
+        return NULL;
+    }
+    return w;
+}
+
+bool ds4_engram_warm_wait(ds4_engram_warm *w, double *seconds) {
+    if (!w) return false;
+    pthread_mutex_lock(&w->lock);
+    while (!w->done) pthread_cond_wait(&w->cond, &w->lock);
+    const bool ok = w->ok;
+    if (seconds) *seconds = w->seconds;
+    pthread_mutex_unlock(&w->lock);
+    return ok;
+}
+
+void ds4_engram_warm_stop(ds4_engram_warm *w) {
+    if (!w) return;
+    w->stop = true;
+    for (unsigned i = 0; i < w->threads; i++)
+        if (pthread_join(w->thread[i], NULL)) abort();
+    pthread_mutex_destroy(&w->lock);
+    pthread_cond_destroy(&w->cond);
+    close(w->fd);
+    free(w);
+}
+
+bool ds4_engram_read_batch_finish(ds4_engram_prefetch *p) {
+    if (!p) return false;
+#ifdef __APPLE__
+    dispatch_group_wait(p->group, DISPATCH_TIME_FOREVER);
+    dispatch_release(p->group);
+#else
+    if (p->threaded && pthread_join(p->thread, NULL)) abort();
+#endif
+    const bool ok = p->ok;
+    if (!ok) errno = p->error;
+    free(p);
     return ok;
 }
 

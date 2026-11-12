@@ -1396,6 +1396,16 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
             dec.ah = file_data[sos_offset + 2] >> 4;
             dec.al = file_data[sos_offset + 2] & 0x0F;
 
+            if (dec.is_progressive) {
+                /* Validate spectral selection and successive approximation
+                 * (T.81 G.1.1.1.1). Se bounds the jpeg_zigzag[64] index in
+                 * the AC decoders. */
+                if (dec.se > 63 || dec.ss > dec.se) goto fail;
+                if (dec.ss == 0 && dec.se != 0) goto fail;  /* DC scan */
+                if (dec.ss > 0 && ns != 1) goto fail;       /* AC scan */
+                if (dec.ah > 13 || dec.al > 13) goto fail;
+            }
+
             /* Setup bitstream for scan data */
             size_t scan_data_start = pos + seg_len;
             dec.bs.data = file_data + scan_data_start;

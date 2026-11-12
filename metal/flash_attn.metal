@@ -1396,15 +1396,21 @@ template [[host_name("kernel_flash_attn_ext_vec_f16_dk512_dv512")]]  kernel flas
 constant int32_t FC_flash_attn_ext_vec_reduce_DV  [[function_constant(FC_FLASH_ATTN_EXT_VEC_REDUCE + 0)]];
 constant int32_t FC_flash_attn_ext_vec_reduce_NWG [[function_constant(FC_FLASH_ATTN_EXT_VEC_REDUCE + 1)]];
 
+static inline float ds4_bf16_round(float v);
+
 // Reduces split-K decode FlashAttention partials. It combines each workgroup's
 // output vector and softmax (sum,max) pair into the final attention result.
 /* Shared and deliberately noinline so the split-K reduction is compiled once and
  * every caller gets identical codegen. The RoPE-fused sibling in dsv4_rope.metal
- * calls this same body, which is what keeps the fusion bit-exact. */
+ * calls this same body, which is what keeps the fusion bit-exact.
+ * HEADS (V4.1 decode) writes the low projection's input instead: each head bf16-rounded and its rotary tail
+ * inverse-roped from the step's table, as the rope low kernel does it (ds4_bf16_round is idempotent). */
+template <bool HEADS = false>
 static __attribute__((noinline)) void ds4_flash_attn_vec_reduce_row(
         constant ds4_metal_args_flash_attn_ext_vec_reduce & args,
         device  const char * htmp,
         device        char * dst,
+        device const float2 * rope_tab,
         uint   tgpig,
         ushort tiisg,
         ushort sgitg,
@@ -1434,7 +1440,24 @@ static __attribute__((noinline)) void ds4_flash_attn_vec_reduce_row(
         const float4 v = simd_sum(htmp4[i*NWG_ + iwg]*ms);
 
         if (iwg == 0) {
-            dst4[i] = v*S;
+            if (!HEADS) {
+                dst4[i] = v*S;
+            } else {
+                const float4 t = v*S;
+                float4 r = float4(ds4_bf16_round(t.x), ds4_bf16_round(t.y), ds4_bf16_round(t.z), ds4_bf16_round(t.w));
+                if (i >= DV4 - 16) {
+                    const short p0 = 2*(i - (DV4 - 16));
+                    const float2 c0 = rope_tab[p0];
+                    const float2 c1 = rope_tab[p0 + 1];
+                    const float s0 = -c0.y, s1 = -c1.y;
+                    const float re0 = r.x, im0 = r.y, re1 = r.z, im1 = r.w;
+                    r.x = ds4_bf16_round(fma(re0, c0.x, -(im0 * s0)));
+                    r.y = ds4_bf16_round(fma(im0, c0.x, re0 * s0));
+                    r.z = ds4_bf16_round(fma(re1, c1.x, -(im1 * s1)));
+                    r.w = ds4_bf16_round(fma(im1, c1.x, re1 * s1));
+                }
+                dst4[i] = r;
+            }
         }
     }
 }
@@ -1446,7 +1469,7 @@ kernel void kernel_flash_attn_ext_vec_reduce(
         uint   tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    ds4_flash_attn_vec_reduce_row(args, htmp, dst, tgpig, tiisg, sgitg,
+    ds4_flash_attn_vec_reduce_row(args, htmp, dst, nullptr, tgpig, tiisg, sgitg,
                                   (short)FC_flash_attn_ext_vec_reduce_NWG,
                                   (short)FC_flash_attn_ext_vec_reduce_DV);
 }

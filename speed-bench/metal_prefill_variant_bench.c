@@ -31,6 +31,7 @@ typedef struct {
     int n_extra;
     int n_control;
     bool interleave;
+    bool display_progress;
     int prefill_chunk;
     int prefix_tokens;
     int initial_tokens;
@@ -66,7 +67,8 @@ static void usage(FILE *fp, const char *argv0) {
             "  --repeats N            alternating ABBA/BAAB pairs (default: 2)\n"
             "  --interleave           one session per repeat, prefilled chunk by chunk with the\n"
             "                         variant alternating per chunk (and per repeat), so both\n"
-            "                         variants share the machine state and every position\n",
+            "                         variants share the machine state and every position\n"
+            "  --display-progress     install the server-style display callback for both variants\n",
             argv0);
 }
 
@@ -135,6 +137,8 @@ static bench_config parse_options(int argc, char **argv) {
             list[(*n)++] = spec;
         } else if (!strcmp(arg, "--interleave")) {
             cfg.interleave = true;
+        } else if (!strcmp(arg, "--display-progress")) {
+            cfg.display_progress = true;
         } else if (!strcmp(arg, "--prefix-tokens")) {
             cfg.prefix_tokens =
                 parse_int_arg(need_arg(&i, argc, argv, arg), arg, 1);
@@ -190,6 +194,10 @@ static double now_sec(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1.0e9;
+}
+
+static void display_progress(void *ud, const char *event, int current, int total) {
+    (void)ud; (void)event; (void)current; (void)total;
 }
 
 static char *read_text(const char *path) {
@@ -348,6 +356,8 @@ static int warm_variant(
                 variant == 0 ? "control" : "candidate");
         return 1;
     }
+    if (cfg->display_progress)
+        ds4_session_set_display_progress(session, display_progress, NULL);
     const int rc = ds4_session_sync(session, &warmup, err, errlen);
     if (rc != 0) {
         fprintf(stderr,
@@ -472,6 +482,8 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "%s: failed to create interleaved session %d\n", BENCH_NAME, repeat + 1);
                 goto done;
             }
+            if (cfg.display_progress)
+                ds4_session_set_display_progress(session, display_progress, NULL);
             err[0] = '\0';
             if (initial.len && ds4_session_sync(session, &initial, err, sizeof(err)) != 0) {
                 fprintf(stderr, "%s: initial prefix failed: %s\n", BENCH_NAME, err);
@@ -537,6 +549,8 @@ int main(int argc, char **argv) {
                 if (session) ds4_session_free(session);
                 goto done;
             }
+            if (cfg.display_progress)
+                ds4_session_set_display_progress(session, display_progress, NULL);
 
             err[0] = '\0';
             if (initial.len && ds4_session_sync(session, &initial, err, sizeof(err)) != 0) {

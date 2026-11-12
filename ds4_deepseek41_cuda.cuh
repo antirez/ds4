@@ -455,14 +455,15 @@ extern "C" int ds4_gpu_dsv41_pool2(ds4_gpu_tensor *out, const ds4_gpu_tensor *kv
 
 __global__ static void dsv41_candidates_kernel(float *out, const float *scores,
                                                const float *mask, uint32_t width,
-                                               uint32_t rows, uint32_t start, uint32_t ratio) {
+                                               uint32_t rows, uint32_t start, uint32_t ratio,
+                                               uint32_t mask_stride) {
     const uint32_t blocks = (width + 7u) / 8u, out_width = mask ? width : blocks;
     const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (uint64_t)out_width * rows) return;
     const uint32_t row = i / out_width, col = i % out_width;
     const uint32_t visible = min(width, (start + row + 1u) / ratio);
     if (mask) {
-        out[i] = col < visible && mask[(uint64_t)row * blocks + col / 8u] == 0.0f ? scores[i] : -INFINITY;
+        out[i] = col < visible && mask[(uint64_t)row * mask_stride + col / 8u] == 0.0f ? scores[i] : -INFINITY;
     } else {
         float best = -INFINITY;
         for (uint32_t j = col * 8u; j < min(visible, (col + 1u) * 8u); j++)
@@ -474,27 +475,64 @@ __global__ static void dsv41_candidates_kernel(float *out, const float *scores,
 
 static int dsv41_candidates(ds4_gpu_tensor *out, const ds4_gpu_tensor *scores,
                             const ds4_gpu_tensor *mask, uint32_t width, uint32_t rows,
-                            uint32_t start, uint32_t ratio) {
+                            uint32_t start, uint32_t ratio, uint32_t mask_stride) {
     if (!width || width > UINT32_MAX - 7u || !rows || !ratio || rows > UINT32_MAX - start) return 0;
     const uint32_t blocks = (width + 7u) / 8u;
     const uint64_t count = (uint64_t)(mask ? width : blocks) * rows;
-    if (!dsv41_has_floats(scores, (uint64_t)width * rows) || !dsv41_has_floats(out, count) ||
-        (mask && !dsv41_has_floats(mask, (uint64_t)blocks * rows)) ||
+    if (!mask_stride) mask_stride = blocks;
+    if (mask_stride < blocks ||
+        !dsv41_has_floats(scores, (uint64_t)width * rows) || !dsv41_has_floats(out, count) ||
+        (mask && !dsv41_has_floats(mask, (uint64_t)mask_stride * (rows - 1u) + blocks)) ||
         (count + 255u) / 256u > INT32_MAX) return 0;
     dsv41_candidates_kernel<<<(unsigned)((count + 255u) / 256u), 256, 0, cuda_decode_stream()>>>(
         (float *)out->ptr, (const float *)scores->ptr, mask ? (const float *)mask->ptr : NULL,
-        width, rows, start, ratio);
+        width, rows, start, ratio, mask_stride);
     return cuda_ok(cudaGetLastError(), "V4.1 sparse candidates");
 }
 
 extern "C" int ds4_gpu_dsv41_candidate_blocks(ds4_gpu_tensor *out, const ds4_gpu_tensor *scores,
                                               uint32_t width, uint32_t rows, uint32_t start, uint32_t ratio) {
-    return dsv41_candidates(out, scores, NULL, width, rows, start, ratio);
+    return dsv41_candidates(out, scores, NULL, width, rows, start, ratio, 0);
 }
 
 extern "C" int ds4_gpu_dsv41_candidate_filter(ds4_gpu_tensor *scores, const ds4_gpu_tensor *mask,
-                                              uint32_t width, uint32_t rows, uint32_t start, uint32_t ratio) {
-    return mask && dsv41_candidates(scores, scores, mask, width, rows, start, ratio);
+                                              uint32_t width, uint32_t rows, uint32_t start, uint32_t ratio,
+                                              uint32_t mask_stride) {
+    return mask && dsv41_candidates(scores, scores, mask, width, rows, start, ratio, mask_stride);
+}
+
+extern "C" int ds4_gpu_dsv41_candidate_topk_batch(ds4_gpu_tensor *selected, const ds4_gpu_tensor *blocks,
+                                                  uint32_t width, uint32_t rows, uint32_t start) {
+    if (!rows || start > UINT32_MAX - 8u || rows > UINT32_MAX - 8u - start ||
+        (start + rows + 7u) / 8u > width || (start + 8u) / 8u <= 2048u ||
+        !dsv41_has_floats(selected, (uint64_t)rows * 2048u) ||
+        !dsv41_has_floats(blocks, (uint64_t)rows * width)) return 0;
+    for (uint32_t row = 0; row < rows; row++) {
+        const uint32_t visible = (start + row + 8u) / 8u;
+        ds4_gpu_tensor src = *blocks, dst = *selected;
+        src.ptr = (float *)src.ptr + (uint64_t)row * width;
+        src.bytes = (uint64_t)visible * sizeof(float);
+        dst.ptr = (uint32_t *)dst.ptr + (uint64_t)row * 2048u;
+        dst.bytes = 2048u * sizeof(uint32_t);
+        if (!ds4_gpu_indexer_topk_tensor(&dst, &src, visible, 1u, 2048u)) return 0;
+    }
+    return 1;
+}
+
+extern "C" int ds4_gpu_dsv41_candidate_mask_batch(ds4_gpu_tensor *mask, const ds4_gpu_tensor *selected,
+                                                  uint32_t width, uint32_t rows, uint32_t mask_stride) {
+    if (!rows || mask_stride < width ||
+        !dsv41_has_floats(selected, (uint64_t)rows * 2048u) ||
+        !dsv41_has_floats(mask, (uint64_t)mask_stride * (rows - 1u) + width)) return 0;
+    for (uint32_t row = 0; row < rows; row++) {
+        ds4_gpu_tensor src = *selected, dst = *mask;
+        src.ptr = (uint32_t *)src.ptr + (uint64_t)row * 2048u;
+        src.bytes = 2048u * sizeof(uint32_t);
+        dst.ptr = (float *)dst.ptr + (uint64_t)row * mask_stride;
+        dst.bytes = (uint64_t)width * sizeof(float);
+        if (!ds4_gpu_dsv4_topk_mask_tensor(&dst, &src, width, 1u, 2048u)) return 0;
+    }
+    return 1;
 }
 
 __global__ static void dsv41_carry_kernel(uint32_t *packed, float *plain,
@@ -556,30 +594,70 @@ extern "C" int ds4_gpu_dsv41_gather_kv(ds4_gpu_tensor *out, const ds4_gpu_tensor
     return cuda_ok(cudaGetLastError(), "V4.1 sparse KV gather");
 }
 
-/* A warp owns one score. Preserve the 128-lane reduction tree, but keep
- * all partials in registers instead of synchronizing a block per head. */
+/* A warp reuses each query across adjacent keys. Each key keeps its own
+ * accumulator and the same 128-element reduction tree. Grouped launches
+ * cover a single fully visible row, so only the final group can be short. */
+template<int keys_per_warp, bool masked>
 __global__ static void dsv41_index_scores_kernel(float *scores, const float *q,
-        const float *weights, const float *keys, uint32_t width,
+        const float *weights, const float *keys, const float *block_mask, uint32_t width,
         uint32_t start, uint32_t ratio) {
-    const uint32_t key = blockIdx.x * 8u + threadIdx.x / 32u;
+    const uint32_t first = (blockIdx.x * 8u + threadIdx.x / 32u) * keys_per_warp;
     const uint32_t row = blockIdx.y, lane = threadIdx.x & 31u;
-    if (key >= width) return;
-    if (key >= (start + row + 1u) / ratio) {
-        if (!lane) scores[(uint64_t)row * width + key] = -INFINITY;
+    if (first >= width) return;
+    scores += (uint64_t)row * width + first;
+    if (first >= (start + row + 1u) / ratio || (masked && block_mask[first / 8u] != 0.0f)) {
+        if (!lane) {
+            #pragma unroll
+            for (int i = 0; i < keys_per_warp; i++)
+                if (first + i < width) scores[i] = -INFINITY;
+        }
         return;
     }
-    const float *k = keys + (uint64_t)key * 128u + lane;
-    const float k0 = k[0], k1 = k[32], k2 = k[64], k3 = k[96];
-    float total = 0;
+    float4 k[keys_per_warp];
+    float total[keys_per_warp] = {};
+    #pragma unroll
+    for (int i = 0; i < keys_per_warp; i++) {
+        const uint32_t key = keys_per_warp == 1 ? first : min(first + i, width - 1u);
+        const float *v = keys + (uint64_t)key * 128u + lane;
+        k[i] = make_float4(v[0], v[32], v[64], v[96]);
+    }
     for (uint32_t h = 0; h < 32u; h++) {
         const float *x = q + ((uint64_t)row * 32u + h) * 128u + lane;
-        const float a = __fadd_rn(__fmul_rn(x[0], k0), __fmul_rn(x[64], k2));
-        const float b = __fadd_rn(__fmul_rn(x[32], k1), __fmul_rn(x[96], k3));
-        float dot = __fadd_rn(a, b);
-        dot = warp_sum_f32(dot);
-        total += fmaxf(dot, 0.0f) * weights[(uint64_t)row * 32u + h];
+        const float q0 = x[0], q1 = x[32], q2 = x[64], q3 = x[96];
+        const float weight = weights[(uint64_t)row * 32u + h];
+        #pragma unroll
+        for (int i = 0; i < keys_per_warp; i++) {
+            const float a = __fadd_rn(__fmul_rn(q0, k[i].x), __fmul_rn(q2, k[i].z));
+            const float b = __fadd_rn(__fmul_rn(q1, k[i].y), __fmul_rn(q3, k[i].w));
+            const float dot = warp_sum_f32(__fadd_rn(a, b));
+            total[i] += fmaxf(dot, 0.0f) * weight;
+        }
     }
-    if (!lane) scores[(uint64_t)row * width + key] = total * (1.0f / 64.0f);
+    if (!lane) {
+        #pragma unroll
+        for (int i = 0; i < keys_per_warp; i++)
+            if (first + i < width) scores[i] = total[i] * (1.0f / 64.0f);
+    }
+}
+
+template<int keys_per_warp, bool masked>
+static void dsv41_launch_index_scores(ds4_gpu_tensor *scores, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights, const ds4_gpu_tensor *keys, const ds4_gpu_tensor *block_mask,
+        uint32_t width, uint32_t rows, uint32_t start, uint32_t ratio) {
+    const uint32_t keys_per_block = 8u * keys_per_warp;
+    dsv41_index_scores_kernel<keys_per_warp, masked>
+        <<<dim3((width + keys_per_block - 1u) / keys_per_block, rows), 256, 0, cuda_decode_stream()>>>(
+            (float *)scores->ptr, (const float *)q->ptr, (const float *)weights->ptr,
+            (const float *)keys->ptr, masked ? (const float *)block_mask->ptr : NULL, width, start, ratio);
+}
+
+static bool dsv41_group_index_keys(uint32_t width) {
+#ifdef __HIP_PLATFORM_AMD__
+    (void)width;
+    return false;
+#else
+    return width >= 8192u && ds4_gpu_device_is_spark() && !getenv("DS4_CUDA_DISABLE_V41_GROUP_INDEX_KEYS");
+#endif
 }
 
 extern "C" int ds4_gpu_dsv41_indexer_scores_batch(ds4_gpu_tensor *scores,
@@ -594,10 +672,27 @@ extern "C" int ds4_gpu_dsv41_indexer_scores_batch(ds4_gpu_tensor *scores,
         !dsv41_has_floats(keys, (uint64_t)source_rows * 128u)) return 0;
     /* FP4 with power-of-two scales can exceed FP16's exponent range.
      * Do not pass these already-quantized values through the GLM FP16 tile. */
-    dsv41_index_scores_kernel<<<dim3((source_rows + 7u) / 8u, rows), 256, 0, cuda_decode_stream()>>>(
-        (float *)scores->ptr, (const float *)q->ptr, (const float *)weights->ptr,
-        (const float *)keys->ptr, source_rows, start, ratio);
+    if (rows == 1 && (start + 1u) / ratio == source_rows && dsv41_group_index_keys(source_rows))
+        dsv41_launch_index_scores<8, false>(scores, q, weights, keys, NULL, source_rows, rows, start, ratio);
+    else
+        dsv41_launch_index_scores<1, false>(scores, q, weights, keys, NULL, source_rows, rows, start, ratio);
     return cuda_ok(cudaGetLastError(), "V4.1 index scores");
+}
+
+/* The rejection sentinel and original key positions match candidate_filter. */
+extern "C" int ds4_gpu_dsv41_indexer_scores_masked_one(ds4_gpu_tensor *scores,
+        const ds4_gpu_tensor *q, const ds4_gpu_tensor *weights, const ds4_gpu_tensor *keys,
+        const ds4_gpu_tensor *block_mask, uint32_t width) {
+    if (!width || width > INT32_MAX) return 0;
+    const uint32_t blocks = (width + 7u) / 8u;
+    if (!dsv41_has_floats(scores, width) || !dsv41_has_floats(q, 32u * 128u) ||
+        !dsv41_has_floats(weights, 32u) || !dsv41_has_floats(keys, (uint64_t)width * 128u) ||
+        !dsv41_has_floats(block_mask, blocks)) return 0;
+    if (dsv41_group_index_keys(width))
+        dsv41_launch_index_scores<8, true>(scores, q, weights, keys, block_mask, width, 1, width - 1u, 1u);
+    else
+        dsv41_launch_index_scores<1, true>(scores, q, weights, keys, block_mask, width, 1, width - 1u, 1u);
+    return cuda_ok(cudaGetLastError(), "V4.1 masked index scores");
 }
 
 extern "C" int ds4_gpu_dsv41_tensor_ops_available(void) { return 0; }
@@ -608,6 +703,52 @@ extern "C" int ds4_gpu_dsv41_indexer_scores_packed(ds4_gpu_tensor *, const ds4_g
                                                    const ds4_gpu_tensor *, const ds4_gpu_tensor *,
                                                    const ds4_gpu_tensor *, uint32_t, uint32_t,
                                                    uint32_t, uint32_t, uint32_t, uint32_t) { return 0; }
+extern "C" int ds4_gpu_dsv41_project_pair_q8(ds4_gpu_tensor *, ds4_gpu_tensor *, const void *, uint64_t,
+                                             uint64_t, uint64_t, uint32_t, uint32_t, uint32_t,
+                                             const ds4_gpu_tensor *) { return 0; }
+extern "C" int ds4_gpu_dsv41_shared_swiglu(ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gpu_tensor *, const void *,
+                                           uint64_t, uint64_t, uint64_t, uint32_t, uint32_t,
+                                           const ds4_gpu_tensor *, float, uint32_t) { return 0; }
+extern "C" int ds4_gpu_dsv41_matmul_expand_rows(ds4_gpu_tensor *, const void *, uint64_t, uint64_t, uint32_t,
+                                                uint32_t, const ds4_gpu_tensor *, const ds4_gpu_tensor *,
+                                                const ds4_gpu_tensor *, const ds4_gpu_tensor *, uint32_t,
+                                                uint32_t) { return 0; }
+extern "C" int ds4_gpu_dsv41_norm_pair_rows(ds4_gpu_tensor *, const ds4_gpu_tensor *, uint64_t, uint32_t,
+                                            ds4_gpu_tensor *, const ds4_gpu_tensor *, uint64_t, uint32_t,
+                                            const void *, uint64_t, float, uint32_t) { return 0; }
+extern "C" int ds4_gpu_dsv41_rope_quantize(const ds4_gpu_tensor *, ds4_gpu_tensor *, uint64_t, uint32_t,
+                                           uint32_t, bool, ds4_v41_activation_format) { return 0; }
+extern "C" int ds4_gpu_dsv41_project_f16_bf16(ds4_gpu_tensor *, const void *, uint64_t, uint64_t, uint32_t,
+                                              uint32_t, const ds4_gpu_tensor *) { return 0; }
+extern "C" int ds4_gpu_dsv41_attention_decode(ds4_gpu_tensor *, const void *, uint64_t, uint64_t,
+                                              const ds4_gpu_tensor *, const ds4_gpu_tensor *, uint32_t, uint32_t,
+                                              uint32_t, const ds4_gpu_tensor *, const ds4_gpu_tensor *,
+                                              ds4_gpu_tensor *, uint32_t, uint32_t, uint32_t, uint32_t) { return 0; }
+extern "C" int ds4_gpu_dsv41_project_q(ds4_gpu_tensor *, const void *, uint64_t, uint64_t, uint32_t, uint32_t,
+                                       const ds4_gpu_tensor *, uint32_t, bool) { return 0; }
+extern "C" int ds4_gpu_dsv41_attention_low(ds4_gpu_tensor *, const void *, uint64_t, uint64_t, uint32_t, uint32_t,
+                                           uint32_t, ds4_gpu_tensor *, uint32_t, bool) { return 0; }
+extern "C" int ds4_gpu_dsv41_hc_block_input_rows(ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gpu_tensor *,
+                                                 ds4_gpu_tensor *, const ds4_gpu_tensor *, const ds4_gpu_tensor *,
+                                                 const void *, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+                                                 uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, float, float,
+                                                 uint32_t, uint32_t) { return 0; }
+extern "C" int ds4_gpu_dsv41_hc_project(ds4_gpu_tensor *, const ds4_gpu_tensor *, const void *, uint64_t, uint64_t,
+                                        uint32_t, uint32_t, float) { return 0; }
+extern "C" int ds4_gpu_dsv41_router_rows(ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gpu_tensor *, const ds4_gpu_tensor *,
+                                         const void *, uint64_t, uint64_t, uint32_t, uint32_t, float,
+                                         uint32_t) { return 0; }
+extern "C" int ds4_gpu_dsv41_matmul_f32_rows(ds4_gpu_tensor *, const void *, uint64_t, uint64_t, uint32_t, uint32_t,
+                                             const ds4_gpu_tensor *, uint32_t) { return 0; }
+extern "C" int ds4_gpu_dsv41_hc_input(ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gpu_tensor *, const ds4_gpu_tensor *,
+                                      const ds4_gpu_tensor *, const ds4_gpu_tensor *, const void *, uint64_t,
+                                      uint64_t, uint64_t, uint64_t, uint32_t, uint32_t, uint32_t, float,
+                                      float) { return 0; }
+
+extern "C" int ds4_gpu_dsv41_indexer_topk_tensor(ds4_gpu_tensor *selected, const ds4_gpu_tensor *scores,
+                                                 uint32_t n_comp, uint32_t n_tokens, uint32_t top_k) {
+    return ds4_gpu_indexer_topk_tensor(selected, scores, n_comp, n_tokens, top_k);
+}
 
 #ifdef __HIP_PLATFORM_AMD__
 __global__ static void dsv41_causal_scores_kernel(float *out, const float *scores,
@@ -623,7 +764,7 @@ extern "C" int ds4_gpu_dsv41_indexer_topk_batch(ds4_gpu_tensor *selected, const 
                                                 uint32_t start, uint32_t ratio) {
     if ((ratio != 1u && ratio != 2u) || !rows || rows > UINT32_MAX - start ||
         width > INT32_MAX || rows > INT32_MAX || (start + rows) / ratio > width ||
-        (start + 1u) / ratio < 1024u ||
+        (start + 1u) / ratio <= 512u ||
         !dsv41_has_floats(selected, (uint64_t)rows * 512u) ||
         !dsv41_has_floats(scores, (uint64_t)rows * width)) return 0;
 #ifdef __HIP_PLATFORM_AMD__
@@ -682,6 +823,24 @@ extern "C" int ds4_gpu_dsv41_indexer_topk_batch(ds4_gpu_tensor *selected, const 
         if (!ds4_gpu_indexer_topk_tensor(&dst, &src, visible, 1u, 512u)) return 0;
     }
     return 1;
+}
+
+__global__ static void dsv41_indexer_all_kernel(int32_t *ids, uint32_t rows,
+                                                uint32_t start, uint32_t ratio) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t row = i / 512u, col = i % 512u;
+    if (row >= rows) return;
+    const uint32_t visible = (start + row + 1u) / ratio;
+    if (col < min(visible, 512u)) ids[i] = (int32_t)col;
+}
+
+extern "C" int ds4_gpu_dsv41_indexer_all_batch(ds4_gpu_tensor *selected, uint32_t rows,
+                                               uint32_t start, uint32_t ratio) {
+    if (!ratio || !rows || rows > UINT32_MAX - start || (start + rows) / ratio > 512u ||
+        !dsv41_has_floats(selected, (uint64_t)rows * 512u)) return 0;
+    dsv41_indexer_all_kernel<<<(unsigned)(((uint64_t)rows * 512u + 255u) / 256u), 256, 0,
+        cuda_decode_stream()>>>((int32_t *)selected->ptr, rows, start, ratio);
+    return cuda_ok(cudaGetLastError(), "V4.1 indexer select all");
 }
 
 extern "C" int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out, const void *model_map,
@@ -795,4 +954,64 @@ extern "C" int ds4_gpu_dsv41_attention_output_tp_batch(
     return ds4_gpu_dsv41_quantize(low, 4096u, rows, DS4_V41_BF16) &&
         ds4_gpu_matmul_q8_0_kslice_rows_tensor(out, model_map, model_size,
             b, 8192u, 5120u, rank * 4096u, 4096u, low, rows);
+}
+
+/* Metal folds these bf16 roundings into the producing kernels; here the
+ * standalone rounding pass follows (or precedes) the unchanged operator. */
+static uint32_t ds4_gpu_dsv41_rows_of(const ds4_gpu_tensor *t, uint32_t width) {
+    const uint64_t bytes = ds4_gpu_tensor_bytes(t);
+    const uint64_t rows = width ? bytes / ((uint64_t)width * sizeof(float)) : 0;
+    return rows ? (uint32_t)rows : 1u;
+}
+
+extern "C" int ds4_gpu_rms_norm_weight_bf16_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const void *model_map,
+        uint64_t model_size, uint64_t weight_offset, uint32_t n, float eps) {
+    return ds4_gpu_rms_norm_weight_tensor(out, x, model_map, model_size, weight_offset, n, eps) &&
+           ds4_gpu_dsv41_quantize(out, n, 1, DS4_V41_BF16);
+}
+
+extern "C" int ds4_gpu_matmul_q8_0_bf16_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
+    return ds4_gpu_matmul_q8_0_tensor(out, model_map, model_size, weight_offset, in_dim, out_dim, x, n_tok) &&
+           ds4_gpu_dsv41_quantize(out, (uint32_t)out_dim, (uint32_t)n_tok, DS4_V41_BF16);
+}
+
+extern "C" int ds4_gpu_matmul_q8_0_bf16io_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint64_t in_dim, uint64_t out_dim, ds4_gpu_tensor *x, uint64_t n_tok) {
+    return ds4_gpu_dsv41_quantize(x, (uint32_t)in_dim, (uint32_t)n_tok, DS4_V41_BF16) &&
+           ds4_gpu_matmul_q8_0_bf16_tensor(out, model_map, model_size, weight_offset, in_dim, out_dim, x, n_tok);
+}
+
+extern "C" int ds4_gpu_hc_weighted_sum_bf16_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *weights,
+        uint32_t n_embd, uint32_t n_hc) {
+    return ds4_gpu_hc_weighted_sum_tensor(out, residual_hc, weights, n_embd, n_hc) &&
+           ds4_gpu_dsv41_quantize(out, n_embd, ds4_gpu_dsv41_rows_of(out, n_embd), DS4_V41_BF16);
+}
+
+extern "C" int ds4_gpu_hc_expand_split_bf16_tensor(
+        ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
+    return ds4_gpu_hc_expand_split_tensor(out_hc, block_out, residual_hc, split, n_embd, n_hc) &&
+           ds4_gpu_dsv41_quantize(out_hc, n_hc * n_embd, ds4_gpu_dsv41_rows_of(out_hc, n_hc * n_embd), DS4_V41_BF16);
+}
+
+/* block_out is scratch owned by the caller: the sum lands in it before the expansion. */
+extern "C" int ds4_gpu_hc_expand_split_add_bf16_tensor(
+        ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *block_add,
+        const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
+    ds4_gpu_tensor *block = (ds4_gpu_tensor *)block_out;
+    const uint32_t rows = ds4_gpu_dsv41_rows_of(block_out, n_embd);
+    return ds4_gpu_add_tensor(block, block_out, block_add, (uint64_t)n_embd * rows) &&
+           ds4_gpu_dsv41_quantize(block, n_embd, rows, DS4_V41_BF16) &&
+           ds4_gpu_hc_expand_split_bf16_tensor(out_hc, block_out, residual_hc, split, n_embd, n_hc);
+}
+
+extern "C" int ds4_gpu_dsv41_rope_bf16(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
+                                       uint32_t rows, uint32_t start, bool compressed, bool inverse) {
+    return ds4_gpu_dsv41_quantize(x, width * heads, rows, DS4_V41_BF16) &&
+           ds4_gpu_dsv41_rope(x, width, heads, rows, start, compressed, inverse);
 }
