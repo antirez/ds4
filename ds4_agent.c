@@ -8,6 +8,7 @@
 #include "ds4_tp.h"
 #include "ds4_web.h"
 #include "linenoise.h"
+#include "ds4_cli_ui.h"
 
 #include <errno.h>
 #include <ctype.h>
@@ -90,6 +91,8 @@ typedef struct {
     const char *gpu_devices_arg;
     const char *chdir_path;
     bool non_interactive;
+    bool no_alt_screen;
+    char launch_dir[PATH_MAX];
     bool edit_upto;
 } agent_config;
 
@@ -116,8 +119,11 @@ typedef struct {
     int ctx_used;
     int ctx_size;
     int power_percent;
+    ds4_think_mode think_mode;
     char error[256];
 } agent_status;
+
+static ds4_cli_ui *agent_ui;
 
 typedef struct agent_bash_job agent_bash_job;
 
@@ -812,6 +818,8 @@ static agent_config parse_options(int argc, char **argv) {
             }
         } else if (!strcmp(arg, "--non-interactive")) {
             c.non_interactive = true;
+        } else if (!strcmp(arg, "--no-alt-screen")) {
+            c.no_alt_screen = true;
         } else if (!strcmp(arg, "--raw") || !strcmp(arg, "--raw-prompt")) {
             c.gen.raw_prompt = true;
         } else if (!strcmp(arg, "--edit-upto")) {
@@ -11316,6 +11324,7 @@ static void worker_consume(agent_worker *w, char **out, size_t *out_len, agent_s
     w->status.ctx_used = w->transcript.len;
     w->status.ctx_size = agent_worker_effective_ctx_size(w);
     w->status.power_percent = worker_status_power_locked(w);
+    w->status.think_mode = effective_think_mode(w->cfg);
     if (status) *status = w->status;
     w->wake_pending = false;
     pthread_mutex_unlock(&w->mu);
@@ -11326,6 +11335,7 @@ static void worker_get_status(agent_worker *w, agent_status *status) {
     w->status.ctx_used = w->transcript.len;
     w->status.ctx_size = agent_worker_effective_ctx_size(w);
     w->status.power_percent = worker_status_power_locked(w);
+    w->status.think_mode = effective_think_mode(w->cfg);
     *status = w->status;
     pthread_mutex_unlock(&w->mu);
 }
@@ -11344,6 +11354,7 @@ static bool worker_is_initialized(agent_worker *w, agent_status *status) {
     w->status.ctx_used = w->transcript.len;
     w->status.ctx_size = agent_worker_effective_ctx_size(w);
     w->status.power_percent = worker_status_power_locked(w);
+    w->status.think_mode = effective_think_mode(w->cfg);
     if (status) *status = w->status;
     bool initialized = w->initialized;
     pthread_mutex_unlock(&w->mu);
@@ -11355,6 +11366,7 @@ static bool stdout_is_tty(void) {
 }
 
 static char *agent_format_user_prompt_echo(const char *text) {
+    if (agent_ui && agent_ui->active) return xstrdup(text);
     agent_buf b = {0};
     if (stdout_is_tty()) {
         agent_buf_puts(&b, "\x1b[1;91m*\x1b[1;97m ");
@@ -11369,6 +11381,10 @@ static char *agent_format_user_prompt_echo(const char *text) {
 }
 
 static void agent_echo_user_prompt(const char *text) {
+    if (agent_ui && agent_ui->active) {
+        ds4_cli_ui_print_user(agent_ui, text);
+        return;
+    }
     char *msg = agent_format_user_prompt_echo(text);
     printf("%s", msg);
     fflush(stdout);
@@ -11383,7 +11399,7 @@ static void agent_echo_user_prompt(const char *text) {
 static void agent_format_ctx_size(int ctx_size, char *buf, size_t len);
 #define AGENT_INPUT_INITIAL_BUFLEN 4096
 #define AGENT_INPUT_MAX_BUFLEN (1024*1024)
-#define AGENT_STATUS_STYLE_START "\x1b[48;5;238;38;5;252m"
+#define AGENT_STATUS_STYLE_START "\x1b[97m"
 #define AGENT_STATUS_STYLE_END "\x1b[0m"
 #define AGENT_STATUS_BAR_FILL "\x1b[48;5;238;38;5;201;1m"
 #define AGENT_QUEUE_STYLE "\x1b[38;5;87;1m"
@@ -11403,7 +11419,7 @@ static void agent_progress_append(char *buf, size_t len, size_t *pos,
 
 static void build_prompt_text(const agent_status *st, char *buf, size_t len) {
     (void)st;
-    snprintf(buf, len, "ds4-agent> ");
+    snprintf(buf, len, "%s", agent_ui && agent_ui->active ? "  " : "ds4-agent> ");
 }
 
 static void agent_progress_bar(int done, int total, double tps,
@@ -11473,6 +11489,15 @@ static const char *agent_prefill_label(const agent_status *st) {
 /* Build the one-line footer shown below the prompt.  It is intentionally compact
  * because linenoise redraws it on every progress update. */
 static void build_status_text(const agent_status *st, char *buf, size_t len) {
+    if (agent_ui && agent_ui->active) {
+        ds4_cli_ui_state *state = &agent_ui->state;
+        state->ctx_used = st->ctx_used;
+        state->ctx_size = st->ctx_size;
+        state->thinking = st->think_mode == DS4_THINK_NONE ? "off" : ds4_think_mode_name(st->think_mode);
+        state->power_percent = st->power_percent;
+        ds4_cli_ui_format_footer(state, agent_ui->columns, buf, len);
+        return;
+    }
     char used[32], total_ctx[32];
     char power[32];
     agent_format_ctx_size(st->ctx_used, used, sizeof(used));
@@ -11576,6 +11601,7 @@ static char *agent_prompt_queue_take_all_echo(agent_prompt_queue *q) {
     agent_buf b = {0};
     for (size_t i = 0; i < q->len; i++) {
         char *echo = agent_format_user_prompt_echo(q->v[i]);
+        if (i && agent_ui && agent_ui->active) agent_buf_puts(&b, "\n\n");
         agent_buf_puts(&b, echo);
         free(echo);
     }
@@ -11607,6 +11633,10 @@ static void build_footer_text(const agent_status *st, const agent_prompt_queue *
         return;
     }
 
+    bool shared = agent_ui && agent_ui->active;
+    bool color = shared ? ds4_cli_ui_color_enabled(stdout) : stdout_is_tty();
+    if (shared) cols = cols > 4 ? cols - 4 : 1;
+
     const char *queued = agent_prompt_queue_peek(queue);
     if (cols < 1) cols = 1;
     int max_rows = 3;
@@ -11637,7 +11667,8 @@ static void build_footer_text(const agent_status *st, const agent_prompt_queue *
     size_t preview_len = strlen(preview);
     for (int row = 0; row < max_rows && pos < preview_len; row++) {
         if (row) agent_buf_puts(&out, "\n");
-        if (stdout_is_tty()) agent_buf_puts(&out, AGENT_QUEUE_STYLE);
+        if (shared) agent_buf_puts(&out, "  ");
+        if (color) agent_buf_puts(&out, shared ? AGENT_STATUS_STYLE_START : AGENT_QUEUE_STYLE);
         cells = 0;
         while (pos < preview_len) {
             int width;
@@ -11647,10 +11678,10 @@ static void build_footer_text(const agent_status *st, const agent_prompt_queue *
             cells += (size_t)width;
             pos += n;
         }
-        if (stdout_is_tty()) agent_buf_puts(&out, "\x1b[0m");
+        if (color) agent_buf_puts(&out, "\x1b[0m");
     }
     agent_buf_puts(&out, "\n");
-    if (stdout_is_tty()) agent_buf_puts(&out, AGENT_STATUS_STYLE_START);
+    if (color) agent_buf_puts(&out, AGENT_STATUS_STYLE_START);
     agent_buf_puts(&out, status);
     snprintf(buf, len, "%s", out.ptr ? out.ptr : "");
     free(preview);
@@ -11659,6 +11690,7 @@ static void build_footer_text(const agent_status *st, const agent_prompt_queue *
 
 typedef struct {
     struct linenoiseState edit;
+    ds4_cli_ui ui;
     char *input;
     char prompt[160];
     char status[4096];
@@ -11687,6 +11719,7 @@ typedef struct {
     double last_prompt_redraw_time;
     char cpr_buf[32];
     size_t cpr_len;
+    double cpr_started;
     bool paste_open;
     bool paste_start_pending;
     char paste_tail[6];
@@ -11791,6 +11824,7 @@ static void editor_track_bracketed_paste(agent_editor *ed, char c) {
  * linenoise. */
 static void editor_filter_input_byte(agent_editor *ed, char c) {
     if (ed->cpr_len || (unsigned char)c == 0x1b) {
+        if (!ed->cpr_len) ed->cpr_started = now_sec();
         if (ed->cpr_len == sizeof(ed->cpr_buf)) {
             editor_flush_cpr_candidate(ed);
         }
@@ -11820,6 +11854,8 @@ static void editor_queue_bytes(agent_editor *ed, const char *buf, size_t len) {
 static void editor_read_stdin(agent_editor *ed) {
     char buf[256];
     for (;;) {
+        struct pollfd input = {.fd = STDIN_FILENO, .events = POLLIN};
+        if (poll(&input, 1, 0) <= 0 || !(input.revents & POLLIN)) break;
         ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
         if (n > 0) {
             editor_queue_bytes(ed, buf, (size_t)n);
@@ -11845,7 +11881,26 @@ static bool editor_take_queued_byte(agent_editor *ed, unsigned char byte) {
 }
 
 static bool editor_take_bare_escape(agent_editor *ed) {
-    if (ed->cpr_len == 1 && (unsigned char)ed->cpr_buf[0] == 0x1b) {
+    /* Mouse and navigation reports may arrive after their initial ESC byte. */
+    struct linenoiseState *edit = &ed->edit;
+    for (size_t i = edit->queued_input_pos; i + 2 < edit->queued_input_len; i++) {
+        if (edit->queued_input[i] != '\x1b' || edit->queued_input[i + 1] != '[') continue;
+        for (size_t end = i + 2; end < edit->queued_input_len && end - i < 32; end++) {
+            unsigned char c = (unsigned char)edit->queued_input[end];
+            if (c < '@' || c > '~') continue;
+            unsigned int key, modifiers;
+            size_t length = end - i + 1;
+            if (linenoiseDecodeKey(edit->queued_input + i + 1, length - 1, &key, &modifiers) > 0 &&
+                key == 27 && !((modifiers - 1) & 63)) {
+                memmove(edit->queued_input + i, edit->queued_input + end + 1, edit->queued_input_len - end - 1);
+                edit->queued_input_len -= length;
+                return true;
+            }
+            break;
+        }
+    }
+    if (ed->cpr_len == 1 && (unsigned char)ed->cpr_buf[0] == 0x1b &&
+        now_sec() - ed->cpr_started >= 0.15) {
         ed->cpr_len = 0;
         return true;
     }
@@ -11861,6 +11916,11 @@ static void editor_replace_input(agent_editor *ed, const char *text) {
 /* Track streamed text with the same widths as linenoise. Partial UTF-8 and
  * escape sequences remain pending across worker-output chunks. */
 static void editor_note_output(agent_editor *ed, const char *text, size_t len) {
+    if (ed->ui.active && !ed->ui.alt_screen) {
+        ed->output_line_open = !ed->ui.text_output.line_start;
+        ed->output_col = ed->output_line_open ? ed->ui.text_output.column + ed->ui.text_output.margin : 0;
+        return;
+    }
     int cols = ed->edit.cols > 0 ? (int)ed->edit.cols : 80;
     for (size_t i = 0; i < len; i++) {
         unsigned char c = (unsigned char)text[i];
@@ -11933,15 +11993,20 @@ static void editor_note_output(agent_editor *ed, const char *text, size_t len) {
 
 /* Normalize generated LF to CRLF for terminal output without changing the text
  * stored in the transcript. */
+static void editor_emit_text(const char *text, size_t len) {
+    if (agent_ui && agent_ui->active) ds4_cli_ui_output_write(&agent_ui->text_output, text, len);
+    else write_all(STDOUT_FILENO, text, len);
+}
+
 static void editor_write_terminal_text(const char *text, size_t len) {
     size_t start = 0;
     for (size_t i = 0; i < len; i++) {
         if (text[i] != '\n') continue;
-        if (i > start) write_all(STDOUT_FILENO, text + start, i - start);
-        write_all(STDOUT_FILENO, "\r\n", 2);
+        if (i > start) editor_emit_text(text + start, i - start);
+        editor_emit_text("\r\n", 2);
         start = i + 1;
     }
-    if (start < len) write_all(STDOUT_FILENO, text + start, len - start);
+    if (start < len) editor_emit_text(text + start, len - start);
 }
 
 /* Locate a CPR reply inside a mixed stdin buffer.  Bytes before/after the reply
@@ -12213,6 +12278,7 @@ static bool editor_configure_scroll_region(agent_editor *ed) {
 }
 
 static void editor_restore_terminal_layout(agent_editor *ed) {
+    if (ed->ui.active) return; // The shared UI stays open across editor restarts.
     if (!ed->scroll_region) return;
     write_all(STDOUT_FILENO, "\x1b[0m", 4);
     write_all(STDOUT_FILENO, "\x1b[r", 3);
@@ -12232,6 +12298,18 @@ static int editor_start(agent_editor *ed, const char *prompt,
     char *input = xmalloc(AGENT_INPUT_INITIAL_BUFLEN);
     snprintf(ed->prompt, sizeof(ed->prompt), "%s", prompt);
     snprintf(ed->status, sizeof(ed->status), "%s", status ? status : "");
+    if (ed->ui.active) {
+        if (ds4_cli_ui_edit_begin(&ed->ui, &ed->edit, input, AGENT_INPUT_INITIAL_BUFLEN, status)) {
+            free(input);
+            return -1;
+        }
+        ed->input = input;
+        ed->active = true;
+        ed->hidden = false;
+        ed->old_stdin_flags = -1;
+        if (initial && *initial) linenoiseEditInsert(&ed->edit, initial, strlen(initial));
+        return 0;
+    }
     bool had_scroll_region = ed->scroll_region;
     bool use_scroll_region = editor_configure_scroll_region(ed);
     if (use_scroll_region) {
@@ -12283,6 +12361,15 @@ static int editor_start(agent_editor *ed, const char *prompt,
 /* Stop the live editor and restore stdin flags. */
 static void editor_stop(agent_editor *ed) {
     if (!ed->active) return;
+    if (ed->ui.active) {
+        ds4_cli_ui_edit_end(&ed->ui, &ed->edit, ed->edit.len != 0);
+        free(ed->edit.buf);
+        ed->input = NULL;
+        ed->active = ed->hidden = false;
+        ed->cpr_len = ed->paste_tail_len = 0;
+        ed->paste_open = ed->paste_start_pending = false;
+        return;
+    }
     if (ed->deferred_output.len)
         editor_write_scroll_output_preserve_prompt(ed, NULL, 0, true);
     /* ds4-agent treats linenoise as a live input widget, not as persistent
@@ -12371,9 +12458,10 @@ static void editor_update_status(agent_editor *ed, const char *status) {
     if (strcmp(ed->status, status ? status : "")) ed->status_dirty = true;
     snprintf(ed->status, sizeof(ed->status), "%s", status ? status : "");
     bool embedded_status = agent_footer_is_multiline(ed->status);
-    const char *status_start = stdout_is_tty() && !embedded_status ?
+    bool color = ed->ui.active ? ds4_cli_ui_color_enabled(stdout) : stdout_is_tty();
+    const char *status_start = color && !embedded_status ?
         AGENT_STATUS_STYLE_START : "";
-    const char *status_end = stdout_is_tty() && ed->status[0] ?
+    const char *status_end = color && ed->status[0] ?
         AGENT_STATUS_STYLE_END : "";
     linenoiseEditSetStatus(&ed->edit, ed->status,
                            status_start, status_end);
@@ -12403,6 +12491,18 @@ static bool editor_prompt_redraw_due(agent_editor *ed) {
 
 static void editor_flush_prompt_status(agent_editor *ed, bool force) {
     if (!ed->active || ed->hidden) return;
+    if (ed->ui.active) {
+        ds4_cli_ui_edit_tick(&ed->ui, &ed->edit);
+        if ((ed->status_dirty || ed->prompt_dirty) && (force || editor_prompt_redraw_due(ed))) {
+            if (!linenoiseRefreshStatus(&ed->edit)) {
+                linenoiseHide(&ed->edit);
+                linenoiseShow(&ed->edit);
+            }
+            ed->prompt_dirty = ed->status_dirty = false;
+            ed->last_prompt_redraw_time = now_sec();
+        }
+        return;
+    }
     int rows, cols;
     if (ed->scroll_region && editor_get_terminal_size(&rows, &cols) &&
         (rows != ed->term_rows || cols != ed->term_cols)) {
@@ -12544,6 +12644,12 @@ static void test_agent_terminal_wrap_output_is_deferred(void) {
 static void editor_write_async(agent_editor *ed, const char *text, size_t len,
                                const char *prompt, const char *status,
                                bool force_show) {
+    if (ed->ui.active) {
+        editor_set_prompt_status(ed, prompt, status);
+        ds4_cli_ui_output_write(&ed->ui.text_output, text, len);
+        if (force_show) ds4_cli_ui_output_finish(&ed->ui.text_output);
+        return;
+    }
     if (ed->scroll_region && ed->active && !ed->hidden &&
         (len || ed->deferred_output.len)) {
         editor_flush_prompt_status(ed, false);
@@ -12609,25 +12715,30 @@ static void editor_cancel_input_with_hint(agent_editor *ed,
 }
 
 static void runtime_help(void) {
-    puts("Commands:");
-    puts("  /help        Show this help.");
-    puts("  /save        Save the current session.");
-    puts("  /compact     Compact the current session context now.");
-    puts("  /list        List saved sessions.");
-    puts("  /switch SHA  Load a saved session and show recent history.");
-    puts("  /del SHA     Delete a saved session.");
-    puts("  /strip SHA   Strip KV payload; /switch rebuilds it by prefill.");
-    puts("  /history [N] Show N recent user turns from the current session.");
-    puts("  /power N     Set GPU duty cycle percentage, 1..100.");
-    puts("  /hints on|off Enable or disable brief programming hints; starts off.");
-    puts("  /steer [F]   Show or set FFN steering for subsequent tokens.");
-    puts("  /new         Start a fresh session from the system prompt.");
-    puts("  /quit, /exit Exit.");
-    puts("  Ctrl+C       Interrupt generation; clear edited text.");
-    puts("  Enter        Queue text while the agent is busy.");
-    puts("  Ctrl+X       Edit the first queued prompt.");
-    puts("  ESC          Interrupt and send queued prompt immediately.");
-    puts("  Ctrl+D       Exit from an empty prompt.");
+    static const ds4_cli_ui_command commands[] = {
+        {"/help", "Command guide"},
+        {"/save", "Save this session"},
+        {"/compact", "Compact context"},
+        {"/list", "Saved sessions"},
+        {"/switch ID", "Resume a session"},
+        {"/del ID", "Delete a session"},
+        {"/strip ID", "Drop saved KV data"},
+        {"/history [N]", "Recent user turns"},
+        {"/power N", "GPU duty cycle"},
+        {"/hints on|off", "Programming hints"},
+        {"/think [N]", "V4.1 effort 0..100"},
+        {"/steer [F]", "FFN steering"},
+        {"/new", "Fresh session"},
+        {"/quit /exit", "Exit session"},
+        {"Shift+Enter", "New line"},
+        {"Ctrl+J", "New line fallback"},
+        {"Ctrl+C", "Stop / clear input"},
+        {"Enter", "Send / queue text"},
+        {"Ctrl+X", "Edit queued text"},
+        {"Esc", "Send queue now"},
+        {"Ctrl+D", "Exit empty input"},
+    };
+    ds4_cli_ui_print_command_list(stdout, commands, sizeof(commands) / sizeof(commands[0]));
 }
 
 static void agent_format_ctx_size(int ctx_size, char *buf, size_t len) {
@@ -12656,6 +12767,7 @@ static void editor_write_welcome_banner(agent_editor *editor,
                                         const agent_config *cfg,
                                         const char *prompt,
                                         const char *statusline) {
+    if (editor->ui.active) return;
     char banner[256];
     agent_format_welcome_banner(cfg, banner, sizeof(banner));
     editor_write_async(editor, banner, strlen(banner), prompt, statusline, true);
@@ -12776,6 +12888,41 @@ static bool agent_prompt_yes_no_ex(const char *prompt,
             printf("[auto-%s in %ds] ", agent_yes_no_auto_name(auto_answer), rem);
         }
         fflush(stdout);
+        if (agent_ui && agent_ui->active) {
+            struct linenoiseState edit;
+            char *input = xmalloc(128);
+            if (ds4_cli_ui_edit_begin(agent_ui, &edit, input, 128, NULL)) { free(input); return false; }
+            char *line = NULL;
+            bool timeout = false;
+            for (;;) {
+                ds4_cli_ui_edit_tick(agent_ui, &edit);
+                double remaining = deadline - now_sec();
+                if (use_timeout && remaining <= 0) { timeout = true; break; }
+                struct pollfd pfd = {.fd = STDIN_FILENO, .events = POLLIN};
+                int ms = use_timeout && remaining < .1 ? (int)(remaining * 1000) + 1 : 100;
+                int ready = poll(&pfd, 1, ms);
+                if (ready < 0 && errno == EINTR) continue;
+                if (ready < 0) break;
+                if (!ready) continue;
+                line = linenoiseEditFeed(&edit);
+                if (line != linenoiseEditMore) break;
+                line = NULL;
+            }
+            ds4_cli_ui_edit_end(agent_ui, &edit, line && *line);
+            free(edit.buf);
+            if (timeout) {
+                if (timed_out) *timed_out = true;
+                return auto_answer == AGENT_YES_NO_AUTO_YES;
+            }
+            if (!line) return false;
+            ds4_cli_ui_print_user(agent_ui, line);
+            char *p = line;
+            while (*p == ' ' || *p == '\t') p++;
+            int answer = *p == 'y' || *p == 'Y' ? 1 : *p == 'n' || *p == 'N' ? 0 : -1;
+            free(line);
+            if (answer >= 0) return answer != 0;
+            continue;
+        }
         if (use_timeout) {
             double rem_sec = deadline - now_sec();
             if (rem_sec <= 0.0) {
@@ -13054,6 +13201,12 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
     agent_completion_worker = &worker;
     linenoiseSetCompletionCallback(agent_switch_completion_callback);
 
+    agent_editor editor = {0};
+    ds4_cli_ui_start(&editor.ui, cfg->no_alt_screen);
+    agent_ui = &editor.ui;
+    editor.ui.state.model = ds4_engine_model_name(engine);
+    editor.ui.state.directory = cfg->launch_dir;
+    editor.ui.state.vision = ds4_engine_has_vision(engine);
     agent_status st;
     worker_get_status(&worker, &st);
     char prompt[160];
@@ -13061,10 +13214,11 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
     build_prompt_text(&st, prompt, sizeof(prompt));
     build_footer_text(&st, NULL, 80, statusline, sizeof(statusline));
 
-    agent_editor editor = {0};
     agent_prompt_queue queue = {0};
     if (editor_start(&editor, prompt, statusline, NULL) != 0) {
         fprintf(stderr, "ds4-agent: failed to start line editor\n");
+        ds4_cli_ui_stop(&editor.ui);
+        agent_ui = NULL;
         agent_worker_free(&worker);
         return 1;
     }
@@ -13157,7 +13311,8 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
             char *queued = agent_prompt_queue_take_all(&queue);
             if (echo) {
                 build_footer_text(&st, &queue, footer_cols, statusline, sizeof(statusline));
-                editor_write_async(&editor, echo, strlen(echo), prompt, statusline, true);
+                if (editor.ui.active) ds4_cli_ui_print_user(&editor.ui, echo);
+                else editor_write_async(&editor, echo, strlen(echo), prompt, statusline, true);
                 free(echo);
             }
             worker_answer_queued_user_drain(&worker, queued);
@@ -13194,6 +13349,7 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
 
         if (initial_pending && worker_is_idle(&worker)) {
             if (worker_submit(&worker, initial_pending)) {
+                if (editor.ui.active) ds4_cli_ui_print_user(&editor.ui, initial_pending);
                 free(initial_pending);
                 initial_pending = NULL;
             }
@@ -13206,8 +13362,10 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                 linenoiseHistoryAdd(queued);
                 linenoiseHistorySave(hist);
                 build_footer_text(&st, &queue, footer_cols, statusline, sizeof(statusline));
-                if (echo)
-                    editor_write_async(&editor, echo, strlen(echo), prompt, statusline, true);
+                if (echo) {
+                    if (editor.ui.active) ds4_cli_ui_print_user(&editor.ui, echo);
+                    else editor_write_async(&editor, echo, strlen(echo), prompt, statusline, true);
+                }
             } else {
                 agent_prompt_queue_push_front(&queue, queued);
                 queued = NULL;
@@ -13265,6 +13423,7 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                 bool had_output_line_open = editor.output_line_open;
                 int saved_output_col = editor.output_col;
                 editor_stop(&editor);
+                if (editor.ui.active && cmd[0] == '/') ds4_cli_ui_print_user(&editor.ui, cmd);
                 bool busy = !worker_is_idle(&worker);
                 if (!cmd[0]) {
                     /* Empty input: just reopen the editor. */
@@ -13365,6 +13524,8 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                     agent_exit_save_result exit_save =
                         agent_maybe_save_before_exiting(&worker);
                     if (exit_save == AGENT_EXIT_NOW) {
+                        ds4_cli_ui_stop(&editor.ui);
+                        agent_ui = NULL;
                         exit(0);
                     } else if (exit_save == AGENT_EXIT_CLEAN) {
                         exit_save_handled = true;
@@ -13500,6 +13661,8 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
     agent_prompt_queue_free(&queue);
     editor_stop(&editor);
     editor_restore_terminal_layout(&editor);
+    ds4_cli_ui_stop(&editor.ui);
+    agent_ui = NULL;
     linenoiseSetCompletionCallback(NULL);
     agent_completion_worker = NULL;
     if (!exit_save_handled) {
@@ -13514,6 +13677,7 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
 #ifndef DS4_AGENT_TEST_NO_MAIN
 int main(int argc, char **argv) {
     agent_config cfg = parse_options(argc, argv);
+    if (!getcwd(cfg.launch_dir, sizeof(cfg.launch_dir))) snprintf(cfg.launch_dir, sizeof(cfg.launch_dir), ".");
     if (cfg.chdir_path) {
         struct stat st;
         if (stat(cfg.chdir_path, &st) != 0) {

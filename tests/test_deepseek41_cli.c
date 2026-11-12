@@ -31,10 +31,31 @@ static void test_thinking_ui(void) {
     puts("CLI UI thinking levels 0..100: PASS");
 }
 
+static void test_output_padding(void) {
+    FILE *fp = tmpfile();
+    assert(fp);
+    token_printer printer = {.fp = fp, .format_thinking = true, .last_output_newline = true};
+    ds4_cli_ui_output_start(&printer.output, fp);
+    printer.output.enabled = true;
+    printer.output.width = 8;
+    printer.output.margin = 2;
+    const char *text = "<think>abc中def</think>abcdefghijklmnop";
+    for (size_t i = 0; text[i]; i++) token_printer_write_text(&printer, text + i, 1);
+    generation_done(&printer);
+    rewind(fp);
+    char output[256];
+    size_t n = fread(output, 1, sizeof(output) - 1, fp);
+    output[n] = '\0';
+    assert(!strcmp(output, "  abc中def\n  abcdefgh\n  ijklmnop\n"));
+    fclose(fp);
+    puts("CLI padded streaming, split UTF-8 and thinking transitions: PASS");
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) return 2;
     if (!strcmp(argv[1], "--ui")) {
         test_thinking_ui();
+        test_output_padding();
         return 0;
     }
     ds4_engine *engine = NULL;

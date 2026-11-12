@@ -18,6 +18,7 @@ import time
 
 import pyte
 from wcwidth import wcswidth
+from ds4_cli_ui_terminal_test import Terminal
 
 
 def check_fixtures(binary, directory):
@@ -156,6 +157,93 @@ def main():
         check_fixtures(binary, directory)
         check_hints(directory)
         check_pty(binary, directory)
+        check_shared_ui(binary)
+        check_home_help(binary)
+
+
+def check_shared_ui(binary):
+    for inline in (False, True):
+        terminal = Terminal(binary, columns=120, no_alt_screen=inline, args=["--shared-terminal-driver"])
+        try:
+            if not inline:
+                terminal.centered()
+            footer = terminal.footer()
+            assert "Preview agent (high) | " in footer and " | ctx " in footer
+            directory = str(Path.cwd())
+            home = str(Path.home())
+            if directory == home: directory = "~/"
+            elif directory.startswith(home + "/"): directory = "~/" + directory[len(home) + 1:]
+            assert directory in footer, footer
+            terminal.send("a中b")
+            terminal.send("\x1b[DZ")
+            assert terminal.input_text() == "a中Zb"
+            terminal.collect(0.8)
+            assert any("queued: pending task" in line for line in terminal.screen.display)
+            assert terminal.input_text() == "a中Zb"
+            assert terminal.screen.cursor.x == 6
+            if not inline:
+                assert terminal.screen.cursor.y == terminal.screen.lines - 4
+                terminal.collect(1)
+                terminal.send("\x1b[<64;20;10M")
+                older = terminal.screen.display[:20]
+                terminal.collect(0.2)
+                assert terminal.screen.display[:20] == older
+                assert terminal.input_text() == "a中Zb"
+                terminal.resize(80, 25)
+                assert terminal.input_text() == "a中Zb"
+                assert "/help" in terminal.footer()
+                terminal.resize(120, 30)
+            terminal.send("\r")
+            terminal.wait_for(lambda: terminal.process.poll() is not None, "agent submission was not accepted")
+            result = re.search(rb"RESULT:([0-9a-f]+)", terminal.output)
+            assert result and bytes.fromhex(result[1].decode()).decode() == "a中Zb"
+        finally:
+            terminal.close()
+    print("Shared agent UI: logo, launch path, live draft/cursor, queued footer, scrolling, resize and inline mode passed")
+    for answer in ("yes", "timeout"):
+        terminal = Terminal(binary, args=["--shared-confirmation", answer])
+        try:
+            assert any("Allow test action?" in line for line in terminal.screen.display)
+            if answer == "yes": terminal.send("y\r")
+            terminal.wait_for(lambda: terminal.process.poll() is not None, "confirmation did not finish")
+        finally:
+            terminal.close()
+    print("Shared agent UI: confirmation input, timeout policy and terminal restoration passed")
+
+
+def check_home_help(binary):
+    for inline in (False, True):
+        terminal = Terminal(binary, columns=120, no_alt_screen=inline, args=["--shared-help"], HOME=str(Path.cwd()))
+        try:
+            assert " | ~/ | ctx " in terminal.footer(), terminal.footer()
+            display = terminal.screen.display
+            heading = next(y for y, line in enumerate(display) if line.strip() == "Commands")
+            assert display[heading].startswith("  Commands")
+            assert terminal.screen.buffer[heading][2].bold
+            for command in ("/save", "/switch ID", "/hints on|off", "Shift+Enter", "Ctrl+J"):
+                row = next(y for y, line in enumerate(display) if command in line)
+                column = display[row].index(command)
+                assert all(terminal.screen.buffer[row][x].fg == "d7af87"
+                           for x in range(column, column + len(command)))
+            row = next(y for y, line in enumerate(display) if "Save this session" in line)
+            assert terminal.screen.buffer[row][display[row].index("Save this session")].fg == "brightblack"
+            terminal.send("first\x1b[13;2usecond")
+            y = terminal.screen.cursor.y
+            assert terminal.screen.display[y - 1].strip() == "first"
+            assert terminal.input_text() == "second"
+            assert not terminal.screen.display[y - 3].strip()
+            terminal.send("\r")
+            terminal.wait_for(lambda: terminal.process.poll() is not None, "agent multiline submission did not finish")
+            result = re.search(rb"RESULT:([0-9a-f]+)", terminal.output)
+            assert result and bytes.fromhex(result[1].decode()).decode() == "first\nsecond"
+        finally:
+            terminal.close()
+    terminal = Terminal(binary, columns=120, args=["--shared-terminal-driver"], HOME=str(Path.cwd()) + "-other")
+    try:
+        assert str(Path.cwd()) in terminal.footer(), "a sibling path was shortened as home"
+    finally:
+        terminal.close()
+    print("Shared agent UI: home abbreviation/boundaries, shared help colors and multiline submission passed")
 
 
 if __name__ == "__main__":

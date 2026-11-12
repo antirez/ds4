@@ -99,7 +99,7 @@ typedef struct {
     cli_generation_options gen;
     char *prompt_owned;
     bool inspect;
-    ds4_cli_logo_mode ui_logo;
+    bool no_alt_screen;
     /* CLI flag wiring: raw argv values for --gpu-vram and --gpu-devices.
      * Resolved post-parse via parse_gpu_vram_arg(). */
     const char *gpu_vram_arg;
@@ -388,6 +388,7 @@ typedef struct {
     bool last_output_newline;
     char pending[16];
     size_t pending_len;
+    ds4_cli_ui_output output;
 } token_printer;
 
 static bool bytes_has_prefix(const char *p, size_t n, const char *prefix) {
@@ -416,7 +417,8 @@ static void token_printer_reset_color(token_printer *p) {
 
 static void token_printer_write_char(token_printer *p, char c) {
     if (p->in_think) token_printer_set_grey(p);
-    fputc((unsigned char)c, p->fp);
+    if (p->output.fp) ds4_cli_ui_output_write(&p->output, &c, 1);
+    else fputc((unsigned char)c, p->fp);
     p->last_output_newline = c == '\n';
 }
 
@@ -443,8 +445,7 @@ static void token_printer_process(token_printer *p, const char *text, size_t len
             p->in_think = false;
             token_printer_reset_color(p);
             if (!p->last_output_newline) {
-                fputc('\n', p->fp);
-                p->last_output_newline = true;
+                token_printer_write_char(p, '\n');
             }
             i += strlen(think_close);
             continue;
@@ -477,9 +478,9 @@ static void token_printer_finish(token_printer *p) {
 static void generation_done(void *ud) {
     token_printer *p = ud;
     token_printer_finish(p);
+    if (p->output.fp) ds4_cli_ui_output_finish(&p->output);
     if (!p->last_output_newline) {
-        fputc('\n', p->fp);
-        p->last_output_newline = true;
+        token_printer_write_char(p, '\n');
     }
     fflush(p->fp);
 }
@@ -488,7 +489,8 @@ static void token_printer_write_text(token_printer *p, const char *text, size_t 
     if (p->format_thinking) {
         token_printer_process(p, text, len, false);
     } else if (len) {
-        fwrite(text, 1, len, p->fp);
+        if (p->output.fp) ds4_cli_ui_output_write(&p->output, text, len);
+        else fwrite(text, 1, len, p->fp);
         p->last_output_newline = text[len - 1] == '\n';
     }
 }
@@ -1290,18 +1292,18 @@ static const char *cli_ui_thinking_name(ds4_think_mode mode) {
 }
 
 static ds4_cli_ui_state cli_ui_make_state(ds4_engine *engine,
-                                           const cli_config *cfg,
-                                           int power_percent) {
+                                         const cli_config *cfg,
+                                         int power_percent, int ctx_used) {
     ds4_cli_ui_state state = {
         .model = ds4_engine_model_name(engine),
         .backend = ds4_backend_name(cfg->engine.backend),
         .thinking = cli_ui_thinking_name(cli_effective_think_mode(&cfg->gen)),
         .ctx_size = cfg->gen.ctx_size,
+        .ctx_used = ctx_used,
         .power_percent = power_percent,
         .ssd_streaming = cfg->engine.ssd_streaming,
         .vision = ds4_engine_has_vision(engine),
         .cache_bytes = cfg->engine.ssd_streaming_cache_bytes,
-        .logo_mode = cfg->ui_logo,
     };
     return state;
 }
@@ -1587,8 +1589,6 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat,
     ds4_session_set_display_progress(chat->session, NULL, NULL);
     const double t_prefill1 = cli_now_sec();
 
-    ds4_cli_ui_print_assistant_prompt(stdout);
-
     token_printer printer = {
         .engine = engine,
         .fp = stdout,
@@ -1599,6 +1599,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat,
     };
 
     int max_tokens = cfg->gen.n_predict;
+    ds4_cli_ui_output_start(&printer.output, stdout);
     int room = ds4_session_ctx(chat->session) - ds4_session_pos(chat->session);
     if (room <= 1) max_tokens = 0;
     else if (max_tokens > room - 1) max_tokens = room - 1;
@@ -1731,29 +1732,20 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
 
     char hist[PATH_MAX];
     history_file_path(hist, sizeof(hist));
-    linenoiseSetMultiLine(1);
     linenoiseHistorySetMaxLen(512);
     linenoiseHistoryLoad(hist);
 
-    /* Clear only after the model and optional prefix are ready. This keeps
-     * load failures visible, then presents the interactive UI on a clean
-     * screen without emitting terminal escapes into redirected output. */
-    const char *term = getenv("TERM");
-    if (isatty(STDIN_FILENO) && isatty(STDOUT_FILENO) &&
-        (!term || strcmp(term, "dumb") != 0)) {
-        fflush(stdout);
-        fflush(stderr);
-        linenoiseClearScreen();
-    }
-
-    ds4_cli_ui_state ui_state = cli_ui_make_state(
-        engine, cfg, ds4_session_power(chat.session));
-    ds4_cli_ui_print_welcome(stdout, &ui_state);
+    /* Enter the terminal UI only after model/prefix initialization so
+     * startup failures stay visible. Pipes keep the ordinary line reader. */
+    ds4_cli_ui ui;
+    ds4_cli_ui_start(&ui, cfg->no_alt_screen);
 
     int rc = 0;
     for (;;) {
+        ds4_cli_ui_state ui_state = cli_ui_make_state(
+            engine, cfg, ds4_session_power(chat.session), chat.transcript.len);
         errno = 0;
-        char *line = linenoise(ds4_cli_ui_user_prompt(stdout));
+        char *line = ds4_cli_ui_readline(&ui, &ui_state);
         if (!line) {
             if (errno == EAGAIN || cli_interrupt_requested()) {
                 cli_interrupt_clear();
@@ -1773,10 +1765,8 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
             ds4_cli_ui_print_commands(stdout);
         } else if (!strcmp(cmd, "/status")) {
             ui_state = cli_ui_make_state(
-                engine, cfg, ds4_session_power(chat.session));
-            fputc('\n', stdout);
+                engine, cfg, ds4_session_power(chat.session), chat.transcript.len);
             ds4_cli_ui_print_status(stdout, &ui_state);
-            fputc('\n', stdout);
         } else if (!strncmp(cmd, "/think", 6) &&
                    (cmd[6] == '\0' || isspace((unsigned char)cmd[6]))) {
             const char *arg = trim_inplace(cmd + 6);
@@ -1891,6 +1881,7 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
         }
         linenoiseFree(line);
     }
+    ds4_cli_ui_stop(&ui);
     if (sigint_installed) sigaction(SIGINT, &old_int, NULL);
     repl_chat_free(&chat);
     return rc;
@@ -2231,16 +2222,8 @@ static cli_config parse_options(int argc, char **argv) {
             exit(2);
         } else if (!strcmp(arg, "--inspect")) {
             c.inspect = true;
-        } else if (!strcmp(arg, "--ui-logo")) {
-            const char *mode = need_arg(&i, argc, argv, arg);
-            if (!strcmp(mode, "auto")) c.ui_logo = DS4_CLI_LOGO_AUTO;
-            else if (!strcmp(mode, "image")) c.ui_logo = DS4_CLI_LOGO_IMAGE;
-            else if (!strcmp(mode, "braille")) c.ui_logo = DS4_CLI_LOGO_BRAILLE;
-            else if (!strcmp(mode, "ascii")) c.ui_logo = DS4_CLI_LOGO_ASCII;
-            else {
-                fprintf(stderr, "ds4: --ui-logo expects auto, image, braille, or ascii\n");
-                exit(2);
-            }
+        } else if (!strcmp(arg, "--no-alt-screen")) {
+            c.no_alt_screen = true;
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
         } else if (!strcmp(arg, "--server")) {

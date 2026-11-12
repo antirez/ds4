@@ -1361,7 +1361,9 @@ void refreshShowHints(struct abuf *ab, struct linenoiseState *l, int pwidth, siz
         if (hint) {
             size_t hintlen = strlen(hint);
             size_t hintwidth = utf8StrWidth(hint, hintlen);
-            size_t hintmaxwidth = l->cols - (pwidth + bufwidth);
+            size_t margin = l->input_start ? (size_t)pwidth : 0;
+            size_t hintmaxwidth = l->cols > pwidth + bufwidth + margin ?
+                                  l->cols - (pwidth + bufwidth + margin) : 0;
             /* Truncate hint to fit, respecting UTF-8 boundaries. */
             if (hintwidth > hintmaxwidth) {
                 size_t i = 0, w = 0;
@@ -1375,14 +1377,17 @@ void refreshShowHints(struct abuf *ab, struct linenoiseState *l, int pwidth, siz
                 hintlen = i;
             }
             if (bold == 1 && color == -1) color = 37;
-            if (color != -1 || bold != 0)
-                snprintf(seq,64,"\033[%d;%d;49m",bold,color);
-            else
+            if (color != -1 || bold != 0) {
+                if (l->input_start) snprintf(seq,64,"\033[%s%dm",bold ? "1;" : "",color);
+                else snprintf(seq,64,"\033[%d;%d;49m",bold,color);
+            } else
                 seq[0] = '\0';
             abAppend(ab,seq,strlen(seq));
             abAppend(ab,hint,hintlen);
-            if (color != -1 || bold != 0)
+            if (color != -1 || bold != 0) {
                 abAppend(ab,"\033[0m",4);
+                if (l->input_start) abAppend(ab,l->input_start,strlen(l->input_start));
+            }
             /* Call the function to free the hint returned. */
             if (freeHintsCallback) freeHintsCallback(hint);
         }
@@ -1487,13 +1492,30 @@ static void refreshSingleLine(struct linenoiseState *l, int flags) {
  * prompt, just write it, or both.
  *
  * This function is UTF-8 aware and uses display widths for positioning. */
+static void multilinePosition(const char *text, size_t length, int columns,
+                               int first, int margin, int *row, int *column) {
+    *row = 0;
+    *column = first;
+    int limit = columns - margin;
+    for (size_t pos = 0; pos < length;) {
+        int width;
+        size_t n = linenoiseNextGrapheme(text + pos, length - pos, &width);
+        if (text[pos] == '\n' || *column + width > limit) {
+            (*row)++;
+            *column = margin;
+        }
+        if (text[pos] != '\n') *column += width;
+        pos += n;
+    }
+}
+
 static void refreshMultiLine(struct linenoiseState *l, int flags) {
     char seq[64];
     size_t pwidth = utf8StrWidth(l->prompt, l->plen);  /* Prompt display width */
     char *render = NULL;
     size_t render_len, render_pos;
     size_t bufwidth;
-    size_t poswidth;
+    int cursor_row, cursor_col, end_row, end_col;
     int rows; /* rows used by current rendered buffer. */
     int rpos = l->oldrpos;   /* cursor relative row from previous refresh. */
     int rpos2; /* rpos after refresh. */
@@ -1507,18 +1529,27 @@ static void refreshMultiLine(struct linenoiseState *l, int flags) {
 
     if (linenoiseRenderBuffer(l,&render,&render_len,&render_pos) == -1) return;
     bufwidth = utf8StrWidth(render, render_len);
-    poswidth = utf8StrWidth(render, render_pos);
-    rows = (pwidth+bufwidth+l->cols-1)/l->cols;
-    int cursor_wrap_row = l->pos &&
-        render_pos == render_len &&
-        (poswidth+pwidth) % l->cols == 0;
-    if (cursor_wrap_row) rows++;
+    int margin = l->input_start && 2 * pwidth < l->cols ? (int)pwidth : 0;
+    multilinePosition(render, render_len, (int)l->cols, (int)pwidth, margin, &end_row, &end_col);
+    multilinePosition(render, render_pos, (int)l->cols, (int)pwidth, margin, &cursor_row, &cursor_col);
+    int cursor_wrap_row = cursor_col >= (int)l->cols;
+    if (cursor_wrap_row) { cursor_row++; cursor_col = margin; }
+    rows = (end_row > cursor_row ? end_row : cursor_row) + 1;
+    rows += 2 * (int)l->input_padding;
 
     /* First step: clear all the lines used before. To do so start by
      * going to the last row. */
     abInit(&ab);
 
-    if (flags & REFRESH_CLEAN) {
+    if ((flags & REFRESH_CLEAN) && l->screen_cursor_row > 0) {
+        /* An anchored input lives outside the output scroll margins. Use
+         * absolute rows so cleanup cannot be clamped into conversation text. */
+        int first = l->screen_cursor_row - rpos + 1;
+        for (j = old_total_rows - 1; j >= 0; j--) {
+            snprintf(seq,sizeof(seq),"\x1b[%d;1H\x1b[0K",first+j);
+            abAppend(&ab,seq,strlen(seq));
+        }
+    } else if (flags & REFRESH_CLEAN) {
         if (old_total_rows-rpos > 0) {
             lndebug("go down %d", old_total_rows-rpos);
             snprintf(seq,64,"\x1b[%dB", old_total_rows-rpos);
@@ -1566,6 +1597,32 @@ static void refreshMultiLine(struct linenoiseState *l, int flags) {
     }
 
     if (flags & REFRESH_WRITE) {
+        if (l->input_start || l->input_padding) {
+            /* Paint every cell, including the rightmost column. EL alone
+             * does not honor the current background in every terminal. */
+            if (l->input_start) abAppend(&ab,l->input_start,strlen(l->input_start));
+            abAppend(&ab,"\x1b[?7l",5);
+            for (int row = 0; row < rows; row++) {
+                if (row) {
+                    if (layout_prompt_row > 0) {
+                        snprintf(seq,sizeof(seq),"\x1b[%d;1H",layout_prompt_row+row);
+                        abAppend(&ab,seq,strlen(seq));
+                    } else abAppend(&ab,"\r\n",2);
+                }
+                for (size_t col = 0; col < l->cols; col++) abAppend(&ab," ",1);
+            }
+            abAppend(&ab,"\x1b[?7h",5);
+            if (layout_prompt_row > 0) {
+                snprintf(seq,sizeof(seq),"\x1b[%d;1H",layout_prompt_row+(int)l->input_padding);
+                abAppend(&ab,seq,strlen(seq));
+            } else if (rows > 1) {
+                snprintf(seq,sizeof(seq),"\x1b[%dA",rows-1);
+                abAppend(&ab,seq,strlen(seq));
+            }
+            abAppend(&ab,"\r",1);
+        }
+        if (layout_prompt_row <= 0)
+            for (size_t row = 0; row < l->input_padding; row++) abAppend(&ab,"\r\n",2);
         /* Write the prompt and the current buffer content */
         abAppend(&ab,l->prompt,l->plen);
         if (maskmode == 1) {
@@ -1576,7 +1633,30 @@ static void refreshMultiLine(struct linenoiseState *l, int flags) {
                 i += utf8NextCharLen(render, i, render_len);
             }
         } else {
-            abAppend(&ab,render,render_len);
+            /* The input is outside the output scroll region. Address wrapped
+             * rows explicitly instead of relying on LF across its margins. */
+            size_t pos = 0, column = pwidth;
+            int row = layout_prompt_row + (int)l->input_padding;
+            while (pos < render_len) {
+                int width;
+                size_t n = linenoiseNextGrapheme(render+pos,render_len-pos,&width);
+                if (render[pos] == '\n' || column + (size_t)width > l->cols - margin) {
+                    row++;
+                    if (layout_prompt_row > 0) {
+                        snprintf(seq,sizeof(seq),"\x1b[%d;%dH",row,margin+1);
+                        abAppend(&ab,seq,strlen(seq));
+                    } else {
+                        abAppend(&ab,"\r\n",2);
+                        for (int i = 0; i < margin; i++) abAppend(&ab," ",1);
+                    }
+                    column = (size_t)margin;
+                }
+                if (render[pos] != '\n') {
+                    abAppend(&ab,render+pos,n);
+                    column += width;
+                }
+                pos += n;
+            }
         }
 
         /* Show hints if any. */
@@ -1586,21 +1666,31 @@ static void refreshMultiLine(struct linenoiseState *l, int flags) {
          * emit a newline and move the prompt to the first column. */
         if (cursor_wrap_row) {
             lndebug("<newline>");
-            abAppend(&ab,"\n",1);
-            snprintf(seq,64,"\r");
+            if (layout_prompt_row > 0 && l->input_start)
+                snprintf(seq,sizeof(seq),"\x1b[%d;1H",layout_prompt_row+rows-(int)l->input_padding-1);
+            else {
+                abAppend(&ab,"\n",1);
+                snprintf(seq,sizeof(seq),"\r");
+            }
             abAppend(&ab,seq,strlen(seq));
         }
 
         /* Move cursor to right position. */
-        rpos2 = (pwidth+poswidth+l->cols)/l->cols; /* Current cursor relative row */
+        rpos2 = (int)l->input_padding + cursor_row + 1;
         lndebug("rpos2 %d", rpos2);
 
+        if (l->input_padding && layout_prompt_row > 0) {
+            snprintf(seq,sizeof(seq),"\x1b[%d;1H",layout_prompt_row+rows-1);
+            abAppend(&ab,seq,strlen(seq));
+        } else
+            for (size_t row = 0; row < l->input_padding; row++) abAppend(&ab,"\r\n",2);
+        if (l->input_end) abAppend(&ab,l->input_end,strlen(l->input_end));
         if (linenoiseStatusActive(l)) {
             refreshStatusLine(&ab, l, layout_prompt_row > 0 ? layout_prompt_row + rows : 0);
         }
 
         /* Set column. */
-        col = (pwidth+poswidth) % l->cols;
+        col = cursor_col;
         if (layout_prompt_row > 0) {
             /* The owner has explicitly anchored the prompt block.  Avoid the
              * relative "go up from status row" cursor motion here: after the
@@ -1656,7 +1746,8 @@ static void refreshLineWithFlags(struct linenoiseState *l, int flags) {
     struct winsize ws;
     if (ioctl(l->ofd, TIOCGWINSZ, &ws) == 0 && ws.ws_col) l->cols = ws.ws_col;
     linenoiseBeginUpdate(l->ofd);
-    if (mlmode || linenoiseStatusActive(l) || l->oldstatusrows)
+    if (mlmode || linenoiseStatusActive(l) || l->oldstatusrows ||
+        l->input_start || l->input_padding)
         refreshMultiLine(l,flags);
     else
         refreshSingleLine(l,flags);
@@ -1766,7 +1857,7 @@ int linenoiseEditInsert(struct linenoiseState *l, const char *c, size_t clen) {
 
         if (linenoiseEditInsertNoRefresh(l,c,clen) == -1) return 0;
         if (!needs_refresh && !mlmode && !linenoiseStatusActive(l) &&
-            !l->oldstatusrows && !hintsCallback &&
+            !l->oldstatusrows && !hintsCallback && !l->input_start && !l->input_padding &&
             (maskmode || l->fold_count == 0))
         {
             size_t bufwidth = utf8StrWidth(l->buf,l->len);
@@ -1854,11 +1945,34 @@ oom:
     return -1;
 }
 
+int linenoiseEditSetInputStyle(struct linenoiseState *l, const char *start_escape,
+                               const char *end_escape, size_t padding) {
+    char *start = start_escape ? strdup(start_escape) : NULL;
+    char *end = end_escape ? strdup(end_escape) : NULL;
+    if ((start_escape && !start) || (end_escape && !end)) {
+        free(start);
+        free(end);
+        return -1;
+    }
+    free(l->input_start);
+    free(l->input_end);
+    l->input_start = start;
+    l->input_end = end;
+    l->input_padding = padding;
+    return 0;
+}
+
 void linenoiseEditSetLayoutCallback(struct linenoiseState *l,
                                     linenoiseLayoutCallback *fn,
                                     void *privdata) {
     l->layout_callback = fn;
     l->layout_privdata = privdata;
+}
+
+void linenoiseEditSetMouseCallback(struct linenoiseState *l,
+                                   linenoiseMouseCallback *fn, void *privdata) {
+    l->mouse_callback = fn;
+    l->mouse_privdata = privdata;
 }
 
 static int linenoiseReadByte(struct linenoiseState *l, char *c) {
@@ -2035,8 +2149,12 @@ int linenoiseEditStart(struct linenoiseState *l, int stdin_fd, int stdout_fd, ch
     l->status = NULL;
     l->status_start = NULL;
     l->status_end = NULL;
+    l->input_start = l->input_end = NULL;
+    l->input_padding = 0;
     l->layout_callback = NULL;
     l->layout_privdata = NULL;
+    l->mouse_callback = NULL;
+    l->mouse_privdata = NULL;
     l->screen_cursor_row = 0;
     l->screen_cursor_col = 0;
     l->queued_input = NULL;
@@ -2256,6 +2374,22 @@ char *linenoiseEditMore = "If you see this, you are misusing the API: when linen
  *
  * Some other errno: I/O error.
  */
+int linenoiseDecodeKey(const char *sequence, size_t length, unsigned int *key, unsigned int *modifiers) {
+    char text[32];
+    if (!length || length >= sizeof(text) || sequence[0] != '[') return 0;
+    memcpy(text, sequence, length);
+    text[length] = '\0';
+    unsigned int event = 1;
+    int used = 0;
+    *modifiers = 1;
+    if ((sscanf(text,"[%7u;%3u:%1uu%n",key,modifiers,&event,&used) != 3 || used != (int)length) &&
+        (sscanf(text,"[%7u;%3uu%n",key,modifiers,&used) != 2 || used != (int)length) &&
+        (sscanf(text,"[%7uu%n",key,&used) != 1 || used != (int)length) &&
+        (sscanf(text,"[27;%3u;%7u~%n",modifiers,key,&used) != 2 || used != (int)length)) return 0;
+    if (!*modifiers || *key > 0x10ffff || (*key >= 0xd800 && *key <= 0xdfff) || event > 3 || !event) return 0;
+    return event == 3 ? -1 : 1;
+}
+
 char *linenoiseEditFeed(struct linenoiseState *l) {
     /* Not a TTY, pass control to line reading without character
      * count limits. */
@@ -2331,7 +2465,67 @@ char *linenoiseEditFeed(struct linenoiseState *l) {
         return linenoiseEditMore;
     }
 
+    /* SGR mouse packets use the same incremental escape parser as keys. Keep
+     * reports out of the input buffer, including releases after tracking ends.
+     * Bounded fields avoid integer overflow on malformed terminal input. */
+    if (c == ESC && seq_len >= 2 && seq[0] == '[' && seq[1] == '<') {
+        unsigned int button, column, row;
+        char kind, extra;
+        if (l->mouse_callback &&
+            sscanf(seq + 2, "%5u;%5u;%5u%c%c", &button, &column, &row, &kind, &extra) == 4 &&
+            (kind == 'M' || kind == 'm'))
+            l->mouse_callback(l, button, column, row, kind == 'M', l->mouse_privdata);
+        return linenoiseEditMore;
+    }
+
+    unsigned int key, modifiers;
+    int decoded = c == ESC ? linenoiseDecodeKey(seq, seq_len, &key, &modifiers) : 0;
+    if (decoded < 0) return linenoiseEditMore;
+    if (decoded > 0) {
+        /* Disambiguation reports keypad keys separately from the main keys. */
+        static const char keypad[] = "0123456789./*-+\r=,";
+        if (key >= 57399 && key <= 57416) key = (unsigned char)keypad[key - 57399];
+        else if (key >= 57344 && key <= 63743) {
+            switch (key) {
+            case 57417: linenoiseEditMoveLeft(l); break;
+            case 57418: linenoiseEditMoveRight(l); break;
+            case 57419: linenoiseEditHistoryNext(l, LINENOISE_HISTORY_PREV); break;
+            case 57420: linenoiseEditHistoryNext(l, LINENOISE_HISTORY_NEXT); break;
+            case 57423: linenoiseEditMoveHome(l); break;
+            case 57424: linenoiseEditMoveEnd(l); break;
+            case 57426: linenoiseEditDelete(l); break;
+            }
+            return linenoiseEditMore;
+        }
+        if (key == 13 && ((modifiers - 1) & 1)) {
+            linenoiseEditInsert(l, "\n", 1);
+            return linenoiseEditMore;
+        }
+        if ((modifiers - 1) & 4) {
+            if ((key >= 'a' && key <= 'z') || (key >= '@' && key <= '_')) key &= 31;
+            else if (key == ' ' || key == '2') key = 0;
+            else if (key >= '3' && key <= '7') key = key - '3' + 27;
+            else if (key == '8' || key == '?') key = 127;
+            else if (key == '/') key = 31;
+            else if (key == '~') key = 30;
+        }
+        if (key < 128) { c = (char)key; memset(seq, 0, sizeof(seq)); seq_len = 0; }
+        else {
+            char bytes[4];
+            size_t n;
+            if (key < 0x800) { bytes[0] = 0xc0 | (key >> 6); n = 2; }
+            else if (key < 0x10000) { bytes[0] = 0xe0 | (key >> 12); bytes[1] = 0x80 | ((key >> 6) & 63); n = 3; }
+            else { bytes[0] = 0xf0 | (key >> 18); bytes[1] = 0x80 | ((key >> 12) & 63); bytes[2] = 0x80 | ((key >> 6) & 63); n = 4; }
+            bytes[n - 1] = 0x80 | (key & 63);
+            linenoiseEditInsert(l, bytes, n);
+            return linenoiseEditMore;
+        }
+    }
+
     switch(c) {
+    case 10: /* Ctrl+J: newline fallback for terminals that cannot report Shift+Enter. */
+        linenoiseEditInsert(l, "\n", 1);
+        break;
     case ENTER:    /* enter */
         history_len--;
         free(history[history_len]);
@@ -2499,6 +2693,10 @@ void linenoiseEditStop(struct linenoiseState *l) {
     free(l->status);
     free(l->status_start);
     free(l->status_end);
+    free(l->input_start);
+    free(l->input_end);
+    l->input_start = l->input_end = NULL;
+    l->input_padding = 0;
     l->status = NULL;
     l->status_start = NULL;
     l->status_end = NULL;
@@ -2623,7 +2821,8 @@ static char *linenoiseNoTTY(void) {
  * editing function or uses a simple line reader so that you will be able
  * to type something even in the most desperate of the conditions. */
 char *linenoise(const char *prompt) {
-    if (!isatty(STDIN_FILENO) && !getenv("LINENOISE_ASSUME_TTY")) {
+    if ((!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) &&
+        !getenv("LINENOISE_ASSUME_TTY")) {
         /* Not a tty: read from file / pipe. In this mode we don't want any
          * limit to the line size, so we call a function to handle that. */
         return linenoiseNoTTY();

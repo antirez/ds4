@@ -51,6 +51,9 @@ extern char *linenoiseEditMore;
 #define LINENOISE_MAX_FOLDS 16
 
 struct linenoiseState;
+typedef void(linenoiseMouseCallback)(struct linenoiseState *l,
+                                    unsigned int button, unsigned int column,
+                                    unsigned int row, int pressed, void *privdata);
 typedef int(linenoiseLayoutCallback)(struct linenoiseState *l,
                                      size_t prompt_rows,
                                      size_t status_rows,
@@ -84,8 +87,12 @@ struct linenoiseState {
     char *status;       /* Optional status/footer rendered below the prompt. */
     char *status_start; /* Optional escape sequence emitted before status. */
     char *status_end;   /* Optional escape sequence emitted after status. */
+    char *input_start, *input_end; /* Optional full-width input styling. */
+    size_t input_padding; /* Blank rows above and below the edited text. */
     linenoiseLayoutCallback *layout_callback; /* Called before refresh writes. */
     void *layout_privdata;
+    linenoiseMouseCallback *mouse_callback;
+    void *mouse_privdata;
     int screen_cursor_row; /* Absolute terminal cursor row after last refresh. */
     int screen_cursor_col; /* Absolute terminal cursor col after last refresh. */
     char *queued_input; /* Bytes already read by an outer event loop. */
@@ -113,9 +120,13 @@ size_t linenoiseEditQueuedInput(struct linenoiseState *l);
 void linenoiseEditClear(struct linenoiseState *l);
 int linenoiseEditSetStatus(struct linenoiseState *l, const char *status,
                            const char *start_escape, const char *end_escape);
+int linenoiseEditSetInputStyle(struct linenoiseState *l, const char *start_escape,
+                               const char *end_escape, size_t padding);
 void linenoiseEditSetLayoutCallback(struct linenoiseState *l,
                                     linenoiseLayoutCallback *fn,
                                     void *privdata);
+void linenoiseEditSetMouseCallback(struct linenoiseState *l,
+                                   linenoiseMouseCallback *fn, void *privdata);
 void linenoiseEditStop(struct linenoiseState *l);
 void linenoiseHide(struct linenoiseState *l);
 void linenoiseShow(struct linenoiseState *l);
@@ -128,6 +139,8 @@ int linenoiseRefreshStatus(struct linenoiseState *l);
 size_t linenoiseUtf8Decode(const char *text, size_t len, uint32_t *cp);
 int linenoiseCharacterWidth(uint32_t cp);
 size_t linenoiseNextGrapheme(const char *text, size_t len, int *width);
+/* Decode CSI-u / modifyOtherKeys reports (without ESC): 1 key, -1 release, 0 other. */
+int linenoiseDecodeKey(const char *sequence, size_t length, unsigned int *key, unsigned int *modifiers);
 
 /* Blocking API. */
 char *linenoise(const char *prompt);
