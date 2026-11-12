@@ -165,7 +165,7 @@ static int decode_rejected(const uint8_t *buf, size_t len, const char *what,
  * the decoder itself has to notice. Lossy streams end with up to two bytes
  * of padding, so cuts of one or two bytes may still decode. */
 static int check_webp_truncations(const char *name) {
-    size_t len = 0, image_at = 12, cut;
+    size_t len = 0, image_at = 12, cut, cuts = 0;
     uint8_t *buf = read_fixture(name, &len);
     uint8_t *copy;
     int ok = 1;
@@ -179,14 +179,28 @@ static int check_webp_truncations(const char *name) {
                               (uint32_t)buf[image_at + 6] << 16 | (uint32_t)buf[image_at + 7] << 24;
         image_at += 8 + (size_t)size + (size & 1);
     }
+    if (image_at + 8 > len) {
+        fprintf(stderr, "%s.webp has no VP8 or VP8L chunk\n", name);
+        free(buf);
+        return 0;
+    }
     copy = malloc(len);
-    for (cut = image_at + 8; ok && copy && cut + 3 <= len; cut++) {
+    if (!copy) {
+        fprintf(stderr, "out of memory copying %s.webp\n", name);
+        free(buf);
+        return 0;
+    }
+    for (cut = image_at + 8; ok && cut + 3 <= len; cut++, cuts++) {
         char what[96];
         memcpy(copy, buf, cut);
         put_le32(copy + 4, (uint32_t)(cut - 8));
         put_le32(copy + image_at + 4, (uint32_t)(cut - image_at - 8));
         snprintf(what, sizeof(what), "%s.webp cut to %zu of %zu bytes", name, cut, len);
         ok = decode_rejected(copy, cut, what, "WebP");
+    }
+    if (ok && cuts == 0) {
+        fprintf(stderr, "%s.webp is too short to cut\n", name);
+        ok = 0;
     }
     free(copy);
     free(buf);
