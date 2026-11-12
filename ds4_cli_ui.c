@@ -268,6 +268,56 @@ static void track_content_spacing(ds4_cli_ui *ui, const char *text, size_t lengt
     }
 }
 
+typedef struct { size_t end, lines; bool failed; } content_extent;
+
+/* Keep trailing line breaks logical until the next content arrives. The input
+ * gap already supplies the outer margin; paragraph gaps still appear between
+ * messages, and painted user-panel padding remains part of the content. */
+static content_extent render_content(FILE *fp, const char *text, size_t length,
+                                     size_t *pending, int *escape, int row, int bottom) {
+    content_extent extent = {0};
+    if (!length) return extent;
+    size_t start = 0;
+    for (size_t i = 0; i < length; i++) {
+        unsigned char c = (unsigned char)text[i];
+        if (*escape) {
+            *escape = *escape == 1 ? (c == '[' ? 2 : 0) : (c >= '@' && c <= '~' ? 0 : 2);
+        } else if (c == 0x1b) *escape = 1;
+        else if (c == '\n') {
+            if (fp && fwrite(text + start, 1, i - start, fp) != i - start) extent.failed = true;
+            (*pending)++;
+            start = i + 1;
+        } else if (c != '\r') {
+            extent.end = i + 1;
+            if (*pending) {
+                if (fp && fwrite(text + start, 1, i - start, fp) != i - start) extent.failed = true;
+                extent.lines += *pending;
+                if (fp) {
+                    // Scrolled blank rows must use the default background,
+                    // even when the next panel has already selected its color.
+                    fputs("\0337\x1b[0m", fp);
+                    for (size_t n = 0; n < *pending; n++)
+                        if (fputs("\r\n", fp) == EOF) extent.failed = true;
+                    size_t room = (size_t)larger(0, bottom - row);
+                    row += (int)(*pending < room ? *pending : room);
+                    fputs("\0338", fp);
+                    cursor(fp, row, 1);
+                }
+                *pending = 0;
+                start = i;
+            }
+        }
+    }
+    if (fp && fwrite(text + start, 1, length - start, fp) != length - start) extent.failed = true;
+    return extent;
+}
+
+static content_extent history_extent(const ds4_cli_ui *ui) {
+    size_t pending = 0;
+    int escape = 0;
+    return render_content(NULL, ui->history, ui->history_len, &pending, &escape, 0, 0);
+}
+
 /* Retain the actual styled output, including carriage-return progress lines.
  * Repainting a smaller viewport never destroys the conversation behind it. */
 static ssize_t content_write(void *cookie, const char *text, size_t length) {
@@ -282,6 +332,7 @@ static ssize_t content_write(void *cookie, const char *text, size_t length) {
         painting--;
     }
     size_t output_length = length;
+    int escape = ui->content_escape;
     if (painting) save_content_cursor(ui);
     else {
         // One plain blank row separates panels, answers and system output.
@@ -311,20 +362,32 @@ static ssize_t content_write(void *cookie, const char *text, size_t length) {
             if (text[i] == '\n' && (!ui->history_len || ui->history[ui->history_len - 1] != '\r'))
                 ui->history[ui->history_len++] = '\r';
             ui->history[ui->history_len++] = text[i];
-            if (ui->scroll_offset && text[i] == '\n') ui->scroll_offset++;
-            if (text[i] == '\n') {
-                if (ui->content_row < ui->output_bottom) ui->content_row++;
-                else if (!ui->alt_screen && ui->inline_prefix) ui->inline_prefix--;
-            }
         }
         ui->history[ui->history_len] = '\0';
         text = ui->history + start;
         output_length = ui->history_len - start;
-        if (ui->scroll_offset) { poll_busy_input(ui); return (ssize_t)length; }
-        if (!ui->content_positioned) fputs("\x1b[?2026h\x1b[?25l\0338", ui->terminal);
-        ui->content_positioned = true;
+        if (!ui->scroll_offset) {
+            if (!ui->content_positioned) fputs("\x1b[?2026h\x1b[?25l\0338", ui->terminal);
+            ui->content_positioned = true;
+        }
     }
-    size_t written = fwrite(text, 1, output_length, ui->terminal);
+    content_extent rendered = {0};
+    if (painting) rendered.failed = fwrite(text, 1, output_length, ui->terminal) != output_length;
+    else {
+        rendered = render_content(ui->scroll_offset ? NULL : ui->terminal, text, output_length,
+                                  &ui->pending_newlines, &escape, ui->content_row, ui->output_bottom);
+        size_t room = (size_t)larger(0, ui->output_bottom - ui->content_row);
+        if (!ui->alt_screen && rendered.lines > room) {
+            size_t scrolled = rendered.lines - room;
+            ui->inline_prefix -= scrolled < (size_t)ui->inline_prefix ? (int)scrolled : ui->inline_prefix;
+        }
+        ui->content_row += (int)(rendered.lines < room ? rendered.lines : room);
+        if (ui->scroll_offset) {
+            ui->scroll_offset += rendered.lines;
+            poll_busy_input(ui);
+            return rendered.failed ? -1 : (ssize_t)length;
+        }
+    }
     if (!painting && !ui->content_escape && !ui->content_utf8) {
         fputs("\0337", ui->terminal);
         ui->content_positioned = false;
@@ -333,7 +396,7 @@ static ssize_t content_write(void *cookie, const char *text, size_t length) {
     }
     fflush(ui->terminal);
     if (!painting && !ui->content_escape && !ui->content_utf8) poll_busy_input(ui);
-    return written == output_length ? (ssize_t)length : -1;
+    return rendered.failed ? -1 : (ssize_t)length;
 }
 
 static ssize_t system_write(void *cookie, const char *text, size_t length) {
@@ -663,7 +726,7 @@ static void print_title(ds4_cli_ui *ui, FILE *fp) {
     cursor(fp, 1, 1);
     fputs("\x1b[2K", fp);
     spaces(fp, ui->columns >= 8 ? 2 : 0);
-    text_cell(fp, &s, s.accent, "DwarfStar", larger(1, ui->columns - 4), false);
+    text_cell(fp, &s, s.accent, ui->title, larger(1, ui->columns - 4), false);
 }
 
 static void repaint_content(ds4_cli_ui *ui, FILE *fp) {
@@ -672,15 +735,18 @@ static void repaint_content(ds4_cli_ui *ui, FILE *fp) {
     clear_rows(fp, top, ui->output_bottom);
     if (ds4_cli_ui_color_enabled(stdout)) fputs("\x1b[0m", fp);
     cursor(fp, top, 1);
-    size_t end = ui->history_len;
+    size_t end = ui->scroll_offset ? history_extent(ui).end : ui->history_len;
     for (size_t skip = ui->scroll_offset; skip && end; skip--) {
         if (ui->history[end - 1] == '\n') end--;
         while (end && ui->history[end - 1] != '\n') end--;
     }
-    if (end) fwrite(ui->history, 1, end, fp);
-    ui->content_row = top;
-    for (size_t i = 0; i < end; i++)
-        if (ui->history[i] == '\n' && ui->content_row < ui->output_bottom) ui->content_row++;
+    size_t pending = 0;
+    int escape = 0;
+    content_extent rendered = render_content(fp, ui->history, end, &pending, &escape,
+                                            top, ui->output_bottom);
+    size_t room = (size_t)larger(0, ui->output_bottom - top);
+    ui->content_row = top + (int)(rendered.lines < room ? rendered.lines : room);
+    if (!ui->scroll_offset) ui->pending_newlines = pending;
     fputs("\0337", fp);
     print_title(ui, fp);
     ui->content_positioned = false;
@@ -697,8 +763,7 @@ static void park_cursor(ds4_cli_ui *ui) {
 }
 
 static void scroll_conversation(ds4_cli_ui *ui, int rows) {
-    size_t lines = 1;
-    for (size_t i = 0; i < ui->history_len; i++) lines += ui->history[i] == '\n';
+    size_t lines = 1 + history_extent(ui).lines;
     size_t height = (size_t)larger(1, ui->output_bottom - (ui->alt_screen ? 1 : ui->inline_prefix));
     size_t limit = lines > height ? lines - height : 0;
     size_t offset = rows > 0 ? ui->scroll_offset + (size_t)rows :
@@ -778,9 +843,8 @@ static void set_layout(ds4_cli_ui *ui, FILE *fp, size_t prompt_rows, size_t stat
         if (ui->logo_visible) erase_logo(ui, fp);
         fprintf(fp, "\x1b[%d;%dr", ui->alt_screen ? 2 : 1, bottom);
         if (!ui->alt_screen) {
-            int lines = 1;
-            for (size_t i = 0; i < ui->history_len; i++) lines += ui->history[i] == '\n';
-            int prefix = smaller(ui->inline_prefix, larger(0, bottom - lines));
+            size_t lines = 1 + history_extent(ui).lines;
+            int prefix = lines >= (size_t)bottom ? 0 : smaller(ui->inline_prefix, bottom - (int)lines);
             if (prefix < ui->inline_prefix) {
                 cursor(fp, bottom, 1);
                 for (int i = prefix; i < ui->inline_prefix; i++) fputs("\r\n", fp);
@@ -974,8 +1038,9 @@ static int inline_cursor_row(ds4_cli_ui *ui) {
     return row;
 }
 
-void ds4_cli_ui_start(ds4_cli_ui *ui, bool no_alt_screen) {
+void ds4_cli_ui_start(ds4_cli_ui *ui, bool no_alt_screen, const char *title) {
     memset(ui, 0, sizeof(*ui));
+    ui->title = title;
     linenoiseSetMultiLine(1);
     struct winsize size = {0};
     if (!isatty(STDIN_FILENO) || !cli_ui_terminal(stdout) ||
@@ -1010,7 +1075,7 @@ void ds4_cli_ui_start(ds4_cli_ui *ui, bool no_alt_screen) {
     }
     else {
         cli_ui_style s = cli_ui_make_style(stdout);
-        fprintf(stdout, "  %sDwarfStar%s\n", s.accent, s.off);
+        fprintf(stdout, "  %s%s%s\n", s.accent, ui->title, s.off);
         int reserved = EMPTY_INPUT_ROWS + 1 + (ui->rows >= 7 ? INPUT_GAP : 0);
         for (int i = 0; i < reserved; i++) fputs("\r\n", stdout);
         fprintf(stdout, "\x1b[%dA\r", reserved);
@@ -1154,7 +1219,9 @@ void ds4_cli_ui_stop(ds4_cli_ui *ui) {
     } else {
         if (ui->scroll_offset) { ui->scroll_offset = 0; repaint_content(ui, stdout); }
         clear_rows(stdout, ui->output_bottom + 1, ui->rows);
-        fputs("\x1b[r\0338\x1b[0m\r\n", stdout);
+        fputs("\x1b[r\0338\x1b[0m", stdout);
+        size_t lines = ui->pending_newlines ? ui->pending_newlines : 1;
+        for (size_t i = 0; i < lines; i++) fputs("\r\n", stdout);
     }
     fflush(stdout);
     painting--;

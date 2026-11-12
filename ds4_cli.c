@@ -386,6 +386,8 @@ typedef struct {
     bool color_open;
     bool use_color;
     bool last_output_newline;
+    bool think_visible, post_think_gap;
+    size_t think_newlines;
     char pending[16];
     size_t pending_len;
     ds4_cli_ui_output output;
@@ -415,11 +417,28 @@ static void token_printer_reset_color(token_printer *p) {
     }
 }
 
-static void token_printer_write_char(token_printer *p, char c) {
+static void token_printer_emit_char(token_printer *p, char c) {
     if (p->in_think) token_printer_set_grey(p);
     if (p->output.fp) ds4_cli_ui_output_write(&p->output, &c, 1);
     else fputc((unsigned char)c, p->fp);
     p->last_output_newline = c == '\n';
+}
+
+static void token_printer_write_char(token_printer *p, char c) {
+    // Delay thinking's trailing line breaks so the answer reuses its gap.
+    // Flush them inside the thought to preserve paragraph spacing.
+    if (p->in_think) {
+        if (c == '\n') { p->think_newlines++; return; }
+        while (p->think_newlines) {
+            token_printer_emit_char(p, '\n');
+            p->think_newlines--;
+        }
+        p->think_visible = true;
+    } else if (p->post_think_gap) {
+        if (c == '\n' || c == '\r') return;
+        p->post_think_gap = false;
+    }
+    token_printer_emit_char(p, c);
 }
 
 static void token_printer_process(token_printer *p, const char *text, size_t len, bool finish) {
@@ -438,15 +457,20 @@ static void token_printer_process(token_printer *p, const char *text, size_t len
         const size_t rem = total - i;
         if (bytes_has_prefix(cur, rem, think_open)) {
             p->in_think = true;
+            p->think_visible = p->post_think_gap = false;
+            p->think_newlines = 0;
             i += strlen(think_open);
             continue;
         }
         if (bytes_has_prefix(cur, rem, think_close)) {
             p->in_think = false;
+            p->think_newlines = 0;
             token_printer_reset_color(p);
-            if (!p->last_output_newline) {
-                token_printer_write_char(p, '\n');
+            if (p->think_visible) {
+                token_printer_emit_char(p, '\n');
+                token_printer_emit_char(p, '\n');
             }
+            p->post_think_gap = true;
             i += strlen(think_close);
             continue;
         }
@@ -480,7 +504,7 @@ static void generation_done(void *ud) {
     token_printer_finish(p);
     if (p->output.fp) ds4_cli_ui_output_finish(&p->output);
     if (!p->last_output_newline) {
-        token_printer_write_char(p, '\n');
+        token_printer_emit_char(p, '\n');
     }
     fflush(p->fp);
 }
@@ -1738,7 +1762,7 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
     /* Enter the terminal UI only after model/prefix initialization so
      * startup failures stay visible. Pipes keep the ordinary line reader. */
     ds4_cli_ui ui;
-    ds4_cli_ui_start(&ui, cfg->no_alt_screen);
+    ds4_cli_ui_start(&ui, cfg->no_alt_screen, "DwarfStar Chat");
 
     int rc = 0;
     for (;;) {

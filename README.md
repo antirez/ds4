@@ -127,65 +127,11 @@ for API access and multiple sessions.
 The interactive CLI keeps a multi-turn conversation. Use `/help`, `/status`,
 `/read FILE`, `/ctx N`, and `/quit`. Ctrl+C interrupts generation and returns to
 the input box.
+
+Interactive sessions in `ds4` and `ds4-agent` use an alternate screen by default;
+pass `--no-alt-screen` to stay in the normal terminal buffer. Enter submits a
+message; Shift+Enter inserts a newline, with Ctrl+J as a fallback.
 Run each binary with `--help` for its full options.
-
-To see the welcome screen, rebuild and start the interactive CLI from this checkout:
-
-```sh
-make
-./ds4 -m ds4flash.gguf
-```
-
-After the model and session are ready, `ds4` and `ds4-agent` open an alternate screen when both
-input and output are supported TTYs. Exiting restores the normal terminal view.
-Use `--no-alt-screen` with either program to keep the session in the normal terminal
-buffer, with a gold `DwarfStar` text label instead of the logo. Both modes pin
-the input and footer below a protected conversation scroll region. Opening and
-closing the UI never explicitly clear the normal terminal screen.
-
-In the alternate screen, a gold `DwarfStar` title stays at the top and the
-conversation starts directly below it. The input bar and footer stay at the
-bottom; growing or shrinking the input preserves the conversation. The logo is
-centered in the space between the title and input bar. It starts dimmed to half
-brightness. Left-click the logo to
-fade it to full brightness, animate its flames, and sweep two quick, warm gold
-shimmers diagonally across the whole logo from bottom left to top right over
-three seconds, then return to the static, dimmed image. Internal bevel shading
-adds depth to the symbol and lettering without an outside shadow.
-Brightness simulates opacity because
-terminal text has no portable alpha channel. Mouse tracking stays enabled while
-the interactive UI is active: the wheel scrolls only the conversation, while Up/Down recall
-input history. The input and footer stay fixed while scrolling.
-
-Typing hides the logo; emptying the input restores it until the first nonempty
-submission dismisses it for the session. Empty input shows a `Message DwarfStar...`
-placeholder. The white footer shows the model with its thinking level, context
-tokens used / maximum (percentage), and a `/help` hint.
-The agent includes its launch directory as the second footer item and keeps its
-live editor and queued prompts. `ds4` discards input typed during generation;
-the cursor stays in the input area during generation in both modes. Home paths
-in the agent footer use `~/`. Use `/status` in `ds4` for full session details and `/help`
-in either program for commands.
-
-The user input box and sent user messages have a full-width cool slate grey
-background with a blank row of padding above and below the text. A separate
-plain row always separates the live text box from conversation output. Use
-Shift+Enter for an editable newline, or Ctrl+J on terminals without distinct
-Shift+Enter reporting; Enter submits. A shared rule
-keeps one plain blank row between user panels, answers, and groups of system
-messages, reusing any existing gap. Assistant replies use the normal
-terminal background and the same two-column side padding, without speaker labels.
-System messages, including processing/prefill progress, and the footer use the
-same side padding.
-
-The Braille logo is shown only in an interactive terminal whose UTF-8 locale
-reports single-cell Braille characters. Other environments skip it without a
-fallback logo. Font glyph coverage cannot be reliably detected; use a font with
-Braille glyphs. `NO_COLOR` disables colors independently of the logo.
-
-Both programs share this interactive UI. In `ds4`, it does not appear with `-p`,
-`--prompt-file`, or `--inspect`; the agent uses `--non-interactive` to skip it.
-Redirected output and non-interactive modes are never cleared.
 
 ### Native coding agent
 

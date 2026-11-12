@@ -19,7 +19,7 @@ int main(int argc, char **argv) {
         .model = "Preview model", .backend = "metal", .thinking = "high",
         .ctx_size = 32768, .power_percent = 100,
     };
-    ds4_cli_ui_start(&ui, no_alt_screen);
+    ds4_cli_ui_start(&ui, no_alt_screen, "DwarfStar Chat");
     for (;;) {
         errno = 0;
         char *line = ds4_cli_ui_readline(&ui, &state);
@@ -51,6 +51,29 @@ int main(int argc, char **argv) {
             ds4_cli_ui_output_write(&output, "answer text\n", 12);
             ds4_cli_ui_output_finish(&output);
             fprintf(stderr, "\x1b[90mds4: prefill: 120 t/s\n\x1b[0m");
+        }
+        else if (!strncmp(line, "/margin ", 8)) {
+            ds4_cli_ui_output output;
+            ds4_cli_ui_output_start(&output, stdout);
+            for (int row = 0; row < 40; row++) {
+                char text[48];
+                int n = snprintf(text, sizeof(text), "earlier row %d\n", row);
+                ds4_cli_ui_output_write(&output, text, (size_t)n);
+            }
+            const char *kind = line + 8;
+            if (!strcmp(kind, "user")) ds4_cli_ui_print_user(&ui, "last user");
+            else if (!strcmp(kind, "system")) {
+                fprintf(stderr, "\rprocessing: previous\x1b[K\rprocessing: last\x1b[K\n");
+                fprintf(stderr, "%slast system\n%s", ds4_cli_ui_color_enabled(stdout) ? "\x1b[90m" : "",
+                        ds4_cli_ui_color_enabled(stdout) ? "\x1b[0m" : "");
+            } else {
+                if (!strcmp(kind, "paragraph")) ds4_cli_ui_output_write(&output, "paragraph one\n\n", 15);
+                ds4_cli_ui_output_write(&output, "last answer", 11);
+                if (strcmp(kind, "partial")) ds4_cli_ui_output_write(&output, "\n", 1);
+                if (!strcmp(kind, "blank") || !strcmp(kind, "paragraph"))
+                    ds4_cli_ui_output_write(&output, "\n\n", 2);
+            }
+            ds4_cli_ui_output_finish(&output);
         }
         else if (*line) {
             ds4_cli_ui_output output;

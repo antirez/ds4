@@ -35,7 +35,15 @@ def utf8_locale():
 
 
 class Screen(pyte.Screen):
-    """Model xterm's alternate buffer, which pyte does not implement itself."""
+    """Model xterm's alternate buffer and background color erase."""
+    def index(self):
+        bottom = self.margins.bottom if self.margins else self.lines - 1
+        scrolling = self.cursor.y == bottom
+        super().index()
+        if scrolling:
+            # Real terminals use the active background for newly scrolled rows.
+            self.erase_in_line(2)
+
     def write_process_input(self, data):
         if hasattr(self, "reply"):
             self.reply(data)
@@ -58,13 +66,14 @@ class Screen(pyte.Screen):
 
 
 class Terminal:
-    def __init__(self, binary, *, columns=80, rows=30, no_alt_screen=False, args=None, early_input="", **environment):
+    def __init__(self, binary, *, columns=80, rows=30, no_alt_screen=False, args=None, early_input="", title="DwarfStar Chat", **environment):
         self.master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", rows, columns, 0, 0))
         env = dict(os.environ, TERM="xterm-256color", LC_ALL=utf8_locale())
         env.pop("NO_COLOR", None)
         env.update(environment)
         self.no_alt_screen = no_alt_screen
+        self.title = title
         args = [binary] + (args or []) + (["--no-alt-screen"] if no_alt_screen else [])
         self.process = subprocess.Popen(args, stdin=slave, stdout=slave, stderr=slave,
                                         env=env, start_new_session=True)
@@ -128,7 +137,7 @@ class Terminal:
         xs, ys = zip(*cells)
         assert abs((min(xs) + max(xs)) / 2 - (self.screen.columns - 1) / 2) <= 2
         assert abs((min(ys) + max(ys)) / 2 - (self.screen.lines - 5) / 2) <= 1
-        assert self.screen.display[0].strip() == "DwarfStar"
+        assert self.screen.display[0].strip() == self.title
         assert self.screen.cursor.y == self.screen.lines - 3
         assert self.input_text() == ""
         assert "/help" in self.screen.display[-1]
@@ -239,11 +248,11 @@ def check_screen_modes(binary):
             if no_alt_screen:
                 assert not terminal.logo()
                 assert terminal.screen.display[0].startswith("existing shell output")
-                assert terminal.screen.display[1].strip() == "DwarfStar"
-                assert all(terminal.screen.buffer[1][x].fg == "d7af87" for x in range(2, 11))
+                assert terminal.screen.display[1].strip() == terminal.title
+                assert all(terminal.screen.buffer[1][x].fg == "d7af87" for x in range(2, 2 + len(terminal.title)))
                 terminal.send("draft")
                 assert terminal.screen.display[0].startswith("existing shell output")
-                assert terminal.screen.display[1].strip() == "DwarfStar"
+                assert terminal.screen.display[1].strip() == terminal.title
                 assert terminal.input_text() == "draft"
                 assert terminal.screen.cursor.y == terminal.screen.lines - 3
                 terminal.send(b"\x15")
@@ -450,7 +459,7 @@ def check_content_layout(binary):
         terminal.centered()
         terminal.send("/layout\r")
         display = terminal.screen.display
-        assert display[0].strip() == "DwarfStar"
+        assert display[0].strip() == terminal.title
         assert not display[1].strip()
         assert display[3].strip() == "/layout", "conversation did not start below the title"
         assert display[6].strip() == "answer first"
@@ -474,9 +483,9 @@ def check_content_layout(binary):
         # own panel rows and symmetric outer gaps; reserved editor rows return.
         terminal.send("/power 50" + " " * 90 + "\r")
         bottom = terminal.screen.margins.bottom
-        assert terminal.screen.display[1:bottom - 5] == baseline[7:bottom + 1]
-        assert terminal.screen.display[bottom - 4].strip() == "/power 50"
-        assert terminal.screen.display[0].strip() == "DwarfStar"
+        assert terminal.screen.display[1:bottom - 4] == baseline[6:bottom + 1]
+        assert terminal.screen.display[bottom - 2].strip() == "/power 50"
+        assert terminal.screen.display[0].strip() == terminal.title
         assert terminal.screen.cursor.y == terminal.screen.lines - 3
         assert "GPU" not in terminal.footer()
     finally:
@@ -617,6 +626,49 @@ def check_scroll_cursor(binary):
     print("CLI UI: input-only cursor, busy input discard, wheel scrollback and arrow-only history passed")
 
 
+def check_input_gap(binary):
+    for inline in (False, True):
+        for color in (True, False):
+            cases = ("partial", "line", "blank", "paragraph", "system", "user") if color else ("line", "user")
+            for kind in cases:
+                terminal = Terminal(binary, no_alt_screen=inline, **({} if color else {"NO_COLOR": "1"}))
+                try:
+                    terminal.send("/margin " + kind + "\r")
+                    display = terminal.screen.display
+                    gap = terminal.screen.cursor.y - 2
+                    assert not display[gap].strip()
+                    assert all(terminal.screen.buffer[gap][x].bg == "default" for x in range(80))
+                    if kind == "user":
+                        assert display[gap - 2].strip() == "last user", (kind, display)
+                        assert not display[gap - 1].strip()
+                        if color: terminal.assert_panel(gap - 3, 3)
+                    else:
+                        expected = "last system" if kind == "system" else "last answer"
+                        assert display[gap - 1].strip() == expected, (kind, display)
+                    if kind == "paragraph":
+                        first = next(y for y, line in enumerate(display) if "paragraph one" in line)
+                        assert display[first + 2].strip() == "last answer"
+                        assert not display[first + 1].strip()
+                    before = display.copy()
+                    terminal.send("x" * 160)
+                    terminal.send(b"\x15")
+                    terminal.wait_for(lambda: terminal.screen.display == before,
+                                      "input resizing changed the collapsed margin")
+                    # The margin is still present when another content block
+                    # follows; collapsing it at the input must not eat it.
+                    terminal.send("/power 50\r")
+                    display = terminal.screen.display
+                    message = next(y for y, line in enumerate(display) if line.strip() == "/power 50")
+                    assert not display[message - 2].strip()
+                    previous = next(y for y, line in enumerate(display)
+                                    if line.strip() == ("last user" if kind == "user" else
+                                                        "last system" if kind == "system" else "last answer"))
+                    assert message - previous >= (4 if kind == "user" else 3)
+                finally:
+                    terminal.close()
+    print("CLI UI: collapsed input gap for streaming, trailing newlines, user padding, system output, paragraphs and NO_COLOR passed")
+
+
 def check_newlines_inline(binary):
     terminal = Terminal(binary, no_alt_screen=True, early_input="a中")
     try:
@@ -697,6 +749,7 @@ if __name__ == "__main__":
     check_system_padding(binary)
     check_footer_placeholder(binary)
     check_message_spacing(binary)
+    check_input_gap(binary)
     check_scroll_cursor(binary)
     check_newlines_inline(binary)
     check_animation(binary)

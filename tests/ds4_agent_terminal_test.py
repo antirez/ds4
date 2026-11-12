@@ -163,7 +163,7 @@ def main():
 
 def check_shared_ui(binary):
     for inline in (False, True):
-        terminal = Terminal(binary, columns=120, no_alt_screen=inline, args=["--shared-terminal-driver"])
+        terminal = Terminal(binary, title="DwarfStar Agent", columns=120, no_alt_screen=inline, args=["--shared-terminal-driver"])
         try:
             if not inline:
                 terminal.centered()
@@ -201,7 +201,7 @@ def check_shared_ui(binary):
             terminal.close()
     print("Shared agent UI: logo, launch path, live draft/cursor, queued footer, scrolling, resize and inline mode passed")
     for answer in ("yes", "timeout"):
-        terminal = Terminal(binary, args=["--shared-confirmation", answer])
+        terminal = Terminal(binary, title="DwarfStar Agent", args=["--shared-confirmation", answer])
         try:
             assert any("Allow test action?" in line for line in terminal.screen.display)
             if answer == "yes": terminal.send("y\r")
@@ -213,7 +213,7 @@ def check_shared_ui(binary):
 
 def check_home_help(binary):
     for inline in (False, True):
-        terminal = Terminal(binary, columns=120, no_alt_screen=inline, args=["--shared-help"], HOME=str(Path.cwd()))
+        terminal = Terminal(binary, title="DwarfStar Agent", columns=120, no_alt_screen=inline, args=["--shared-help"], HOME=str(Path.cwd()))
         try:
             assert " | ~/ | ctx " in terminal.footer(), terminal.footer()
             display = terminal.screen.display
@@ -238,7 +238,7 @@ def check_home_help(binary):
             assert result and bytes.fromhex(result[1].decode()).decode() == "first\nsecond"
         finally:
             terminal.close()
-    terminal = Terminal(binary, columns=120, args=["--shared-terminal-driver"], HOME=str(Path.cwd()) + "-other")
+    terminal = Terminal(binary, title="DwarfStar Agent", columns=120, args=["--shared-terminal-driver"], HOME=str(Path.cwd()) + "-other")
     try:
         assert str(Path.cwd()) in terminal.footer(), "a sibling path was shortened as home"
     finally:

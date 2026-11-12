@@ -35,6 +35,7 @@ typedef struct {
 
 typedef struct {
     ds4_cli_ui_state state;
+    const char *title;
     int rows, columns, output_bottom, prompt_row;
     int inline_prefix, content_row;
     int logo_top, logo_left, logo_width, logo_height;
@@ -44,6 +45,7 @@ typedef struct {
     struct termios input_mode;
     struct linenoiseState *edit;
     size_t scroll_offset;
+    size_t pending_newlines;
     int content_utf8;
     char busy_input[32];
     size_t busy_input_len;
@@ -62,7 +64,7 @@ bool ds4_cli_ui_color_enabled(FILE *fp);
 void ds4_cli_ui_output_start(ds4_cli_ui_output *out, FILE *fp);
 void ds4_cli_ui_output_write(ds4_cli_ui_output *out, const char *text, size_t length);
 void ds4_cli_ui_output_finish(ds4_cli_ui_output *out);
-void ds4_cli_ui_start(ds4_cli_ui *ui, bool no_alt_screen);
+void ds4_cli_ui_start(ds4_cli_ui *ui, bool no_alt_screen, const char *title);
 void ds4_cli_ui_format_footer(const ds4_cli_ui_state *state, int columns, char *text, size_t length);
 int ds4_cli_ui_edit_begin(ds4_cli_ui *ui, struct linenoiseState *edit,
                          char *buffer, size_t length, const char *footer);

@@ -228,6 +228,8 @@ typedef struct {
     bool use_color;
     bool last_output_newline;
     bool wrote_visible_output;
+    bool think_visible, post_think_gap;
+    size_t think_newlines;
     bool md_bold;
     bool md_italic;
     bool md_inline_code;
@@ -3567,6 +3569,19 @@ static void renderer_markdown_finish(agent_token_renderer *r) {
 }
 
 static void renderer_write_char(agent_token_renderer *r, char c) {
+    // Keep internal thinking paragraphs, but reuse trailing line breaks for
+    // the single blank row before the answer.
+    if (r->in_think) {
+        if (c == '\n') { r->think_newlines++; return; }
+        while (r->think_newlines) {
+            renderer_write_char_raw(r, '\n');
+            r->think_newlines--;
+        }
+        r->think_visible = true;
+    } else if (r->post_think_gap) {
+        if (c == '\n' || c == '\r') return;
+        r->post_think_gap = false;
+    }
     if (!r->format_markdown || r->in_think) {
         renderer_markdown_emit_pending_literals(r);
         renderer_hint_end(r);
@@ -3610,6 +3625,19 @@ static void renderer_write_char(agent_token_renderer *r, char c) {
     renderer_markdown_feed(r, c);
 }
 
+static void renderer_end_thinking(agent_token_renderer *r) {
+    renderer_hint_end(r);
+    renderer_flush_utf8(r);
+    r->in_think = false;
+    r->think_newlines = 0;
+    renderer_reset_color(r);
+    if (r->think_visible) {
+        renderer_write(r, "\n\n", 2);
+        r->last_output_newline = true;
+    }
+    r->post_think_gap = true;
+}
+
 /* Render assistant text while hiding <think> tags and dimming thinking text.
  * The function is also responsible for not prematurely emitting a partial
  * control tag split across model tokens. */
@@ -3629,16 +3657,13 @@ static void renderer_process(agent_token_renderer *r, const char *text, size_t l
         if (bytes_has_prefix(cur, rem, think_open)) {
             renderer_hint_end(r);
             r->in_think = true;
+            r->think_visible = r->post_think_gap = false;
+            r->think_newlines = 0;
             i += strlen(think_open);
             continue;
         }
         if (bytes_has_prefix(cur, rem, think_close)) {
-            renderer_hint_end(r);
-            r->in_think = false;
-            renderer_reset_color(r);
-            if (!r->last_output_newline) renderer_write(r, "\n", 1);
-            renderer_write(r, "\n", 1);
-            r->last_output_newline = true;
+            renderer_end_thinking(r);
             i += strlen(think_close);
             continue;
         }
@@ -4247,6 +4272,7 @@ static void agent_stream_start_dsml(agent_stream_renderer *sr, bool ignored) {
     if (ignored) sr->dsml_in_think = true;
     sr->dsml_start_len = 0;
     sr->post_think_gap = false;
+    sr->renderer->post_think_gap = false;
     agent_trace(sr->renderer->worker, "%s tool start detected%s",
                 sr->syntax == AGENT_TOOL_SYNTAX_QWEN ? "qwen" :
                 sr->syntax == AGENT_TOOL_SYNTAX_GLM ? "glm" : "dsml",
@@ -4468,19 +4494,15 @@ static void agent_stream_text(agent_stream_renderer *sr, const char *text, size_
             sr->post_think_gap = false;
             sr->in_think = true;
             sr->renderer->in_think = true;
+            sr->renderer->think_visible = sr->renderer->post_think_gap = false;
+            sr->renderer->think_newlines = 0;
             i += strlen(think_open);
             continue;
         }
         if (!sr->dsml_active && bytes_has_prefix(cur, rem, think_close)) {
             agent_stream_flush_start_tail(sr);
-            renderer_hint_end(sr->renderer);
             sr->in_think = false;
-            sr->renderer->in_think = false;
-            renderer_reset_color(sr->renderer);
-            if (!sr->renderer->last_output_newline)
-                renderer_write(sr->renderer, "\n", 1);
-            renderer_write(sr->renderer, "\n", 1);
-            sr->renderer->last_output_newline = true;
+            renderer_end_thinking(sr->renderer);
             sr->post_think_gap = true;
             i += strlen(think_close);
             continue;
@@ -13202,7 +13224,7 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
     linenoiseSetCompletionCallback(agent_switch_completion_callback);
 
     agent_editor editor = {0};
-    ds4_cli_ui_start(&editor.ui, cfg->no_alt_screen);
+    ds4_cli_ui_start(&editor.ui, cfg->no_alt_screen, "DwarfStar Agent");
     agent_ui = &editor.ui;
     editor.ui.state.model = ds4_engine_model_name(engine);
     editor.ui.state.directory = cfg->launch_dir;

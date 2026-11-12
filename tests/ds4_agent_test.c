@@ -548,6 +548,35 @@ static char *test_hint_capture(const char *text, size_t split, bool markdown,
     return agent_tail_capture_take(&capture, NULL);
 }
 
+static void test_thinking_spacing(void) {
+    const char *gaps[] = {"", "\n", "\n\n", "\n\n\n"};
+    for (size_t before = 0; before < 4; before++) {
+        for (size_t after = 0; after < 4; after++) {
+            char text[256];
+            snprintf(text, sizeof(text), "<think>first\n\nlast%s</think>%sanswer\n\nparagraph",
+                     gaps[before], gaps[after]);
+            for (size_t split = 0; split <= strlen(text) + 1; split++) {
+                char *out = test_hint_capture(text, split, true, false, AGENT_TOOL_SYNTAX_DSML, NULL);
+                AGENT_TEST_ASSERT(!strcmp(out, "first\n\nlast\n\nanswer\n\nparagraph\n\n"));
+                free(out);
+                agent_tail_capture capture = {.cap = 4096};
+                agent_token_renderer r = {.capture = &capture, .format_thinking = true,
+                    .format_markdown = true, .last_output_newline = true};
+                if (split <= strlen(text)) {
+                    renderer_process(&r, text, split, false);
+                    renderer_process(&r, text + split, strlen(text) - split, false);
+                } else {
+                    for (size_t i = 0; text[i]; i++) renderer_process(&r, text + i, 1, false);
+                }
+                renderer_finish(&r);
+                out = agent_tail_capture_take(&capture, NULL);
+                AGENT_TEST_ASSERT(!strcmp(out, "first\n\nlast\n\nanswer\n\nparagraph\n\n"));
+                free(out);
+            }
+        }
+    }
+}
+
 static void test_hint_rendering(void) {
     const char *badge = "\x1b[1;97;48;5;23m Hint \x1b[0m";
     const char *sample =
@@ -730,7 +759,7 @@ static int test_terminal_driver(bool shared, bool inline_screen, bool show_help)
     char directory[PATH_MAX];
     agent_prompt_queue queue = {0};
     if (shared) {
-        ds4_cli_ui_start(&ed.ui, inline_screen);
+        ds4_cli_ui_start(&ed.ui, inline_screen, "DwarfStar Agent");
         agent_ui = &ed.ui;
         ed.ui.state.model = "Preview agent";
         ed.ui.state.directory = getcwd(directory, sizeof(directory)) ? directory : ".";
@@ -1071,7 +1100,7 @@ static int test_full_context_save(const char *model) {
 
 static int test_shared_confirmation(bool timeout_expected) {
     ds4_cli_ui ui;
-    ds4_cli_ui_start(&ui, false);
+    ds4_cli_ui_start(&ui, false, "DwarfStar Agent");
     agent_ui = &ui;
     ui.state.model = "Preview agent";
     ui.state.thinking = "high";
@@ -1112,6 +1141,7 @@ int main(int argc, char **argv) {
     test_fragmented_terminal_input();
     test_shell_terminal_controls();
     test_markdown_literals();
+    test_thinking_spacing();
     test_hint_rendering();
     test_unicode_output_and_footer();
     test_footer_only_updates();
