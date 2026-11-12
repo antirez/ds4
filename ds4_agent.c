@@ -1286,7 +1286,7 @@ static const char agent_tools_prompt_after_edit[] =
     "unless explicitly asked otherwise by the user.\n";
 
 static const char agent_vision_tool_schema[] =
-    "{\"name\":\"view_image\",\"description\":\"Open a local PNG or JPEG as a visual observation.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}}";
+    "{\"name\":\"view_image\",\"description\":\"Open a local PNG, JPEG, or WebP as a visual observation.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}}";
 
 static char *agent_build_dsml_tools_prompt(bool edit_upto, bool vision) {
     const char *edit = edit_upto ? agent_tools_prompt_edit_upto

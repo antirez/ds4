@@ -1292,7 +1292,7 @@ static void print_repl_help(void) {
     puts("  /ctx N         Set context size for following prompts.");
     puts("  /power N       Set GPU duty cycle percentage, 1..100.");
     puts("  /steer F       Set FFN steering for subsequent tokens; no value shows it.");
-    puts("  /read FILE     Submit a text file, PNG, or JPEG.");
+    puts("  /read FILE     Submit a text file, PNG, JPEG, or WebP.");
     puts("  /quit, /exit   Leave the prompt.");
     puts("  Ctrl+C         Stop generation and return to the prompt.");
 }
@@ -1697,13 +1697,14 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat,
 }
 
 static bool cli_file_has_image_magic(const char *path) {
-    unsigned char magic[8] = {0};
+    unsigned char magic[12] = {0};
     FILE *fp = fopen(path, "rb");
     if (!fp) return false;
     size_t n = fread(magic, 1, sizeof(magic), fp);
     fclose(fp);
     return (n >= 8 && !memcmp(magic, "\x89PNG\r\n\x1a\n", 8)) ||
-           (n >= 2 && magic[0] == 0xff && magic[1] == 0xd8);
+           (n >= 2 && magic[0] == 0xff && magic[1] == 0xd8) ||
+           (n >= 12 && !memcmp(magic, "RIFF", 4) && !memcmp(magic + 8, "WEBP", 4));
 }
 
 static int run_repl(ds4_engine *engine, cli_config *cfg) {
