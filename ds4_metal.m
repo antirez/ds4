@@ -11740,8 +11740,11 @@ int ds4_gpu_warm_command_queue(void) {
  * engine's command queue has been idle for about 3 s, the next command
  * buffer on it starts 600-800 ms late (the driver drops and rebuilds the
  * process's GPU mappings; 76-145 GB of no-copy model views here).  Work on
- * other queues does not prevent it.  One 1 KB kernel per second on this
- * queue keeps the mappings alive at no measurable cost.
+ * other queues does not prevent it.  A 1 KB kernel on this queue keeps the
+ * mappings alive at no measurable cost.  It runs every 250 ms: on M5 Ultra
+ * (macOS 27, 205 GB of model views) the drop comes after about 1 s idle, so
+ * a 1 s period lost the race every ~6 s and a request arriving then waited
+ * 3-11 s; at 500 ms and 250 ms no drop was seen.
  * DS4_METAL_DISABLE_QUEUE_KEEPALIVE=1 opts out. */
 static pthread_t g_queue_keepalive_thread;
 static volatile int g_queue_keepalive_running;
@@ -11755,7 +11758,7 @@ static void *ds4_gpu_queue_keepalive_thread(void *arg) {
     if (!pipeline || !scratch) return NULL;
     memset(scratch.contents, 0, 256u * sizeof(float));
     const uint32_t iters = 1u;
-    uint64_t period_ms = ds4_gpu_env_u64("DS4_METAL_QUEUE_KEEPALIVE_MS", 1000u, 50u, 10000u);
+    uint64_t period_ms = ds4_gpu_env_u64("DS4_METAL_QUEUE_KEEPALIVE_MS", 250u, 50u, 10000u);
     while (!g_queue_keepalive_stop) {
         @autoreleasepool {
             id<MTLCommandBuffer> cb = [g_queue commandBuffer];
