@@ -101,9 +101,10 @@ For the eight-L40S example, see [CUDA GPUs](CUDA_MULTI_GPU.md#serve-multiple-use
 Start with the matching language GGUF and `--vision FILE`; see
 [model-specific instructions](MODELS.md#vision).
 
-OpenAI chat and Responses accept inline PNG/JPEG data URIs. Anthropic accepts
-base64 image sources. Remote URLs and server-side file paths are rejected.
-Image blocks preserve their order in the request. The limit is 16 images and
+OpenAI chat and Responses accept inline PNG, JPEG, and WebP data URIs.
+Anthropic accepts base64 image sources of the same types. Animated WebP is
+rejected. Remote URLs and server-side file paths are rejected.
+Image blocks preserve their order in the request. The limit is 256 images and
 a 64 MiB HTTP body.
 
 ## Disk KV cache

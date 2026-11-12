@@ -222,7 +222,7 @@ Directional steering is supported for GLM 5.3, not GLM 5.2.
 
 ## Vision
 
-PNG and JPEG input works in the CLI, native agent, and HTTP server on Metal,
+PNG, JPEG, and WebP input works in the CLI, native agent, and HTTP server on Metal,
 single-GPU CUDA, and ROCm. The encoder must match the model.
 V4.1 Flash vision is currently Metal-only; its setup is [above](#deepseek-v41-flash).
 

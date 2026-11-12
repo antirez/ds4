@@ -10,8 +10,10 @@
 
 #define JPEG_IMPLEMENTATION
 #define PNG_IMPLEMENTATION
+#define WEBP_IMPLEMENTATION
 #include "third_party/iris/jpeg.h"
 #include "third_party/iris/png.h"
+#include "ds4_webp.h"
 
 typedef struct {
     uint32_t state[8];
@@ -275,8 +277,26 @@ int ds4_image_decode_memory(
         if (!ok) ds4_image_error(error, error_cap, "unable to allocate decoded JPEG pixels");
         return ok;
     }
+    if (encoded_len >= 12 && memcmp(encoded, "RIFF", 4) == 0 &&
+        memcmp(encoded + 8, "WEBP", 4) == 0) {
+        webp_image *decoded = webp_load_mem(encoded, encoded_len);
+        if (!decoded) {
+            ds4_image_error(error, error_cap,
+                            webp_is_animated(encoded, encoded_len)
+                                ? "animated WebP images are not supported"
+                                : "invalid or unsupported WebP image");
+            return 0;
+        }
+        int ok = ds4_oriented_rgb(out, decoded->data,
+                                  (uint32_t)decoded->width,
+                                  (uint32_t)decoded->height,
+                                  (uint32_t)decoded->channels, 1);
+        webp_free(decoded);
+        if (!ok) ds4_image_error(error, error_cap, "unable to allocate decoded WebP pixels");
+        return ok;
+    }
 
-    ds4_image_error(error, error_cap, "image must be JPEG or PNG");
+    ds4_image_error(error, error_cap, "image must be JPEG, PNG or WebP");
     return 0;
 }
 
