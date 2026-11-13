@@ -213,6 +213,63 @@ replays the retained prefix on the next evaluation. The native context is
 262144 tokens; `DS4_QWEN4_YARN_FACTOR=2` or `=4` enables static YaRN for
 longer contexts, with a possible quality cost on shorter prompts.
 
+## Streamed decode overlap
+
+Each streamed decode layer starts with a full GPU drain, because the CPU
+needs the router's expert ids before it can load experts. The layer's expert
+work used to wait in the open command buffer until the next layer's drain
+committed it, so the GPU idled while the CPU encoded the reduce and the next
+layer's attention and router. That buffer is now committed as soon as the
+experts are encoded (`ds4_metal_stream_overlap.inc`).
+
+The decode handshake (`ds4_metal_stream_handshake.inc`) removes the drain
+itself for single-token layers. The router's ids are copied to a shared
+buffer and the command buffer signals an event; the next command buffer
+starts with a wait on a second event and runs the experts through the
+layer's expert address table. The CPU blocks on the first event, loads the
+missing experts, writes their addresses and signals the second, so the GPU
+idles only for that service. The kernels must see every expert slab when
+they are encoded, so the handshake allocates the whole expert-cache budget's
+slabs up front (slots stay unlocked until used); the expert cache is
+otherwise unchanged. A failed read behaves as on the ordinary path: the call
+fails, the cached and shared slots are computed, the missing slots stay
+untouched (their address entries are zero and the kernels skip them), the
+layer's entries are dropped and a retry is exact. A failed load returns its
+slab reservations, on the ordinary path too. The released experts' cache
+slots are marked in flight; when the next layer's ids arrive, the service
+checks that the buffer which published them and every buffer committed
+before it have completed, and retires the marks up to that buffer before the
+load. If the budget's slabs cannot be allocated, if the cache has lost slab
+slots, or if the loader places an expert in an explicit buffer the encoded
+kernels cannot see, the handshake switches itself off with one message and
+the ordinary path serves every layer. `DS4_QWEN4_STREAM_HANDSHAKE=0`
+keeps the ordinary path; `DS4_QWEN4_STREAM_HANDSHAKE_PROFILE=1` prints the
+CPU wait and service time per layer. MTP verification steps (two or three
+tokens), Q4_K gate/up rows and a cache budget below the slot count keep the
+ordinary path.
+
+Measured on an M4 Pro 48 GB (AC power, High Power Mode), Q2 model,
+`ds4-bench --ssd-streaming` with the 4K-token `promessi_sposi.txt` prompt,
+128 tokens, `--ctx-alloc 262144` (13.3 GiB expert cache), three interleaved
+rounds against the preceding main (tok/s, min to max):
+
+| | Prefill | Decode | Steady decode |
+| --- | ---: | ---: | ---: |
+| main | 217-223 | 17.4-18.2 | 18.7-19.5 |
+| early commit + handshake | 223-224 | 19.5-19.7 | 20.6-20.9 |
+
+Over a 2048 to 16384 sweep in 2048-token steps, where each decode phase
+follows a prefill chunk that churned the expert cache, decode averaged 2%
+faster. With `--mtp`, where only the single-token steps take the handshake,
+generation measured the same (22.3-23.2 against 22.5-22.9 tok/s). Spinning
+on the arrival words instead of blocking on the event measured about 3%
+more steady decode but kept a CPU core busy; the handshake blocks.
+
+`tests/test_qwen4_ssd_experts` runs every single-token streamed case through
+the handshake, including warm hits, failed reads with exact retry and the
+resident/missing split cases, and asserts that the path was taken;
+`tests/test_qwen4_generation --ssd-streaming` passes bit-exact with it on.
+
 ## Metal tuning on M1 Max and M2-M4
 
 The established M1 Max simdgroup optimizations also apply to Apple M2, M3

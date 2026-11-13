@@ -7,6 +7,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
+#include <strings.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -44,6 +46,30 @@ static struct {
 static void need(int ok, const char *what) {
     if (!ok) { fprintf(stderr, "Qwen SSD: %s failed\n", what); exit(1); }
 }
+/* Single-token streamed rows take the decode handshake; count its layers
+ * and failures so parity cannot pass with the path never selected. */
+static struct { uint64_t layers, failed; } hs_probe;
+/* Whether a streamed single-token call takes the handshake: Q4_K gate/up
+ * rows take the grouped expert tables, and the diagnostics that disable the
+ * early load or the slabs keep the ordinary path. Budgets here cover S. */
+static int handshake_expected(uint32_t T, uint32_t gate_type) {
+    /* Same reading as the engine's env parser: trimmed, case-insensitive. */
+    const char *hs = getenv("DS4_QWEN4_STREAM_HANDSHAKE");
+    char v[16] = "";
+    if (hs) {
+        while (isspace((unsigned char)*hs)) hs++;
+        size_t n = strlen(hs);
+        while (n > 0 && isspace((unsigned char)hs[n - 1])) n--;
+        snprintf(v, sizeof(v), "%.*s", (int)(n < sizeof(v) - 1 ? n : sizeof(v) - 1), hs);
+    }
+    const int off = !strcasecmp(v, "0") || !strcasecmp(v, "false") || !strcasecmp(v, "no") || !strcasecmp(v, "off");
+    return T == 1 && gate_type != 12 && !off &&
+           !getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_EARLY_LOAD") &&
+           !getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_SLABS") &&
+           !getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_COMBINED_BUFFER");
+}
+void ds4_test_qwen4_handshake(int ok) { hs_probe.layers++; hs_probe.failed += !ok; }
+
 /* Check dispatch decisions as well as outputs: parity alone also passes
  * when an optimized path is accidentally never selected. */
 void ds4_test_qwen4_ssd_mm(uint32_t n_tokens, uint32_t weight_type,
@@ -373,7 +399,14 @@ static void check_case_impl(const weights *w, uint32_t T, unsigned route, int go
         check_mm_lists(ids, T, route, routing_reference[0], routing_reference[1]);
     }
     ds4_gpu_qwen4_set_verify_rows_exact(T == 3);
+    const int handshake = handshake_expected(T, w->gate_type);
+    uint64_t hs_layers = hs_probe.layers, hs_failed = hs_probe.failed;
     if (w->gate_type == 16 && T == 1 && route == 0) {
+        /* The handshake learns the ids after encoding, so only the ordinary
+         * path can reject an invalid id before anything runs. */
+        const char *hs_env = getenv("DS4_QWEN4_STREAM_HANDSHAKE");
+        char *hs_saved = hs_env ? strdup(hs_env) : NULL;
+        need((!hs_env || hs_saved) && setenv("DS4_QWEN4_STREAM_HANDSHAKE", "0", 1) == 0, "ordinary path for rejection");
         weights invalid = *w; invalid.table.down_expert_bytes--;
         for (unsigned i = 0; i < 4; i++) reset(outputs + i);
         need(ds4_gpu_begin_commands(), "invalid-size batch begin");
@@ -385,6 +418,9 @@ static void check_case_impl(const weights *w, uint32_t T, unsigned route, int go
         need(!project(w, T, 1, outputs[0].view, outputs[1].view, gx, gi, NULL, NULL), "reject expert ID512");
         need(ds4_gpu_commands_active() && ds4_gpu_end_commands(), "invalid-ID batch ownership");
         need(ds4_gpu_tensor_write(gi, 0, ids, sn * 4), "restore valid IDs");
+        need((hs_saved ? setenv("DS4_QWEN4_STREAM_HANDSHAKE", hs_saved, 1) : unsetenv("DS4_QWEN4_STREAM_HANDSHAKE")) == 0,
+             "restore handshake switch");
+        free(hs_saved);
         for (unsigned i = 0; i < 4; i++) {
             float *got = read_output(outputs + i);
             for (uint64_t j = 0; j < outputs[i].n + 2 * GUARD; j++)
@@ -398,6 +434,9 @@ static void check_case_impl(const weights *w, uint32_t T, unsigned route, int go
         probe_begin(w, ids, sn, good_fd, empty_fd);
         const int accepted = project(w, T, 1, outputs[0].view, outputs[1].view, gx, gi, lists, counts);
         need(!accepted, "uncached read must fail on empty file");
+        hs_layers += handshake; hs_failed += handshake;
+        need(hs_probe.layers == hs_layers && hs_probe.failed == hs_failed,
+             "handshake reports the failed read from the call");
         need(ds4_gpu_commands_active(), "failure preserves active batch ownership");
         need(ds4_gpu_end_commands(), "failure batch drain");
         (void)probe_end(0, 0);
@@ -444,6 +483,9 @@ static void check_case_impl(const weights *w, uint32_t T, unsigned route, int go
         need(ds4_gpu_begin_commands(), "projection batch begin");
         probe_begin(w, ids, sn, good_fd, empty_fd);
         need(project(w, T, run != 0, outputs[0].view, outputs[1].view, gx, gi, lists, counts), "resident/SSD projection");
+        hs_layers += run && handshake;
+        need(hs_probe.layers == hs_layers && hs_probe.failed == hs_failed,
+             "single-token streamed rows take the handshake");
         need(ds4_gpu_commands_active(), "projection preserves active batch ownership");
         need(ds4_gpu_qwen4_moe_reduce_tensor(outputs[2].view, outputs[1].view, gw,
             mm ? NULL : gsg, NULL, outputs[3].view, ginj, T, S, stride, D, HC), "reduce and HC");
@@ -470,11 +512,12 @@ static void check_case_impl(const weights *w, uint32_t T, unsigned route, int go
     need(read_x && read_ids && ds4_gpu_tensor_read(gx, 0, read_x, xn * 4) &&
          ds4_gpu_tensor_read(gi, 0, read_ids, sn * 4), "input integrity read");
     need(!memcmp(x, read_x, xn * 4) && !memcmp(ids, read_ids, sn * 4), "input and selected IDs unchanged");
-    printf("PASS Qwen SSD %u/%u T=%u %s route=%u: exact mid/down/reduce/HC, guards; pread=%llu bytes/%llu calls%s%s%s\n",
+    printf("PASS Qwen SSD %u/%u T=%u %s route=%u: exact mid/down/reduce/HC, guards; pread=%llu bytes/%llu calls%s%s%s%s\n",
            w->gate_type, w->down_type, T, mm ? "MM" : "rows", route,
            (unsigned long long)reads[1].bytes, (unsigned long long)reads[1].calls,
            warm_probe ? ", warm hits without readable fd" : "",
            fail_first ? ", failed read and exact retry" : "",
+           handshake ? ", via the decode handshake" : "",
            compare_mm ? ", generic NT4/grid4 reference exact; generic NT1/grid4/default/generic NT1/grid4 on same buffers" : "");
     for (unsigned i = 0; i < 4; i++) { free(reference[i]); free_output(outputs + i); }
     ds4_gpu_qwen4_set_verify_rows_exact(false);
@@ -591,6 +634,8 @@ static void check_split_one(const weights *w, uint32_t T, uint32_t slots, int sh
     ds4_gpu_set_streaming_expert_cache_budget(budget);
     ds4_gpu_set_streaming_expert_cache_expert_bytes(2 * w->table.gate_expert_bytes + w->table.down_expert_bytes);
     need(ds4_gpu_set_model_fd(good_fd), "split source fd");
+    const int handshake = handshake_expected(T, w->gate_type);
+    uint64_t hs_layers = hs_probe.layers, hs_failed = hs_probe.failed;
     if (seed_count) need(ds4_gpu_stream_expert_cache_seed_experts(&w->table, seeds, NULL, seed_count), "split cache seed");
     need(ds4_gpu_stream_expert_cache_current_count() == seed_count, "split exact initial cache");
     for (unsigned failure = 0; failure < (fail_first == 2 ? 4u : !!fail_first); failure++) {
@@ -609,6 +654,8 @@ static void check_split_one(const weights *w, uint32_t T, uint32_t slots, int sh
         }
         need(!project_split(w, T, slots, shared, 1, outputs[0].view, outputs[1].view,
                             inputs[0].view, inputs[1].view, lists, counts), "split read failure");
+        hs_layers += handshake; hs_failed += handshake;
+        need(hs_probe.layers == hs_layers && hs_probe.failed == hs_failed, "split failure via the handshake");
         need(ds4_gpu_commands_active() && ds4_gpu_end_commands(), "split failure drains and preserves batch");
         const read_stats reads = probe_end(0, 0);
         need(reads.calls && reads.bytes == (fail_first == 2 ?
@@ -653,6 +700,8 @@ static void check_split_one(const weights *w, uint32_t T, uint32_t slots, int sh
         probe_begin(w, missing, n_missing, good_fd, empty_fd);
         need(project_split(w, T, slots, shared, 1, outputs[0].view, outputs[1].view,
                            inputs[0].view, inputs[1].view, lists, counts), "split retry/warm projection");
+        hs_layers += handshake;
+        need(hs_probe.layers == hs_layers && hs_probe.failed == hs_failed, "split projection via the handshake");
         need(ds4_gpu_commands_active(), "split projection batch ownership");
         need(ds4_gpu_qwen4_moe_reduce_tensor(outputs[2].view, outputs[1].view, inputs[2].view,
              shared ? inputs[3].view : NULL, NULL, outputs[3].view, inputs[4].view,
@@ -680,8 +729,9 @@ static void check_split_one(const weights *w, uint32_t T, uint32_t slots, int sh
     for (unsigned i = 0; i < 4; i++) { free(reference[i]); free_output(outputs + i); }
     if (compare_q4_mv) q4_mv_restore(saved_q4_mv_env);
     free(ids); free(x); free(mix); free(r); free(inj); free(shared_gate);
-    printf("PASS Qwen SSD split T%u %s %u/%u slots=%u shared=%d seeded=%u unique=%u retry=%d: exact all stages, missing-only %llu bytes, warm0\n",
-           T, mm ? "MM" : "rows", w->gate_type, w->down_type, slots, shared, seed_count, unique, fail_first, (unsigned long long)first.bytes);
+    printf("PASS Qwen SSD split T%u %s %u/%u slots=%u shared=%d seeded=%u unique=%u retry=%d: exact all stages, missing-only %llu bytes, warm0%s\n",
+           T, mm ? "MM" : "rows", w->gate_type, w->down_type, slots, shared, seed_count, unique, fail_first, (unsigned long long)first.bytes,
+           handshake ? ", via the decode handshake" : "");
 }
 
 static void check_half_split(const weights *w, uint32_t T, uint32_t nt,
