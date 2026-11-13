@@ -23,16 +23,17 @@
  *   the slab buffers, which are all made resident at encode time; the
  *   handshake first allocates every slab of the cache budget.
  * - A layer's released experts are marked in flight with their command
- *   buffer's sequence. When the CPU sees layer l's ids, the buffer that
- *   signalled them and, in queue order, every buffer before it have
- *   completed, so the service retires all sequences up to that buffer before
- *   it loads. No load therefore waits for in-flight GPU work, which would
- *   wait on the buffer parked at the release. Layer l's own experts are
- *   protected by its load and then by their mark.
- * - Anything the handshake cannot serve, such as a slab budget the device
- *   will not grant or an expert the loader could only place in an explicit
- *   buffer, switches it off for the process with one message; the ordinary
- *   path then serves every layer.
+ *   buffer's sequence. When the CPU sees layer l's ids, the service checks
+ *   that the buffer which signalled them and every buffer committed before
+ *   it have completed (none of them can be parked at a release) and retires
+ *   all sequences up to that buffer before it loads. No load therefore waits
+ *   for in-flight GPU work, which would wait on the buffer parked at the
+ *   release. Layer l's own experts are protected by its load and then by
+ *   their mark.
+ * - Anything the handshake cannot serve, such as slabs it cannot allocate,
+ *   slab slots the cache has lost or an expert the loader could only place
+ *   in an explicit buffer, switches it off for the process with one message;
+ *   the ordinary path then serves every layer.
  * - Failure is reported like the ordinary path's: the call returns 0 with the
  *   batch still open, the cached and shared slots computed, the missing slots
  *   untouched (their address entries stay zero and the kernels skip them),
@@ -121,55 +122,31 @@ static int qwen4_handshake_reserve_slabs(uint64_t gate_expert_bytes, uint64_t do
     return 1;
 }
 
-/* Joins the selected load. A failed load's reservations never became cache
- * entries: return their slab slots or unlock their buffers, as the batch
- * loader does after a failed read, so a retry finds the same slots again. */
-static int qwen4_handshake_finish_load(void) {
-    ds4_gpu_stream_expert_pending_load *p = &g_stream_expert_pending_load;
-    if (!p->active) return 1;
-    const uint32_t n_loads = p->n_loads;
-    id<MTLBuffer> gate[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED], up[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED],
-                  down[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
-    NSUInteger inner[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
-    uint32_t expert[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
-    for (uint32_t i = 0; i < n_loads; i++) {
-        gate[i] = p->gate_bufs[i]; up[i] = p->up_bufs[i]; down[i] = p->down_bufs[i];
-        inner[i] = p->gate_inners[i];
-        expert[i] = (uint32_t)p->selected_ids[p->load_slots[i]];
-    }
-    const uint32_t layer = p->layer;
-    if (ds4_gpu_stream_expert_pending_load_finish(NULL)) return 1;
-    for (uint32_t i = 0; i < n_loads; i++) {
-        if (!gate[i]) continue;
-        const ds4_gpu_stream_expert_cache_entry *e = &g_stream_expert_cache[layer][expert[i]];
-        if (e->valid && e->gate_buffer == gate[i] && e->gate_inner == inner[i]) continue;
-        uint32_t slot = 0;
-        if (gate[i] == up[i] && gate[i] == down[i] &&
-            ds4_gpu_stream_expert_slab_slot_for_buffer(gate[i], inner[i], &slot)) {
-            ds4_gpu_stream_expert_slab_push_free_slot(slot);
-        } else {
-            ds4_gpu_stream_expert_unlock_explicit_buffer(gate[i]);
-            if (up[i] != gate[i]) ds4_gpu_stream_expert_unlock_explicit_buffer(up[i]);
-            if (down[i] != gate[i] && down[i] != up[i]) ds4_gpu_stream_expert_unlock_explicit_buffer(down[i]);
-        }
-    }
-    return 0;
-}
-
 /* Loads and binds the layer's experts once the GPU has published their ids:
  * one selected load, like the ordinary path. entry[] receives the layer's
- * cache entries. The release is signalled on every exit. */
+ * cache entries. The release is signalled on every exit. n_pending counts
+ * the pending command buffers up to and including the router's. */
 static int qwen4_handshake_service(const ds4_gpu_stream_expert_table *t, uint32_t n_slots, uint64_t arrival,
-                                   uint64_t router_seq, ds4_gpu_stream_expert_cache_entry **entry,
-                                   uint32_t *n_entries) {
+                                   uint64_t router_seq, NSUInteger n_pending,
+                                   ds4_gpu_stream_expert_cache_entry **entry, uint32_t *n_entries) {
     const double t0 = ds4_gpu_now_ms();
     int ok = [g_qwen4_hs_arrival waitUntilSignaledValue:arrival timeoutMS:60000];
     const double t1 = ds4_gpu_now_ms();
     g_qwen4_hs_stats.wait_ms += t1 - t0;
     if (!ok) fprintf(stderr, "ds4: timeout waiting for the Qwen router's expert ids\n");
-    /* The router's buffer and every buffer before it have completed, so
-     * their in-flight marks are retired before this load may evict. */
-    if (ok && router_seq > g_stream_expert_cache_done_seq) g_stream_expert_cache_done_seq = router_seq;
+    if (ok) {
+        /* The in-flight marks up to the router's buffer are retired on those
+         * buffers' completion, which Metal reports per buffer; the queue's
+         * order alone says nothing about completion. None of these buffers
+         * waits at a release, so this cannot block on the parked one. */
+        if (n_pending > [g_pending_cbs count]) n_pending = [g_pending_cbs count];
+        for (NSUInteger i = 0; i < n_pending; i++) {
+            id<MTLCommandBuffer> cb = g_pending_cbs[i];
+            if (cb.status != MTLCommandBufferStatusCompleted && cb.status != MTLCommandBufferStatusError)
+                [cb waitUntilCompleted];
+        }
+        if (router_seq > g_stream_expert_cache_done_seq) g_stream_expert_cache_done_seq = router_seq;
+    }
 
     const int32_t *ids = (const int32_t *)[g_qwen4_hs_ids contents];
     int32_t unique[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
@@ -183,8 +160,9 @@ static int qwen4_handshake_service(const ds4_gpu_stream_expert_table *t, uint32_
         ds4_gpu_stream_expert_cache_note_token(t->layer);
         ds4_gpu_stream_expert_cache_note_frequency_hotness(t->layer, frequency, t->n_total_expert);
         ds4_gpu_stream_expert_pending_load_clear();
+        /* A failed load returns its reservations, so a retry is exact. */
         ok = ds4_gpu_stream_expert_cache_begin_selected_load(t, unique, n_unique) &&
-             qwen4_handshake_finish_load();
+             ds4_gpu_stream_expert_pending_load_finish(NULL);
     }
     /* The loader counted the hits; read the entries as the ordinary path does. */
     for (uint32_t i = 0; ok && i < n_unique; i++) {
@@ -233,10 +211,24 @@ static int qwen4_stream_handshake_layer(
         return 0;
     if (g_stream_expert_cache_slab_total_slots < budget &&
         !qwen4_handshake_reserve_slabs(table->gate_expert_bytes, table->down_expert_bytes)) {
-        qwen4_handshake_switch_off("the device did not grant the expert cache budget's slabs");
+        qwen4_handshake_switch_off("the expert cache budget's slabs could not be allocated");
         return 0;
     }
     if (g_stream_expert_cache_slab_count == 0) return 0;
+    /* Every load must find a free slot or an entry to reuse: a slot the cache
+     * lost would send a load to an explicit buffer the kernels cannot see.
+     * Slots are free, unused in the newest slab, entries or a pending load's. */
+    {
+        const uint32_t last = g_stream_expert_cache_slab_count - 1u;
+        const uint64_t slots = (uint64_t)g_stream_expert_cache_free_slot_count +
+            g_stream_expert_cache_slab_slot_count[last] - g_stream_expert_cache_slab_slots_used[last] +
+            g_stream_expert_cache_entry_count +
+            (g_stream_expert_pending_load.active ? g_stream_expert_pending_load.n_loads : 0u);
+        if (slots < budget) {
+            qwen4_handshake_switch_off("the expert cache lost slab slots");
+            return 0;
+        }
+    }
     if (!g_qwen4_hs_release) {
         g_qwen4_hs_arrival = [g_device newSharedEvent];
         g_qwen4_hs_release = [g_device newSharedEvent];
@@ -272,8 +264,10 @@ static int qwen4_stream_handshake_layer(
     ds4_gpu_stream_expert_cache_entry *entries[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
     uint32_t n_entries = 0;
     uint64_t experts_seq = 0;
+    NSUInteger n_pending = 0;
     *ok = ds4_gpu_flush_commands();
     if (*ok) {
+        n_pending = [g_pending_cbs count];
         /* wait release | experts via the address table || commit */
         [g_batch_cb encodeWaitForEvent:g_qwen4_hs_release value:++g_qwen4_hs_release_value];
         g_batch_has_work = YES;
@@ -301,8 +295,10 @@ static int qwen4_stream_handshake_layer(
         ds4_gpu_parallel_ffn_reset_state(YES);
         ds4_gpu_commit_batch_commands();
     }
-    /* The GPU now waits for the release; service whatever happened above. */
-    if (!qwen4_handshake_service(table, n_slots, arrival, router_seq, entries, &n_entries)) *ok = 0;
+    /* The GPU now waits for the release; service whatever happened above. A
+     * failed flush encoded no wait and drained, so there is nothing to serve. */
+    if (*ok && !qwen4_handshake_service(table, n_slots, arrival, router_seq, n_pending, entries, &n_entries))
+        *ok = 0;
     /* Like the ordinary path, return with the caller's batch open. */
     if (!g_batch_cb && !ds4_gpu_begin_commands()) *ok = 0;
     /* The released kernels read these slots until their buffer completes. */
