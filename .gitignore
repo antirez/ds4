@@ -40,6 +40,7 @@
 /tests/test_q4k_dot
 /tests/test_sampling
 /tests/test_web_recovery
+/tests/test_linenoise_wordnav
 /tests/test_quality_api
 /tests/test_cuda_q8_scratch
 /tests/test_cuda_dspark_moe
