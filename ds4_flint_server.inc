@@ -294,3 +294,67 @@ static bool flint_model_alias_known(const char *id) {
     return id && (!strcmp(id, "flint") || !strcmp(id, "recursive/flint") ||
                   flint_model_alias_disables_thinking(id) || flint_model_alias_enables_thinking(id));
 }
+
+/* Live KV reuse when clients send assistant turns back without reasoning.
+ *
+ * rec's template renders a history assistant turn as
+ * <|assistant|>[<think>R</think>]CONTENT[<tool_call>...</tool_call>]: without
+ * reasoning_content there is no think block at all, while the live KV holds
+ * the sampled <think>R</think>.  Agent clients (tau2, most OpenAI-style
+ * harnesses) echo content and tool calls byte for byte and drop the
+ * reasoning, so the next request's token prefix parts from the live KV at
+ * the <think> of the generation prompt and every turn re-prefills the whole
+ * conversation.  The server's thinking-visible key (Qwen's path) fixes this
+ * without touching the KV: remember the bytes the next request will render
+ * for the current frontier, and continue from live KV with only the new
+ * suffix tokenized.  For Flint that key is the generation prompt without its
+ * trailing <think> (or <think></think> with thinking off), the content as
+ * returned, and the sampled tool-call text, which the renderer replays by id.
+ * The stop token is not in the KV; the suffix (<|user|>..., <|observation|>...)
+ * evaluates it. */
+static char *build_flint_visible_text(const request *r, const char *content, const tool_calls *calls) {
+    if (!r || !r->prompt_text || r->kind != REQ_CHAT || r->image_count != 0) return NULL;
+    if (r->api == API_RESPONSES || r->api == API_ANTHROPIC) return NULL;
+    const size_t pt_len = strlen(r->prompt_text);
+    static const char *const gens[] = { "<|assistant|><think></think>", "<|assistant|><think>" };
+    size_t cut = 0;
+    for (size_t i = 0; i < sizeof(gens) / sizeof(gens[0]) && !cut; i++) {
+        const size_t n = strlen(gens[i]);
+        if (pt_len >= n && !memcmp(r->prompt_text + pt_len - n, gens[i], n)) cut = pt_len - n + strlen("<|assistant|>");
+    }
+    if (!cut) return NULL;
+    if (calls && calls->len > 0 && !(calls->raw_tool_text && calls->raw_tool_text[0])) return NULL;
+    buf visible = {0};
+    buf_append(&visible, r->prompt_text, cut);
+    buf_puts(&visible, content ? content : "");
+    if (calls && calls->len > 0) buf_puts(&visible, calls->raw_tool_text);
+    return buf_take(&visible);
+}
+
+/* The gate for text answers: unlike GLM and DeepSeek, Flint's clients drop
+ * the reasoning in tool conversations too, and thinking off needs the key as
+ * well (the generation prompt's <think></think> is not in the history). */
+static bool flint_should_remember_visible_checkpoint(const request *r, bool inside_thinking, const char *finish) {
+    if (!r || r->kind != REQ_CHAT || r->api == API_RESPONSES || r->api == API_ANTHROPIC) return false;
+    if (finish && (!strcmp(finish, "error") || !strcmp(finish, "length"))) return false;
+    return !inside_thinking;
+}
+
+typedef struct server_slot server_slot;   /* defined after this include; C11 allows the repeat */
+static void thinking_live_remember(server *s, server_slot *slot, const char *visible_text, const request *req);
+static void server_log(ds4_log_type type, const char *fmt, ...);
+
+/* Tool-call turns stop at </tool_call>, so the frontier is the raw call text. */
+static bool remember_flint_tool_turn_visible_checkpoint(server *s, server_slot *slot, const request *req,
+                                                        const char *ctx, const char *finish, bool inside_thinking,
+                                                        const char *content, const tool_calls *calls) {
+    if (!finish || strcmp(finish, "tool_calls") != 0 || inside_thinking) return false;
+    char *visible = build_flint_visible_text(req, content, calls);
+    if (!visible) return false;
+    thinking_live_remember(s, slot, visible, req);
+    server_log(DS4_LOG_KVCACHE,
+               "ds4-server: flint tool-turn visible checkpoint remembered ctx=%s visible=%zu",
+               ctx, strlen(visible));
+    free(visible);
+    return true;
+}

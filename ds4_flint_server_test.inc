@@ -2,6 +2,8 @@
  * into ds4_server.c next to the upstream tests (needs TEST_ASSERT and the
  * GLM reply parser, both defined after the renderer). */
 
+static void test_flint_visible_checkpoint(void);
+
 static void test_flint_render_prompt(void) {
     /* roles, escaping, think stripping, tool preamble placement */
     const char *messages_json =
@@ -97,4 +99,100 @@ static void test_flint_render_prompt(void) {
 
     TEST_ASSERT(flint_model_alias_known("flint") && flint_model_alias_known("flint-chat") && flint_model_alias_known("flint-reasoner"));
     TEST_ASSERT(flint_model_alias_disables_thinking("flint-nothink") && !flint_model_alias_disables_thinking("flint"));
+    test_flint_visible_checkpoint();
+}
+
+/* The thinking-visible key: the bytes the next request renders for the turn
+ * just generated when the client echoes content and tool calls but not the
+ * reasoning, so the live KV continues with only the new suffix tokenized. */
+static void test_flint_visible_checkpoint(void) {
+    const char *tools_json =
+        "[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"parameters\":{\"type\":\"object\","
+        "\"properties\":{\"city\":{\"type\":\"string\"}}}}}]";
+    const char *tp = tools_json;
+    char *schemas = NULL;
+    tool_schema_orders orders = {0};
+    TEST_ASSERT(parse_tools_value(&tp, &schemas, &orders));
+    const char *first_json = "[{\"role\":\"user\",\"content\":\"Hi\"}]";
+    const char *p = first_json;
+    chat_msgs first = {0};
+    TEST_ASSERT(parse_messages(&p, &first));
+
+    /* a text answer in a tool conversation, thinking on */
+    char *prompt = render_flint_chat_prompt_text(&first, schemas, &orders, DS4_THINK_HIGH);
+    TEST_ASSERT(prompt && strstr(prompt, "<|user|>Hi<|assistant|><think>"));
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.think_mode = DS4_THINK_HIGH;
+    r.model_syntax = SERVER_MODEL_SYNTAX_GLM;
+    r.has_tools = true;
+    r.prompt_text = prompt;
+    TEST_ASSERT(flint_should_remember_visible_checkpoint(&r, false, "stop"));
+    TEST_ASSERT(!flint_should_remember_visible_checkpoint(&r, true, "stop"));
+    TEST_ASSERT(!flint_should_remember_visible_checkpoint(&r, false, "length"));
+    char *visible = build_flint_visible_text(&r, "Hello!\nHow are you?", NULL);
+    TEST_ASSERT(visible != NULL);
+    const char *next_json =
+        "[{\"role\":\"user\",\"content\":\"Hi\"},"
+        " {\"role\":\"assistant\",\"content\":\"Hello!\\nHow are you?\"},"
+        " {\"role\":\"user\",\"content\":\"Fine.\"}]";
+    p = next_json;
+    chat_msgs next = {0};
+    TEST_ASSERT(parse_messages(&p, &next));
+    char *future = render_flint_chat_prompt_text(&next, schemas, &orders, DS4_THINK_HIGH);
+    TEST_ASSERT(future && strlen(future) > strlen(visible) && !memcmp(future, visible, strlen(visible)));
+    TEST_ASSERT(!strcmp(future + strlen(visible), "<|user|>Fine.<|assistant|><think>"));
+    free(future);
+    /* reasoning echoed back is rendered and must not match the key */
+    next.v[1].reasoning = xstrdup("greet");
+    future = render_flint_chat_prompt_text(&next, schemas, &orders, DS4_THINK_HIGH);
+    TEST_ASSERT(future && strncmp(future, visible, strlen(visible)) != 0);
+    free(future);
+    chat_msgs_free(&next);
+    free(visible);
+
+    /* thinking off: the generation prompt's empty think block is not in the history either */
+    free(r.prompt_text);
+    r.prompt_text = render_flint_chat_prompt_text(&first, schemas, &orders, DS4_THINK_NONE);
+    r.think_mode = DS4_THINK_NONE;
+    visible = build_flint_visible_text(&r, "Hello!", NULL);
+    TEST_ASSERT(visible && strlen(visible) > 19 && !strcmp(visible + strlen(visible) - 19, "<|assistant|>Hello!"));
+    TEST_ASSERT(strstr(visible, "<think>") == NULL);
+    free(visible);
+
+    /* a tool call: the sampled call text, replayed by id, is the frontier */
+    free(r.prompt_text);
+    r.prompt_text = render_flint_chat_prompt_text(&first, schemas, &orders, DS4_THINK_HIGH);
+    r.think_mode = DS4_THINK_HIGH;
+    const char *raw = "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>";
+    tool_calls calls = {0};
+    tool_call tc = {0};
+    tc.id = xstrdup("c1");
+    tc.name = xstrdup("get_weather");
+    tc.arguments = xstrdup("{\"city\": \"Paris\"}");
+    tool_calls_push(&calls, tc);
+    TEST_ASSERT(build_flint_visible_text(&r, "", &calls) == NULL);   /* no raw text: the renderer would re-render */
+    calls.raw_tool_text = xstrdup(raw);
+    visible = build_flint_visible_text(&r, "", &calls);
+    TEST_ASSERT(visible != NULL);
+    const char *round_json =
+        "[{\"role\":\"user\",\"content\":\"Hi\"},"
+        " {\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\","
+        "  \"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\": \\\"Paris\\\"}\"}}]},"
+        " {\"role\":\"tool\",\"tool_call_id\":\"c1\",\"content\":\"18C\"}]";
+    p = round_json;
+    chat_msgs round = {0};
+    TEST_ASSERT(parse_messages(&p, &round));
+    round.v[1].calls.raw_tool_text = xstrdup(raw);   /* what tool memory attaches by id */
+    future = render_flint_chat_prompt_text(&round, schemas, &orders, DS4_THINK_HIGH);
+    TEST_ASSERT(future && strlen(future) > strlen(visible) && !memcmp(future, visible, strlen(visible)));
+    TEST_ASSERT(!strcmp(future + strlen(visible), "<|observation|><tool_response>18C</tool_response><|assistant|><think>"));
+    free(future);
+    chat_msgs_free(&round);
+    free(visible);
+    tool_calls_free(&calls);
+    request_free(&r);
+    chat_msgs_free(&first);
+    free(schemas);
+    tool_schema_orders_free(&orders);
 }

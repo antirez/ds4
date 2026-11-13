@@ -12670,6 +12670,7 @@ static int server_decode_budget(int requested, int generated, int room) {
 static bool should_remember_thinking_checkpoint(const request *r,
                                                 const thinking_state *thinking,
                                                 const char *finish) {
+    if (g_flint_server) return flint_should_remember_visible_checkpoint(r, thinking && thinking->inside, finish);   /* fork */
     if (!r || r->kind != REQ_CHAT) return false;
     /* Qwen Chat Completions clients may omit reasoning even with tools.
      * Remember an alternative visible key without changing exact replay.
@@ -12906,6 +12907,7 @@ static char *build_responses_visible_assistant_suffix(const request *r,
  * visible suffix. */
 static char *build_thinking_visible_text(const request *r,
                                          const char *content) {
+    if (g_flint_server) return build_flint_visible_text(r, content, NULL);   /* fork: no think block in rendered history */
     if (!r || !r->prompt_text) return NULL;
     if (!ds4_think_mode_enabled(r->think_mode)) return NULL;
 
@@ -14636,10 +14638,11 @@ decode_again:
                                      parsed_reasoning, &parsed_calls);
         thinking_live_clear(s, slot);
     } else if (parsed_calls.len) {
-        if (!remember_qwen_tool_turn_visible_checkpoint(
+        if (!(g_flint_server ? remember_flint_tool_turn_visible_checkpoint(s, slot, &j->req, ctx_span, finish, thinking.inside, parsed_content ? parsed_content : "", &parsed_calls) :   /* fork */
+              remember_qwen_tool_turn_visible_checkpoint(
                 s, slot, j, ctx_span, finish, thinking.inside,
                 parsed_content ? parsed_content : "",
-                &parsed_calls))
+                &parsed_calls)))
         {
             thinking_live_clear(s, slot);
         }
