@@ -340,12 +340,12 @@ static bool flint_should_remember_visible_checkpoint(const request *r, bool insi
     return !inside_thinking;
 }
 
-typedef struct server_slot server_slot;   /* defined after this include; C11 allows the repeat */
-static void thinking_live_remember(server *s, server_slot *slot, const char *visible_text, const request *req);
+struct server_slot;   /* defined after this include */
+static void thinking_live_remember(server *s, struct server_slot *slot, const char *visible_text, const request *req);
 static void server_log(ds4_log_type type, const char *fmt, ...);
 
 /* Tool-call turns stop at </tool_call>, so the frontier is the raw call text. */
-static bool remember_flint_tool_turn_visible_checkpoint(server *s, server_slot *slot, const request *req,
+static bool remember_flint_tool_turn_visible_checkpoint(server *s, struct server_slot *slot, const request *req,
                                                         const char *ctx, const char *finish, bool inside_thinking,
                                                         const char *content, const tool_calls *calls) {
     if (!finish || strcmp(finish, "tool_calls") != 0 || inside_thinking) return false;
@@ -357,4 +357,35 @@ static bool remember_flint_tool_turn_visible_checkpoint(server *s, server_slot *
                ctx, strlen(visible));
     free(visible);
     return true;
+}
+
+/* Argument values.  The template renders a tool-call argument as
+ * `v | tojson if v is not string else v`, so the model writes string
+ * values raw and everything else (arrays, objects, numbers, booleans,
+ * null) as JSON text between <arg_value> tags.  The GLM reply parser
+ * takes every value as a string, which hands clients {"item_ids":
+ * "[\"1\"]"} for an array parameter.  Invert the template rule the way
+ * the Qwen parser does: a parameter the tool schema declares as a
+ * string stays text whatever it looks like; any other value that parses
+ * as one complete non-string JSON value is passed through as JSON. */
+static bool qwen_param_value_is_json(const char *s);   /* defined after this include */
+static const char *flint_glm_arg_is_string(const tool_schema_orders *orders, const char *name,
+                                           const char *key, const char *value) {
+    const tool_schema_order *order = tool_schema_orders_find(orders, name);
+    for (int i = 0; order && i < order->len; i++) {
+        if (strcmp(order->prop[i], key)) continue;
+        json_args schema = {0};
+        bool declared_string = false;
+        if (json_args_parse(order->prop_schema[i], &schema)) {
+            for (int j = 0; j < schema.len; j++) {
+                const json_arg *arg = &schema.v[j];
+                if (!strcmp(arg->key, "type") && arg->is_string && !strcmp(arg->value, "string"))
+                    declared_string = true;
+            }
+        }
+        json_args_free(&schema);
+        if (declared_string) return "true";
+        break;
+    }
+    return qwen_param_value_is_json(value) ? "false" : "true";
 }

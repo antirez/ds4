@@ -3,6 +3,7 @@
  * GLM reply parser, both defined after the renderer). */
 
 static void test_flint_visible_checkpoint(void);
+static void test_flint_typed_arguments(void);
 
 static void test_flint_render_prompt(void) {
     /* roles, escaping, think stripping, tool preamble placement */
@@ -89,7 +90,7 @@ static void test_flint_render_prompt(void) {
     tool_calls calls = {0};
     TEST_ASSERT(parse_glm_generated_message_ex(
         "I will check.</think>Checking.<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>",
-        true, &content, &reasoning, &calls));
+        true, &content, &reasoning, &calls, NULL));
     TEST_ASSERT(reasoning && !strcmp(reasoning, "I will check."));
     TEST_ASSERT(content && !strcmp(content, "Checking."));
     TEST_ASSERT(calls.len == 1 && !strcmp(calls.v[0].name, "get_weather"));
@@ -100,6 +101,56 @@ static void test_flint_render_prompt(void) {
     TEST_ASSERT(flint_model_alias_known("flint") && flint_model_alias_known("flint-chat") && flint_model_alias_known("flint-reasoner"));
     TEST_ASSERT(flint_model_alias_disables_thinking("flint-nothink") && !flint_model_alias_disables_thinking("flint"));
     test_flint_visible_checkpoint();
+    test_flint_typed_arguments();
+}
+
+/* Argument values follow the template's `tojson if not string` rule: a
+ * schema-declared string stays text whatever it looks like, anything else
+ * that parses as JSON (arrays, objects, numbers, booleans) is passed on as
+ * JSON, and a value that is not JSON stays text. */
+static void test_flint_typed_arguments(void) {
+    const char *tools_json =
+        "[{\"type\":\"function\",\"function\":{\"name\":\"return_items\",\"parameters\":{\"type\":\"object\","
+        "\"properties\":{\"order_id\":{\"type\":\"string\"},\"zip\":{\"type\":\"string\"},"
+        "\"item_ids\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"count\":{\"type\":\"integer\"},"
+        "\"note\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}]}}}}}]";
+    const char *tp = tools_json;
+    char *schemas = NULL;
+    tool_schema_orders orders = {0};
+    TEST_ASSERT(parse_tools_value(&tp, &schemas, &orders));
+    const char *generated =
+        "</think><tool_call>return_items"
+        "<arg_key>order_id</arg_key><arg_value>#W6390527</arg_value>"
+        "<arg_key>zip</arg_key><arg_value>12345</arg_value>"
+        "<arg_key>item_ids</arg_key><arg_value>[\"8538875209\", \"1\"]</arg_value>"
+        "<arg_key>count</arg_key><arg_value>2</arg_value>"
+        "<arg_key>note</arg_key><arg_value>none</arg_value>"
+        "<arg_key>extra</arg_key><arg_value>{\"a\": true}</arg_value>"
+        "<arg_key>loose</arg_key><arg_value>[not json</arg_value>"
+        "</tool_call>";
+    const bool was_flint = g_flint_server;
+    g_flint_server = true;
+    char *content = NULL, *reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_glm_generated_message_ex(generated, true, &content, &reasoning, &calls, &orders));
+    g_flint_server = was_flint;
+    TEST_ASSERT(calls.len == 1 && !strcmp(calls.v[0].name, "return_items"));
+    const char *expected_args =
+        "{\"order_id\": \"#W6390527\", \"zip\": \"12345\", \"item_ids\": [\"8538875209\",\"1\"], \"count\": 2, "
+        "\"note\": \"none\", \"extra\": {\"a\":true}, \"loose\": \"[not json\"}";
+    if (strcmp(calls.v[0].arguments, expected_args) != 0)
+        fprintf(stderr, "flint typed arguments:\n%s\n---expected---\n%s\n", calls.v[0].arguments, expected_args);
+    TEST_ASSERT(!strcmp(calls.v[0].arguments, expected_args));
+    free(content); free(reasoning);
+    tool_calls_free(&calls);
+
+    /* without the schema (or outside Flint) the upstream behaviour holds */
+    TEST_ASSERT(parse_glm_generated_message_ex(generated, true, &content, &reasoning, &calls, NULL));
+    TEST_ASSERT(calls.len == 1 && strstr(calls.v[0].arguments, "\"item_ids\": \"[\\\"8538875209\\\", \\\"1\\\"]\""));
+    free(content); free(reasoning);
+    tool_calls_free(&calls);
+    free(schemas);
+    tool_schema_orders_free(&orders);
 }
 
 /* The thinking-visible key: the bytes the next request renders for the turn

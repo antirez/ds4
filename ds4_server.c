@@ -6366,7 +6366,8 @@ static bool parse_glm_generated_message_ex(const char *text,
                                            bool require_thinking_closed,
                                            char **content_out,
                                            char **reasoning_out,
-                                           tool_calls *calls) {
+                                           tool_calls *calls,
+                                           const tool_schema_orders *orders) {   /* fork: orders for Flint's typed values */
     static const char tool_start[] = "<tool_call>";
     static const char tool_end[] = "</tool_call>";
     static const char arg_key_start[] = "<arg_key>";
@@ -6469,7 +6470,7 @@ static bool parse_glm_generated_message_ex(const char *text,
             char *raw_value = xstrndup(p, (size_t)(value_end - p));
             char *value = xstrdup(raw_value);
             ds4_tool_text_unescape(value, arg_value_end);
-            tool_call_json_args_add(&args, key, value, "true");
+            tool_call_json_args_add(&args, key, value, g_flint_server ? flint_glm_arg_is_string(orders, name, key, value) : "true");   /* fork */
             free(key);
             free(raw_value);
             free(value);
@@ -6716,7 +6717,7 @@ static bool parse_generated_message_ex_for_syntax(server_model_syntax syntax,
     if (syntax == SERVER_MODEL_SYNTAX_GLM) {
         return parse_glm_generated_message_ex(text, require_thinking_closed,
                                               content_out, reasoning_out,
-                                              calls);
+                                              calls, NULL);
     }
     if (syntax == SERVER_MODEL_SYNTAX_QWEN) {
         return parse_qwen_generated_message_ex(text, require_thinking_closed,
@@ -6838,6 +6839,7 @@ static bool parse_generated_message_for_response_for_syntax(server_model_syntax 
     bool parsed_ok = syntax == SERVER_MODEL_SYNTAX_QWEN ?
         parse_qwen_generated_message_ex(text, require_thinking_closed,
                                          content_out, reasoning_out, calls, orders) :
+        g_flint_server ? parse_glm_generated_message_ex(text ? text : "", require_thinking_closed, content_out, reasoning_out, calls, orders) :   /* fork */
         parse_generated_message_ex_for_syntax(syntax,
                                                            text ? text : "",
                                                            require_thinking_closed,
