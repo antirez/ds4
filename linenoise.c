@@ -1905,6 +1905,41 @@ void linenoiseEditMoveEnd(struct linenoiseState *l) {
     }
 }
 
+/* Words are whitespace-delimited, including '\n' since buffers can hold
+ * multiple lines. Whitespace bytes are ASCII, so scanning bytes is safe: UTF-8
+ * continuation bytes never match, and PrevLen/NextLen keep pos on boundaries. */
+static size_t linenoiseWordStartBefore(struct linenoiseState *l, size_t pos) {
+    while (pos > 0 && isspace((unsigned char)l->buf[pos-1]))
+        pos -= linenoiseEditPrevLen(l, pos);
+    while (pos > 0 && !isspace((unsigned char)l->buf[pos-1]))
+        pos -= linenoiseEditPrevLen(l, pos);
+    return pos;
+}
+
+static size_t linenoiseWordStartAfter(struct linenoiseState *l, size_t pos) {
+    while (pos < l->len && !isspace((unsigned char)l->buf[pos]))
+        pos += linenoiseEditNextLen(l, pos);
+    while (pos < l->len && isspace((unsigned char)l->buf[pos]))
+        pos += linenoiseEditNextLen(l, pos);
+    return pos;
+}
+
+/* Option+Left on macOS sends ESC b, like readline's backward-word. */
+static void linenoiseEditMovePrevWord(struct linenoiseState *l) {
+    size_t target = linenoiseWordStartBefore(l, l->pos);
+    if (target == l->pos) return;
+    l->pos = target;
+    refreshLine(l);
+}
+
+/* Option+Right on macOS sends ESC f, like readline's forward-word. */
+static void linenoiseEditMoveNextWord(struct linenoiseState *l) {
+    size_t target = linenoiseWordStartAfter(l, l->pos);
+    if (target == l->pos) return;
+    l->pos = target;
+    refreshLine(l);
+}
+
 /* Substitute the currently edited line with the next or previous history
  * entry as specified by 'dir'. */
 #define LINENOISE_HISTORY_NEXT 0
@@ -1982,12 +2017,7 @@ void linenoiseEditDeletePrevWord(struct linenoiseState *l) {
     size_t old_pos = l->pos;
     size_t diff;
 
-    /* Skip spaces before the word (move backwards by UTF-8 chars). */
-    while (l->pos > 0 && l->buf[l->pos-1] == ' ')
-        l->pos -= linenoiseEditPrevLen(l, l->pos);
-    /* Skip non-space characters (move backwards by UTF-8 chars). */
-    while (l->pos > 0 && l->buf[l->pos-1] != ' ')
-        l->pos -= linenoiseEditPrevLen(l, l->pos);
+    l->pos = linenoiseWordStartBefore(l, l->pos);
     diff = old_pos - l->pos;
     linenoiseAdjustFoldsAfterDelete(l,l->pos,diff);
     memmove(l->buf+l->pos, l->buf+old_pos, l->len-old_pos+1);
@@ -2238,6 +2268,40 @@ static int linenoiseEditPaste(struct linenoiseState *l) {
 
 char *linenoiseEditMore = "If you see this, you are misusing the API: when linenoiseEditFeed() is called, if it returns linenoiseEditMore the user is yet editing the line. See the README file for more information.";
 
+/* Detect a word-motion modified horizontal arrow encoded as a CSI or SS3
+ * escape-sequence body (seq, without the leading ESC). Many terminals encode
+ * Alt+Left / Alt+Right as:
+ *   ESC [ 1 ; 3 C   (Alt+Right)      ESC [ 1 ; 3 D   (Alt+Left)
+ *   ESC [ 1 ; 4 C   (Alt+Shift+Right) ESC O 1 ; 3 C   (SS3 form)
+ *   ESC [ 1 ; 5 D   (Ctrl+Left, the word-jump key on most Linux terminals/tmux)
+ * where modifier 3 = Alt/Option, 4 = Alt+Shift, 5 = Ctrl and 9 = Meta (iTerm)
+ * in xterm numbering.
+ * Returns 'L' for word-left, 'R' for word-right, or 0 if not applicable. */
+static int linenoiseAltArrowDir(const char *seq, size_t seq_len) {
+    if (seq_len < 4) return 0; /* need at least "[1;3C" */
+    char letter = seq[seq_len - 1];
+    if (letter != 'C' && letter != 'D') return 0;
+
+    /* Walk back to the last ';' (the modifier separator). */
+    const char *p = seq + seq_len - 1;
+    while (p > seq && *p != ';') p--;
+    if (p == seq) return 0;
+
+    /* Parse the modifier digits that follow the ';'. */
+    p++;
+    long mod = 0;
+    int any = 0;
+    while (p < seq + seq_len - 1 && *p >= '0' && *p <= '9') {
+        mod = mod * 10 + (*p - '0');
+        any = 1;
+        p++;
+    }
+    if (!any) return 0;
+
+    if (mod == 3 || mod == 4 || mod == 5 || mod == 9) return (letter == 'C') ? 'R' : 'L';
+    return 0;
+}
+
 /* This function is part of the multiplexed API of linenoise, see the top
  * comment on linenoiseEditStart() for more information. Call this function
  * each time there is some data to read from the standard input file
@@ -2306,7 +2370,16 @@ char *linenoiseEditFeed(struct linenoiseState *l) {
         }
     }
     if (l->pending_key_len) {
-        if (l->pending_key_len == 1 && c != '[' && c != 'O') {
+        if (l->pending_key_len == 1 &&
+            (c == 'b' || c == 'B' || c == 'f' || c == 'F' || c == 0x7f)) {
+            /* Meta-key chords: macOS sends ESC b / ESC f for Option+Left/Right
+             * and ESC DEL for Option+Backspace. Like readline, treat them as
+             * commands rather than a lone ESC followed by a typed character. */
+            seq[0] = c;
+            seq_len = 1;
+            l->pending_key_len = 0;
+            c = ESC;
+        } else if (l->pending_key_len == 1 && c != '[' && c != 'O') {
             l->pending_key_len = 0; /* Preserve the character after a lone ESC. */
         } else {
             l->pending_key[l->pending_key_len++] = c;
@@ -2397,7 +2470,14 @@ char *linenoiseEditFeed(struct linenoiseState *l) {
         break;
     case ESC:    /* escape sequence */
         if (seq[0] == '[' || seq[0] == 'O') {
-            if (seq_len == 3 && !memcmp(seq, "[3~", 3)) {
+            int altdir = linenoiseAltArrowDir(seq, seq_len);
+            if (altdir == 'L') {
+                /* Alt/Option+Left (ESC [ 1 ; 3 D etc.): move to previous word. */
+                linenoiseEditMovePrevWord(l);
+            } else if (altdir == 'R') {
+                /* Alt/Option+Right (ESC [ 1 ; 3 C etc.): move to next word. */
+                linenoiseEditMoveNextWord(l);
+            } else if (seq_len == 3 && !memcmp(seq, "[3~", 3)) {
                 linenoiseEditDelete(l);
             } else if (seq_len == 5 && !memcmp(seq, "[200~", 5)) {
                 if (linenoiseEditPaste(l) < 0) return NULL;
@@ -2423,6 +2503,15 @@ char *linenoiseEditFeed(struct linenoiseState *l) {
                     break;
                 }
             }
+        } else if (seq[0] == 'b' || seq[0] == 'B') {
+            /* Option+Left on macOS (ESC b / ESC B): move to previous word. */
+            linenoiseEditMovePrevWord(l);
+        } else if (seq[0] == 'f' || seq[0] == 'F') {
+            /* Option+Right on macOS (ESC f / ESC F): move to next word. */
+            linenoiseEditMoveNextWord(l);
+        } else if (seq[0] == 0x7f) {
+            /* Option+Backspace on macOS (ESC DEL): delete previous word. */
+            linenoiseEditDeletePrevWord(l);
         }
 
         break;
