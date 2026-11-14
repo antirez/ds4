@@ -189,9 +189,20 @@ const char *ds4_flint_gpu_device_profile(const char **why) {
         g_flint_profile = "M4 Pro";
     } else if (!strcmp(name, "Apple M4 Max") && !strcmp(arch, "applegpu_g16s")) {
         g_flint_profile = "M4 Max";
+    } else if (getenv("DS4_FLINT_UNPROFILED_DEVICE")) {
+        /* Opt-in for chips rec never profiled: the 36 worker threadgroups
+         * must be co-resident; if they are not, the barriers' spin budget
+         * runs out and the step fails with "GPU synchronization failed"
+         * instead of hanging, so a field tester can find out safely. */
+        g_flint_profile = "unprofiled";
+        fprintf(stderr, "ds4: Flint: %s (%s) has no resident decode profile; running the M4 Pro envelope "
+                        "(36 threadgroups of 256) because DS4_FLINT_UNPROFILED_DEVICE is set. If the chip cannot "
+                        "hold them at once, decode stops with \"GPU synchronization failed\"; please report either outcome.\n",
+                name, arch);
     } else {
         snprintf(reason, sizeof(reason),
-                 "no resident decode profile for %s (%s); the kernel is tuned for the M4 Pro launch envelope",
+                 "no resident decode profile for %s (%s); the kernel is tuned for the M4 Pro launch envelope "
+                 "(rec supports M4 Pro, M4 Max, M5 Pro, M5 Max); set DS4_FLINT_UNPROFILED_DEVICE=1 to try anyway",
                  name, arch);
         if (why) *why = reason;
         return NULL;

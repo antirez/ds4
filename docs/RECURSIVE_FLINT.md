@@ -394,8 +394,20 @@ the trace test:
   how a lost barrier surfaces, and the trace is the test interface.
 
 Launch envelope: 36 threadgroups of 256 must be co-resident or the barriers
-deadlock into the watchdog. rec's `DeviceProfile` encodes what each chip
-sustains; ds4 reads the same device name and refuses others until profiled.
+never complete; each barrier spins at most 10M iterations, then the group
+writes the phase into the diagnostic buffer and returns, and the host
+reports `GPU synchronization failed: group G timed out in phase P`. rec's
+`DeviceProfile` (`rec_mlx/kernels/device.py`) lists what each chip
+sustains: M4 Pro and M4 Max (36 workers, 32 MLP, 32 head), M5 Pro (the
+same), M5 Max (76 / 64 / 64); every other Metal device raises
+`Unsupported resident kernel device`. That is about two threadgroups per
+GPU core (16 cores on the M4 Pro, 40 on the M5 Max), so a 10-core base
+M4 would need 3.6 per core and nobody has measured whether it holds; the
+kernel cannot go below 32 workers (the expert teams need 32 MLP
+workers). ds4 reads the same device name and architecture and accepts
+M4 Pro and M4 Max; `DS4_FLINT_UNPROFILED_DEVICE=1` runs the 36-worker
+envelope on any other chip, with the timeout above as the failure mode,
+so a field tester can find out instead of being refused.
 
 ### KV cache and sessions
 
@@ -955,6 +967,23 @@ Macs, above all the 16, 24 and 32 GB ones streaming was built for. Each
 contribution is one row in the table at the end of this section plus the
 raw log lines, sent as a PR against `recursive-flint` on
 `github.com/mschneider/ds4` (or an issue there with the logs attached).
+
+**Which Macs can run it.** The decode megakernel needs its 36
+threadgroups resident at once (Design: Decode). rec has profiled that on
+M4 Pro, M4 Max, M5 Pro and M5 Max only, and ds4 accepts M4 Pro and M4 Max
+by name; a base M4, or any M1, M2 or M3, is refused with `no resident
+decode profile for <chip>`. The machines that run today's build out of
+the box are therefore the 24 GB M4 Pro (MacBook Pro 14" and Mac mini)
+and the 36 GB M4 Max; a 48 GB or larger M4 Pro/Max can still contribute
+by capping the cache (`--ssd-streaming-cache-experts 8GB`). On any other
+Apple GPU, set `DS4_FLINT_UNPROFILED_DEVICE=1`: if the chip holds the
+envelope, every measurement below applies; if not, the first decode step
+ends within seconds with `GPU synchronization failed: group G timed out
+in phase P`, and that line together with the chip name and GPU core
+count (`system_profiler SPDisplaysDataType`) is itself a useful report,
+since it tells where a smaller profile would be needed. The refusal
+itself (chip and architecture from the error line) is worth reporting
+too.
 
 ### Setup
 
