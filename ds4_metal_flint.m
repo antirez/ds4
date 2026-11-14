@@ -22,8 +22,17 @@
 #include "ds4_flint_gpu.h"
 #include "ds4_flint_stream.h"
 
-#define FLINT_WORKERS 36u
+#ifndef FLINT_MAX_WORKERS
+#define FLINT_MAX_WORKERS 36u   /* rec's M4 Pro envelope; the shader caps FLINT_WORKERS the same way */
+#endif
 #define FLINT_THREADS 256u
+/* Decode threadgroups in flight: rec's M4 Pro envelope unless DS4_FLINT_WORKERS
+ * or the residency probe for unprofiled chips says otherwise
+ * (flint_choose_workers).  The shader is compiled with this count. */
+static uint32_t g_flint_workers = FLINT_MAX_WORKERS;
+static uint32_t g_flint_compiled_workers;
+static char g_flint_device_desc[192];
+static int flint_choose_workers(const char **why);
 #define FLINT_WORKSPACE_ELEMS 78848u
 #define FLINT_PARTIALS_ELEMS (32u * 1024u * 128u / 2u)
 #define FLINT_STATISTICS_ELEMS (32u * 1024u * 2u)
@@ -184,29 +193,15 @@ const char *ds4_flint_gpu_device_profile(const char **why) {
     if (@available(macOS 14.0, *)) {
         arch = [[[dev architecture] name] UTF8String];
     }
-    static char reason[256];
     if (!strcmp(name, "Apple M4 Pro") && !strcmp(arch, "applegpu_g16s")) {
         g_flint_profile = "M4 Pro";
     } else if (!strcmp(name, "Apple M4 Max") && !strcmp(arch, "applegpu_g16s")) {
         g_flint_profile = "M4 Max";
-    } else if (getenv("DS4_FLINT_UNPROFILED_DEVICE")) {
-        /* Opt-in for chips rec never profiled: the 36 worker threadgroups
-         * must be co-resident; if they are not, the barriers' spin budget
-         * runs out and the step fails with "GPU synchronization failed"
-         * instead of hanging, so a field tester can find out safely. */
-        g_flint_profile = "unprofiled";
-        fprintf(stderr, "ds4: Flint: %s (%s) has no resident decode profile; running the M4 Pro envelope "
-                        "(36 threadgroups of 256) because DS4_FLINT_UNPROFILED_DEVICE is set. If the chip cannot "
-                        "hold them at once, decode stops with \"GPU synchronization failed\"; please report either outcome.\n",
-                name, arch);
     } else {
-        snprintf(reason, sizeof(reason),
-                 "no resident decode profile for %s (%s); the kernel is tuned for the M4 Pro launch envelope "
-                 "(rec supports M4 Pro, M4 Max, M5 Pro, M5 Max); set DS4_FLINT_UNPROFILED_DEVICE=1 to try anyway",
-                 name, arch);
-        if (why) *why = reason;
-        return NULL;
+        g_flint_profile = "unprofiled";   /* flint_choose_workers probes the launch envelope */
     }
+    if (getenv("DS4_FLINT_FORCE_PROBE")) g_flint_profile = "unprofiled";   /* diagnostic: probe a profiled chip too */
+    snprintf(g_flint_device_desc, sizeof(g_flint_device_desc), "%s (%s)", name, arch);
     return g_flint_profile;
 }
 
@@ -232,7 +227,9 @@ static NSString *flint_read_source(const char **why) {
 }
 
 static int flint_compile(const char **why) {
-    if (g_flint_decode) return 1;
+    if (g_flint_decode && g_flint_compiled_workers == g_flint_workers) return 1;
+    g_flint_decode = nil;
+    g_flint_library = nil;
     @autoreleasepool {
         NSString *source = flint_read_source(why);
         if (!source) return 0;
@@ -248,8 +245,11 @@ static int flint_compile(const char **why) {
         }
         /* DS4_FLINT_KV_PREFETCH=N overrides the kernel's KV prefetch depth
          * (metal/flint.metal, FLINT_KV_PREFETCH) for timing sweeps. */
+        NSMutableDictionary *macros = [NSMutableDictionary dictionary];
+        macros[@"FLINT_WORKERS"] = @(g_flint_workers);
         const char *pf_env = getenv("DS4_FLINT_KV_PREFETCH");
-        if (pf_env && atoi(pf_env) > 0) options.preprocessorMacros = @{ @"FLINT_KV_PREFETCH": @(atoi(pf_env)) };
+        if (pf_env && atoi(pf_env) > 0) macros[@"FLINT_KV_PREFETCH"] = @(atoi(pf_env));
+        options.preprocessorMacros = macros;
         NSError *error = nil;
         g_flint_library = [g_flint_device newLibraryWithSource:source options:options error:&error];
         if (!g_flint_library) {
@@ -280,6 +280,7 @@ static int flint_compile(const char **why) {
             fprintf(stderr, "ds4: flint_decode pipeline: max %lu threads per threadgroup, %lu bytes of threadgroup memory\n",
                     (unsigned long)g_flint_decode.maxTotalThreadsPerThreadgroup,
                     (unsigned long)g_flint_decode.staticThreadgroupMemoryLength);
+        g_flint_compiled_workers = g_flint_workers;
         return 1;
     }
 }
@@ -319,7 +320,6 @@ int ds4_flint_gpu_engine_open(const void *model_map, uint64_t model_size,
             return 0;
         }
         if (!ds4_flint_gpu_device_profile(why)) return 0;
-        if (!flint_compile(why)) return 0;
         if (!g_flint_model && !flint_wrap_model(model_map, model_size, why)) return 0;
         memcpy(g_flint_meta, metadata, sizeof(g_flint_meta));
         /* The model buffer starts `inner` bytes before the map; descriptor
@@ -364,6 +364,7 @@ int ds4_flint_gpu_engine_open(const void *model_map, uint64_t model_size,
             table[i] = expert_pack_offsets[i] ? model_address + g_flint_model_inner + expert_pack_offsets[i] : 0;
         }
         memcpy([g_flint_silu contents], silu_bf16, DS4_FLINT_GPU_SILU_ENTRIES * sizeof(uint16_t));
+        if (!flint_choose_workers(why)) return 0;
         return 1;
     }
 }
@@ -429,7 +430,7 @@ uint64_t ds4_flint_gpu_session_bytes(uint32_t ctx_cap) {
     bytes += (uint64_t)FLINT_WORKSPACE_ELEMS * 2 + (uint64_t)FLINT_PARTIALS_ELEMS * 4 +
              (uint64_t)FLINT_STATISTICS_ELEMS * 4 + (uint64_t)FLINT_ROUTING_WORDS * 4 +
              (uint64_t)DS4_FLINT_GPU_N_VOCAB * 2 + (uint64_t)DS4_FLINT_GPU_TRACE_ELEMS * 2 +
-             (uint64_t)DS4_FLINT_GPU_META_WORDS * 4 + FLINT_CONTROL_WORDS * 4 + FLINT_WORKERS * 4 +
+             (uint64_t)DS4_FLINT_GPU_META_WORDS * 4 + FLINT_CONTROL_WORDS * 4 + FLINT_MAX_WORKERS * 4 +
              FLINT_REQUEST_WORDS * 4;
     return bytes;
 }
@@ -476,7 +477,7 @@ ds4_flint_gpu_session *ds4_flint_gpu_session_create(uint32_t ctx_cap) {
         s->routing = flint_buffer((uint64_t)FLINT_ROUTING_WORDS * 4, "ds4_flint_routing", 1);
         s->logits = flint_buffer((uint64_t)DS4_FLINT_GPU_N_VOCAB * 2, "ds4_flint_logits", 1);
         s->trace = flint_buffer((uint64_t)DS4_FLINT_GPU_TRACE_ELEMS * 2, "ds4_flint_trace", 1);
-        s->diagnostic = flint_buffer(FLINT_WORKERS * 4, "ds4_flint_diagnostic", 1);
+        s->diagnostic = flint_buffer(FLINT_MAX_WORKERS * 4, "ds4_flint_diagnostic", 1);
         s->control = flint_buffer(FLINT_CONTROL_WORDS * 4, "ds4_flint_control", 1);
         s->requests = flint_buffer(FLINT_REQUEST_WORDS * 4, "ds4_flint_requests", 1);
         if (!s->metadata || !s->workspace || !s->partials || !s->statistics || !s->routing ||
@@ -506,6 +507,136 @@ void ds4_flint_gpu_session_free(ds4_flint_gpu_session *s) {
 
 uint32_t ds4_flint_gpu_session_ctx_cap(const ds4_flint_gpu_session *s) {
     return s ? s->ctx_cap : 0;
+}
+
+/* Residency probe.  One launch with layer_count 0 and FLINT_PROBE_BARRIERS
+ * extra grid-wide barriers runs the embedding, the barriers and the head.
+ * Returns 1 and the wall time of the launch in *ms when every group passed
+ * every barrier, 0 when the diagnostic says a group timed out (the spin
+ * budget bounds the wait), -1 on a Metal error.  Residency shows in the time
+ * more than in the verdict: the GPU time-slices a moderately over-committed
+ * grid (64 and 128 groups on the M4 Pro ran, 50 to 300 times slower; 256
+ * timed out), so each barrier costs a scheduler slice instead of microseconds. */
+#define FLINT_PROBE_BARRIERS 256u
+static int flint_probe_launch(struct ds4_flint_gpu_session *s, double *ms, const char **why) {
+    @autoreleasepool {
+        memset([s->control contents], 0, FLINT_CONTROL_WORDS * 4);
+        memset([s->diagnostic contents], 0, FLINT_MAX_WORKERS * 4);
+        memset([s->requests contents], 0, FLINT_REQUEST_WORDS * 4);
+        const uint32_t parameters[8] = {0, 0, 0, 0, 0, 0, FLINT_PROBE_BARRIERS, 0};
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_metal_command_buffer(&owned);
+        id<MTLComputeCommandEncoder> enc = cb ? ds4_metal_compute_encoder(cb) : nil;
+        if (!enc) {
+            if (why) *why = "no Metal command buffer for the Flint residency probe";
+            return -1;
+        }
+        [enc setComputePipelineState:g_flint_decode];
+        flint_use_resources(enc);
+        [enc setBuffer:g_flint_model offset:0 atIndex:0];
+        [enc setBuffer:s->metadata offset:0 atIndex:1];
+        for (uint32_t b = 0; b < DS4_FLINT_GPU_MAX_BLOCKS; b++) [enc setBuffer:s->kv[b] offset:0 atIndex:2 + b];
+        [enc setBytes:parameters length:sizeof(parameters) atIndex:6];
+        [enc setBuffer:g_flint_silu offset:0 atIndex:7];
+        [enc setBuffer:s->control offset:0 atIndex:8];
+        [enc setBuffer:g_flint_experts offset:0 atIndex:9];
+        [enc setBuffer:s->logits offset:0 atIndex:10];
+        [enc setBuffer:s->trace offset:0 atIndex:11];
+        [enc setBuffer:s->diagnostic offset:0 atIndex:12];
+        [enc setBuffer:s->workspace offset:0 atIndex:13];
+        [enc setBuffer:s->partials offset:0 atIndex:14];
+        [enc setBuffer:s->statistics offset:0 atIndex:15];
+        [enc setBuffer:s->routing offset:0 atIndex:16];
+        [enc setBuffer:s->requests offset:0 atIndex:17];
+        [enc dispatchThreadgroups:MTLSizeMake(g_flint_workers, 1, 1) threadsPerThreadgroup:MTLSizeMake(FLINT_THREADS, 1, 1)];
+        ds4_metal_end_compute_encoder(cb, enc);
+        const double t0 = ds4_flint_now_s();
+        if (!ds4_metal_finish_command_buffer(cb, owned, "flint_decode probe")) {
+            if (why) *why = "the Flint residency probe command buffer failed";
+            return -1;
+        }
+        *ms = (ds4_flint_now_s() - t0) * 1e3;
+        const uint32_t *diag = (const uint32_t *)[s->diagnostic contents];
+        for (uint32_t g = 0; g < g_flint_workers; g++) if (diag[g]) return 0;
+        return 1;
+    }
+}
+
+/* The decode worker count: DS4_FLINT_WORKERS if set (any chip), rec's 36 on
+ * the profiled chips, else a probe sweep.  Every candidate from the cap down
+ * to 8 in steps of 4 is compiled and launched FLINT_PROBE_LAUNCHES times
+ * after FLINT_PROBE_WARMUP untimed launches (the GPU clock ramps over the
+ * first ones: 2.8x of noise seen on a cold M4 Pro); the best time per
+ * candidate is kept and the largest count within FLINT_PROBE_SLACK of the
+ * fastest wins.  Resident counts differ by the head's share of the launch
+ * (more workers, faster head) and by clock noise, a few times at most; a
+ * count that is only time-sliced would differ by the slices, 256 of them.
+ * A count the GPU cannot hold at all times out and is skipped.  On the M4 Pro
+ * (20 cores) 36 to 128 groups all pass at 1 to 3 ms and 256 time out: the
+ * residency limit sits well above rec's 36 there, so the sweep matters on
+ * the small GPUs, 7 to 10 cores.  Called at the end of engine open, when the
+ * model, tables and silu are in place. */
+#define FLINT_PROBE_SLACK 10.0
+#define FLINT_PROBE_WARMUP 2
+#define FLINT_PROBE_LAUNCHES 3
+static int flint_choose_workers(const char **why) {
+    const char *env = getenv("DS4_FLINT_WORKERS");
+    if (env && env[0]) {
+        const int n = atoi(env);
+        if (n < 8 || n > (int)FLINT_MAX_WORKERS || n % 4) {
+            if (why) *why = "DS4_FLINT_WORKERS must be a multiple of 4 between 8 and 36";
+            return 0;
+        }
+        g_flint_workers = (uint32_t)n;
+        if (!flint_compile(why)) return 0;
+        fprintf(stderr, "ds4: Flint: %u decode threadgroups on %s (DS4_FLINT_WORKERS)\n", g_flint_workers, g_flint_device_desc);
+        return 1;
+    }
+    if (!g_flint_profile || strcmp(g_flint_profile, "unprofiled") != 0) return flint_compile(why);
+    fprintf(stderr, "ds4: Flint: %s has no resident decode profile (rec profiles M4 Pro, M4 Max, M5 Pro and M5 Max); "
+                    "probing how many of the kernel's threadgroups it keeps resident\n", g_flint_device_desc);
+    double best_ms[FLINT_MAX_WORKERS / 4 + 1];
+    double fastest = 0;
+    for (uint32_t w = FLINT_MAX_WORKERS; w >= 8; w -= 4) {
+        g_flint_workers = w;
+        best_ms[w / 4] = 0;
+        const double t_compile = ds4_flint_now_s();
+        if (!flint_compile(why)) return 0;
+        const double compile_s = ds4_flint_now_s() - t_compile;
+        struct ds4_flint_gpu_session *s = ds4_flint_gpu_session_create(256);
+        if (!s) {
+            if (why) *why = "could not create the Flint probe session";
+            return 0;
+        }
+        int ok = 1;
+        double best = 0;
+        for (int r = 0; r < FLINT_PROBE_WARMUP + FLINT_PROBE_LAUNCHES && ok > 0; r++) {
+            double ms = 0;
+            ok = flint_probe_launch(s, &ms, why);
+            if (ok > 0 && r >= FLINT_PROBE_WARMUP && (best == 0 || ms < best)) best = ms;
+        }
+        ds4_flint_gpu_session_free(s);
+        if (ok < 0) return 0;
+        if (ok) {
+            best_ms[w / 4] = best;
+            if (fastest == 0 || best < fastest) fastest = best;
+            fprintf(stderr, "ds4: Flint: probe %2u workers: %8.2f ms per launch (%u barriers; compile %.1f s)\n",
+                    w, best, FLINT_PROBE_BARRIERS, compile_s);
+        } else {
+            fprintf(stderr, "ds4: Flint: probe %2u workers: a group timed out (compile %.1f s)\n", w, compile_s);
+        }
+    }
+    for (uint32_t w = FLINT_MAX_WORKERS; w >= 8; w -= 4) {
+        if (best_ms[w / 4] <= 0 || best_ms[w / 4] > fastest * FLINT_PROBE_SLACK) continue;
+        g_flint_workers = w;
+        if (!flint_compile(why)) return 0;
+        fprintf(stderr, "ds4: Flint: %u threadgroups stay resident on %s; decoding with %u workers "
+                        "(pin it with DS4_FLINT_WORKERS=%u; a later \"GPU synchronization failed\" or a crawl means a smaller count is needed)\n",
+                g_flint_workers, g_flint_device_desc, g_flint_workers, g_flint_workers);
+        return 1;
+    }
+    if (why) *why = "no decode worker count from 36 down to 8 kept all threadgroups resident on this GPU";
+    return 0;
 }
 
 /* Element address of one KV row: block and offset within it. */
@@ -597,7 +728,7 @@ int ds4_flint_gpu_decode(ds4_flint_gpu_session *s, uint32_t token, uint32_t posi
         for (;;) {
             const double t_wall0 = (dprof || sprof) ? ds4_flint_now_s() : 0;
             memset([s->control contents], 0, FLINT_CONTROL_WORDS * 4);
-            memset([s->diagnostic contents], 0, FLINT_WORKERS * 4);
+            memset([s->diagnostic contents], 0, FLINT_MAX_WORKERS * 4);
             memset([s->requests contents], 0, FLINT_REQUEST_WORDS * 4);
             const uint32_t parameters[8] = { token, position, initial_position, layer_count, layer_start, streaming, 0, 0 };
             int owned = 0;
@@ -628,7 +759,7 @@ int ds4_flint_gpu_decode(ds4_flint_gpu_session *s, uint32_t token, uint32_t posi
             [enc setBuffer:s->statistics offset:0 atIndex:15];
             [enc setBuffer:s->routing offset:0 atIndex:16];
             [enc setBuffer:s->requests offset:0 atIndex:17];
-            [enc dispatchThreadgroups:MTLSizeMake(FLINT_WORKERS, 1, 1) threadsPerThreadgroup:MTLSizeMake(FLINT_THREADS, 1, 1)];
+            [enc dispatchThreadgroups:MTLSizeMake(g_flint_workers, 1, 1) threadsPerThreadgroup:MTLSizeMake(FLINT_THREADS, 1, 1)];
             ds4_metal_end_compute_encoder(cb, enc);
             const double t_commit = sprof ? ds4_flint_now_s() : 0;
             if (!ds4_metal_finish_command_buffer(cb, owned, "flint_decode")) {
@@ -718,7 +849,7 @@ int ds4_flint_gpu_decode(ds4_flint_gpu_session *s, uint32_t token, uint32_t posi
                 }
             }
             const uint32_t *diag = (const uint32_t *)[s->diagnostic contents];
-            for (uint32_t g = 0; g < FLINT_WORKERS; g++) {
+            for (uint32_t g = 0; g < g_flint_workers; g++) {
                 if (diag[g]) {
                     s->broken = 1;
                     if (err && errlen) {

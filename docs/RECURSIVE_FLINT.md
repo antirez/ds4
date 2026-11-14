@@ -40,7 +40,7 @@ rec reports more than 125 tok/s averaged over a 128K-token session.
 | Step | State |
 |---|---|
 | 0. Scaffolding: fork files from `bonsai2`; converter from rec's checkpoint (rec's tensor layout, per-expert packs); shape, loader, tokenizer, server id | **done 2026-11-07.** Family `DS4_MODEL_FAMILY_FLINT = 200` / variant 202 with fork scaffolding; converter writes 22.574 GB in 56 s, `--check-all` byte-identical on all 1375 tensors and the nibble layout confirmed against `mx.dequantize`; `--inspect` opens, binds and validates the GGUF; tokenizer bit-identical to HF tokenizers on 1069 cases; `golden.json` has 8 rec cases (incl. a 20277-token story; rec decodes ~120 tok/s, prefill ~550 tok/s on the M4 Pro); `rec_logits.py` dumps prefill and per-step logits, 50×2048 bf16 traces and per-layer KV from rec's runtime (loads in 10 s). Descriptor and address tables move to step 1 with the kernel. |
-| 1. Decode megakernel ported: per-layer residual trace bit-identical to rec on identical KV; one token per launch, CPU sampling | **done 2026-11-07.** `metal/flint.metal` + `ds4_metal_flint.m` + `ds4_flint.inc`; `trace_compare.py` reports every trace row (50 × 2048) and all 150144 logits identical to rec on 56 decode steps over four prefills: 5 tokens, 559 (ring wrapped), 1401 (above the 1024-part boundary, 8-head path, 128 parts) and 8445 (256 parts). Warm decode 7.3 ms/token at 5 tokens, 8.0 at 559, 8.4 at 1401, 10.0 at 8445 (one token per launch with logits readback); a cold first step pays about 200 ms of page-ins. Not yet exercised: count exactly 1024 (64 parts), 512 parts, and contexts past 65536 (multi-block KV). |
+| 1. Decode megakernel ported: per-layer residual trace bit-identical to rec on identical KV; one token per launch, CPU sampling | **done 2026-11-07.** `metal/flint.metal` + `ds4_metal_flint.m` + `ds4_flint.inc`; `trace_compare.py` reports every trace row (50 × 2048) and all 150144 logits identical to rec on 56 decode steps over four prefills: 5 tokens, 559 (ring wrapped), 1401 (above the 1024-part boundary, 8-head path, 128 parts) and 8445 (256 parts). Warm decode 7.3 ms/token at 5 tokens, 8.0 at 559, 8.4 at 1401, 10.0 at 8445 (one token per launch with logits readback); a cold first step pays about 200 ms of page-ins. Not yet exercised: count exactly 1024 (64 parts), 512 parts, and contexts past 65536 (multi-block KV). **2026-11-14:** the worker count is a shader macro (8 to 36, step 4) and a runtime choice: pinned, profiled (36) or probed at start-up on other Apple GPUs; traces byte-identical at every count, streaming bit-identical at 16 and 8; 134 / 137 / 124 / 112 / 67 tok/s at 36 / 32 / 24 / 16 / 8 workers on the M4 Pro (Design: Decode). |
 | 2. Prefill (chunked, window attention, sorted-expert GEMM), sessions, live KV reuse, disk checkpoints; golden cases within rec's spread | **done 2026-11-09.** `metal/flint_prefill.metal` (own kernels, see Design: Prefill), `ds4_flint_session.inc`; `make test-flint-kernels` passes. Against rec (`prefill_compare.py`): the last row's logits agree to KL 1e-8 to 1e-9 on 12-, 578- and 2556-token prompts; per-layer error grows like rounding noise (relative mean 0.003 to 0.12 by layer 48) with a few rows diverging at routing near-ties (578-token prompt: 55 of 578 rows have a sixth/seventh expert margin under 1%). Golden teacher-forced (`check_golden.py`, 128 tokens): argmax = rec's 94.5 to 100%, abs delta logprob mean 0.011 to 0.039, max 0.60; rec's own decode-vs-prefill at identical positions is mean 0.05 to 0.32, max 4.5, agreement 88 to 100% (3 dumps, 40 positions). Greedy paths part after 15 to 66 tokens on the short cases and run 64/64 on the tool case. Gate 2 (`reuse_check.py`): a follow-up turn on decode KV versus a fresh prefill differs along 64 steps by KL mean 0.001 to 0.005, max 0.064, abs delta logprob mean 0.011 to 0.032, top-1 same 97 to 100%: reuse stays. `ds4_test --server`, `--session-snapshot` and `--long-context` (29624 tokens, 100K context, two KV blocks) pass. Speed (not tuned): prefill 170 tok/s at 20K (rec 410 to 425 on this Mac), the first-cut GEMM; decode through sessions 10.3 to 11.4 ms/token short, 21.3 at 20K. |
 | 3. Measure against rec: decode at 4K/32K/128K, prefill, launch overhead; decide on 8-token resident blocks | **done 2026-11-11** (mains, High Power Mode, M4 Pro 48 GB, `tests/flint/bench_vs_rec.py`: both servers through one streaming client, thinking on; the harness accounts for rec sending its tokens in bursts of 8, which had undercounted rec's decode time by 5% and overcounted its prefill by 7 decode steps). Decode ms/token rec vs ds4: 7.7 vs 7.6 at 256 tokens, 9.0 vs 8.8 at 4K, 11.6 vs 11.6 at 16K, 14.0 vs 14.0 at 28K, 23.7 vs 23.0 at 64K, 39.4 vs 38.1 at 128K (148K-token prompt, 64 new tokens): the same kernel at the same speed. The launch floor (`DS4_FLINT_LAYER_COUNT=0`) is 0.92 ms per step; a 64K step is 23.2 ms GPU against 23.4 ms wall (`DS4_FLINT_DECODE_PROFILE=1`), so **8-token resident blocks would buy at most 1 to 4%: decision no.** Prefill tok/s rec vs ds4 after the attention rewrite and the MoE tile heights (step 3): 449 vs 589 at 256 (warm), 684 vs 852 at 1K, 671 vs 856 at 4K, 573 vs 708 at 16K, 501 vs 578 at 28K, 349 vs 400 at 64K, 220 vs 239 at 128K: ds4 is 9 to 31% ahead at every length, with prefill output bit-identical to the first kernels. A cold first prefill pays about 8 s of page-ins for the 22.6 GB mapping. **Decode attention loads (2026-11-11):** one 8-byte vector load per lane for K and for V per token instead of eight scalars (bit-identical on all four trace dumps) takes decode to 7.6 / 8.6 / 13.2 / 21.4 / 34.2 ms at 256 / 4K / 28K / 64K / 128K (rec 7.7 / 9.0 / 14.0 / 23.7 / 39.4); deeper prefetch, launch overlap and MoE register prefetch measured no gain (step 3). |
 | 4. Expert streaming: routing-trace study, cache and address table, in-kernel slot wait (or per-layer split), prefill staging, budget; streamed output bit-identical to resident | **done 2026-11-09** (`ds4_flint_stream.c`, see Design: Streaming). The visibility experiment failed usefully: a CPU store reaches a running kernel only after 0.3 to 10.7 s and a GPU store reaches the CPU about 30 ms after launch (caches flush at command-buffer boundaries), so misses are handled by **abort and resume**: the megakernel aborts at the first layer whose expert is not cached, publishes the layer's ids, the host reads the packs and relaunches from that layer. Hits are the unchanged resident path. `stream_check.py`: streamed and resident outputs are bit-identical on `short_01`, `multi_01` and `tool_01` with a 1 GB cache (606 slots; every decode layer misses, 4.8 of 6 experts), under all three prefill policies. `make test-flint-stream` (model-free, sparse file) passes; `ds4_test --server` and `--session-snapshot` pass with `DS4_TEST_SSD_STREAMING=1` and a 2 GB cache. Cost of a relaunch about 0.3 ms plus the reads (35 ms/token with a 1 GB cache and the file in the page cache, against 9 resident). Routing logs over 1197 decoded tokens (`route_sim.py`, plain LRU): miss fraction 0.65 at 2 GB, 0.21 at 8 GB, 0.09 at 12 GB, 0.03 at 16 GB, 0.007 at 20 GB. Not measured: cold-SSD bandwidth (the file sits in this Mac's page cache and `purge` needs root) and the 20K case in streaming mode (deferred to an AC-powered session). |
@@ -393,21 +393,70 @@ the trace test:
 - The `trace` and `diagnostic` outputs stay: the watchdog's diagnostic is
   how a lost barrier surfaces, and the trace is the test interface.
 
-Launch envelope: 36 threadgroups of 256 must be co-resident or the barriers
-never complete; each barrier spins at most 10M iterations, then the group
-writes the phase into the diagnostic buffer and returns, and the host
-reports `GPU synchronization failed: group G timed out in phase P`. rec's
-`DeviceProfile` (`rec_mlx/kernels/device.py`) lists what each chip
+Launch envelope: the worker threadgroups must be co-resident or the
+barriers never complete; each barrier spins at most 10M iterations, then
+the group writes the phase into the diagnostic buffer and returns, and the
+host reports `GPU synchronization failed: group G timed out in phase P`.
+rec's `DeviceProfile` (`rec_mlx/kernels/device.py`) lists what each chip
 sustains: M4 Pro and M4 Max (36 workers, 32 MLP, 32 head), M5 Pro (the
 same), M5 Max (76 / 64 / 64); every other Metal device raises
 `Unsupported resident kernel device`. That is about two threadgroups per
 GPU core (16 cores on the M4 Pro, 40 on the M5 Max), so a 10-core base
-M4 would need 3.6 per core and nobody has measured whether it holds; the
-kernel cannot go below 32 workers (the expert teams need 32 MLP
-workers). ds4 reads the same device name and architecture and accepts
-M4 Pro and M4 Max; `DS4_FLINT_UNPROFILED_DEVICE=1` runs the 36-worker
-envelope on any other chip, with the timeout above as the failure mode,
-so a field tester can find out instead of being refused.
+M4 would need 3.6 per core at 36.
+
+**Worker count as a parameter (2026-11-14).** The port's shader was rec's
+generated text for 36 workers, with the derived numbers (KV teams of 9
+groups, 72 simdgroups per team in the attention loops, expert teams of 4
+plus 8 shared workers, 392 QKV tickets) as literals. They are now macros
+derived from `FLINT_WORKERS`, following rec's generators (`kv_teams.py`,
+`expert_teams.py`, `rank_routing.py`): four KV teams of W/4 groups, expert
+teams of W/8 groups (rec's 4 from 32 up) for the six routed experts and a
+double team for the shared one, up to 32 head workers; W is any multiple
+of 4 from 8 to 36 (rec's 76-worker M5 Max shape, which uses the other
+KV-team code path, is not ported, so an M5 Max runs 36). Every output row
+is still produced by one simdgroup whatever the count, so the arithmetic
+is the same, and it is: 128 greedy tokens at 32, 24, 16 and 8 workers give
+the same text and a byte-identical 50 × 2048 residual trace per token as
+36, and streaming with a 1 GB cache (the abort-and-resume path with
+2-group and 1-group expert teams) is bit-identical to resident on all four
+`stream_check.py` cases at 16 and at 8 workers, the 20K story included.
+Speed on the M4 Pro, 300 greedy tokens: 134 tok/s at 36 workers, 137 at
+32, 124 at 24, 112 at 16, 67 at 8 (resident); with an 8 GB streaming
+cache 42 at 36 and 35 at 16. So the count is a bandwidth knob that costs
+little down to 16 and halves at 8.
+
+The host compiles the shader with the count (`ds4_metal_flint.m`,
+`flint_choose_workers`): `DS4_FLINT_WORKERS=N` pins it on any chip, the
+profiled chips (M4 Pro, M4 Max) get 36, and an unprofiled chip is probed
+at start-up. The probe launches the decode kernel with `layer_count` 0
+and `parameters[6]` = 256 extra grid-wide barriers (embedding, 257
+barriers, head), for every candidate from 36 down to 8 in steps of 4: two
+warm-up launches, then the best of three timed ones; a candidate whose
+groups do not all pass a barrier within the spin budget is skipped, and
+the largest candidate within 10x of the fastest wins, printed as a table
+(`ds4: Flint: probe 36 workers: 1.51 ms per launch ...`) and a choice line
+with the pin to reuse. The 10x slack is because resident counts differ
+only by the head's share of the launch and by clock noise (1.1 to 1.8 ms
+warm, up to 5 ms on a cold GPU across 8 to 36 on this Mac), while a count
+the GPU could only time-slice would pay a scheduler slice per barrier, two
+orders of magnitude. What the M4 Pro actually does when over-committed
+(one-off build with the cap raised, `DS4_METAL_FLINT_SOURCE` on a shader
+with the cap raised): 64 and 128 groups all pass the 256 barriers in under
+3 ms, so the 20-core GPU keeps at least 128 groups of this kernel resident
+and rec's 36 is a speed choice there, not the residency limit; 256 groups
+time out cleanly ("GPU synchronization failed: group 0 timed out in phase
+1", about 3 s per launch), which is what the probe relies on for a GPU
+that cannot hold a count. Decoding at 64 or 128 crawls (2.8 and 1.05
+tok/s, already 130 ms per token on the two dense layers alone), a kernel
+effect above the supported range that was not chased. The probe therefore
+matters on the 7- to 10-core GPUs (the pipeline reports 1024 threads per
+threadgroup, so at least four groups per core fit: 28 on a 7-core M1, 32
+on an 8-core, 40 on a 10-core M4) and is expected to say 36 on most
+others. Each count compiles in 0.3 to 0.4 s the first time and comes from
+the system shader cache afterwards, so a cold sweep adds about 3 s to the
+first start. `DS4_FLINT_FORCE_PROBE=1` runs the sweep on a profiled chip
+(diagnostic); the sweep's first start on an unprofiled chip is the first
+thing to report from such a machine (Field measurements).
 
 ### KV cache and sessions
 
@@ -665,6 +714,10 @@ and an exp), so what is left is instruction count, not latency.
   prefill, exported from rec), and compare the 50 × 2048 residual trace and
   the logits. Decode must be bit-identical; a difference names the layer
   and the phase.
+- **Worker counts** (2026-11-14): `DS4_FLINT_TRACE_DUMP` at 32, 24, 16 and
+  8 workers against 36 on 128 greedy tokens, byte-identical traces and
+  text; `stream_check.py --cache 1GB` at 16 and at 8 workers, all four
+  cases IDENTICAL (Design: Decode, worker count).
 - **Kernel tests** (`make test-flint-kernels`), model-free: `dot16` and
   `load16` against a double reference over all nibble patterns, RMSNorm,
   head norm and RoPE, split-K attention with sinks at the part-count
@@ -947,7 +1000,8 @@ GPU clocked through the fetch gaps (23 -> 36 tok/s at 8 GB, 27 -> 41 at
 `DS4_FLINT_STREAM_PROFILE=1` (per token), `=2` (per launch: host, encode,
 queue, GPU, wake, fetch; GPU split by aborted and final launches), `=3`
 (one line per launch), `DS4_FLINT_TRACE_DUMP=FILE` (the 50 x 2048 bf16
-residual rows per token), `DS4_FLINT_STREAM_THREADS`. Left: lookahead
+residual rows per token), `DS4_FLINT_STREAM_THREADS`, `DS4_FLINT_WORKERS=N`
+(decode threadgroups, Design: Decode), `DS4_FLINT_FORCE_PROBE=1`. Left: lookahead
 prefetch from in-kernel prediction for caches of 14 GB and up (about 10%
 simulated), and a check of the keep-alive on a 16 GB Mac (here it costs
 about a third of a CPU core and a few GPU watts).
@@ -968,22 +1022,24 @@ contribution is one row in the table at the end of this section plus the
 raw log lines, sent as a PR against `recursive-flint` on
 `github.com/mschneider/ds4` (or an issue there with the logs attached).
 
-**Which Macs can run it.** The decode megakernel needs its 36
-threadgroups resident at once (Design: Decode). rec has profiled that on
-M4 Pro, M4 Max, M5 Pro and M5 Max only, and ds4 accepts M4 Pro and M4 Max
-by name; a base M4, or any M1, M2 or M3, is refused with `no resident
-decode profile for <chip>`. The machines that run today's build out of
-the box are therefore the 24 GB M4 Pro (MacBook Pro 14" and Mac mini)
-and the 36 GB M4 Max; a 48 GB or larger M4 Pro/Max can still contribute
-by capping the cache (`--ssd-streaming-cache-experts 8GB`). On any other
-Apple GPU, set `DS4_FLINT_UNPROFILED_DEVICE=1`: if the chip holds the
-envelope, every measurement below applies; if not, the first decode step
-ends within seconds with `GPU synchronization failed: group G timed out
-in phase P`, and that line together with the chip name and GPU core
-count (`system_profiler SPDisplaysDataType`) is itself a useful report,
-since it tells where a smaller profile would be needed. The refusal
-itself (chip and architecture from the error line) is worth reporting
-too.
+**Which Macs can run it.** The decode megakernel runs a fixed number of
+threadgroups that must all be resident on the GPU at once (Design:
+Decode). rec profiled 36 on M4 Pro and M4 Max (and M5 Pro and M5 Max) and
+refuses every other chip; ds4 uses 36 on M4 Pro and M4 Max and on any
+other Apple GPU probes at start-up, for every count from 36 down to 8 in
+steps of 4, whether the GPU holds it and how fast it passes a run of
+barriers, then decodes with the largest count that is resident and fast
+(the log prints one `ds4: Flint: probe N workers: X ms per launch` line
+per count and a choice line). On the M4 Pro the GPU holds far more than
+36 groups, so a base M4 or an M1, M2 or M3 with 8 or 10 GPU cores is
+expected to be told 36 too and to run at the speed its memory bandwidth
+allows; a 7-core M1 may land on 28 or 24. The three things to report from
+such a machine are the probe table, the chosen count and the resulting
+tok/s (Rules for a timed run). If decode later stops with `GPU
+synchronization failed: group G timed out in phase P`, or runs at a crawl
+(under 10 tok/s resident), rerun with `DS4_FLINT_WORKERS=N` one step
+lower and report both. A 48 GB or larger M4 Pro/Max contributes by
+capping the cache (`--ssd-streaming-cache-experts 8GB`).
 
 ### Setup
 

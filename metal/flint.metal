@@ -50,13 +50,35 @@ flint_bf16_math(__METAL_PRECISE_MATH__)
 }
 #undef flint_bf16_math
 
-// M4 Pro launch envelope.  Other profiles change these together.
-#define FLINT_WORKERS 36u
-#define FLINT_GROUPS (FLINT_WORKERS * 8u)         // 288 simdgroups
-#define FLINT_THREADS (FLINT_WORKERS * 256u)      // 9216 threads
-#define FLINT_MLP_WORKERS 32u
-#define FLINT_HEAD_WORKERS 32u
+// Launch envelope.  FLINT_WORKERS threadgroups of 256 threads run the whole
+// forward pass together and meet at grid-wide barriers, so all of them must
+// be resident on the GPU at once.  rec's M4 Pro profile is 36 (its M5 Max
+// profile, 76, uses a different KV-team shape and is not ported); the host
+// compiles this file with FLINT_WORKERS set from the device profile, from
+// DS4_FLINT_WORKERS, or from a residency probe on chips rec never profiled
+// (ds4_metal_flint.m, flint_choose_workers).  Everything below derives from
+// it the way rec's generator does (kv_teams.py, expert_teams.py,
+// rank_routing.py): four KV teams of FLINT_WORKERS/4 groups, expert teams
+// of FLINT_WORKERS/8 groups (capped at rec's 4) for the six routed experts
+// plus a double team for the shared expert, up to 32 head workers.  Every
+// output row is still produced by one simdgroup, so the arithmetic does
+// not depend on the count.
+#ifndef FLINT_WORKERS
+#define FLINT_WORKERS 36
+#endif
+#if FLINT_WORKERS < 8 || FLINT_WORKERS > 36 || FLINT_WORKERS % 4 != 0
+#error "FLINT_WORKERS must be a multiple of 4 between 8 and 36"
+#endif
+#define FLINT_W ((uint)(FLINT_WORKERS))
+#define FLINT_GROUPS (FLINT_W * 8u)               // simdgroups in the grid (288 at 36)
+#define FLINT_THREADS (FLINT_W * 256u)            // threads in the grid (9216 at 36)
 #define FLINT_KV_TEAMS 4u
+#define FLINT_KV_TEAM_SIZE (FLINT_W / FLINT_KV_TEAMS)      // groups per KV team (9 at 36)
+#define FLINT_KV_TEAM_SIMDS (FLINT_KV_TEAM_SIZE * 8u)      // simdgroups per KV team (72 at 36)
+#define FLINT_MLP_TEAM (FLINT_W >= 32u ? 4u : FLINT_W / 8u) // groups per routed expert
+#define FLINT_MLP_SHARED0 (FLINT_MLP_TEAM * 6u)            // first group of the shared-expert team
+#define FLINT_MLP_WORKERS (FLINT_MLP_TEAM * 8u)            // 32 at 36
+#define FLINT_HEAD_WORKERS (FLINT_W < 32u ? FLINT_W : 32u)
 // Tokens of K and V each lane keeps in flight ahead of the running token in
 // the partial attention path (one 8-byte vector of K and one of V per lane
 // per token): 1 (rec's), 2 or 4; the host sets it from DS4_FLINT_KV_PREFETCH.
@@ -69,7 +91,6 @@ flint_bf16_math(__METAL_PRECISE_MATH__)
 #if FLINT_KV_PREFETCH!=1 && FLINT_KV_PREFETCH!=2 && FLINT_KV_PREFETCH!=4
 #error "FLINT_KV_PREFETCH must be 1, 2 or 4"
 #endif
-#define FLINT_KV_TEAM_SIZE 9u
 
 // One routed expert pack (gguf-tools/flint_int4_to_gguf.py, flint.expert_pack.offsets).
 #define FLINT_PACK_GATE_W 0u
@@ -265,7 +286,7 @@ inline void attention_merge_vec4_w2(device bfloat16_t* out,
                       uint parts,uint lane,uint sg) {
     // A SIMD owns 16 output dimensions. Every scalar retains its original
     // per-lane partition order and simd_sum; loads follow native four-wide tiles.
-    for(uint task=(sg/72)*64+sg%72;task<(sg/72+1)*64;task+=72) {
+    for(uint task=(sg/FLINT_KV_TEAM_SIMDS)*64+sg%FLINT_KV_TEAM_SIMDS;task<(sg/FLINT_KV_TEAM_SIMDS+1)*64;task+=FLINT_KV_TEAM_SIMDS) {
         uint h=task/8,dim=(task%8)*16;
         float top=-3.402823466e+38f;
         for(uint p=lane;p<parts;p+=32)top=max(top,stats[(h*parts+p)*2]);
@@ -310,7 +331,7 @@ inline void attention_partial_path_w53(const device bfloat16_t* q,KVView k,
                       uint count,uint cap,uint parts,bool runtime_rounded,uint lane,uint sg) {
     (void)out;(void)cap;(void)runtime_rounded;
     constexpr bool rounded=ROUNDED;
-    for(uint task=(sg/72)*((8/HEADS)*parts)+sg%72;task<(sg/72+1)*((8/HEADS)*parts);task+=72) {
+    for(uint task=(sg/FLINT_KV_TEAM_SIMDS)*((8/HEADS)*parts)+sg%FLINT_KV_TEAM_SIMDS;task<(sg/FLINT_KV_TEAM_SIMDS+1)*((8/HEADS)*parts);task+=FLINT_KV_TEAM_SIMDS) {
         uint kv=task/((8/HEADS)*parts),part=(task/(8/HEADS))%parts,first=kv*8+(task%(8/HEADS))*HEADS;
         KVView key_base=k.head(kv,lane*4);
         KVView value_base=v.head(kv,lane*4);
@@ -433,7 +454,7 @@ inline void rms_256_w4(const thread bfloat16_t* x,const device bfloat16_t* w,
     threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
-// Independent expert teams: four groups per routed role, eight for shared.
+// Independent expert teams: FLINT_MLP_TEAM groups per routed role, twice that for shared.
 // Routed matrices come from the expert's pack (experts[] holds the GPU
 // address of each pack of this layer); the shared expert from the bank.
 inline void expert_team_gateup(const device uchar* bank,const threadgroup uint* d,
@@ -441,9 +462,9 @@ inline void expert_team_gateup(const device uchar* bank,const threadgroup uint* 
                       const threadgroup bfloat16_t* x,const device uint* ids,
                       const device bfloat16_t* silu,device bfloat16_t* out,
                       uint lane,uint local_sg,uint group) {
-    bool shared=group>=24;
-    uint role=shared?6:group/4, team=shared?group-24:group%4;
-    uint teams=shared?8:4, width=shared?1024:512;
+    bool shared=group>=FLINT_MLP_SHARED0;
+    uint role=shared?6:group/FLINT_MLP_TEAM, team=shared?group-FLINT_MLP_SHARED0:group%FLINT_MLP_TEAM;
+    uint teams=shared?FLINT_MLP_TEAM*2u:FLINT_MLP_TEAM, width=shared?1024:512;
     const device uchar* pack=shared?bank:(const device uchar*)experts[ids[role]];
     Matrix g=shared?weight_matrix(bank,d+45):expert_matrix(pack,0);
     Matrix u=shared?weight_matrix(bank,d+50):expert_matrix(pack,1);
@@ -472,9 +493,9 @@ inline void expert_team_down(const device uchar* bank,const threadgroup uint* d,
                      const device ulong* experts,
                      const device bfloat16_t* x,const device uint* ids,
                      device bfloat16_t* out,uint lane,uint local_sg,uint group) {
-    bool shared=group>=24;
-    uint role=shared?6:group/4, team=shared?group-24:group%4;
-    uint teams=shared?8:4;
+    bool shared=group>=FLINT_MLP_SHARED0;
+    uint role=shared?6:group/FLINT_MLP_TEAM, team=shared?group-FLINT_MLP_SHARED0:group%FLINT_MLP_TEAM;
+    uint teams=shared?FLINT_MLP_TEAM*2u:FLINT_MLP_TEAM;
     const device uchar* pack=shared?bank:(const device uchar*)experts[ids[role]];
     Matrix m=shared?weight_matrix(bank,d+55):expert_matrix(pack,2);
     const device bfloat16_t* input=x+role*512;
@@ -494,7 +515,7 @@ inline void expert_team_down(const device uchar* bank,const threadgroup uint* d,
 
 inline bool expert_team_handoff(device uint* routing,device atomic_uint* control,
                     uint tid,uint group,uint layer,uint phase,threadgroup uint* ready) {
-    uint first=group>=24?24:(group/4)*4, count=group>=24?8:4;
+    uint first=group>=FLINT_MLP_SHARED0?FLINT_MLP_SHARED0:(group/FLINT_MLP_TEAM)*FLINT_MLP_TEAM, count=group>=FLINT_MLP_SHARED0?FLINT_MLP_TEAM*2u:FLINT_MLP_TEAM;
     atomic_thread_fence(mem_flags::mem_device,memory_order_seq_cst,thread_scope_device);
     threadgroup_barrier(mem_flags::mem_device);
     if(tid==0) {
@@ -517,8 +538,8 @@ inline bool expert_team_handoff(device uint* routing,device atomic_uint* control
 // Flint's routing has no expert bias: rank on the sigmoid probabilities.
 inline void w3_route_own_rank(device float* probs,
                             device float* chosen,device uint* ids,uint lane,uint sg,uint group) {
-    if(sg==0 && group<24) {
-        uint role=group/4;
+    if(sg==0 && group<FLINT_MLP_SHARED0) {
+        uint role=group/FLINT_MLP_TEAM;
         float p[8],b[8];for(uint j=0;j<8;++j){p[j]=probs[lane+32*j];b[j]=p[j];}
         for(uint rank=0;rank<=role;++rank) {
             float best=-3.402823466e+38f;uint idx=0;
@@ -528,7 +549,7 @@ inline void w3_route_own_rank(device float* probs,
                 float value=simd_shuffle(p[selected/32],selected%32);
                 if(lane==0) {
                     ids[role]=selected;
-                    if(group%4==0)chosen[role]=value;
+                    if(group%FLINT_MLP_TEAM==0)chosen[role]=value;
                 }
             }
             for(uint j=0;j<8;++j)if(lane+32*j==selected)b[j]=-3.402823466e+38f;
@@ -568,7 +589,7 @@ inline bool kv_team_sync(device atomic_uint* control,uint tid,thread uint& phase
 //   9 experts      49 x 256 ulong: GPU address of each expert pack
 //  10 logits       150144 bf16
 //  11 trace        50 x 2048 bf16 residual stream
-//  12 diagnostic   FLINT_WORKERS uint: 0, or the phase a group timed out in
+//  12 diagnostic   36 uint (FLINT_WORKERS used): 0, or the phase a group timed out in
 //  13 workspace    78848 bf16
 //  14 partials     2097152 float
 //  15 statistics   65536 float
@@ -578,11 +599,15 @@ inline bool kv_team_sync(device atomic_uint* control,uint tid,thread uint& phase
 //                  is 1 + layer when the launch aborted on a cache miss
 //
 // parameters: {token, position, initial_position, layer_count, layer_start,
-// streaming, 0, 0}.  layer_start > 0 resumes a launch from that layer: the
+// streaming, probe_barriers, 0}.  layer_start > 0 resumes a launch from that layer: the
 // residual is read back from the trace row the previous layer wrote.  With
 // streaming set, a zero expert-table entry for a selected expert aborts the
 // launch (every group leaves through the abort word) after publishing the
 // layer's ids; the host fetches the packs and relaunches from the layer.
+// probe_barriers (host residency probe, flint_choose_workers) adds that
+// many grid-wide barriers after the embedding: resident groups pass one in
+// microseconds, a launch with more groups than the GPU holds pays a
+// scheduler slice per barrier, so the launch time tells the two apart.
 kernel void flint_decode(
         const device uchar* bank [[buffer(0)]],
         const device uint* metadata [[buffer(1)]],
@@ -649,6 +674,7 @@ kernel void flint_decode(
         for(uint j=0;j<8;++j){uint i=(tid+(j/4)*256)*4+j%4;h[j]=trace[layer_start*2048+i];}
     }
     SYNC();
+    for(uint probe=parameters[6];probe>0;--probe){SYNC();}
     for(uint layer=layer_start;layer<uint(layer_count);++layer) {
         if(tid<64)layer_descriptor[tid]=metadata[layer*64+tid];
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -673,7 +699,7 @@ kernel void flint_decode(
             m.w+=size_t(local)*128*1024;m.s+=local*128*32;m.b+=local*128*32;m.n=128;
             q4_local_block<2048>(m,n,(head<32?q:head<36?k:v)+local*128,lane,(unit%32u)*4u);
         }
-        kv_qkv_base+=392u;
+        kv_qkv_base+=320u+FLINT_KV_TEAM_SIMDS;   // the tickets each simdgroup took past the end
         KV_TEAM_SYNC();
         for(uint member=kv_member;member<10;member+=FLINT_KV_TEAM_SIZE) {
             uint head=member<8?kv_team*8+member:member==8?32+kv_team:36+kv_team;
@@ -714,14 +740,14 @@ kernel void flint_decode(
             SYNC();
             w3_route_own_rank(statistics,(device float*)(routing+8),ids,lane,simdgroup_index_in_threadgroup,group);
             // The local route_top device fence publishes this group's ids and scores.
-            if(group<24) {
+            if(group<FLINT_MLP_SHARED0) {
                 // Publish the selection (one group per role) and, when streaming,
                 // abort on a pack that is not resident.  The abort word makes
                 // every other group leave at its next barrier; the host reads
                 // requests[392], fetches, and relaunches from this layer.
-                uint role=group/4,e=ids[role];
+                uint role=group/FLINT_MLP_TEAM,e=ids[role];
                 bool miss=streaming!=0 && experts[e]==0;
-                if(tid==0 && (group%4)==0) {
+                if(tid==0 && (group%FLINT_MLP_TEAM)==0) {
                     requests[layer*8+role]=e;
                     if(miss)atomic_fetch_or_explicit((device atomic_uint*)(requests+layer*8+6),1u<<role,memory_order_relaxed);
                 }
