@@ -293,6 +293,72 @@ kernel void kernel_k3_mul_mv_bf16_f32_unroll16(
     if (lane == 0u) out[(ulong)token * args.out_dim + out_row] = sum;
 }
 
+/* Reuse each BF16 weight across a few token rows without changing any token's
+ * lane-local FMA sequence or its final SIMD reduction. Four-load unrolling
+ * leaves room for the independent accumulators and their input values. */
+template <ushort rows_per_group>
+kernel void kernel_k3_mul_mv_bf16_f32_rows(
+        constant k3_matmul_args &args,
+        device const ushort     *weights,
+        device const float      *x,
+        device float            *out,
+        uint2 tgpig [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]],
+        ushort nsg [[simdgroups_per_threadgroup]]) {
+    const uint out_row = tgpig.x * (uint)nsg + sg;
+    const uint token = tgpig.y * rows_per_group;
+    if (out_row >= args.out_dim || token >= args.n_rows) return;
+
+    device const ushort *w = weights + (ulong)out_row * args.in_dim;
+    float sums[rows_per_group] = {};
+    uint k = lane;
+    for (; k + 96u < args.in_dim; k += 128u) {
+        const float w0 = k3_bf16_to_f32(w[k]);
+        const float w1 = k3_bf16_to_f32(w[k + 32u]);
+        const float w2 = k3_bf16_to_f32(w[k + 64u]);
+        const float w3 = k3_bf16_to_f32(w[k + 96u]);
+        #pragma unroll
+        for (ushort row = 0; row < rows_per_group; row++) {
+            if (token + row < args.n_rows) {
+                device const float *xr =
+                    x + (ulong)(token + row) * args.in_dim;
+                const float x0 = xr[k];
+                const float x1 = xr[k + 32u];
+                const float x2 = xr[k + 64u];
+                const float x3 = xr[k + 96u];
+                float sum = sums[row];
+                sum = fma(w0, x0, sum);
+                sum = fma(w1, x1, sum);
+                sum = fma(w2, x2, sum);
+                sum = fma(w3, x3, sum);
+                sums[row] = sum;
+            }
+        }
+    }
+    for (; k < args.in_dim; k += 32u) {
+        const float value = k3_bf16_to_f32(w[k]);
+        #pragma unroll
+        for (ushort row = 0; row < rows_per_group; row++) {
+            if (token + row < args.n_rows) {
+                sums[row] = fma(value,
+                    x[(ulong)(token + row) * args.in_dim + k], sums[row]);
+            }
+        }
+    }
+    #pragma unroll
+    for (ushort row = 0; row < rows_per_group; row++) {
+        const float sum = simd_sum(sums[row]);
+        if (lane == 0u && token + row < args.n_rows) {
+            out[(ulong)(token + row) * args.out_dim + out_row] = sum;
+        }
+    }
+}
+
+typedef decltype(kernel_k3_mul_mv_bf16_f32_rows<4>) k3_mul_mv_bf16_rows_t;
+template [[host_name("kernel_k3_mul_mv_bf16_f32_rows4")]]
+kernel k3_mul_mv_bf16_rows_t kernel_k3_mul_mv_bf16_f32_rows<4>;
+
 /*
  * KDA's Q/K/V/output-gate projections share input and shape. A third grid
  * dimension selects the matrix, reducing four independent dispatches to one

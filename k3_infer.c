@@ -132,6 +132,7 @@ typedef struct {
     uint64_t size;
     uint64_t bias;
     const k3_q8_layer_cache *q8;
+    bool streamed_small_batches;
 } k3_weight_source;
 
 typedef struct {
@@ -3451,6 +3452,29 @@ static int matmul(ds4_gpu_tensor *out,
     if (!weight || !source) {
         return 0;
     }
+    /* Reuse the streamed layer across a larger prefill while retaining the
+     * native small-batch arithmetic for its BF16 and quantized projections.
+     * These views slice activations only; the weight mapping stays live. */
+    if (source->streamed_small_batches && rows > 8u && rows <= 32u) {
+        if (in_dim == 0 || out_dim == 0) return 0;
+        const uint64_t input_row_bytes = (uint64_t)in_dim * sizeof(float);
+        const uint64_t output_row_bytes = (uint64_t)out_dim * sizeof(float);
+        for (uint32_t first = 0; first < rows; first += 8u) {
+            const uint32_t count = rows - first < 8u ? rows - first : 8u;
+            ds4_gpu_tensor *input = ds4_gpu_tensor_view(
+                x, (uint64_t)first * input_row_bytes,
+                (uint64_t)count * input_row_bytes);
+            ds4_gpu_tensor *output = ds4_gpu_tensor_view(
+                out, (uint64_t)first * output_row_bytes,
+                (uint64_t)count * output_row_bytes);
+            const int ok = input && output &&
+                matmul(output, weight, input, in_dim, out_dim, count, source);
+            ds4_gpu_tensor_free(output);
+            ds4_gpu_tensor_free(input);
+            if (!ok) return 0;
+        }
+        return 1;
+    }
     const k3_q8_layer_cache *q8 = source->q8;
     if (q8) {
         const k3_q8_weight *cached = find_q8_weight(q8, weight);
@@ -5205,6 +5229,8 @@ static int evaluate(k3_context *ctx,
                   .base = k3_st_map_base(gguf_static_shard),
                   .size = k3_st_file_size(gguf_static_shard),
                   .bias = 0,
+                  .streamed_small_batches = temporary_gguf_map &&
+                      ds4_gpu_device_is_pre_m5_apple_silicon(),
               }
             : (k3_weight_source){
                   .base = k3_st_map_base(layer->shard),
