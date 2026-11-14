@@ -527,6 +527,7 @@ typedef enum {
     DS4_MODEL_FAMILY_GLM_DSA   = 1,
     DS4_MODEL_FAMILY_DEEPSEEK41 = 2,
     DS4_MODEL_FAMILY_QWEN4_EXP = 3,
+    DS4_MODEL_FAMILY_FLINT = 200,   /* fork: Recursive Flint (ds4_flint_shape.inc) */
 } ds4_model_family;
 
 typedef enum {
@@ -537,6 +538,7 @@ typedef enum {
     DS4_VARIANT_FLASH41 = 4,
     DS4_VARIANT_QWEN4_EXP = 5,
     DS4_VARIANT_QWEN4_MINI = 6,
+    DS4_VARIANT_FLINT = 202,   /* fork: Recursive Flint; 200 and 201 are taken by other fork branches */
 } ds4_variant;
 
 typedef struct {
@@ -1025,6 +1027,8 @@ static bool ds4_qwen4_layer_is_nextn(uint32_t il) {
     return ds4_model_is_qwen4() && DS4_N_NEXTN_PREDICT != 0 &&
            il + DS4_N_NEXTN_PREDICT >= DS4_N_LAYER;
 }
+
+#include "ds4_flint_shape.inc"
 
 #if defined(__GNUC__) || defined(__clang__)
 #define DS4_MAYBE_UNUSED __attribute__((unused))
@@ -2445,6 +2449,9 @@ static const gguf_type_info gguf_types[] = {
     [28] = {"f64",      1,   8},
     [29] = {"iq1_m",  256,  56},
     [30] = {"bf16",     1,   2},
+    [143] = {"flint_u4", 2,  1},   /* fork: Recursive Flint MLX int4 nibbles */
+    [144] = {"flint_u8", 1,  1},   /* fork: Recursive Flint MLX int8 bytes */
+    [145] = {"flint_pack", 1, 1},  /* fork: Recursive Flint per-expert pack */
     [39] = {"mxfp4",   32,  17},
 };
 
@@ -2463,6 +2470,9 @@ enum {
     DS4_TENSOR_I8       = 24,
     DS4_TENSOR_I32      = 26,
     DS4_TENSOR_BF16     = 30,
+    DS4_TENSOR_FLINT_U4 = 143,   /* fork: Recursive Flint (ds4_flint_model.inc) */
+    DS4_TENSOR_FLINT_U8 = 144,
+    DS4_TENSOR_FLINT_PACK = 145,
     DS4_TENSOR_MXFP4    = 39,
 };
 
@@ -5440,7 +5450,10 @@ static void tensor_expect_routed_expert(
     }
 }
 
+#include "ds4_flint_weights.inc"
+
 static bool weights_have_output_head(const ds4_weights *w) {
+    if (ds4_model_is_flint()) return w && w->output_norm && w->output;
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ||
         DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
         return w && w->output_norm && w->output;
@@ -5457,6 +5470,7 @@ static bool weights_have_output_head(const ds4_weights *w) {
 }
 
 static bool weights_have_partial_output_head(const ds4_weights *w) {
+    if (ds4_model_is_flint()) return w && (w->output_norm || w->output);
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ||
         DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
         return w && (w->output_norm || w->output);
@@ -5737,6 +5751,7 @@ static void weights_validate_qwen4_layout(
 
 static bool weights_layer_has_required(const ds4_layer_weights *l, uint32_t il) {
     if (!l) return false;
+    if (ds4_model_is_flint()) return weights_flint_layer_has_required(l, il);
     if (ds4_model_is_qwen4()) {
         return weights_qwen4_layer_has_required(l, il);
     }
@@ -5987,6 +6002,10 @@ static void weights_validate_layout(
         uint32_t           layer_end,
         bool               require_token_embd,
         bool               require_output) {
+    if (ds4_model_is_flint()) {
+        weights_validate_flint_layout(w, layer_start, layer_end, require_token_embd, require_output);
+        return;
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         weights_validate_glm_dsa_layout(w,
                                         layer_start,
@@ -7249,6 +7268,8 @@ static void config_validate_qwen4_model(const ds4_model *m) {
     }
 }
 
+#include "ds4_flint_model.inc"
+
 static void config_validate_model(const ds4_model *m) {
     g_ds4_flash_vision_exp = false;
     ds4_str arch = {0};
@@ -7267,6 +7288,10 @@ static void config_validate_model(const ds4_model *m) {
         }
         if (ds4_streq(arch, "qwen4exp")) {
             config_validate_qwen4_model(m);
+            return;
+        }
+        if (ds4_streq(arch, "flint")) {
+            config_validate_flint_model(m);
             return;
         }
     }
@@ -7745,6 +7770,10 @@ static void weights_bind_output(
         const ds4_model *m,
         bool             required,
         bool             optional) {
+    if (ds4_model_is_flint()) {
+        weights_bind_flint_output(w, m, required, optional);
+        return;
+    }
     if (ds4_model_is_qwen4()) {
         if (required) {
             w->output_hc_norm = required_tensor(m, "output_hc_norm.weight");
@@ -7924,6 +7953,10 @@ static void weights_bind_qwen4_layer(ds4_layer_weights *l, const ds4_model *m, u
 static void weights_bind_layer(ds4_layer_weights *l, const ds4_model *m, uint32_t il) {
     if (ds4_model_is_qwen4()) {
         weights_bind_qwen4_layer(l, m, il);
+        return;
+    }
+    if (ds4_model_is_flint()) {
+        weights_bind_flint_layer(l, m, il);
         return;
     }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
@@ -45512,7 +45545,13 @@ static void bpe_tokenize_text_qwen35(const ds4_vocab *vocab, const char *text, t
  * word (for example ">;\n").  Splitting those newlines separately changes the
  * token stream for code prompts and produces wrong long-context logits.
  */
+#include "ds4_flint_tokenizer.inc"
+
 static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_vec *out) {
+    if (ds4_model_is_flint()) {
+        bpe_tokenize_text_flint(vocab, text, out);
+        return;
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         bpe_tokenize_text_glm4(vocab, text, out);
         return;
@@ -45644,6 +45683,10 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
     vocab->im_end_id = -1;
     vocab->endoftext_id = -1;
 
+    if (ds4_model_is_flint()) {
+        flint_vocab_setup(vocab);
+        return;
+    }
     if (ds4_model_is_qwen4()) {
         /* ChatML without BOS; <|endoftext|> is the document separator and a
          * second generation stop. */
@@ -45759,6 +45802,7 @@ const char *ds4_deepseek41_reasoning_effort_text(ds4_think_mode mode) {
 static void chat_push_think_prefix(const ds4_vocab *vocab,
                                    ds4_think_mode   think_mode,
                                    token_vec       *out) {
+    if (ds4_model_is_flint()) return;   /* fork: Flint's template has no effort prefix */
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         const char *effort = ds4_glm_reasoning_effort_text(think_mode);
         if (effort) {
@@ -45830,6 +45874,7 @@ static void encode_chat_prompt(
         const char      *prompt,
         ds4_think_mode   think_mode,
         token_vec       *out) {
+    if (ds4_model_is_flint()) { flint_encode_chat_prompt(vocab, system, prompt, out); return; }
     if (ds4_model_is_qwen4()) {
         if (vocab->im_start_id < 0 || vocab->im_end_id < 0 ||
             vocab->think_start_id < 0 || vocab->think_end_id < 0) {
@@ -45881,6 +45926,7 @@ void ds4_tokenize_text(ds4_engine *e, const char *text, ds4_tokens *out) {
 }
 
 static bool special_token_at(const ds4_vocab *vocab, const char *p, int *token, size_t *len) {
+    if (ds4_model_is_flint()) return flint_special_token_at(vocab, p, token, len);
     struct special {
         const char *text;
         int token;
@@ -46027,6 +46073,7 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
     if (!role) role = "user";
     if (!content) content = "";
 
+    if (ds4_model_is_flint()) { flint_chat_append_message(vocab, tokens, role, content); return; }
     if (ds4_model_is_qwen4()) {
         if (!strcmp(role, "tool") || !strcmp(role, "function")) {
             qwen4_chat_open(vocab, "user", tokens);
@@ -46093,6 +46140,7 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
 }
 
 void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode think_mode) {
+    if (ds4_model_is_flint()) { flint_chat_append_assistant_prefix(&e->vocab, think_mode, tokens); return; }   /* fork */
     if (ds4_model_is_qwen4()) {
         qwen4_chat_assistant_prefix(&e->vocab, think_mode, tokens);
         return;
@@ -46217,6 +46265,7 @@ static bool vocab_token_is_generation_stop(const ds4_vocab *vocab, int token) {
     if (!vocab || token < 0) return false;
     if (token == vocab->eos_id) return true;
     if (vocab->endoftext_id >= 0 && token == vocab->endoftext_id) return true;
+    if (ds4_model_is_flint()) return flint_token_is_generation_stop(vocab, token);
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         return (vocab->system_id >= 0 && token == vocab->system_id) ||
                (vocab->user_id >= 0 && token == vocab->user_id) ||
@@ -63007,6 +63056,7 @@ typedef struct {
 
 struct ds4_session {
     ds4_engine *engine;
+    void *flint;   /* fork: Recursive Flint session state (ds4_flint_session.inc) */
     ds4_dist_session *distributed;
     uint64_t tp_session_id;
     uint64_t glm_reserved_graph_bytes;
@@ -63120,6 +63170,11 @@ struct ds4_session {
 };
 
 static bool ds4_session_tp_leader(const ds4_session *s);
+/* fork: Recursive Flint session driver (ds4_flint_session.inc, included later) */
+static uint64_t flint_session_payload_bytes(ds4_session *s);
+static int flint_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen);
+static int flint_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *h, uint64_t *remaining,
+                                      char *err, size_t errlen);
 
 #ifndef DS4_NO_GPU
 static bool ds4_dspark_stats_enabled(void);
@@ -64998,6 +65053,7 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
 
 int ds4_engine_routed_quant_bits(ds4_engine *e) {
     if (!e) return 0;
+    if (ds4_model_is_flint()) return 4;   /* fork: MLX affine int4 packs (no per-matrix expert tensors) */
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const ds4_tensor *gate = e->weights.layer[il].ffn_gate_exps;
         if (!gate) continue;
@@ -65351,6 +65407,7 @@ static uint64_t qwen4_payload_tensor_bytes(uint32_t rows, uint32_t mtp_rows, boo
 #endif
 
 uint64_t ds4_session_payload_bytes(ds4_session *s) {
+    if (s && s->flint) return flint_session_payload_bytes(s);
     if (s && !s->distributed && ds4_session_is_qwen4(s)) {
 #ifndef DS4_HAS_QWEN4_GPU
         return 0;
@@ -65777,6 +65834,7 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
     if (s->distributed) {
         return ds4_dist_session_save_payload(s->distributed, s, fp, err, errlen);
     }
+    if (s->flint) return flint_session_save_payload(s, fp, err, errlen);
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     if (ds4_session_is_ds41(s)) return ds41_save_payload(s, fp, err, errlen);
 #endif
@@ -66164,6 +66222,7 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         ds4_tokens_free(&tokens);
         return rc;
     }
+    if (s->flint) return flint_session_load_payload(s, fp, h, &remaining, err, errlen);
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     if (ds4_session_is_ds41(s)) return ds41_load_payload(s, fp, h, remaining, err, errlen);
 #endif
@@ -67498,6 +67557,10 @@ static bool ds4_session_greedy_splitkv_replay_exact(
 #endif
 
 int ds4_session_eval_argmax(ds4_session *s, int token, char *err, size_t errlen) {
+    if (s && s->flint) {   /* fork: Flint has no fused eval+argmax */
+        if (ds4_session_eval(s, token, err, errlen) != 0) return -1;
+        return ds4_session_argmax(s);
+    }
     if (!s) return -1;
     if (ds4_session_is_cpu(s) || ds4_session_is_glm(s) || ds4_session_is_ds41(s)) {
         if (ds4_session_eval(s, token, err, errlen) != 0) return -1;
@@ -67983,7 +68046,7 @@ int ds4_engine_generate_argmax(
                     ds4_backend_name(e->backend));
             return 1;
         }
-        if (e->multi_tier || DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+        if (e->multi_tier || DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 || ds4_model_is_flint()) {   /* fork: Flint generates through sessions */
             ds4_session *s = NULL;
             char err[256] = {0};
             const double t_prefill0 = now_sec();
@@ -73540,6 +73603,9 @@ static void tp_dspark_split_meta(const ds4_engine *e, uint8_t meta[DS4_TP_DSPARK
 
 static int engine_install_dspark_support_cache(ds4_engine *e);
 static int engine_install_gpu_placement(ds4_engine *e);
+#include "ds4_flint.inc"
+#include "ds4_flint_session.inc"
+
 static int ds4_engine_open_internal(ds4_engine **out,
                                     const ds4_engine_options *opt,
                                     const ds4_gpu_config *gpu_cfg);
@@ -73892,6 +73958,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
         return 1;
     }
     config_validate_model(&e->model);
+    if (ds4_model_is_flint() && !opt->inspect_only && !flint_engine_supported(opt, e->backend)) {
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
+    }
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
     /* V4.1's model views are read-only to the GPU: untracked by default */
     if (e->backend == DS4_BACKEND_METAL)
@@ -74158,6 +74229,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
         if (engine_warm_full_model(opt)) model_warm_weights(&e->model);
     }
 #endif
+    if (ds4_model_is_flint()) {
+        if (opt->inspect_only) { *out = e; return 0; }
+        return flint_engine_open_tail(e, opt, out);
+    }
     if (ds4_model_is_qwen4()) {
         if (opt->inspect_only) {
             *out = e;
@@ -76144,6 +76219,7 @@ void ds4_engine_close(ds4_engine *e) {
 #ifndef DS4_NO_GPU
 #ifdef DS4_HAS_QWEN4_GPU
     qwen4_state_pool_free(e);
+    flint_engine_close();
     if (e->qwen4_shared_workspace) {
         qwen4_graph_free(e->qwen4_shared_workspace);
         free(e->qwen4_shared_workspace);
@@ -76312,6 +76388,10 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             fprintf(stderr, "ds4: Qwen3.8 sessions require Metal or CUDA\n");
             return 1;
         }
+        if (ds4_model_is_flint()) {
+            fprintf(stderr, "ds4: Recursive Flint sessions require Metal\n");
+            return 1;
+        }
         if (e->distributed.role == DS4_DISTRIBUTED_COORDINATOR) {
             fprintf(stderr, "ds4: distributed coordinator sessions require the graph backend\n");
             return 1;
@@ -76340,6 +76420,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     ds4_session *s = xcalloc(1, sizeof(*s));
     s->engine = e;
     s->ctx_size = ctx_size;
+    if (ds4_model_is_flint()) return flint_session_create(s, e, ctx_size, out);
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
         if (ctx_size > 1048576 ||
@@ -76822,6 +76903,9 @@ void ds4_session_free(ds4_session *s) {
     }
 #ifndef DS4_NO_GPU
     else {
+        if (s->flint) {
+            flint_session_free(s);
+        } else
 #ifdef DS4_HAS_DEEPSEEK41_GPU
         if (s->ds41_graph_ready) {
             s->engine->ds41_session_bytes -= s->ds41_graph.allocation_bytes;
@@ -78833,6 +78917,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                                      err,
                                      errlen);
     }
+    if (s->flint) return flint_session_sync(s, prompt, err, errlen);
 #ifdef DS4_HAS_QWEN4_GPU
     if (ds4_session_is_qwen4(s)) {
         ds4_engine *e = s->engine;
@@ -81131,6 +81216,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     return 1;
 #else
     ds4_engine *e = s->engine;
+    if (s->flint) { (void)probe_mtp; return flint_session_eval(s, token, err, errlen); }
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     if (ds4_session_is_ds41(s)) {
         ds41_dspark *d = s->ds41_graph.dspark;
@@ -82835,6 +82921,7 @@ static bool ds4_sessions_eval_batch_metal_supported(
         ds4_decode_item *items,
         int count,
         ds4_engine *e) {
+    if (items && count > 0 && items[0].session && items[0].session->flint) return false;   /* fork: sequential until step 7 */
     const char *tp_batch = getenv("DS4_METAL_TP_SESSION_BATCH");
     if (!items || count < 2 || !e || e->backend != DS4_BACKEND_METAL ||
         e->support_kind != DS4_SUPPORT_NONE ||
@@ -88455,7 +88542,7 @@ static int ds4_session_eval_speculative_argmax_impl(
         accepted[0] = first_token;
         return 1;
     }
-    if (ds4_session_is_cpu(s)) {
+    if (ds4_session_is_cpu(s) || s->flint) {   /* fork: Flint has no draft head */
         (void)max_tokens;
         (void)eos_token;
         if (!accepted || accepted_cap <= 0) return 0;
@@ -89629,6 +89716,7 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     }
     bool state_ok = false;
 #ifndef DS4_NO_GPU
+    if (s->checkpoint_valid && s->flint) state_ok = flint_session_rewind(s, pos);
 #ifdef DS4_HAS_QWEN4_GPU
     if (s->checkpoint_valid && ds4_session_is_qwen4(s)) {
         /* a verify snapshot can restore the verified block's start (the

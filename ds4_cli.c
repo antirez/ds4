@@ -98,6 +98,8 @@ typedef struct {
     cli_generation_options gen;
     char *prompt_owned;
     bool inspect;
+    const char *flint_trace_in, *flint_trace_out;   /* fork: Flint decode trace check */
+    const char *flint_prefill_in, *flint_prefill_out, *flint_generate_in, *flint_generate_out;   /* fork */
     /* CLI flag wiring: raw argv values for --gpu-vram and --gpu-devices.
      * Resolved post-parse via parse_gpu_vram_arg(). */
     const char *gpu_vram_arg;
@@ -2198,6 +2200,12 @@ static cli_config parse_options(int argc, char **argv) {
             exit(2);
         } else if (!strcmp(arg, "--inspect")) {
             c.inspect = true;
+        } else if (!strcmp(arg, "--flint-trace") && i + 2 < argc) {
+            c.flint_trace_in = argv[++i]; c.flint_trace_out = argv[++i];
+        } else if (!strcmp(arg, "--flint-prefill-trace") && i + 2 < argc) {
+            c.flint_prefill_in = argv[++i]; c.flint_prefill_out = argv[++i];
+        } else if (!strcmp(arg, "--flint-generate") && i + 2 < argc) {
+            c.flint_generate_in = argv[++i]; c.flint_generate_out = argv[++i];
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
         } else if (!strcmp(arg, "--server")) {
@@ -2413,6 +2421,12 @@ int main(int argc, char **argv) {
     int rc = 0;
     if (cfg.inspect) {
         ds4_engine_summary(engine);
+    } else if (cfg.flint_trace_in) {
+        rc = ds4_flint_trace_check(engine, cfg.flint_trace_in, cfg.flint_trace_out);
+    } else if (cfg.flint_prefill_in) {
+        rc = ds4_flint_prefill_trace(engine, cfg.flint_prefill_in, cfg.flint_prefill_out);
+    } else if (cfg.flint_generate_in) {
+        rc = ds4_flint_generate_check(engine, cfg.flint_generate_in, cfg.flint_generate_out);
     } else if (cfg.gen.imatrix_output_path) {
         rc = ds4_engine_collect_imatrix(engine,
                                         cfg.gen.imatrix_dataset_path,
