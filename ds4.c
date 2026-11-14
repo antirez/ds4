@@ -72331,6 +72331,8 @@ static int ds4_engine_open_k3(ds4_engine *e,
             .layer_start = layer_start,
             .layer_end = layer_end,
             .has_output = has_output,
+            .expert_cache_bytes = opt->ssd_streaming_cache_bytes,
+            .expert_cache_slots = opt->ssd_streaming_cache_experts,
         };
         if (!k3_context_create(
                 &e->k3_primary, &config, err, sizeof(err))) {

@@ -85,12 +85,14 @@ ifeq ($(UNAME_S),Darwin)
 
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
 
-.PHONY: test-k3 test-k3-gguf test-k3-gguf-source
+.PHONY: test-k3 test-k3-memory test-k3-stream-mapping test-k3-gguf test-k3-gguf-source
 
 help:
 	@echo "DS4 build targets:"
 	@echo "  make              Build Metal ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
 	@echo "  make test-k3      Run K3 unit tests and the downloaded checkpoint smoke test"
+	@echo "  make test-k3-memory Run memory-budget tests without Metal or model weights"
+	@echo "  make test-k3-stream-mapping Run a tiny synthetic Metal mapping-lifetime test"
 	@echo "  make test-k3-gguf Run K3 mixed-Q2 GGUF parser and Metal smoke tests"
 	@echo "  make test-k3-gguf-source Byte-compare every retained K3 GGUF tensor with SafeTensors"
 	@echo "  make cpu          Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
@@ -142,6 +144,18 @@ tests/test_metal_tp_cancel: tests/test_metal_tp_cancel.c ds4.h ds4_tp.h $(CORE_O
 
 test-metal-session-batch: tests/test_metal_session_batch
 	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" ./tests/test_metal_session_batch
+
+tests/test_k3_memory: tests/test_k3_memory.c k3_memory.h
+	$(CC) $(CFLAGS) -I. -o $@ $<
+
+test-k3-memory: tests/test_k3_memory
+	./tests/test_k3_memory
+
+tests/test_k3_stream_mapping: tests/test_k3_stream_mapping.c k3_safetensors.o ds4_metal.o ds4_image.o gguf-tools/quants.c
+	$(CC) $(CFLAGS) -I. -o $@ $^ $(METAL_LDLIBS)
+
+test-k3-stream-mapping: tests/test_k3_stream_mapping
+	./tests/test_k3_stream_mapping
 
 tests/test_k3_safetensors: tests/test_k3_safetensors.o k3_safetensors.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
@@ -226,7 +240,7 @@ k3_safetensors.o: k3_safetensors.c k3_safetensors.h
 k3_model.o: k3_model.c k3_model.h k3_safetensors.h
 	$(CC) $(CFLAGS) -c -o $@ k3_model.c
 
-k3_infer.o: k3_infer.c k3_infer.h k3_model.h k3_safetensors.h k3_metal.h ds4_gpu.h
+k3_infer.o: k3_infer.c k3_infer.h k3_memory.h k3_model.h k3_safetensors.h k3_metal.h ds4_gpu.h
 	$(CC) $(CFLAGS) -c -o $@ k3_infer.c
 
 k3_tokenizer.o: k3_tokenizer.c k3_tokenizer.h k3_safetensors.h
@@ -1467,7 +1481,7 @@ clean:
 	rm -f tests/test_qwen4_ngrams
 	rm -f tests/test_qwen4_ngram_state
 	rm -f tests/test_web_recovery
-	rm -f tests/test_k3_stream
+	rm -f tests/test_k3_stream tests/test_k3_memory tests/test_k3_stream_mapping
 	rm -f tests/test_metal_ssd_experts
 	rm -f tests/test_metal_command_memory
 	rm -f tests/test_deepseek41_metal

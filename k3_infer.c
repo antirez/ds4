@@ -2,6 +2,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "k3_infer.h"
+#include "k3_memory.h"
 
 #include "ds4_gpu.h"
 #include "k3_metal.h"
@@ -239,6 +240,9 @@ struct k3_context {
     k3_hidden_hook_fn hidden_hook;
     void *hidden_hook_ud;
     uint64_t resident_static_bytes;
+    uint64_t tensor_allocation_limit;
+    uint64_t gguf_cache_bytes;
+    uint64_t gguf_transient_bytes;
     k3_static_slot static_slots[2];
     k3_static_slot resident_static_slots[K3_N_LAYER];
     k3_static_slot resident_shared_slots[K3_N_LAYER];
@@ -384,6 +388,9 @@ typedef struct {
     uint64_t file_backed;
     uint64_t purgeable;
     uint64_t compressed;
+    uint64_t speculative;
+    uint64_t wired;
+    uint64_t anonymous;
 } k3_memory_status;
 
 static int macos_memory_status(k3_memory_status *status) {
@@ -429,6 +436,10 @@ static int macos_memory_status(k3_memory_status *status) {
     status->purgeable = purgeable_pages * (uint64_t)page_size;
     status->compressed =
         (uint64_t)vm.compressor_page_count * (uint64_t)page_size;
+    status->speculative =
+        (uint64_t)vm.speculative_count * (uint64_t)page_size;
+    status->wired = (uint64_t)vm.wire_count * (uint64_t)page_size;
+    status->anonymous = (uint64_t)vm.internal_page_count * (uint64_t)page_size;
     return 1;
 }
 
@@ -532,6 +543,119 @@ static uint64_t resident_static_budget(uint64_t allocated_bytes) {
         return safety_cap;
     }
     return requested;
+}
+
+static const uint64_t K3_GGUF_LIVE_RESERVE_BYTES = 4ull * 1024ull * 1024ull * 1024ull;
+
+static int gguf_memory_budget(uint64_t allocated, uint64_t *budget,
+                              char *err, size_t errcap) {
+    k3_memory_status memory;
+    const uint64_t physical = macos_physical_memory();
+    if (!physical || !macos_memory_status(&memory)) {
+        set_error(err, errcap, "could not read the K3 GGUF memory budget");
+        return 0;
+    }
+    *budget = k3_memory_available(physical,
+        ds4_gpu_recommended_working_set_size(), allocated,
+        memory.reclaimable, resident_memory_reserve(), K3_GGUF_LIVE_RESERVE_BYTES);
+    return 1;
+}
+
+static int check_gguf_memory(const k3_context *ctx, const char *phase,
+                             uint32_t layer, char *err, size_t errcap) {
+    if (!ctx->model->gguf || ctx->gguf_resident) return 1;
+    const k3_context *owner = ctx->shared_owner ? ctx->shared_owner : ctx;
+    k3_memory_status memory = {0};
+    /* Slabs are allocated lazily. Reserve every cache byte not yet guaranteed
+     * resident by mlock, without charging the already-filled cache again. */
+    const uint64_t locked_cache = k3_gpu_streaming_cache_locked_bytes();
+    const uint64_t cache_growth =
+        k3_memory_remaining(owner->gguf_cache_bytes, locked_cache);
+    uint64_t minimum = 0;
+    if (!k3_memory_step_required(owner->gguf_transient_bytes,
+            owner->gguf_cache_bytes, locked_cache,
+            K3_GGUF_LIVE_RESERVE_BYTES, &minimum)) {
+        set_error(err, errcap, "K3 GGUF streaming memory requirement overflow");
+        return 0;
+    }
+    if (!macos_memory_status(&memory) || memory.reclaimable < minimum) {
+        /* Capture these before cleanup releases the GPU allocations. A
+         * post-exit system-memory reading cannot explain an in-flight stop. */
+        fprintf(stderr,
+                "k3: memory stop at %s, layer %u, position %u: "
+                "reclaimable %.2f GiB, required %.2f GiB\n",
+                phase, layer, ctx->position,
+                (double)memory.reclaimable / 1073741824.0,
+                (double)minimum / 1073741824.0);
+        fprintf(stderr,
+                "k3: system memory: free (excluding speculative) %.2f GiB, "
+                "file-backed %.2f GiB, purgeable %.2f GiB, "
+                "speculative %.2f GiB, wired %.2f GiB, "
+                "anonymous %.2f GiB, compressor %.2f GiB\n",
+                (double)memory.free / 1073741824.0,
+                (double)memory.file_backed / 1073741824.0,
+                (double)memory.purgeable / 1073741824.0,
+                (double)memory.speculative / 1073741824.0,
+                (double)memory.wired / 1073741824.0,
+                (double)memory.anonymous / 1073741824.0,
+                (double)memory.compressed / 1073741824.0);
+        fprintf(stderr,
+                "k3: stop threshold: %.2f GiB live reserve + "
+                "%.2f GiB transient peak + %.2f GiB remaining cache growth\n",
+                (double)K3_GGUF_LIVE_RESERVE_BYTES / 1073741824.0,
+                (double)owner->gguf_transient_bytes / 1073741824.0,
+                (double)cache_growth / 1073741824.0);
+        ds4_gpu_print_memory_report("K3 memory stop");
+        set_error(err, errcap,
+                  "K3 GGUF stopped: %.2f GiB reclaimable, %.2f GiB required "
+                  "before the next streaming step; close other applications "
+                  "or reduce --prefill-chunk/--ctx",
+                  (double)memory.reclaimable / 1073741824.0,
+                  (double)minimum / 1073741824.0);
+        return 0;
+    }
+    return 1;
+}
+
+static int gguf_span_capacity(uint64_t offset, uint64_t size,
+                               uint64_t page, uint64_t *bytes) {
+    const uint64_t leading = offset & (page - 1u);
+    return size <= UINT64_MAX - leading &&
+           k3_memory_align(size + leading, page, bytes);
+}
+
+static int gguf_transient_capacity(const k3_context *ctx, uint64_t *bytes) {
+    const long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0) return 0;
+    uint64_t layers[K3_N_LAYER];
+    uint32_t count = 0;
+    for (uint32_t i = ctx->layer_start; i <= ctx->layer_end; i++) {
+        if (!gguf_span_capacity(ctx->layers[i]->static_offset,
+                                ctx->layers[i]->static_size, (uint64_t)page,
+                                &layers[count++])) return 0;
+    }
+    uint64_t head = 0, output = 0;
+    if (ctx->has_output) {
+        const k3_st_tensor *tensors[] = {
+            ctx->globals.output_attn_res_norm,
+            ctx->globals.output_attn_res_proj,
+            ctx->globals.norm,
+            ctx->globals.lm_head,
+        };
+        for (uint32_t i = 0; i < sizeof(tensors) / sizeof(tensors[0]); i++) {
+            uint64_t span;
+            if (!tensors[i] ||
+                !gguf_span_capacity(tensors[i]->offset, tensors[i]->size,
+                                    (uint64_t)page, &span) ||
+                span > UINT64_MAX - output) return 0;
+            output += span;
+            if (tensors[i] == ctx->globals.lm_head) head = span;
+        }
+    }
+    /* Only adjacent layers overlap. The head is prefetched with the final
+     * layer; output views are dropped before the next evaluation's prefetch. */
+    return k3_memory_transient_peak(layers, count, head, output,
+                                    256ull * 1024ull * 1024ull, bytes);
 }
 
 static int q8_static_requested(void) {
@@ -642,12 +766,20 @@ static int checked_bytes(uint64_t rows,
     return 1;
 }
 
-static ds4_gpu_tensor *alloc_tensor(uint64_t rows,
+static ds4_gpu_tensor *alloc_tensor(k3_context *ctx,
+                                    uint64_t rows,
                                     uint64_t width,
                                     uint64_t element_size,
                                     int managed) {
     uint64_t bytes = 0;
     if (!checked_bytes(rows, width, element_size, &bytes)) return NULL;
+    if (ctx->model->gguf &&
+        bytes > k3_memory_remaining(ctx->tensor_allocation_limit,
+                                    ds4_gpu_tensor_allocated_bytes())) {
+        fprintf(stderr, "k3: tensor allocation exceeds the GGUF memory budget; "
+                        "reduce --ctx or --prefill-chunk\n");
+        return NULL;
+    }
     return managed ? ds4_gpu_tensor_alloc_managed(bytes)
                    : ds4_gpu_tensor_alloc(bytes);
 }
@@ -669,7 +801,7 @@ static int alloc_scratch(k3_context *ctx, char *err, size_t errcap) {
         rows > max_partials ? rows : max_partials;
 
 #define ALLOC(field_, rows_, width_, size_, managed_) do { \
-    s->field_ = alloc_tensor((rows_), (width_), (size_), (managed_)); \
+    s->field_ = alloc_tensor(ctx, (rows_), (width_), (size_), (managed_)); \
     if (!s->field_) { \
         set_error(err, errcap, "GPU allocation failed for K3 scratch " #field_); \
         return 0; \
@@ -1216,16 +1348,16 @@ static int alloc_states(k3_context *ctx, char *err, size_t errcap) {
     for (uint32_t i = ctx->layer_start; i <= ctx->layer_end; i++) {
         if (k3_layer_is_mla(i)) {
             ctx->mla[i].cache = alloc_tensor(
-                ctx->context_capacity,
+                ctx, ctx->context_capacity,
                 K3_MLA_CACHE_WIDTH,
                 sizeof(uint16_t),
                 0);
             if (ctx->layers[i]->index_q && ctx->context_capacity > K31_INDEX_TOPK) {
-                ctx->mla[i].index_keys = alloc_tensor(ctx->context_capacity, K31_INDEX_DIM + sizeof(float), 1, 0);
+                ctx->mla[i].index_keys = alloc_tensor(ctx, ctx->context_capacity, K31_INDEX_DIM + sizeof(float), 1, 0);
                 if (!ctx->index_scores) {
                     const uint32_t tile = ctx->max_prefill_tokens < 8u ? ctx->max_prefill_tokens : 8u;
-                    ctx->index_scores = alloc_tensor(tile, ctx->context_capacity, sizeof(float), 0);
-                    ctx->index_ids = alloc_tensor(ctx->max_prefill_tokens, K31_INDEX_TOPK, sizeof(int32_t), 0);
+                    ctx->index_scores = alloc_tensor(ctx, tile, ctx->context_capacity, sizeof(float), 0);
+                    ctx->index_ids = alloc_tensor(ctx, ctx->max_prefill_tokens, K31_INDEX_TOPK, sizeof(int32_t), 0);
                 }
                 if (!ctx->mla[i].index_keys || !ctx->index_scores || !ctx->index_ids) {
                     set_error(err, errcap, "GPU allocation failed for K3.1 indexer layer %u", i);
@@ -1239,9 +1371,9 @@ static int alloc_states(k3_context *ctx, char *err, size_t errcap) {
             }
         } else {
             ctx->kda[i].conv = alloc_tensor(
-                conv_count, 1, sizeof(float), 0);
+                ctx, conv_count, 1, sizeof(float), 0);
             ctx->kda[i].recurrent = alloc_tensor(
-                recurrent_count, 1, sizeof(float), 0);
+                ctx, recurrent_count, 1, sizeof(float), 0);
             if (!ctx->kda[i].conv || !ctx->kda[i].recurrent ||
                 !ds4_gpu_tensor_fill_f32(
                     ctx->kda[i].conv, 0.0f, conv_count) ||
@@ -1359,44 +1491,12 @@ static int map_gguf_layer_spans(const k3_context *ctx,
                                 char *err,
                                 size_t errcap) {
     if (!ctx || !ctx->globals.shard || !layer || !layer->shard) return 0;
-    const k3_st_tensor *experts[] = {
-        layer->expert_gate,
-        layer->expert_up,
-        layer->expert_down,
-    };
-    uint64_t offsets[4] = {0};
-    uint64_t sizes[4] = {0};
-    uint32_t count = 0;
-    uint64_t max_tensor = 1;
-    if (include_static) {
-        offsets[count] = layer->static_offset;
-        sizes[count] = layer->static_size;
-        if (sizes[count] > max_tensor) max_tensor = sizes[count];
-        count++;
-    }
-    if (layer->index != 0) {
-        for (uint32_t i = 0; i < 3; i++) {
-            if (!experts[i] || experts[i]->size == 0) {
-                set_error(err, errcap,
-                          "K3 layer %u GGUF expert span is missing",
-                          layer->index);
-                return 0;
-            }
-            offsets[count] = experts[i]->offset;
-            sizes[count] = experts[i]->size;
-            if (sizes[count] > max_tensor) max_tensor = sizes[count];
-            count++;
-        }
-    }
-    if (count == 0) return 1;
-    return map_spans(
-        ctx->globals.shard,
-        offsets,
-        sizes,
-        count,
-        max_tensor,
-        err,
-        errcap);
+    /* Streamed experts use bounded, reusable slabs. Never register the full
+     * multi-GiB expert stacks as a fallback Metal view. */
+    if (!include_static) return 1;
+    return map_spans(layer->shard,
+                     &layer->static_offset, &layer->static_size, 1,
+                     layer->static_size, err, errcap);
 }
 
 static int prepare_gguf_selected_experts(
@@ -1776,13 +1876,12 @@ static int try_pin_resident_gguf(k3_context *ctx,
     return 1;
 }
 
-/* Keep the weights touched by every token out of the SSD working set. Charge
- * the entire lazy expert cache before pinning, not just its current contents. */
-static void try_pin_gguf_static(k3_context *ctx, uint64_t budget,
-                                uint64_t expert_cache_bytes) {
+/* This budget already excludes tensors, the full lazy expert cache and
+ * transient layer/output views before any static weights are pinned. */
+static void try_pin_gguf_static(k3_context *ctx, uint64_t budget) {
     if (!ctx->model->gguf || ctx->gguf_resident ||
         getenv("K3_DISABLE_GGUF_STATIC_RESIDENCY") != NULL ||
-        budget <= expert_cache_bytes) return;
+        budget == 0) return;
     uint64_t offsets[K3_N_LAYER + 5] = {0};
     uint64_t sizes[K3_N_LAYER + 5] = {0};
     uint32_t count = 0;
@@ -1790,7 +1889,7 @@ static void try_pin_gguf_static(k3_context *ctx, uint64_t budget,
     if (!gguf_resident_spans(ctx, 0, offsets, sizes, &count, &total)) return;
     const uint32_t layers = ctx->layer_end - ctx->layer_start + 1u;
     const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
-    uint64_t remaining = budget - expert_cache_bytes;
+    uint64_t remaining = budget;
     uint32_t kept = 0;
     uint8_t selected[K3_N_LAYER] = {0};
     uint64_t kept_offsets[K3_N_LAYER + 5], kept_sizes[K3_N_LAYER + 5];
@@ -1821,7 +1920,7 @@ static void try_pin_gguf_static(k3_context *ctx, uint64_t budget,
     fprintf(stderr, "k3: pinned %.3f GiB of static GGUF weights; "
                     "%.3f GiB reserved for streamed experts\n",
             (double)total / 1073741824.0,
-            (double)expert_cache_bytes / 1073741824.0);
+            (double)ctx->gguf_cache_bytes / 1073741824.0);
 }
 
 static int load_resident_lm_head(k3_context *ctx,
@@ -3306,6 +3405,7 @@ static int start_speculative_experts(k3_context *ctx,
 }
 
 static int map_global_tensors(k3_context *ctx,
+                              const k3_st_shard *shard,
                               int embedding,
                               char *err,
                               size_t errcap) {
@@ -3317,7 +3417,7 @@ static int map_global_tensors(k3_context *ctx,
     const k3_global_weights *g = &ctx->globals;
     if (embedding) {
         return map_range(
-            g->shard,
+            shard,
             g->token_embedding->offset,
             g->token_embedding->size,
             g->token_embedding->size,
@@ -3338,7 +3438,7 @@ static int map_global_tensors(k3_context *ctx,
         if (sizes[i] > max_tensor) max_tensor = sizes[i];
     }
     return map_spans(
-        g->shard, offsets, sizes, count, max_tensor, err, errcap);
+        shard, offsets, sizes, count, max_tensor, err, errcap);
 }
 
 static int matmul(ds4_gpu_tensor *out,
@@ -4190,7 +4290,9 @@ static int run_moe_ffn(k3_context *ctx,
             down_weights->offset >= source->bias &&
             down_weights->offset <= source_end &&
             down_weights->size <= source_end - down_weights->offset;
-        if (!experts_in_source) {
+        /* Expert cache identity must stay canonical while static layer
+         * mappings are created and retired at each execution boundary. */
+        if (ctx->model->gguf || !experts_in_source) {
             if (ctx->model->gguf) {
                 mapped_experts = (k3_weight_source){
                     .base = k3_st_map_base(ctx->globals.shard),
@@ -4673,15 +4775,24 @@ static int run_output(k3_context *ctx,
                       size_t errcap) {
     k3_scratch *s = &ctx->scratch;
     k3_global_weights *g = &ctx->globals;
+    const int streamed_output = ctx->model->gguf &&
+        !ctx->gguf_resident && !ctx->gguf_static_resident;
+    /* Reuse the now-idle final layer's descriptor for an output mapping that
+     * can be retired without invalidating the canonical expert-cache key. */
+    k3_st_shard *output_shard = streamed_output
+        ? ctx->layers[ctx->layer_end]->shard : g->shard;
+    ds4_gpu_tensor *last = NULL;
+    int ok = 0;
     if (!output_prefetch_join(output_prefetch, err, errcap) ||
         (!ctx->gguf_resident && !ds4_gpu_synchronize()) ||
-        !map_global_tensors(ctx, 0, err, errcap) ||
+        (streamed_output && !k3_st_map(output_shard, err, errcap)) ||
+        !map_global_tensors(ctx, output_shard, 0, err, errcap) ||
         !ds4_gpu_begin_commands()) {
         if (!err || !err[0]) set_error(err, errcap, "K3 output setup failed");
-        return 0;
+        goto done;
     }
-    const void *base = k3_st_map_base(g->shard);
-    const uint64_t size = k3_st_file_size(g->shard);
+    const void *base = k3_st_map_base(output_shard);
+    const uint64_t size = k3_st_file_size(output_shard);
     const k3_weight_source source = {
         .base = base,
         .size = size,
@@ -4713,9 +4824,9 @@ static int run_output(k3_context *ctx,
             K3_RMS_EPS,
             0.0f)) {
         set_error(err, errcap, "K3 final AttnRes failed");
-        return 0;
+        goto done;
     }
-    ds4_gpu_tensor *last = view_rows(
+    last = view_rows(
         s->final_hidden, rows - 1u, 1, K3_N_EMBD, sizeof(float));
     if (!last ||
         !rms_norm(s->final_norm, last, g->norm,
@@ -4726,12 +4837,21 @@ static int run_output(k3_context *ctx,
         !ds4_gpu_tensor_read(
             s->logits, 0, logits,
             (uint64_t)K3_N_VOCAB * sizeof(float))) {
-        ds4_gpu_tensor_free(last);
         set_error(err, errcap, "K3 output projection failed");
-        return 0;
+        goto done;
     }
+    ok = 1;
+done:
     ds4_gpu_tensor_free(last);
-    return 1;
+    if (streamed_output) {
+        if (!ds4_gpu_synchronize() || !ds4_gpu_release_model_views()) {
+            if (ok) set_error(err, errcap, "K3 output mapping release failed");
+            ok = 0;
+        } else {
+            k3_st_unmap(output_shard);
+        }
+    }
+    return ok;
 }
 
 static int import_boundary(k3_context *ctx,
@@ -4807,9 +4927,16 @@ static int evaluate(k3_context *ctx,
             return 0;
         }
     }
-    if (!finish_all_speculative_experts(ctx, err, errcap)) {
+    if (!finish_all_speculative_experts(ctx, err, errcap)) return 0;
+    /* The previous output head must not overlap the first two layers of the
+     * next token/chunk. This also clears views left by a failed output step. */
+    if (ctx->model->gguf && !ctx->gguf_resident &&
+        (!ds4_gpu_synchronize() || !ds4_gpu_release_model_views())) {
+        set_error(err, errcap, "K3 GGUF output-view release failed");
         return 0;
     }
+    if (!check_gguf_memory(ctx, "evaluation start", ctx->layer_start,
+                           err, errcap)) return 0;
 
     k3_layer_load *current_load = NULL;
     k3_static_load static_load = {0};
@@ -4926,6 +5053,16 @@ static int evaluate(k3_context *ctx,
     for (uint32_t i = ctx->layer_start; i <= ctx->layer_end; i++) {
         const double layer_start = profile ? now_seconds() : 0.0;
         k3_layer *layer = ctx->layers[i];
+        if (!check_gguf_memory(ctx, "layer boundary", i, err, errcap)) {
+            (void)ds4_gpu_synchronize();
+            static_load_cancel(&static_load);
+            k3_layer_load_cancel(current_load);
+            (void)finish_all_speculative_experts(ctx, NULL, 0);
+            output_prefetch_discard(&output_prefetch);
+            (void)ds4_gpu_release_model_views();
+            k3_st_unmap(layer->shard);
+            return 0;
+        }
         const int layer_resident =
             ctx->q8_static || ctx->resident_static_slots[i].data != NULL;
         if (ctx->model->gguf &&
@@ -5039,6 +5176,14 @@ static int evaluate(k3_context *ctx,
              (!ctx->model->gguf &&
               ctx->pinned_static && layer_resident && !ctx->q8_static &&
               next_layer_resident));
+        /* Static GGUF weights need a layer-local mapping. Unmapping the
+         * layer descriptor below must retire the actual pages Metal used. */
+        const int temporary_gguf_map = ctx->model->gguf &&
+            !ctx->gguf_resident && !ctx->gguf_static_layers[i];
+        const int have_layer_map = !temporary_gguf_map ||
+            k3_st_map(layer->shard, err, errcap);
+        const k3_st_shard *gguf_static_shard = temporary_gguf_map
+            ? layer->shard : ctx->globals.shard;
         const k3_weight_source source = ctx->gguf_resident
             ? (k3_weight_source){
                   .base = k3_st_map_base(ctx->globals.shard),
@@ -5057,8 +5202,8 @@ static int evaluate(k3_context *ctx,
               }
             : ctx->model->gguf
             ? (k3_weight_source){
-                  .base = k3_st_map_base(ctx->globals.shard),
-                  .size = k3_st_file_size(ctx->globals.shard),
+                  .base = k3_st_map_base(gguf_static_shard),
+                  .size = k3_st_file_size(gguf_static_shard),
                   .bias = 0,
               }
             : (k3_weight_source){
@@ -5066,7 +5211,9 @@ static int evaluate(k3_context *ctx,
                   .size = k3_st_file_size(layer->shard),
                   .bias = 0,
               };
-        const int mapped =
+        const int memory_ok = check_gguf_memory(ctx, "before layer execution",
+                                                i, err, errcap);
+        const int mapped = memory_ok && have_layer_map && (
             ctx->gguf_resident || pinned_decode
             ? 1
             : ctx->model->gguf
@@ -5084,7 +5231,7 @@ static int evaluate(k3_context *ctx,
                   map_size,
                   K3_LAYER_MAX_TENSOR_BYTES,
                   err,
-                  errcap);
+                  errcap));
         if (!mapped ||
             (!ds4_gpu_commands_active() && !ds4_gpu_begin_commands()) ||
             !run_layer(
@@ -5124,9 +5271,9 @@ static int evaluate(k3_context *ctx,
             return 0;
         }
         /*
-         * Each layer lives in a separate shard. Keeping all 93 mappings alive
-         * retains their faulted pages in this process even after Metal drops
-         * its no-copy views, so make the mapping lifetime layer-major too.
+         * SafeTensors layers have separate files; streamed GGUF layers use
+         * separate mappings of the same file. Retire the mapping Metal used
+         * after releasing its views, so visited layers cannot accumulate.
          */
         if (ctx->model->gguf || !use_static_slot) {
             k3_st_unmap(layer->shard);
@@ -5151,7 +5298,8 @@ static int evaluate(k3_context *ctx,
     }
     if (resident_readahead) owner->gguf_readahead_done = 1;
     const double output_start = profile ? now_seconds() : 0.0;
-    if (!require_no_layer_mappings(ctx, "output", err, errcap) ||
+    if (!check_gguf_memory(ctx, "before output", ctx->layer_end, err, errcap) ||
+        !require_no_layer_mappings(ctx, "output", err, errcap) ||
         (output_boundary &&
          !export_boundary(ctx, output_boundary, rows)) ||
         (output_logits &&
@@ -5336,6 +5484,39 @@ int k3_context_create(k3_context **out,
         k3_context_destroy(ctx);
         return 0;
     }
+    const uint64_t initial_tensors = ds4_gpu_tensor_allocated_bytes();
+    uint64_t gguf_budget = 0;
+    if (ctx->model->gguf) {
+        if (!gguf_memory_budget(initial_tensors, &gguf_budget, err, errcap)) {
+            k3_context_destroy(ctx);
+            return 0;
+        }
+        if (!gguf_transient_capacity(ctx, &ctx->gguf_transient_bytes)) {
+            set_error(err, errcap, "invalid K3 GGUF streaming memory spans");
+            k3_context_destroy(ctx);
+            return 0;
+        }
+        fprintf(stderr,
+                "k3: GGUF admission budget %.2f GiB before buffers, "
+                "transient peak %.2f GiB (host reserve %.2f GiB, "
+                "live reserve %.2f GiB)\n",
+                (double)gguf_budget / 1073741824.0,
+                (double)ctx->gguf_transient_bytes / 1073741824.0,
+                (double)resident_memory_reserve() / 1073741824.0,
+                (double)K3_GGUF_LIVE_RESERVE_BYTES / 1073741824.0);
+        if (gguf_budget <= ctx->gguf_transient_bytes) {
+            set_error(err, errcap,
+                      "K3 GGUF has %.2f GiB available but needs %.2f GiB "
+                      "for streamed weights before buffers/cache; "
+                      "close other applications",
+                      (double)gguf_budget / 1073741824.0,
+                      (double)ctx->gguf_transient_bytes / 1073741824.0);
+            k3_context_destroy(ctx);
+            return 0;
+        }
+        ctx->tensor_allocation_limit = initial_tensors +
+            gguf_budget - ctx->gguf_transient_bytes;
+    }
     const int want_q8_static =
         !ctx->model->gguf && q8_static_requested();
     if (!alloc_scratch(ctx, err, errcap) ||
@@ -5355,14 +5536,26 @@ int k3_context_create(k3_context **out,
     if (ctx->model->gguf && (!predict || strcmp(predict, "0") != 0)) {
         ctx->gguf_lookahead_experts = 4;
     }
-    const uint64_t resident_budget = want_q8_static
-        ? 0 : resident_static_budget(ds4_gpu_tensor_allocated_bytes());
+    const uint64_t allocated_tensors = ds4_gpu_tensor_allocated_bytes();
+    if (ctx->model->gguf) {
+        gguf_budget = k3_memory_remaining(gguf_budget,
+                                          allocated_tensors - initial_tensors);
+        uint64_t live_budget = 0;
+        if (!gguf_memory_budget(allocated_tensors, &live_budget, err, errcap)) {
+            k3_context_destroy(ctx);
+            return 0;
+        }
+        if (gguf_budget > live_budget) gguf_budget = live_budget;
+    }
+    uint64_t resident_budget = want_q8_static
+        ? 0 : resident_static_budget(allocated_tensors);
+    if (ctx->model->gguf && resident_budget > gguf_budget)
+        resident_budget = gguf_budget;
     if (!try_pin_resident_gguf(
             ctx, resident_budget, err, errcap)) {
         k3_context_destroy(ctx);
         return 0;
     }
-    uint64_t gguf_expert_cache_bytes = 0;
     if (ctx->model->gguf && !ctx->gguf_resident) {
         const k3_st_tensor *gate = ctx->layers[1]->expert_gate;
         const k3_st_tensor *down = ctx->layers[1]->expert_down;
@@ -5392,48 +5585,50 @@ int k3_context_create(k3_context **out,
         const uint32_t routed_layers =
             first_routed <= ctx->layer_end
                 ? ctx->layer_end - first_routed + 1u : 0u;
-        uint32_t cache_slots =
-            routed_layers * K3_N_EXPERT_USED;
-        /*
-         * Batched prefill may route to every expert in a layer. Keep enough
-         * reusable slabs for one complete layer so the selected-address path
-         * never falls back to faulting multi-GiB tensor views. Slabs are
-         * allocated lazily, and decode retains the larger per-layer top-k
-         * budget when this process owns enough layers.
-         */
-        if (routed_layers != 0 && cache_slots < K3_N_EXPERT) {
-            cache_slots = K3_N_EXPERT;
-        }
-        /* Static weights are reused at every step. Give the cache the space
-         * left after those weights, including with larger prefill scratch.
-         * Account for the page-aligned slab slots, not just tensor bytes. */
-        uint64_t offsets[K3_N_LAYER + 5], sizes[K3_N_LAYER + 5], static_bytes;
+        uint64_t offsets[K3_N_LAYER + 5], sizes[K3_N_LAYER + 5];
+        uint64_t static_bytes = 0, slot_bytes = 0;
         uint32_t spans;
-        const long page_value = sysconf(_SC_PAGESIZE);
-        if (routed_layers != 0 && page_value > 0 &&
-            getenv("K3_DISABLE_GGUF_STATIC_RESIDENCY") == NULL &&
-            gguf_resident_spans(ctx, 0, offsets, sizes, &spans, &static_bytes) &&
-            resident_budget > static_bytes) {
-            const uint64_t page = (uint64_t)page_value;
-            const uint64_t slot_bytes = (expert_bytes + page - 1u) & ~(page - 1u);
-            uint64_t slots = (resident_budget - static_bytes) / slot_bytes;
-            const uint64_t maximum = (uint64_t)routed_layers * K3_N_EXPERT;
-            if (slots > maximum) slots = maximum;
-            if (slots >= K3_N_EXPERT) cache_slots = (uint32_t)slots;
+        const long page = sysconf(_SC_PAGESIZE);
+        if (page <= 0 ||
+            !k3_memory_align(expert_bytes, (uint64_t)page, &slot_bytes) ||
+            !gguf_resident_spans(ctx, 0, offsets, sizes, &spans, &static_bytes)) {
+            set_error(err, errcap, "invalid K3 GGUF memory layout");
+            k3_context_destroy(ctx);
+            return 0;
         }
+        /* A batch can select at most rows * top-k distinct experts in a
+         * layer. Lookahead only advises disk reads; it needs no cache slots. */
+        uint32_t required_slots = ctx->max_prefill_tokens * K3_N_EXPERT_USED;
+        if (required_slots > K3_N_EXPERT) required_slots = K3_N_EXPERT;
+        if (!routed_layers) required_slots = 0;
+        k3_memory_plan plan;
+        if (!k3_plan_gguf_memory(gguf_budget, ctx->gguf_transient_bytes,
+                slot_bytes, required_slots, routed_layers * K3_N_EXPERT_USED,
+                routed_layers * K3_N_EXPERT, static_bytes,
+                config->expert_cache_bytes, config->expert_cache_slots, &plan)) {
+            set_error(err, errcap,
+                      "K3 GGUF memory/cache limit cannot fit %u expert slots "
+                      "(%.2f GiB) and %.2f GiB streaming reserve; "
+                      "reduce --prefill-chunk or --ctx, or close other applications",
+                      required_slots, (double)required_slots * slot_bytes / 1073741824.0,
+                      (double)ctx->gguf_transient_bytes / 1073741824.0);
+            k3_context_destroy(ctx);
+            return 0;
+        }
+        ctx->gguf_cache_bytes = plan.cache_bytes;
+        if (resident_budget > plan.static_bytes) resident_budget = plan.static_bytes;
         ds4_gpu_set_streaming_expert_cache_expert_bytes(expert_bytes);
-        ds4_gpu_set_streaming_expert_cache_budget(cache_slots);
-        gguf_expert_cache_bytes = (uint64_t)cache_slots * expert_bytes;
+        ds4_gpu_set_streaming_expert_cache_budget(plan.cache_slots);
         fprintf(stderr,
-                "k3: GGUF expert staging/cache enabled: %u slots "
-                "(at least one full routed layer), up to %.2f GiB\n",
-                cache_slots,
-                (double)cache_slots * (double)expert_bytes /
-                    1073741824.0);
+                "k3: bounded GGUF memory: %u expert slots (%.2f GiB), "
+                "%.2f GiB transient reserve, up to %.2f GiB resident static\n",
+                plan.cache_slots, (double)plan.cache_bytes / 1073741824.0,
+                (double)ctx->gguf_transient_bytes / 1073741824.0,
+                (double)resident_budget / 1073741824.0);
     } else {
         ds4_gpu_set_streaming_expert_cache_budget(0);
     }
-    try_pin_gguf_static(ctx, resident_budget, gguf_expert_cache_bytes);
+    try_pin_gguf_static(ctx, resident_budget);
     const uint64_t head_capacity =
         ctx->has_output ? resident_lm_head_capacity(ctx) : 0;
     const uint64_t all_layers_capacity =
@@ -5548,6 +5743,15 @@ int k3_context_create(k3_context **out,
         k3_context_destroy(ctx);
         return 0;
     }
+    if (ctx->model->gguf && !ctx->gguf_resident) {
+        /* Future session clones must not consume memory reserved for cache
+         * slabs that are still empty, or for mapped/prefetched weights. */
+        uint64_t spare = k3_memory_remaining(gguf_budget, ctx->gguf_cache_bytes);
+        spare = k3_memory_remaining(spare, ctx->gguf_transient_bytes);
+        spare = k3_memory_remaining(spare, ctx->resident_static_bytes);
+        spare = k3_memory_remaining(spare, ctx->resident_lm_head.capacity);
+        ctx->tensor_allocation_limit = ds4_gpu_tensor_allocated_bytes() + spare;
+    }
     *out = ctx;
     return 1;
 }
@@ -5613,7 +5817,16 @@ int k3_context_clone(k3_context **out,
         ctx->speculative_layer[bank] = UINT32_MAX;
     }
     pthread_mutex_lock(&owner->execution_mutex);
-    const int states_ok = alloc_states(ctx, err, errcap);
+    int budget_ok = 1;
+    ctx->tensor_allocation_limit = owner->tensor_allocation_limit;
+    if (ctx->model->gguf) {
+        const uint64_t allocated = ds4_gpu_tensor_allocated_bytes();
+        uint64_t available = 0;
+        budget_ok = gguf_memory_budget(allocated, &available, err, errcap);
+        if (ctx->tensor_allocation_limit > allocated + available)
+            ctx->tensor_allocation_limit = allocated + available;
+    }
+    const int states_ok = budget_ok && alloc_states(ctx, err, errcap);
     if (!states_ok) {
         free_states(ctx);
     }

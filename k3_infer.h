@@ -24,6 +24,9 @@ typedef struct {
     uint32_t layer_start;
     uint32_t layer_end;
     bool has_output;
+    /* Optional upper limits for GGUF expert caching; zero means automatic. */
+    uint64_t expert_cache_bytes;
+    uint32_t expert_cache_slots;
 } k3_context_config;
 
 int k3_context_create(k3_context **out,

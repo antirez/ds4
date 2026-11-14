@@ -4645,6 +4645,40 @@ void ds4_gpu_print_memory_report(const char *label) {
             ds4_gpu_mib(tensor_live_snap),
             ds4_gpu_mib(tensor_peak_snap));
     ds4_gpu_print_task_memory_report();
+    if (g_device &&
+        [g_device respondsToSelector:@selector(currentAllocatedSize)]) {
+        fprintf(stderr,
+                "ds4:   Metal resource allocation %.2f GiB "
+                "(currentAllocatedSize; not unique physical RAM)\n",
+                ds4_gpu_gib((uint64_t)[g_device currentAllocatedSize]));
+    }
+    uint64_t live_view_bytes = 0;
+    uint32_t live_view_count = 0;
+    for (uint32_t i = 0; i < g_model_view_count; i++) {
+        if (!g_model_views[i].buffer) continue;
+        const uint64_t bytes = (uint64_t)[g_model_views[i].buffer length];
+        live_view_bytes = bytes > UINT64_MAX - live_view_bytes
+            ? UINT64_MAX : live_view_bytes + bytes;
+        live_view_count++;
+    }
+    fprintf(stderr,
+            "ds4:   ordinary mmap views live %u buffers, %.2f GiB of spans "
+            "(not unique physical RAM)\n",
+            live_view_count, ds4_gpu_gib(live_view_bytes));
+    uint64_t allocated_slab_bytes = 0;
+    uint32_t allocated_slab_count = 0;
+    for (uint32_t i = 0; i < g_stream_expert_cache_slab_count; i++) {
+        if (!g_stream_expert_cache_slabs[i]) continue;
+        const uint64_t bytes =
+            (uint64_t)[g_stream_expert_cache_slabs[i] length];
+        allocated_slab_bytes = bytes > UINT64_MAX - allocated_slab_bytes
+            ? UINT64_MAX : allocated_slab_bytes + bytes;
+        allocated_slab_count++;
+    }
+    fprintf(stderr,
+            "ds4:   streaming expert slabs allocated %u buffers, %.2f GiB "
+            "including unused slots\n",
+            allocated_slab_count, ds4_gpu_gib(allocated_slab_bytes));
     fprintf(stderr,
             "ds4:   mmap model wrapper creations %llu buffers %.2f GiB cumulative, %.2f GiB max (not copied)\n",
             (unsigned long long)g_model_wrap_count,
@@ -4956,6 +4990,13 @@ uint64_t ds4_gpu_tensor_allocated_bytes(void) {
     bytes = g_tensor_alloc_live_bytes;
     pthread_mutex_unlock(&g_tensor_mu);
     return bytes;
+}
+
+uint64_t k3_gpu_streaming_cache_locked_bytes(void) {
+    /* Both slab slots and individual expert buffers update this counter only
+     * after successful mlock/munlock. Free slots retained in a slab stay locked
+     * and reusable, so logical cache-entry counts would undercount them. */
+    return g_stream_expert_cache_mlock_bytes;
 }
 
 static int ds4_gpu_model_map_log_enabled(void) {
@@ -17976,7 +18017,8 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         uint32_t      *unique_out,
         id<MTLBuffer> *overflow_gate,
         id<MTLBuffer> *overflow_up,
-        id<MTLBuffer> *overflow_down) {
+        id<MTLBuffer> *overflow_down,
+        bool          allow_overflow_views) {
     if (overflow_gate) *overflow_gate = nil;
     if (overflow_up) *overflow_up = nil;
     if (overflow_down) *overflow_down = nil;
@@ -18052,6 +18094,16 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         ds4_gpu_stream_expert_cache_note_frequency_hotness(layer,
                                                            frequency,
                                                            n_total_expert);
+    }
+    if (ok && !allow_overflow_views &&
+        unique_count > ds4_gpu_stream_expert_cache_configured_budget()) {
+        fprintf(stderr,
+                "ds4: K3 streaming prefill needs %u simultaneous expert slots "
+                "at layer %u, but only %u are available; reduce --prefill-chunk\n",
+                unique_count, layer,
+                ds4_gpu_stream_expert_cache_configured_budget());
+        free(ids);
+        return 0;
     }
     /*
      * When the layer's unique selected set does not fit the cache budget, the
@@ -18395,6 +18447,13 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
             ds4_gpu_stream_expert_cache_entry *entry = unique_entries[u];
             const uint32_t expert = (uint32_t)unique_ids[u];
             if (!entry) {
+                if (!allow_overflow_views) {
+                    fprintf(stderr,
+                            "ds4: K3 streaming expert cache exhausted at layer %u; "
+                            "refusing whole-tensor mapped fallback\n", layer);
+                    ok = 0;
+                    break;
+                }
                 const uint64_t gate_rel = unique_gate_offsets[u] - gate_offset;
                 const uint64_t down_rel = unique_down_offsets[u] - down_offset;
                 if (!*overflow_gate) {
@@ -40481,7 +40540,8 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
                         &stream_unique,
                         &stream_overflow_gate,
                         &stream_overflow_up,
-                        &stream_overflow_down)) {
+                        &stream_overflow_down,
+                        true)) {
                 return 0;
             }
             if (stream_unique == 0) {
@@ -41176,7 +41236,8 @@ static int ds4_gpu_routed_moe_one_tensor_impl(
         uint32_t                activation_kind,
         float                   activation_beta,
         float                   activation_linear_beta,
-        const int32_t          *ready_ids) {
+        const int32_t          *ready_ids,
+        bool                    require_stream_cache) {
     BOOL parallel_ffn_scope
         __attribute__((cleanup(ds4_gpu_parallel_ffn_scope_cleanup))) =
             g_parallel_q8_pending;
@@ -41855,6 +41916,16 @@ static int ds4_gpu_routed_moe_one_tensor_impl(
         const bool use_selected_slots =
             use_q4_selected_slots || use_iq2_selected_slots ||
             use_mxfp4_selected_slots || use_iq2_stream_addr_table;
+        if (require_stream_cache &&
+            (!use_iq2_selected_slots ||
+             ds4_gpu_stream_expert_cache_configured_budget() < n_expert ||
+             ds4_gpu_stream_full_expert_addr_table_requested())) {
+            fprintf(stderr,
+                    "ds4: K3 streaming decode requires the selected-expert "
+                    "cache path and at least %u available slots; "
+                    "refusing mapped expert fallback\n", n_expert);
+            return 0;
+        }
         id<MTLComputePipelineState> slots_pair_swiglu_pipeline =
             use_iq2_selected_slots ? g_moe_mul_mv_slots6_iq2_xxs_pair_swiglu_pipeline :
             (use_mxfp4_selected_slots ? g_moe_mul_mv_slots6_mxfp4_pair_swiglu_pipeline :
@@ -42205,6 +42276,12 @@ static int ds4_gpu_routed_moe_one_tensor_impl(
                 ds4_gpu_stream_expert_cache_effective_cap(layer_index,
                                                           n_total_expert,
                                                           n_expert) != 0;
+            if (require_stream_cache && !use_stream_expert_cache) {
+                fprintf(stderr,
+                        "ds4: K3 streaming decode expert cache is unavailable; "
+                        "refusing mapped expert fallback\n");
+                return 0;
+            }
             if (use_iq2_stream_addr_table && !use_stream_expert_cache) {
                 fprintf(stderr,
                         "ds4: Metal IQ2/IQ2 streaming decode requires a non-empty expert cache\n");
@@ -43893,7 +43970,7 @@ int ds4_gpu_routed_moe_one_tensor(
         expert_in_dim, expert_mid_dim, out_dim,
         selected, weights, n_total_expert, n_expert, clamp,
         x, add_in, layer_index, force_resident,
-        0u, 0.0f, 0.0f, NULL);
+        0u, 0.0f, 0.0f, NULL, false);
 }
 
 int ds4_gpu_k3_routed_moe_one_tensor(
@@ -43931,7 +44008,7 @@ int ds4_gpu_k3_routed_moe_one_tensor(
         expert_in_dim, expert_mid_dim, out_dim,
         selected, weights, n_total_expert, n_expert, 0.0f,
         x, NULL, layer_index, force_resident,
-        1u, 4.0f, 25.0f, ready_ids);
+        1u, 4.0f, 25.0f, ready_ids, !force_resident);
 }
 
 static int ds4_gpu_routed_moe_batch_tensor_impl(
@@ -43966,7 +44043,8 @@ static int ds4_gpu_routed_moe_batch_tensor_impl(
         bool                    force_resident,
         uint32_t                activation_kind,
         float                   activation_beta,
-        float                   activation_linear_beta) {
+        float                   activation_linear_beta,
+        bool                    require_stream_cache) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     /* TP sharding (see ds4_gpu_routed_moe_one_tensor): bind from the owned
      * expert range and rebase ids in the kernels. */
@@ -44126,7 +44204,8 @@ static int ds4_gpu_routed_moe_batch_tensor_impl(
                                              force_resident,
                                              activation_kind,
                                              activation_beta,
-                                             activation_linear_beta, NULL);
+                                             activation_linear_beta, NULL,
+                                             require_stream_cache);
     }
 
     @autoreleasepool {
@@ -44229,6 +44308,13 @@ static int ds4_gpu_routed_moe_batch_tensor_impl(
             getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") == NULL &&
             getenv("DS4_METAL_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR") == NULL;
         const bool use_cached_batch = use_iq2_batch_selected_addr || use_iq2_cached_batch;
+        if (require_stream_cache && !use_iq2_batch_selected_addr) {
+            fprintf(stderr,
+                    "ds4: K3 streaming prefill requires the selected-expert "
+                    "cache path for %u tokens; reduce --prefill-chunk or "
+                    "remove incompatible Metal path overrides\n", n_tokens);
+            return 0;
+        }
 
         ds4_gpu_mul_mv_id_args gate_args =
             ds4_gpu_make_mul_mv_id_args(expert_in_dim, expert_mid_dim, n_total_expert,
@@ -44691,7 +44777,8 @@ static int ds4_gpu_routed_moe_batch_tensor_impl(
                         &stream_unique,
                         &stream_overflow_gate,
                         &stream_overflow_up,
-                        &stream_overflow_down)) {
+                        &stream_overflow_down,
+                        !require_stream_cache)) {
                 g_stream_prefill_batch_selected_addr_building--;
                 return 0;
             }
@@ -45513,7 +45600,7 @@ int ds4_gpu_routed_moe_batch_tensor(
         expert_in_dim, expert_mid_dim, out_dim,
         selected, weights, n_total_expert, n_expert, clamp,
         x, layer_index, n_tokens, mid_is_f16, force_resident,
-        0u, 0.0f, 0.0f);
+        0u, 0.0f, 0.0f, false);
 }
 
 int ds4_gpu_k3_routed_moe_batch_tensor(
@@ -45552,7 +45639,7 @@ int ds4_gpu_k3_routed_moe_batch_tensor(
         expert_in_dim, expert_mid_dim, out_dim,
         selected, weights, n_total_expert, n_expert, 0.0f,
         x, layer_index, n_tokens, &mid_is_f16, force_resident,
-        1u, 4.0f, 25.0f);
+        1u, 4.0f, 25.0f, !force_resident);
 }
 
 int ds4_gpu_hc_split_sinkhorn_tensor(
