@@ -1,5 +1,5 @@
-/* Compare batched BF16 projections with the unchanged single-token kernel.
- * Anonymous synthetic weights keep the mapping below 3 MiB; no model is used. */
+/* Compare batched BF16 projections with independent single-token calls.
+ * Anonymous synthetic weights keep the mapping below 12 MiB; no model is used. */
 #define _POSIX_C_SOURCE 200809L
 #define _DARWIN_C_SOURCE
 
@@ -62,7 +62,7 @@ static int test_shape(uint32_t in_dim, uint32_t out_dim) {
     const uint64_t weight_offset = (uint64_t)page + 128u;
     mapping_size = (weight_offset + weight_size + GUARD + (uint64_t)page - 1u)
         / (uint64_t)page * (uint64_t)page;
-    CHECK(mapping_size < UINT64_C(3) * 1024u * 1024u);
+    CHECK(mapping_size < UINT64_C(12) * 1024u * 1024u);
     mapping = mmap(NULL, (size_t)mapping_size, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANON, -1, 0);
     CHECK(mapping != MAP_FAILED);
@@ -183,14 +183,20 @@ cleanup:
 #undef CHECK
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    const bool resident = argc == 2 && strcmp(argv[1], "--resident") == 0;
+    if (argc > 2 || (argc == 2 && !resident)) {
+        fprintf(stderr, "usage: %s [--resident]\n", argv[0]);
+        return 2;
+    }
     /* Fix the dispatch configuration so an inherited tuning override cannot
      * silently bypass the candidate on supported hardware. */
     if (setenv("K3_BF16_MV_UNROLL", "16", 1) ||
         setenv("K3_BF16_MV_NSG", "4", 1)) return 1;
-    ds4_gpu_set_ssd_streaming(true);
+    ds4_gpu_set_ssd_streaming(!resident);
     if (!ds4_gpu_init()) return 1;
     const int ok = test_shape(1024, 1024) && test_shape(1025, 1031) &&
+                   test_shape(1024, 4096) && test_shape(1025, 4097) &&
                    test_shape(128, 17) && test_shape(128, 1031) &&
                    test_shape(1024, 96);
     ds4_gpu_cleanup();

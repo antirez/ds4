@@ -297,15 +297,12 @@ kernel void kernel_k3_mul_mv_bf16_f32_unroll16(
  * lane-local FMA sequence or its final SIMD reduction. Four-load unrolling
  * leaves room for the independent accumulators and their input values. */
 template <ushort rows_per_group>
-kernel void kernel_k3_mul_mv_bf16_f32_rows(
+inline void k3_mul_mv_bf16_f32_rows_body(
         constant k3_matmul_args &args,
         device const ushort     *weights,
         device const float      *x,
         device float            *out,
-        uint2 tgpig [[threadgroup_position_in_grid]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]],
-        ushort nsg [[simdgroups_per_threadgroup]]) {
+        uint2 tgpig, ushort lane, ushort sg, ushort nsg) {
     const uint out_row = tgpig.x * (uint)nsg + sg;
     const uint token = tgpig.y * rows_per_group;
     if (out_row >= args.out_dim || token >= args.n_rows) return;
@@ -355,9 +352,51 @@ kernel void kernel_k3_mul_mv_bf16_f32_rows(
     }
 }
 
+template <ushort rows_per_group>
+kernel void kernel_k3_mul_mv_bf16_f32_rows(
+        constant k3_matmul_args &args,
+        device const ushort *weights, device const float *x, device float *out,
+        uint2 tgpig [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]],
+        ushort nsg [[simdgroups_per_threadgroup]]) {
+    k3_mul_mv_bf16_f32_rows_body<rows_per_group>(
+        args, weights, x, out, tgpig, lane, sg, nsg);
+}
+
 typedef decltype(kernel_k3_mul_mv_bf16_f32_rows<4>) k3_mul_mv_bf16_rows_t;
 template [[host_name("kernel_k3_mul_mv_bf16_f32_rows4")]]
 kernel k3_mul_mv_bf16_rows_t kernel_k3_mul_mv_bf16_f32_rows<4>;
+template [[host_name("kernel_k3_mul_mv_bf16_f32_rows8")]]
+kernel k3_mul_mv_bf16_rows_t kernel_k3_mul_mv_bf16_f32_rows<8>;
+
+/* Reuse the same FP32 arithmetic for four independent QKVG projections. */
+template <ushort rows_per_group>
+kernel void kernel_k3_mul_mv4_bf16_f32_rows(
+        constant k3_matmul_args &args,
+        device const ushort *weights0, device const ushort *weights1,
+        device const ushort *weights2, device const ushort *weights3,
+        device const float *x,
+        device float *out0, device float *out1,
+        device float *out2, device float *out3,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]],
+        ushort nsg [[simdgroups_per_threadgroup]]) {
+    const uint matrix = tgpig.z;
+    if (matrix >= 4u) return;
+    device const ushort *weights = matrix == 0u ? weights0 :
+        (matrix == 1u ? weights1 : (matrix == 2u ? weights2 : weights3));
+    device float *out = matrix == 0u ? out0 :
+        (matrix == 1u ? out1 : (matrix == 2u ? out2 : out3));
+    k3_mul_mv_bf16_f32_rows_body<rows_per_group>(
+        args, weights, x, out, tgpig.xy, lane, sg, nsg);
+}
+typedef decltype(kernel_k3_mul_mv4_bf16_f32_rows<4>) k3_mul_mv4_bf16_rows_t;
+template [[host_name("kernel_k3_mul_mv4_bf16_f32_rows4")]]
+kernel k3_mul_mv4_bf16_rows_t kernel_k3_mul_mv4_bf16_f32_rows<4>;
+template [[host_name("kernel_k3_mul_mv4_bf16_f32_rows8")]]
+kernel k3_mul_mv4_bf16_rows_t kernel_k3_mul_mv4_bf16_f32_rows<8>;
 
 /*
  * KDA's Q/K/V/output-gate projections share input and shape. A third grid

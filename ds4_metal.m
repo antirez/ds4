@@ -51909,14 +51909,20 @@ int k3_gpu_matmul_bf16(
         if (!cb) return 0;
 
         if (n_rows <= 8u) {
-            /* Reusing weights across tokens shrinks the grid. Short dot
-             * products and small output grids do better on the original path. */
-            const uint32_t rows_per_group =
-                n_rows >= 4u && g_k3_bf16_mv_unroll == 16 &&
-                in_dim >= 1024u &&
-                out_dim >= 256u * (uint32_t)g_k3_bf16_mv_nsg &&
+            /* Reusing weights across tokens shrinks the grid. Eight-token
+             * reuse needs more output groups to keep enough parallel work. */
+            const bool m1_default = g_k3_bf16_mv_unroll == 16 &&
                 ds4_gpu_device_is_pre_m5_apple_silicon() &&
-                ds4_gpu_device_name_contains("Apple M1") ? 4u : 1u;
+                ds4_gpu_device_name_contains("Apple M1");
+            const bool large_shape = in_dim >= 1024u &&
+                out_dim >= 256u * (uint32_t)g_k3_bf16_mv_nsg;
+            const bool wide_grid =
+                out_dim >= 1024u * (uint32_t)g_k3_bf16_mv_nsg;
+            /* Long dot products favor the smaller four-token working set. */
+            const uint32_t rows_per_group =
+                n_rows >= 4u && m1_default && large_shape
+                    ? (n_rows == 8u && wide_grid && in_dim < 16384u
+                           ? 8u : 4u) : 1u;
             const char *kernel =
                 g_k3_bf16_mv_unroll == 16
                     ? "kernel_k3_mul_mv_bf16_f32_unroll16"
@@ -51925,8 +51931,14 @@ int k3_gpu_matmul_bf16(
                         : (g_k3_bf16_mv_unroll == 4
                             ? "kernel_k3_mul_mv_bf16_f32_unroll4"
                             : "kernel_k3_mul_mv_bf16_f32"));
-            if (rows_per_group == 4u) {
+            if (rows_per_group == 8u) {
+                kernel = "kernel_k3_mul_mv_bf16_f32_rows8";
+            } else if (rows_per_group == 4u) {
                 kernel = "kernel_k3_mul_mv_bf16_f32_rows4";
+            } else if (n_rows == 1u && m1_default && large_shape && wide_grid) {
+                /* A shorter load window reduces register pressure for a
+                 * single token; retain the original path for small grids. */
+                kernel = "kernel_k3_mul_mv_bf16_f32_unroll8";
             }
             id<MTLComputePipelineState> pipeline =
                 ds4_gpu_get_pipeline(kernel);
@@ -52034,11 +52046,24 @@ int k3_gpu_matmul4_bf16(
                 "fused BF16 matrix");
             if (!weights[i]) return 0;
         }
-        id<MTLComputePipelineState> pipeline =
-            ds4_gpu_get_pipeline(
-                g_k3_bf16_mv_unroll == 16
-                    ? "kernel_k3_mul_mv4_bf16_f32_unroll16"
-                    : "kernel_k3_mul_mv4_bf16_f32_unroll8");
+        /* Keep fused projections on the same M1 shape policy as the
+         * individual BF16 wrapper, including the long-dot fallback. */
+        const bool m1_default = g_k3_bf16_mv_unroll == 16 &&
+            ds4_gpu_device_is_pre_m5_apple_silicon() &&
+            ds4_gpu_device_name_contains("Apple M1");
+        const bool large_shape = in_dim >= 1024u &&
+            out_dim >= 256u * (uint32_t)g_k3_bf16_mv_nsg;
+        const bool wide_grid = out_dim >= 1024u * (uint32_t)g_k3_bf16_mv_nsg;
+        const uint32_t rows_per_group = n_rows >= 4u && m1_default && large_shape
+            ? (n_rows == 8u && wide_grid && in_dim < 16384u ? 8u : 4u) : 1u;
+        const char *kernel = rows_per_group == 8u
+            ? "kernel_k3_mul_mv4_bf16_f32_rows8"
+            : rows_per_group == 4u ? "kernel_k3_mul_mv4_bf16_f32_rows4"
+            : (g_k3_bf16_mv_unroll == 8 ||
+               (n_rows == 1u && m1_default && large_shape && wide_grid))
+                ? "kernel_k3_mul_mv4_bf16_f32_unroll8"
+                : "kernel_k3_mul_mv4_bf16_f32_unroll16";
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(kernel);
         if (!pipeline) return 0;
 
         k3_gpu_matmul_args args = {
@@ -52068,7 +52093,7 @@ int k3_gpu_matmul4_bf16(
                 ((NSUInteger)out_dim +
                  (NSUInteger)g_k3_bf16_mv_nsg - 1u) /
                     (NSUInteger)g_k3_bf16_mv_nsg,
-                n_rows,
+                (n_rows + rows_per_group - 1u) / rows_per_group,
                 4u)
             threadsPerThreadgroup:MTLSizeMake(
                 32u * (NSUInteger)g_k3_bf16_mv_nsg, 1, 1)];
