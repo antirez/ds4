@@ -42,6 +42,7 @@
 #include <unistd.h>
 
 #include "ds4.h"
+#include "k3_streaming.h"
 #include "ds4_tool_text.h"
 #include "ds4_distributed.h"
 #include "ds4_image.h"
@@ -72267,10 +72268,18 @@ static int ds4_engine_open_k3(ds4_engine *e,
             return 0;
         }
     }
+    struct stat k3_path_stat;
+    const bool is_gguf = stat(opt->model_path, &k3_path_stat) == 0 &&
+        S_ISREG(k3_path_stat.st_mode);
+    const bool optimized_ssd = k3_ssd_defaults_enabled(
+        opt->ssd_streaming, is_gguf, getenv("K3_SSD_STREAMING_DEFAULTS"));
     const uint32_t requested_prefill =
-        opt->prefill_chunk ? opt->prefill_chunk : 512u;
+        k3_ssd_prefill_chunk(opt->prefill_chunk, optimized_ssd);
+    /* Preserve an unspecified target until the K3 context has measured live
+     * memory and charged its tensors, staging buffers and cache workspace. */
+    const uint64_t expert_cache_bytes = opt->ssd_streaming_cache_bytes;
     const uint32_t initial_context =
-        opt->context_size > 0 ? (uint32_t)opt->context_size : requested_prefill;
+        k3_ssd_initial_context(opt->context_size, opt->prefill_chunk);
     e->is_k3 = true;
     if (pthread_mutex_init(&e->k3_lifecycle_mutex, NULL) != 0) {
         fprintf(stderr, "ds4: could not initialize Kimi K3 engine locks\n");
@@ -72282,10 +72291,9 @@ static int ds4_engine_open_k3(ds4_engine *e,
         return 0;
     }
     e->k3_tokenizer_mutex_ready = true;
-    struct stat k3_path_stat;
-    e->k3_gguf =
-        stat(opt->model_path, &k3_path_stat) == 0 &&
-        S_ISREG(k3_path_stat.st_mode);
+    e->k3_gguf = is_gguf;
+    e->ssd_streaming_cache_bytes = expert_cache_bytes;
+    e->ssd_streaming_cache_experts = opt->ssd_streaming_cache_experts;
     e->k3_layer_start = layer_start;
     e->k3_layer_end = layer_end;
     e->k3_has_output = has_output;
@@ -72331,6 +72339,9 @@ static int ds4_engine_open_k3(ds4_engine *e,
             .layer_start = layer_start,
             .layer_end = layer_end,
             .has_output = has_output,
+            .expert_cache_bytes = expert_cache_bytes,
+            .expert_cache_slots = opt->ssd_streaming_cache_experts,
+            .optimized_ssd_streaming = optimized_ssd,
         };
         if (!k3_context_create(
                 &e->k3_primary, &config, err, sizeof(err))) {
@@ -72338,6 +72349,8 @@ static int ds4_engine_open_k3(ds4_engine *e,
                     err[0] ? err : "open failed");
             return 0;
         }
+        e->ssd_streaming_cache_bytes =
+            k3_context_expert_cache_bytes(e->k3_primary);
         e->metal_ready = true;
     }
     const char *k3_format = e->k3_gguf ? "GGUF" : "SafeTensors";

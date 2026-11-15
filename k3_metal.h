@@ -9,6 +9,10 @@
 extern "C" {
 #endif
 
+/* Guaranteed resident expert-cache bytes, including individual-buffer
+ * fallback. Read only between completed cache loads under K3's execution lock. */
+uint64_t k3_gpu_streaming_cache_locked_bytes(void);
+
 /*
  * Kimi K3 checkpoint-native Metal operations. Model tensor offsets are
  * absolute offsets in the mmaped SafeTensors shard.

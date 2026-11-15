@@ -32,8 +32,23 @@ K3_MODEL ?= models/Kimi-K3.1-Pro
 K3_DETECT_OBJS = k3_safetensors.o
 
 ifeq ($(UNAME_S),Darwin)
-METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal -licucore
-K3_OBJS = k3_infer.o k3_model.o k3_safetensors.o k3_tokenizer.o
+# The lossless static-cache module supplies stubs when libzstd is unavailable.
+# Force K3_STATIC_CACHE_ZSTD=0 to build without this optional feature.
+K3_STATIC_CACHE_ZSTD ?= $(shell pkg-config --exists libzstd 2>/dev/null && echo 1 || echo 0)
+ifeq ($(K3_STATIC_CACHE_ZSTD),1)
+K3_STATIC_CACHE_CFLAGS := -DK3_STATIC_CACHE_ZSTD $(shell pkg-config --cflags libzstd)
+K3_STATIC_CACHE_LIBS := $(shell pkg-config --libs libzstd)
+K3_STATIC_CACHE_OBJ := k3_static_cache.zstd.o
+else
+K3_STATIC_CACHE_OBJ := k3_static_cache.stub.o
+endif
+# A variant switch must relink even when make only sees second-resolution
+# timestamps and both builds finish in the same second.
+ifneq ($(shell cat k3_static_cache.config 2>/dev/null),$(K3_STATIC_CACHE_OBJ))
+.PHONY: $(K3_STATIC_CACHE_OBJ) tests/test_k3_static_cache
+endif
+METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal -licucore $(K3_STATIC_CACHE_LIBS)
+K3_OBJS = k3_infer.o $(K3_STATIC_CACHE_OBJ) k3_model.o k3_safetensors.o k3_tokenizer.o
 CORE_OBJS = ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_metal.o ds4_layer_pack.o ds4_engram.o $(K3_OBJS)
 CPU_CORE_OBJS = ds4_cpu.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o $(K3_DETECT_OBJS)
 else
@@ -85,12 +100,18 @@ ifeq ($(UNAME_S),Darwin)
 
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
 
-.PHONY: test-k3 test-k3-gguf test-k3-gguf-source
+.PHONY: test-k3 test-k3-memory test-k3-streaming test-k3-streaming-slab test-k3-static-staging test-k3-stream-mapping test-k3-bf16-rows test-k3-bf16-fused test-k3-mla-prefill test-k3-kda-prefill test-k3-gguf test-k3-gguf-source
 
 help:
 	@echo "DS4 build targets:"
 	@echo "  make              Build Metal ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
 	@echo "  make test-k3      Run K3 unit tests and the downloaded checkpoint smoke test"
+	@echo "  make test-k3-memory Run memory-budget tests without Metal or model weights"
+	@echo "  make test-k3-streaming Run K3 automatic SSD configuration tests without Metal or weights"
+	@echo "  make test-k3-static-staging Run static-loader byte/lock fixtures without GPU execution"
+	@echo "  make k3-static-cache-build Build the optional lossless GGUF static-cache creator"
+	@echo "  make test-k3-static-cache Run lossless-cache CPU format and decoder fixtures"
+	@echo "  make test-k3-stream-mapping Run a tiny synthetic Metal mapping-lifetime test"
 	@echo "  make test-k3-gguf Run K3 mixed-Q2 GGUF parser and Metal smoke tests"
 	@echo "  make test-k3-gguf-source Byte-compare every retained K3 GGUF tensor with SafeTensors"
 	@echo "  make cpu          Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
@@ -143,6 +164,30 @@ tests/test_metal_tp_cancel: tests/test_metal_tp_cancel.c ds4.h ds4_tp.h $(CORE_O
 test-metal-session-batch: tests/test_metal_session_batch
 	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" ./tests/test_metal_session_batch
 
+tests/test_k3_memory: tests/test_k3_memory.c k3_memory.h
+	$(CC) $(CFLAGS) -I. -o $@ $<
+
+test-k3-memory: tests/test_k3_memory
+	./tests/test_k3_memory
+
+tests/test_k3_streaming: tests/test_k3_streaming.c k3_streaming.h k3_memory.h
+	$(CC) $(QUALITY_CFLAGS) -I. -o $@ $<
+
+test-k3-streaming: tests/test_k3_streaming
+	./tests/test_k3_streaming
+
+tests/test_k3_streaming_slab: tests/test_k3_streaming_slab.c k3_streaming_slab.h
+	$(CC) $(QUALITY_CFLAGS) -I. -o $@ $<
+
+test-k3-streaming-slab: tests/test_k3_streaming_slab
+	./tests/test_k3_streaming_slab
+
+tests/test_k3_stream_mapping: tests/test_k3_stream_mapping.c k3_safetensors.o ds4_metal.o ds4_image.o gguf-tools/quants.c
+	$(CC) $(CFLAGS) -I. -o $@ $^ $(METAL_LDLIBS)
+
+test-k3-stream-mapping: tests/test_k3_stream_mapping
+	./tests/test_k3_stream_mapping
+
 tests/test_k3_safetensors: tests/test_k3_safetensors.o k3_safetensors.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
@@ -155,6 +200,69 @@ tests/test_k3_metal.o: tests/test_k3_metal.c k3_metal.h ds4_gpu.h gguf-tools/qua
 tests/test_k3_metal: tests/test_k3_metal.o ds4_metal.o ds4_image.o gguf-tools/quants.c
 	$(CC) $(CFLAGS) -o $@ tests/test_k3_metal.o ds4_metal.o \
 		ds4_image.o gguf-tools/quants.c $(METAL_LDLIBS)
+
+tests/test_k3_bf16_rows.o: tests/test_k3_bf16_rows.c k3_metal.h ds4_gpu.h
+	$(CC) $(QUALITY_CFLAGS) -I. -c -o $@ $<
+
+tests/test_k3_bf16_rows: tests/test_k3_bf16_rows.o ds4_metal.o ds4_image.o gguf-tools/quants.c
+	$(CC) $(QUALITY_CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+test-k3-bf16-rows: tests/test_k3_bf16_rows
+	./tests/test_k3_bf16_rows --resident
+	./tests/test_k3_bf16_rows
+
+tests/test_k3_bf16_fused.o: tests/test_k3_bf16_fused.c k3_metal.h ds4_gpu.h
+	$(CC) $(QUALITY_CFLAGS) -I. -c -o $@ $<
+
+tests/test_k3_bf16_fused: tests/test_k3_bf16_fused.o ds4_metal.o ds4_image.o gguf-tools/quants.c
+	$(CC) $(QUALITY_CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+test-k3-bf16-fused: tests/test_k3_bf16_fused
+	./tests/test_k3_bf16_fused --resident
+	./tests/test_k3_bf16_fused
+
+# This fixture includes the internal loader, so do not also link k3_infer.o.
+tests/test_k3_static_staging.o: tests/test_k3_static_staging.c k3_infer.c k3_infer.h k3_memory.h k3_streaming.h k3_static_cache.h k3_model.h k3_safetensors.h k3_metal.h ds4_gpu.h
+	$(CC) $(QUALITY_CFLAGS) -I. -c -o $@ $<
+
+tests/test_k3_static_staging: tests/test_k3_static_staging.o $(K3_STATIC_CACHE_OBJ) k3_model.o k3_safetensors.o ds4_metal.o ds4_image.o
+	$(CC) $(QUALITY_CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+test-k3-static-staging: tests/test_k3_static_staging
+	./tests/test_k3_static_staging
+
+# CPU-only sidecar creation and format/decoder fixtures; neither uses Metal.
+.PHONY: test-k3-static-cache
+k3-static-cache-build: k3_static_cache_build.c k3_static_cache.h k3_static_cache_format.h $(K3_STATIC_CACHE_OBJ) k3_model.o k3_safetensors.o
+	$(CC) $(QUALITY_CFLAGS) -I. -o $@ k3_static_cache_build.c $(K3_STATIC_CACHE_OBJ) k3_model.o k3_safetensors.o $(LDLIBS) $(K3_STATIC_CACHE_LIBS)
+
+# The fixture includes the module to exercise private corruption hooks.
+# Do not also link the module object.
+tests/test_k3_static_cache: tests/test_k3_static_cache.c k3_static_cache.c k3_static_cache.h k3_static_cache_format.h k3_static_cache.config
+	$(CC) $(QUALITY_CFLAGS) $(K3_STATIC_CACHE_CFLAGS) -I. -o $@ tests/test_k3_static_cache.c $(LDLIBS) $(K3_STATIC_CACHE_LIBS)
+
+test-k3-static-cache: tests/test_k3_static_cache
+	./tests/test_k3_static_cache
+
+tests/test_k3_mla_prefill.o: tests/test_k3_mla_prefill.c k3_metal.h ds4_gpu.h
+	$(CC) $(QUALITY_CFLAGS) -I. -c -o $@ $<
+
+tests/test_k3_mla_prefill: tests/test_k3_mla_prefill.o ds4_metal.o ds4_image.o gguf-tools/quants.c
+	$(CC) $(QUALITY_CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+test-k3-mla-prefill: tests/test_k3_mla_prefill
+	./tests/test_k3_mla_prefill --resident
+	./tests/test_k3_mla_prefill
+
+tests/test_k3_kda_prefill.o: tests/test_k3_kda_prefill.c k3_metal.h ds4_gpu.h
+	$(CC) $(QUALITY_CFLAGS) -I. -c -o $@ $<
+
+tests/test_k3_kda_prefill: tests/test_k3_kda_prefill.o ds4_metal.o ds4_image.o gguf-tools/quants.c
+	$(CC) $(QUALITY_CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+test-k3-kda-prefill: tests/test_k3_kda_prefill
+	./tests/test_k3_kda_prefill --resident
+	./tests/test_k3_kda_prefill
 
 tests/test_k3_tokenizer.o: tests/test_k3_tokenizer.c k3_tokenizer.h
 	$(CC) $(CFLAGS) -I. -c -o $@ tests/test_k3_tokenizer.c
@@ -183,7 +291,7 @@ tests/test_k3_gguf_metal_map: tests/test_k3_gguf_metal_map.o k3_model.o k3_safet
 tests/test_k3_gguf_slice.o: tests/test_k3_gguf_slice.c k3_infer.h k3_model.h
 	$(CC) $(CFLAGS) -I. -c -o $@ tests/test_k3_gguf_slice.c
 
-tests/test_k3_gguf_slice: tests/test_k3_gguf_slice.o k3_infer.o k3_model.o k3_safetensors.o ds4_metal.o ds4_image.o
+tests/test_k3_gguf_slice: tests/test_k3_gguf_slice.o k3_infer.o $(K3_STATIC_CACHE_OBJ) k3_model.o k3_safetensors.o ds4_metal.o ds4_image.o
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
 tests/test_k3_stream: tests/test_k3_stream.c $(CORE_OBJS)
@@ -212,10 +320,21 @@ test-k3-gguf: ds4 tests/test_k3_gguf tests/test_k3_tokenizer tests/test_k3_gguf_
 test-k3-gguf-source: tests/test_k3_gguf
 	./tests/test_k3_gguf "$(K3_GGUF)" "$(K3_MODEL)"
 
-test-k3: ds4 tests/test_k3_safetensors tests/test_k3_tokenizer tests/test_k3_metal tests/test_k3_checkpoint tests/test_k3_gguf_slice
+test-k3: ds4 tests/test_k3_streaming tests/test_k3_streaming_slab tests/test_k3_static_staging tests/test_k3_safetensors tests/test_k3_tokenizer tests/test_k3_bf16_rows tests/test_k3_bf16_fused tests/test_k3_mla_prefill tests/test_k3_kda_prefill tests/test_k3_metal tests/test_k3_checkpoint tests/test_k3_gguf_slice
+	./tests/test_k3_streaming
+	./tests/test_k3_streaming_slab
+	./tests/test_k3_static_staging
 	./tests/test_k3_safetensors
 	./tests/test_k3_tokenizer "$(K3_MODEL)"
 	@./ds4 -m "$(K3_MODEL)" --dump-tokens -p x | grep -q '^[[:space:]]*87  x$$'
+	./tests/test_k3_bf16_rows --resident
+	./tests/test_k3_bf16_rows
+	./tests/test_k3_bf16_fused --resident
+	./tests/test_k3_bf16_fused
+	./tests/test_k3_mla_prefill --resident
+	./tests/test_k3_mla_prefill
+	./tests/test_k3_kda_prefill --resident
+	./tests/test_k3_kda_prefill
 	./tests/test_k3_metal
 	./tests/test_k3_checkpoint "$(K3_MODEL)"
 	K3_STATIC_STAGING=1 K3_TEST_LAYER=1 ./tests/test_k3_gguf_slice "$(K3_MODEL)"
@@ -226,8 +345,25 @@ k3_safetensors.o: k3_safetensors.c k3_safetensors.h
 k3_model.o: k3_model.c k3_model.h k3_safetensors.h
 	$(CC) $(CFLAGS) -c -o $@ k3_model.c
 
-k3_infer.o: k3_infer.c k3_infer.h k3_model.h k3_safetensors.h k3_metal.h ds4_gpu.h
+k3_infer.o: k3_infer.c k3_infer.h k3_memory.h k3_streaming.h k3_static_cache.h k3_model.h k3_safetensors.h k3_metal.h ds4_gpu.h
 	$(CC) $(CFLAGS) -c -o $@ k3_infer.c
+
+# Update this stamp only when the selected variant changes. Distinct object
+# names avoid stale codec code, and the stamp also rebuilds/relinks when an
+# older already-built variant is selected again.
+.PHONY: k3-static-cache-config-force
+k3-static-cache-config-force:
+
+k3_static_cache.config: k3-static-cache-config-force
+	@printf '%s\n' '$(K3_STATIC_CACHE_OBJ)' > $@.tmp
+	@cmp -s $@.tmp $@ || mv $@.tmp $@
+	@rm -f $@.tmp
+
+k3_static_cache.zstd.o: k3_static_cache.c k3_static_cache.h k3_static_cache_format.h k3_static_cache.config
+	$(CC) $(QUALITY_CFLAGS) $(K3_STATIC_CACHE_CFLAGS) -c -o $@ k3_static_cache.c
+
+k3_static_cache.stub.o: k3_static_cache.c k3_static_cache.h k3_static_cache_format.h k3_static_cache.config
+	$(CC) $(QUALITY_CFLAGS) -c -o $@ k3_static_cache.c
 
 k3_tokenizer.o: k3_tokenizer.c k3_tokenizer.h k3_safetensors.h
 	$(CC) $(CFLAGS) -c -o $@ k3_tokenizer.c
@@ -342,19 +478,19 @@ tests/test_deepseek41_metal: tests/test_deepseek41_metal.o $(CORE_OBJS)
 test-deepseek41-metal: tests/test_deepseek41_metal
 	./tests/test_deepseek41_metal
 
-tests/test_deepseek41_graph.o: tests/test_deepseek41_graph.c ds4.c ds4_gpu.h ds4_engram.h
+tests/test_deepseek41_graph.o: tests/test_deepseek41_graph.c ds4.c k3_streaming.h ds4_gpu.h ds4_engram.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
 
 tests/test_deepseek41_graph: tests/test_deepseek41_graph.o $(filter-out ds4.o,$(CORE_OBJS))
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -o $@ $^ $(METAL_LDLIBS)
 
-tests/test_deepseek41_dspark.o: tests/test_deepseek41_dspark.c ds4.c ds4_deepseek41_dspark.h ds4_gpu.h
+tests/test_deepseek41_dspark.o: tests/test_deepseek41_dspark.c ds4.c k3_streaming.h ds4_deepseek41_dspark.h ds4_gpu.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
 
 tests/test_deepseek41_dspark: tests/test_deepseek41_dspark.o $(filter-out ds4.o,$(CORE_OBJS))
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -o $@ $^ $(METAL_LDLIBS)
 
-tests/test_deepseek41_prefill.o: tests/test_deepseek41_prefill.c ds4.c ds4_gpu.h ds4_engram.h
+tests/test_deepseek41_prefill.o: tests/test_deepseek41_prefill.c ds4.c k3_streaming.h ds4_gpu.h ds4_engram.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
 
 tests/test_deepseek41_prefill: tests/test_deepseek41_prefill.o $(filter-out ds4.o,$(CORE_OBJS))
@@ -753,13 +889,13 @@ tests/test_cuda_topk_stream: tests/test_cuda_topk_stream.o ds4_cuda.o ds4_image.
 test-cuda-topk-stream: tests/test_cuda_topk_stream
 	./tests/test_cuda_topk_stream
 
-tests/test_deepseek41_prefill.o: tests/test_deepseek41_prefill.c ds4.c ds4_gpu.h ds4_engram.h
+tests/test_deepseek41_prefill.o: tests/test_deepseek41_prefill.c ds4.c k3_streaming.h ds4_gpu.h ds4_engram.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
 tests/test_deepseek41_prefill: tests/test_deepseek41_prefill.o $(filter-out ds4.o,$(CORE_OBJS))
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 
-tests/test_deepseek41_dspark.o: tests/test_deepseek41_dspark.c ds4.c ds4_deepseek41_dspark.h ds4_gpu.h
+tests/test_deepseek41_dspark.o: tests/test_deepseek41_dspark.c ds4.c k3_streaming.h ds4_deepseek41_dspark.h ds4_gpu.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
 
 tests/test_deepseek41_dspark: tests/test_deepseek41_dspark.o $(filter-out ds4.o,$(CORE_OBJS))
@@ -848,7 +984,7 @@ test-qwen4-cuda: tests/test_qwen4_cuda
 	./tests/test_qwen4_cuda
 endif
 
-ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_gpu_copy.h ds4_gpu_tp.h ds4_deepseek41_gpu.h ds4_deepseek41_dspark.h ds4_linux_memory.h ds4_engram.h k3_infer.h k3_model.h k3_tokenizer.h
+ds4.o: ds4.c ds4.h k3_streaming.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_gpu_copy.h ds4_gpu_tp.h ds4_deepseek41_gpu.h ds4_deepseek41_dspark.h ds4_linux_memory.h ds4_engram.h k3_infer.h k3_model.h k3_tokenizer.h
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
 
 ds4_image.o: ds4_image.c ds4_image.h third_party/iris/jpeg.h third_party/iris/png.h
@@ -917,7 +1053,7 @@ rax.o: rax.c rax.h rax_malloc.h
 linenoise.o: linenoise.c linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ linenoise.c
 
-ds4_cpu.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_gpu_tp.h k3_model.h k3_tokenizer.h
+ds4_cpu.o: ds4.c k3_streaming.h ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_gpu_tp.h k3_model.h k3_tokenizer.h
 	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_NO_GPU -c -o $@ ds4.c
 
 ds4_cli_cpu.o: ds4_cli.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_prompt_prefix.h linenoise.h
@@ -938,7 +1074,7 @@ ds4_eval_cpu.o: ds4_eval.c ds4_eval_cases.h ds4.h ds4_ssd.h ds4_distributed.h ds
 ds4_agent_cpu.o: ds4_agent.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_prompt_prefix.h ds4_kvstore.h ds4_web.h linenoise.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_agent.c
 
-ds4_metal.o: ds4_metal.m ds4.h ds4_gpu.h ds4_gpu_tp.h ds4_deepseek41_gpu.h ds4_image.h k3_metal.h $(METAL_SRCS)
+ds4_metal.o: ds4_metal.m ds4.h k3_streaming.h k3_streaming_slab.h ds4_gpu.h ds4_gpu_tp.h ds4_deepseek41_gpu.h ds4_image.h k3_metal.h $(METAL_SRCS)
 	$(CC) $(OBJCFLAGS) -c -o $@ ds4_metal.m
 
 tests/test_glm53_kda.o: tests/test_glm53_kda.c ds4_gpu.h
@@ -1098,7 +1234,7 @@ tests/test_engram: tests/test_engram.c ds4_engram.c ds4_engram.h
 test-engram: tests/test_engram
 	./tests/test_engram
 
-tests/test_deepseek41_gguf.o: tests/test_deepseek41_gguf.c ds4.c ds4.h ds4_engram.h
+tests/test_deepseek41_gguf.o: tests/test_deepseek41_gguf.c ds4.c k3_streaming.h ds4.h ds4_engram.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -DDS4_NO_GPU -I. -c -o $@ $<
 
 tests/test_deepseek41_gguf: tests/test_deepseek41_gguf.o ds4_engram.c $(filter-out ds4_cpu.o,$(CPU_CORE_OBJS))
@@ -1108,7 +1244,7 @@ tests/test_deepseek41_gguf: tests/test_deepseek41_gguf.o ds4_engram.c $(filter-o
 test-deepseek41-gguf: tests/test_deepseek41_gguf
 	./tests/test_deepseek41_gguf
 
-tests/test_qwen4_ngrams.o: tests/test_qwen4_ngrams.c ds4.c ds4.h
+tests/test_qwen4_ngrams.o: tests/test_qwen4_ngrams.c ds4.c k3_streaming.h ds4.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
 
 tests/test_qwen4_ngrams: tests/test_qwen4_ngrams.o $(filter-out ds4_cpu.o,$(CPU_CORE_OBJS))
@@ -1118,7 +1254,7 @@ tests/test_qwen4_ngrams: tests/test_qwen4_ngrams.o $(filter-out ds4_cpu.o,$(CPU_
 test-qwen4-ngrams: tests/test_qwen4_ngrams
 	./tests/test_qwen4_ngrams
 
-tests/test_qwen4_ngram_state.o: tests/test_qwen4_ngram_state.c ds4.c ds4.h
+tests/test_qwen4_ngram_state.o: tests/test_qwen4_ngram_state.c ds4.c k3_streaming.h ds4.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
 
 tests/test_qwen4_ngram_state: tests/test_qwen4_ngram_state.o $(filter-out ds4.o,$(CORE_OBJS))
@@ -1224,7 +1360,7 @@ tests/test_gpu_args.o: tests/test_gpu_args.c ds4_gpu_args.h ds4_gpu_mgpu.h
 tests/test_gpu_args: tests/test_gpu_args.o ds4_gpu_args_cpu.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
-ds4_cpu_test_hooks.o: ds4.c ds4.h ds4_image.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h k3_model.h k3_tokenizer.h
+ds4_cpu_test_hooks.o: ds4.c k3_streaming.h ds4.h ds4_image.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h k3_model.h k3_tokenizer.h
 	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_NO_GPU -DDS4_TEST_HOOKS -c -o $@ ds4.c
 
 tests/test_engine_mgpu_placement.o: tests/test_engine_mgpu_placement.c ds4.h ds4_gpu_mgpu.h ds4_layer_pack.h
@@ -1239,13 +1375,13 @@ tests/test_sampling.o: tests/test_sampling.c ds4.h
 tests/test_sampling: tests/test_sampling.o ds4_cpu_test_hooks.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o $(K3_DETECT_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
-tests/test_session_state.o: tests/test_session_state.c ds4.c ds4.h ds4_gpu.h ds4_image.h ds4_tp.h
+tests/test_session_state.o: tests/test_session_state.c ds4.c k3_streaming.h ds4.h ds4_gpu.h ds4_image.h ds4_tp.h
 	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_NO_GPU -I. -c -o $@ $<
 
 tests/test_session_state: tests/test_session_state.o $(filter-out ds4_cpu.o,$(CPU_CORE_OBJS))
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
-tests/test_session_state_gpu.o: tests/test_session_state.c ds4.c ds4.h ds4_gpu.h ds4_image.h ds4_tp.h
+tests/test_session_state_gpu.o: tests/test_session_state.c ds4.c k3_streaming.h ds4.h ds4_gpu.h ds4_image.h ds4_tp.h
 	$(CC) $(CFLAGS) -Wno-unused-function -I. -c -o $@ $<
 
 tests/test_session_state_gpu: tests/test_session_state_gpu.o $(filter-out ds4.o,$(CORE_OBJS))
@@ -1255,7 +1391,7 @@ else
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 endif
 
-tests/test_deepseek_indexer.o: tests/test_deepseek_indexer.c ds4.c ds4.h ds4_gpu.h ds4_tp.h
+tests/test_deepseek_indexer.o: tests/test_deepseek_indexer.c ds4.c k3_streaming.h ds4.h ds4_gpu.h ds4_tp.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
 
 tests/test_deepseek_indexer: tests/test_deepseek_indexer.o $(filter-out ds4.o,$(CORE_OBJS))
@@ -1315,7 +1451,7 @@ tests/test_gpu_lookup_cache_strict.o: tests/test_gpu_lookup_cache_strict.c ds4_g
 tests/test_gpu_lookup_cache_strict: tests/test_gpu_lookup_cache_strict.o ds4_cuda.o ds4_image.o $(MMQ_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-ds4_cuda_test_hooks.o: ds4.c ds4.h ds4_gpu.h ds4_gpu_mgpu.h ds4_gpu_tp.h ds4_layer_pack.h
+ds4_cuda_test_hooks.o: ds4.c k3_streaming.h ds4.h ds4_gpu.h ds4_gpu_mgpu.h ds4_gpu_tp.h ds4_layer_pack.h
 	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_TEST_HOOKS -I$(CUDA_HOME)/include -c -o $@ ds4.c
 
 tests/test_engine_mgpu_refusal.o: tests/test_engine_mgpu_refusal.c ds4.h ds4_gpu_mgpu.h
@@ -1463,11 +1599,12 @@ ds4_cpu_test_hooks.o ds4_cuda_test_hooks.o tests/test_session_state.o \
 tests/test_session_state_gpu.o: ds4_tool_text.h
 
 clean:
+	rm -f k3_static_cache.config k3_static_cache.config.tmp k3-static-cache-build tests/test_k3_static_cache
 	rm -f tests/test_mmvq_cuda tests/test_mmvq_rocm
 	rm -f tests/test_qwen4_ngrams
 	rm -f tests/test_qwen4_ngram_state
 	rm -f tests/test_web_recovery
-	rm -f tests/test_k3_stream
+	rm -f tests/test_k3_stream tests/test_k3_memory tests/test_k3_streaming tests/test_k3_streaming_slab tests/test_k3_stream_mapping
 	rm -f tests/test_metal_ssd_experts
 	rm -f tests/test_metal_command_memory
 	rm -f tests/test_deepseek41_metal
@@ -1519,7 +1656,7 @@ clean:
 	rm -f tests/test_deepseek_indexer
 	rm -f tests/test_tp_rdma tests/test_tp_link tests/test_tp_tcp tests/test_cuda_tp_link
 	rm -f tests/test_metal_tp_spec
-	rm -f ds4_cli_test tests/test_k3_safetensors tests/test_k3_metal tests/test_k3_tokenizer tests/test_k3_checkpoint tests/test_k3_gguf tests/test_k3_gguf_metal_map tests/test_k3_gguf_slice
+	rm -f ds4_cli_test tests/test_k3_static_staging tests/test_k3_safetensors tests/test_k3_metal tests/test_k3_bf16_rows tests/test_k3_bf16_fused tests/test_k3_mla_prefill tests/test_k3_kda_prefill tests/test_k3_tokenizer tests/test_k3_checkpoint tests/test_k3_gguf tests/test_k3_gguf_metal_map tests/test_k3_gguf_slice
 	rm -f tests/test_metal_tp_cancel
 	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_metal_moe_prefill tests/test_qwen4_moe_mm_specialize tests/test_qwen4_conv_parallel tests/test_q8_prefill_variants tests/test_metal_dense_mpp tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_deepseek4_vision_image tests/test_prompt_prefix tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
 	rm -f tests/test_image_decode
@@ -1529,7 +1666,7 @@ clean:
 # The active tokenizer includes generated Unicode classes.
 ds4.o ds4_cpu.o ds4_cpu_test_hooks.o: ds4_qwen4_unicode.inc
 
-ds4_verify_test_hooks.o: ds4.c ds4.h ds4_deepseek41_dspark.h ds4_gpu.h
+ds4_verify_test_hooks.o: ds4.c k3_streaming.h ds4.h ds4_deepseek41_dspark.h ds4_gpu.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -DDS4_TEST_HOOKS -Wno-unused-function -c -o $@ $<
 
 gguf-tools/quality-testing/score_official_verify.o: gguf-tools/quality-testing/score_official.c ds4.h

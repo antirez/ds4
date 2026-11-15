@@ -26,6 +26,8 @@
 #include "ds4_gpu.h"
 #include "ds4_image.h"
 #include "k3_metal.h"
+#include "k3_streaming.h"
+#include "k3_streaming_slab.h"
 
 /*
  * Objective-C Metal glue for the C engine.
@@ -836,6 +838,7 @@ static uint64_t g_model_residency_count;
 static int g_model_residency_added_to_queue;
 static int g_glm_model_mode;
 static int g_ssd_streaming_mode;
+static bool g_k3_ssd_streaming_defaults;
 static int g_glm_streaming_prefill_full_layer_runtime;
 static int g_metal4_runtime_available;
 static int g_metal4_family_supported;
@@ -4645,6 +4648,40 @@ void ds4_gpu_print_memory_report(const char *label) {
             ds4_gpu_mib(tensor_live_snap),
             ds4_gpu_mib(tensor_peak_snap));
     ds4_gpu_print_task_memory_report();
+    if (g_device &&
+        [g_device respondsToSelector:@selector(currentAllocatedSize)]) {
+        fprintf(stderr,
+                "ds4:   Metal resource allocation %.2f GiB "
+                "(currentAllocatedSize; not unique physical RAM)\n",
+                ds4_gpu_gib((uint64_t)[g_device currentAllocatedSize]));
+    }
+    uint64_t live_view_bytes = 0;
+    uint32_t live_view_count = 0;
+    for (uint32_t i = 0; i < g_model_view_count; i++) {
+        if (!g_model_views[i].buffer) continue;
+        const uint64_t bytes = (uint64_t)[g_model_views[i].buffer length];
+        live_view_bytes = bytes > UINT64_MAX - live_view_bytes
+            ? UINT64_MAX : live_view_bytes + bytes;
+        live_view_count++;
+    }
+    fprintf(stderr,
+            "ds4:   ordinary mmap views live %u buffers, %.2f GiB of spans "
+            "(not unique physical RAM)\n",
+            live_view_count, ds4_gpu_gib(live_view_bytes));
+    uint64_t allocated_slab_bytes = 0;
+    uint32_t allocated_slab_count = 0;
+    for (uint32_t i = 0; i < g_stream_expert_cache_slab_count; i++) {
+        if (!g_stream_expert_cache_slabs[i]) continue;
+        const uint64_t bytes =
+            (uint64_t)[g_stream_expert_cache_slabs[i] length];
+        allocated_slab_bytes = bytes > UINT64_MAX - allocated_slab_bytes
+            ? UINT64_MAX : allocated_slab_bytes + bytes;
+        allocated_slab_count++;
+    }
+    fprintf(stderr,
+            "ds4:   streaming expert slabs allocated %u buffers, %.2f GiB "
+            "including unused slots\n",
+            allocated_slab_count, ds4_gpu_gib(allocated_slab_bytes));
     fprintf(stderr,
             "ds4:   mmap model wrapper creations %llu buffers %.2f GiB cumulative, %.2f GiB max (not copied)\n",
             (unsigned long long)g_model_wrap_count,
@@ -4912,7 +4949,12 @@ void ds4_gpu_set_glm_model(bool enabled) {
     g_glm_model_mode = enabled ? 1 : 0;
 }
 
+void ds4_gpu_set_k3_ssd_streaming_defaults(bool enabled) {
+    g_k3_ssd_streaming_defaults = enabled;
+}
+
 void ds4_gpu_set_ssd_streaming(bool enabled) {
+    g_k3_ssd_streaming_defaults = false;
     g_ssd_streaming_mode = enabled ? 1 : 0;
     ds4_gpu_stream_expert_cache_clear_all(1);
     if (g_ssd_streaming_mode) {
@@ -4956,6 +4998,13 @@ uint64_t ds4_gpu_tensor_allocated_bytes(void) {
     bytes = g_tensor_alloc_live_bytes;
     pthread_mutex_unlock(&g_tensor_mu);
     return bytes;
+}
+
+uint64_t k3_gpu_streaming_cache_locked_bytes(void) {
+    /* Both slab slots and individual expert buffers update this counter only
+     * after successful mlock/munlock. Free slots retained in a slab stay locked
+     * and reusable, so logical cache-entry counts would undercount them. */
+    return g_stream_expert_cache_mlock_bytes;
 }
 
 static int ds4_gpu_model_map_log_enabled(void) {
@@ -11926,6 +11975,7 @@ static void qwen4_nax_release_scratch(void);
 static void qwen4_batch_release_scratch(void);
 
 void ds4_gpu_cleanup(void) {
+    g_k3_ssd_streaming_defaults = false;
     if (!g_initialized) return;
     ds4_gpu_queue_keepalive_stop_thread();
 
@@ -13636,8 +13686,9 @@ static void ds4_gpu_stream_expert_timing_note_cache_class(
 }
 
 static int ds4_gpu_stream_expert_readahead_enabled(void) {
-    return g_ssd_streaming_mode &&
-           getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_READAHEAD") == NULL;
+    return k3_ssd_expert_readahead_enabled(
+        g_ssd_streaming_mode, g_k3_ssd_streaming_defaults,
+        getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_READAHEAD"));
 }
 
 static void ds4_gpu_advise_file_range(int fd, uint64_t offset, uint64_t len) {
@@ -14301,17 +14352,8 @@ static int ds4_gpu_stream_expert_slab_enabled(void) {
  * that actually hold a streamed expert.
  */
 static uint64_t ds4_gpu_stream_expert_slab_target_bytes(void) {
-    const uint64_t mib = 1024ull * 1024ull;
-    uint64_t target = 4096ull * mib;
-    const char *env = getenv("DS4_METAL_STREAMING_EXPERT_SLAB_MB");
-    if (env && env[0]) {
-        char *end = NULL;
-        unsigned long long v = strtoull(env, &end, 10);
-        if (end != env && *end == '\0' && v != 0) {
-            target = v > UINT64_MAX / mib ? UINT64_MAX : (uint64_t)v * mib;
-        }
-    }
-    return target;
+    return k3_ssd_slab_target_bytes(g_k3_ssd_streaming_defaults,
+        getenv("DS4_METAL_STREAMING_EXPERT_SLAB_MB"));
 }
 
 static id<MTLBuffer> ds4_gpu_stream_expert_alloc_slab_buffer(
@@ -14597,16 +14639,15 @@ static int ds4_gpu_stream_expert_alloc_slab_slot(
         if (budget != 0 && g_stream_expert_cache_slab_total_slots >= budget) {
             return 0;
         }
-        uint64_t target = ds4_gpu_stream_expert_slab_target_bytes();
-        uint64_t slots64 = target / slot_bytes;
-        if (slots64 == 0) slots64 = 1;
-        if (slots64 > UINT32_MAX) slots64 = UINT32_MAX;
-        uint32_t slots = (uint32_t)slots64;
-        if (budget != 0) {
-            const uint32_t remaining =
-                budget - g_stream_expert_cache_slab_total_slots;
-            if (slots > remaining) slots = remaining;
-        }
+        const uint64_t target = ds4_gpu_stream_expert_slab_target_bytes();
+        const bool automatic_slabs = g_k3_ssd_streaming_defaults &&
+            getenv("DS4_METAL_STREAMING_EXPERT_SLAB_MB") == NULL;
+        uint32_t slots = k3_streaming_slab_slots(target, slot_bytes, budget,
+            g_stream_expert_cache_slab_total_slots,
+            g_stream_expert_cache_slab_count,
+            DS4_METAL_STREAM_EXPERT_CACHE_MAX_SLABS,
+            g_device ? (uint64_t)[g_device maxBufferLength] : 0,
+            automatic_slabs);
         if (slots == 0) return 0;
         id<MTLBuffer> slab_buffer = nil;
         while (slots != 0) {
@@ -17976,7 +18017,8 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         uint32_t      *unique_out,
         id<MTLBuffer> *overflow_gate,
         id<MTLBuffer> *overflow_up,
-        id<MTLBuffer> *overflow_down) {
+        id<MTLBuffer> *overflow_down,
+        bool          allow_overflow_views) {
     if (overflow_gate) *overflow_gate = nil;
     if (overflow_up) *overflow_up = nil;
     if (overflow_down) *overflow_down = nil;
@@ -18052,6 +18094,16 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         ds4_gpu_stream_expert_cache_note_frequency_hotness(layer,
                                                            frequency,
                                                            n_total_expert);
+    }
+    if (ok && !allow_overflow_views &&
+        unique_count > ds4_gpu_stream_expert_cache_configured_budget()) {
+        fprintf(stderr,
+                "ds4: K3 streaming prefill needs %u simultaneous expert slots "
+                "at layer %u, but only %u are available; reduce --prefill-chunk\n",
+                unique_count, layer,
+                ds4_gpu_stream_expert_cache_configured_budget());
+        free(ids);
+        return 0;
     }
     /*
      * When the layer's unique selected set does not fit the cache budget, the
@@ -18395,6 +18447,13 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
             ds4_gpu_stream_expert_cache_entry *entry = unique_entries[u];
             const uint32_t expert = (uint32_t)unique_ids[u];
             if (!entry) {
+                if (!allow_overflow_views) {
+                    fprintf(stderr,
+                            "ds4: K3 streaming expert cache exhausted at layer %u; "
+                            "refusing whole-tensor mapped fallback\n", layer);
+                    ok = 0;
+                    break;
+                }
                 const uint64_t gate_rel = unique_gate_offsets[u] - gate_offset;
                 const uint64_t down_rel = unique_down_offsets[u] - down_offset;
                 if (!*overflow_gate) {
@@ -40481,7 +40540,8 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
                         &stream_unique,
                         &stream_overflow_gate,
                         &stream_overflow_up,
-                        &stream_overflow_down)) {
+                        &stream_overflow_down,
+                        true)) {
                 return 0;
             }
             if (stream_unique == 0) {
@@ -41176,7 +41236,8 @@ static int ds4_gpu_routed_moe_one_tensor_impl(
         uint32_t                activation_kind,
         float                   activation_beta,
         float                   activation_linear_beta,
-        const int32_t          *ready_ids) {
+        const int32_t          *ready_ids,
+        bool                    require_stream_cache) {
     BOOL parallel_ffn_scope
         __attribute__((cleanup(ds4_gpu_parallel_ffn_scope_cleanup))) =
             g_parallel_q8_pending;
@@ -41855,6 +41916,16 @@ static int ds4_gpu_routed_moe_one_tensor_impl(
         const bool use_selected_slots =
             use_q4_selected_slots || use_iq2_selected_slots ||
             use_mxfp4_selected_slots || use_iq2_stream_addr_table;
+        if (require_stream_cache &&
+            (!use_iq2_selected_slots ||
+             ds4_gpu_stream_expert_cache_configured_budget() < n_expert ||
+             ds4_gpu_stream_full_expert_addr_table_requested())) {
+            fprintf(stderr,
+                    "ds4: K3 streaming decode requires the selected-expert "
+                    "cache path and at least %u available slots; "
+                    "refusing mapped expert fallback\n", n_expert);
+            return 0;
+        }
         id<MTLComputePipelineState> slots_pair_swiglu_pipeline =
             use_iq2_selected_slots ? g_moe_mul_mv_slots6_iq2_xxs_pair_swiglu_pipeline :
             (use_mxfp4_selected_slots ? g_moe_mul_mv_slots6_mxfp4_pair_swiglu_pipeline :
@@ -42205,6 +42276,12 @@ static int ds4_gpu_routed_moe_one_tensor_impl(
                 ds4_gpu_stream_expert_cache_effective_cap(layer_index,
                                                           n_total_expert,
                                                           n_expert) != 0;
+            if (require_stream_cache && !use_stream_expert_cache) {
+                fprintf(stderr,
+                        "ds4: K3 streaming decode expert cache is unavailable; "
+                        "refusing mapped expert fallback\n");
+                return 0;
+            }
             if (use_iq2_stream_addr_table && !use_stream_expert_cache) {
                 fprintf(stderr,
                         "ds4: Metal IQ2/IQ2 streaming decode requires a non-empty expert cache\n");
@@ -43893,7 +43970,7 @@ int ds4_gpu_routed_moe_one_tensor(
         expert_in_dim, expert_mid_dim, out_dim,
         selected, weights, n_total_expert, n_expert, clamp,
         x, add_in, layer_index, force_resident,
-        0u, 0.0f, 0.0f, NULL);
+        0u, 0.0f, 0.0f, NULL, false);
 }
 
 int ds4_gpu_k3_routed_moe_one_tensor(
@@ -43931,7 +44008,7 @@ int ds4_gpu_k3_routed_moe_one_tensor(
         expert_in_dim, expert_mid_dim, out_dim,
         selected, weights, n_total_expert, n_expert, 0.0f,
         x, NULL, layer_index, force_resident,
-        1u, 4.0f, 25.0f, ready_ids);
+        1u, 4.0f, 25.0f, ready_ids, !force_resident);
 }
 
 static int ds4_gpu_routed_moe_batch_tensor_impl(
@@ -43966,7 +44043,8 @@ static int ds4_gpu_routed_moe_batch_tensor_impl(
         bool                    force_resident,
         uint32_t                activation_kind,
         float                   activation_beta,
-        float                   activation_linear_beta) {
+        float                   activation_linear_beta,
+        bool                    require_stream_cache) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     /* TP sharding (see ds4_gpu_routed_moe_one_tensor): bind from the owned
      * expert range and rebase ids in the kernels. */
@@ -44126,7 +44204,8 @@ static int ds4_gpu_routed_moe_batch_tensor_impl(
                                              force_resident,
                                              activation_kind,
                                              activation_beta,
-                                             activation_linear_beta, NULL);
+                                             activation_linear_beta, NULL,
+                                             require_stream_cache);
     }
 
     @autoreleasepool {
@@ -44229,6 +44308,13 @@ static int ds4_gpu_routed_moe_batch_tensor_impl(
             getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") == NULL &&
             getenv("DS4_METAL_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR") == NULL;
         const bool use_cached_batch = use_iq2_batch_selected_addr || use_iq2_cached_batch;
+        if (require_stream_cache && !use_iq2_batch_selected_addr) {
+            fprintf(stderr,
+                    "ds4: K3 streaming prefill requires the selected-expert "
+                    "cache path for %u tokens; reduce --prefill-chunk or "
+                    "remove incompatible Metal path overrides\n", n_tokens);
+            return 0;
+        }
 
         ds4_gpu_mul_mv_id_args gate_args =
             ds4_gpu_make_mul_mv_id_args(expert_in_dim, expert_mid_dim, n_total_expert,
@@ -44691,7 +44777,8 @@ static int ds4_gpu_routed_moe_batch_tensor_impl(
                         &stream_unique,
                         &stream_overflow_gate,
                         &stream_overflow_up,
-                        &stream_overflow_down)) {
+                        &stream_overflow_down,
+                        !require_stream_cache)) {
                 g_stream_prefill_batch_selected_addr_building--;
                 return 0;
             }
@@ -45513,7 +45600,7 @@ int ds4_gpu_routed_moe_batch_tensor(
         expert_in_dim, expert_mid_dim, out_dim,
         selected, weights, n_total_expert, n_expert, clamp,
         x, layer_index, n_tokens, mid_is_f16, force_resident,
-        0u, 0.0f, 0.0f);
+        0u, 0.0f, 0.0f, false);
 }
 
 int ds4_gpu_k3_routed_moe_batch_tensor(
@@ -45552,7 +45639,7 @@ int ds4_gpu_k3_routed_moe_batch_tensor(
         expert_in_dim, expert_mid_dim, out_dim,
         selected, weights, n_total_expert, n_expert, 0.0f,
         x, layer_index, n_tokens, &mid_is_f16, force_resident,
-        1u, 4.0f, 25.0f);
+        1u, 4.0f, 25.0f, !force_resident);
 }
 
 int ds4_gpu_hc_split_sinkhorn_tensor(
@@ -51822,6 +51909,22 @@ int k3_gpu_matmul_bf16(
         if (!cb) return 0;
 
         if (n_rows <= 8u) {
+            /* Reusing weights across tokens shrinks the grid. Eight-token
+             * reuse needs more output groups to keep enough parallel work. */
+            const bool m1_default = g_k3_bf16_mv_unroll == 16 &&
+                ds4_gpu_device_is_pre_m5_apple_silicon() &&
+                ds4_gpu_device_name_contains("Apple M1");
+            const bool large_shape = in_dim >= 1024u &&
+                out_dim >= 256u * (uint32_t)g_k3_bf16_mv_nsg;
+            const bool wide_grid =
+                out_dim >= 1024u * (uint32_t)g_k3_bf16_mv_nsg;
+            /* Long dot products favor the smaller four-token working set. */
+            const bool small_rows_reuse = n_rows >= 2u && n_rows <= 3u &&
+                m1_default && large_shape && wide_grid && in_dim < 16384u;
+            const uint32_t rows_per_group = small_rows_reuse ? n_rows :
+                n_rows >= 4u && m1_default && large_shape
+                    ? (n_rows == 8u && wide_grid && in_dim < 16384u
+                           ? 8u : 4u) : 1u;
             const char *kernel =
                 g_k3_bf16_mv_unroll == 16
                     ? "kernel_k3_mul_mv_bf16_f32_unroll16"
@@ -51830,6 +51933,19 @@ int k3_gpu_matmul_bf16(
                         : (g_k3_bf16_mv_unroll == 4
                             ? "kernel_k3_mul_mv_bf16_f32_unroll4"
                             : "kernel_k3_mul_mv_bf16_f32"));
+            if (rows_per_group == 8u) {
+                kernel = "kernel_k3_mul_mv_bf16_f32_rows8";
+            } else if (rows_per_group == 4u) {
+                kernel = "kernel_k3_mul_mv_bf16_f32_rows4";
+            } else if (rows_per_group == 3u) {
+                kernel = "kernel_k3_mul_mv_bf16_f32_rows3";
+            } else if (rows_per_group == 2u) {
+                kernel = "kernel_k3_mul_mv_bf16_f32_rows2";
+            } else if (n_rows == 1u && m1_default && large_shape && wide_grid) {
+                /* A shorter load window reduces register pressure for a
+                 * single token; retain the original path for small grids. */
+                kernel = "kernel_k3_mul_mv_bf16_f32_unroll8";
+            }
             id<MTLComputePipelineState> pipeline =
                 ds4_gpu_get_pipeline(kernel);
             if (!pipeline) return 0;
@@ -51848,7 +51964,7 @@ int k3_gpu_matmul_bf16(
                     ((NSUInteger)out_dim +
                      (NSUInteger)g_k3_bf16_mv_nsg - 1u) /
                         (NSUInteger)g_k3_bf16_mv_nsg,
-                    n_rows,
+                    (n_rows + rows_per_group - 1u) / rows_per_group,
                     1)
                 threadsPerThreadgroup:MTLSizeMake(
                     32u * (NSUInteger)g_k3_bf16_mv_nsg, 1, 1)];
@@ -51936,11 +52052,29 @@ int k3_gpu_matmul4_bf16(
                 "fused BF16 matrix");
             if (!weights[i]) return 0;
         }
-        id<MTLComputePipelineState> pipeline =
-            ds4_gpu_get_pipeline(
-                g_k3_bf16_mv_unroll == 16
-                    ? "kernel_k3_mul_mv4_bf16_f32_unroll16"
-                    : "kernel_k3_mul_mv4_bf16_f32_unroll8");
+        /* Small fused batches reuse weights only on wide M1 output grids;
+         * long dot products retain the existing fallback. */
+        const bool m1_default = g_k3_bf16_mv_unroll == 16 &&
+            ds4_gpu_device_is_pre_m5_apple_silicon() &&
+            ds4_gpu_device_name_contains("Apple M1");
+        const bool large_shape = in_dim >= 1024u &&
+            out_dim >= 256u * (uint32_t)g_k3_bf16_mv_nsg;
+        const bool wide_grid = out_dim >= 1024u * (uint32_t)g_k3_bf16_mv_nsg;
+        const bool small_rows_reuse = n_rows >= 2u && n_rows <= 3u &&
+            m1_default && large_shape && wide_grid && in_dim < 16384u;
+        const uint32_t rows_per_group = small_rows_reuse ? n_rows :
+            n_rows >= 4u && m1_default && large_shape
+                ? (n_rows == 8u && wide_grid && in_dim < 16384u ? 8u : 4u) : 1u;
+        const char *kernel = rows_per_group == 8u
+            ? "kernel_k3_mul_mv4_bf16_f32_rows8"
+            : rows_per_group == 4u ? "kernel_k3_mul_mv4_bf16_f32_rows4"
+            : rows_per_group == 3u ? "kernel_k3_mul_mv4_bf16_f32_rows3"
+            : rows_per_group == 2u ? "kernel_k3_mul_mv4_bf16_f32_rows2"
+            : (g_k3_bf16_mv_unroll == 8 ||
+               (n_rows == 1u && m1_default && large_shape && wide_grid))
+                ? "kernel_k3_mul_mv4_bf16_f32_unroll8"
+                : "kernel_k3_mul_mv4_bf16_f32_unroll16";
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(kernel);
         if (!pipeline) return 0;
 
         k3_gpu_matmul_args args = {
@@ -51970,7 +52104,7 @@ int k3_gpu_matmul4_bf16(
                 ((NSUInteger)out_dim +
                  (NSUInteger)g_k3_bf16_mv_nsg - 1u) /
                     (NSUInteger)g_k3_bf16_mv_nsg,
-                n_rows,
+                (n_rows + rows_per_group - 1u) / rows_per_group,
                 4u)
             threadsPerThreadgroup:MTLSizeMake(
                 32u * (NSUInteger)g_k3_bf16_mv_nsg, 1, 1)];
@@ -53674,12 +53808,20 @@ int k3_gpu_mla_prefill(
             &weight_inner, "MLA KV up projection");
         id<MTLComputePipelineState> store_pipeline =
             ds4_gpu_get_pipeline("kernel_k3_mla_prefill_store_cache");
+        /* Group loads ahead of the same serial FP32 FMAs on M1. */
+        const bool m1_projections =
+            ds4_gpu_device_is_pre_m5_apple_silicon() &&
+            ds4_gpu_device_name_contains("Apple M1");
         id<MTLComputePipelineState> absorb_pipeline =
-            ds4_gpu_get_pipeline("kernel_k3_mla_prefill_absorb_q");
+            ds4_gpu_get_pipeline(m1_projections
+                ? "kernel_k3_mla_prefill_absorb_q_unroll16"
+                : "kernel_k3_mla_prefill_absorb_q");
         id<MTLComputePipelineState> attention_pipeline =
             ds4_gpu_get_pipeline("kernel_k3_mla_prefill_attention");
         id<MTLComputePipelineState> value_pipeline =
-            ds4_gpu_get_pipeline("kernel_k3_mla_prefill_value_up_gate");
+            ds4_gpu_get_pipeline(m1_projections
+                ? "kernel_k3_mla_prefill_value_up_gate_unroll16"
+                : "kernel_k3_mla_prefill_value_up_gate");
         if (!kv_b || !store_pipeline || !absorb_pipeline ||
             !attention_pipeline || !value_pipeline) {
             return 0;
