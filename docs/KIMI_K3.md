@@ -56,6 +56,63 @@ K3 uses its native XTML chat and tool format. Its sampling defaults are
 temperature 1, top-p 0.95, and min-p 0. Saved sessions rebuild their inference
 state by replaying the saved tokens.
 
+## Optional SSD streaming setup for a 32 GiB M1 Max
+
+For the original K3 mixed-Q2 GGUF, aligned static staging and tiled output-head
+reads reuse two bounded buffers. An optional lossless static cache stores
+16 MiB blocks using byte-plane shuffling and zstd, with raw blocks when
+compression does not save space. It changes no tensor values or model math.
+
+The cache requires `libzstd` discoverable through `pkg-config`; the normal
+build still works without this optional dependency. These commands build the
+tools and create a new cache without installing packages:
+
+```sh
+k3_model_file="/absolute/path/to/Kimi-K3-IQ2_XXS-Q2_K.gguf"
+k3_static_cache_file="/absolute/path/to/Kimi-K3-IQ2_XXS-Q2_K.static-zstd-v1.cache"
+pkg-config --exists libzstd && make ds4 k3-static-cache-build
+./k3-static-cache-build "$k3_model_file" "$k3_static_cache_file"
+```
+
+Allow about 59 GiB of additional disk space for this GGUF. The builder reads
+its static spans, compares every decoded block byte-for-byte with the source,
+and publishes the completed cache atomically without replacing an existing
+file. The original GGUF remains unchanged and is still required for experts,
+embeddings and the output head. The cache is tied to that file's identity,
+size and timestamps; the loader checks header/index CRCs and each decoded
+block's CRC, and rejects changed or corrupt data.
+
+A reproducible short generation check uses a 10 GiB expert cache, a 12 GiB
+host reserve, and approximately 131 MiB of additional decoder workspace
+accounted for before allocation. All existing memory checks remain active.
+
+```sh
+K3_MEMORY_RESERVE_GIB=12 K3_RESIDENT_STATIC=0 \
+K3_GGUF_STATIC_STAGING=1 K3_GGUF_STATIC_ALIGNED=1 \
+K3_GGUF_HEAD_STAGING=1 K3_GGUF_STATIC_CACHE="$k3_static_cache_file" \
+K3_STATIC_IO_THREADS=4 K3_LAYER_PAGEIN=0 K3_ROUTE_PREDICT=1 \
+K3_BF16_MV_UNROLL=16 K3_BF16_MV_NSG=4 \
+DS4_METAL_STREAMING_EXPERT_SLAB_MB=256 \
+DS4_METAL_DISABLE_STREAMING_EXPERT_READAHEAD=1 K3_IO_PROFILE=1 \
+./ds4 -m "$k3_model_file" --ssd-streaming \
+  --ssd-streaming-cache-experts 10GB --prefill-chunk 64 --ctx 1024 \
+  --nothink --temp 0 --seed 1 -n 9 -p "Ciao, come stai?"
+```
+
+Leave `K3_GGUF_STATIC_CACHE` unset to use the original GGUF static reads.
+An invalid cache causes an explicit error rather than a silent fallback.
+`make test-k3-static-cache` runs the CPU format and decoder fixtures.
+On the 32 GiB M1 Max, one controlled comparison of eight greedy decode steps
+for this prompt measured 41.488 to 28.379 seconds per step: 46.2% more tokens
+per second, or 31.6% less decode time. The reference already used GGUF static
+staging (`8ba3fac3`); these numbers measure the combined settings above.
+Prefill was 181.156 versus 183.668 seconds. Peak task footprint was 13.827
+versus 13.949 GiB, with normal memory pressure and no new swap in either run.
+Generated text matched, all 5,309 cache blocks were roundtrip verified, and
+separate KDA/MLA boundary and full output-head checks were bitwise identical.
+This is one measured pair with a short prompt, not a long-session benchmark;
+filesystem cache, external load and temperature were not controlled.
+
 ## Two 512 GiB Macs
 
 Put the same GGUF on both machines. This is a contiguous-layer pipeline, not

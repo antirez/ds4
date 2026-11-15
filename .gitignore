@@ -128,3 +128,9 @@ __pycache__/
 
 /tests/test_qwen4_conv_parallel
 /tests/test_q8_prefill_variants
+
+# Optional K3 lossless static-cache build outputs
+/k3-static-cache-build
+/k3_static_cache.config
+/k3_static_cache.config.tmp
+/tests/test_k3_static_cache

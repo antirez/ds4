@@ -32,8 +32,23 @@ K3_MODEL ?= models/Kimi-K3.1-Pro
 K3_DETECT_OBJS = k3_safetensors.o
 
 ifeq ($(UNAME_S),Darwin)
-METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal -licucore
-K3_OBJS = k3_infer.o k3_model.o k3_safetensors.o k3_tokenizer.o
+# The lossless static-cache module supplies stubs when libzstd is unavailable.
+# Force K3_STATIC_CACHE_ZSTD=0 to build without this optional feature.
+K3_STATIC_CACHE_ZSTD ?= $(shell pkg-config --exists libzstd 2>/dev/null && echo 1 || echo 0)
+ifeq ($(K3_STATIC_CACHE_ZSTD),1)
+K3_STATIC_CACHE_CFLAGS := -DK3_STATIC_CACHE_ZSTD $(shell pkg-config --cflags libzstd)
+K3_STATIC_CACHE_LIBS := $(shell pkg-config --libs libzstd)
+K3_STATIC_CACHE_OBJ := k3_static_cache.zstd.o
+else
+K3_STATIC_CACHE_OBJ := k3_static_cache.stub.o
+endif
+# A variant switch must relink even when make only sees second-resolution
+# timestamps and both builds finish in the same second.
+ifneq ($(shell cat k3_static_cache.config 2>/dev/null),$(K3_STATIC_CACHE_OBJ))
+.PHONY: $(K3_STATIC_CACHE_OBJ) tests/test_k3_static_cache
+endif
+METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal -licucore $(K3_STATIC_CACHE_LIBS)
+K3_OBJS = k3_infer.o $(K3_STATIC_CACHE_OBJ) k3_model.o k3_safetensors.o k3_tokenizer.o
 CORE_OBJS = ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_metal.o ds4_layer_pack.o ds4_engram.o $(K3_OBJS)
 CPU_CORE_OBJS = ds4_cpu.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o $(K3_DETECT_OBJS)
 else
@@ -93,6 +108,8 @@ help:
 	@echo "  make test-k3      Run K3 unit tests and the downloaded checkpoint smoke test"
 	@echo "  make test-k3-memory Run memory-budget tests without Metal or model weights"
 	@echo "  make test-k3-static-staging Run static-loader byte/lock fixtures without GPU execution"
+	@echo "  make k3-static-cache-build Build the optional lossless GGUF static-cache creator"
+	@echo "  make test-k3-static-cache Run lossless-cache CPU format and decoder fixtures"
 	@echo "  make test-k3-stream-mapping Run a tiny synthetic Metal mapping-lifetime test"
 	@echo "  make test-k3-gguf Run K3 mixed-Q2 GGUF parser and Metal smoke tests"
 	@echo "  make test-k3-gguf-source Byte-compare every retained K3 GGUF tensor with SafeTensors"
@@ -192,14 +209,27 @@ test-k3-bf16-fused: tests/test_k3_bf16_fused
 	./tests/test_k3_bf16_fused
 
 # This fixture includes the internal loader, so do not also link k3_infer.o.
-tests/test_k3_static_staging.o: tests/test_k3_static_staging.c k3_infer.c k3_infer.h k3_memory.h k3_model.h k3_safetensors.h k3_metal.h ds4_gpu.h
+tests/test_k3_static_staging.o: tests/test_k3_static_staging.c k3_infer.c k3_infer.h k3_memory.h k3_static_cache.h k3_model.h k3_safetensors.h k3_metal.h ds4_gpu.h
 	$(CC) $(QUALITY_CFLAGS) -I. -c -o $@ $<
 
-tests/test_k3_static_staging: tests/test_k3_static_staging.o k3_model.o k3_safetensors.o ds4_metal.o ds4_image.o
+tests/test_k3_static_staging: tests/test_k3_static_staging.o $(K3_STATIC_CACHE_OBJ) k3_model.o k3_safetensors.o ds4_metal.o ds4_image.o
 	$(CC) $(QUALITY_CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
 test-k3-static-staging: tests/test_k3_static_staging
 	./tests/test_k3_static_staging
+
+# CPU-only sidecar creation and format/decoder fixtures; neither uses Metal.
+.PHONY: test-k3-static-cache
+k3-static-cache-build: k3_static_cache_build.c k3_static_cache.h k3_static_cache_format.h $(K3_STATIC_CACHE_OBJ) k3_model.o k3_safetensors.o
+	$(CC) $(QUALITY_CFLAGS) -I. -o $@ k3_static_cache_build.c $(K3_STATIC_CACHE_OBJ) k3_model.o k3_safetensors.o $(LDLIBS) $(K3_STATIC_CACHE_LIBS)
+
+# The fixture includes the module to exercise private corruption hooks.
+# Do not also link the module object.
+tests/test_k3_static_cache: tests/test_k3_static_cache.c k3_static_cache.c k3_static_cache.h k3_static_cache_format.h k3_static_cache.config
+	$(CC) $(QUALITY_CFLAGS) $(K3_STATIC_CACHE_CFLAGS) -I. -o $@ tests/test_k3_static_cache.c $(LDLIBS) $(K3_STATIC_CACHE_LIBS)
+
+test-k3-static-cache: tests/test_k3_static_cache
+	./tests/test_k3_static_cache
 
 tests/test_k3_mla_prefill.o: tests/test_k3_mla_prefill.c k3_metal.h ds4_gpu.h
 	$(CC) $(QUALITY_CFLAGS) -I. -c -o $@ $<
@@ -248,7 +278,7 @@ tests/test_k3_gguf_metal_map: tests/test_k3_gguf_metal_map.o k3_model.o k3_safet
 tests/test_k3_gguf_slice.o: tests/test_k3_gguf_slice.c k3_infer.h k3_model.h
 	$(CC) $(CFLAGS) -I. -c -o $@ tests/test_k3_gguf_slice.c
 
-tests/test_k3_gguf_slice: tests/test_k3_gguf_slice.o k3_infer.o k3_model.o k3_safetensors.o ds4_metal.o ds4_image.o
+tests/test_k3_gguf_slice: tests/test_k3_gguf_slice.o k3_infer.o $(K3_STATIC_CACHE_OBJ) k3_model.o k3_safetensors.o ds4_metal.o ds4_image.o
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
 tests/test_k3_stream: tests/test_k3_stream.c $(CORE_OBJS)
@@ -300,8 +330,25 @@ k3_safetensors.o: k3_safetensors.c k3_safetensors.h
 k3_model.o: k3_model.c k3_model.h k3_safetensors.h
 	$(CC) $(CFLAGS) -c -o $@ k3_model.c
 
-k3_infer.o: k3_infer.c k3_infer.h k3_memory.h k3_model.h k3_safetensors.h k3_metal.h ds4_gpu.h
+k3_infer.o: k3_infer.c k3_infer.h k3_memory.h k3_static_cache.h k3_model.h k3_safetensors.h k3_metal.h ds4_gpu.h
 	$(CC) $(CFLAGS) -c -o $@ k3_infer.c
+
+# Update this stamp only when the selected variant changes. Distinct object
+# names avoid stale codec code, and the stamp also rebuilds/relinks when an
+# older already-built variant is selected again.
+.PHONY: k3-static-cache-config-force
+k3-static-cache-config-force:
+
+k3_static_cache.config: k3-static-cache-config-force
+	@printf '%s\n' '$(K3_STATIC_CACHE_OBJ)' > $@.tmp
+	@cmp -s $@.tmp $@ || mv $@.tmp $@
+	@rm -f $@.tmp
+
+k3_static_cache.zstd.o: k3_static_cache.c k3_static_cache.h k3_static_cache_format.h k3_static_cache.config
+	$(CC) $(QUALITY_CFLAGS) $(K3_STATIC_CACHE_CFLAGS) -c -o $@ k3_static_cache.c
+
+k3_static_cache.stub.o: k3_static_cache.c k3_static_cache.h k3_static_cache_format.h k3_static_cache.config
+	$(CC) $(QUALITY_CFLAGS) -c -o $@ k3_static_cache.c
 
 k3_tokenizer.o: k3_tokenizer.c k3_tokenizer.h k3_safetensors.h
 	$(CC) $(CFLAGS) -c -o $@ k3_tokenizer.c
@@ -1537,6 +1584,7 @@ ds4_cpu_test_hooks.o ds4_cuda_test_hooks.o tests/test_session_state.o \
 tests/test_session_state_gpu.o: ds4_tool_text.h
 
 clean:
+	rm -f k3_static_cache.config k3_static_cache.config.tmp k3-static-cache-build tests/test_k3_static_cache
 	rm -f tests/test_mmvq_cuda tests/test_mmvq_rocm
 	rm -f tests/test_qwen4_ngrams
 	rm -f tests/test_qwen4_ngram_state

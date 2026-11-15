@@ -16,9 +16,174 @@ static void write_all(int fd, const void *p_, size_t bytes, uint64_t offset) {
 }
 
 
+static void test_head_staging_policy(void) {
+    const uint64_t bytes = (uint64_t)K3_N_VOCAB * K3_N_EMBD * sizeof(uint16_t);
+    const uint64_t tile_bytes = (uint64_t)K3_GGUF_HEAD_TILE_ROWS * K3_N_EMBD * sizeof(uint16_t);
+    char path[] = "/tmp/k3-head-policy-XXXXXX";
+    int fd = mkstemp(path); assert(fd >= 0);
+    char header[256];
+    int n = snprintf(header, sizeof(header),
+        "{\"head\":{\"dtype\":\"BF16\",\"shape\":[%u,%u],\"data_offsets\":[0,%llu]}}",
+        (uint32_t)K3_N_VOCAB, (uint32_t)K3_N_EMBD, (unsigned long long)bytes);
+    assert(n > 0 && n < (int)sizeof(header));
+    const uint64_t hbytes = (uint64_t)n;
+    assert(pwrite(fd, &hbytes, 8, 0) == 8);
+    assert(pwrite(fd, header, n, 8) == n);
+    assert(ftruncate(fd, (off_t)(8u + hbytes + bytes)) == 0);
+    char err[512] = {0};
+    k3_st_shard *shard = NULL;
+    assert(k3_st_open(&shard, path, err, sizeof(err)));
+    k3_st_tensor head = *k3_st_find(shard, "head");
+    k3_model model = {.gguf=true};
+    k3_context ctx = {.model=&model, .static_staging=1, .has_output=1,
+                      .layer_end=K3_N_LAYER - 1u};
+    ctx.globals.shard = shard;
+    ctx.globals.lm_head = &head;
+    for (uint32_t i=0; i<2u; i++)
+        ctx.static_slots[i] = (k3_static_slot){.data=(void *)(uintptr_t)(i+1),
+            .capacity=tile_bytes + K3_GGUF_HEAD_IO_ALIGNMENT, .locked=1};
+    assert(setenv("K3_GGUF_HEAD_STAGING", "1", 1) == 0);
+    assert(gguf_head_staging_enabled(&ctx, 1u, 0));
+    assert(!gguf_head_staging_enabled(&ctx, 1u, 1));
+    assert(!gguf_head_staging_enabled(&ctx, 2u, 0));
+    assert(!gguf_head_staging_enabled(NULL, 1u, 0));
+    assert(setenv("K3_GGUF_HEAD_STAGING", "0", 1) == 0);
+    assert(!gguf_head_staging_enabled(&ctx, 1u, 0));
+    assert(setenv("K3_GGUF_HEAD_STAGING", "1", 1) == 0);
+#define REJECT_FIELD(field, value) do { \
+    __typeof__(field) saved = (field); (field) = (value); \
+    assert(!gguf_head_staging_enabled(&ctx, 1u, 0)); (field) = saved; \
+} while (0)
+    REJECT_FIELD(model.gguf, false);
+    REJECT_FIELD(ctx.static_staging, 0);
+    REJECT_FIELD(ctx.has_output, 0);
+    REJECT_FIELD(ctx.layer_end, K3_N_LAYER-2u);
+    REJECT_FIELD(ctx.gguf_resident, 1);
+    REJECT_FIELD(ctx.gguf_static_resident, 1);
+    REJECT_FIELD(ctx.resident_lm_head.data, (void *)1);
+    REJECT_FIELD(ctx.globals.shard, NULL);
+    REJECT_FIELD(ctx.globals.lm_head, NULL);
+    REJECT_FIELD(head.dtype, K3_ST_DTYPE_Q8_0);
+    REJECT_FIELD(head.n_dims, 1u);
+    REJECT_FIELD(head.shape[0], K3_N_VOCAB-1u);
+    REJECT_FIELD(head.shape[1], K3_N_EMBD-1u);
+    REJECT_FIELD(head.size, bytes-1u);
+    REJECT_FIELD(head.offset, head.offset+1u);
+    REJECT_FIELD(head.offset, UINT64_MAX-bytes+1u);
+    for (uint32_t i=0; i<2u; i++) {
+        REJECT_FIELD(ctx.static_slots[i].data, NULL);
+        REJECT_FIELD(ctx.static_slots[i].locked, 0);
+        REJECT_FIELD(ctx.static_slots[i].capacity, tile_bytes + K3_GGUF_HEAD_IO_ALIGNMENT - 1u);
+    }
+#undef REJECT_FIELD
+    assert(gguf_head_staging_enabled(&ctx, 1u, 0));
+    uint64_t lo=0, span=0;
+    /* The real GGUF header shifts every head tile by 11936 bytes. */
+    assert(static_read_span(1ull<<40, 3059360u, tile_bytes,
+                            K3_GGUF_HEAD_IO_ALIGNMENT, &lo, &span));
+    assert(lo == 3047424u && span == tile_bytes + 16384u);
+    k3_st_close(shard); close(fd); unlink(path);
+}
+
 static unsigned char large_pattern(uint64_t offset) {
     return (unsigned char)((offset * 131u + offset / 251u +
                              (offset >> 20u) * 17u + 29u) & 255u);
+}
+
+static void test_static_read_plan(void) {
+    const uint64_t page = 16384u;
+    uint64_t offset = 0, bytes = 0;
+    assert(static_read_span(8u*page, 160u, 2u*page-11u, page,
+                            &offset, &bytes));
+    assert(offset == 0 && bytes == 3u*page);
+    assert(static_read_span(2u*page+123u, 2u*page-100u, 223u, page,
+                            &offset, &bytes));
+    assert(offset == page && bytes == page+123u);
+    assert(static_read_span(8u*page, page, page, page, &offset, &bytes));
+    assert(offset == page && bytes == page);
+    assert(static_read_span(8u*page, 160u, 27u, 1u, &offset, &bytes));
+    assert(offset == 160u && bytes == 27u);
+    assert(static_read_span(UINT64_MAX, UINT64_MAX-10u, 10u, page,
+                            &offset, &bytes));
+    assert(offset == (UINT64_MAX & ~(page-1u)) && bytes == page-1u);
+    assert(!static_read_span(4096u, 4095u, 2u, page, &offset, &bytes));
+    assert(!static_read_span(UINT64_MAX, UINT64_MAX, 1u, page, &offset, &bytes));
+    assert(!static_read_span(4096u, 0, 0, page, &offset, &bytes));
+    assert(!static_read_span(4096u, 0, 1u, 0, &offset, &bytes));
+    assert(!static_read_span(4096u, 0, 1u, 3u, &offset, &bytes));
+}
+
+static void test_aligned_slots(void) {
+    const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
+    const uint64_t offsets[2] = {UINT64_C(4294967296)+160u,
+        UINT64_C(4294967296)+4u*page+672u};
+    const uint64_t sizes[2] = {2u*page-11u, page-23u};
+    const uint64_t file_end = offsets[1]+sizes[1];
+    char path[] = "/tmp/k3-aligned-fixture-XXXXXX";
+    int fd = mkstemp(path); assert(fd >= 0);
+    char header[256];
+    /* A fixed padded header leaves an exact, known absolute payload origin. */
+    const uint64_t header_bytes = 248u;
+    memset(header, ' ', sizeof(header));
+    int n = snprintf(header, sizeof(header),
+        "{\"data\":{\"dtype\":\"U8\",\"shape\":[%llu],\"data_offsets\":[0,%llu]}}",
+        (unsigned long long)(file_end-256u),
+        (unsigned long long)(file_end-256u));
+    assert(n > 0 && n < (int)header_bytes);
+    header[n] = ' ';
+    write_all(fd, &header_bytes, 8u, 0);
+    write_all(fd, header, (size_t)header_bytes, 8u);
+    assert(ftruncate(fd, (off_t)file_end) == 0);
+    const uint64_t begin = offsets[0] & ~(page-1u);
+    const size_t count = (size_t)(file_end-begin);
+    unsigned char *expected = malloc(count); assert(expected);
+    for (size_t i=0; i<count; i++) expected[i] = large_pattern(begin+i);
+    write_all(fd, expected, count, begin);
+    k3_st_shard *shard = NULL; char err[512] = {0};
+    assert(k3_st_open(&shard, path, err, sizeof(err)));
+    k3_layer layers[2] = {
+        {.index=0, .shard=shard, .static_offset=offsets[0], .static_size=sizes[0]},
+        {.index=1, .shard=shard, .static_offset=offsets[1], .static_size=sizes[1]},
+    };
+    k3_model model = {.gguf=true};
+    k3_context ctx = {.model=&model, .layer_start=0, .layer_end=1};
+    ctx.layers[0] = &layers[0]; ctx.layers[1] = &layers[1];
+    const uint64_t original_capacity = static_slots_capacity(&ctx);
+    uint64_t lo=0, span=0;
+    assert(layer_static_read_span(&ctx, &layers[0], &lo, &span));
+    assert(lo == offsets[0] && span == sizes[0]);
+    ctx.gguf_static_aligned = 1;
+    ctx.gguf_staging_bytes = static_slots_capacity(&ctx);
+    assert(ctx.gguf_staging_bytes == original_capacity+2u*page);
+    ctx.gguf_transient_bytes = ctx.gguf_staging_bytes+page;
+    assert(alloc_static_slots(&ctx, err, sizeof(err)));
+    assert(lock_gguf_static_slots(&ctx, err, sizeof(err)));
+    for (unsigned pass=0; pass<4; pass++) {
+        const unsigned i = pass & 1u;
+        k3_static_slot *slot = &ctx.static_slots[i];
+        k3_static_load load = {0};
+        memset(slot->data, 0xa5, (size_t)slot->capacity);
+        assert(static_layer_load_start(&ctx, &load, &layers[i], slot,
+                                       0, 0, err, sizeof(err)));
+        assert(static_load_join(&load, err, sizeof(err)));
+        assert(load.offset % page == 0 && slot->bytes == load.size);
+        assert(load.offset+load.size <= file_end);
+        assert(memcmp(slot->data, expected+(load.offset-begin),
+                      (size_t)load.size) == 0);
+        const k3_weight_source source = {
+            .base=slot->data, .size=slot->bytes, .bias=load.offset};
+        const k3_st_tensor tensor = {.offset=offsets[i], .size=sizes[i]};
+        const uint64_t inner = source_offset(&source, &tensor);
+        assert(inner == offsets[i]-load.offset && inner+sizes[i] <= source.size);
+        assert(memcmp((const unsigned char *)source.base+inner,
+                      expected+(offsets[i]-begin), (size_t)sizes[i]) == 0);
+        for (uint64_t j=slot->bytes; j<slot->capacity; j++)
+            assert(((const unsigned char *)slot->data)[j] == 0xa5);
+        if (i == 1u) assert(slot->bytes < slot->capacity); /* EOF clamp. */
+    }
+    free_static_slots(&ctx);
+    k3_st_close(shard); close(fd); unlink(path); free(expected);
+    puts("static staging: aligned cover, source bias, both slots and EOF clamp passed");
 }
 
 static void test_large_multiworker(void) {
@@ -90,6 +255,32 @@ static void test_large_multiworker(void) {
     assert(strstr(err, "unexpected end of file"));
     free_static_slots(&ctx);
     assert(!ctx.gguf_staging_locked_bytes && !slot->data);
+    /* The same payload through the opt-in covering span keeps worker file
+     * offsets and destinations aligned, including a clipped EOF tail. */
+    ctx.gguf_static_aligned = 1;
+    ctx.gguf_staging_bytes = static_slots_capacity(&ctx);
+    ctx.gguf_transient_bytes = ctx.gguf_staging_bytes+page;
+    assert(alloc_static_slots(&ctx, err, sizeof(err)));
+    assert(lock_gguf_static_slots(&ctx, err, sizeof(err)));
+    slot = &ctx.static_slots[0];
+    memset(slot->data, 0xa5, (size_t)slot->capacity);
+    assert(static_layer_load_start(&ctx, &load, &layer, slot, 0, 0,
+                                   err, sizeof(err)));
+    assert(static_load_join(&load, err, sizeof(err)));
+    assert(load.offset % page == 0 && load.offset+load.size == offset+bytes);
+    actual = slot->data;
+    for (uint64_t i=0; i<load.size; i++) {
+        const uint64_t absolute = load.offset+i;
+        const unsigned char want = absolute < offset ? 0 : large_pattern(absolute-offset);
+        assert(actual[i] == want);
+    }
+    const k3_weight_source source = {
+        .base=slot->data, .size=slot->bytes, .bias=load.offset};
+    const k3_st_tensor tensor = {.offset=offset, .size=bytes};
+    const uint64_t leading = source_offset(&source, &tensor);
+    assert(leading == offset-load.offset && leading+bytes == source.size);
+    for (uint64_t i=load.size; i<slot->capacity; i++) assert(actual[i] == 0xa5);
+    free_static_slots(&ctx);
     k3_st_close(shard); close(fd); unlink(path);
     puts("static staging: optional 67MiB two-worker partition, bias, tail and EOF passed");
 }
@@ -225,6 +416,9 @@ int main(void) {
     status=0; assert(waitpid(child, &status, 0)==child);
     assert(WIFEXITED(status) && WEXITSTATUS(status)==0);
     k3_st_close(shard); close(fd); unlink(path); free(pattern);
+    test_static_read_plan();
+    test_aligned_slots();
+    test_head_staging_policy();
     if (large) test_large_multiworker();
     puts("static staging: exact offset/tail/reuse bytes, EOF, lock accounting and cleanup passed (no GPU)");
     return 0;

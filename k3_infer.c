@@ -3,6 +3,7 @@
 
 #include "k3_infer.h"
 #include "k3_memory.h"
+#include "k3_static_cache.h"
 
 #include "ds4_gpu.h"
 #include "k3_metal.h"
@@ -212,6 +213,7 @@ struct k3_context {
     uint64_t expert_stream_bytes;
     double expert_stream_seconds;
     uint64_t static_stream_bytes;
+    uint64_t static_cache_physical_bytes;
     double static_stream_seconds;
     uint64_t route_overlap;
     uint64_t route_total;
@@ -228,6 +230,9 @@ struct k3_context {
     int32_t predicted_route[K3_N_LAYER][K3_N_EXPERT_USED];
     uint8_t predicted_route_valid[K3_N_LAYER];
     int static_staging;
+    int gguf_static_aligned;
+    k3_static_cache *static_cache;
+    uint64_t static_cache_workspace_bytes;
     int resident_static;
     int selective_shared;
     int pinned_static;
@@ -325,6 +330,8 @@ typedef struct {
     uint64_t size;
     uint64_t skip_offset;
     uint64_t skip_size;
+    k3_static_cache *cache;
+    uint64_t physical_bytes;
     int started;
     int ok;
     double seconds;
@@ -378,6 +385,11 @@ static int static_staging_requested(void) {
 
 static int gguf_static_staging_requested(void) {
     const char *value = getenv("K3_GGUF_STATIC_STAGING");
+    return value && value[0] && strcmp(value, "0") != 0;
+}
+
+static int gguf_static_aligned_requested(void) {
+    const char *value = getenv("K3_GGUF_STATIC_ALIGNED");
     return value && value[0] && strcmp(value, "0") != 0;
 }
 
@@ -1090,13 +1102,57 @@ static void layer_static_skip(const k3_context *ctx,
     (void)layer_shared_span(layer, offset, bytes);
 }
 
+/* Plan a covering read without moving the payload inside its buffer. A short
+ * final page at EOF is valid; allocation still rounds capacity up separately. */
+static int static_read_span(uint64_t file_size,
+                            uint64_t offset,
+                            uint64_t bytes,
+                            uint64_t alignment,
+                            uint64_t *read_offset,
+                            uint64_t *read_bytes) {
+    if (!read_offset || !read_bytes || !bytes || !alignment ||
+        (alignment & (alignment - 1u)) != 0 || offset > file_size ||
+        bytes > file_size - offset) return 0;
+    const uint64_t begin = offset & ~(alignment - 1u);
+    const uint64_t end = offset + bytes;
+    uint64_t rounded_end = 0;
+    if (!k3_memory_align(end, alignment, &rounded_end)) {
+        /* Rounding above UINT64_MAX is only a valid clipped final page. */
+        rounded_end = file_size;
+    }
+    if (rounded_end > file_size) rounded_end = file_size;
+    if (rounded_end < end || rounded_end <= begin) return 0;
+    *read_offset = begin;
+    *read_bytes = rounded_end - begin;
+    return 1;
+}
+
+static int layer_static_read_span(const k3_context *ctx,
+                                  const k3_layer *layer,
+                                  uint64_t *offset,
+                                  uint64_t *bytes) {
+    if (!ctx || !layer || !offset || !bytes) return 0;
+    if (!ctx->gguf_static_aligned) {
+        *offset = layer->static_offset;
+        *bytes = layer->static_size;
+        return 1;
+    }
+    const long page = sysconf(_SC_PAGESIZE);
+    return layer->shard && page > 0 &&
+        static_read_span(k3_st_file_size(layer->shard),
+                         layer->static_offset, layer->static_size,
+                         (uint64_t)page, offset, bytes);
+}
+
 static uint64_t static_slots_capacity(const k3_context *ctx) {
     const long page_value = sysconf(_SC_PAGESIZE);
     if (!ctx || page_value <= 0) return 0;
     uint64_t max_static[2] = {0};
     for (uint32_t i = ctx->layer_start; i <= ctx->layer_end; i++) {
         const uint32_t slot = i & 1u;
-        const uint64_t bytes = ctx->layers[i]->static_size;
+        uint64_t offset = 0, bytes = 0;
+        if (!layer_static_read_span(ctx, ctx->layers[i], &offset, &bytes))
+            return 0;
         if (bytes > max_static[slot]) max_static[slot] = bytes;
     }
     const uint64_t page = (uint64_t)page_value;
@@ -1113,6 +1169,47 @@ static uint64_t static_slots_capacity(const k3_context *ctx) {
     return total;
 }
 
+/* Open only bounded metadata before admission. Workspaces are prepared after
+ * the full cache/staging budget has been admitted. A sidecar covers all model
+ * layers, so the same cache can also serve a context evaluating a layer slice. */
+static int open_gguf_static_cache(k3_context *ctx, char *err, size_t errcap) {
+    const char *path = getenv("K3_GGUF_STATIC_CACHE");
+    if (!path || !path[0]) return 1;
+    const char *resident = getenv("K3_RESIDENT_STATIC");
+    const char *resident_gib = getenv("K3_RESIDENT_STATIC_GIB");
+    const char *full = getenv("K3_GGUF_RESIDENT");
+    if (path[0] != '/' || !ctx || !ctx->model || !ctx->model->gguf ||
+        !gguf_static_staging_requested() || !ctx->gguf_static_aligned ||
+        !resident || strcmp(resident, "0") != 0 ||
+        (resident_gib && resident_gib[0]) ||
+        (full && full[0] && strcmp(full, "0") != 0 && strcmp(full, "auto") != 0)) {
+        set_error(err, errcap,
+                  "K3_GGUF_STATIC_CACHE requires an absolute path, GGUF "
+                  "staging/aligned reads, K3_RESIDENT_STATIC=0 without a GIB "
+                  "override, and nonresident GGUF mode");
+        return 0;
+    }
+    k3_static_cache_span spans[K3_N_LAYER];
+    for (uint32_t i = 0; i < K3_N_LAYER; i++) {
+        spans[i].layer = i;
+        if (!layer_static_read_span(ctx, ctx->layers[i],
+                                   &spans[i].offset, &spans[i].bytes)) {
+            set_error(err, errcap, "invalid K3 static cache layer span");
+            return 0;
+        }
+    }
+    if (!k3_static_cache_open(path, k3_st_fd(ctx->globals.shard), spans,
+                             K3_N_LAYER, 4u, &ctx->static_cache, err, errcap))
+        return 0;
+    ctx->static_cache_workspace_bytes =
+        k3_static_cache_workspace_bytes(ctx->static_cache);
+    if (!ctx->static_cache_workspace_bytes) {
+        set_error(err, errcap, "invalid K3 static cache workspace capacity");
+        return 0;
+    }
+    return 1;
+}
+
 static int alloc_static_slots(
         k3_context *ctx,
         char *err,
@@ -1120,7 +1217,11 @@ static int alloc_static_slots(
     uint64_t max_static[2] = {0};
     for (uint32_t i = ctx->layer_start; i <= ctx->layer_end; i++) {
         const uint32_t slot = i & 1u;
-        const uint64_t bytes = ctx->layers[i]->static_size;
+        uint64_t offset = 0, bytes = 0;
+        if (!layer_static_read_span(ctx, ctx->layers[i], &offset, &bytes)) {
+            set_error(err, errcap, "invalid K3 static read span");
+            return 0;
+        }
         if (bytes > max_static[slot]) {
             max_static[slot] = bytes;
         }
@@ -1511,7 +1612,8 @@ static int map_static_slot_span(
             bytes,
             0,
             bytes,
-            K3_LAYER_MAX_TENSOR_BYTES)) {
+            bytes < K3_LAYER_MAX_TENSOR_BYTES
+                ? bytes : K3_LAYER_MAX_TENSOR_BYTES)) {
         set_error(err, errcap,
                   "Metal could not map K3 staged layer %u",
                   layer ? layer->index : UINT32_MAX);
@@ -2094,6 +2196,16 @@ static void *static_load_main(void *arg) {
     discard_unused_static_pages(load->slot, load->size);
     load->slot->bytes = 0;
     const double start = now_seconds();
+    if (load->cache) {
+        load->ok = load->skip_size == 0 &&
+            k3_static_cache_read(load->cache, load->layer->index,
+                load->offset, load->size, load->slot->data,
+                load->slot->capacity, &load->physical_bytes,
+                load->error, sizeof(load->error));
+        load->seconds = now_seconds() - start;
+        if (load->ok) load->slot->bytes = load->size;
+        return NULL;
+    }
     const int fd = open_uncached_stream_fd(
         load->layer->shard, load->error, sizeof(load->error));
     if (fd < 0) {
@@ -2192,11 +2304,14 @@ static void *static_load_main(void *arg) {
     }
     close(fd);
     load->seconds = now_seconds() - start;
-    if (load->ok) load->slot->bytes = load->size;
+    if (load->ok) {
+        load->slot->bytes = load->size;
+        load->physical_bytes = logical_size;
+    }
     return NULL;
 }
 
-static int static_span_load_start(
+static int static_span_load_start_with_cache(
         k3_static_load *load,
         k3_layer *layer,
         k3_static_slot *slot,
@@ -2204,9 +2319,11 @@ static int static_span_load_start(
         uint64_t size,
         uint64_t skip_offset,
         uint64_t skip_size,
+        k3_static_cache *cache,
         char *err,
         size_t errcap) {
     if (!load || load->started || !layer || !slot || !slot->data ||
+        (cache && skip_size != 0) ||
         size == 0 || size > slot->capacity || skip_size > size ||
         (skip_size != 0 &&
          (skip_offset < offset ||
@@ -2221,6 +2338,7 @@ static int static_span_load_start(
         .size = size,
         .skip_offset = skip_offset,
         .skip_size = skip_size,
+        .cache = cache,
         .ok = 0,
     };
     const int rc = pthread_create(
@@ -2233,6 +2351,42 @@ static int static_span_load_start(
     }
     load->started = 1;
     return 1;
+}
+
+/* The generic span contract still reads the original model, including head
+ * tiles. Cache selection is confined to the static-layer wrapper below. */
+static int static_span_load_start(
+        k3_static_load *load,
+        k3_layer *layer,
+        k3_static_slot *slot,
+        uint64_t offset,
+        uint64_t size,
+        uint64_t skip_offset,
+        uint64_t skip_size,
+        char *err,
+        size_t errcap) {
+    return static_span_load_start_with_cache(load, layer, slot, offset, size,
+                                             skip_offset, skip_size, NULL,
+                                             err, errcap);
+}
+
+static int static_layer_load_start(
+        const k3_context *ctx,
+        k3_static_load *load,
+        k3_layer *layer,
+        k3_static_slot *slot,
+        uint64_t skip_offset,
+        uint64_t skip_size,
+        char *err,
+        size_t errcap) {
+    uint64_t offset = 0, bytes = 0;
+    if (!layer_static_read_span(ctx, layer, &offset, &bytes)) {
+        set_error(err, errcap, "invalid K3 staged layer read span");
+        return 0;
+    }
+    return static_span_load_start_with_cache(load, layer, slot, offset, bytes,
+                                             skip_offset, skip_size,
+                                             ctx->static_cache, err, errcap);
 }
 
 static int static_load_start(
@@ -3462,6 +3616,7 @@ static int start_speculative_experts(k3_context *ctx,
 static int map_global_tensors(k3_context *ctx,
                               const k3_st_shard *shard,
                               int embedding,
+                              int skip_head,
                               char *err,
                               size_t errcap) {
     if (!ctx) {
@@ -3486,7 +3641,7 @@ static int map_global_tensors(k3_context *ctx,
         g->lm_head,
     };
     uint64_t offsets[4], sizes[4], max_tensor = 1;
-    const uint32_t count = ctx->resident_lm_head.data ? 3u : 4u;
+    const uint32_t count = ctx->resident_lm_head.data || skip_head ? 3u : 4u;
     for (uint32_t i = 0; i < count; i++) {
         offsets[i] = tensors[i]->offset;
         sizes[i] = tensors[i]->size;
@@ -4846,10 +5001,122 @@ static int run_layer(k3_context *ctx,
     return 1;
 }
 
+/* Each BF16 vocabulary row is an independent dot product. A 32768-row
+ * tile occupies 448 MiB and keeps the same M1 single-row kernel as the full
+ * head. Reuse the already-locked static slots; no extra weights are pinned. */
+enum { K3_GGUF_HEAD_TILE_ROWS = 32768, K3_GGUF_HEAD_IO_ALIGNMENT = 16384 };
+
+static int gguf_head_staging_enabled(const k3_context *ctx,
+                                     uint32_t rows, int prefill) {
+    const char *value = getenv("K3_GGUF_HEAD_STAGING");
+    if (!value || !value[0] || !strcmp(value, "0") ||
+        !ctx || !ctx->model || !ctx->model->gguf ||
+        rows != 1u || prefill || !ctx->has_output ||
+        ctx->layer_end + 1u != K3_N_LAYER || !ctx->static_staging ||
+        ctx->gguf_resident || ctx->gguf_static_resident ||
+        ctx->resident_lm_head.data) return 0;
+    const k3_st_tensor *head = ctx->globals.lm_head;
+    const uint64_t row_bytes = (uint64_t)K3_N_EMBD * sizeof(uint16_t);
+    const uint64_t tile_bytes = row_bytes * K3_GGUF_HEAD_TILE_ROWS;
+    if (!head || head->dtype != K3_ST_DTYPE_BF16 ||
+        head->n_dims != 2u || head->shape[0] != K3_N_VOCAB ||
+        head->shape[1] != K3_N_EMBD ||
+        head->size != row_bytes * K3_N_VOCAB ||
+        head->offset > UINT64_MAX - head->size ||
+        !ctx->globals.shard ||
+        head->offset + head->size > k3_st_file_size(ctx->globals.shard))
+        return 0;
+    for (uint32_t i = 0; i < 2u; i++) {
+        if (!ctx->static_slots[i].data || !ctx->static_slots[i].locked ||
+            ctx->static_slots[i].capacity < tile_bytes +
+                K3_GGUF_HEAD_IO_ALIGNMENT) return 0;
+    }
+    return 1;
+}
+
+static int run_staged_output_head(k3_context *ctx,
+                                   char *err, size_t errcap) {
+    const k3_st_tensor *head = ctx->globals.lm_head;
+    const uint64_t row_bytes = (uint64_t)K3_N_EMBD * sizeof(uint16_t);
+    k3_layer *descriptor = ctx->layers[ctx->layer_end];
+    k3_static_load load = {0};
+    ds4_gpu_tensor *out_view = NULL;
+    double read_seconds = 0.0;
+    uint32_t tile_index = 0;
+    uint64_t read_offset = 0, read_bytes = 0;
+    const uint64_t file_size = k3_st_file_size(ctx->globals.shard);
+    int ok = 0;
+    if (!gguf_head_staging_enabled(ctx, 1u, 0) || !descriptor ||
+        !static_read_span(file_size, head->offset,
+            row_bytes * K3_GGUF_HEAD_TILE_ROWS, K3_GGUF_HEAD_IO_ALIGNMENT, &read_offset, &read_bytes) ||
+        !static_span_load_start(&load, descriptor, &ctx->static_slots[0],
+            read_offset, read_bytes, 0, 0, err, errcap)) goto done;
+    for (uint32_t row = 0; row < K3_N_VOCAB;
+         row += K3_GGUF_HEAD_TILE_ROWS, tile_index++) {
+        const uint32_t count = K3_N_VOCAB - row < K3_GGUF_HEAD_TILE_ROWS
+            ? K3_N_VOCAB - row : K3_GGUF_HEAD_TILE_ROWS;
+        const uint64_t bytes = row_bytes * count;
+        k3_static_slot *slot = &ctx->static_slots[tile_index & 1u];
+        if (!static_load_join(&load, err, errcap)) goto done;
+        read_seconds += load.seconds;
+        const uint64_t current_read_offset = load.offset;
+        const uint64_t current_read_bytes = load.size;
+        if (!check_gguf_memory(ctx, "before output head tile", ctx->layer_end,
+                               err, errcap)) goto done;
+        const uint32_t next = row + count;
+        if (next < K3_N_VOCAB) {
+            const uint32_t next_count = K3_N_VOCAB - next < K3_GGUF_HEAD_TILE_ROWS
+                ? K3_N_VOCAB - next : K3_GGUF_HEAD_TILE_ROWS;
+            if (!static_read_span(file_size,
+                    head->offset + (uint64_t)next * row_bytes,
+                    (uint64_t)next_count * row_bytes, K3_GGUF_HEAD_IO_ALIGNMENT, &read_offset, &read_bytes) ||
+                !static_span_load_start(&load, descriptor,
+                    &ctx->static_slots[(tile_index + 1u) & 1u],
+                    read_offset, read_bytes, 0, 0, err, errcap)) goto done;
+        }
+        k3_st_tensor tile = *head;
+        tile.offset += (uint64_t)row * row_bytes;
+        tile.size = bytes;
+        tile.shape[0] = count;
+        const k3_weight_source source = {
+            .base = slot->data, .size = current_read_bytes,
+            .bias = current_read_offset,
+        };
+        out_view = ds4_gpu_tensor_view(ctx->scratch.logits,
+            (uint64_t)row * sizeof(float), (uint64_t)count * sizeof(float));
+        if (!out_view ||
+            !map_static_slot_span(slot, descriptor, current_read_bytes, err, errcap) ||
+            !ds4_gpu_begin_commands() ||
+            !matmul(out_view, &tile, ctx->scratch.final_norm,
+                    K3_N_EMBD, count, 1u, &source) ||
+            !ds4_gpu_end_commands() || !ds4_gpu_release_model_views())
+            goto done;
+        ds4_gpu_tensor_free(out_view);
+        out_view = NULL;
+        /* Current GPU readers have retired before this slot can be filled
+         * again two tiles later. Only the other slot may load concurrently. */
+    }
+    if (io_profile_enabled()) {
+        fprintf(stderr,
+                "k3: output head staging tiles=%u tile_rows=%u bytes=%.3f GiB "
+                "read=%.6f s\n", tile_index, (uint32_t)K3_GGUF_HEAD_TILE_ROWS,
+                (double)head->size / 1073741824.0, read_seconds);
+    }
+    ok = 1;
+done:
+    static_load_cancel(&load);
+    if (!ds4_gpu_synchronize() || !ds4_gpu_release_model_views()) ok = 0;
+    ds4_gpu_tensor_free(out_view);
+    if (!ok && (!err || !err[0]))
+        set_error(err, errcap, "K3 staged output head failed");
+    return ok;
+}
+
 static int run_output(k3_context *ctx,
                       uint32_t rows,
                       float *logits,
                       k3_output_prefetch *output_prefetch,
+                      int stage_head,
                       char *err,
                       size_t errcap) {
     k3_scratch *s = &ctx->scratch;
@@ -4865,7 +5132,7 @@ static int run_output(k3_context *ctx,
     if (!output_prefetch_join(output_prefetch, err, errcap) ||
         (!ctx->gguf_resident && !ds4_gpu_synchronize()) ||
         (streamed_output && !k3_st_map(output_shard, err, errcap)) ||
-        !map_global_tensors(ctx, output_shard, 0, err, errcap) ||
+        !map_global_tensors(ctx, output_shard, 0, stage_head, err, errcap) ||
         !ds4_gpu_begin_commands()) {
         if (!err || !err[0]) set_error(err, errcap, "K3 output setup failed");
         goto done;
@@ -4910,9 +5177,12 @@ static int run_output(k3_context *ctx,
     if (!last ||
         !rms_norm(s->final_norm, last, g->norm,
                   K3_N_EMBD, 1, &source) ||
-        !matmul(s->logits, g->lm_head, s->final_norm,
-                K3_N_EMBD, K3_N_VOCAB, 1, &head_source) ||
-        !ds4_gpu_end_commands() ||
+        !(stage_head
+            ? (ds4_gpu_end_commands() && ds4_gpu_release_model_views() &&
+               run_staged_output_head(ctx, err, errcap))
+            : (matmul(s->logits, g->lm_head, s->final_norm,
+                       K3_N_EMBD, K3_N_VOCAB, 1, &head_source) &&
+               ds4_gpu_end_commands())) ||
         !ds4_gpu_tensor_read(
             s->logits, 0, logits,
             (uint64_t)K3_N_VOCAB * sizeof(float))) {
@@ -5036,6 +5306,8 @@ static int evaluate(k3_context *ctx,
     /* GGUF staging is decode-only; prefill retains its mapped FP32 path. */
     const int stage_static = ctx->static_staging && rows == 1u &&
         (!ctx->model->gguf || (!prefill && !ctx->gguf_resident));
+    const int stage_head = output_logits &&
+        gguf_head_staging_enabled(ctx, rows, prefill);
     const uint32_t first_layer = ctx->layer_start;
     const int first_resident =
         ctx->q8_static ||
@@ -5046,6 +5318,7 @@ static int evaluate(k3_context *ctx,
     ctx->expert_stream_bytes = 0;
     ctx->expert_stream_seconds = 0.0;
     ctx->static_stream_bytes = 0;
+    ctx->static_cache_physical_bytes = 0;
     ctx->static_stream_seconds = 0.0;
     ctx->route_overlap = 0;
     ctx->route_total = 0;
@@ -5084,12 +5357,11 @@ static int evaluate(k3_context *ctx,
         : first_resident
         ? 1
         : (stage_static
-            ? static_span_load_start(
+            ? static_layer_load_start(
+                  ctx,
                   &static_load,
                   ctx->layers[first_layer],
                   &ctx->static_slots[first_layer & 1u],
-                  ctx->layers[first_layer]->static_offset,
-                  ctx->layers[first_layer]->static_size,
                   0,
                   0,
                   err,
@@ -5145,6 +5417,8 @@ static int evaluate(k3_context *ctx,
         }
         const int layer_resident =
             ctx->q8_static || ctx->resident_static_slots[i].data != NULL;
+        const int staged_layer = stage_static && !layer_resident &&
+            !ctx->gguf_static_layers[i];
         if (ctx->model->gguf && !stage_static &&
             ((!ctx->gguf_resident && !ctx->gguf_static_layers[i]) ||
              resident_readahead)) {
@@ -5165,8 +5439,12 @@ static int evaluate(k3_context *ctx,
                 return 0;
             }
             ctx->static_stream_bytes +=
-                layer_stream_static_size(ctx, layer);
+                ctx->gguf_static_aligned
+                    ? static_load.size - static_load.skip_size
+                    : layer_stream_static_size(ctx, layer);
             ctx->static_stream_seconds += static_load.seconds;
+            if (static_load.cache)
+                ctx->static_cache_physical_bytes += static_load.physical_bytes;
         } else if (!ctx->model->gguf && !layer_resident) {
             layer = NULL;
             if (!k3_layer_load_join(current_load, &layer, err, errcap)) {
@@ -5177,6 +5455,12 @@ static int evaluate(k3_context *ctx,
             current_load = NULL;
         }
         const double layer_ready = profile ? now_seconds() : 0.0;
+        /* Save the completed buffer's coordinates before the next load
+         * reuses static_load. Tensor offsets remain absolute in the file. */
+        const uint64_t map_offset = staged_layer
+            ? static_load.offset : layer->static_offset;
+        const uint64_t map_size = staged_layer
+            ? static_load.size : layer->static_size;
         if (i < ctx->layer_end) {
             uint64_t next_skip_offset = 0;
             uint64_t next_skip_bytes = 0;
@@ -5207,12 +5491,11 @@ static int evaluate(k3_context *ctx,
                           err,
                           errcap)
                     : stage_static
-                    ? static_span_load_start(
+                    ? static_layer_load_start(
+                          ctx,
                           &static_load,
                           ctx->layers[i + 1u],
                           &ctx->static_slots[(i + 1u) & 1u],
-                          ctx->layers[i + 1u]->static_offset,
-                          ctx->layers[i + 1u]->static_size,
                           next_skip_offset,
                           next_skip_bytes,
                           err,
@@ -5234,10 +5517,6 @@ static int evaluate(k3_context *ctx,
                 }
             }
         }
-        const uint64_t map_size =
-            layer->static_size;
-        const int staged_layer = stage_static && !layer_resident &&
-            !ctx->gguf_static_layers[i];
         const k3_static_slot *static_slot = ctx->q8_static
             ? &ctx->q8_layers[i].native
             : (layer_resident
@@ -5280,7 +5559,7 @@ static int evaluate(k3_context *ctx,
                           !ctx->q8_static
                       ? static_slot->capacity
                       : map_size,
-                  .bias = layer->static_offset,
+                  .bias = map_offset,
                   .q8 = ctx->q8_static ? &ctx->q8_layers[i] : NULL,
                   .streamed_small_batches = ctx->model->gguf &&
                       ds4_gpu_device_is_pre_m5_apple_silicon(),
@@ -5331,7 +5610,7 @@ static int evaluate(k3_context *ctx,
                 rows,
                 prefill,
                 i != 0,
-                output_logits && i + 1u == K3_N_LAYER
+                output_logits && !stage_head && i + 1u == K3_N_LAYER
                     ? &output_prefetch
                     : NULL,
                 err,
@@ -5394,7 +5673,7 @@ static int evaluate(k3_context *ctx,
          !export_boundary(ctx, output_boundary, rows)) ||
         (output_logits &&
          !run_output(
-             ctx, rows, logits, &output_prefetch, err, errcap))) {
+             ctx, rows, logits, &output_prefetch, stage_head, err, errcap))) {
         if ((!err || !err[0]) && output_boundary) {
             set_error(err, errcap, "K3 boundary export failed");
         }
@@ -5420,10 +5699,19 @@ static int evaluate(k3_context *ctx,
             fprintf(stderr,
                     "k3: static I/O threads=%u bytes=%.3f GiB "
                     "read=%.3f s throughput=%.2f GiB/s\n",
-                    static_io_threads(),
+                    ctx->static_cache ? 4u : static_io_threads(),
                     static_gib,
                     ctx->static_stream_seconds,
                     static_gib / ctx->static_stream_seconds);
+            if (ctx->static_cache) {
+                fprintf(stderr,
+                        "k3: static cache I/O physical=%.3f GiB logical=%.3f GiB "
+                        "physical_bytes=%" PRIu64 " logical_bytes=%" PRIu64
+                        " read=%.6f s\n",
+                        (double)ctx->static_cache_physical_bytes / 1073741824.0,
+                        static_gib, ctx->static_cache_physical_bytes,
+                        ctx->static_stream_bytes, ctx->static_stream_seconds);
+            }
         }
         if (ctx->route_total != 0) {
             fprintf(stderr,
@@ -5576,6 +5864,14 @@ int k3_context_create(k3_context **out,
     }
     const int want_gguf_staging = ctx->model->gguf &&
         gguf_static_staging_requested();
+    ctx->gguf_static_aligned =
+        want_gguf_staging && gguf_static_aligned_requested();
+    if (ctx->gguf_static_aligned)
+        fprintf(stderr, "k3: aligned GGUF static reads enabled for decode\n");
+    if (!open_gguf_static_cache(ctx, err, errcap)) {
+        k3_context_destroy(ctx);
+        return 0;
+    }
     const uint64_t initial_tensors = ds4_gpu_tensor_allocated_bytes();
     uint64_t gguf_budget = 0;
     if (ctx->model->gguf) {
@@ -5587,6 +5883,20 @@ int k3_context_create(k3_context **out,
             set_error(err, errcap, "invalid K3 GGUF streaming memory spans");
             k3_context_destroy(ctx);
             return 0;
+        }
+        if (ctx->static_cache) {
+            if (ctx->static_cache_workspace_bytes >
+                    UINT64_MAX - ctx->gguf_transient_bytes) {
+                set_error(err, errcap, "K3 static cache workspace overflow");
+                k3_context_destroy(ctx);
+                return 0;
+            }
+            ctx->gguf_transient_bytes += ctx->static_cache_workspace_bytes;
+            fprintf(stderr,
+                    "k3: lossless GGUF static cache workspace %.2f MiB "
+                    "(4 workers, bytes=%" PRIu64 ")\n",
+                    (double)ctx->static_cache_workspace_bytes / 1048576.0,
+                    ctx->static_cache_workspace_bytes);
         }
         if (want_gguf_staging) {
             /* Anonymous slots are lazy initially. Charge their full capacity
@@ -5660,7 +5970,9 @@ int k3_context_create(k3_context **out,
         ? 0 : resident_static_budget(allocated_tensors);
     if (ctx->model->gguf && resident_budget > gguf_budget)
         resident_budget = gguf_budget;
-    if (!try_pin_resident_gguf(
+    /* A requested sidecar selects the nonresident staging path. Explicit
+     * full residency was rejected before metadata open; skip auto-residency. */
+    if (!ctx->static_cache && !try_pin_resident_gguf(
             ctx, resident_budget, err, errcap)) {
         k3_context_destroy(ctx);
         return 0;
@@ -5857,6 +6169,13 @@ int k3_context_create(k3_context **out,
         k3_context_destroy(ctx);
         return 0;
     }
+    if (ctx->static_cache &&
+        (!check_gguf_memory(ctx, "before static cache workspace",
+                            ctx->layer_start, err, errcap) ||
+         !k3_static_cache_prepare(ctx->static_cache, err, errcap))) {
+        k3_context_destroy(ctx);
+        return 0;
+    }
     if (ctx->model->gguf && !ctx->gguf_resident) {
         /* Future session clones must not consume memory reserved for cache
          * slabs that are still empty, or for mapped/prefetched weights. */
@@ -5902,6 +6221,10 @@ int k3_context_clone(k3_context **out,
     ctx->layer_end = owner->layer_end;
     ctx->has_output = owner->has_output;
     ctx->static_staging = owner->static_staging;
+    ctx->gguf_static_aligned = owner->gguf_static_aligned;
+    ctx->static_cache = owner->static_cache;
+    ctx->static_cache_workspace_bytes = owner->static_cache_workspace_bytes;
+    k3_static_cache_retain(ctx->static_cache);
     ctx->resident_static = owner->resident_static;
     ctx->selective_shared = owner->selective_shared;
     ctx->pinned_static = owner->pinned_static;
@@ -5946,6 +6269,7 @@ int k3_context_clone(k3_context **out,
     }
     pthread_mutex_unlock(&owner->execution_mutex);
     if (!states_ok) {
+        k3_static_cache_release(ctx->static_cache);
         free(ctx);
         return 0;
     }
@@ -5963,6 +6287,8 @@ void k3_context_destroy(k3_context *ctx) {
         (void)finish_all_speculative_experts(ctx, NULL, 0);
         (void)ds4_gpu_synchronize();
         free_states(ctx);
+        k3_static_cache_release(ctx->static_cache);
+        ctx->static_cache = NULL;
         if (owner && owner->execution_mutex_initialized) {
             pthread_mutex_unlock(&owner->execution_mutex);
         }
@@ -5986,6 +6312,10 @@ void k3_context_destroy(k3_context *ctx) {
     ds4_gpu_cleanup();
     free_static_slots(ctx);
     free_resident_static_slots(ctx);
+    /* evaluate joins/cancels its loader on every exit before releasing the
+     * execution mutex. No cache read remains when context cleanup begins. */
+    k3_static_cache_release(ctx->static_cache);
+    ctx->static_cache = NULL;
     for (uint32_t i = 0; i < K3_N_LAYER; i++) {
         if (ctx->expert_fds[i] >= 0) close(ctx->expert_fds[i]);
         k3_layer_close(ctx->layers[i]);
