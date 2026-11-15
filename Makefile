@@ -85,13 +85,14 @@ ifeq ($(UNAME_S),Darwin)
 
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
 
-.PHONY: test-k3 test-k3-memory test-k3-stream-mapping test-k3-bf16-rows test-k3-bf16-fused test-k3-mla-prefill test-k3-kda-prefill test-k3-gguf test-k3-gguf-source
+.PHONY: test-k3 test-k3-memory test-k3-static-staging test-k3-stream-mapping test-k3-bf16-rows test-k3-bf16-fused test-k3-mla-prefill test-k3-kda-prefill test-k3-gguf test-k3-gguf-source
 
 help:
 	@echo "DS4 build targets:"
 	@echo "  make              Build Metal ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
 	@echo "  make test-k3      Run K3 unit tests and the downloaded checkpoint smoke test"
 	@echo "  make test-k3-memory Run memory-budget tests without Metal or model weights"
+	@echo "  make test-k3-static-staging Run static-loader byte/lock fixtures without GPU execution"
 	@echo "  make test-k3-stream-mapping Run a tiny synthetic Metal mapping-lifetime test"
 	@echo "  make test-k3-gguf Run K3 mixed-Q2 GGUF parser and Metal smoke tests"
 	@echo "  make test-k3-gguf-source Byte-compare every retained K3 GGUF tensor with SafeTensors"
@@ -190,6 +191,16 @@ test-k3-bf16-fused: tests/test_k3_bf16_fused
 	./tests/test_k3_bf16_fused --resident
 	./tests/test_k3_bf16_fused
 
+# This fixture includes the internal loader, so do not also link k3_infer.o.
+tests/test_k3_static_staging.o: tests/test_k3_static_staging.c k3_infer.c k3_infer.h k3_memory.h k3_model.h k3_safetensors.h k3_metal.h ds4_gpu.h
+	$(CC) $(QUALITY_CFLAGS) -I. -c -o $@ $<
+
+tests/test_k3_static_staging: tests/test_k3_static_staging.o k3_model.o k3_safetensors.o ds4_metal.o ds4_image.o
+	$(CC) $(QUALITY_CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+test-k3-static-staging: tests/test_k3_static_staging
+	./tests/test_k3_static_staging
+
 tests/test_k3_mla_prefill.o: tests/test_k3_mla_prefill.c k3_metal.h ds4_gpu.h
 	$(CC) $(QUALITY_CFLAGS) -I. -c -o $@ $<
 
@@ -266,7 +277,8 @@ test-k3-gguf: ds4 tests/test_k3_gguf tests/test_k3_tokenizer tests/test_k3_gguf_
 test-k3-gguf-source: tests/test_k3_gguf
 	./tests/test_k3_gguf "$(K3_GGUF)" "$(K3_MODEL)"
 
-test-k3: ds4 tests/test_k3_safetensors tests/test_k3_tokenizer tests/test_k3_bf16_rows tests/test_k3_bf16_fused tests/test_k3_mla_prefill tests/test_k3_kda_prefill tests/test_k3_metal tests/test_k3_checkpoint tests/test_k3_gguf_slice
+test-k3: ds4 tests/test_k3_static_staging tests/test_k3_safetensors tests/test_k3_tokenizer tests/test_k3_bf16_rows tests/test_k3_bf16_fused tests/test_k3_mla_prefill tests/test_k3_kda_prefill tests/test_k3_metal tests/test_k3_checkpoint tests/test_k3_gguf_slice
+	./tests/test_k3_static_staging
 	./tests/test_k3_safetensors
 	./tests/test_k3_tokenizer "$(K3_MODEL)"
 	@./ds4 -m "$(K3_MODEL)" --dump-tokens -p x | grep -q '^[[:space:]]*87  x$$'
@@ -1581,7 +1593,7 @@ clean:
 	rm -f tests/test_deepseek_indexer
 	rm -f tests/test_tp_rdma tests/test_tp_link tests/test_tp_tcp tests/test_cuda_tp_link
 	rm -f tests/test_metal_tp_spec
-	rm -f ds4_cli_test tests/test_k3_safetensors tests/test_k3_metal tests/test_k3_bf16_rows tests/test_k3_bf16_fused tests/test_k3_mla_prefill tests/test_k3_kda_prefill tests/test_k3_tokenizer tests/test_k3_checkpoint tests/test_k3_gguf tests/test_k3_gguf_metal_map tests/test_k3_gguf_slice
+	rm -f ds4_cli_test tests/test_k3_static_staging tests/test_k3_safetensors tests/test_k3_metal tests/test_k3_bf16_rows tests/test_k3_bf16_fused tests/test_k3_mla_prefill tests/test_k3_kda_prefill tests/test_k3_tokenizer tests/test_k3_checkpoint tests/test_k3_gguf tests/test_k3_gguf_metal_map tests/test_k3_gguf_slice
 	rm -f tests/test_metal_tp_cancel
 	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_metal_moe_prefill tests/test_qwen4_moe_mm_specialize tests/test_qwen4_conv_parallel tests/test_q8_prefill_variants tests/test_metal_dense_mpp tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_deepseek4_vision_image tests/test_prompt_prefix tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
 	rm -f tests/test_image_decode

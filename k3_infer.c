@@ -139,6 +139,7 @@ typedef struct {
     void *data;
     uint64_t capacity;
     uint64_t bytes;
+    int locked;
 } k3_static_slot;
 
 typedef struct {
@@ -244,6 +245,8 @@ struct k3_context {
     uint64_t tensor_allocation_limit;
     uint64_t gguf_cache_bytes;
     uint64_t gguf_transient_bytes;
+    uint64_t gguf_staging_bytes;
+    uint64_t gguf_staging_locked_bytes;
     k3_static_slot static_slots[2];
     k3_static_slot resident_static_slots[K3_N_LAYER];
     k3_static_slot resident_shared_slots[K3_N_LAYER];
@@ -371,6 +374,11 @@ static int layer_pagein_enabled(void) {
 static int static_staging_requested(void) {
     const char *value = getenv("K3_STATIC_STAGING");
     return !value || !value[0] || strcmp(value, "0") != 0;
+}
+
+static int gguf_static_staging_requested(void) {
+    const char *value = getenv("K3_GGUF_STATIC_STAGING");
+    return value && value[0] && strcmp(value, "0") != 0;
 }
 
 static uint64_t macos_physical_memory(void) {
@@ -572,8 +580,18 @@ static int check_gguf_memory(const k3_context *ctx, const char *phase,
     const uint64_t locked_cache = k3_gpu_streaming_cache_locked_bytes();
     const uint64_t cache_growth =
         k3_memory_remaining(owner->gguf_cache_bytes, locked_cache);
+    /* Successfully mlocked staging pages are already wired and excluded
+     * from reclaimable memory. Reserve only their future growth here; full
+     * slot capacity remains charged to admission and session-clone limits. */
+    if (owner->gguf_staging_locked_bytes > owner->gguf_staging_bytes ||
+        owner->gguf_staging_bytes > owner->gguf_transient_bytes) {
+        set_error(err, errcap, "invalid K3 GGUF staging memory accounting");
+        return 0;
+    }
+    const uint64_t transient_growth =
+        owner->gguf_transient_bytes - owner->gguf_staging_locked_bytes;
     uint64_t minimum = 0;
-    if (!k3_memory_step_required(owner->gguf_transient_bytes,
+    if (!k3_memory_step_required(transient_growth,
             owner->gguf_cache_bytes, locked_cache,
             K3_GGUF_LIVE_RESERVE_BYTES, &minimum)) {
         set_error(err, errcap, "K3 GGUF streaming memory requirement overflow");
@@ -604,7 +622,7 @@ static int check_gguf_memory(const k3_context *ctx, const char *phase,
                 "k3: stop threshold: %.2f GiB live reserve + "
                 "%.2f GiB transient peak + %.2f GiB remaining cache growth\n",
                 (double)K3_GGUF_LIVE_RESERVE_BYTES / 1073741824.0,
-                (double)owner->gguf_transient_bytes / 1073741824.0,
+                (double)transient_growth / 1073741824.0,
                 (double)cache_growth / 1073741824.0);
         ds4_gpu_print_memory_report("K3 memory stop");
         set_error(err, errcap,
@@ -1152,6 +1170,40 @@ static int alloc_static_slots(
     return 1;
 }
 
+static int lock_gguf_static_slots(k3_context *ctx,
+                                  char *err,
+                                  size_t errcap) {
+    if (!ctx || !ctx->model->gguf || !ctx->static_staging ||
+        ctx->gguf_staging_locked_bytes != 0) {
+        set_error(err, errcap, "invalid K3 GGUF staging lock request");
+        return 0;
+    }
+    for (uint32_t i = 0; i < 2u; i++) {
+        k3_static_slot *slot = &ctx->static_slots[i];
+        if (!slot->capacity) continue;
+        if (!slot->data || slot->locked ||
+            slot->capacity > ctx->gguf_staging_bytes -
+                ctx->gguf_staging_locked_bytes ||
+            !check_gguf_memory(ctx, "before static slot lock", ctx->layer_start,
+                               err, errcap)) return 0;
+        if (mlock(slot->data, (size_t)slot->capacity) != 0) {
+            set_error(err, errcap,
+                      "mlock K3 GGUF static slot %u (%.2f GiB): %s",
+                      i, (double)slot->capacity / 1073741824.0, strerror(errno));
+            return 0;
+        }
+        slot->locked = 1;
+        ctx->gguf_staging_locked_bytes += slot->capacity;
+    }
+    if (ctx->gguf_staging_locked_bytes != ctx->gguf_staging_bytes) {
+        set_error(err, errcap, "incomplete K3 GGUF staging locks");
+        return 0;
+    }
+    fprintf(stderr, "k3: GGUF decode staging locked %.2f GiB in two slots\n",
+            (double)ctx->gguf_staging_locked_bytes / 1073741824.0);
+    return 1;
+}
+
 static int alloc_resident_static_slots(
         k3_context *ctx,
         uint64_t budget,
@@ -1315,6 +1367,7 @@ static void free_static_slots(k3_context *ctx) {
         memset(slot, 0, sizeof(*slot));
     }
     ctx->static_staging = 0;
+    ctx->gguf_staging_locked_bytes = 0;
 }
 
 static void free_resident_static_slots(k3_context *ctx) {
@@ -2003,7 +2056,8 @@ static void *static_worker_main(void *arg) {
 static void discard_unused_static_pages(k3_static_slot *slot,
                                         uint64_t next_bytes) {
 #if defined(MADV_DONTNEED)
-    if (!slot || !slot->data || slot->bytes <= next_bytes) return;
+    /* Locked GGUF slots retain their entire wired reservation until munmap. */
+    if (!slot || !slot->data || slot->locked || slot->bytes <= next_bytes) return;
     const long page_value = sysconf(_SC_PAGESIZE);
     if (page_value <= 0) return;
     const uint64_t page = (uint64_t)page_value;
@@ -4979,8 +5033,9 @@ static int evaluate(k3_context *ctx,
             ds4_gpu_stream_expert_cache_reset_route_hotness();
         owner->gguf_prefill_hotness = prefill;
     }
-    const int stage_static =
-        !ctx->model->gguf && ctx->static_staging && rows == 1u;
+    /* GGUF staging is decode-only; prefill retains its mapped FP32 path. */
+    const int stage_static = ctx->static_staging && rows == 1u &&
+        (!ctx->model->gguf || (!prefill && !ctx->gguf_resident));
     const uint32_t first_layer = ctx->layer_start;
     const int first_resident =
         ctx->q8_static ||
@@ -5018,7 +5073,7 @@ static int evaluate(k3_context *ctx,
                errcap))
         : ctx->gguf_static_layers[first_layer]
         ? 1
-        : ctx->model->gguf
+        : ctx->model->gguf && !stage_static
         ? k3_layer_prefetch_start(
               &current_load,
               ctx->layers[first_layer],
@@ -5090,7 +5145,7 @@ static int evaluate(k3_context *ctx,
         }
         const int layer_resident =
             ctx->q8_static || ctx->resident_static_slots[i].data != NULL;
-        if (ctx->model->gguf &&
+        if (ctx->model->gguf && !stage_static &&
             ((!ctx->gguf_resident && !ctx->gguf_static_layers[i]) ||
              resident_readahead)) {
             k3_layer *loaded = NULL;
@@ -5102,8 +5157,8 @@ static int evaluate(k3_context *ctx,
                 return 0;
             }
             current_load = NULL;
-        } else if (!ctx->model->gguf &&
-                   !layer_resident && stage_static) {
+        } else if (!layer_resident && stage_static &&
+                   !ctx->gguf_static_layers[i]) {
             if (!static_load_join(&static_load, err, errcap)) {
                 (void)finish_all_speculative_experts(ctx, NULL, 0);
                 output_prefetch_discard(&output_prefetch);
@@ -5143,7 +5198,7 @@ static int evaluate(k3_context *ctx,
                           true,
                           err,
                           errcap)
-                    : ctx->model->gguf
+                    : ctx->model->gguf && !stage_static
                     ? k3_layer_prefetch_start(
                           &current_load,
                           ctx->layers[i + 1u],
@@ -5181,12 +5236,14 @@ static int evaluate(k3_context *ctx,
         }
         const uint64_t map_size =
             layer->static_size;
+        const int staged_layer = stage_static && !layer_resident &&
+            !ctx->gguf_static_layers[i];
         const k3_static_slot *static_slot = ctx->q8_static
             ? &ctx->q8_layers[i].native
             : (layer_resident
                 ? &ctx->resident_static_slots[i]
-                : (stage_static ? &ctx->static_slots[i & 1u] : NULL));
-        const int use_static_slot = layer_resident || stage_static;
+                : (staged_layer ? &ctx->static_slots[i & 1u] : NULL));
+        const int use_static_slot = layer_resident || staged_layer;
         const int next_layer_resident =
             i < ctx->layer_end &&
             (ctx->q8_static ||
@@ -5204,7 +5261,8 @@ static int evaluate(k3_context *ctx,
         /* Static GGUF weights need a layer-local mapping. Unmapping the
          * layer descriptor below must retire the actual pages Metal used. */
         const int temporary_gguf_map = ctx->model->gguf &&
-            !ctx->gguf_resident && !ctx->gguf_static_layers[i];
+            !ctx->gguf_resident && !ctx->gguf_static_layers[i] &&
+            !use_static_slot;
         const int have_layer_map = !temporary_gguf_map ||
             k3_st_map(layer->shard, err, errcap);
         const k3_st_shard *gguf_static_shard = temporary_gguf_map
@@ -5224,6 +5282,8 @@ static int evaluate(k3_context *ctx,
                       : map_size,
                   .bias = layer->static_offset,
                   .q8 = ctx->q8_static ? &ctx->q8_layers[i] : NULL,
+                  .streamed_small_batches = ctx->model->gguf &&
+                      ds4_gpu_device_is_pre_m5_apple_silicon(),
               }
             : ctx->model->gguf
             ? (k3_weight_source){
@@ -5243,6 +5303,9 @@ static int evaluate(k3_context *ctx,
         const int mapped = memory_ok && have_layer_map && (
             ctx->gguf_resident || pinned_decode
             ? 1
+            : staged_layer
+            ? map_static_slot_span(
+                  static_slot, layer, map_size, err, errcap)
             : ctx->model->gguf
             ? map_gguf_layer_spans(
                   ctx, layer, !use_static_slot && !ctx->gguf_static_layers[i],
@@ -5511,6 +5574,8 @@ int k3_context_create(k3_context **out,
         k3_context_destroy(ctx);
         return 0;
     }
+    const int want_gguf_staging = ctx->model->gguf &&
+        gguf_static_staging_requested();
     const uint64_t initial_tensors = ds4_gpu_tensor_allocated_bytes();
     uint64_t gguf_budget = 0;
     if (ctx->model->gguf) {
@@ -5522,6 +5587,23 @@ int k3_context_create(k3_context **out,
             set_error(err, errcap, "invalid K3 GGUF streaming memory spans");
             k3_context_destroy(ctx);
             return 0;
+        }
+        if (want_gguf_staging) {
+            /* Anonymous slots are lazy initially. Charge their full capacity
+             * once in the shared transient reserve used by admission, cache
+             * planning, live guards and session-clone headroom. Keep the
+             * existing mmap/output allowance for prefill and the output head. */
+            const uint64_t capacity = static_slots_capacity(ctx);
+            if (!capacity || capacity > UINT64_MAX - ctx->gguf_transient_bytes) {
+                set_error(err, errcap, "invalid K3 GGUF static staging capacity");
+                k3_context_destroy(ctx);
+                return 0;
+            }
+            ctx->gguf_staging_bytes = capacity;
+            ctx->gguf_transient_bytes += capacity;
+            fprintf(stderr,
+                    "k3: GGUF decode staging reserves %.2f GiB in two slots\n",
+                    (double)capacity / 1073741824.0);
         }
         fprintf(stderr,
                 "k3: GGUF admission budget %.2f GiB before buffers, "
@@ -5764,9 +5846,14 @@ int k3_context_create(k3_context **out,
             break;
         }
     }
-    if (!ctx->model->gguf && has_nonresident &&
-        static_staging_requested() &&
+    if (has_nonresident && !ctx->gguf_resident &&
+        (ctx->model->gguf ? want_gguf_staging : static_staging_requested()) &&
         !alloc_static_slots(ctx, err, errcap)) {
+        k3_context_destroy(ctx);
+        return 0;
+    }
+    if (want_gguf_staging && !ctx->gguf_resident &&
+        !lock_gguf_static_slots(ctx, err, errcap)) {
         k3_context_destroy(ctx);
         return 0;
     }
