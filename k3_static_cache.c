@@ -10,6 +10,7 @@ static void fail(char *err, size_t cap, const char *fmt, ...) {
 }
 
 #ifndef K3_STATIC_CACHE_ZSTD
+int k3_static_cache_supported(void) { return 0; }
 int k3_static_cache_open(const char *p, int fd, const k3_static_cache_span *s,
     uint32_t n, unsigned w, k3_static_cache **out, char *e, size_t cap) {
     (void)p; (void)fd; (void)s; (void)n; (void)w;
@@ -49,6 +50,8 @@ int k3_static_cache_build(const char *p, int fd, const k3_static_cache_span *s,
 #if defined(__aarch64__) && defined(__ARM_FEATURE_CRC32)
 #include <arm_acle.h>
 #endif
+
+int k3_static_cache_supported(void) { return 1; }
 
 #define K3SC_WORKERS 4u
 #define K3SC_STACK_BYTES (512u * 1024u)
@@ -196,7 +199,9 @@ int k3_static_cache_open(const char *path,int model_fd,const k3_static_cache_spa
     if(!path || !out || !little_endian() || workers<1 || workers>K3SC_WORKERS) {
         fail(err,cap,"invalid K3 static cache open arguments");return 0;
     }
-    int fd=open(path,O_RDONLY|O_CLOEXEC); k3sc_header h; struct stat st,after;
+    /* Nonblocking open prevents an invalid/replaced FIFO from hanging before
+     * fstat can reject it. O_NONBLOCK does not change regular-file reads. */
+    int fd=open(path,O_RDONLY|O_CLOEXEC|O_NONBLOCK); k3sc_header h; struct stat st,after;
     if(fd<0 || fstat(fd,&st) || !S_ISREG(st.st_mode) || st.st_size<(off_t)sizeof(h) ||
        !read_all(fd,&h,sizeof(h),0)) {
         if(fd>=0)close(fd); fail(err,cap,"cannot read K3 static cache header: %s",strerror(errno));return 0;

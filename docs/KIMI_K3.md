@@ -56,7 +56,36 @@ K3 uses its native XTML chat and tool format. Its sampling defaults are
 temperature 1, top-p 0.95, and min-p 0. Saved sessions rebuild their inference
 state by replaying the saved tokens.
 
-## Optional SSD streaming setup for a 32 GiB M1 Max
+## SSD streaming setup for a 32 GiB M1 Max
+
+For Kimi K3 GGUF, `--ssd-streaming` automatically selects the optimized
+streaming configuration: a 10 GiB expert-cache target, prefill chunk64,
+aligned static reads, tiled decode output-head reads, four static I/O threads,
+256 MiB expert slabs and no redundant expert read advice. It discovers the
+lossless sidecar beside the canonical GGUF path by replacing `.gguf` with
+`.static-zstd-v1.cache`. If that sidecar is available, both prefill and decode
+use it. The existing default host reserve remains at least 12 GiB, and all memory
+admission/live checks still apply; the expert-cache target may be reduced to
+fit available memory.
+
+```sh
+./ds4 -m "/absolute/path/to/Kimi-K3-IQ2_XXS-Q2_K.gguf" \
+  --ssd-streaming --ctx 1024 --nothink -n 64 -p "Ciao, come stai?"
+```
+
+Explicit `--prefill-chunk`, `--ssd-streaming-cache-experts`, and environment
+settings retain priority. For example, `K3_GGUF_PREFILL_STAGING=0` disables
+only cached prefill, and `K3_GGUF_STATIC_CACHE=` disables automatic sidecar
+discovery. `K3_SSD_STREAMING_DEFAULTS=0` restores the earlier defaults while
+allowing manual tuning. Prompt, sampling, context size and diagnostic logging
+are not changed by this profile. Other model families and SafeTensors retain
+their existing behavior.
+
+A missing sidecar or a build without libzstd uses ordinary GGUF streaming
+with aligned decode staging; it does not create a cache automatically. A
+present invalid or incompatible cache is reported as an error. An explicit
+`K3_GGUF_STATIC_CACHE` path is always validated and never silently ignored.
+Create a sidecar once using the commands below if needed.
 
 For the original K3 mixed-Q2 GGUF, aligned static staging and tiled output-head
 reads reuse two bounded buffers. An optional lossless static cache stores
@@ -87,6 +116,7 @@ host reserve, and approximately 131 MiB of additional decoder workspace
 accounted for before allocation. All existing memory checks remain active.
 
 ```sh
+K3_SSD_STREAMING_DEFAULTS=0 \
 K3_MEMORY_RESERVE_GIB=12 K3_RESIDENT_STATIC=0 \
 K3_GGUF_STATIC_STAGING=1 K3_GGUF_STATIC_ALIGNED=1 \
 K3_GGUF_HEAD_STAGING=1 K3_GGUF_STATIC_CACHE="$k3_static_cache_file" \
@@ -99,20 +129,18 @@ DS4_METAL_DISABLE_STREAMING_EXPERT_READAHEAD=1 K3_IO_PROFILE=1 \
   --nothink --temp 0 --seed 1 -n 9 -p "Ciao, come stai?"
 ```
 
-To also stage multi-token prefill from the same lossless cache, add
-`K3_GGUF_PREFILL_STAGING=1` to the command environment. This optional path
-reuses the existing two static buffers and decoder workspace; no cache rebuild
-or extra weight buffers are needed. Expert selection, the expert cache and
-FP32 computation retain their existing paths. The flag requires the lossless
-cache configuration above and is disabled by default; unset it or set it to
-`0` to restore the original prefill path while keeping cached decode.
-The earlier decode measurements below describe the command above without
-this additional flag.
+The command above records the earlier explicit configuration used for the
+decode measurements below. With the automatic profile enabled,
+`K3_GGUF_PREFILL_STAGING=1` is now implicit when a compatible lossless cache
+is found; it reuses the same two static buffers and decoder workspace.
+For manual configuration with `K3_SSD_STREAMING_DEFAULTS=0`, add that flag
+to enable cached prefill. Expert selection and FP32 computation retain their
+existing paths.
 
-Leave both `K3_GGUF_STATIC_CACHE` and `K3_GGUF_PREFILL_STAGING` unset to use
-the original GGUF static reads.
 An invalid cache causes an explicit error rather than a silent fallback.
 `make test-k3-static-cache` runs the CPU format and decoder fixtures.
+`make test-k3-streaming test-k3-static-staging` checks default precedence,
+sidecar discovery and loader policy without executing the GPU.
 On the 32 GiB M1 Max, one controlled comparison of eight greedy decode steps
 for this prompt measured 41.488 to 28.379 seconds per step: 46.2% more tokens
 per second, or 31.6% less decode time. The reference already used GGUF static

@@ -17,6 +17,210 @@ static void write_all(int fd, const void *p_, size_t bytes, uint64_t offset) {
 
 
 
+static const char *policy_env_names[] = {
+    "K3_GGUF_STATIC_STAGING", "K3_GGUF_STATIC_ALIGNED",
+    "K3_GGUF_PREFILL_STAGING", "K3_GGUF_HEAD_STAGING",
+    "K3_STATIC_IO_THREADS", "K3_GGUF_STATIC_CACHE",
+    "K3_RESIDENT_STATIC", "K3_RESIDENT_STATIC_GIB", "K3_GGUF_RESIDENT",
+};
+#define POLICY_ENV_COUNT (sizeof(policy_env_names) / sizeof(policy_env_names[0]))
+
+/* Test-local environment changes are restored; the resolver must never write
+ * environment state or make a later context inherit an earlier choice. */
+static void policy_env_save_clear(char *saved[POLICY_ENV_COUNT]) {
+    for (size_t i=0; i<POLICY_ENV_COUNT; i++) {
+        const char *value = getenv(policy_env_names[i]);
+        saved[i] = value ? strdup(value) : NULL;
+        assert(!value || saved[i]);
+        assert(unsetenv(policy_env_names[i]) == 0);
+    }
+}
+
+static void policy_env_restore(char *saved[POLICY_ENV_COUNT]) {
+    for (size_t i=0; i<POLICY_ENV_COUNT; i++) {
+        assert(saved[i] ? setenv(policy_env_names[i], saved[i], 1) == 0
+                        : unsetenv(policy_env_names[i]) == 0);
+        free(saved[i]);
+    }
+}
+
+static void test_streaming_option_resolution(void) {
+    char *saved[POLICY_ENV_COUNT];
+    policy_env_save_clear(saved);
+    k3_model model = {.gguf=true};
+    k3_context ctx = {.model=&model};
+    resolve_gguf_streaming_options(NULL, true);
+    resolve_gguf_streaming_options(&ctx, false);
+    assert(!ctx.optimized_ssd_streaming && !ctx.gguf_staging_requested);
+    assert(!ctx.gguf_static_aligned && !ctx.gguf_prefill_staging);
+    assert(!ctx.gguf_head_staging && context_static_io_threads(&ctx) == 16u);
+    assert(!resident_static_disabled(&ctx));
+    resolve_gguf_streaming_options(&ctx, true);
+    assert(ctx.optimized_ssd_streaming && ctx.gguf_staging_requested);
+    assert(ctx.gguf_static_aligned && ctx.gguf_prefill_staging);
+    assert(ctx.gguf_head_staging && context_static_io_threads(&ctx) == 4u);
+    assert(resident_static_disabled(&ctx) && gguf_static_cache_compatible(&ctx));
+    for (size_t i=0; i<POLICY_ENV_COUNT; i++)
+        assert(getenv(policy_env_names[i]) == NULL);
+
+    const char *values[] = {"", "0", "1"};
+    for (size_t i=0; i<4u; i++) {
+        for (size_t v=0; v<sizeof(values)/sizeof(values[0]); v++) {
+            assert(setenv(policy_env_names[i], values[v], 1) == 0);
+            resolve_gguf_streaming_options(&ctx, true);
+            const int enabled = v == 2u;
+            assert(ctx.gguf_staging_requested == (i == 0u ? enabled : 1));
+            assert(ctx.gguf_static_aligned == (i <= 1u ? enabled : 1));
+            assert(ctx.gguf_prefill_staging == (i == 2u ? enabled : 1));
+            assert(ctx.gguf_head_staging == (i == 3u ? enabled : 1));
+            assert(strcmp(getenv(policy_env_names[i]), values[v]) == 0);
+        }
+        assert(unsetenv(policy_env_names[i]) == 0);
+    }
+    assert(setenv("K3_STATIC_IO_THREADS", "2", 1) == 0);
+    resolve_gguf_streaming_options(&ctx, true);
+    k3_context other = {.model=&model};
+    assert(setenv("K3_STATIC_IO_THREADS", "8", 1) == 0);
+    resolve_gguf_streaming_options(&other, true);
+    assert(context_static_io_threads(&ctx) == 2u);
+    assert(context_static_io_threads(&other) == 8u);
+    assert(strcmp(getenv("K3_STATIC_IO_THREADS"), "8") == 0);
+    assert(setenv("K3_STATIC_IO_THREADS", "17", 1) == 0);
+    resolve_gguf_streaming_options(&ctx, true);
+    assert(context_static_io_threads(&ctx) == 4u);
+    assert(setenv("K3_STATIC_IO_THREADS", "", 1) == 0);
+    resolve_gguf_streaming_options(&ctx, false);
+    assert(context_static_io_threads(&ctx) == 16u);
+    assert(unsetenv("K3_STATIC_IO_THREADS") == 0);
+
+    /* Optimized defaults never apply to native K3 or a missing model. */
+    model.gguf = false;
+    resolve_gguf_streaming_options(&ctx, true);
+    assert(!ctx.optimized_ssd_streaming && !ctx.gguf_staging_requested);
+    assert(!ctx.gguf_static_aligned && !ctx.gguf_prefill_staging);
+    assert(!ctx.gguf_head_staging && context_static_io_threads(&ctx) == 16u);
+    ctx.model = NULL;
+    resolve_gguf_streaming_options(&ctx, true);
+    assert(!ctx.optimized_ssd_streaming && context_static_io_threads(&ctx) == 16u);
+    ctx.model = &model; model.gguf = true;
+    resolve_gguf_streaming_options(&ctx, true);
+    assert(setenv("K3_RESIDENT_STATIC", "", 1) == 0);
+    assert(!resident_static_disabled(&ctx) && !gguf_static_cache_compatible(&ctx));
+    assert(setenv("K3_RESIDENT_STATIC", "auto", 1) == 0);
+    assert(!resident_static_disabled(&ctx));
+    assert(setenv("K3_RESIDENT_STATIC", "0", 1) == 0);
+    assert(resident_static_disabled(&ctx));
+    assert(setenv("K3_RESIDENT_STATIC_GIB", "0", 1) == 0);
+    assert(!resident_static_disabled(&ctx) && !gguf_static_cache_compatible(&ctx));
+    assert(setenv("K3_RESIDENT_STATIC_GIB", "", 1) == 0);
+    assert(resident_static_disabled(&ctx));
+    assert(setenv("K3_GGUF_RESIDENT", "1", 1) == 0);
+    assert(!gguf_static_cache_compatible(&ctx));
+    assert(setenv("K3_GGUF_RESIDENT", "auto", 1) == 0);
+    assert(gguf_static_cache_compatible(&ctx));
+    policy_env_restore(saved);
+    puts("static staging: per-context defaults, explicit overrides and isolation passed");
+}
+
+static void test_static_cache_discovery(void) {
+    char *saved[POLICY_ENV_COUNT];
+    policy_env_save_clear(saved);
+    char directory[] = "/tmp/k3-cache-discovery-XXXXXX";
+    assert(mkdtemp(directory));
+    char path[PATH_MAX], alias[PATH_MAX], cache[PATH_MAX], expected[PATH_MAX];
+    assert(snprintf(path, sizeof(path), "%s/mini model.GGUF", directory) > 0);
+    assert(snprintf(alias, sizeof(alias), "%s/link.gguf", directory) > 0);
+    int fd = open(path, O_CREAT | O_EXCL | O_RDWR, 0600); assert(fd >= 0);
+    const uint64_t header_bytes = 248u, file_bytes = 32768u;
+    char header[248]; memset(header, ' ', sizeof(header));
+    int n = snprintf(header, sizeof(header),
+        "{\"data\":{\"dtype\":\"U8\",\"shape\":[32512],\"data_offsets\":[0,32512]}}");
+    assert(n > 0 && n < (int)sizeof(header)); header[n] = ' ';
+    write_all(fd, &header_bytes, sizeof(header_bytes), 0);
+    write_all(fd, header, sizeof(header), 8u);
+    assert(ftruncate(fd, (off_t)file_bytes) == 0);
+    assert(symlink(path, alias) == 0);
+    char canonical[PATH_MAX], err[512] = {0};
+    assert(realpath(directory, canonical));
+    assert(snprintf(expected, sizeof(expected), "%s/mini model.static-zstd-v1.cache",
+                    canonical) > 0);
+    assert(adjacent_gguf_static_cache_path(alias, cache, sizeof(cache), err, sizeof(err)));
+    assert(strcmp(cache, expected) == 0);
+    char tiny[8];
+    assert(!adjacent_gguf_static_cache_path(path, tiny, sizeof(tiny), err, sizeof(err)));
+    assert(strstr(err, "too long"));
+    assert(!adjacent_gguf_static_cache_path(cache, expected, sizeof(expected), err, sizeof(err)));
+
+    k3_st_shard *shard = NULL;
+    assert(k3_st_open(&shard, alias, err, sizeof(err)));
+    k3_model model = {.gguf=true};
+    k3_context ctx = {.model=&model};
+    ctx.globals.shard = shard;
+    k3_layer layers[K3_N_LAYER];
+    memset(layers, 0, sizeof(layers));
+    for (uint32_t i=0; i<K3_N_LAYER; i++) {
+        layers[i] = (k3_layer){.index=i, .shard=shard,
+            .static_offset=256u, .static_size=64u};
+        ctx.layers[i] = &layers[i];
+    }
+    resolve_gguf_streaming_options(&ctx, true);
+    assert(ctx.gguf_prefill_staging);
+    assert(open_gguf_static_cache(&ctx, err, sizeof(err)));
+    assert(!ctx.static_cache && !ctx.gguf_prefill_staging);
+    assert(ctx.gguf_staging_requested && ctx.gguf_head_staging);
+    /* The explicit empty value disables discovery, even if an invalid file
+     * exists. Explicit prefill with that disabled cache remains an error. */
+    int cache_fd = open(cache, O_CREAT | O_EXCL | O_WRONLY, 0600);
+    assert(cache_fd >= 0);
+    const unsigned char invalid[128] = {0};
+    write_all(cache_fd, invalid, sizeof(invalid), 0); close(cache_fd);
+    assert(setenv("K3_GGUF_STATIC_CACHE", "", 1) == 0);
+    resolve_gguf_streaming_options(&ctx, true);
+    assert(open_gguf_static_cache(&ctx, err, sizeof(err)));
+    assert(!ctx.static_cache && !ctx.gguf_prefill_staging);
+    assert(setenv("K3_GGUF_PREFILL_STAGING", "1", 1) == 0);
+    resolve_gguf_streaming_options(&ctx, true);
+    assert(!open_gguf_static_cache(&ctx, err, sizeof(err)));
+    assert(strstr(err, "requires K3_GGUF_STATIC_CACHE"));
+    assert(unsetenv("K3_GGUF_PREFILL_STAGING") == 0);
+    assert(unsetenv("K3_GGUF_STATIC_CACHE") == 0);
+    resolve_gguf_streaming_options(&ctx, true);
+    if (k3_static_cache_supported()) {
+        assert(!open_gguf_static_cache(&ctx, err, sizeof(err)));
+        assert(strstr(err, "K3 static cache") && strstr(err, cache));
+    } else {
+        assert(open_gguf_static_cache(&ctx, err, sizeof(err)));
+        assert(!ctx.gguf_prefill_staging);
+    }
+    assert(!ctx.static_cache);
+    assert(setenv("K3_GGUF_STATIC_CACHE", "relative.cache", 1) == 0);
+    resolve_gguf_streaming_options(&ctx, true);
+    assert(!open_gguf_static_cache(&ctx, err, sizeof(err)));
+    assert(strstr(err, "absolute path"));
+    assert(setenv("K3_GGUF_STATIC_CACHE", cache, 1) == 0);
+    assert(!open_gguf_static_cache(&ctx, err, sizeof(err)));
+    assert(strstr(err, "K3 static cache") && strstr(err, cache));
+    assert(unlink(cache) == 0);
+    assert(!open_gguf_static_cache(&ctx, err, sizeof(err)));
+    assert(strstr(err, cache));
+    /* Existing FIFO paths must fail immediately, never block waiting for a
+     * writer. Automatic discovery rejects non-regular files before opening. */
+    assert(mkfifo(cache, 0600) == 0);
+    assert(unsetenv("K3_GGUF_STATIC_CACHE") == 0);
+    resolve_gguf_streaming_options(&ctx, true);
+    assert(!open_gguf_static_cache(&ctx, err, sizeof(err)));
+    assert(strstr(err, cache));
+    assert(setenv("K3_GGUF_STATIC_CACHE", cache, 1) == 0);
+    assert(!open_gguf_static_cache(&ctx, err, sizeof(err)));
+    assert(strstr(err, cache));
+    assert(!ctx.static_cache);
+    assert(unlink(cache) == 0);
+    k3_st_close(shard); close(fd);
+    assert(unlink(alias) == 0 && unlink(path) == 0 && rmdir(directory) == 0);
+    policy_env_restore(saved);
+    puts("static staging: canonical sidecar discovery, explicit disable, invalid cache and FIFO passed");
+}
+
 static void test_prefill_staging_policy(void) {
     k3_model model = {.gguf=true};
     k3_context ctx = {.model=&model, .static_staging=1,
@@ -30,12 +234,15 @@ static void test_prefill_staging_policy(void) {
     assert(!cache_env || saved_cache);
     assert(!prefill_env || saved_prefill);
     assert(unsetenv("K3_GGUF_PREFILL_STAGING") == 0);
+    ctx.gguf_prefill_staging = 0;
     assert(static_staging_enabled(&ctx, 1u, 0));
     assert(!static_staging_enabled(&ctx, 1u, 1));
     assert(!static_staging_enabled(&ctx, 32u, 1));
     assert(setenv("K3_GGUF_PREFILL_STAGING", "0", 1) == 0);
+    ctx.gguf_prefill_staging = 0;
     assert(!static_staging_enabled(&ctx, 32u, 1));
     assert(setenv("K3_GGUF_PREFILL_STAGING", "1", 1) == 0);
+    ctx.gguf_prefill_staging = 1;
     const uint32_t rows[] = {1u, 8u, 9u, 32u, 64u, 128u};
     for (size_t i=0; i<sizeof(rows)/sizeof(rows[0]); i++)
         assert(static_staging_enabled(&ctx, rows[i], 1));
@@ -106,14 +313,14 @@ static void test_head_staging_policy(void) {
     for (uint32_t i=0; i<2u; i++)
         ctx.static_slots[i] = (k3_static_slot){.data=(void *)(uintptr_t)(i+1),
             .capacity=tile_bytes + K3_GGUF_HEAD_IO_ALIGNMENT, .locked=1};
-    assert(setenv("K3_GGUF_HEAD_STAGING", "1", 1) == 0);
+    ctx.gguf_head_staging = 1;
     assert(gguf_head_staging_enabled(&ctx, 1u, 0));
     assert(!gguf_head_staging_enabled(&ctx, 1u, 1));
     assert(!gguf_head_staging_enabled(&ctx, 2u, 0));
     assert(!gguf_head_staging_enabled(NULL, 1u, 0));
-    assert(setenv("K3_GGUF_HEAD_STAGING", "0", 1) == 0);
+    ctx.gguf_head_staging = 0;
     assert(!gguf_head_staging_enabled(&ctx, 1u, 0));
-    assert(setenv("K3_GGUF_HEAD_STAGING", "1", 1) == 0);
+    ctx.gguf_head_staging = 1;
 #define REJECT_FIELD(field, value) do { \
     __typeof__(field) saved = (field); (field) = (value); \
     assert(!gguf_head_staging_enabled(&ctx, 1u, 0)); (field) = saved; \
@@ -484,6 +691,8 @@ int main(void) {
     test_aligned_slots();
     test_head_staging_policy();
     test_prefill_staging_policy();
+    test_streaming_option_resolution();
+    test_static_cache_discovery();
     if (large) test_large_multiworker();
     puts("static staging: exact offset/tail/reuse bytes, EOF, lock accounting and cleanup passed (no GPU)");
     return 0;

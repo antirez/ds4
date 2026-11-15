@@ -27,6 +27,8 @@ typedef struct {
     /* Optional upper limits for GGUF expert caching; zero means automatic. */
     uint64_t expert_cache_bytes;
     uint32_t expert_cache_slots;
+    /* Engine opt-in for K3 GGUF --ssd-streaming defaults; zero is legacy. */
+    bool optimized_ssd_streaming;
 } k3_context_config;
 
 int k3_context_create(k3_context **out,

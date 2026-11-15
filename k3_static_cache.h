@@ -4,6 +4,8 @@
 #include <stdint.h>
 
 typedef struct k3_static_cache k3_static_cache;
+/* Compile-time feature probe; performs no I/O and allocates no memory. */
+int k3_static_cache_supported(void);
 typedef struct {
     uint32_t layer;
     uint64_t offset;

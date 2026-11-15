@@ -134,3 +134,5 @@ __pycache__/
 /k3_static_cache.config
 /k3_static_cache.config.tmp
 /tests/test_k3_static_cache
+
+/tests/test_k3_streaming

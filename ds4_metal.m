@@ -26,6 +26,7 @@
 #include "ds4_gpu.h"
 #include "ds4_image.h"
 #include "k3_metal.h"
+#include "k3_streaming.h"
 
 /*
  * Objective-C Metal glue for the C engine.
@@ -836,6 +837,7 @@ static uint64_t g_model_residency_count;
 static int g_model_residency_added_to_queue;
 static int g_glm_model_mode;
 static int g_ssd_streaming_mode;
+static bool g_k3_ssd_streaming_defaults;
 static int g_glm_streaming_prefill_full_layer_runtime;
 static int g_metal4_runtime_available;
 static int g_metal4_family_supported;
@@ -4946,7 +4948,12 @@ void ds4_gpu_set_glm_model(bool enabled) {
     g_glm_model_mode = enabled ? 1 : 0;
 }
 
+void ds4_gpu_set_k3_ssd_streaming_defaults(bool enabled) {
+    g_k3_ssd_streaming_defaults = enabled;
+}
+
 void ds4_gpu_set_ssd_streaming(bool enabled) {
+    g_k3_ssd_streaming_defaults = false;
     g_ssd_streaming_mode = enabled ? 1 : 0;
     ds4_gpu_stream_expert_cache_clear_all(1);
     if (g_ssd_streaming_mode) {
@@ -11967,6 +11974,7 @@ static void qwen4_nax_release_scratch(void);
 static void qwen4_batch_release_scratch(void);
 
 void ds4_gpu_cleanup(void) {
+    g_k3_ssd_streaming_defaults = false;
     if (!g_initialized) return;
     ds4_gpu_queue_keepalive_stop_thread();
 
@@ -13677,8 +13685,9 @@ static void ds4_gpu_stream_expert_timing_note_cache_class(
 }
 
 static int ds4_gpu_stream_expert_readahead_enabled(void) {
-    return g_ssd_streaming_mode &&
-           getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_READAHEAD") == NULL;
+    return k3_ssd_expert_readahead_enabled(
+        g_ssd_streaming_mode, g_k3_ssd_streaming_defaults,
+        getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_READAHEAD"));
 }
 
 static void ds4_gpu_advise_file_range(int fd, uint64_t offset, uint64_t len) {
@@ -14342,17 +14351,8 @@ static int ds4_gpu_stream_expert_slab_enabled(void) {
  * that actually hold a streamed expert.
  */
 static uint64_t ds4_gpu_stream_expert_slab_target_bytes(void) {
-    const uint64_t mib = 1024ull * 1024ull;
-    uint64_t target = 4096ull * mib;
-    const char *env = getenv("DS4_METAL_STREAMING_EXPERT_SLAB_MB");
-    if (env && env[0]) {
-        char *end = NULL;
-        unsigned long long v = strtoull(env, &end, 10);
-        if (end != env && *end == '\0' && v != 0) {
-            target = v > UINT64_MAX / mib ? UINT64_MAX : (uint64_t)v * mib;
-        }
-    }
-    return target;
+    return k3_ssd_slab_target_bytes(g_k3_ssd_streaming_defaults,
+        getenv("DS4_METAL_STREAMING_EXPERT_SLAB_MB"));
 }
 
 static id<MTLBuffer> ds4_gpu_stream_expert_alloc_slab_buffer(
