@@ -16,6 +16,70 @@ static void write_all(int fd, const void *p_, size_t bytes, uint64_t offset) {
 }
 
 
+
+static void test_prefill_staging_policy(void) {
+    k3_model model = {.gguf=true};
+    k3_context ctx = {.model=&model, .static_staging=1,
+                      .gguf_static_aligned=1};
+    /* The policy only tests presence; it must never access the cache. */
+    ctx.static_cache = (k3_static_cache *)(void *)&ctx;
+    const char *cache_env = getenv("K3_GGUF_STATIC_CACHE");
+    char *saved_cache = cache_env ? strdup(cache_env) : NULL;
+    const char *prefill_env = getenv("K3_GGUF_PREFILL_STAGING");
+    char *saved_prefill = prefill_env ? strdup(prefill_env) : NULL;
+    assert(!cache_env || saved_cache);
+    assert(!prefill_env || saved_prefill);
+    assert(unsetenv("K3_GGUF_PREFILL_STAGING") == 0);
+    assert(static_staging_enabled(&ctx, 1u, 0));
+    assert(!static_staging_enabled(&ctx, 1u, 1));
+    assert(!static_staging_enabled(&ctx, 32u, 1));
+    assert(setenv("K3_GGUF_PREFILL_STAGING", "0", 1) == 0);
+    assert(!static_staging_enabled(&ctx, 32u, 1));
+    assert(setenv("K3_GGUF_PREFILL_STAGING", "1", 1) == 0);
+    const uint32_t rows[] = {1u, 8u, 9u, 32u, 64u, 128u};
+    for (size_t i=0; i<sizeof(rows)/sizeof(rows[0]); i++)
+        assert(static_staging_enabled(&ctx, rows[i], 1));
+    assert(static_staging_enabled(&ctx, 1u, 0));
+    assert(!static_staging_enabled(&ctx, 32u, 0));
+    assert(!static_staging_enabled(&ctx, 0u, 1));
+    assert(!static_staging_enabled(NULL, 32u, 1));
+#define REJECT_PREFILL(field, value) do { \
+    __typeof__(field) saved = (field); (field) = (value); \
+    assert(!static_staging_enabled(&ctx, 32u, 1)); (field) = saved; \
+} while (0)
+    REJECT_PREFILL(ctx.model, NULL);
+    REJECT_PREFILL(ctx.static_staging, 0);
+    REJECT_PREFILL(ctx.gguf_resident, 1);
+    REJECT_PREFILL(ctx.gguf_static_resident, 1);
+    REJECT_PREFILL(ctx.gguf_static_aligned, 0);
+    REJECT_PREFILL(ctx.static_cache, NULL);
+#undef REJECT_PREFILL
+    /* Native staging keeps its original one-row policy even with the flag. */
+    model.gguf = false;
+    assert(static_staging_enabled(&ctx, 1u, 0));
+    assert(static_staging_enabled(&ctx, 1u, 1));
+    assert(!static_staging_enabled(&ctx, 32u, 1));
+    model.gguf = true;
+    ctx.static_cache = NULL;
+    assert(static_staging_enabled(&ctx, 1u, 0));
+    /* A requested feature with no sidecar fails before metadata/model I/O. */
+    char err[256] = {0};
+    assert(unsetenv("K3_GGUF_STATIC_CACHE") == 0);
+    assert(!open_gguf_static_cache(&ctx, err, sizeof(err)));
+    assert(strstr(err, "requires K3_GGUF_STATIC_CACHE"));
+    assert(setenv("K3_GGUF_STATIC_CACHE", "", 1) == 0);
+    assert(!open_gguf_static_cache(&ctx, err, sizeof(err)));
+    assert(setenv("K3_GGUF_PREFILL_STAGING", "0", 1) == 0);
+    assert(open_gguf_static_cache(&ctx, err, sizeof(err)));
+    assert(!ctx.static_cache);
+    assert(saved_cache ? setenv("K3_GGUF_STATIC_CACHE", saved_cache, 1) == 0
+                       : unsetenv("K3_GGUF_STATIC_CACHE") == 0);
+    assert(saved_prefill ? setenv("K3_GGUF_PREFILL_STAGING", saved_prefill, 1) == 0
+                         : unsetenv("K3_GGUF_PREFILL_STAGING") == 0);
+    free(saved_cache); free(saved_prefill);
+    puts("static staging: lossless prefill policy, defaults and missing-cache rejection passed");
+}
+
 static void test_head_staging_policy(void) {
     const uint64_t bytes = (uint64_t)K3_N_VOCAB * K3_N_EMBD * sizeof(uint16_t);
     const uint64_t tile_bytes = (uint64_t)K3_GGUF_HEAD_TILE_ROWS * K3_N_EMBD * sizeof(uint16_t);
@@ -419,6 +483,7 @@ int main(void) {
     test_static_read_plan();
     test_aligned_slots();
     test_head_staging_policy();
+    test_prefill_staging_policy();
     if (large) test_large_multiworker();
     puts("static staging: exact offset/tail/reuse bytes, EOF, lock accounting and cleanup passed (no GPU)");
     return 0;

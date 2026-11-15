@@ -393,6 +393,23 @@ static int gguf_static_aligned_requested(void) {
     return value && value[0] && strcmp(value, "0") != 0;
 }
 
+static int gguf_prefill_staging_requested(void) {
+    const char *value = getenv("K3_GGUF_PREFILL_STAGING");
+    return value && value[0] && strcmp(value, "0") != 0;
+}
+
+/* Prefill changes only where static weights are read from. Its attention,
+ * expert batching and small-batch projection arithmetic remain unchanged. */
+static int static_staging_enabled(const k3_context *ctx,
+                                  uint32_t rows, int prefill) {
+    if (!ctx || !ctx->model || !ctx->static_staging || rows == 0u) return 0;
+    if (!ctx->model->gguf) return rows == 1u;
+    if (ctx->gguf_resident) return 0;
+    if (!prefill) return rows == 1u;
+    return ctx->static_cache && ctx->gguf_static_aligned &&
+        !ctx->gguf_static_resident && gguf_prefill_staging_requested();
+}
+
 static uint64_t macos_physical_memory(void) {
     uint64_t bytes = 0;
     size_t size = sizeof(bytes);
@@ -1174,7 +1191,14 @@ static uint64_t static_slots_capacity(const k3_context *ctx) {
  * layers, so the same cache can also serve a context evaluating a layer slice. */
 static int open_gguf_static_cache(k3_context *ctx, char *err, size_t errcap) {
     const char *path = getenv("K3_GGUF_STATIC_CACHE");
-    if (!path || !path[0]) return 1;
+    if (!path || !path[0]) {
+        if (gguf_prefill_staging_requested()) {
+            set_error(err, errcap,
+                      "K3_GGUF_PREFILL_STAGING requires K3_GGUF_STATIC_CACHE");
+            return 0;
+        }
+        return 1;
+    }
     const char *resident = getenv("K3_RESIDENT_STATIC");
     const char *resident_gib = getenv("K3_RESIDENT_STATIC_GIB");
     const char *full = getenv("K3_GGUF_RESIDENT");
@@ -1207,6 +1231,8 @@ static int open_gguf_static_cache(k3_context *ctx, char *err, size_t errcap) {
         set_error(err, errcap, "invalid K3 static cache workspace capacity");
         return 0;
     }
+    if (gguf_prefill_staging_requested())
+        fprintf(stderr, "k3: lossless GGUF static staging enabled for prefill\n");
     return 1;
 }
 
@@ -5303,9 +5329,10 @@ static int evaluate(k3_context *ctx,
             ds4_gpu_stream_expert_cache_reset_route_hotness();
         owner->gguf_prefill_hotness = prefill;
     }
-    /* GGUF staging is decode-only; prefill retains its mapped FP32 path. */
-    const int stage_static = ctx->static_staging && rows == 1u &&
-        (!ctx->model->gguf || (!prefill && !ctx->gguf_resident));
+    /* Lossless prefill staging reuses the same two bounded static slots.
+     * Source offsets, expert identities and all row-dependent kernels stay
+     * unchanged; the mapped path remains the default. */
+    const int stage_static = static_staging_enabled(ctx, rows, prefill);
     const int stage_head = output_logits &&
         gguf_head_staging_enabled(ctx, rows, prefill);
     const uint32_t first_layer = ctx->layer_start;

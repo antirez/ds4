@@ -99,7 +99,18 @@ DS4_METAL_DISABLE_STREAMING_EXPERT_READAHEAD=1 K3_IO_PROFILE=1 \
   --nothink --temp 0 --seed 1 -n 9 -p "Ciao, come stai?"
 ```
 
-Leave `K3_GGUF_STATIC_CACHE` unset to use the original GGUF static reads.
+To also stage multi-token prefill from the same lossless cache, add
+`K3_GGUF_PREFILL_STAGING=1` to the command environment. This optional path
+reuses the existing two static buffers and decoder workspace; no cache rebuild
+or extra weight buffers are needed. Expert selection, the expert cache and
+FP32 computation retain their existing paths. The flag requires the lossless
+cache configuration above and is disabled by default; unset it or set it to
+`0` to restore the original prefill path while keeping cached decode.
+The earlier decode measurements below describe the command above without
+this additional flag.
+
+Leave both `K3_GGUF_STATIC_CACHE` and `K3_GGUF_PREFILL_STAGING` unset to use
+the original GGUF static reads.
 An invalid cache causes an explicit error rather than a silent fallback.
 `make test-k3-static-cache` runs the CPU format and decoder fixtures.
 On the 32 GiB M1 Max, one controlled comparison of eight greedy decode steps
@@ -112,6 +123,29 @@ Generated text matched, all 5,309 cache blocks were roundtrip verified, and
 separate KDA/MLA boundary and full output-head checks were bitwise identical.
 This is one measured pair with a short prompt, not a long-session benchmark;
 filesystem cache, external load and temperature were not controlled.
+
+
+With `K3_GGUF_PREFILL_STAGING=1`, four alternating full-model runs on the
+same M1 Max compared commit `bb4ae3e9` with this prefill extension. Each run
+used the prompt above (44 formatted tokens), chunk64, ctx1024 and the same
+10 GiB expert cache, 12 GiB host reserve and lossless-cache configuration.
+`--dump-logits` measured one complete prefill without generation:
+
+| Prefill path | Run 1 | Run 2 | Median |
+| --- | ---: | ---: | ---: |
+| Reference `bb4ae3e9` | 183.589 s | 178.048 s | 180.819 s |
+| Lossless prefill staging | 103.380 s | 102.212 s | 102.796 s |
+
+The median prefill time fell 43.15%, equivalent to 75.90% more tokens per
+second. Comparing the slowest optimized run with the fastest reference still
+reduced time by 41.94%. All 163,840 final FP32 logits were bitwise identical
+across all four runs. A separate real-model KDA/MLA slice check compared all
+931,840 boundary values after 9-token prefill, 3-token continuation and one
+decode step, also bitwise identical. Peak task footprint was 13.747 GiB for
+the optimized path versus 13.629 GiB for the reference, with normal memory
+pressure and no new swap in every run. This measures the short prompt above;
+longer contexts were not benchmarked, and filesystem cache, temperature and
+external load were not controlled.
 
 ## Two 512 GiB Macs
 
