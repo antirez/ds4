@@ -105,7 +105,7 @@ static int test_shape(uint32_t in_dim, uint32_t out_dim) {
     CHECK(ds4_gpu_set_model_map_spans(mapping, mapping_size,
         &weight_offset, &weight_size, 1, weight_size));
 
-    for (uint32_t rows = 4; rows <= MAX_ROWS; rows++) {
+    for (uint32_t rows = 1; rows <= MAX_ROWS; rows++) {
         memset(actual, 0xa5, (size_t)output_size);
         CHECK(ds4_gpu_tensor_write(output_base, 0, actual, output_size));
         CHECK(ds4_gpu_tensor_write(reference_base, 0, actual, output_size));

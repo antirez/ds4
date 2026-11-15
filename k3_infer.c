@@ -3454,8 +3454,9 @@ static int matmul(ds4_gpu_tensor *out,
     }
     /* Reuse the streamed layer across a larger prefill while retaining the
      * native small-batch arithmetic for its BF16 and quantized projections.
-     * These views slice activations only; the weight mapping stays live. */
-    if (source->streamed_small_batches && rows > 8u && rows <= 32u) {
+     * Up to 64 tokens reuse one streamed layer without switching to half
+     * matrix operands. Only activations are sliced; the weights stay live. */
+    if (source->streamed_small_batches && rows > 8u && rows <= 64u) {
         if (in_dim == 0 || out_dim == 0) return 0;
         const uint64_t input_row_bytes = (uint64_t)in_dim * sizeof(float);
         const uint64_t output_row_bytes = (uint64_t)out_dim * sizeof(float);

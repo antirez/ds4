@@ -258,11 +258,79 @@ static void test_user_cache_limits(void) {
                                16 * GIB, 128 * slot - 1, 0, &plan));
     CHECK(!k3_plan_gguf_memory(budget, transient, slot, 128, 1472, maximum,
                                16 * GIB, 0, 127, &plan));
-    /* User requests can only lower the automatic cap, never overcommit it. */
+    /* An oversized request must still respect available memory. */
     CHECK(k3_plan_gguf_memory(budget, transient, slot, 128, 1472, maximum,
                               16 * GIB, UINT64_MAX, UINT32_MAX, &plan));
     CHECK(plan.cache_slots == 1024);
     check_plan(plan, budget, transient, slot, 128, maximum);
+}
+
+static void test_explicit_cache_targets(void) {
+    /* Actual K3 expert slots: the automatic 1472-slot target is 12.735 GiB.
+     * A 14 GiB request must reach 1618 slots when the memory budget permits. */
+    const uint64_t slot = UINT64_C(9289728);
+    const uint64_t budget = 20 * GIB, transient = 3 * GIB;
+    const uint64_t static_weights = 83 * GIB;
+    const uint32_t required = 512, desired = 1472, maximum = 92 * 896;
+    k3_memory_plan plan;
+    CHECK(k3_plan_gguf_memory(budget, transient, slot, required, desired,
+                              maximum, static_weights, 0, 0, &plan));
+    CHECK(plan.cache_slots == desired);
+    check_plan(plan, budget, transient, slot, required, maximum);
+
+    CHECK(k3_plan_gguf_memory(budget, transient, slot, required, desired,
+                              maximum, static_weights, 14 * GIB, 0, &plan));
+    CHECK(plan.cache_slots == 1618);
+    CHECK(plan.cache_bytes <= 14 * GIB);
+    CHECK(14 * GIB - plan.cache_bytes < slot);
+    check_plan(plan, budget, transient, slot, required, maximum);
+    CHECK(k3_plan_gguf_memory(budget, transient, slot, required, desired,
+                              maximum, static_weights, 15 * GIB, 0, &plan));
+    CHECK(plan.cache_slots == 1733);
+    check_plan(plan, budget, transient, slot, required, maximum);
+    CHECK(k3_plan_gguf_memory(budget, transient, slot, required, desired,
+                              maximum, static_weights, 0, 1800, &plan));
+    CHECK(plan.cache_slots == 1800);
+    check_plan(plan, budget, transient, slot, required, maximum);
+
+    /* When both forms are supplied, the tighter target wins. */
+    CHECK(k3_plan_gguf_memory(budget, transient, slot, required, desired,
+                              maximum, static_weights, 14 * GIB, 1800, &plan));
+    CHECK(plan.cache_slots == 1618);
+    check_plan(plan, budget, transient, slot, required, maximum);
+    CHECK(k3_plan_gguf_memory(budget, transient, slot, required, desired,
+                              maximum, static_weights, 16 * GIB, 1500, &plan));
+    CHECK(plan.cache_slots == 1500);
+    check_plan(plan, budget, transient, slot, required, maximum);
+
+    /* Targets remain soft: memory, physical expert count, and the minimum
+     * simultaneous working set retain their original authority. */
+    CHECK(k3_plan_gguf_memory(budget, transient, slot, required, desired,
+                              maximum, static_weights, UINT64_MAX, 0, &plan));
+    CHECK(plan.cache_slots == (budget - transient) / slot);
+    CHECK(plan.static_bytes < slot);
+    check_plan(plan, budget, transient, slot, required, maximum);
+    CHECK(k3_plan_gguf_memory(budget, transient, slot, required, desired,
+                              1500, static_weights, UINT64_MAX, UINT32_MAX, &plan));
+    CHECK(plan.cache_slots == 1500);
+    check_plan(plan, budget, transient, slot, required, 1500);
+    const uint64_t minimum_budget = transient + required * slot;
+    CHECK(k3_plan_gguf_memory(minimum_budget, transient, slot, required, desired,
+                              maximum, static_weights, 14 * GIB, 1800, &plan));
+    CHECK(plan.cache_slots == required && plan.static_bytes == 0);
+    check_plan(plan, minimum_budget, transient, slot, required, maximum);
+    CHECK(!k3_plan_gguf_memory(minimum_budget - 1, transient, slot, required,
+                               desired, maximum, static_weights, 14 * GIB, 0, &plan));
+    CHECK(!k3_plan_gguf_memory(budget, transient, slot, required, desired,
+                               maximum, static_weights, required * slot - 1, 0, &plan));
+    CHECK(!k3_plan_gguf_memory(budget, transient, slot, required, desired,
+                               maximum, static_weights, 0, required - 1, &plan));
+    CHECK(plan.cache_slots == 0 && plan.cache_bytes == 0 && plan.static_bytes == 0);
+
+    CHECK(k3_plan_gguf_memory(budget, transient, 0, 0, 0, 0,
+                              static_weights, UINT64_MAX, UINT32_MAX, &plan));
+    CHECK(plan.cache_slots == 0 && plan.cache_bytes == 0);
+    CHECK(plan.static_bytes == budget - transient);
 }
 
 static void test_large_machine_and_no_experts(void) {
@@ -319,6 +387,7 @@ int main(void) {
     test_transient_peak();
     test_32gb_cache_cap();
     test_user_cache_limits();
+    test_explicit_cache_targets();
     test_large_machine_and_no_experts();
     test_invalid_and_extreme_inputs();
     puts("K3 memory planner tests passed");

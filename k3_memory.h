@@ -117,13 +117,17 @@ static inline int k3_plan_gguf_memory(uint64_t budget,
         limit = requested_slots;
     if (limit < required_slots) return 0;
 
-    /* Larger machines can use spare space after keeping the static weights.
-     * Small machines retain only the cache that fits, with enough slots for
-     * all experts selected by one prefill batch. */
-    uint64_t slots = k3_memory_remaining(budget, static_bytes) / slot_bytes;
-    if (slots < desired_slots) slots = desired_slots;
-    if (slots < required_slots) slots = required_slots;
-    if (slots > limit) slots = limit;
+    /* An explicit cache target takes priority over optional static weights,
+     * but remains bounded by available memory and the limits above. */
+    uint64_t slots = limit;
+    if (requested_bytes == 0 && requested_slots == 0) {
+        /* Automatic sizing keeps static weights when possible, with enough
+         * slots for all experts selected by one prefill batch. */
+        slots = k3_memory_remaining(budget, static_bytes) / slot_bytes;
+        if (slots < desired_slots) slots = desired_slots;
+        if (slots < required_slots) slots = required_slots;
+        if (slots > limit) slots = limit;
+    }
     plan->cache_slots = (uint32_t)slots;
     plan->cache_bytes = slots * slot_bytes;
     plan->static_bytes = budget - plan->cache_bytes;

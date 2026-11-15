@@ -51919,7 +51919,9 @@ int k3_gpu_matmul_bf16(
             const bool wide_grid =
                 out_dim >= 1024u * (uint32_t)g_k3_bf16_mv_nsg;
             /* Long dot products favor the smaller four-token working set. */
-            const uint32_t rows_per_group =
+            const bool small_rows_reuse = n_rows >= 2u && n_rows <= 3u &&
+                m1_default && large_shape && wide_grid && in_dim < 16384u;
+            const uint32_t rows_per_group = small_rows_reuse ? n_rows :
                 n_rows >= 4u && m1_default && large_shape
                     ? (n_rows == 8u && wide_grid && in_dim < 16384u
                            ? 8u : 4u) : 1u;
@@ -51935,6 +51937,10 @@ int k3_gpu_matmul_bf16(
                 kernel = "kernel_k3_mul_mv_bf16_f32_rows8";
             } else if (rows_per_group == 4u) {
                 kernel = "kernel_k3_mul_mv_bf16_f32_rows4";
+            } else if (rows_per_group == 3u) {
+                kernel = "kernel_k3_mul_mv_bf16_f32_rows3";
+            } else if (rows_per_group == 2u) {
+                kernel = "kernel_k3_mul_mv_bf16_f32_rows2";
             } else if (n_rows == 1u && m1_default && large_shape && wide_grid) {
                 /* A shorter load window reduces register pressure for a
                  * single token; retain the original path for small grids. */
@@ -52046,19 +52052,24 @@ int k3_gpu_matmul4_bf16(
                 "fused BF16 matrix");
             if (!weights[i]) return 0;
         }
-        /* Keep fused projections on the same M1 shape policy as the
-         * individual BF16 wrapper, including the long-dot fallback. */
+        /* Small fused batches reuse weights only on wide M1 output grids;
+         * long dot products retain the existing fallback. */
         const bool m1_default = g_k3_bf16_mv_unroll == 16 &&
             ds4_gpu_device_is_pre_m5_apple_silicon() &&
             ds4_gpu_device_name_contains("Apple M1");
         const bool large_shape = in_dim >= 1024u &&
             out_dim >= 256u * (uint32_t)g_k3_bf16_mv_nsg;
         const bool wide_grid = out_dim >= 1024u * (uint32_t)g_k3_bf16_mv_nsg;
-        const uint32_t rows_per_group = n_rows >= 4u && m1_default && large_shape
-            ? (n_rows == 8u && wide_grid && in_dim < 16384u ? 8u : 4u) : 1u;
+        const bool small_rows_reuse = n_rows >= 2u && n_rows <= 3u &&
+            m1_default && large_shape && wide_grid && in_dim < 16384u;
+        const uint32_t rows_per_group = small_rows_reuse ? n_rows :
+            n_rows >= 4u && m1_default && large_shape
+                ? (n_rows == 8u && wide_grid && in_dim < 16384u ? 8u : 4u) : 1u;
         const char *kernel = rows_per_group == 8u
             ? "kernel_k3_mul_mv4_bf16_f32_rows8"
             : rows_per_group == 4u ? "kernel_k3_mul_mv4_bf16_f32_rows4"
+            : rows_per_group == 3u ? "kernel_k3_mul_mv4_bf16_f32_rows3"
+            : rows_per_group == 2u ? "kernel_k3_mul_mv4_bf16_f32_rows2"
             : (g_k3_bf16_mv_unroll == 8 ||
                (n_rows == 1u && m1_default && large_shape && wide_grid))
                 ? "kernel_k3_mul_mv4_bf16_f32_unroll8"
@@ -53797,12 +53808,20 @@ int k3_gpu_mla_prefill(
             &weight_inner, "MLA KV up projection");
         id<MTLComputePipelineState> store_pipeline =
             ds4_gpu_get_pipeline("kernel_k3_mla_prefill_store_cache");
+        /* Group loads ahead of the same serial FP32 FMAs on M1. */
+        const bool m1_projections =
+            ds4_gpu_device_is_pre_m5_apple_silicon() &&
+            ds4_gpu_device_name_contains("Apple M1");
         id<MTLComputePipelineState> absorb_pipeline =
-            ds4_gpu_get_pipeline("kernel_k3_mla_prefill_absorb_q");
+            ds4_gpu_get_pipeline(m1_projections
+                ? "kernel_k3_mla_prefill_absorb_q_unroll16"
+                : "kernel_k3_mla_prefill_absorb_q");
         id<MTLComputePipelineState> attention_pipeline =
             ds4_gpu_get_pipeline("kernel_k3_mla_prefill_attention");
         id<MTLComputePipelineState> value_pipeline =
-            ds4_gpu_get_pipeline("kernel_k3_mla_prefill_value_up_gate");
+            ds4_gpu_get_pipeline(m1_projections
+                ? "kernel_k3_mla_prefill_value_up_gate_unroll16"
+                : "kernel_k3_mla_prefill_value_up_gate");
         if (!kv_b || !store_pipeline || !absorb_pipeline ||
             !attention_pipeline || !value_pipeline) {
             return 0;
