@@ -12,16 +12,17 @@ is when an important correctness bug is fixed and it requires some speed penalty
 ## Pull Request Gate
 
 Every pull request runs `.github/workflows/ci.yml`: warning-free builds and the
-tests that need neither a model nor a GPU backend, on macOS and on Linux x64 and
-arm64. To run the same checks locally from a clean tree:
+tests that need no model, on macOS and on Linux x64 and arm64. macOS also runs
+the model-free Metal tests. To run the same checks locally from a clean tree:
 
 ```sh
 make clean
 tests/ci_gate.sh
 ```
 
-The gate does not replace the tests below: it covers no inference, GPU kernels,
-speed, SSD streaming or distributed execution. Runner images and Python test
+The gate does not replace the tests below: it covers no model inference, CUDA
+or ROCm kernels, speed or distributed execution, and only the Metal tests that
+run without a model. Runner images and Python test
 dependencies are pinned in the workflow, so updating them is an explicit change.
 
 ## Correctness Regression Tests
