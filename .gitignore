@@ -136,3 +136,5 @@ __pycache__/
 /tests/test_k3_static_cache
 
 /tests/test_k3_streaming
+
+/tests/test_k3_streaming_slab

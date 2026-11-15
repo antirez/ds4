@@ -30,7 +30,8 @@ The original K3 GGUF is 799.783 GiB. It streams from SSD automatically when its 
 weights cannot fit safely in memory. The router still selects all 16 experts;
 streaming changes where the weights live, not the computation.
 
-On a 128 GiB Mac, the runtime keeps the non-routed weights resident when they
+Without the optimized `--ssd-streaming` profile, on a 128 GiB Mac the runtime
+keeps the non-routed weights resident when they
 fit, then uses the remaining safe budget for an expert cache. With less free
 memory it keeps only some layers' non-routed weights resident. This is automatic;
 no cache or residency flags are needed.
@@ -59,14 +60,35 @@ state by replaying the saved tokens.
 ## SSD streaming setup for a 32 GiB M1 Max
 
 For Kimi K3 GGUF, `--ssd-streaming` automatically selects the optimized
-streaming configuration: a 10 GiB expert-cache target, prefill chunk64,
-aligned static reads, tiled decode output-head reads, four static I/O threads,
-256 MiB expert slabs and no redundant expert read advice. It discovers the
+streaming configuration: an expert-cache target adapted to available memory,
+prefill chunk64, aligned static reads, tiled decode output-head reads, four
+static I/O threads and no redundant expert read advice. Macs with up to 32 GiB
+retain the tested 10 GiB cache target. On larger Macs the target adds half of
+the safe capacity above 10 GiB, measured after runtime tensors, staging buffers,
+the lossless-cache workspace and memory reserves have been accounted for.
+The other half remains available for the macOS file cache and session growth;
+it is not an additional mandatory reserve. This avoids assigning all spare
+memory to locked expert pages while repeatedly reading static weights.
+Expert slabs start at 256 MiB and grow only when needed to fit the admitted
+cache within the backend's slab count; allocation remains lazy. It discovers the
 lossless sidecar beside the canonical GGUF path by replacing `.gguf` with
 `.static-zstd-v1.cache`. If that sidecar is available, both prefill and decode
 use it. The existing default host reserve remains at least 12 GiB, and all memory
 admission/live checks still apply; the expert-cache target may be reduced to
-fit available memory.
+fit available memory. The admission budget respects physical RAM, the Metal
+recommended working set and live reclaimable memory. For example, a simulated
+128 GiB machine with 88 GiB of safe capacity after buffers/reserves selects a
+49 GiB expert-cache target; this is a policy example, not a benchmark or a
+fixed 128 GiB setting. The startup log reports capacity, target and admitted
+cache separately.
+
+This profile continues to stream static weights, using the lossless sidecar
+when available. It does not automatically enable static residency, enlarge
+prefill chunks or resize an already running cache when other applications
+change their memory use. Existing live guards stop inference if headroom
+becomes insufficient. An explicit static-residency setting retains the prior
+10 GiB automatic expert-cache preference; explicit byte/count cache limits
+still take priority and remain bounded by admission.
 
 ```sh
 ./ds4 -m "/absolute/path/to/Kimi-K3-IQ2_XXS-Q2_K.gguf" \

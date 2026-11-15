@@ -90,5 +90,7 @@ void k3_context_set_hidden_hook(k3_context *ctx,
 uint32_t k3_context_position(const k3_context *ctx);
 uint32_t k3_context_capacity(const k3_context *ctx);
 uint32_t k3_context_prefill_capacity(const k3_context *ctx);
+/* Admitted shared GGUF expert-cache capacity, before lazy slab allocation. */
+uint64_t k3_context_expert_cache_bytes(const k3_context *ctx);
 
 #endif

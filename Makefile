@@ -100,7 +100,7 @@ ifeq ($(UNAME_S),Darwin)
 
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
 
-.PHONY: test-k3 test-k3-memory test-k3-streaming test-k3-static-staging test-k3-stream-mapping test-k3-bf16-rows test-k3-bf16-fused test-k3-mla-prefill test-k3-kda-prefill test-k3-gguf test-k3-gguf-source
+.PHONY: test-k3 test-k3-memory test-k3-streaming test-k3-streaming-slab test-k3-static-staging test-k3-stream-mapping test-k3-bf16-rows test-k3-bf16-fused test-k3-mla-prefill test-k3-kda-prefill test-k3-gguf test-k3-gguf-source
 
 help:
 	@echo "DS4 build targets:"
@@ -170,11 +170,17 @@ tests/test_k3_memory: tests/test_k3_memory.c k3_memory.h
 test-k3-memory: tests/test_k3_memory
 	./tests/test_k3_memory
 
-tests/test_k3_streaming: tests/test_k3_streaming.c k3_streaming.h
+tests/test_k3_streaming: tests/test_k3_streaming.c k3_streaming.h k3_memory.h
 	$(CC) $(QUALITY_CFLAGS) -I. -o $@ $<
 
 test-k3-streaming: tests/test_k3_streaming
 	./tests/test_k3_streaming
+
+tests/test_k3_streaming_slab: tests/test_k3_streaming_slab.c k3_streaming_slab.h
+	$(CC) $(QUALITY_CFLAGS) -I. -o $@ $<
+
+test-k3-streaming-slab: tests/test_k3_streaming_slab
+	./tests/test_k3_streaming_slab
 
 tests/test_k3_stream_mapping: tests/test_k3_stream_mapping.c k3_safetensors.o ds4_metal.o ds4_image.o gguf-tools/quants.c
 	$(CC) $(CFLAGS) -I. -o $@ $^ $(METAL_LDLIBS)
@@ -216,7 +222,7 @@ test-k3-bf16-fused: tests/test_k3_bf16_fused
 	./tests/test_k3_bf16_fused
 
 # This fixture includes the internal loader, so do not also link k3_infer.o.
-tests/test_k3_static_staging.o: tests/test_k3_static_staging.c k3_infer.c k3_infer.h k3_memory.h k3_static_cache.h k3_model.h k3_safetensors.h k3_metal.h ds4_gpu.h
+tests/test_k3_static_staging.o: tests/test_k3_static_staging.c k3_infer.c k3_infer.h k3_memory.h k3_streaming.h k3_static_cache.h k3_model.h k3_safetensors.h k3_metal.h ds4_gpu.h
 	$(CC) $(QUALITY_CFLAGS) -I. -c -o $@ $<
 
 tests/test_k3_static_staging: tests/test_k3_static_staging.o $(K3_STATIC_CACHE_OBJ) k3_model.o k3_safetensors.o ds4_metal.o ds4_image.o
@@ -314,8 +320,9 @@ test-k3-gguf: ds4 tests/test_k3_gguf tests/test_k3_tokenizer tests/test_k3_gguf_
 test-k3-gguf-source: tests/test_k3_gguf
 	./tests/test_k3_gguf "$(K3_GGUF)" "$(K3_MODEL)"
 
-test-k3: ds4 tests/test_k3_streaming tests/test_k3_static_staging tests/test_k3_safetensors tests/test_k3_tokenizer tests/test_k3_bf16_rows tests/test_k3_bf16_fused tests/test_k3_mla_prefill tests/test_k3_kda_prefill tests/test_k3_metal tests/test_k3_checkpoint tests/test_k3_gguf_slice
+test-k3: ds4 tests/test_k3_streaming tests/test_k3_streaming_slab tests/test_k3_static_staging tests/test_k3_safetensors tests/test_k3_tokenizer tests/test_k3_bf16_rows tests/test_k3_bf16_fused tests/test_k3_mla_prefill tests/test_k3_kda_prefill tests/test_k3_metal tests/test_k3_checkpoint tests/test_k3_gguf_slice
 	./tests/test_k3_streaming
+	./tests/test_k3_streaming_slab
 	./tests/test_k3_static_staging
 	./tests/test_k3_safetensors
 	./tests/test_k3_tokenizer "$(K3_MODEL)"
@@ -338,7 +345,7 @@ k3_safetensors.o: k3_safetensors.c k3_safetensors.h
 k3_model.o: k3_model.c k3_model.h k3_safetensors.h
 	$(CC) $(CFLAGS) -c -o $@ k3_model.c
 
-k3_infer.o: k3_infer.c k3_infer.h k3_memory.h k3_static_cache.h k3_model.h k3_safetensors.h k3_metal.h ds4_gpu.h
+k3_infer.o: k3_infer.c k3_infer.h k3_memory.h k3_streaming.h k3_static_cache.h k3_model.h k3_safetensors.h k3_metal.h ds4_gpu.h
 	$(CC) $(CFLAGS) -c -o $@ k3_infer.c
 
 # Update this stamp only when the selected variant changes. Distinct object
@@ -1067,7 +1074,7 @@ ds4_eval_cpu.o: ds4_eval.c ds4_eval_cases.h ds4.h ds4_ssd.h ds4_distributed.h ds
 ds4_agent_cpu.o: ds4_agent.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_prompt_prefix.h ds4_kvstore.h ds4_web.h linenoise.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_agent.c
 
-ds4_metal.o: ds4_metal.m ds4.h k3_streaming.h ds4_gpu.h ds4_gpu_tp.h ds4_deepseek41_gpu.h ds4_image.h k3_metal.h $(METAL_SRCS)
+ds4_metal.o: ds4_metal.m ds4.h k3_streaming.h k3_streaming_slab.h ds4_gpu.h ds4_gpu_tp.h ds4_deepseek41_gpu.h ds4_image.h k3_metal.h $(METAL_SRCS)
 	$(CC) $(OBJCFLAGS) -c -o $@ ds4_metal.m
 
 tests/test_glm53_kda.o: tests/test_glm53_kda.c ds4_gpu.h
@@ -1597,7 +1604,7 @@ clean:
 	rm -f tests/test_qwen4_ngrams
 	rm -f tests/test_qwen4_ngram_state
 	rm -f tests/test_web_recovery
-	rm -f tests/test_k3_stream tests/test_k3_memory tests/test_k3_streaming tests/test_k3_stream_mapping
+	rm -f tests/test_k3_stream tests/test_k3_memory tests/test_k3_streaming tests/test_k3_streaming_slab tests/test_k3_stream_mapping
 	rm -f tests/test_metal_ssd_experts
 	rm -f tests/test_metal_command_memory
 	rm -f tests/test_deepseek41_metal

@@ -72275,9 +72275,9 @@ static int ds4_engine_open_k3(ds4_engine *e,
         opt->ssd_streaming, is_gguf, getenv("K3_SSD_STREAMING_DEFAULTS"));
     const uint32_t requested_prefill =
         k3_ssd_prefill_chunk(opt->prefill_chunk, optimized_ssd);
-    const uint64_t expert_cache_bytes = k3_ssd_expert_cache_bytes(
-        opt->ssd_streaming_cache_bytes, opt->ssd_streaming_cache_experts,
-        optimized_ssd);
+    /* Preserve an unspecified target until the K3 context has measured live
+     * memory and charged its tensors, staging buffers and cache workspace. */
+    const uint64_t expert_cache_bytes = opt->ssd_streaming_cache_bytes;
     const uint32_t initial_context =
         k3_ssd_initial_context(opt->context_size, opt->prefill_chunk);
     e->is_k3 = true;
@@ -72349,6 +72349,8 @@ static int ds4_engine_open_k3(ds4_engine *e,
                     err[0] ? err : "open failed");
             return 0;
         }
+        e->ssd_streaming_cache_bytes =
+            k3_context_expert_cache_bytes(e->k3_primary);
         e->metal_ready = true;
     }
     const char *k3_format = e->k3_gguf ? "GGUF" : "SafeTensors";

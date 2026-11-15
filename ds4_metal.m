@@ -27,6 +27,7 @@
 #include "ds4_image.h"
 #include "k3_metal.h"
 #include "k3_streaming.h"
+#include "k3_streaming_slab.h"
 
 /*
  * Objective-C Metal glue for the C engine.
@@ -14638,16 +14639,15 @@ static int ds4_gpu_stream_expert_alloc_slab_slot(
         if (budget != 0 && g_stream_expert_cache_slab_total_slots >= budget) {
             return 0;
         }
-        uint64_t target = ds4_gpu_stream_expert_slab_target_bytes();
-        uint64_t slots64 = target / slot_bytes;
-        if (slots64 == 0) slots64 = 1;
-        if (slots64 > UINT32_MAX) slots64 = UINT32_MAX;
-        uint32_t slots = (uint32_t)slots64;
-        if (budget != 0) {
-            const uint32_t remaining =
-                budget - g_stream_expert_cache_slab_total_slots;
-            if (slots > remaining) slots = remaining;
-        }
+        const uint64_t target = ds4_gpu_stream_expert_slab_target_bytes();
+        const bool automatic_slabs = g_k3_ssd_streaming_defaults &&
+            getenv("DS4_METAL_STREAMING_EXPERT_SLAB_MB") == NULL;
+        uint32_t slots = k3_streaming_slab_slots(target, slot_bytes, budget,
+            g_stream_expert_cache_slab_total_slots,
+            g_stream_expert_cache_slab_count,
+            DS4_METAL_STREAM_EXPERT_CACHE_MAX_SLABS,
+            g_device ? (uint64_t)[g_device maxBufferLength] : 0,
+            automatic_slabs);
         if (slots == 0) return 0;
         id<MTLBuffer> slab_buffer = nil;
         while (slots != 0) {

@@ -26,12 +26,28 @@ static inline uint32_t k3_ssd_initial_context(int requested,
                          : k3_ssd_prefill_chunk(prefill_requested, false);
 }
 
-/* An explicit expert count has precedence over the byte-budget default. */
+/* Explicit cache settings retain priority. The budget must already reflect
+ * physical RAM, Metal's working-set recommendation, live availability and
+ * runtime buffers; transient staging is still charged separately below.
+ * Keep the validated 10 GiB target on machines up to 32 GiB (or unknown size).
+ * Larger machines use half the additional admissible capacity for experts,
+ * leaving the rest available for file cache and future session growth.
+ * This remains a target: the memory planner enforces the live cap and minimum
+ * simultaneous slots. Do not return zero for low headroom: zero means legacy
+ * automatic allocation rather than a disabled or zero-sized expert cache. */
 static inline uint64_t k3_ssd_expert_cache_bytes(uint64_t bytes,
                                                uint32_t slots,
-                                               bool enabled) {
-    return enabled && bytes == 0 && slots == 0
-        ? UINT64_C(10) * 1024u * 1024u * 1024u : bytes;
+                                               bool enabled,
+                                               uint64_t physical,
+                                               uint64_t budget,
+                                               uint64_t transient) {
+    if (!enabled || bytes != 0 || slots != 0) return bytes;
+    const uint64_t gib = UINT64_C(1024) * 1024u * 1024u;
+    const uint64_t base = 10u * gib;
+    const uint64_t usable = budget > transient ? budget - transient : 0;
+    if (physical <= 32u * gib || usable <= base) return base;
+    /* Subtract before adding so even a UINT64_MAX budget cannot overflow. */
+    return base + (usable - base) / 2u;
 }
 
 /* Preserve the existing Metal slab parser for every explicit value, including

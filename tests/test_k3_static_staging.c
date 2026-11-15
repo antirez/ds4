@@ -692,6 +692,13 @@ int main(void) {
     test_head_staging_policy();
     test_prefill_staging_policy();
     test_streaming_option_resolution();
+    /* Session clones report the admitted shared cache, never a guessed
+     * default or their own zero-initialized counter. */
+    k3_context cache_owner = {.gguf_cache_bytes = UINT64_C(49) * 1024 * 1024 * 1024};
+    k3_context cache_clone = {.shared_owner = &cache_owner};
+    assert(k3_context_expert_cache_bytes(NULL) == 0);
+    assert(k3_context_expert_cache_bytes(&cache_owner) == cache_owner.gguf_cache_bytes);
+    assert(k3_context_expert_cache_bytes(&cache_clone) == cache_owner.gguf_cache_bytes);
     test_static_cache_discovery();
     if (large) test_large_multiworker();
     puts("static staging: exact offset/tail/reuse bytes, EOF, lock accounting and cleanup passed (no GPU)");

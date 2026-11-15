@@ -3,6 +3,7 @@
 
 #include "k3_infer.h"
 #include "k3_memory.h"
+#include "k3_streaming.h"
 #include "k3_static_cache.h"
 
 #include "ds4_gpu.h"
@@ -6159,11 +6160,23 @@ int k3_context_create(k3_context **out,
         uint32_t required_slots = ctx->max_prefill_tokens * K3_N_EXPERT_USED;
         if (required_slots > K3_N_EXPERT) required_slots = K3_N_EXPERT;
         if (!routed_layers) required_slots = 0;
+        /* Select automatic cache capacity only after runtime tensors and
+         * both staging slots have been accounted for. A larger Mac can use
+         * more experts while retaining file-cache headroom for static reads.
+         * Explicit residency retains the previous 10 GiB cache preference. */
+        const uint64_t physical = macos_physical_memory();
+        const uint64_t cache_target = k3_ssd_expert_cache_bytes(
+            config->expert_cache_bytes, config->expert_cache_slots,
+            ctx->optimized_ssd_streaming,
+            resident_static_disabled(ctx) ? physical : 0,
+            gguf_budget, ctx->gguf_transient_bytes);
+        const int automatic_cache = ctx->optimized_ssd_streaming &&
+            !config->expert_cache_bytes && !config->expert_cache_slots;
         k3_memory_plan plan;
         if (!k3_plan_gguf_memory(gguf_budget, ctx->gguf_transient_bytes,
                 slot_bytes, required_slots, routed_layers * K3_N_EXPERT_USED,
                 routed_layers * K3_N_EXPERT, static_bytes,
-                config->expert_cache_bytes, config->expert_cache_slots, &plan)) {
+                cache_target, config->expert_cache_slots, &plan)) {
             set_error(err, errcap,
                       "K3 GGUF memory/cache limit cannot fit %u expert slots "
                       "(%.2f GiB) and %.2f GiB streaming reserve; "
@@ -6174,6 +6187,17 @@ int k3_context_create(k3_context **out,
             return 0;
         }
         ctx->gguf_cache_bytes = plan.cache_bytes;
+        if (automatic_cache) {
+            fprintf(stderr,
+                    "k3: automatic SSD expert cache: physical %.2f GiB, "
+                    "safe capacity after buffers/reserves %.2f GiB, "
+                    "target %.2f GiB, admitted %.2f GiB\n",
+                    (double)physical / 1073741824.0,
+                    (double)k3_memory_remaining(gguf_budget,
+                        ctx->gguf_transient_bytes) / 1073741824.0,
+                    (double)cache_target / 1073741824.0,
+                    (double)plan.cache_bytes / 1073741824.0);
+        }
         if (resident_budget > plan.static_bytes) resident_budget = plan.static_bytes;
         ds4_gpu_set_streaming_expert_cache_expert_bytes(expert_bytes);
         ds4_gpu_set_streaming_expert_cache_budget(plan.cache_slots);
@@ -6608,4 +6632,9 @@ uint32_t k3_context_capacity(const k3_context *ctx) {
 
 uint32_t k3_context_prefill_capacity(const k3_context *ctx) {
     return ctx ? ctx->max_prefill_tokens : 0;
+}
+
+uint64_t k3_context_expert_cache_bytes(const k3_context *ctx) {
+    const k3_context *owner = ctx && ctx->shared_owner ? ctx->shared_owner : ctx;
+    return owner ? owner->gguf_cache_bytes : 0;
 }
