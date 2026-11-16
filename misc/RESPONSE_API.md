@@ -3,6 +3,26 @@
 This note tracks the design for fixing `/v1/responses` tool-call continuation
 and the KV-cache behavior around it.
 
+## Response-id state
+
+`previous_response_id` now selects a bounded server-local continuation record.
+A compatible text-only delta is parsed, rendered, and tokenized without replaying
+the saved messages. The slot frontier or a retained disk checkpoint supplies the
+exact sampled prefix. Records preserve prompt settings and ordered tool-call ids;
+streamed and buffered responses expose the same stable id.
+
+The optional KV cache stores continuation frontiers at the continued-cache
+cadence, rather than writing a full checkpoint after every response. The index
+and disk cache are evictable: a returned id is not a promise of permanent
+retention. A miss or incompatible delta returns an error requesting full replay.
+First requests and explicit full-history edits retain the stateless route.
+Response-id image deltas and dynamic tool-search schema extensions require full
+replay. `conversation` objects are not implemented. See `docs/CLIENTS.md` for the
+client-facing contract.
+
+The sections below record the earlier continuation design and implementation
+stages; statements there about missing response-id support are historical.
+
 ## Problem
 
 The current implementation handles `/v1/responses` too much like a stateless
