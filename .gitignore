@@ -44,6 +44,7 @@
 /tests/test_cuda_q8_scratch
 /tests/test_cuda_dspark_moe
 /tests/test_session_state
+/tests/bench_responses
 /tests/test_session_state_gpu
 /tests/test_tp_commands
 /tests/test_tp_rdma

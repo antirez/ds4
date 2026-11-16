@@ -183,8 +183,10 @@ uint8_t ds4_kvstore_reason_code(const char *reason) {
 }
 
 const char *ds4_kvstore_key_kind(uint8_t ext_flags) {
+    if (ext_flags & DS4_KVSTORE_EXT_RESPONSES_ID) return "responses-id";
     if (ext_flags & DS4_KVSTORE_EXT_RESPONSES_VISIBLE) return "responses-visible";
     if (ext_flags & DS4_KVSTORE_EXT_THINKING_VISIBLE) return "thinking-visible";
+    if (ext_flags & DS4_KVSTORE_EXT_RECOVERY) return "recovery";
     return "token-text";
 }
 
@@ -744,13 +746,21 @@ static int kv_cache_continued_step(const ds4_kvstore *kc) {
     return step;
 }
 
-int ds4_kvstore_continued_store_target(const ds4_kvstore *kc, int live_tokens) {
+int ds4_kvstore_continued_store_crossed_target(const ds4_kvstore *kc,
+                                               int last_store_tokens,
+                                               int live_tokens) {
+    if (!kc) return 0;
     const int step = kv_cache_continued_step(kc);
-    if (step <= 0) return 0;
-    if (live_tokens < kc->opt.min_tokens) return 0;
-    if (live_tokens % step != 0) return 0;
-    if (live_tokens <= kc->continued_last_store_tokens) return 0;
-    return live_tokens;
+    if (step <= 0 || live_tokens < kc->opt.min_tokens) return 0;
+    const int boundary = live_tokens - live_tokens % step;
+    if (boundary < kc->opt.min_tokens || boundary <= last_store_tokens) return 0;
+    return boundary;
+}
+
+int ds4_kvstore_continued_store_target(const ds4_kvstore *kc, int live_tokens) {
+    const int boundary = ds4_kvstore_continued_store_crossed_target(
+        kc, kc ? kc->continued_last_store_tokens : 0, live_tokens);
+    return boundary == live_tokens ? boundary : 0;
 }
 
 void ds4_kvstore_note_store(ds4_kvstore *kc, int tokens) {
@@ -886,44 +896,51 @@ static bool kv_trailer_write(const ds4_kvstore_trailer_hooks *hooks,
     return hooks->write(hooks->ud, fp, text, written_bytes);
 }
 
-static void kv_cache_rewrite_trailer(ds4_kvstore *kc, const char *path,
+/* An already-compatible payload need not be staged again.  It can still need
+ * a trailer refresh or a protocol marker (for example RECOVERY) in its header. */
+static bool kv_cache_rewrite_trailer(ds4_kvstore *kc, const char *path,
                                      const char *text,
-                                     const ds4_kvstore_trailer_hooks *hooks) {
+                                     const ds4_kvstore_trailer_hooks *hooks,
+                                     uint8_t extra_ext_flags) {
     uint64_t trailer_est = 0;
-    if (!hooks || !hooks->write || !hooks->serialized_size ||
-        !kv_trailer_serialized_size(hooks, text, &trailer_est) ||
-        trailer_est == 0)
-    {
-        return;
-    }
+    const bool rewrite_trailer =
+        hooks && hooks->write && hooks->serialized_size &&
+        kv_trailer_serialized_size(hooks, text, &trailer_est) &&
+        trailer_est > 0;
+    if (!rewrite_trailer && extra_ext_flags == 0) return true;
+
     FILE *fp = fopen(path, "r+b");
-    if (!fp) return;
+    if (!fp) return false;
     ds4_kvstore_entry hdr = {0};
     uint32_t text_bytes = 0;
     bool ok = ds4_kvstore_read_header(fp, &hdr, &text_bytes);
     uint64_t end = DS4_KVSTORE_FIXED_HEADER + 4ull +
                    (uint64_t)text_bytes + hdr.payload_bytes;
-    if (ok && end <= (uint64_t)INT64_MAX &&
+    uint8_t added_ext_flags = extra_ext_flags;
+    if (ok && end <= (uint64_t)INT64_MAX && rewrite_trailer &&
         fseeko(fp, (off_t)end, SEEK_SET) == 0 &&
         ftruncate(fileno(fp), (off_t)end) == 0)
     {
-        uint64_t ignored = 0;
-        ok = kv_trailer_write(hooks, fp, text, &ignored) && fflush(fp) == 0;
-        if (ok && ignored > 0) {
-            uint8_t h[DS4_KVSTORE_FIXED_HEADER];
-            uint64_t now = (uint64_t)time(NULL);
-            ds4_kvstore_fill_header(h, hdr.model_id, hdr.quant_bits, hdr.reason,
-                                    (uint8_t)(hdr.ext_flags | hooks->ext_flag),
-                                    hdr.tokens, hdr.hits, hdr.ctx_size,
-                                    hdr.created_at, now, hdr.payload_bytes);
-            ok = fseeko(fp, 0, SEEK_SET) == 0 &&
-                 fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
-                 fflush(fp) == 0;
-        }
+        uint64_t written = 0;
+        ok = kv_trailer_write(hooks, fp, text, &written) && fflush(fp) == 0;
+        if (ok && written > 0) added_ext_flags |= hooks->ext_flag;
+    } else if (ok && rewrite_trailer) {
+        ok = false;
     }
-    fclose(fp);
+    if (ok && added_ext_flags != 0) {
+        uint8_t h[DS4_KVSTORE_FIXED_HEADER];
+        uint64_t now = (uint64_t)time(NULL);
+        ds4_kvstore_fill_header(h, hdr.model_id, hdr.quant_bits, hdr.reason,
+                                (uint8_t)(hdr.ext_flags | added_ext_flags),
+                                hdr.tokens, hdr.hits, hdr.ctx_size,
+                                hdr.created_at, now, hdr.payload_bytes);
+        ok = fseeko(fp, 0, SEEK_SET) == 0 &&
+             fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
+             fflush(fp) == 0;
+    }
+    if (fclose(fp) != 0) ok = false;
     (void)kc;
-    (void)ok;
+    return ok;
 }
 
 bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
@@ -931,6 +948,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                         ds4_session *session,
                                         const ds4_tokens *tokens,
                                         int store_len,
+                                        bool force_store,
                                         const char *reason,
                                         const char *cache_text_override,
                                         uint8_t cache_text_ext,
@@ -939,7 +957,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                         char *err,
                                         size_t err_len) {
     if (!kc->enabled) return false;
-    if (!tokens || store_len < kc->opt.min_tokens) return false;
+    if (!tokens || (!force_store && store_len < kc->opt.min_tokens)) return false;
     const int original_len = tokens->len;
 
     ds4_tokens store_tokens = {0};
@@ -1003,11 +1021,12 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     if (kv_cache_existing_compatible(kc, path, sha, text, text_len,
                                      model_id,
                                      quant_bits, ds4_session_ctx(session))) {
-        kv_cache_rewrite_trailer(kc, path, text, hooks);
+        bool rewritten = kv_cache_rewrite_trailer(kc, path, text, hooks,
+                                                   cache_text_ext);
         free(text);
         free(path);
         ds4_tokens_free(&store_tokens);
-        return true;
+        return rewritten;
     }
 
     ds4_session_payload_file staged = {0};
@@ -1078,7 +1097,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     const uint64_t now = (uint64_t)time(NULL);
     uint8_t h[DS4_KVSTORE_FIXED_HEADER];
     uint8_t ext_flags = trailer_est_bytes > 0 && hooks ? hooks->ext_flag : 0;
-    if (text_override) ext_flags |= cache_text_ext;
+    if (cache_text_ext) ext_flags |= cache_text_ext;
     ds4_kvstore_fill_header(h, (uint8_t)model_id, (uint8_t)quant_bits,
                             reason_code, ext_flags,
                             (uint32_t)store_tokens.len, 0,
@@ -1170,7 +1189,7 @@ bool ds4_kvstore_store_live_prefix(ds4_kvstore *kc,
                                    char *err,
                                    size_t err_len) {
     return ds4_kvstore_store_live_prefix_text(kc, engine, session, tokens,
-                                              store_len, reason, NULL, 0, NULL,
+                                              store_len, false, reason, NULL, 0, NULL,
                                               hooks, err, err_len);
 }
 
@@ -1193,16 +1212,22 @@ bool ds4_kvstore_maybe_store_continued(ds4_kvstore *kc,
     return false;
 }
 
-int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
-                                 int model_id, int quant_bits, int ctx_size) {
+static int kv_cache_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
+                                      int model_id, int quant_bits, int ctx_size,
+                                      uint8_t required_ext_flags) {
     if (!prompt_text) return -1;
     const size_t prompt_bytes = strlen(prompt_text);
     kv_cache_refresh(kc);
     int best = -1;
     for (int i = 0; i < kc->len; i++) {
         ds4_kvstore_entry *e = &kc->entry[i];
+        /* Response-id keys name opaque state, not model-facing text. */
+        if ((e->ext_flags & required_ext_flags) != required_ext_flags ||
+            ((e->ext_flags ^ required_ext_flags) & DS4_KVSTORE_EXT_RESPONSES_ID)) continue;
         if (e->text_bytes > prompt_bytes || e->text_bytes > SIZE_MAX) continue;
-        if ((int)e->tokens < kc->opt.min_tokens) continue;
+        if ((int)e->tokens < kc->opt.min_tokens &&
+            !(e->ext_flags & (DS4_KVSTORE_EXT_RESPONSES_ID |
+                              DS4_KVSTORE_EXT_RECOVERY))) continue;
         if (e->model_id != (uint8_t)model_id) continue;
         if ((uint32_t)ctx_size < e->ctx_size) continue;
         if (kc->reject_different_quant && e->quant_bits != (uint8_t)quant_bits) continue;
@@ -1218,6 +1243,12 @@ int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
     return best;
 }
 
+int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
+                                 int model_id, int quant_bits, int ctx_size) {
+    return kv_cache_find_text_prefix(kc, prompt_text, model_id, quant_bits,
+                                     ctx_size, 0);
+}
+
 int ds4_kvstore_try_load_text(ds4_kvstore *kc,
                               ds4_engine *engine,
                               ds4_session *session,
@@ -1225,7 +1256,8 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
                               ds4_tokens *effective_prompt,
                               ds4_kvstore_load_result *result,
                               const ds4_kvstore_trailer_hooks *hooks,
-                              bool responses_protocol) {
+                              bool responses_protocol,
+                              uint8_t required_ext_flags) {
     if (result) memset(result, 0, sizeof(*result));
     if (effective_prompt) effective_prompt->len = 0;
     if (!kc->enabled || !prompt_text) return 0;
@@ -1233,8 +1265,8 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
     if (!ds4_kvstore_quant_bits_supported(quant_bits)) return 0;
     const int model_id = ds4_engine_model_id(engine);
     const size_t prompt_bytes = strlen(prompt_text);
-    int idx = ds4_kvstore_find_text_prefix(kc, prompt_text, model_id, quant_bits,
-                                           ds4_session_ctx(session));
+    int idx = kv_cache_find_text_prefix(kc, prompt_text, model_id, quant_bits,
+                                        ds4_session_ctx(session), required_ext_flags);
     if (idx < 0) return 0;
 
     ds4_kvstore_entry e = kc->entry[idx];
@@ -1254,6 +1286,10 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
         if (hdr.model_id != (uint8_t)model_id) {
             header_ok = false;
             fail_reason = "cached checkpoint was written for a different model";
+        } else if (required_ext_flags &&
+                   (hdr.ext_flags & required_ext_flags) != required_ext_flags) {
+            header_ok = false;
+            fail_reason = "cached checkpoint has incompatible extension flags";
         } else if ((uint64_t)text_bytes > prompt_bytes) {
             header_ok = false;
             fail_reason = "cached text is longer than prompt";

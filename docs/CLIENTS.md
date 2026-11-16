@@ -100,6 +100,23 @@ stream_idle_timeout_ms = 1000000
 codex --model deepseek-v4-flash -c model_provider=ds4
 ```
 
+## Responses continuation
+
+HTTP clients can send a returned `resp_` id as `previous_response_id`, with
+`input` containing only new user messages or tool outputs. Compatible text-only
+continuations retain the exact sampled prefix, including hidden reasoning and
+tool-call bindings. Omitted instructions, tools, and reasoning settings inherit
+from the saved response; explicitly changed prompt settings require full replay.
+
+The index is local to one server and its KV-cache directory, not an authorization
+boundary. It keeps up to 4096 records, with a 64 MiB metadata cap. A record is
+usable while its exact frontier is still live or its checkpoint remains in the
+optional disk cache. Only `previous_response_id` continuations write these
+checkpoints, at the continued-cache cadence; not every returned id survives
+another turn or a restart. Unavailable ids return an error asking for full replay. To edit history,
+replay it without `previous_response_id`. Images and dynamic tool-search schema
+changes still require full replay; `conversation` remains unsupported.
+
 ## Claude Code
 
 Use the Anthropic-compatible endpoint. A shell wrapper can select the local
