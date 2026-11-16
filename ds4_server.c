@@ -5893,6 +5893,58 @@ static size_t trim_tool_separator_ws(const char *raw, size_t start, size_t limit
     return limit;
 }
 
+/* Live streams stop projecting text at the first thing that looks like the
+ * start of a tool-call block and leave the decision to the final parser.  When
+ * the final parser reports no tool call, the held bytes were ordinary model
+ * text: a reply that quotes "<tool_call>" or explains the DSML syntax, or a
+ * marker mentioned inside reasoning.  Without a catch-up those bytes never
+ * reach a streaming client, which then sees a reply cut off at the marker while
+ * a non-streaming request returns it whole.
+ *
+ * sent_end is the stream cursor up to which bytes were sent or consumed as
+ * syntax (<think>, </think>); content_started tells whether that cursor is
+ * already past the reasoning.  The tail is split exactly like
+ * split_reasoning_content(), so stream and non-stream end with the same
+ * reasoning and content. */
+typedef struct {
+    size_t reasoning_off;
+    size_t reasoning_len;
+    size_t content_off;
+    size_t content_len;
+    bool closed_thinking;
+} stream_unsent_tail;
+
+static bool stream_unsent_tail_split(const char *raw, size_t raw_len,
+                                     size_t sent_end, bool content_started,
+                                     stream_unsent_tail *out) {
+    memset(out, 0, sizeof(*out));
+    if (!raw || sent_end >= raw_len) return false;
+    if (content_started) {
+        out->content_off = sent_end;
+        out->content_len = raw_len - sent_end;
+        return true;
+    }
+    const char *close = strstr(raw + sent_end, "</think>");
+    if (close && (size_t)(close - raw) + strlen("</think>") <= raw_len) {
+        out->reasoning_off = sent_end;
+        out->reasoning_len = (size_t)(close - raw) - sent_end;
+        out->content_off = (size_t)(close - raw) + strlen("</think>");
+        out->content_len = raw_len - out->content_off;
+        out->closed_thinking = true;
+    } else {
+        out->reasoning_off = sent_end;
+        out->reasoning_len = raw_len - sent_end;
+    }
+    return true;
+}
+
+/* The catch-up applies only when the final response carries no tool call and
+ * is not an error: then the streamed text must equal the non-streamed text. */
+static bool stream_tail_is_plain_text(const tool_calls *calls, const char *finish) {
+    if (calls && calls->len) return false;
+    return !finish || strcmp(finish, "error") != 0;
+}
+
 static const char *skip_ascii_ws(const char *p) {
     while (*p && isspace((unsigned char)*p)) p++;
     return p;
@@ -7206,6 +7258,8 @@ typedef struct {
     bool guard_second_reasoning;
     bool sent_reasoning;
     bool sent_content;
+    size_t sent_end;          /* bytes sent to the client or consumed as syntax */
+    bool content_started;     /* sent_end is past the reasoning */
     openai_tool_stream tool;
 } openai_stream;
 
@@ -7218,6 +7272,7 @@ static void openai_stream_start(const request *r, openai_stream *st) {
     memset(st, 0, sizeof(*st));
     st->active = true;
     st->mode = ds4_think_mode_enabled(r->think_mode) ? OPENAI_STREAM_THINKING : OPENAI_STREAM_TEXT;
+    st->content_started = st->mode == OPENAI_STREAM_TEXT;
     st->guard_second_reasoning = stream_needs_second_reasoning_guard(r);
 }
 
@@ -8047,6 +8102,7 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
             }
             if (raw_len >= open_len && !strncmp(raw, open, open_len)) {
                 st->emit_pos = open_len;
+                st->sent_end = open_len;
             }
             st->checked_think_prefix = true;
         }
@@ -8077,6 +8133,7 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
                                   limit - st->emit_pos)) return false;
             st->sent_reasoning = true;
             st->emit_pos = limit;
+            st->sent_end = limit;
         }
 
         if (tool_before_close) {
@@ -8089,6 +8146,8 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
 
         if (close) {
             st->emit_pos = (size_t)(close - raw) + strlen("</think>");
+            st->sent_end = st->emit_pos;
+            st->content_started = true;
             st->mode = OPENAI_STREAM_TEXT;
         } else if (final) {
             st->mode = OPENAI_STREAM_SUPPRESS;
@@ -8111,6 +8170,7 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
                                       limit - st->emit_pos)) return false;
                 if (limit > st->emit_pos) st->sent_reasoning = true;
                 st->emit_pos = limit + strlen("</think>");
+                st->sent_end = st->emit_pos;
                 st->guard_second_reasoning = false;
             } else if (!tool && !final) {
                 return true;
@@ -8129,6 +8189,7 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
                                   limit - st->emit_pos)) return false;
             st->sent_content = true;
             st->emit_pos = limit;
+            st->sent_end = limit;
         }
 
         if (tool) {
@@ -8156,6 +8217,25 @@ static bool openai_sse_finish_live(int fd, server *s, const request *r, const ch
                                    const char *finish, int prompt_tokens,
                                    int completion_tokens) {
     if (!openai_sse_stream_update(fd, s, r, id, st, raw, raw_len, true)) return false;
+
+    stream_unsent_tail tail;
+    if (st->active && !st->tool.emitted_any && stream_tail_is_plain_text(calls, finish) &&
+        stream_unsent_tail_split(raw, raw_len, st->sent_end, st->content_started, &tail))
+    {
+        if (tail.reasoning_len) {
+            if (!sse_chat_delta_n(fd, r, id, "reasoning_content",
+                                  raw + tail.reasoning_off, tail.reasoning_len)) return false;
+            st->sent_reasoning = true;
+        }
+        if (tail.content_len) {
+            if (!sse_chat_delta_n(fd, r, id, "content",
+                                  raw + tail.content_off, tail.content_len)) return false;
+            st->sent_content = true;
+        }
+        st->sent_end = raw_len;
+        st->emit_pos = raw_len;
+        if (tail.closed_thinking) st->content_started = true;
+    }
 
     buf b = {0};
     long now = (long)time(NULL);
@@ -8234,6 +8314,8 @@ typedef struct {
     bool message_item_closed;
     bool reasoning_emitted_any;
     bool message_emitted_any;
+    size_t sent_end;          /* bytes sent to the client or consumed as syntax */
+    bool content_started;     /* sent_end is past the reasoning */
     buf reasoning_text;
     buf message_text;
     char response_id[40];
@@ -8248,6 +8330,7 @@ typedef struct {
 static void responses_stream_init(const request *r, responses_stream *st) {
     memset(st, 0, sizeof(*st));
     st->mode = ds4_think_mode_enabled(r->think_mode) ? RESP_STREAM_THINKING : RESP_STREAM_TEXT;
+    st->content_started = st->mode == RESP_STREAM_TEXT;
     responses_random_id(st->response_id, sizeof(st->response_id), "resp_");
     responses_random_id(st->reasoning_id, sizeof(st->reasoning_id), "rs_");
     responses_random_id(st->message_id, sizeof(st->message_id), "msg_");
@@ -8780,6 +8863,7 @@ static bool responses_sse_stream_update(int fd, const request *r,
             }
             if (raw_len >= open_len && !strncmp(raw, open, open_len)) {
                 st->emit_pos = open_len;
+                st->sent_end = open_len;
             }
             st->checked_think_prefix = true;
         }
@@ -8822,6 +8906,7 @@ static bool responses_sse_stream_update(int fd, const request *r,
                 st->reasoning_emitted_any = true;
             }
             st->emit_pos = limit;
+            st->sent_end = limit;
         }
 
         if (tool_before_close) {
@@ -8834,6 +8919,8 @@ static bool responses_sse_stream_update(int fd, const request *r,
 
         if (close) {
             st->emit_pos = (size_t)(close - raw) + strlen("</think>");
+            st->sent_end = st->emit_pos;
+            st->content_started = true;
             st->mode = RESP_STREAM_TEXT;
             st->reasoning_closed_naturally = true;
         } else if (final) {
@@ -8865,6 +8952,7 @@ static bool responses_sse_stream_update(int fd, const request *r,
             buf_append(&st->message_text, raw + st->emit_pos, limit - st->emit_pos);
             st->message_emitted_any = true;
             st->emit_pos = limit;
+            st->sent_end = limit;
         }
 
         if (tool) {
@@ -8887,23 +8975,45 @@ static bool responses_sse_finish_live(int fd, const request *r,
                                       long created_at) {
     if (!responses_sse_stream_update(fd, r, st, raw, raw_len, true)) return false;
 
+    /* Catch up text the stream held at a tool-call-looking marker that the
+     * final parser did not turn into a tool call (see stream_unsent_tail_split).
+     * This also covers the recovery path, where DSML failed to parse and the
+     * worker promoted the whole generation to assistant text: the client must
+     * accumulate what output_item.done and the terminal response report.
+     * Reasoning is split off at </think> because the stream may have stopped
+     * inside it. */
+    stream_unsent_tail tail;
+    const bool catch_up = st->active &&
+        (recovered_content || stream_tail_is_plain_text(calls, finish)) &&
+        stream_unsent_tail_split(raw, raw_len, st->sent_end, st->content_started, &tail);
+    if (catch_up && tail.reasoning_len && r->reasoning_summary_emit &&
+        !st->reasoning_item_closed)
+    {
+        if (!st->reasoning_item_opened) {
+            st->reasoning_index = st->next_output_index++;
+            if (!responses_sse_reasoning_added(fd, st)) return false;
+            st->reasoning_item_opened = true;
+        }
+        if (!st->reasoning_summary_started) {
+            if (!responses_sse_reasoning_summary_part_added(fd, st)) return false;
+            st->reasoning_summary_started = true;
+        }
+        if (!responses_sse_reasoning_delta(fd, st, raw + tail.reasoning_off,
+                                           tail.reasoning_len)) return false;
+        buf_append(&st->reasoning_text, raw + tail.reasoning_off, tail.reasoning_len);
+        st->reasoning_emitted_any = true;
+    }
+    if (catch_up && tail.closed_thinking) st->reasoning_closed_naturally = true;
+
     /* Close any half-open reasoning summary so the TUI knows the part ended
      * before we slot in any tool calls or completion. */
     if (st->reasoning_item_opened && !st->reasoning_item_closed) {
         if (!responses_sse_reasoning_done(fd, st, finish)) return false;
         st->reasoning_item_closed = true;
     }
-    /* Recovery path: when DSML tool parsing fails the worker promotes the entire
-     * generation to assistant text. Streaming had already entered suppress mode
-     * at the tool marker, so anything in raw[st->emit_pos..raw_len] never made
-     * it to the client. Emit those bytes as additional output_text deltas so
-     * what the client accumulates matches output_item.done and the terminal
-     * response. We use the stream cursor instead of comparing against
-     * recovered_content because the raw text can begin with `<think>...</think>`
-     * which the streaming side consumed as reasoning, not message text. */
-    if (recovered_content && raw && st->emit_pos < raw_len) {
-        const char *tail = raw + st->emit_pos;
-        size_t tail_len = raw_len - st->emit_pos;
+    if (catch_up && tail.content_len) {
+        const char *text = raw + tail.content_off;
+        size_t text_len = tail.content_len;
         if (!st->message_item_opened) {
             st->message_index = st->next_output_index++;
             if (!responses_sse_message_added(fd, st)) return false;
@@ -8913,10 +9023,14 @@ static bool responses_sse_finish_live(int fd, const request *r,
             if (!responses_sse_message_text_part_added(fd, st)) return false;
             st->message_text_part_open = true;
         }
-        if (!responses_sse_output_text_delta(fd, st, tail, tail_len)) return false;
-        buf_append(&st->message_text, tail, tail_len);
+        if (!responses_sse_output_text_delta(fd, st, text, text_len)) return false;
+        buf_append(&st->message_text, text, text_len);
         st->message_emitted_any = true;
+    }
+    if (catch_up) {
+        st->sent_end = raw_len;
         st->emit_pos = raw_len;
+        if (tail.closed_thinking) st->content_started = true;
     }
     if (st->message_item_opened && !st->message_item_closed) {
         if (!responses_sse_message_done(fd, st, finish)) return false;
@@ -9203,6 +9317,8 @@ typedef struct {
     bool guard_second_reasoning;
     bool sent_thinking;
     bool sent_text;
+    size_t sent_end;          /* bytes sent to the client or consumed as syntax */
+    bool content_started;     /* sent_end is past the reasoning */
     anthropic_tool_stream tool;
 } anthropic_stream;
 
@@ -9226,6 +9342,7 @@ static bool anthropic_sse_start_live(int fd, const request *r, const char *id,
     memset(st, 0, sizeof(*st));
     st->active = ok;
     st->mode = ds4_think_mode_enabled(r->think_mode) ? ANTH_STREAM_THINKING : ANTH_STREAM_TEXT;
+    st->content_started = st->mode == ANTH_STREAM_TEXT;
     st->guard_second_reasoning = stream_needs_second_reasoning_guard(r);
     return ok;
 }
@@ -9674,6 +9791,7 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
             }
             if (raw_len >= open_len && !strncmp(raw, open, open_len)) {
                 st->emit_pos = open_len;
+                st->sent_end = open_len;
             }
             st->checked_think_prefix = true;
         }
@@ -9705,6 +9823,7 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
                                           limit - st->emit_pos)) return false;
             st->sent_thinking = true;
             st->emit_pos = limit;
+            st->sent_end = limit;
         }
 
         if (tool_before_close) {
@@ -9720,6 +9839,8 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
             if (!anthropic_sse_close_block_live(fd, id, st)) return false;
             if (close) {
                 st->emit_pos = (size_t)(close - raw) + strlen("</think>");
+                st->sent_end = st->emit_pos;
+                st->content_started = true;
                 st->mode = ANTH_STREAM_TEXT;
             } else {
                 st->mode = ANTH_STREAM_SUPPRESS;
@@ -9746,6 +9867,7 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
                 }
                 if (!anthropic_sse_close_block_live(fd, id, st)) return false;
                 st->emit_pos = limit + strlen("</think>");
+                st->sent_end = st->emit_pos;
                 st->guard_second_reasoning = false;
             } else if (!tool && !final) {
                 return true;
@@ -9765,6 +9887,7 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
                                           limit - st->emit_pos)) return false;
             st->sent_text = true;
             st->emit_pos = limit;
+            st->sent_end = limit;
         }
 
         if (tool) {
@@ -9859,6 +9982,35 @@ static bool anthropic_sse_finish_live(int fd, server *s, const request *r, const
                                       size_t raw_len, const tool_calls *calls,
                                       const char *finish, int completion_tokens) {
     if (!anthropic_sse_stream_update(fd, s, r, id, st, raw, raw_len, true)) return false;
+
+    stream_unsent_tail tail;
+    if (st->active && !st->tool.emitted_any && stream_tail_is_plain_text(calls, finish) &&
+        stream_unsent_tail_split(raw, raw_len, st->sent_end, st->content_started, &tail))
+    {
+        if (tail.reasoning_len) {
+            if (st->open_block != ANTH_BLOCK_NONE && st->open_block != ANTH_BLOCK_THINKING &&
+                !anthropic_sse_close_block_live(fd, id, st)) return false;
+            if (!anthropic_sse_open_block(fd, st, ANTH_BLOCK_THINKING)) return false;
+            if (!anthropic_sse_delta_live(fd, st, ANTH_BLOCK_THINKING,
+                                          raw + tail.reasoning_off,
+                                          tail.reasoning_len)) return false;
+            st->sent_thinking = true;
+        }
+        if (tail.content_len) {
+            if (st->open_block != ANTH_BLOCK_NONE && st->open_block != ANTH_BLOCK_TEXT &&
+                !anthropic_sse_close_block_live(fd, id, st)) return false;
+            if (!anthropic_sse_open_block(fd, st, ANTH_BLOCK_TEXT)) return false;
+            if (!anthropic_sse_delta_live(fd, st, ANTH_BLOCK_TEXT,
+                                          raw + tail.content_off,
+                                          tail.content_len)) return false;
+            st->sent_text = true;
+        }
+        if (st->open_block != ANTH_BLOCK_NONE &&
+            !anthropic_sse_close_block_live(fd, id, st)) return false;
+        st->sent_end = raw_len;
+        st->emit_pos = raw_len;
+        if (tail.closed_thinking) st->content_started = true;
+    }
 
     if (st->sent_thinking && !st->sent_text && (!calls || calls->len == 0)) {
         if (!anthropic_sse_open_block(fd, st, ANTH_BLOCK_TEXT)) return false;
@@ -23014,6 +23166,260 @@ static void test_deepseek41_live_result_order(void) {
     pthread_mutex_destroy(&s.tool_mu);
 }
 
+/* --- streamed replies that mention tool-call markers --------------------- */
+
+typedef enum {
+    TEST_STREAM_OPENAI,
+    TEST_STREAM_ANTHROPIC,
+    TEST_STREAM_RESPONSES,
+} test_stream_api;
+
+/* Concatenate every JSON string value that follows `key` on SSE lines that
+ * contain `event` (any line when event is NULL). */
+static char *test_sse_collect(const char *out, const char *event, const char *key) {
+    buf b = {0};
+    buf_puts(&b, "");
+    const char *p = out ? out : "";
+    while (*p) {
+        const char *nl = strchr(p, '\n');
+        size_t n = nl ? (size_t)(nl - p) : strlen(p);
+        char *line = xstrndup(p, n);
+        if (!event || strstr(line, event)) {
+            for (const char *k = strstr(line, key); k; k = strstr(k + 1, key)) {
+                const char *v = k + strlen(key);
+                char *str = NULL;
+                if (json_string(&v, &str) && str) buf_puts(&b, str);
+                free(str);
+            }
+        }
+        free(line);
+        if (!nl) break;
+        p = nl + 1;
+    }
+    return buf_take(&b);
+}
+
+/* Stream `raw` the way the worker does (growing NUL-terminated prefixes of
+ * `step` bytes), finish with `calls`/`finish`, and return the SSE transcript. */
+static char *test_stream_transcript(test_stream_api api, ds4_think_mode think,
+                                    bool has_tools, const char *raw, size_t step,
+                                    tool_calls *calls, const char *finish) {
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+        TEST_ASSERT(false);
+        return xstrdup("");
+    }
+    int sz = 1 << 20;
+    setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &sz, sizeof(sz));
+    setsockopt(sv[1], SOL_SOCKET, SO_RCVBUF, &sz, sizeof(sz));
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = api == TEST_STREAM_ANTHROPIC ? API_ANTHROPIC :
+            api == TEST_STREAM_RESPONSES ? API_RESPONSES : API_OPENAI;
+    r.stream = true;
+    r.think_mode = think;
+    r.has_tools = has_tools;
+    r.reasoning_summary_emit = true;
+    if (has_tools) r.tool_orders = make_bash_order();
+
+    const size_t len = strlen(raw);
+    openai_stream os;
+    anthropic_stream as;
+    responses_stream rs;
+    if (api == TEST_STREAM_OPENAI) {
+        TEST_ASSERT(sse_chunk(sv[0], &r, "chatcmpl_tail", NULL, NULL));
+        openai_stream_start(&r, &os);
+    } else if (api == TEST_STREAM_ANTHROPIC) {
+        TEST_ASSERT(anthropic_sse_start_live(sv[0], &r, "msg_tail", 5, &as));
+    } else {
+        responses_stream_init(&r, &rs);
+        rs.active = true;
+    }
+    for (size_t n = step; n < len; n += step) {
+        char *prefix = xstrndup(raw, n);
+        if (api == TEST_STREAM_OPENAI) {
+            TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_tail", &os,
+                                                 prefix, n, false));
+        } else if (api == TEST_STREAM_ANTHROPIC) {
+            TEST_ASSERT(anthropic_sse_stream_update(sv[0], NULL, &r, "msg_tail", &as,
+                                                    prefix, n, false));
+        } else {
+            TEST_ASSERT(responses_sse_stream_update(sv[0], &r, &rs, prefix, n, false));
+        }
+        free(prefix);
+    }
+    if (api == TEST_STREAM_OPENAI) {
+        if (calls) apply_openai_stream_tool_ids(calls, &os);
+        TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_tail", &os, raw, len,
+                                           calls, finish, 10, 4));
+        openai_stream_free(&os);
+    } else if (api == TEST_STREAM_ANTHROPIC) {
+        if (calls) apply_anthropic_stream_tool_ids(calls, &as);
+        TEST_ASSERT(anthropic_sse_finish_live(sv[0], NULL, &r, "msg_tail", &as, raw, len,
+                                              calls, finish, 9));
+        anthropic_stream_free(&as);
+    } else {
+        TEST_ASSERT(responses_sse_finish_live(sv[0], &r, &rs, raw, len, NULL, calls,
+                                              finish, 10, 4, 1234));
+        responses_stream_free(&rs);
+    }
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+    return out;
+}
+
+static void test_stream_split(test_stream_api api, const char *out,
+                              char **reasoning, char **content) {
+    if (api == TEST_STREAM_OPENAI) {
+        *reasoning = test_sse_collect(out, NULL, "\"reasoning_content\":");
+        *content = test_sse_collect(out, NULL, "\"content\":");
+    } else if (api == TEST_STREAM_ANTHROPIC) {
+        *reasoning = test_sse_collect(out, "thinking_delta", "\"thinking\":");
+        *content = test_sse_collect(out, "text_delta", "\"text\":");
+    } else {
+        *reasoning = test_sse_collect(out, "reasoning_summary_text.delta", "\"delta\":");
+        *content = test_sse_collect(out, "output_text.delta", "\"delta\":");
+    }
+}
+
+/* With no tool call in the final parse, every protocol must stream exactly the
+ * reasoning and content a non-streaming request returns, whatever the model
+ * wrote about tool-call syntax and however the bytes were chunked. */
+static void test_stream_quoted_tool_markers_match_final_parse(void) {
+    static const struct {
+        bool think;
+        bool has_tools;
+        const char *raw;
+    } cases[] = {
+        {false, true, "Here is one `<tool_call>` tag and more text after it.\nSecond line."},
+        {false, true, "Intro text\n\n<tool_call> is the GLM wrapper; the rest stays."},
+        {false, true, "Plain XML `<tool_calls>` ends here? No: `</tool_calls>` too, caf\xc3\xa9."},
+        {false, true, "<tool_call>"},
+        {true, true, "I should explain <tool_call> wrappers.</think>Final answer quotes `<tool_call>` too."},
+        {true, true, "Reasoning mentions <tool_call>x</tool_call> fully.</think>Answer after it."},
+        {true, true, "Reasoning names " DS41_TOOL_CALLS_START " only.</think>Answer."},
+        {true, true, "short</think>No markers here at all."},
+        {true, false, "no tools</think>So <tool_call> is just text."},
+        {false, false, "<tool_call> irrelevant without tools"},
+    };
+    static const test_stream_api apis[] = {
+        TEST_STREAM_OPENAI, TEST_STREAM_ANTHROPIC, TEST_STREAM_RESPONSES,
+    };
+    static const size_t steps[] = {1, 3, 7, 4096};
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        /* What a non-streaming request returns, including the worker's
+         * fallback when a quoted marker does not parse as DSML: then the whole
+         * generation is assistant text. */
+        char *want_content = NULL, *want_reasoning = NULL;
+        tool_calls none = {0};
+        const char *finish = "stop";
+        bool recovered = false;
+        char err[64];
+        const bool saw_tool_start = cases[c].has_tools &&
+                                    find_any_tool_start(cases[c].raw) != NULL;
+        (void)parse_generated_message_for_response(cases[c].raw, cases[c].has_tools,
+                                                   saw_tool_start, cases[c].think,
+                                                   &finish, err, sizeof(err),
+                                                   &want_content, &want_reasoning,
+                                                   &none, &recovered);
+        TEST_ASSERT(none.len == 0);
+        TEST_ASSERT(!strcmp(finish, "stop"));
+        for (size_t a = 0; a < sizeof(apis) / sizeof(apis[0]); a++) {
+            for (size_t k = 0; k < sizeof(steps) / sizeof(steps[0]); k++) {
+                tool_calls calls = {0};
+                char *out = test_stream_transcript(apis[a],
+                    cases[c].think ? DS4_THINK_HIGH : DS4_THINK_NONE,
+                    cases[c].has_tools, cases[c].raw, steps[k], &calls, finish);
+                char *reasoning = NULL, *content = NULL;
+                test_stream_split(apis[a], out, &reasoning, &content);
+                const bool ok_content = !strcmp(content, want_content ? want_content : "");
+                const bool ok_reasoning =
+                    !strcmp(reasoning, want_reasoning ? want_reasoning : "");
+                if (!ok_content || !ok_reasoning) {
+                    fprintf(stderr, "stream tail case=%zu api=%zu step=%zu\n"
+                            "  content   got [%s] want [%s]\n"
+                            "  reasoning got [%s] want [%s]\n",
+                            c, a, steps[k], content, want_content ? want_content : "",
+                            reasoning, want_reasoning ? want_reasoning : "");
+                }
+                TEST_ASSERT(ok_content);
+                TEST_ASSERT(ok_reasoning);
+                free(reasoning);
+                free(content);
+                free(out);
+                tool_calls_free(&calls);
+            }
+        }
+        free(want_content);
+        free(want_reasoning);
+        tool_calls_free(&none);
+    }
+}
+
+/* Real tool calls keep their old wire shape: the DSML block never leaks into
+ * text and the call still arrives as a structured tool call. */
+static void test_stream_real_tool_calls_unchanged_by_tail_catch_up(void) {
+    static const char *raws[] = {
+        "Before.\n\n"
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"bash\">\n"
+        DS4_PARAM_START " name=\"command\" string=\"true\">echo hi" DS4_PARAM_END "\n"
+        DS4_INVOKE_END "\n"
+        DS4_TOOL_CALLS_END,
+        "Before.\n\n"
+        DS41_TOOL_CALLS_START "\n"
+        DS41_INVOKE_START " name=\"bash\">\n"
+        DS41_PARAM_START " name=\"command\" string=\"true\">echo hi" DS41_PARAM_END "\n"
+        DS41_INVOKE_END "\n"
+        DS41_TOOL_CALLS_END,
+    };
+    static const test_stream_api apis[] = {
+        TEST_STREAM_OPENAI, TEST_STREAM_ANTHROPIC, TEST_STREAM_RESPONSES,
+    };
+    for (size_t i = 0; i < sizeof(raws) / sizeof(raws[0]); i++) {
+        for (size_t a = 0; a < sizeof(apis) / sizeof(apis[0]); a++) {
+            for (size_t step = 1; step <= 9; step += 8) {
+                char *pc = NULL, *pr = NULL;
+                tool_calls calls = {0};
+                TEST_ASSERT(parse_generated_message_ex(raws[i], false, &pc, &pr, &calls));
+                TEST_ASSERT(calls.len == 1);
+                char *out = test_stream_transcript(apis[a], DS4_THINK_NONE, true,
+                                                   raws[i], step, &calls, "tool_calls");
+                char *reasoning = NULL, *content = NULL;
+                test_stream_split(apis[a], out, &reasoning, &content);
+                TEST_ASSERT(!strcmp(content, "Before."));
+                TEST_ASSERT(strstr(out, "DSML") == NULL);
+                TEST_ASSERT(strstr(out, "tool_calls>") == NULL);
+                TEST_ASSERT(strstr(out, "bash") != NULL);
+                free(reasoning);
+                free(content);
+                free(out);
+                free(pc);
+                free(pr);
+                tool_calls_free(&calls);
+            }
+        }
+    }
+}
+
+/* An error turn keeps the old behavior: nothing held is replayed as text. */
+static void test_stream_error_finish_does_not_flush_held_text(void) {
+    const char *raw = "Here is one `<tool_call>` tag and more text after it.";
+    tool_calls calls = {0};
+    char *out = test_stream_transcript(TEST_STREAM_OPENAI, DS4_THINK_NONE, true,
+                                       raw, 1, &calls, "error");
+    char *reasoning = NULL, *content = NULL;
+    test_stream_split(TEST_STREAM_OPENAI, out, &reasoning, &content);
+    TEST_ASSERT(!strcmp(content, "Here is one `"));
+    free(reasoning);
+    free(content);
+    free(out);
+}
+
 static void ds4_server_unit_tests_run(void) {
     test_deepseek41_server_stream();
     test_deepseek41_server_tools();
@@ -23091,6 +23497,9 @@ static void ds4_server_unit_tests_run(void) {
     test_responses_usage_reports_cache_details();
     test_openai_chat_stream_splits_reasoning_without_tools();
     test_openai_tool_stream_sends_partial_arguments();
+    test_stream_quoted_tool_markers_match_final_parse();
+    test_stream_real_tool_calls_unchanged_by_tail_catch_up();
+    test_stream_error_finish_does_not_flush_held_text();
     test_openai_glm_tool_stream_suppresses_raw_tool_call();
     test_openai_tool_stream_waits_for_incomplete_tool_tags();
     test_openai_tool_stream_sends_partial_raw_arguments();
