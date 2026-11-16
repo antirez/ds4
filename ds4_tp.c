@@ -2777,8 +2777,7 @@ int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
     if (!tp || ds4_tp_failed(tp)) return 0;
     if (tp->data_fd < 0 || !out || !in || bytes == 0) return 0;
 #ifdef DS4_TP_HAVE_VERBS
-    static int dbg = -1;
-    if (dbg < 0) dbg = getenv("DS4_TP_BIG_GATE_DEBUG") != NULL;
+    const int dbg = getenv("DS4_TP_BIG_GATE_DEBUG") != NULL;
     const double t_start = dbg ? tp_now_sec() : 0.0;
 #endif
     /* A cold prefill kernel, or the host-side Engram reads that precede
@@ -2786,17 +2785,16 @@ int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
      * seconds after the other.  Only this arrival handshake gets the long
      * grace; the decode timeout and the payload exchange stay strict, and a
      * dead peer still fails at once on the closed socket.
-     * DS4_TP_BIG_GATE_ARRIVAL_MS overrides the default. */
-    static uint64_t arrival_ms = 0;
-    if (arrival_ms == 0) {
-        arrival_ms = DS4_TP_DEFAULT_BIG_GATE_ARRIVAL_MS;
-        const char *env = getenv("DS4_TP_BIG_GATE_ARRIVAL_MS");
-        if (env) {
-            const long v = strtol(env, NULL, 10);
-            if (v > 0 && v <= 600000) arrival_ms = (uint64_t)v;
-        }
-        if (arrival_ms < tp->gate_timeout_ms + 2000u) arrival_ms = tp->gate_timeout_ms + 2000u;
+     * DS4_TP_BIG_GATE_ARRIVAL_MS overrides the default. It is read on every
+     * call, not cached: the floor depends on this tp's own gate timeout, and
+     * ranks sharing a process must not race on a lazily initialized static. */
+    uint64_t arrival_ms = DS4_TP_DEFAULT_BIG_GATE_ARRIVAL_MS;
+    const char *env = getenv("DS4_TP_BIG_GATE_ARRIVAL_MS");
+    if (env) {
+        const long v = strtol(env, NULL, 10);
+        if (v > 0 && v <= 600000) arrival_ms = (uint64_t)v;
     }
+    if (arrival_ms < tp->gate_timeout_ms + 2000u) arrival_ms = tp->gate_timeout_ms + 2000u;
     if (!tp_socket_set_gate_timeout(tp->data_fd, arrival_ms)) return 0;
     ds4_tp_gate_header h = { DS4_TP_BATCH_MAGIC, (uint16_t)layer, 0xB16u, seq };
     ds4_tp_gate_header ph;
