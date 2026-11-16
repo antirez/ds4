@@ -11745,7 +11745,9 @@ int ds4_gpu_warm_command_queue(void) {
  * DS4_METAL_DISABLE_QUEUE_KEEPALIVE=1 opts out. */
 static pthread_t g_queue_keepalive_thread;
 static volatile int g_queue_keepalive_running;
-static volatile int g_queue_keepalive_stop;
+/* Written by the main thread while the keepalive thread polls it: atomic,
+ * since volatile does not make concurrent access race-free. */
+static int g_queue_keepalive_stop;
 
 static void *ds4_gpu_queue_keepalive_thread(void *arg) {
     (void)arg;
@@ -11756,7 +11758,7 @@ static void *ds4_gpu_queue_keepalive_thread(void *arg) {
     memset(scratch.contents, 0, 256u * sizeof(float));
     const uint32_t iters = 1u;
     uint64_t period_ms = ds4_gpu_env_u64("DS4_METAL_QUEUE_KEEPALIVE_MS", 1000u, 50u, 10000u);
-    while (!g_queue_keepalive_stop) {
+    while (!__atomic_load_n(&g_queue_keepalive_stop, __ATOMIC_ACQUIRE)) {
         @autoreleasepool {
             id<MTLCommandBuffer> cb = [g_queue commandBuffer];
             id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
@@ -11767,7 +11769,9 @@ static void *ds4_gpu_queue_keepalive_thread(void *arg) {
             [enc endEncoding];
             [cb commit];
         }
-        for (uint64_t slept = 0; slept < period_ms && !g_queue_keepalive_stop; slept += 50)
+        for (uint64_t slept = 0;
+             slept < period_ms && !__atomic_load_n(&g_queue_keepalive_stop, __ATOMIC_ACQUIRE);
+             slept += 50)
             usleep(50000);
     }
     return NULL;
@@ -11776,14 +11780,14 @@ static void *ds4_gpu_queue_keepalive_thread(void *arg) {
 static void ds4_gpu_queue_keepalive_start(void) {
     if (g_queue_keepalive_running) return;
     if (getenv("DS4_METAL_DISABLE_QUEUE_KEEPALIVE")) return;
-    g_queue_keepalive_stop = 0;
+    __atomic_store_n(&g_queue_keepalive_stop, 0, __ATOMIC_RELEASE);
     if (pthread_create(&g_queue_keepalive_thread, NULL, ds4_gpu_queue_keepalive_thread, NULL) == 0)
         g_queue_keepalive_running = 1;
 }
 
 static void ds4_gpu_queue_keepalive_stop_thread(void) {
     if (!g_queue_keepalive_running) return;
-    g_queue_keepalive_stop = 1;
+    __atomic_store_n(&g_queue_keepalive_stop, 1, __ATOMIC_RELEASE);
     pthread_join(g_queue_keepalive_thread, NULL);
     g_queue_keepalive_running = 0;
 }
