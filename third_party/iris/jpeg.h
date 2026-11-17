@@ -275,8 +275,10 @@ static int jpeg_read_byte(jpeg_bitstream *bs) {
     return b;
 }
 
-/* Get n bits from bitstream */
+/* Get n bits from bitstream. JPEG never codes more than 16 extra bits, but a
+ * malformed Huffman table can ask for up to 255: reject it as corrupt data. */
 static int jpeg_get_bits(jpeg_bitstream *bs, int n) {
+    if (n > 16) return -1;
     while (bs->bitcount < n) {
         int b = jpeg_read_byte(bs);
         if (b == -2) {
@@ -351,6 +353,9 @@ static int jpeg_build_huffman(jpeg_huff_table *h, const uint8_t *bits, const uin
                 }
                 code++;
             }
+            /* Codes of this length must fit in len bits. An oversubscribed
+             * table would make the slow path compute a negative value index. */
+            if (code > (1 << len)) return 0;
             h->maxcode[len] = code - 1;
             idx += bits[len - 1];
         }
@@ -405,14 +410,16 @@ static int jpeg_extend(int v, int bits) {
  * Inverse DCT
  * ======================================================================== */
 
-/* Fast integer IDCT using AAN algorithm (Arai, Agui, Nakajima 1988) */
+/* Fast integer IDCT using AAN algorithm (Arai, Agui, Nakajima 1988).
+ * Intermediates are 64-bit like libjpeg's JLONG: valid coefficients never
+ * need it, but corrupt ones would overflow 32-bit sums. */
 static void jpeg_idct(int *block, uint8_t *out, int stride) {
-    int tmp0, tmp1, tmp2, tmp3;
-    int tmp10, tmp11, tmp12, tmp13;
-    int z1, z2, z3, z4, z5;
+    int64_t tmp0, tmp1, tmp2, tmp3;
+    int64_t tmp10, tmp11, tmp12, tmp13;
+    int64_t z1, z2, z3, z4, z5;
     int *blkptr;
     uint8_t *outptr;
-    int workspace[64];
+    int64_t workspace[64];
 
     /* Constants for IDCT */
     #define FIX_0_298 2446
@@ -430,12 +437,12 @@ static void jpeg_idct(int *block, uint8_t *out, int stride) {
 
     /* Pass 1: process columns */
     blkptr = block;
-    int *wsptr = workspace;
+    int64_t *wsptr = workspace;
     for (int col = 0; col < 8; col++) {
         /* Check for all-zero AC terms */
         if (blkptr[8] == 0 && blkptr[16] == 0 && blkptr[24] == 0 &&
             blkptr[32] == 0 && blkptr[40] == 0 && blkptr[48] == 0 && blkptr[56] == 0) {
-            int dc = blkptr[0] * 4;
+            int64_t dc = (int64_t)blkptr[0] * 4;
             wsptr[0] = wsptr[8] = wsptr[16] = wsptr[24] =
             wsptr[32] = wsptr[40] = wsptr[48] = wsptr[56] = dc;
             blkptr++;
@@ -598,7 +605,13 @@ static int jpeg_decode_block(jpeg_decoder *dec, int comp_idx, int *block) {
         dc_val = jpeg_extend(dc_val, dc_len);
     }
 
-    dec->dc_pred[comp_idx] += dc_val;
+    /* Keep the DC predictor in 16 bits, like the progressive path's coef[].
+     * Valid 8-bit data never leaves that range, so this only changes corrupt
+     * streams: they cannot grow the predictor without bound, and a 16-bit
+     * coefficient times a 16-bit quantizer fits an int. libjpeg instead keeps
+     * the predictor in an int, fails on overflow, and truncates only the
+     * stored JCOEF; the two differ only on such corrupt data. */
+    dec->dc_pred[comp_idx] = (int16_t)(dec->dc_pred[comp_idx] + dc_val);
     block[0] = dec->dc_pred[comp_idx] * qt[0];
 
     /* Decode AC coefficients */
@@ -624,7 +637,7 @@ static int jpeg_decode_block(jpeg_decoder *dec, int comp_idx, int *block) {
             if (ac_val < 0) return -1;
             ac_val = jpeg_extend(ac_val, size);
 
-            block[jpeg_zigzag[k]] = ac_val * qt[k];
+            block[jpeg_zigzag[k]] = (int16_t)ac_val * qt[k];
             k++;
         }
     }
@@ -828,7 +841,7 @@ static int jpeg_prog_decode_dc_first(jpeg_decoder *dec, int comp_idx, int16_t *c
         dc_val = jpeg_extend(dc_val, dc_len);
     }
 
-    dec->dc_pred[comp_idx] += dc_val;
+    dec->dc_pred[comp_idx] = (int16_t)(dec->dc_pred[comp_idx] + dc_val);
     coef[0] = (int16_t)(dec->dc_pred[comp_idx] * (1 << dec->al));
 
     return 0;
@@ -1186,6 +1199,11 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
 
     jpeg_decoder dec;
     memset(&dec, 0, sizeof(dec));
+    /* A scan may name a Huffman table the file never defines. Start every
+     * table with no codes, so decoding with it fails instead of matching
+     * zeroed maxcode entries and indexing values[-1]. */
+    for (int t = 0; t < 4; t++)
+        for (int len = 0; len <= 16; len++) dec.huff[t].maxcode[len] = -1;
 
     size_t pos = 2;
     jpeg_image *img = NULL;
