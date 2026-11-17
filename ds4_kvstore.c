@@ -12,6 +12,7 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -1095,6 +1096,52 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                                save_err, sizeof(save_err)) == 0 &&
               kv_trailer_write(hooks, fp, text, &trailer_bytes) &&
               fflush(fp) == 0;
+    /* Durability barrier: the rename below makes this file visible, but the rows
+     * may still be only in the page cache.  A checkpoint is content-addressed by
+     * the sha1 of its prompt text, and on load it is validated by magic, the header
+     * version and payload-ABI byte, the file size, the header token count and the
+     * payload's own version and layout tags.  None of that covers the KV rows
+     * themselves: the stored text is re-hashed and compared against the file name, the
+     * rows behind it are not.  So if the directory entry survives while the data does
+     * not, the entry
+     * loads as a valid checkpoint carrying stale or zeroed KV rows, and the session
+     * resumes with silently wrong state instead of an ordinary cache miss.
+     *
+     * fsync() hands the file's dirty pages to the device, which is all a process or
+     * kernel crash needs; F_FULLFSYNC additionally asks the device to commit what
+     * it holds in a volatile write cache, which is the power-loss case.  It runs
+     * second because on its own it does not flush the buffer cache.  The cost is the
+     * writeback still pending when the store closes, plus a few milliseconds of
+     * command overhead; the commit notes carry the measurements and their conditions.
+     *
+     * A rejection of the ioctl (EINVAL/ENOTSUP/EOPNOTSUPP) is tolerated: the
+     * checkpoint stands on the fsync barrier alone instead of being discarded.
+     * Any other barrier failure fails the store, so the rename is skipped and the
+     * temp file unlinked.  Failures are not retried on EINTR -- discarding a store
+     * costs a recompute, never a bad entry.
+     *
+     * The guard is deliberate: without <fcntl.h> the macro is undefined, the #if
+     * below is skipped silently, and this becomes an fsync-only barrier with no
+     * build diagnostic.  Failing the build is better than shipping a durability fix
+     * that never reaches the media. */
+    if (ok) {
+        if (fsync(fileno(fp)) != 0) ok = false;
+#if defined(__APPLE__) && !defined(F_FULLFSYNC)
+#error "F_FULLFSYNC not visible: include <fcntl.h> or the media barrier compiles out"
+#endif
+#if defined(F_FULLFSYNC)
+        if (ok && fcntl(fileno(fp), F_FULLFSYNC) != 0) {
+            const int e = errno;
+            if (e != EINVAL && e != ENOTSUP && e != EOPNOTSUPP) {
+                ok = false;
+            } else {
+                /* Tolerated, so clear it: a rejected ioctl must not be reported
+                 * later as the reason an fclose or rename appeared to fail. */
+                errno = 0;
+            }
+        }
+#endif
+    }
     int saved_errno = errno;
     if (fclose(fp) != 0) {
         if (!saved_errno) saved_errno = errno;
