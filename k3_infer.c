@@ -5548,6 +5548,16 @@ int k3_context_create(k3_context **out,
         k3_context_destroy(ctx);
         return 0;
     }
+    if (ctx->gguf_resident && config->layer_slice) {
+        /* Each rank can go idle while its peer runs a slice. Keep its Metal
+         * mappings warm across the handoff. A completed warm-up buffer has
+         * already prepared this queue's residency set. */
+        if (ds4_gpu_warm_command_queue()) {
+            ctx->gguf_readahead_done = 1;
+        } else {
+            fprintf(stderr, "k3: Metal queue warm-up unavailable; using first-use read-ahead\n");
+        }
+    }
     *out = ctx;
     return 1;
 }
