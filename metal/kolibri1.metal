@@ -177,7 +177,9 @@ struct ds4_metal_args_kolibri_attn {
 /* Online-softmax GQA decode tile over the row span this token attends.
  * Each simdgroup owns a slice of the kv head's query-head group; a lane owns
  * four consecutive head dims.  One split writes out directly; otherwise each
- * head leaves (m, l, acc) partials for the merge kernel. */
+ * head leaves (m, l, acc) partials for the merge kernel.  Inactive
+ * simdgroups (ng = 0) still run the loop with no work so every threadgroup
+ * takes the same path. */
 static inline void kolibri_attn_decode_tile(
         constant ds4_metal_args_kolibri_attn &args, uint split, uint kvh, uint tok,
         uint n, uint start, uint n_splits, uint keys_per_split, uint part_splits,
@@ -188,9 +190,8 @@ static inline void kolibri_attn_decode_tile(
     const uint D = args.head_dim;
     const uint group = H / Hkv;
     const uint hps = (group + KOLIBRI_ATTN_NSG - 1) / KOLIBRI_ATTN_NSG;
-    const uint g0 = (uint)sgitg * hps;
-    if (g0 >= group) return;
-    const uint ng = min(hps, group - g0);
+    const uint hb = (uint)sgitg * hps;
+    const uint ng = hb < group ? min(hps, group - hb) : 0u;
     const uint k0 = split * keys_per_split;
     const uint k1 = min(n, k0 + keys_per_split);
 
@@ -198,7 +199,7 @@ static inline void kolibri_attn_decode_tile(
     float m[3], l[3], acc[3][4];
     for (uint g = 0; g < 3u; g++) {
         if (g < ng) {
-            const uint h = kvh * group + g0 + g;
+            const uint h = kvh * group + hb + g;
             device const float *qh = q + ((uint64_t)tok * H + h) * D;
             for (uint j = 0; j < 4u; j++) {
                 const uint d = tiisg * 4u + j;
@@ -234,7 +235,7 @@ static inline void kolibri_attn_decode_tile(
     }
     if (n_splits == 1) {
         for (uint g = 0; g < ng; g++) {
-            const uint h = kvh * group + g0 + g;
+            const uint h = kvh * group + hb + g;
             device float *dst = out + ((uint64_t)tok * H + h) * D;
             const float inv = l[g] > 0.0f ? 1.0f / l[g] : 0.0f;
             for (uint j = 0; j < 4u; j++) {
@@ -245,9 +246,9 @@ static inline void kolibri_attn_decode_tile(
         return;
     }
     for (uint g = 0; g < ng; g++) {
-        const uint h = kvh * group + g0 + g;
+        const uint h = kvh * group + hb + g;
         device float *dst = part + ((((uint64_t)tok * Hkv + kvh) * part_splits + split) * group
-                                    + (g0 + g)) * (2u + D);
+                                    + (hb + g)) * (2u + D);
         if (tiisg == 0) { dst[0] = m[g]; dst[1] = l[g]; }
         for (uint j = 0; j < 4u; j++) {
             const uint d = tiisg * 4u + j;
@@ -277,42 +278,87 @@ kernel void kernel_kolibri_attn_decode(
                              args.n_splits, q, k_cache, v_cache, out, part, sgitg, tiisg);
 }
 
-/* Combine the split partials of one (head, token).  The per-lane m/l walk is
- * the same arithmetic the single-split path ran inline, in the same order. */
+/* Combine the split partials of one (head, dim-slice).  One threadgroup
+ * per 32-dim slice of a head.  The split walk is software-pipelined: the
+ * m/l maximum is reduced cooperatively, and the accumulation loop batches
+ * four splits' loads into registers before combining them in ascending
+ * split order, so every output element sees the same FP operations in the
+ * same order as the serial version while the load latencies overlap. */
 kernel void kernel_kolibri_attn_merge(
         constant ds4_metal_args_kolibri_attn & args,
         device const float *part,
         device float       *out,
         uint3 tgpig [[threadgroup_position_in_grid]],
         ushort tiisg [[thread_index_in_simdgroup]]) {
-    const uint h = tgpig.x;
-    const uint tok = tgpig.y;
-    if (h >= args.n_head || tok >= args.n_tokens) return;
     const uint H = args.n_head, Hkv = args.n_head_kv;
     const uint D = args.head_dim;
+    const uint n_slice = (D + 31u) / 32u;
+    const uint h = tgpig.x / n_slice;
+    const uint slice = tgpig.x % n_slice;
+    const uint tok = tgpig.y;
+    if (h >= H || tok >= args.n_tokens) return;
     const uint group = H / Hkv;
     const uint kvh = h / group, g = h % group;
     const uint64_t stride = (uint64_t)group * (2u + D);
     device const float *base = part + (((uint64_t)tok * Hkv + kvh) * args.n_splits * group + g) * (2u + D);
+    const uint ns = args.n_splits;
+    /* mm via strided loads per lane and a cooperative simd maximum; each
+     * lane covers the 16 splits at tiisg + 32*k (up to 512 splits). */
     float mm = -3.0e38f;
-    for (uint s = 0; s < args.n_splits; s++) mm = max(mm, base[s * stride]);
+    for (uint k = 0; k < 16u; k++) {
+        const uint idx = tiisg + 32u * k;
+        if (idx < ns) mm = max(mm, base[(uint64_t)idx * stride]);
+    }
+    mm = simd_max(mm);
     float ll = 0.0f;
     float o[4];
     for (uint j = 0; j < 4u; j++) o[j] = 0.0f;
-    for (uint s = 0; s < args.n_splits; s++) {
-        device const float *p = base + s * stride;
-        const float c = p[1] > 0.0f ? exp(p[0] - mm) : 0.0f;
-        ll += p[1] * c;
-        for (uint j = 0; j < 4u; j++) {
-            const uint d = tiisg * 4u + j;
-            if (d < D) o[j] += p[2u + d] * c;
+    const uint d0 = slice * 32u + tiisg * 4u;
+    for (uint s = 0; s < ns; s += 4u) {
+        /* Batch this group's independent loads before any dependent math. */
+        device const float *p0 = base + (uint64_t)s * stride;
+        device const float *p1 = p0 + stride;
+        device const float *p2 = p0 + 2u * stride;
+        device const float *p3 = p0 + 3u * stride;
+        const bool h1 = s + 1u < ns, h2 = s + 2u < ns, h3 = s + 3u < ns;
+        float4 a0 = d0 + 3u < D ? *(device const float4 *)(p0 + 2u + d0) : float4(0.0f);
+        float4 a1 = h1 && d0 + 3u < D ? *(device const float4 *)(p1 + 2u + d0) : float4(0.0f);
+        float4 a2 = h2 && d0 + 3u < D ? *(device const float4 *)(p2 + 2u + d0) : float4(0.0f);
+        float4 a3 = h3 && d0 + 3u < D ? *(device const float4 *)(p3 + 2u + d0) : float4(0.0f);
+        float m0 = p0[0], l0 = p0[1];
+        float m1 = h1 ? p1[0] : -3.0e38f, l1 = h1 ? p1[1] : 0.0f;
+        float m2 = h2 ? p2[0] : -3.0e38f, l2 = h2 ? p2[1] : 0.0f;
+        float m3 = h3 ? p3[0] : -3.0e38f, l3 = h3 ? p3[1] : 0.0f;
+        if (s < ns) {
+            const float c = l0 > 0.0f ? exp(m0 - mm) : 0.0f;
+            ll += l0 * c;
+            o[0] += a0.x * c; o[1] += a0.y * c; o[2] += a0.z * c; o[3] += a0.w * c;
+        }
+        if (h1) {
+            const float c = l1 > 0.0f ? exp(m1 - mm) : 0.0f;
+            ll += l1 * c;
+            o[0] += a1.x * c; o[1] += a1.y * c; o[2] += a1.z * c; o[3] += a1.w * c;
+        }
+        if (h2) {
+            const float c = l2 > 0.0f ? exp(m2 - mm) : 0.0f;
+            ll += l2 * c;
+            o[0] += a2.x * c; o[1] += a2.y * c; o[2] += a2.z * c; o[3] += a2.w * c;
+        }
+        if (h3) {
+            const float c = l3 > 0.0f ? exp(m3 - mm) : 0.0f;
+            ll += l3 * c;
+            o[0] += a3.x * c; o[1] += a3.y * c; o[2] += a3.z * c; o[3] += a3.w * c;
         }
     }
     const float inv = ll > 0.0f ? 1.0f / ll : 0.0f;
     device float *dst = out + ((uint64_t)tok * H + h) * D;
-    for (uint j = 0; j < 4u; j++) {
-        const uint d = tiisg * 4u + j;
-        if (d < D) dst[d] = o[j] * inv;
+    if (d0 + 3u < D) {
+        *(device float4 *)(dst + d0) = float4(o[0] * inv, o[1] * inv, o[2] * inv, o[3] * inv);
+    } else {
+        for (uint j = 0; j < 4u; j++) {
+            const uint d = d0 + j;
+            if (d < D) dst[d] = o[j] * inv;
+        }
     }
 }
 
@@ -437,6 +483,31 @@ kernel void kernel_kolibri_moe_sum(
         for (uint s = 0; s < args.n_slots; s++) {
             acc += weights[(uint64_t)tok * args.n_slots + s] *
                    part[((uint64_t)tok * stride + s) * args.dim + d];
+        }
+        out[(uint64_t)tok * args.dim + d] = acc;
+    }
+}
+
+/* Prefill grouped-GEMM variant: the routed slots come from the tiled expert
+ * matmuls as [T][n_slots][dim] and the shared expert (dense projections)
+ * from its own [T][dim] buffer.  Same element order as kernel_kolibri_moe_sum:
+ * the shared row first, then every routed slot ascending. */
+kernel void kernel_kolibri_moe_sum_shared(
+        constant ds4_metal_args_kolibri_moe_sum & args,
+        device const float *part,       /* [T][n_slots][dim] */
+        device const float *shared,     /* [T][dim] */
+        device const float *weights,    /* [T][n_slots] */
+        device float       *out,        /* [T][dim] */
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]]) {
+    const uint tok = tgpig.y;
+    if (tok >= args.n_tokens) return;
+    for (uint d = tgpig.x * ntg.x + tid; d < args.dim; d += ntg.x) {
+        float acc = shared[(uint64_t)tok * args.dim + d];
+        for (uint s = 0; s < args.n_slots; s++) {
+            acc += weights[(uint64_t)tok * args.n_slots + s] *
+                   part[(((uint64_t)tok * args.n_slots) + s) * args.dim + d];
         }
         out[(uint64_t)tok * args.dim + d] = acc;
     }

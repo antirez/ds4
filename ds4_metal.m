@@ -48327,10 +48327,13 @@ typedef struct {
 static bool qwen4_moe_mv_specialize(uint32_t type) {
     /* Constant quantization and logical width remove the generic decode
      * branches. Keep the original per-lane reduction order and padded stride.
-     * M3 Ultra uses low-bit and MXFP4 down rows; M5 uses MXFP4 down rows. */
+     * M3 Ultra uses low-bit, MXFP4 and Q8_0 down rows; M5 uses MXFP4 down
+     * rows.  Q8_0 joined the M3 Ultra set for the Kolibri-1 q8 recipe
+     * (decode A/B: +1.5% median, fixtures bit-exact). */
     const int override = ds4_gpu_env_bool("DS4_QWEN4_MOE_MV_SPECIALIZE");
     return override >= 0 ? override != 0 :
-        ((type == 16u || type == 10u || type == 39u) && ds4_gpu_device_name_contains("M3 Ultra")) ||
+        ((type == 16u || type == 10u || type == 39u || type == 8u) &&
+         ds4_gpu_device_name_contains("M3 Ultra")) ||
         (type == 39u && ds4_gpu_device_is_m5_apple_silicon());
 }
 
@@ -50564,6 +50567,7 @@ enum {
     KOLIBRI_K_ATTN_MERGE,
     KOLIBRI_K_ROUTER,
     KOLIBRI_K_MOE_SUM,
+    KOLIBRI_K_MOE_SUM_SHARED,
     KOLIBRI_K_COUNT,
 };
 
@@ -50574,6 +50578,7 @@ static const char *const kolibri_kernel_names[KOLIBRI_K_COUNT] = {
     "kernel_kolibri_attn_merge",
     "kernel_kolibri_router_topk",
     "kernel_kolibri_moe_sum",
+    "kernel_kolibri_moe_sum_shared",
 };
 
 static int kolibri_dispatch(int kernel, const void *args, size_t args_len,
@@ -50644,7 +50649,7 @@ int ds4_gpu_kolibri_attn_prep_tensor(
                             MTLSizeMake(32, 1, 1), 0);
 }
 
-#define KOLIBRI_ATTN_MAX_SPLITS 64
+#define KOLIBRI_ATTN_MAX_SPLITS 512
 
 uint64_t ds4_gpu_kolibri_attn_part_floats(uint32_t n_tokens, uint32_t n_head, uint32_t head_dim) {
     return (uint64_t)n_tokens * n_head * KOLIBRI_ATTN_MAX_SPLITS * (2u + head_dim);
@@ -50656,19 +50661,36 @@ int ds4_gpu_kolibri_attn_decode_tensor(
         ds4_gpu_tensor *part,
         uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim,
         uint32_t pos0, uint32_t window, uint32_t cache_rows, float scale) {
-    const uint32_t n_keys = pos0 + n_tokens;
+    const uint32_t n_keys_all = pos0 + n_tokens;
+    /* Sliding layers only ever attend `window` rows; size the splits for
+     * the span that will actually be walked, not the absolute position. */
+    const uint32_t span_keys = window ? (n_keys_all < window ? n_keys_all : window)
+                                      : n_keys_all;
     uint32_t n_splits = 1;
     if (part) {
-        n_splits = (n_keys + 31u) / 32u;
+        const char *env = getenv("DS4_KOLIBRI1_ATTN_SPLITS");
+        const long forced = env && env[0] ? strtol(env, NULL, 10) : 0;
+        if (forced > 0) {
+            n_splits = (uint32_t)forced;
+        } else {
+            /* Balance the decode split chunk's serial key chain
+             * (~keys_per_split x 0.8 us) against the merge's split chain
+             * (~splits x 0.17 us): splits ~= sqrt(keys * 4.7), with at
+             * least 8 keys per split so short spans stay cheap. */
+            n_splits = (uint32_t)(sqrt((double)span_keys * 4.7) + 0.5);
+            const uint32_t floor_splits = span_keys < 8u ? 1u : (span_keys + 7u) / 8u;
+            if (n_splits > floor_splits) n_splits = floor_splits;
+        }
         if (n_splits < 1) n_splits = 1;
         if (n_splits > KOLIBRI_ATTN_MAX_SPLITS) n_splits = KOLIBRI_ATTN_MAX_SPLITS;
     }
-    const uint32_t keys_per_split = (n_keys + n_splits - 1) / n_splits;
+    const uint32_t keys_per_split = n_splits > 1
+        ? (span_keys + n_splits - 1) / n_splits : n_keys_all;
     struct { uint32_t n_tokens, n_head, n_head_kv, head_dim, pos0, window, cache_rows, n_splits, keys_per_split;
              float scale; } args =
         { n_tokens, n_head, n_head_kv, head_dim, pos0, window, cache_rows, n_splits, keys_per_split, scale };
     const uint64_t q_bytes = (uint64_t)n_tokens * n_head * head_dim * sizeof(float);
-    const uint64_t cache_bytes = (uint64_t)(cache_rows ? cache_rows : n_keys) *
+    const uint64_t cache_bytes = (uint64_t)(cache_rows ? cache_rows : n_keys_all) *
                                  n_head_kv * head_dim * sizeof(float);
     const uint64_t part_bytes = ds4_gpu_kolibri_attn_part_floats(n_tokens, n_head, head_dim) * sizeof(float);
     kolibri_bind b[5];
@@ -50692,9 +50714,13 @@ int ds4_gpu_kolibri_attn_decode_tensor(
         return 0;
     }
     if (n_splits == 1) return 1;
+    /* One threadgroup per 32-dim slice of each head: the merge is
+     * latency-bound at 48 tiny threadgroups, so spread the split reads
+     * across n_head * (head_dim/32) groups (per-element order kept). */
+    const uint32_t n_slice = (head_dim + 31u) / 32u;
     kolibri_bind mb[2] = { b[4], b[3] };
     return kolibri_dispatch(KOLIBRI_K_ATTN_MERGE, &args, sizeof(args), mb, 2,
-                            MTLSizeMake(n_head, n_tokens, 1), MTLSizeMake(32, 1, 1), 0);
+                            MTLSizeMake(n_head * n_slice, n_tokens, 1), MTLSizeMake(32, 1, 1), 0);
 }
 
 int ds4_gpu_kolibri_router_topk_tensor(
@@ -50731,6 +50757,26 @@ int ds4_gpu_kolibri_moe_sum_tensor(
         return 0;
     }
     return kolibri_dispatch(KOLIBRI_K_MOE_SUM, &args, sizeof(args), b, 3,
+                            MTLSizeMake((dim + 255u) / 256u, n_tokens, 1),
+                            MTLSizeMake(256, 1, 1), 0);
+}
+
+int ds4_gpu_kolibri_moe_sum_shared_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *part, const ds4_gpu_tensor *shared,
+        const ds4_gpu_tensor *weights, uint32_t n_tokens, uint32_t n_slots, uint32_t dim) {
+    struct { uint32_t n_tokens, n_slots, dim, pad0; } args = { n_tokens, n_slots, dim, 0 };
+    kolibri_bind b[4];
+    if (n_tokens == 0 || n_slots == 0 || dim == 0 ||
+        !kolibri_bind_tensor(&b[0], part, (uint64_t)n_tokens * n_slots * dim * sizeof(float),
+                             "moe partial") ||
+        !kolibri_bind_tensor(&b[1], shared, (uint64_t)n_tokens * dim * sizeof(float),
+                             "moe shared") ||
+        !kolibri_bind_tensor(&b[2], weights, (uint64_t)n_tokens * n_slots * sizeof(float),
+                             "moe weights") ||
+        !kolibri_bind_tensor(&b[3], out, (uint64_t)n_tokens * dim * sizeof(float), "moe out")) {
+        return 0;
+    }
+    return kolibri_dispatch(KOLIBRI_K_MOE_SUM_SHARED, &args, sizeof(args), b, 4,
                             MTLSizeMake((dim + 255u) / 256u, n_tokens, 1),
                             MTLSizeMake(256, 1, 1), 0);
 }

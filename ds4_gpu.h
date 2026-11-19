@@ -3571,6 +3571,12 @@ int ds4_gpu_kolibri_moe_sum_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *part, const ds4_gpu_tensor *weights,
         uint32_t n_tokens, uint32_t n_slots, uint32_t dim);
 
+/* Prefill grouped-GEMM sum: routed slots packed [T][n_slots][dim] and the
+ * dense shared expert in its own [T][dim] buffer; same element order. */
+int ds4_gpu_kolibri_moe_sum_shared_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *part, const ds4_gpu_tensor *shared,
+        const ds4_gpu_tensor *weights, uint32_t n_tokens, uint32_t n_slots, uint32_t dim);
+
 #ifdef __cplusplus
 }
 #endif

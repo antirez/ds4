@@ -59922,6 +59922,9 @@ typedef struct ds4_kolibri1_gpu_graph {
     ds4_gpu_tensor *attn_part;    /* split partials, decode-sized */
     ds4_gpu_tensor *router, *selected, *rweights;
     ds4_gpu_tensor *mid, *part;
+    /* Grouped prefill GEMM routing and the dense shared-expert path. */
+    ds4_gpu_tensor *moe_lists, *moe_counts;
+    ds4_gpu_tensor *sh_gate, *sh_up, *sh_mid, *sh_out;
     ds4_gpu_tensor *layer_k_cache[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_v_cache[DS4_MAX_LAYER];
     float *host_row;
@@ -59982,7 +59985,8 @@ static bool kolibri1_graph_weights_supported(const ds4_weights *w) {
  * K/V rings and the logits row are not in the list. */
 #define DS4_KOLIBRI1_SCRATCH_FIELDS(X) \
     X(R) X(x) X(blk) X(attn_o) X(moe_out) X(q) X(kv) X(attn_part) \
-    X(router) X(selected) X(rweights) X(mid) X(part)
+    X(router) X(selected) X(rweights) X(mid) X(part) \
+    X(moe_lists) X(moe_counts) X(sh_gate) X(sh_up) X(sh_mid) X(sh_out)
 
 static void kolibri1_graph_free(ds4_kolibri1_gpu_graph *g) {
     if (!g) return;
@@ -60060,6 +60064,8 @@ static bool kolibri1_graph_alloc(ds4_kolibri1_gpu_graph *g, const ds4_weights *w
         KOLIBRI1_BORROW(moe_out) KOLIBRI1_BORROW(q) KOLIBRI1_BORROW(kv) KOLIBRI1_BORROW(attn_part)
         KOLIBRI1_BORROW(router) KOLIBRI1_BORROW(selected) KOLIBRI1_BORROW(rweights)
         KOLIBRI1_BORROW(mid) KOLIBRI1_BORROW(part)
+        KOLIBRI1_BORROW(moe_lists) KOLIBRI1_BORROW(moe_counts)
+        KOLIBRI1_BORROW(sh_gate) KOLIBRI1_BORROW(sh_up) KOLIBRI1_BORROW(sh_mid) KOLIBRI1_BORROW(sh_out)
 #undef KOLIBRI1_BORROW
         g->host_row = shared->host_row;
         goto private_state;
@@ -60077,6 +60083,16 @@ static bool kolibri1_graph_alloc(ds4_kolibri1_gpu_graph *g, const ds4_weights *w
     KOLIBRI1_ALLOC(rweights, cap_tokens * DS4_N_EXPERT_USED);
     KOLIBRI1_ALLOC(mid, cap_tokens * (DS4_N_EXPERT_USED + 1u) * DS4_N_FF_EXP);
     KOLIBRI1_ALLOC(part, cap_tokens * (DS4_N_EXPERT_USED + 1u) * E);
+    /* Grouped prefill GEMM: per-expert token lists and the dense shared
+     * expert's projections.  The lists hold up to cap_tokens token-slot
+     * pairs per expert, the same capacity the Qwen graph uses. */
+    g->moe_lists = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT * cap_tokens * sizeof(int32_t));
+    g->moe_counts = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT * sizeof(int32_t));
+    ok = ok && g->moe_lists && g->moe_counts;
+    KOLIBRI1_ALLOC(sh_gate, cap_tokens * DS4_N_FF_EXP);
+    KOLIBRI1_ALLOC(sh_up, cap_tokens * DS4_N_FF_EXP);
+    KOLIBRI1_ALLOC(sh_mid, cap_tokens * DS4_N_FF_EXP);
+    KOLIBRI1_ALLOC(sh_out, cap_tokens * E);
     g->host_row = xmalloc((size_t)cap_tokens * E * sizeof(float));
     ok = ok && g->host_row;
 
@@ -60151,7 +60167,15 @@ static bool kolibri1_graph_attention(ds4_kolibri1_gpu_graph *g, const ds4_model 
 
 /* Every layer's MLP: sigmoid router with expert bias, per-(token, slot)
  * expert matvecs, the shared expert as an extra slot, and the weighted sum
- * (shared unweighted, matching the CPU reference exactly). */
+ * (shared unweighted, matching the CPU reference exactly).
+ * Prefill-sized batches (T > 64) route each expert's tokens through the
+ * tiled grouped GEMMs instead: the expert weights are read once per tile
+ * rather than once per token slot, and the shared expert runs as dense
+ * GEMVs.  The sum keeps the same element order (shared first, slots
+ * ascending).  Qualified by the core capability eval on the Q8 recipe
+ * (2026-11-19: same failure set as the per-token path, one fewer hard
+ * failure, and the F32 fixtures stay bit-exact).  DS4_KOLIBRI1_NO_MOE_MM=1
+ * restores the per-token kernels for A/B. */
 static bool kolibri1_graph_moe(ds4_kolibri1_gpu_graph *g, const ds4_model *m,
                                const ds4_layer_weights *l, uint32_t T) {
     const uint32_t slots = DS4_N_EXPERT_USED;
@@ -60159,19 +60183,48 @@ static bool kolibri1_graph_moe(ds4_kolibri1_gpu_graph *g, const ds4_model *m,
               ds4_gpu_kolibri_router_topk_tensor(g->selected, g->rweights, g->router,
                                                  l->ffn_exp_probs_b->abs_offset, m->map, m->size,
                                                  T, DS4_N_EXPERT, slots,
-                                                 DS4_EXPERT_WEIGHT_SCALE) &&
-              ds4_gpu_qwen4_moe_mid_tensor(g->mid, g->x, g->selected, m->map, m->size,
-                                           l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
-                                           l->ffn_gate_exps->type, DS4_N_EXPERT, T, slots,
-                                           DS4_N_EMBD, DS4_N_FF_EXP,
-                                           l->ffn_gate_shexp->abs_offset, l->ffn_up_shexp->abs_offset,
-                                           l->ffn_gate_shexp->type) &&
-              ds4_gpu_qwen4_moe_down_tensor(g->part, g->mid, g->selected, m->map, m->size,
-                                            l->ffn_down_exps->abs_offset, l->ffn_down_exps->type,
-                                            DS4_N_EXPERT, T, slots, DS4_N_FF_EXP, DS4_N_EMBD,
-                                            l->ffn_down_shexp->abs_offset, l->ffn_down_shexp->type) &&
-              ds4_gpu_kolibri_moe_sum_tensor(g->moe_out, g->part, g->rweights, T, slots, DS4_N_EMBD);
-    return ok;
+                                                 DS4_EXPERT_WEIGHT_SCALE);
+#ifdef DS4_HAS_KOLIBRI1_METAL
+    if (ok && T > 64u && getenv("DS4_KOLIBRI1_NO_MOE_MM") == NULL &&
+        (DS4_N_EMBD % 64u) == 0u && (DS4_N_FF_EXP % 64u) == 0u &&
+        qwen4_expert_type_has_mm(l->ffn_gate_exps->type) &&
+        l->ffn_up_exps->type == l->ffn_gate_exps->type &&
+        qwen4_expert_type_has_mm(l->ffn_down_exps->type) &&
+        kolibri1_graph_dense_ok(l->ffn_gate_shexp) && kolibri1_graph_dense_ok(l->ffn_up_shexp) &&
+        kolibri1_graph_dense_ok(l->ffn_down_shexp)) {
+        ok = ds4_gpu_qwen4_moe_build_lists_tensor(g->moe_lists, g->moe_counts, g->selected,
+                                                   T, slots, DS4_N_EXPERT, g->cap_tokens) &&
+             ds4_gpu_qwen4_moe_mm_mid_tensor(g->mid, g->x, g->moe_lists, g->moe_counts, m->map, m->size,
+                                             l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
+                                             l->ffn_gate_exps->type, DS4_N_EXPERT, T, slots,
+                                             slots, DS4_N_EMBD, DS4_N_FF_EXP, g->cap_tokens) &&
+             kolibri1_gemv(g->sh_gate, m, l->ffn_gate_shexp, g->x, T) &&
+             kolibri1_gemv(g->sh_up, m, l->ffn_up_shexp, g->x, T) &&
+             ds4_gpu_swiglu_tensor(g->sh_mid, g->sh_gate, g->sh_up, T * DS4_N_FF_EXP, 0.0f, 1.0f);
+        if (ok) {
+            ok = ds4_gpu_qwen4_moe_mm_down_tensor(g->part, g->mid, g->moe_lists, g->moe_counts,
+                                                  m->map, m->size, l->ffn_down_exps->abs_offset,
+                                                  l->ffn_down_exps->type, DS4_N_EXPERT, T, slots,
+                                                  slots, DS4_N_FF_EXP, DS4_N_EMBD, g->cap_tokens) &&
+                 kolibri1_gemv(g->sh_out, m, l->ffn_down_shexp, g->sh_mid, T) &&
+                 ds4_gpu_kolibri_moe_sum_shared_tensor(g->moe_out, g->part, g->sh_out, g->rweights,
+                                                       T, slots, DS4_N_EMBD);
+        }
+        return ok;
+    }
+#endif
+    return ok &&
+           ds4_gpu_qwen4_moe_mid_tensor(g->mid, g->x, g->selected, m->map, m->size,
+                                        l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
+                                        l->ffn_gate_exps->type, DS4_N_EXPERT, T, slots,
+                                        DS4_N_EMBD, DS4_N_FF_EXP,
+                                        l->ffn_gate_shexp->abs_offset, l->ffn_up_shexp->abs_offset,
+                                        l->ffn_gate_shexp->type) &&
+           ds4_gpu_qwen4_moe_down_tensor(g->part, g->mid, g->selected, m->map, m->size,
+                                         l->ffn_down_exps->abs_offset, l->ffn_down_exps->type,
+                                         DS4_N_EXPERT, T, slots, DS4_N_FF_EXP, DS4_N_EMBD,
+                                         l->ffn_down_shexp->abs_offset, l->ffn_down_shexp->type) &&
+           ds4_gpu_kolibri_moe_sum_tensor(g->moe_out, g->part, g->rweights, T, slots, DS4_N_EMBD);
 }
 
 /* Embeddings are staged on the host like the Qwen graph does: one ref_row
