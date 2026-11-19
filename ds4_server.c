@@ -18235,6 +18235,23 @@ static void test_reasoning_effort_mapping(void) {
     TEST_ASSERT(think_mode_from_enabled(false, DS4_THINK_LOW) == DS4_THINK_NONE);
     TEST_ASSERT(!strcmp(ds4_glm_reasoning_effort_text(DS4_THINK_LOW), "Reasoning Effort: High"));
     TEST_ASSERT(!strcmp(ds4_glm_reasoning_effort_text(DS4_THINK_MEDIUM), "Reasoning Effort: High"));
+    {
+        static const struct { ds4_think_mode mode; const char *prefix; } v41[] = {
+            {DS4_THINK_LOW, "Reasoning Effort: 50 "},
+            {DS4_THINK_MEDIUM, "Reasoning Effort: 62 "},
+            {DS4_THINK_HIGH, "Reasoning Effort: 75 "},
+            {DS4_THINK_MAX, "Reasoning Effort: 100 "},
+        };
+        for (size_t i = 0; i < sizeof(v41) / sizeof(v41[0]); i++) {
+            const char *text = ds4_deepseek41_reasoning_effort_text(v41[i].mode);
+            TEST_ASSERT(text && !strncmp(text, v41[i].prefix, strlen(v41[i].prefix)));
+        }
+        TEST_ASSERT(ds4_deepseek41_reasoning_effort_text(DS4_THINK_NONE) == NULL);
+        ds4_think_mode lvl = DS4_THINK_NONE;
+        TEST_ASSERT(ds4_think_mode_parse_level("30", &lvl));
+        const char *text = ds4_deepseek41_reasoning_effort_text(lvl);
+        TEST_ASSERT(text && !strncmp(text, "Reasoning Effort: 30 ", 21));
+    }
     TEST_ASSERT(ds4_think_mode_for_context(DS4_THINK_MAX, 32768) == DS4_THINK_HIGH);
     TEST_ASSERT(ds4_think_mode_for_context(DS4_THINK_MAX,
                                            (int)ds4_think_max_min_context()) == DS4_THINK_MAX);
