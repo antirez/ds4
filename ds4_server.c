@@ -6527,8 +6527,9 @@ static void qwen_trim_split(char **content_out, char **reasoning_out) {
     }
 }
 
-static bool qwen_param_declared_string(const tool_schema_orders *orders,
-                                       const char *name, const char *key) {
+static bool qwen_param_declared_type(const tool_schema_orders *orders,
+                                     const char *name, const char *key,
+                                     const char *want) {
     const tool_schema_order *order = tool_schema_orders_find(orders, name);
     if (!order) return false;
     for (int i = 0; i < order->len; i++) {
@@ -6538,7 +6539,7 @@ static bool qwen_param_declared_string(const tool_schema_orders *orders,
         if (json_args_parse(order->prop_schema[i], &schema)) {
             for (int j = 0; j < schema.len; j++) {
                 const json_arg *arg = &schema.v[j];
-                if (!strcmp(arg->key, "type") && arg->is_string && !strcmp(arg->value, "string"))
+                if (!strcmp(arg->key, "type") && arg->is_string && !strcmp(arg->value, want))
                     is_string = true;
             }
         }
@@ -6644,7 +6645,12 @@ static bool parse_qwen_generated_message_ex(const char *text,
                 return false;
             }
             char *value = qwen_strip_value_newlines(value_start, value_end);
-            const bool is_string = qwen_param_declared_string(orders, name, key) ||
+            /* Qwen writes booleans Python-style (True/False); lower them when
+             * the schema says boolean so they stay JSON booleans. */
+            if ((!strcmp(value, "True") || !strcmp(value, "False")) &&
+                qwen_param_declared_type(orders, name, key, "boolean"))
+                value[0] = (char)(value[0] - 'A' + 'a');
+            const bool is_string = qwen_param_declared_type(orders, name, key, "string") ||
                                    !qwen_param_value_is_json(value);
             if (is_string) ds4_tool_text_unescape(value, param_end);
             tool_call_json_args_add(&args, key, value, is_string ? "true" : "false");
@@ -18698,6 +18704,26 @@ static void test_parse_qwen_tool_call_message(void) {
     tool_calls_free(&bad);
 }
 
+static void test_qwen_python_bool_with_boolean_schema(void) {
+    tool_schema_orders orders = {0};
+    tool_schema_orders_add_json(&orders,
+        "{\"name\":\"set_light\",\"parameters\":{\"type\":\"object\",\"properties\":{"
+        "\"on\":{\"type\":\"boolean\"},\"label\":{\"type\":\"string\"}}}}");
+    char *content = NULL, *reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_qwen_generated_message_ex(
+        "<tool_call>\n<function=set_light>\n<parameter=on>\nTrue\n</parameter>\n"
+        "<parameter=label>\nFalse\n</parameter>\n</function>\n</tool_call>",
+        false, &content, &reasoning, &calls, &orders));
+    TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(strstr(calls.v[0].arguments, "\"on\": true") != NULL);
+    TEST_ASSERT(strstr(calls.v[0].arguments, "\"label\": \"False\"") != NULL);
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+    tool_schema_orders_free(&orders);
+}
+
 static void test_qwen_literal_tool_end_in_argument(void) {
     const char *block =
         "<tool_call>\n<function=write>\n<parameter=content>\n"
@@ -23050,6 +23076,7 @@ static void ds4_server_unit_tests_run(void) {
     test_qwen_tool_visible_checkpoint_boundary();
     test_qwen_decode_tracker_markers();
     test_parse_qwen_tool_call_message();
+    test_qwen_python_bool_with_boolean_schema();
     test_qwen_literal_tool_end_in_argument();
     test_qwen_string_arguments_follow_schema();
     test_qwen_tool_checkpoint_round_trip();
