@@ -45748,6 +45748,11 @@ const char *ds4_glm_reasoning_effort_text(ds4_think_mode mode) {
 
 const char *ds4_deepseek41_reasoning_effort_text(ds4_think_mode mode) {
     int level = ds4_think_mode_level(mode);
+    /* DeepSeek's V4.1 encoder maps "low" to 50, "high" to 75 and "max" to 100.
+     * It names no medium; 62 sits between low and high.  Without these two
+     * cases low/minimal/medium rendered no effort line at all. */
+    if (mode == DS4_THINK_LOW) level = 50;
+    if (mode == DS4_THINK_MEDIUM) level = 62;
     if (mode == DS4_THINK_HIGH) level = 75;
     if (mode == DS4_THINK_MAX) level = 100;
     if (level <= 0) return NULL;
