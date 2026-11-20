@@ -18233,7 +18233,7 @@ static void test_reasoning_effort_mapping(void) {
     TEST_ASSERT(!parse_reasoning_effort_name("banana", &mode));
     TEST_ASSERT(think_mode_from_enabled(true, DS4_THINK_LOW) == DS4_THINK_LOW);
     TEST_ASSERT(think_mode_from_enabled(false, DS4_THINK_LOW) == DS4_THINK_NONE);
-    TEST_ASSERT(!strcmp(ds4_glm_reasoning_effort_text(DS4_THINK_LOW), "Reasoning Effort: High"));
+    TEST_ASSERT(!strcmp(ds4_glm_reasoning_effort_text(DS4_THINK_LOW), "Reasoning Effort: Low"));
     TEST_ASSERT(!strcmp(ds4_glm_reasoning_effort_text(DS4_THINK_MEDIUM), "Reasoning Effort: High"));
     TEST_ASSERT(ds4_think_mode_for_context(DS4_THINK_MAX, 32768) == DS4_THINK_HIGH);
     TEST_ASSERT(ds4_think_mode_for_context(DS4_THINK_MAX,
