@@ -3669,7 +3669,12 @@ static void server_log(ds4_log_type type, const char *fmt, ...);
  * honest history and the prompt remains a deterministic cache key.  The
  * retained set is always the last N in document order; a hard limit still
  * fails absurd requests fast, before any work. */
-#define DS4_VISION_REJECT_LIMIT 16
+/* The default reject wall follows the request wall: #1245 raised SERVER_MAX_IMAGES to 256,
+ * so a hardcoded 16 would reject, by default, requests that upstream accepts. A rejected
+ * request is unrecoverable for the client while a lossy drop is not; the real bound is the
+ * vision/context budget, not a request count. SERVER_MAX_IMAGES is defined later in this
+ * file, which is fine: a macro body expands at use, and every use is below that define. */
+#define DS4_VISION_REJECT_LIMIT SERVER_MAX_IMAGES
 #define DS4_VISION_HARD_LIMIT 1024
 #define DS4_VISION_OMIT_NOTE "[oldest image omitted to fit the vision budget]"
 
