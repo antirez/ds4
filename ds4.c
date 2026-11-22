@@ -78858,6 +78858,16 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             s->checkpoint.len = 0;
             s->checkpoint_valid = false;
         }
+        if (start < prompt->len) {
+            /* New prompt tokens start a new answer: the draft depth policy
+             * must not open it with the acceptance window of the previous
+             * one, or the same request drafts differently after different
+             * requests. */
+            s->qwen4_depth_window = 0u;
+            s->qwen4_depth_cycles = 0u;
+            s->qwen4_reject2_streak = 0u;
+            s->qwen4_depth3_engaged = false;
+        }
         for (int i = start; i < prompt->len; i++) {
             if (prompt->v[i] < 0 || prompt->v[i] >= (int)DS4_N_VOCAB) {
                 snprintf(err, errlen, "token id %d at position %d is outside the vocabulary", prompt->v[i], i);
