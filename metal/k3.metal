@@ -374,6 +374,48 @@ kernel k3_mul_mv_bf16_rows_t kernel_k3_mul_mv_bf16_f32_rows<4>;
 template [[host_name("kernel_k3_mul_mv_bf16_f32_rows8")]]
 kernel k3_mul_mv_bf16_rows_t kernel_k3_mul_mv_bf16_f32_rows<8>;
 
+
+/* Adjacent threadgroups read the same output-channel weights for independent
+ * blocks of eight tokens. Each lane keeps its original input positions. */
+kernel void kernel_k3_bf16_prefill_tiles(
+        constant k3_matmul_args &args, device const ushort *weights,
+        device const float *x, device float *out,
+        uint2 group [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort simd [[simdgroup_index_in_threadgroup]],
+        ushort simd_count [[simdgroups_per_threadgroup]]) {
+    constexpr uint token_groups = 4, channels = 2;
+    const uint first_channel = ((group.x / token_groups) * simd_count + simd) * channels;
+    const uint first_token = (group.y * token_groups + group.x % token_groups) * 8u;
+    float sums[8][channels] = {};
+    for (uint k = lane; k < args.in_dim; k += 128u) {
+        float w[channels][4];
+        #pragma unroll
+        for (uint col = 0; col < channels; col++) {
+            device const ushort *wc = weights + (ulong)(first_channel + col) * args.in_dim + k;
+            #pragma unroll
+            for (uint j = 0; j < 4; j++) w[col][j] = k3_bf16_to_f32(wc[j * 32u]);
+        }
+        #pragma unroll
+        for (uint r = 0; r < 8; r++) {
+            device const float *in = x + (ulong)(first_token + r) * args.in_dim + k;
+            #pragma unroll
+            for (uint j = 0; j < 4; j++) {
+                float value = in[j * 32u];
+                #pragma unroll
+                for (uint col = 0; col < channels; col++) sums[r][col] = fma(w[col][j], value, sums[r][col]);
+            }
+        }
+    }
+    #pragma unroll
+    for (uint r = 0; r < 8; r++) {
+        #pragma unroll
+        for (uint col = 0; col < channels; col++) {
+            float sum = simd_sum(sums[r][col]);
+            if (lane == 0u) out[(ulong)(first_token + r) * args.out_dim + first_channel + col] = sum;
+        }
+    }
+}
 /* Reuse the same FP32 arithmetic for four independent QKVG projections. */
 template <ushort rows_per_group>
 kernel void kernel_k3_mul_mv4_bf16_f32_rows(
@@ -1654,6 +1696,17 @@ kernel void kernel_k3_kda_decode(
     }
 }
 
+inline float4 k3_kda_conv_weights(device const float *w) {
+    return float4(w[0], w[1], w[2], w[3]);
+}
+
+inline float k3_kda_conv4(float3 history, float sample, float4 weight) {
+    float sum = fma(history.x, weight.x, 0.0f);
+    sum = fma(history.y, weight.y, sum);
+    sum = fma(history.z, weight.z, sum);
+    return fma(sample, weight.w, sum);
+}
+
 kernel void kernel_k3_kda_prefill_prepare(
         constant k3_kda_args &args,
         device float         *q,
@@ -1674,56 +1727,43 @@ kernel void kernel_k3_kda_prefill_prepare(
     constexpr uint D = 128u;
     constexpr uint HISTORY = 3u;
     if (head >= args.n_heads) return;
-    threadgroup float *sq = scratch;
-    threadgroup float *sk = sq + D;
-    threadgroup float *reduce_q = sk + D;
+    threadgroup float *reduce_q = scratch;
     threadgroup float *reduce_k = reduce_q + 4u;
     const uint projection = args.n_heads * D;
     const uint channel = head * D + tid;
-    device float *q_state = conv_state;
+    device float *q_state = conv_state + channel;
     device float *k_state = q_state + HISTORY * projection;
     device float *v_state = k_state + HISTORY * projection;
 
+    // One channel belongs to one thread for the entire chunk.
+    float3 q_history(q_state[0], q_state[projection], q_state[2ul * projection]);
+    float3 k_history(k_state[0], k_state[projection], k_state[2ul * projection]);
+    float3 v_history(v_state[0], v_state[projection], v_state[2ul * projection]);
+    const float4 qw = k3_kda_conv_weights(q_conv + (ulong)channel * 4u);
+    const float4 kw = k3_kda_conv_weights(k_conv + (ulong)channel * 4u);
+    const float4 vw = k3_kda_conv_weights(v_conv + (ulong)channel * 4u);
+    const float gate_bias = dt_bias[channel];
+    const float gate_slope = exp(a_log[head]);
     for (uint token = 0; token < args.n_rows; token++) {
         const ulong index = (ulong)token * projection + channel;
-        float q_acc = 0.0f;
-        float k_acc = 0.0f;
-        float v_acc = 0.0f;
-        for (uint w = 0; w < HISTORY; w++) {
-            q_acc = fma(q_state[(ulong)w * projection + channel],
-                        q_conv[(ulong)channel * 4u + w], q_acc);
-            k_acc = fma(k_state[(ulong)w * projection + channel],
-                        k_conv[(ulong)channel * 4u + w], k_acc);
-            v_acc = fma(v_state[(ulong)w * projection + channel],
-                        v_conv[(ulong)channel * 4u + w], v_acc);
-        }
         const float q_new = q[index];
         const float k_new = k[index];
         const float v_new = v[index];
-        q_acc = fma(q_new, q_conv[(ulong)channel * 4u + 3u], q_acc);
-        k_acc = fma(k_new, k_conv[(ulong)channel * 4u + 3u], k_acc);
-        v_acc = fma(v_new, v_conv[(ulong)channel * 4u + 3u], v_acc);
-        q_state[channel] = q_state[projection + channel];
-        q_state[projection + channel] = q_state[2ul * projection + channel];
-        q_state[2ul * projection + channel] = q_new;
-        k_state[channel] = k_state[projection + channel];
-        k_state[projection + channel] = k_state[2ul * projection + channel];
-        k_state[2ul * projection + channel] = k_new;
-        v_state[channel] = v_state[projection + channel];
-        v_state[projection + channel] = v_state[2ul * projection + channel];
-        v_state[2ul * projection + channel] = v_new;
+        const float q_acc = k3_kda_conv4(q_history, q_new, qw);
+        const float k_acc = k3_kda_conv4(k_history, k_new, kw);
+        const float v_acc = k3_kda_conv4(v_history, v_new, vw);
+        q_history = float3(q_history.yz, q_new);
+        k_history = float3(k_history.yz, k_new);
+        v_history = float3(v_history.yz, v_new);
 
-        sq[tid] = q_acc / (1.0f + exp(-q_acc));
-        sk[tid] = k_acc / (1.0f + exp(-k_acc));
+        const float q_raw = q_acc / (1.0f + exp(-q_acc));
+        const float k_raw = k_acc / (1.0f + exp(-k_acc));
         v[index] = v_acc / (1.0f + exp(-v_acc));
-        const float gate = raw_gate[index] + dt_bias[channel];
+        const float gate = raw_gate[index] + gate_bias;
         raw_gate[index] = exp(args.lower_bound *
-            (1.0f / (1.0f + exp(-exp(a_log[head]) * gate))));
-        threadgroup_barrier(mem_flags::mem_threadgroup |
-                           mem_flags::mem_device);
-
-        float q_sumsq = simd_sum(sq[tid] * sq[tid]);
-        float k_sumsq = simd_sum(sk[tid] * sk[tid]);
+            (1.0f / (1.0f + exp(-gate_slope * gate))));
+        const float q_sumsq = simd_sum(q_raw * q_raw);
+        const float k_sumsq = simd_sum(k_raw * k_raw);
         if (lane == 0u) {
             reduce_q[sg] = q_sumsq;
             reduce_k[sg] = k_sumsq;
@@ -1733,12 +1773,19 @@ kernel void kernel_k3_kda_prefill_prepare(
         float k_total = lane < 4u ? reduce_k[lane] : 0.0f;
         q_total = simd_sum(q_total);
         k_total = simd_sum(k_total);
-        q[index] = sq[tid] * rsqrt(q_total + 1.0e-6f) *
-                   0x1.6a09e6p-4f;
-        k[index] = sk[tid] * rsqrt(k_total + 1.0e-6f);
-        threadgroup_barrier(mem_flags::mem_threadgroup |
-                           mem_flags::mem_device);
+        q[index] = q_raw * rsqrt(q_total + 1.0e-6f) * 0x1.6a09e6p-4f;
+        k[index] = k_raw * rsqrt(k_total + 1.0e-6f);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+    q_state[0] = q_history.x;
+    q_state[projection] = q_history.y;
+    q_state[2ul * projection] = q_history.z;
+    k_state[0] = k_history.x;
+    k_state[projection] = k_history.y;
+    k_state[2ul * projection] = k_history.z;
+    v_state[0] = v_history.x;
+    v_state[projection] = v_history.y;
+    v_state[2ul * projection] = v_history.z;
 }
 
 kernel void kernel_k3_kda_prefill_recurrence(

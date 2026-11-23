@@ -33424,6 +33424,16 @@ static int ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu(
     const NSUInteger row_groups = ((NSUInteger)args->ne01 + rows_per_group - 1u) / rows_per_group;
     const NSUInteger pairs = (NSUInteger)args->nei0 * (NSUInteger)args->nei1;
 
+    if (act->activation_kind == 1u && args->ne00 == 3584 && args->ne01 == 3072 &&
+        args->nei0 == 16 && args->nr0 == 4 && nsg == 2 && !rows_per_group_is_nr0 &&
+        ds4_gpu_device_is_pre_m5_apple_silicon() && ds4_gpu_device_name_contains("Apple M1")) {
+        id<MTLComputePipelineState> expanded =
+            ds4_gpu_get_mul_mv_pipeline("kernel_k3_addr_iq2_pair_expanded_f32", 2);
+        if (expanded && expanded.maxTotalThreadsPerThreadgroup >= 64 &&
+            expanded.staticThreadgroupMemoryLength + threadgroup_bytes <= g_device.maxThreadgroupMemoryLength) {
+            pipeline = expanded;
+        }
+    }
     id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
     [enc setComputePipelineState:pipeline];
     [enc setBytes:args length:sizeof(*args) atIndex:0];
@@ -51871,7 +51881,16 @@ int k3_gpu_matmul_q8_0_tensor(
         false);
 }
 
-int k3_gpu_matmul_bf16(
+bool k3_gpu_can_tile_bf16_prefill(uint32_t in_dim, uint32_t out_dim, uint32_t rows) {
+    return g_ssd_streaming_mode && g_k3_bf16_mv_unroll == 16 && g_k3_bf16_mv_nsg == 4 &&
+        ds4_gpu_device_is_pre_m5_apple_silicon() && ds4_gpu_device_name_contains("Apple M1 Max") &&
+        rows == 256u &&
+        ((in_dim == 7168u && out_dim == 12288u) ||
+            (in_dim == 12288u && out_dim == 7168u) ||
+            (in_dim == 1536u && out_dim == 18432u));
+}
+
+static int k3_gpu_matmul_bf16_impl(
         ds4_gpu_tensor       *out,
         const void           *model_map,
         uint64_t              model_size,
@@ -51879,7 +51898,8 @@ int k3_gpu_matmul_bf16(
         uint32_t              in_dim,
         uint32_t              out_dim,
         const ds4_gpu_tensor *x,
-        uint32_t              n_rows) {
+        uint32_t              n_rows,
+        bool                  tiled) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (in_dim == 0 || out_dim == 0 || n_rows == 0) return 0;
 
@@ -51908,7 +51928,7 @@ int k3_gpu_matmul_bf16(
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb) return 0;
 
-        if (n_rows <= 8u) {
+        if (n_rows <= 8u || tiled) {
             /* Reusing weights across tokens shrinks the grid. Eight-token
              * reuse needs more output groups to keep enough parallel work. */
             const bool m1_default = g_k3_bf16_mv_unroll == 16 &&
@@ -51933,7 +51953,9 @@ int k3_gpu_matmul_bf16(
                         : (g_k3_bf16_mv_unroll == 4
                             ? "kernel_k3_mul_mv_bf16_f32_unroll4"
                             : "kernel_k3_mul_mv_bf16_f32"));
-            if (rows_per_group == 8u) {
+            if (tiled) {
+                kernel = "kernel_k3_bf16_prefill_tiles";
+            } else if (rows_per_group == 8u) {
                 kernel = "kernel_k3_mul_mv_bf16_f32_rows8";
             } else if (rows_per_group == 4u) {
                 kernel = "kernel_k3_mul_mv_bf16_f32_rows4";
@@ -51960,12 +51982,12 @@ int k3_gpu_matmul_bf16(
             [enc setBuffer:weightbuf offset:(NSUInteger)weight_inner atIndex:1];
             [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
             [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
-            [enc dispatchThreadgroups:MTLSizeMake(
-                    ((NSUInteger)out_dim +
-                     (NSUInteger)g_k3_bf16_mv_nsg - 1u) /
-                        (NSUInteger)g_k3_bf16_mv_nsg,
-                    (n_rows + rows_per_group - 1u) / rows_per_group,
-                    1)
+            const NSUInteger nsg = (NSUInteger)g_k3_bf16_mv_nsg;
+            const NSUInteger output_groups = tiled ? ((NSUInteger)out_dim / (nsg * 2u)) * 4u :
+                ((NSUInteger)out_dim + nsg - 1u) / nsg;
+            const NSUInteger token_tile = tiled ? 8u * 4u : rows_per_group;
+            [enc dispatchThreadgroups:MTLSizeMake(output_groups,
+                    ((NSUInteger)n_rows + token_tile - 1u) / token_tile, 1)
                 threadsPerThreadgroup:MTLSizeMake(
                     32u * (NSUInteger)g_k3_bf16_mv_nsg, 1, 1)];
             ds4_gpu_end_compute_encoder(cb, enc);
@@ -51998,6 +52020,33 @@ int k3_gpu_matmul_bf16(
         return ds4_gpu_finish_command_buffer(
             cb, owned, "K3 BF16 matrix-matrix multiply");
     }
+}
+
+int k3_gpu_matmul_bf16(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_rows) {
+    return k3_gpu_matmul_bf16_impl(out, model_map, model_size, weight_offset,
+        in_dim, out_dim, x, n_rows, false);
+}
+
+int k3_gpu_matmul_bf16_prefill_tiles(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_rows) {
+    if (!k3_gpu_can_tile_bf16_prefill(in_dim, out_dim, n_rows)) return 0;
+    return k3_gpu_matmul_bf16_impl(out, model_map, model_size, weight_offset,
+        in_dim, out_dim, x, n_rows, true);
 }
 
 int k3_gpu_matmul4_bf16_enabled(void) {
@@ -53469,7 +53518,7 @@ int k3_gpu_kda_prefill(
         [enc setBuffer:dt_bias offset:(NSUInteger)dt_inner atIndex:9];
         [enc setBuffer:ds4_gpu_tensor_buffer(conv_state)
                 offset:ds4_gpu_tensor_offset(conv_state) atIndex:10];
-        [enc setThreadgroupMemoryLength:264u * sizeof(float) atIndex:0];
+        [enc setThreadgroupMemoryLength:8u * sizeof(float) atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(n_heads, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
 

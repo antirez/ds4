@@ -3805,6 +3805,12 @@ static int matmul(ds4_gpu_tensor *out,
      * across its 64-token groups. Only activations are sliced; the weights stay live. */
     if (source->streamed_small_batches && rows > 8u &&
         (rows <= 64u || rows == source->staged_prefill_rows)) {
+        if (!source->q8 && weight->dtype == K3_ST_DTYPE_BF16 &&
+            k3_gpu_can_tile_bf16_prefill(in_dim, out_dim, rows)) {
+            if (!source->base || weight->offset < source->bias) return 0;
+            return k3_gpu_matmul_bf16_prefill_tiles(out, source->base, source->size,
+                weight->offset - source->bias, in_dim, out_dim, x, rows);
+        }
         if (in_dim == 0 || out_dim == 0) return 0;
         const uint64_t input_row_bytes = (uint64_t)in_dim * sizeof(float);
         const uint64_t output_row_bytes = (uint64_t)out_dim * sizeof(float);

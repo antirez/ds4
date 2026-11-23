@@ -42,6 +42,17 @@ int k3_gpu_matmul_bf16(
         const ds4_gpu_tensor *x,
         uint32_t              n_rows);
 
+bool k3_gpu_can_tile_bf16_prefill(uint32_t in_dim, uint32_t out_dim, uint32_t rows);
+int k3_gpu_matmul_bf16_prefill_tiles(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_rows);
+
 int k3_gpu_matmul4_bf16_enabled(void);
 int k3_gpu_matmul4_bf16(
         ds4_gpu_tensor * const outputs[4],

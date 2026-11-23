@@ -3211,7 +3211,7 @@ void kernel_mul_mv_iq2_xxs_f32_impl(
     }
 }
 
-template<int nr0>
+template<int nr0, bool expanded = false>
 void kernel_mul_mv_iq2_xxs_pair_f32_impl(
         ds4_metal_args_mul_mv args,
         device const char * src0_gate,
@@ -3222,7 +3222,8 @@ void kernel_mul_mv_iq2_xxs_pair_f32_impl(
         threadgroup  char * shmem,
         uint3  tgpig,
         ushort tiisg,
-        ushort sgitg) {
+        ushort sgitg,
+        threadgroup half4 *magnitudes = nullptr) {
     const short NSG = FC_mul_mv_nsg;
 
     const int nb = args.ne00/QK_K;
@@ -3251,15 +3252,35 @@ void kernel_mul_mv_iq2_xxs_pair_f32_impl(
 
     threadgroup uint64_t * svalues = (threadgroup uint64_t *)(shmem);
     threadgroup uint8_t  * ssigns  = (threadgroup uint8_t  *)(svalues + 256);
-    {
+    // IQ2 magnitudes (8, 25, 43) and signs are exactly representable in half.
+    // Decode both tables once per threadgroup, keeping the sign multiplication
+    // separate to preserve the FP32 rounding of the original dot product.
+    threadgroup ushort4 *factor_bits = (threadgroup ushort4 *)shmem;
+    if (expanded) {
+        const uint worker = 32u * sgitg + tiisg;
+        const uint workers = 32u * NSG;
+        for (uint i = worker; i < 256; i += workers) {
+            const uint2 grid = as_type<uint2>(ds4_metal_iq2xxs_grid[i]);
+            magnitudes[2*i] = half4(as_type<uchar4>(grid.x));
+            magnitudes[2*i + 1] = half4(as_type<uchar4>(grid.y));
+        }
+        const ushort4 bits(1, 2, 4, 8);
+        for (uint i = worker; i < 128; i += workers) {
+            const ushort sign = ds4_metal_ksigns_iq2xs[i];
+            factor_bits[2*i] = ushort4(0x3c00) |
+                select(ushort4(0), ushort4(0x8000), (sign & bits) != ushort4(0));
+            factor_bits[2*i + 1] = ushort4(0x3c00) |
+                select(ushort4(0), ushort4(0x8000), ((sign >> 4) & bits) != ushort4(0));
+        }
+    } else {
         int nval = 4;
         int pos  = (32*sgitg + tiisg)*nval;
         for (int i = 0; i < nval; ++i) svalues[pos + i] = ds4_metal_iq2xxs_grid[pos + i];
         nval = 2;
         pos  = (32*sgitg + tiisg)*nval;
         for (int i = 0; i < nval; ++i) ssigns[pos+i] = ds4_metal_ksigns_iq2xs[pos+i];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const int ix = tiisg;
     device const float * y4 = y + 32 * ix;
@@ -3290,14 +3311,32 @@ void kernel_mul_mv_iq2_xxs_pair_f32_impl(
             float sg = 0;
             float su = 0;
             for (short l = 0; l < 4; ++l) {
-                const threadgroup uint8_t * gridg = (const threadgroup uint8_t *)(svalues + aux8g[l]);
-                const threadgroup uint8_t * gridu = (const threadgroup uint8_t *)(svalues + aux8u[l]);
-                const uint8_t signg = ssigns[(aux32g >> 7*l) & 127];
-                const uint8_t signu = ssigns[(aux32u >> 7*l) & 127];
-                for (short j = 0; j < 8; ++j) {
-                    const float v = yl[8*l + j];
-                    sg += v * gridg[j] * (signg & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
-                    su += v * gridu[j] * (signu & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+                if (expanded) {
+                    const uint gridg = 2u * aux8g[l];
+                    const uint gridu = 2u * aux8u[l];
+                    const uint signg = 2u * ((aux32g >> (7*l)) & 127u);
+                    const uint signu = 2u * ((aux32u >> (7*l)) & 127u);
+                    for (ushort part = 0; part < 2; ++part) {
+                        const float4 mg = float4(magnitudes[gridg + part]);
+                        const float4 mu = float4(magnitudes[gridu + part]);
+                        const float4 fg = float4(as_type<half4>(factor_bits[signg + part]));
+                        const float4 fu = float4(as_type<half4>(factor_bits[signu + part]));
+                        for (ushort j = 0; j < 4; ++j) {
+                            const float v = yl[8*l + 4*part + j];
+                            sg += v * mg[j] * fg[j];
+                            su += v * mu[j] * fu[j];
+                        }
+                    }
+                } else {
+                    const threadgroup uint8_t * gridg = (const threadgroup uint8_t *)(svalues + aux8g[l]);
+                    const threadgroup uint8_t * gridu = (const threadgroup uint8_t *)(svalues + aux8u[l]);
+                    const uint8_t signg = ssigns[(aux32g >> 7*l) & 127];
+                    const uint8_t signu = ssigns[(aux32u >> 7*l) & 127];
+                    for (short j = 0; j < 8; ++j) {
+                        const float v = yl[8*l + j];
+                        sg += v * gridg[j] * (signg & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+                        su += v * gridu[j] * (signu & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+                    }
                 }
             }
             sumg[row] += dg * sg;
@@ -4032,7 +4071,8 @@ kernel void kernel_mul_mv_slots6_iq2_xxs_pair_swiglu_f32(
     (void)tiitg;
 }
 
-kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_f32(
+template<bool expanded>
+kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu(
         constant ds4_metal_args_mul_mv_id & args,
         constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
         device const uint64_t * gate_addrs,
@@ -4082,7 +4122,8 @@ kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_f32(
         args.ne0, 1, args.nr0, 1, 1,
     };
 
-    kernel_mul_mv_iq2_xxs_pair_f32_impl<N_R0_IQ2_XXS>(
+    threadgroup half4 magnitudes[expanded ? 512 : 1];
+    kernel_mul_mv_iq2_xxs_pair_f32_impl<N_R0_IQ2_XXS, expanded>(
         args0,
         src0_gate_cur,
         src0_up_cur,
@@ -4092,7 +4133,8 @@ kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_f32(
         shmem,
         tgpig,
         tiisg,
-        sgitg);
+        sgitg,
+        magnitudes);
 
     const short NSG = FC_mul_mv_nsg;
     const int first_row = (tgpig.x * NSG + sgitg) * N_R0_IQ2_XXS;
@@ -4112,6 +4154,10 @@ kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_f32(
         }
     }
 }
+
+typedef decltype(kernel_mul_mv_addr_iq2_xxs_pair_swiglu<false>) k3_addr_iq2_pair_t;
+template [[host_name("kernel_mul_mv_addr_iq2_xxs_pair_swiglu_f32")]] kernel k3_addr_iq2_pair_t kernel_mul_mv_addr_iq2_xxs_pair_swiglu<false>;
+template [[host_name("kernel_k3_addr_iq2_pair_expanded_f32")]] kernel k3_addr_iq2_pair_t kernel_mul_mv_addr_iq2_xxs_pair_swiglu<true>;
 
 kernel void kernel_mul_mv_addr_iq2_xxs_f32(
         constant ds4_metal_args_mul_mv_id & args,

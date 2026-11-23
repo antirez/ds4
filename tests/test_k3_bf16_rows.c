@@ -1,5 +1,5 @@
 /* Compare batched BF16 projections with independent single-token calls.
- * Anonymous synthetic weights keep the mapping below 12 MiB; no model is used. */
+ * The grouped prefill case uses one synthetic matrix at the K3 projection shape. */
 #define _POSIX_C_SOURCE 200809L
 #define _DARWIN_C_SOURCE
 
@@ -35,11 +35,13 @@ static int guards_intact(const uint8_t *bytes, uint64_t size,
 }
 
 static int test_shape(uint32_t in_dim, uint32_t out_dim) {
-    enum { MAX_ROWS = 8, INPUT_OFFSET = 64, OUTPUT_OFFSET = 128, GUARD = 128 };
+    const bool tiled = k3_gpu_can_tile_bf16_prefill(in_dim, out_dim, 256);
+    const uint32_t max_rows = tiled ? 256u : 8u;
+    enum { MAX_ROWS = 256, INPUT_OFFSET = 64, OUTPUT_OFFSET = 128, GUARD = 128 };
     const uint64_t input_row = (uint64_t)in_dim * sizeof(float);
     const uint64_t output_row = (uint64_t)out_dim * sizeof(float);
-    const uint64_t input_size = INPUT_OFFSET + MAX_ROWS * input_row + GUARD;
-    const uint64_t output_size = OUTPUT_OFFSET + MAX_ROWS * output_row + GUARD;
+    const uint64_t input_size = INPUT_OFFSET + max_rows * input_row + GUARD;
+    const uint64_t output_size = OUTPUT_OFFSET + max_rows * output_row + GUARD;
     const uint64_t weight_size = (uint64_t)in_dim * out_dim * sizeof(uint16_t);
     const long page = sysconf(_SC_PAGESIZE);
     uint64_t mapping_size = 0;
@@ -62,7 +64,7 @@ static int test_shape(uint32_t in_dim, uint32_t out_dim) {
     const uint64_t weight_offset = (uint64_t)page + 128u;
     mapping_size = (weight_offset + weight_size + GUARD + (uint64_t)page - 1u)
         / (uint64_t)page * (uint64_t)page;
-    CHECK(mapping_size < UINT64_C(12) * 1024u * 1024u);
+    CHECK(mapping_size < (tiled ? UINT64_C(176) : UINT64_C(12)) * 1024u * 1024u);
     mapping = mmap(NULL, (size_t)mapping_size, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANON, -1, 0);
     CHECK(mapping != MAP_FAILED);
@@ -79,7 +81,7 @@ static int test_shape(uint32_t in_dim, uint32_t out_dim) {
     expected = malloc((size_t)output_size);
     CHECK(inputs && input_check && actual && expected);
     memset(inputs, 0xa5, (size_t)input_size);
-    for (uint64_t i = 0; i < MAX_ROWS * input_row / sizeof(float); i++) {
+    for (uint64_t i = 0; i < max_rows * input_row / sizeof(float); i++) {
         const uint32_t hash = mix((uint32_t)i + UINT32_C(0x13579bdf));
         /* Mixed signs and full FP32 mantissas expose cancellation and any
          * accidental narrowing of activations to half precision. */
@@ -92,10 +94,10 @@ static int test_shape(uint32_t in_dim, uint32_t out_dim) {
     output_base = ds4_gpu_tensor_alloc_managed(output_size);
     reference_base = ds4_gpu_tensor_alloc_managed(output_size);
     CHECK(input_base && output_base && reference_base);
-    input = ds4_gpu_tensor_view(input_base, INPUT_OFFSET, MAX_ROWS * input_row);
-    output = ds4_gpu_tensor_view(output_base, OUTPUT_OFFSET, MAX_ROWS * output_row);
+    input = ds4_gpu_tensor_view(input_base, INPUT_OFFSET, max_rows * input_row);
+    output = ds4_gpu_tensor_view(output_base, OUTPUT_OFFSET, max_rows * output_row);
     CHECK(input && output);
-    for (uint32_t row = 0; row < MAX_ROWS; row++) {
+    for (uint32_t row = 0; row < max_rows; row++) {
         input_rows[row] = ds4_gpu_tensor_view(input, row * input_row, input_row);
         output_rows[row] = ds4_gpu_tensor_view(reference_base,
             OUTPUT_OFFSET + row * output_row, output_row);
@@ -105,13 +107,18 @@ static int test_shape(uint32_t in_dim, uint32_t out_dim) {
     CHECK(ds4_gpu_set_model_map_spans(mapping, mapping_size,
         &weight_offset, &weight_size, 1, weight_size));
 
-    for (uint32_t rows = 1; rows <= MAX_ROWS; rows++) {
+    for (uint32_t rows = tiled ? max_rows : 1u; rows <= max_rows; rows++) {
         memset(actual, 0xa5, (size_t)output_size);
         CHECK(ds4_gpu_tensor_write(output_base, 0, actual, output_size));
         CHECK(ds4_gpu_tensor_write(reference_base, 0, actual, output_size));
         CHECK(ds4_gpu_begin_commands());
-        CHECK(k3_gpu_matmul_bf16(output, mapping, mapping_size, weight_offset,
-                                 in_dim, out_dim, input, rows));
+        if (tiled) {
+            CHECK(k3_gpu_matmul_bf16_prefill_tiles(output, mapping, mapping_size, weight_offset,
+                in_dim, out_dim, input, rows));
+        } else {
+            CHECK(k3_gpu_matmul_bf16(output, mapping, mapping_size, weight_offset,
+                in_dim, out_dim, input, rows));
+        }
         for (uint32_t row = 0; row < rows; row++) {
             CHECK(k3_gpu_matmul_bf16(output_rows[row], mapping, mapping_size,
                 weight_offset, in_dim, out_dim, input_rows[row], 1));
@@ -136,7 +143,7 @@ static int test_shape(uint32_t in_dim, uint32_t out_dim) {
     /* A few independent double-precision dots also catch shared addressing
      * mistakes that a comparison between two GPU calls could miss. */
     const uint32_t columns[] = {0, out_dim / 2u, out_dim - 1u};
-    for (uint32_t row = 0; row < MAX_ROWS; row++) {
+    for (uint32_t row = 0; row < max_rows; row++) {
         for (uint32_t sample = 0; sample < 3u; sample++) {
             const uint32_t column = columns[sample];
             double sum = 0, absolute_sum = 0;
@@ -163,7 +170,7 @@ cleanup:
     if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = 0;
     const int retired = ds4_gpu_synchronize() && ds4_gpu_release_model_views();
     if (!retired) ok = 0;
-    for (uint32_t row = 0; row < MAX_ROWS; row++) {
+    for (uint32_t row = 0; row < max_rows; row++) {
         ds4_gpu_tensor_free(output_rows[row]);
         ds4_gpu_tensor_free(input_rows[row]);
     }
@@ -198,7 +205,8 @@ int main(int argc, char **argv) {
     const int ok = test_shape(1024, 1024) && test_shape(1025, 1031) &&
                    test_shape(1024, 4096) && test_shape(1025, 4097) &&
                    test_shape(128, 17) && test_shape(128, 1031) &&
-                   test_shape(1024, 96);
+                   test_shape(1024, 96) &&
+                   (!k3_gpu_can_tile_bf16_prefill(1536, 18432, 256) || test_shape(1536, 18432));
     ds4_gpu_cleanup();
     if (ok) puts("K3 BF16 batched rows match single-token projections exactly");
     return ok ? 0 : 1;
