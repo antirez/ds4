@@ -134,8 +134,10 @@ static int run_case(uint32_t heads, uint32_t rows, uint32_t split) {
     CHECK(ds4_gpu_set_model_map_spans(mapping, map_size, offsets, &span_size, 1, span_size));
     CHECK(ds4_gpu_begin_commands());
     CHECK(dispatch(buffers[0], mapping, map_size, offsets, heads, rows, 0, rows));
-    CHECK(dispatch(buffers[1], mapping, map_size, offsets, heads, rows, 0, split));
-    CHECK(dispatch(buffers[1], mapping, map_size, offsets, heads, rows, split, rows - split));
+    for (uint32_t row = 0; row < rows; row += split) {
+        const uint32_t count = rows - row < split ? rows - row : split;
+        CHECK(dispatch(buffers[1], mapping, map_size, offsets, heads, rows, row, count));
+    }
     CHECK(ds4_gpu_end_commands());
     for (uint32_t b = Q; b < BUFFERS; b++) {
         for (uint32_t v = 0; v < 2; v++) {
@@ -182,7 +184,7 @@ int main(int argc, char **argv) {
     ds4_gpu_set_ssd_streaming(!resident);
     if (!ds4_gpu_init()) return 1;
     const int ok = run_case(1, 32, 16) && run_case(5, 44, 32) && run_case(5, 64, 32) &&
-        run_case(5, 128, 64);
+        run_case(5, 128, 64) && run_case(3, 256, 64) && run_case(3, 249, 64);
     ds4_gpu_cleanup();
     if (ok) puts("KDA prefill: exact full/chunked outputs, convolution history and recurrent state");
     return ok ? 0 : 1;

@@ -13,7 +13,7 @@
 #include <unistd.h>
 
 bool ds4_log_is_tty(FILE *fp) { (void)fp; return false; }
-enum { OFFSET = 128, GUARD = 128, MAX_ROWS = 128,
+enum { OFFSET = 128, GUARD = 128, MAX_ROWS = 256,
        Q = 0, KV = 1, GATE = 2, IDS = 3, INPUTS = 4,
        CACHE = 0, LATENT = 1, OUT = 2, STATES = 3 };
 typedef struct {
@@ -132,7 +132,7 @@ static int oracle(const uint16_t *weights, const test_buffer input[INPUTS],
     return 1;
 }
 
-static int run_case(uint32_t heads, uint32_t rows, uint32_t start, bool indexed) {
+static int run_case(uint32_t heads, uint32_t rows, uint32_t start, bool indexed, uint32_t split) {
     const uint32_t capacity = start + rows + 5u;
     const uint64_t weight_bytes = (uint64_t)heads * 256 * 512 * sizeof(uint16_t);
     const uint64_t input_bytes[] = {(uint64_t)rows * heads * 192 * 4,
@@ -149,7 +149,7 @@ static int run_case(uint32_t heads, uint32_t rows, uint32_t start, bool indexed)
     fprintf(stderr, "MLA heads=%u rows=%u start=%u indexed=%u line%d: %s\n", \
         heads, rows, start, indexed, __LINE__, #condition); goto cleanup; } } while (0)
     const long page = sysconf(_SC_PAGESIZE);
-    CHECK(page > 0 && rows > 0 && rows <= MAX_ROWS);
+    CHECK(page > 0 && rows > 0 && rows <= MAX_ROWS && split > 0);
     weight_offset = (uint64_t)page + OFFSET;
     mapping_size = ((weight_offset + weight_bytes + GUARD + page - 1u) / page) * page;
     uint64_t allocation = mapping_size + state_bytes[CACHE];
@@ -201,20 +201,21 @@ static int run_case(uint32_t heads, uint32_t rows, uint32_t start, bool indexed)
     CHECK(k3_gpu_mla_prefill(state[0][OUT].view, state[0][CACHE].view, state[0][LATENT].view,
         input[Q].view, input[KV].view, input[GATE].view, mapping, mapping_size, weight_offset,
         heads, start, rows, capacity, indexed ? input[IDS].view : NULL));
-    for (uint32_t row = 0; row < rows; row++) {
+    for (uint32_t row = 0; row < rows; row += split) {
+        const uint32_t count = rows - row < split ? rows - row : split;
         for (uint32_t i = 0; i < INPUTS; i++) {
             const uint64_t bytes = input_bytes[i] / rows;
-            slices[row][i] = ds4_gpu_tensor_view(input[i].view, (uint64_t)row * bytes, bytes);
+            slices[row][i] = ds4_gpu_tensor_view(input[i].view, (uint64_t)row * bytes, count * bytes);
             CHECK(slices[row][i]);
         }
         for (uint32_t s = LATENT; s <= OUT; s++) {
             const uint64_t bytes = state_bytes[s] / rows;
-            slices[row][s + 3] = ds4_gpu_tensor_view(state[1][s].view, (uint64_t)row * bytes, bytes);
+            slices[row][s + 3] = ds4_gpu_tensor_view(state[1][s].view, (uint64_t)row * bytes, count * bytes);
             CHECK(slices[row][s + 3]);
         }
         CHECK(k3_gpu_mla_prefill(slices[row][5], state[1][CACHE].view, slices[row][4],
             slices[row][Q], slices[row][KV], slices[row][GATE], mapping, mapping_size, weight_offset,
-            heads, start + row, 1, capacity, indexed ? slices[row][IDS] : NULL));
+            heads, start + row, count, capacity, indexed ? slices[row][IDS] : NULL));
     }
     CHECK(ds4_gpu_end_commands());
     for (uint32_t s = 0; s < STATES; s++) {
@@ -259,11 +260,12 @@ int main(int argc, char **argv) {
     if (argc > 2 || (argc == 2 && !resident)) return 2;
     ds4_gpu_set_ssd_streaming(!resident);
     if (!ds4_gpu_init()) return 1;
-    const int ok = run_case(1, 1, 0, false) && run_case(5, 7, 31, false) &&
-        run_case(5, 32, 0, false) && run_case(5, 44, 0, false) &&
-        run_case(5, 64, 31, false) && run_case(5, 128, 31, false) &&
-        run_case(5, 3, 2047, true) &&
-        run_case(3, 1, 2048, false) && run_case(1, 1, 4095, true);
+    const int ok = run_case(1, 1, 0, false, 1) && run_case(5, 7, 31, false, 1) &&
+        run_case(5, 32, 0, false, 1) && run_case(5, 44, 0, false, 1) &&
+        run_case(5, 64, 31, false, 1) && run_case(5, 128, 31, false, 1) &&
+        run_case(5, 3, 2047, true, 1) &&
+        run_case(3, 256, 11, false, 64) && run_case(3, 249, 11, false, 64) &&
+        run_case(3, 1, 2048, false, 1) && run_case(1, 1, 4095, true, 1);
     ds4_gpu_cleanup();
     if (ok) puts("MLA prefill: exact chunk/token outputs and cache; CPU oracles and guards passed");
     return ok ? 0 : 1;
