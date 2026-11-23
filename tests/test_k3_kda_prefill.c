@@ -181,7 +181,8 @@ int main(int argc, char **argv) {
     if (argc > 2 || (argc == 2 && !resident)) return 2;
     ds4_gpu_set_ssd_streaming(!resident);
     if (!ds4_gpu_init()) return 1;
-    const int ok = run_case(1, 32, 16) && run_case(5, 44, 32) && run_case(5, 64, 32);
+    const int ok = run_case(1, 32, 16) && run_case(5, 44, 32) && run_case(5, 64, 32) &&
+        run_case(5, 128, 64);
     ds4_gpu_cleanup();
     if (ok) puts("KDA prefill: exact full/chunked outputs, convolution history and recurrent state");
     return ok ? 0 : 1;

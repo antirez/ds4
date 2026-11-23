@@ -137,6 +137,7 @@ typedef struct {
     uint64_t bias;
     const k3_q8_layer_cache *q8;
     bool streamed_small_batches;
+    bool staged_prefill_128;
 } k3_weight_source;
 
 typedef struct {
@@ -3800,9 +3801,10 @@ static int matmul(ds4_gpu_tensor *out,
     }
     /* Reuse the streamed layer across a larger prefill while retaining the
      * native small-batch arithmetic for its BF16 and quantized projections.
-     * Up to 64 tokens reuse one streamed layer without switching to half
-     * matrix operands. Only activations are sliced; the weights stay live. */
-    if (source->streamed_small_batches && rows > 8u && rows <= 64u) {
+     * A full 128-token staged prefill can share expert reads across both
+     * 64-token halves. Only activations are sliced; the weights stay live. */
+    if (source->streamed_small_batches && rows > 8u &&
+        (rows <= 64u || (rows == 128u && source->staged_prefill_128))) {
         if (in_dim == 0 || out_dim == 0) return 0;
         const uint64_t input_row_bytes = (uint64_t)in_dim * sizeof(float);
         const uint64_t output_row_bytes = (uint64_t)out_dim * sizeof(float);
@@ -5701,6 +5703,9 @@ static int evaluate(k3_context *ctx,
                   .q8 = ctx->q8_static ? &ctx->q8_layers[i] : NULL,
                   .streamed_small_batches = ctx->model->gguf &&
                       ds4_gpu_device_is_pre_m5_apple_silicon(),
+                  .staged_prefill_128 = staged_layer && prefill && ctx->static_cache &&
+                      ctx->optimized_ssd_streaming && rows == 128u &&
+                      ctx->max_prefill_tokens == 128u && owner->max_prefill_tokens == 128u,
               }
             : ctx->model->gguf
             ? (k3_weight_source){

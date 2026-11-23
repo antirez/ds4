@@ -13,7 +13,7 @@
 #include <unistd.h>
 
 bool ds4_log_is_tty(FILE *fp) { (void)fp; return false; }
-enum { OFFSET = 128, GUARD = 128, MAX_ROWS = 64,
+enum { OFFSET = 128, GUARD = 128, MAX_ROWS = 128,
        Q = 0, KV = 1, GATE = 2, IDS = 3, INPUTS = 4,
        CACHE = 0, LATENT = 1, OUT = 2, STATES = 3 };
 typedef struct {
@@ -261,7 +261,8 @@ int main(int argc, char **argv) {
     if (!ds4_gpu_init()) return 1;
     const int ok = run_case(1, 1, 0, false) && run_case(5, 7, 31, false) &&
         run_case(5, 32, 0, false) && run_case(5, 44, 0, false) &&
-        run_case(5, 64, 31, false) && run_case(5, 3, 2047, true) &&
+        run_case(5, 64, 31, false) && run_case(5, 128, 31, false) &&
+        run_case(5, 3, 2047, true) &&
         run_case(3, 1, 2048, false) && run_case(1, 1, 4095, true);
     ds4_gpu_cleanup();
     if (ok) puts("MLA prefill: exact chunk/token outputs and cache; CPU oracles and guards passed");
