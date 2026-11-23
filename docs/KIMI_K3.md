@@ -197,6 +197,20 @@ pressure and no new swap in every run. This measures the short prompt above;
 longer contexts were not benchmarked, and filesystem cache, temperature and
 external load were not controlled.
 
+
+For decode correctness checks, `ds4-bench --dump-decode-logits` together with
+`--dump-frontier-logits-dir DIR` writes the full vocabulary logits after each
+successful scalar decode step, in addition to the prefill frontier. Create
+`DIR` before running the benchmark. Decode files include the consumed token
+ID, step number and actual session position, so comparisons can check every
+FP32 value and the token sequence rather than only the generated text. The
+option is incompatible with `--dspark`.
+
+Direct dump time is excluded from the reported generation timings, but the
+pauses and diagnostic I/O can still affect subsequent work. Use matching dump
+settings for correctness comparisons and separate runs without decode dumps
+for performance measurements.
+
 ## Two 512 GiB Macs
 
 Put the same GGUF on both machines. This is a contiguous-layer pipeline, not
