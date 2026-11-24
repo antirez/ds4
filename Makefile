@@ -209,6 +209,7 @@ tests/test_k3_bf16_rows: tests/test_k3_bf16_rows.o ds4_metal.o ds4_image.o gguf-
 
 test-k3-bf16-rows: tests/test_k3_bf16_rows
 	./tests/test_k3_bf16_rows --resident
+	env -u K3_EXPERIMENTAL_PREFILL_KERNELS ./tests/test_k3_bf16_rows
 	K3_EXPERIMENTAL_PREFILL_KERNELS=0 ./tests/test_k3_bf16_rows
 	K3_EXPERIMENTAL_PREFILL_KERNELS=1 ./tests/test_k3_bf16_rows
 
@@ -329,6 +330,7 @@ test-k3: ds4 tests/test_k3_streaming tests/test_k3_streaming_slab tests/test_k3_
 	./tests/test_k3_tokenizer "$(K3_MODEL)"
 	@./ds4 -m "$(K3_MODEL)" --dump-tokens -p x | grep -q '^[[:space:]]*87  x$$'
 	./tests/test_k3_bf16_rows --resident
+	env -u K3_EXPERIMENTAL_PREFILL_KERNELS ./tests/test_k3_bf16_rows
 	K3_EXPERIMENTAL_PREFILL_KERNELS=0 ./tests/test_k3_bf16_rows
 	K3_EXPERIMENTAL_PREFILL_KERNELS=1 ./tests/test_k3_bf16_rows
 	./tests/test_k3_bf16_fused --resident

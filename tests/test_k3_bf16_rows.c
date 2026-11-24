@@ -108,7 +108,7 @@ static int test_shape(uint32_t in_dim, uint32_t out_dim) {
         &weight_offset, &weight_size, 1, weight_size));
 
     const char *prefill_setting = getenv("K3_EXPERIMENTAL_PREFILL_KERNELS");
-    const bool short_tiles = prefill_setting && strcmp(prefill_setting, "1") == 0;
+    const bool short_tiles = !prefill_setting || strcmp(prefill_setting, "1") == 0;
     const uint32_t tile_rows[] = {16, 44, 64, 256};
     CHECK(!k3_gpu_can_tile_bf16_prefill(in_dim, out_dim, 45));
     const uint32_t cases = tiled ? sizeof(tile_rows) / sizeof(tile_rows[0]) : max_rows;

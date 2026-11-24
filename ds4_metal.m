@@ -7204,7 +7204,7 @@ typedef struct {
 int ds4_gpu_init(void) {
     if (g_initialized) return 1;
     const char *prefill_kernels = getenv("K3_EXPERIMENTAL_PREFILL_KERNELS");
-    g_k3_experimental_prefill_kernels = prefill_kernels && strcmp(prefill_kernels, "1") == 0;
+    g_k3_experimental_prefill_kernels = !prefill_kernels || strcmp(prefill_kernels, "1") == 0;
     const char *decode_kernels = getenv("K3_EXPERIMENTAL_DECODE_KERNELS");
     g_k3_experimental_decode_kernels = decode_kernels && strcmp(decode_kernels, "1") == 0;
     const char *k3_bf16_unroll = getenv("K3_BF16_MV_UNROLL");
