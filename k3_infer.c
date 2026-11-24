@@ -46,6 +46,12 @@ static const uint64_t K3_PREAD_CHUNK_BYTES =
     64ull * 1024ull * 1024ull;
 static const uint64_t K3_IO_SPLIT_ALIGNMENT = 16ull * 1024ull;
 
+typedef enum {
+    K3_STATIC_IO_UNDECIDED,
+    K3_STATIC_IO_STREAMING,
+    K3_STATIC_IO_MAPPED,
+} k3_static_io_mode;
+
 typedef struct {
     ds4_gpu_tensor *conv;
     ds4_gpu_tensor *recurrent;
@@ -137,7 +143,7 @@ typedef struct {
     uint64_t bias;
     const k3_q8_layer_cache *q8;
     bool streamed_small_batches;
-    uint32_t staged_prefill_rows;
+    uint32_t streamed_prefill_rows;
 } k3_weight_source;
 
 typedef struct {
@@ -258,6 +264,8 @@ struct k3_context {
     uint64_t resident_static_bytes;
     uint64_t tensor_allocation_limit;
     uint64_t gguf_cache_bytes;
+    uint64_t gguf_file_cache_span;
+    k3_static_io_mode gguf_file_cache_mode;
     uint64_t gguf_transient_bytes;
     uint64_t gguf_staging_bytes;
     uint64_t gguf_staging_locked_bytes;
@@ -617,6 +625,51 @@ static int gguf_memory_budget(uint64_t allocated, uint64_t *budget,
         ds4_gpu_recommended_working_set_size(), allocated,
         memory.reclaimable, resident_memory_reserve(), K3_GGUF_LIVE_RESERVE_BYTES);
     return 1;
+}
+
+/* Only the active layer and its prefetch need temporary Metal views. Clean
+ * pages from earlier layers can occupy the larger, reclaimable OS file cache. */
+static uint64_t gguf_file_cache_capacity(const k3_context *owner, uint64_t experts) {
+    int pressure = 0;
+    size_t size = sizeof(pressure);
+    k3_memory_status memory;
+    const uint64_t physical = macos_physical_memory();
+    if (!physical || sysctlbyname("kern.memorystatus_vm_pressure_level",
+            &pressure, &size, NULL, 0) != 0 || size != sizeof(pressure) ||
+        pressure != 1 || !macos_memory_status(&memory)) return 0;
+    const uint64_t process = k3_memory_remaining(
+        k3_memory_remaining(physical, resident_memory_reserve()),
+        ds4_gpu_tensor_allocated_bytes());
+    return k3_file_cache_capacity(process,
+        k3_memory_remaining(memory.reclaimable, K3_GGUF_LIVE_RESERVE_BYTES),
+        owner->gguf_transient_bytes, owner->gguf_staging_locked_bytes,
+        experts, k3_gpu_streaming_cache_locked_bytes());
+}
+
+static int automatic_gguf_static_io(const k3_context *ctx) {
+    return ctx->optimized_ssd_streaming && ctx->gguf_staging_requested &&
+        !getenv("K3_GGUF_STATIC_CACHE") && !getenv("K3_GGUF_RESIDENT") &&
+        !getenv("K3_RESIDENT_STATIC") && !getenv("K3_RESIDENT_STATIC_GIB") &&
+        !getenv("K3_DISABLE_GGUF_STATIC_RESIDENCY") &&
+        !getenv("K3_GGUF_STATIC_STAGING") && !getenv("K3_GGUF_STATIC_ALIGNED") &&
+        !getenv("K3_GGUF_PREFILL_STAGING") && !getenv("K3_GGUF_HEAD_STAGING");
+}
+
+static int use_gguf_file_cache(k3_context *owner) {
+    if (!owner->gguf_file_cache_span) return 0;
+    const uint64_t capacity = gguf_file_cache_capacity(owner, owner->gguf_cache_bytes);
+    const int mapped = capacity >= owner->gguf_file_cache_span;
+    const k3_static_io_mode mode = mapped ? K3_STATIC_IO_MAPPED : K3_STATIC_IO_STREAMING;
+    if (mode != owner->gguf_file_cache_mode) {
+        fprintf(stderr,
+                "k3: automatic static weights: mode=%s, span %.2f GiB, "
+                "file-cache headroom %.2f GiB\n",
+                mapped ? "mapped" : "streaming",
+                (double)owner->gguf_file_cache_span / 1073741824.0,
+                (double)capacity / 1073741824.0);
+        owner->gguf_file_cache_mode = mode;
+    }
+    return mapped;
 }
 
 static int check_gguf_memory(const k3_context *ctx, const char *phase,
@@ -3801,10 +3854,10 @@ static int matmul(ds4_gpu_tensor *out,
     }
     /* Reuse the streamed layer across a larger prefill while retaining the
      * native small-batch arithmetic for its BF16 and quantized projections.
-     * A full 128- or 256-token staged prefill can share expert reads
+     * A full 128- or 256-token streamed prefill can share expert reads
      * across its 64-token groups. Only activations are sliced; the weights stay live. */
     if (source->streamed_small_batches && rows > 8u &&
-        (rows <= 64u || rows == source->staged_prefill_rows)) {
+        (rows <= 64u || rows == source->streamed_prefill_rows)) {
         if (!source->q8 && weight->dtype == K3_ST_DTYPE_BF16 &&
             k3_gpu_can_tile_bf16_prefill(in_dim, out_dim, rows)) {
             if (!source->base || weight->offset < source->bias) return 0;
@@ -5448,12 +5501,17 @@ static int evaluate(k3_context *ctx,
             ds4_gpu_stream_expert_cache_reset_route_hotness();
         owner->gguf_prefill_hotness = prefill;
     }
-    /* Lossless prefill staging reuses the same two bounded static slots.
-     * Source offsets, expert identities and all row-dependent kernels stay
-     * unchanged; the mapped path remains the default. */
-    const int stage_static = static_staging_enabled(ctx, rows, prefill);
-    const int stage_head = output_logits &&
+    /* Select the source after previous GPU views are retired. One token or
+     * prefill chunk uses a single policy across all layers and the head. */
+    const int file_cache = use_gguf_file_cache(owner);
+    const int staging_requested = static_staging_enabled(ctx, rows, prefill);
+    const int stage_static = !file_cache && staging_requested;
+    const int stage_head = !file_cache && output_logits &&
         gguf_head_staging_enabled(ctx, rows, prefill);
+    const uint32_t streamed_prefill_rows =
+        staging_requested && prefill && ctx->static_cache && ctx->optimized_ssd_streaming &&
+        (rows == 128u || rows == 256u) &&
+        ctx->max_prefill_tokens == rows && owner->max_prefill_tokens == rows ? rows : 0u;
     const uint32_t first_layer = ctx->layer_start;
     const int first_resident =
         ctx->q8_static ||
@@ -5709,10 +5767,7 @@ static int evaluate(k3_context *ctx,
                   .q8 = ctx->q8_static ? &ctx->q8_layers[i] : NULL,
                   .streamed_small_batches = ctx->model->gguf &&
                       ds4_gpu_device_is_pre_m5_apple_silicon(),
-                  .staged_prefill_rows = staged_layer && prefill && ctx->static_cache &&
-                      ctx->optimized_ssd_streaming && (rows == 128u || rows == 256u) &&
-                      ctx->max_prefill_tokens == rows && owner->max_prefill_tokens == rows
-                      ? rows : 0u,
+                  .streamed_prefill_rows = staged_layer ? streamed_prefill_rows : 0u,
               }
             : ctx->model->gguf
             ? (k3_weight_source){
@@ -5721,6 +5776,7 @@ static int evaluate(k3_context *ctx,
                   .bias = 0,
                   .streamed_small_batches = temporary_gguf_map &&
                       ds4_gpu_device_is_pre_m5_apple_silicon(),
+                  .streamed_prefill_rows = file_cache ? streamed_prefill_rows : 0u,
               }
             : (k3_weight_source){
                   .base = k3_st_map_base(layer->shard),
@@ -5922,7 +5978,7 @@ static int evaluate(k3_context *ctx,
                     ? "q8-resident"
                     : ctx->resident_static
                     ? (ctx->static_staging ? "resident+staged" : "resident")
-                    : (stage_static ? "staged" : "mmap"),
+                    : (stage_static ? "staged" : file_cache ? "file-cache" : "mmap"),
                 pagein ? "on" : "off",
                 layer_ready_seconds,
                 layer_execute_seconds,
@@ -6177,13 +6233,21 @@ int k3_context_create(k3_context **out,
          * more experts while retaining file-cache headroom for static reads.
          * Explicit residency retains the previous 10 GiB cache preference. */
         const uint64_t physical = macos_physical_memory();
-        const uint64_t cache_target = k3_ssd_expert_cache_bytes(
+        uint64_t cache_target = k3_ssd_expert_cache_bytes(
             config->expert_cache_bytes, config->expert_cache_slots,
             ctx->optimized_ssd_streaming,
             resident_static_disabled(ctx) ? physical : 0,
             gguf_budget, ctx->gguf_transient_bytes);
         const int automatic_cache = ctx->optimized_ssd_streaming &&
             !config->expert_cache_bytes && !config->expert_cache_slots;
+        if (automatic_gguf_static_io(ctx)) {
+            ctx->gguf_file_cache_span = static_bytes;
+            if (automatic_cache) {
+                const uint64_t capacity = gguf_file_cache_capacity(ctx, 0);
+                cache_target = k3_ssd_file_cache_expert_target(cache_target,
+                    capacity, static_bytes, slot_bytes, required_slots);
+            }
+        }
         k3_memory_plan plan;
         if (!k3_plan_gguf_memory(gguf_budget, ctx->gguf_transient_bytes,
                 slot_bytes, required_slots, routed_layers * K3_N_EXPERT_USED,

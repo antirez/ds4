@@ -57,57 +57,62 @@ K3 uses its native XTML chat and tool format. Its sampling defaults are
 temperature 1, top-p 0.95, and min-p 0. Saved sessions rebuild their inference
 state by replaying the saved tokens.
 
-## SSD streaming setup for a 32 GiB M1 Max
+## Automatic SSD streaming on Apple Silicon
 
-For Kimi K3 GGUF, `--ssd-streaming` automatically selects the optimized
-streaming configuration: an expert-cache target adapted to available memory,
-prefill chunk64, aligned static reads, tiled decode output-head reads, four
-static I/O threads and no redundant expert read advice. Macs with up to 32 GiB
-retain the tested 10 GiB cache target. On larger Macs the target adds half of
-the safe capacity above 10 GiB, measured after runtime tensors, staging buffers,
-the lossless-cache workspace and memory reserves have been accounted for.
-The other half remains available for the macOS file cache and session growth;
-it is not an additional mandatory reserve. This avoids assigning all spare
-memory to locked expert pages while repeatedly reading static weights.
-Expert slabs start at 256 MiB and grow only when needed to fit the admitted
-cache within the backend's slab count; allocation remains lazy. It discovers the
-lossless sidecar beside the canonical GGUF path by replacing `.gguf` with
-`.static-zstd-v1.cache`. If that sidecar is available, both prefill and decode
-use it. The existing default host reserve remains at least 12 GiB, and all memory
-admission/live checks still apply; the expert-cache target may be reduced to
-fit available memory. The admission budget respects physical RAM, the Metal
-recommended working set and live reclaimable memory. For example, a simulated
-128 GiB machine with 88 GiB of safe capacity after buffers/reserves selects a
-49 GiB expert-cache target; this is a policy example, not a benchmark or a
-fixed 128 GiB setting. The startup log reports capacity, target and admitted
-cache separately.
+`--ssd-streaming` selects how Kimi K3 GGUF reads its static weights. Before
+each prefill chunk or decode step, ds4 checks the available RAM and macOS
+memory pressure. When pressure is normal and the complete static working set
+fits alongside the admitted expert cache, runtime buffers and memory reserves,
+Metal reads the weights directly from the GGUF mapping. The working set
+includes the static weights of the selected layers and the output weights
+when the slice owns them. macOS can cache these file-backed pages and reclaim
+them as needed.
 
-This profile continues to stream static weights, using the lossless sidecar
-when available. It does not automatically enable static residency, enlarge
-prefill chunks or resize an already running cache when other applications
-change their memory use. Existing live guards stop inference if headroom
-becomes insufficient. An explicit static-residency setting retains the prior
-10 GiB automatic expert-cache preference; explicit byte/count cache limits
-still take priority and remain bounded by admission.
+With less headroom, ds4 uses bounded staging. It discovers the lossless
+sidecar beside the canonical GGUF by replacing `.gguf` with
+`.static-zstd-v1.cache`. A compatible sidecar supplies static layer weights
+during prefill and decode. Without a sidecar or libzstd, the bounded path
+uses the original GGUF with aligned decode staging. A sidecar selected for
+loading must pass validation. The profile uses a default prefill chunk of
+64 tokens and four static I/O threads.
+
+Expert-cache capacity is set at startup. The automatic target starts at
+10 GiB, subject to admission. When the static working set fits alongside a
+full prefill batch of experts, ds4 leaves room for the file-backed pages.
+If less than 10 GiB remains for experts, the cache can shrink as far as the
+capacity needed for one batch. On larger Macs with additional headroom, ds4
+uses half the excess above 10 GiB for additional experts. Expert slabs start
+at 256 MiB and are allocated lazily.
+
+Admission accounts for live reclaimable RAM, physical RAM, the Metal
+working-set recommendation and a default host reserve of at least 12 GiB.
+A running session can switch static read paths while keeping the same
+expert-cache capacity. If headroom is too low even for bounded streaming,
+the live memory guard stops the evaluation.
 
 ```sh
 ./ds4 -m "/absolute/path/to/Kimi-K3-IQ2_XXS-Q2_K.gguf" \
   --ssd-streaming --ctx 1024 --nothink -n 64 -p "Ciao, come stai?"
 ```
 
-Explicit `--prefill-chunk`, `--ssd-streaming-cache-experts`, and environment
-settings retain priority. For example, `K3_GGUF_PREFILL_STAGING=0` disables
-only cached prefill, and `K3_GGUF_STATIC_CACHE=` disables automatic sidecar
-discovery. `K3_SSD_STREAMING_DEFAULTS=0` restores the earlier defaults while
-allowing manual tuning. Prompt, sampling, context size and diagnostic logging
-are not changed by this profile. Other model families and SafeTensors retain
-their existing behavior.
+Explicit `--prefill-chunk` and `--ssd-streaming-cache-experts` values take
+priority. Setting `K3_GGUF_STATIC_CACHE` selects manual static I/O policy.
+An absolute path selects and validates that sidecar, and an empty value
+disables sidecar discovery. Explicit static-residency or GGUF staging
+settings also retain their manual behavior. For example,
+`K3_RESIDENT_STATIC=0` requests zero resident-static budget and
+`K3_GGUF_PREFILL_STAGING=0` disables cached prefill.
+`K3_SSD_STREAMING_DEFAULTS=0` selects the legacy profile.
 
-A missing sidecar or a build without libzstd uses ordinary GGUF streaming
-with aligned decode staging; it does not create a cache automatically. A
-present invalid or incompatible cache is reported as an error. An explicit
-`K3_GGUF_STATIC_CACHE` path is always validated and never silently ignored.
-Create a sidecar once using the commands below if needed.
+To compare the automatic paths on a 128 GiB Mac, run `ds4-bench` twice with
+the same GGUF, sidecar next to the GGUF, prompt, context, chunk and token
+count. Leave the static-cache, residency, staging and profile overrides
+unset. First run at normal memory pressure, then repeat with
+`--simulate-used-memory 80GB` to reproduce the constrained case. Keep
+`--ssd-streaming-cache-experts 10GB` in both runs to isolate the static I/O
+choice. Omit it in a separate pair to test automatic expert-cache sizing.
+Report the admitted cache, chosen static path, prefill throughput, seconds per
+decode step and any admission or live-memory stop.
 
 For the original K3 mixed-Q2 GGUF, aligned static staging and tiled output-head
 reads reuse two bounded buffers. An optional lossless static cache stores
@@ -169,12 +174,10 @@ DS4_METAL_DISABLE_STREAMING_EXPERT_READAHEAD=1 K3_IO_PROFILE=1 \
 ```
 
 The command above records the earlier explicit configuration used for the
-decode measurements below. With the automatic profile enabled,
-`K3_GGUF_PREFILL_STAGING=1` is now implicit when a compatible lossless cache
-is found; it reuses the same two static buffers and decoder workspace.
-For manual configuration with `K3_SSD_STREAMING_DEFAULTS=0`, add that flag
-to enable cached prefill. Expert selection and FP32 computation retain their
-existing paths.
+decode measurements below. In the automatic profile, a prefill using the
+sidecar shares the two static buffers and decoder workspace with decode.
+For the explicit configuration above, add `K3_GGUF_PREFILL_STAGING=1` to
+enable cached prefill.
 
 An invalid cache causes an explicit error rather than a silent fallback.
 `make test-k3-static-cache` runs the CPU format and decoder fixtures.

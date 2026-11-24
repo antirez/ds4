@@ -142,6 +142,47 @@ static void test_live_reserve_regression(void) {
     CHECK(pressured == after_scratch - 2 * GIB);
 }
 
+static void test_file_cache_capacity(void) {
+    /* The process budget excludes host and runtime allocations. The live
+     * budget excludes the emergency reserve and already-wired pages. */
+    const uint64_t static_span = 844 * GIB / 10;
+    const uint64_t transient = 6 * GIB, staging = 3 * GIB, cache = 10 * GIB;
+    const uint64_t large_process = (128 - 16 - 1) * GIB;
+    const uint64_t small_process = (32 - 12 - 1) * GIB;
+    const uint64_t large_live = (112 - 4) * GIB;
+    const uint64_t small_live = (24 - 4) * GIB;
+    const uint64_t cold = k3_file_cache_capacity(large_process, large_live,
+                                                 transient, 0, cache, 0);
+    CHECK(cold == 92 * GIB && cold >= static_span);
+    CHECK(k3_file_cache_capacity(small_process, small_live, transient, 0,
+                                 cache, 0) == 3 * GIB);
+    CHECK(k3_file_cache_capacity(large_process, (48 - 4) * GIB, transient, 0,
+                                 cache, 0) == 28 * GIB);
+    CHECK(k3_file_cache_capacity(large_process, large_live - staging - cache,
+                                 transient, staging, cache, cache) == cold);
+
+    /* Exact fit and one byte below it on each independent limit. */
+    const uint64_t process = static_span + transient + cache;
+    const uint64_t warm_live = static_span + transient - staging;
+    CHECK(k3_file_cache_capacity(process, warm_live, transient, staging,
+                                 cache, cache) == static_span);
+    CHECK(k3_file_cache_capacity(process - 1, warm_live, transient, staging,
+                                 cache, cache) == static_span - 1);
+    CHECK(k3_file_cache_capacity(process, warm_live - 1, transient, staging,
+                                 cache, cache) == static_span - 1);
+    CHECK(k3_file_cache_capacity(process, warm_live, transient, staging,
+                                 cache, cache + 1) == static_span);
+
+    CHECK(k3_file_cache_capacity(UINT64_MAX, UINT64_MAX, transient,
+                                 transient + 1, cache, 0) == 0);
+    CHECK(k3_file_cache_capacity(transient + cache - 1, UINT64_MAX,
+                                 transient, staging, cache, cache) == 0);
+    CHECK(k3_file_cache_capacity(UINT64_MAX, transient - staging - 1,
+                                 transient, staging, cache, cache) == 0);
+    CHECK(k3_file_cache_capacity(UINT64_MAX, UINT64_MAX, UINT64_MAX, 0,
+                                 UINT64_MAX, 0) == 0);
+}
+
 static void test_alignment(void) {
     const uint64_t page = 16384;
     uint64_t aligned = 42;
@@ -383,6 +424,7 @@ int main(void) {
     test_step_required();
     test_available();
     test_live_reserve_regression();
+    test_file_cache_capacity();
     test_alignment();
     test_transient_peak();
     test_32gb_cache_cap();

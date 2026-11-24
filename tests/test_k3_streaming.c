@@ -193,10 +193,54 @@ static void test_adaptive_explicit_overrides(void) {
         desired, maximum, 0, tiny, 0, &plan));
 }
 
+static void test_file_cache_expert_target(void) {
+    const uint64_t span = 844 * GIB / 10, slot = UINT64_C(9289728);
+    const uint32_t required = 896;
+    const uint64_t batch = required * slot, transient = 6 * GIB;
+    /* Same 128 GiB machine and same Metal recommendation, two live samples. */
+    const uint64_t live[] = {116 * GIB, 44 * GIB};
+    for (size_t i = 0; i < sizeof(live) / sizeof(live[0]); ++i) {
+        const uint64_t budget = k3_memory_available(128 * GIB, 96 * GIB, GIB,
+            live[i] + 4 * GIB, 16 * GIB, 4 * GIB);
+        const uint64_t target = k3_ssd_expert_cache_bytes(0, 0, true, 128 * GIB,
+            budget, transient);
+        const uint64_t capacity = k3_file_cache_capacity(111 * GIB, live[i],
+            transient, 0, 0, 0);
+        const uint64_t chosen = k3_ssd_file_cache_expert_target(target,
+            capacity, span, slot, required);
+        if (i == 0) {
+            assert(chosen == 10 * GIB + (105 * GIB - span - 10 * GIB) / 2);
+            assert(chosen < target && capacity - chosen >= span);
+        } else {
+            assert(chosen == target && capacity < span);
+        }
+    }
+    /* Nine GiB spare still fits a complete batch, exceeding the minimum
+     * by less than the 10 GiB preferred target. One byte too few for a
+     * batch instead leaves the ordinary streaming policy in place. */
+    const uint64_t target = 50 * GIB;
+    assert(batch < 9 * GIB);
+    assert(k3_ssd_file_cache_expert_target(target, span + 9 * GIB, span,
+        slot, required) == batch + (9 * GIB - batch) / 2);
+    assert(k3_ssd_file_cache_expert_target(target, span + batch, span,
+        slot, required) == batch);
+    assert(k3_ssd_file_cache_expert_target(target, span + batch - 1, span,
+        slot, required) == target);
+    assert(k3_ssd_file_cache_expert_target(target, span + 10 * GIB, span,
+        slot, required) == 10 * GIB);
+    assert(k3_ssd_file_cache_expert_target(10 * GIB, 19 * GIB, span,
+        slot, required) == 10 * GIB);
+    assert(k3_ssd_file_cache_expert_target(target, UINT64_MAX, 1,
+        UINT64_MAX, 2) == target);
+    assert(k3_ssd_file_cache_expert_target(target, span, span,
+        slot, 0) == target);
+}
+
 int main(void) {
     test_adaptive_cache_policy();
     test_adaptive_memory_admission();
     test_adaptive_explicit_overrides();
+    test_file_cache_expert_target();
     const uint64_t mib = UINT64_C(1024) * 1024u;
     const uint64_t gib = mib * 1024u;
     assert(!k3_ssd_defaults_enabled(false, true, NULL));

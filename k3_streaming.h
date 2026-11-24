@@ -6,6 +6,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define K3_SSD_BASE_EXPERT_CACHE_BYTES (UINT64_C(10) << 30)
+
 /* Pure policy: the caller supplies the environment value. No process-global
  * environment changes, filesystem access, model loading or GPU calls. */
 static inline bool k3_ssd_defaults_enabled(bool requested, bool gguf,
@@ -43,11 +45,31 @@ static inline uint64_t k3_ssd_expert_cache_bytes(uint64_t bytes,
                                                uint64_t transient) {
     if (!enabled || bytes != 0 || slots != 0) return bytes;
     const uint64_t gib = UINT64_C(1024) * 1024u * 1024u;
-    const uint64_t base = 10u * gib;
+    const uint64_t base = K3_SSD_BASE_EXPERT_CACHE_BYTES;
     const uint64_t usable = budget > transient ? budget - transient : 0;
     if (physical <= 32u * gib || usable <= base) return base;
     /* Subtract before adding so even a UINT64_MAX budget cannot overflow. */
     return base + (usable - base) / 2u;
+}
+
+/* Leave room for the whole static working set and one simultaneous expert
+ * batch. Prefer the usual 10 GiB cache if it fits, then share additional
+ * headroom between experts and other work. Below 10 GiB share the headroom
+ * above the batch minimum instead. */
+static inline uint64_t k3_ssd_file_cache_expert_target(uint64_t target,
+                                                       uint64_t capacity,
+                                                       uint64_t static_bytes,
+                                                       uint64_t slot_bytes,
+                                                       uint32_t required_slots) {
+    const uint64_t base = K3_SSD_BASE_EXPERT_CACHE_BYTES;
+    if (!target || !required_slots || !slot_bytes || !static_bytes || capacity < static_bytes)
+        return target;
+    const uint64_t spare = capacity - static_bytes;
+    if (required_slots > spare / slot_bytes) return target;
+    const uint64_t minimum = required_slots * slot_bytes;
+    const uint64_t floor = spare >= base && minimum < base ? base : minimum;
+    const uint64_t adjusted = floor + (spare - floor) / 2u;
+    return adjusted < target ? adjusted : target;
 }
 
 /* Preserve the existing Metal slab parser for every explicit value, including

@@ -15,6 +15,24 @@ static inline uint64_t k3_memory_remaining(uint64_t budget, uint64_t used) {
     return budget > used ? budget - used : 0;
 }
 
+/* File-backed weights can remain in the OS cache between temporary Metal
+ * views. The live snapshot already excludes wired pages, whereas the physical
+ * ceiling must include the full admitted cache and both staging buffers. */
+static inline uint64_t k3_file_cache_capacity(uint64_t process_budget,
+                                              uint64_t live_budget,
+                                              uint64_t transient,
+                                              uint64_t locked_staging,
+                                              uint64_t experts,
+                                              uint64_t locked_experts) {
+    if (locked_staging > transient) return 0;
+    const uint64_t process = k3_memory_remaining(
+        k3_memory_remaining(process_budget, transient), experts);
+    const uint64_t live = k3_memory_remaining(
+        k3_memory_remaining(live_budget, transient - locked_staging),
+        k3_memory_remaining(experts, locked_experts));
+    return process < live ? process : live;
+}
+
 static inline int k3_memory_step_required(uint64_t transient,
                                          uint64_t cache_budget,
                                          uint64_t locked_cache,

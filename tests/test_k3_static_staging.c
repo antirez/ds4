@@ -22,6 +22,7 @@ static const char *policy_env_names[] = {
     "K3_GGUF_PREFILL_STAGING", "K3_GGUF_HEAD_STAGING",
     "K3_STATIC_IO_THREADS", "K3_GGUF_STATIC_CACHE",
     "K3_RESIDENT_STATIC", "K3_RESIDENT_STATIC_GIB", "K3_GGUF_RESIDENT",
+    "K3_DISABLE_GGUF_STATIC_RESIDENCY",
 };
 #define POLICY_ENV_COUNT (sizeof(policy_env_names) / sizeof(policy_env_names[0]))
 
@@ -55,6 +56,7 @@ static void test_streaming_option_resolution(void) {
     assert(!ctx.gguf_static_aligned && !ctx.gguf_prefill_staging);
     assert(!ctx.gguf_head_staging && context_static_io_threads(&ctx) == 16u);
     assert(!resident_static_disabled(&ctx));
+    assert(!automatic_gguf_static_io(&ctx));
     resolve_gguf_streaming_options(&ctx, true);
     assert(ctx.optimized_ssd_streaming && ctx.gguf_staging_requested);
     assert(ctx.gguf_static_aligned && ctx.gguf_prefill_staging);
@@ -63,6 +65,15 @@ static void test_streaming_option_resolution(void) {
     for (size_t i=0; i<POLICY_ENV_COUNT; i++)
         assert(getenv(policy_env_names[i]) == NULL);
 
+    assert(automatic_gguf_static_io(&ctx));
+    for (size_t i = 0; i < POLICY_ENV_COUNT; i++) {
+        /* An explicit static source or residency option wins even when empty.
+         * Tuning the I/O worker count remains independent of this choice. */
+        assert(setenv(policy_env_names[i], "", 1) == 0);
+        assert(automatic_gguf_static_io(&ctx) ==
+               (strcmp(policy_env_names[i], "K3_STATIC_IO_THREADS") == 0));
+        assert(unsetenv(policy_env_names[i]) == 0);
+    }
     const char *values[] = {"", "0", "1"};
     for (size_t i=0; i<4u; i++) {
         for (size_t v=0; v<sizeof(values)/sizeof(values[0]); v++) {
