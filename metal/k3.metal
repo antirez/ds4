@@ -375,19 +375,21 @@ template [[host_name("kernel_k3_mul_mv_bf16_f32_rows8")]]
 kernel k3_mul_mv_bf16_rows_t kernel_k3_mul_mv_bf16_f32_rows<8>;
 
 
-/* Adjacent threadgroups read the same output-channel weights for independent
- * blocks of eight tokens. Each lane keeps its original input positions. */
-kernel void kernel_k3_bf16_prefill_tiles(
+/* Neighboring threadgroups reuse weights across four token tiles. Short
+ * prefills use a 4x4 tile to reuse more activations per input load. */
+template<uint tokens, uint channels>
+kernel void k3_bf16_prefill_tiles(
         constant k3_matmul_args &args, device const ushort *weights,
         device const float *x, device float *out,
         uint2 group [[threadgroup_position_in_grid]],
         ushort lane [[thread_index_in_simdgroup]],
         ushort simd [[simdgroup_index_in_threadgroup]],
         ushort simd_count [[simdgroups_per_threadgroup]]) {
-    constexpr uint token_groups = 4, channels = 2;
+    constexpr uint token_groups = 4;
     const uint first_channel = ((group.x / token_groups) * simd_count + simd) * channels;
-    const uint first_token = (group.y * token_groups + group.x % token_groups) * 8u;
-    float sums[8][channels] = {};
+    const uint first_token = (group.y * token_groups + group.x % token_groups) * tokens;
+    if (tokens == 4u && first_token >= args.n_rows) return;
+    float sums[tokens][channels] = {};
     for (uint k = lane; k < args.in_dim; k += 128u) {
         float w[channels][4];
         #pragma unroll
@@ -397,7 +399,7 @@ kernel void kernel_k3_bf16_prefill_tiles(
             for (uint j = 0; j < 4; j++) w[col][j] = k3_bf16_to_f32(wc[j * 32u]);
         }
         #pragma unroll
-        for (uint r = 0; r < 8; r++) {
+        for (uint r = 0; r < tokens; r++) {
             device const float *in = x + (ulong)(first_token + r) * args.in_dim + k;
             #pragma unroll
             for (uint j = 0; j < 4; j++) {
@@ -408,7 +410,7 @@ kernel void kernel_k3_bf16_prefill_tiles(
         }
     }
     #pragma unroll
-    for (uint r = 0; r < 8; r++) {
+    for (uint r = 0; r < tokens; r++) {
         #pragma unroll
         for (uint col = 0; col < channels; col++) {
             float sum = simd_sum(sums[r][col]);
@@ -416,6 +418,12 @@ kernel void kernel_k3_bf16_prefill_tiles(
         }
     }
 }
+typedef decltype(k3_bf16_prefill_tiles<8,2>) k3_bf16_prefill_tiles_t;
+template [[host_name("kernel_k3_bf16_prefill_tiles")]]
+kernel k3_bf16_prefill_tiles_t k3_bf16_prefill_tiles<8,2>;
+template [[host_name("kernel_k3_bf16_prefill_tiles4x4")]]
+kernel k3_bf16_prefill_tiles_t k3_bf16_prefill_tiles<4,4>;
+
 /* Reuse the same FP32 arithmetic for four independent QKVG projections. */
 template <ushort rows_per_group>
 kernel void kernel_k3_mul_mv4_bf16_f32_rows(

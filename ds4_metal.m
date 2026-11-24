@@ -438,6 +438,7 @@ static int16_t g_mxfp4_mv_nxpsg;
 static int16_t g_k3_bf16_mv_unroll = 16;
 static int16_t g_k3_bf16_mv_nsg = 4;
 static bool g_k3_experimental_decode_kernels;
+static bool g_k3_experimental_prefill_kernels;
 static int g_k3_fused_qkvg = 1;
 static int g_k3_router_mode = 3;
 static uint16_t g_k3_router_rank_threads = 896;
@@ -7202,6 +7203,8 @@ typedef struct {
  * while long-context prefill and decode can still pick specialized variants. */
 int ds4_gpu_init(void) {
     if (g_initialized) return 1;
+    const char *prefill_kernels = getenv("K3_EXPERIMENTAL_PREFILL_KERNELS");
+    g_k3_experimental_prefill_kernels = prefill_kernels && strcmp(prefill_kernels, "1") == 0;
     const char *decode_kernels = getenv("K3_EXPERIMENTAL_DECODE_KERNELS");
     g_k3_experimental_decode_kernels = decode_kernels && strcmp(decode_kernels, "1") == 0;
     const char *k3_bf16_unroll = getenv("K3_BF16_MV_UNROLL");
@@ -51908,7 +51911,8 @@ int k3_gpu_matmul_q8_0_tensor(
 bool k3_gpu_can_tile_bf16_prefill(uint32_t in_dim, uint32_t out_dim, uint32_t rows) {
     return g_ssd_streaming_mode && g_k3_bf16_mv_unroll == 16 && g_k3_bf16_mv_nsg == 4 &&
         ds4_gpu_device_is_pre_m5_apple_silicon() && ds4_gpu_device_name_contains("Apple M1 Max") &&
-        rows == 256u &&
+        (rows == 256u || (g_k3_experimental_prefill_kernels &&
+                          rows >= 16u && rows <= 64u && rows % 4u == 0u)) &&
         ((in_dim == 7168u && out_dim == 12288u) ||
             (in_dim == 12288u && out_dim == 7168u) ||
             (in_dim == 1536u && out_dim == 18432u));
@@ -51990,10 +51994,11 @@ static int k3_gpu_matmul_bf16_impl(
                 (in_dim == 1536u && out_dim == 18432u);
             const bool vector_decode = vector_shape &&
                 k3_gpu_can_vec8_decode(m1_default, n_rows, x, weight_inner);
+            const bool short_tile = tiled && n_rows <= 64u;
             if (vector_decode) {
                 kernel = "kernel_k3_bf16_decode_vec8";
             } else if (tiled) {
-                kernel = "kernel_k3_bf16_prefill_tiles";
+                kernel = short_tile ? "kernel_k3_bf16_prefill_tiles4x4" : "kernel_k3_bf16_prefill_tiles";
             } else if (rows_per_group == 8u) {
                 kernel = "kernel_k3_mul_mv_bf16_f32_rows8";
             } else if (rows_per_group == 4u) {
@@ -52023,9 +52028,10 @@ static int k3_gpu_matmul_bf16_impl(
             [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
             const NSUInteger nsg = vector_decode ? 2u : (NSUInteger)g_k3_bf16_mv_nsg;
             const NSUInteger channels_per_group = nsg * (vector_decode ? 8u : 1u);
-            const NSUInteger output_groups = tiled ? ((NSUInteger)out_dim / (nsg * 2u)) * 4u :
+            const NSUInteger tile_channels = short_tile ? 4u : 2u;
+            const NSUInteger output_groups = tiled ? ((NSUInteger)out_dim / (nsg * tile_channels)) * 4u :
                 ((NSUInteger)out_dim + channels_per_group - 1u) / channels_per_group;
-            const NSUInteger token_tile = tiled ? 8u * 4u : rows_per_group;
+            const NSUInteger token_tile = tiled ? (short_tile ? 4u : 8u) * 4u : rows_per_group;
             [enc dispatchThreadgroups:MTLSizeMake(output_groups,
                     ((NSUInteger)n_rows + token_tile - 1u) / token_tile, 1)
                 threadsPerThreadgroup:MTLSizeMake(

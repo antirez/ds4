@@ -107,7 +107,17 @@ static int test_shape(uint32_t in_dim, uint32_t out_dim) {
     CHECK(ds4_gpu_set_model_map_spans(mapping, mapping_size,
         &weight_offset, &weight_size, 1, weight_size));
 
-    for (uint32_t rows = tiled ? max_rows : 1u; rows <= max_rows; rows++) {
+    const char *prefill_setting = getenv("K3_EXPERIMENTAL_PREFILL_KERNELS");
+    const bool short_tiles = prefill_setting && strcmp(prefill_setting, "1") == 0;
+    const uint32_t tile_rows[] = {16, 44, 64, 256};
+    CHECK(!k3_gpu_can_tile_bf16_prefill(in_dim, out_dim, 45));
+    const uint32_t cases = tiled ? sizeof(tile_rows) / sizeof(tile_rows[0]) : max_rows;
+    for (uint32_t i = 0; i < cases; ++i) {
+        const uint32_t rows = tiled ? tile_rows[i] : i + 1u;
+        if (tiled && rows != 256u) {
+            CHECK(k3_gpu_can_tile_bf16_prefill(in_dim, out_dim, rows) == short_tiles);
+            if (!short_tiles) continue;
+        }
         memset(actual, 0xa5, (size_t)output_size);
         CHECK(ds4_gpu_tensor_write(output_base, 0, actual, output_size));
         CHECK(ds4_gpu_tensor_write(reference_base, 0, actual, output_size));

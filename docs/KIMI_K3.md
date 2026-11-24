@@ -133,6 +133,16 @@ embeddings and the output head. The cache is tied to that file's identity,
 size and timestamps; the loader checks header/index CRCs and each decoded
 block's CRC, and rejects changed or corrupt data.
 
+For short prefill A/B tests on an M1 Max, set
+`K3_EXPERIMENTAL_PREFILL_KERNELS=1` with `--ssd-streaming`. This enables a
+BF16 kernel that processes four tokens and four output channels at a time for
+supported projections with 16 to 64 rows in multiples of four. The switch
+defaults to off. In a 44-token prefill with a 10 GiB expert cache and the
+lossless sidecar, GPU time for the 417 affected projections fell from 4.16 to
+2.25 seconds. Full prefill took 141.69 and 102.93 seconds for the reference
+and trial. With the trial run first, it took 138.47 seconds and the reference
+took 111.39. All compared FP32 logits matched bit for bit.
+
 For decode kernel A/B tests on an M1 Max, set
 `K3_EXPERIMENTAL_DECODE_KERNELS=1` with `--ssd-streaming` to try the
 single-token BF16 projections and the Q2_K and masked IQ2_XXS expert kernels.
