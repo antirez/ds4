@@ -4212,7 +4212,8 @@ kernel void kernel_mul_mv_addr_iq2_xxs_f32(
         sgitg);
 }
 
-kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_masked_f32(
+template<bool expanded>
+kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_masked(
         constant ds4_metal_args_mul_mv_id & args,
         constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
         constant ds4_metal_stream_expert_split_args & split,
@@ -4267,7 +4268,8 @@ kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_masked_f32(
         args.ne0, 1, args.nr0, 1, 1,
     };
 
-    kernel_mul_mv_iq2_xxs_pair_f32_impl<N_R0_IQ2_XXS>(
+    threadgroup half4 magnitudes[expanded ? 512 : 1];
+    kernel_mul_mv_iq2_xxs_pair_f32_impl<N_R0_IQ2_XXS, expanded>(
         args0,
         src0_gate_cur,
         src0_up_cur,
@@ -4277,7 +4279,8 @@ kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_masked_f32(
         shmem,
         tgpig,
         tiisg,
-        sgitg);
+        sgitg,
+        magnitudes);
 
     const short NSG = FC_mul_mv_nsg;
     const int first_row = (tgpig.x * NSG + sgitg) * N_R0_IQ2_XXS;
@@ -4299,6 +4302,12 @@ kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_masked_f32(
 
     (void)tiitg;
 }
+
+typedef decltype(kernel_mul_mv_addr_iq2_xxs_pair_swiglu_masked<false>) k3_masked_iq2_t;
+template [[host_name("kernel_mul_mv_addr_iq2_xxs_pair_swiglu_masked_f32")]]
+kernel k3_masked_iq2_t kernel_mul_mv_addr_iq2_xxs_pair_swiglu_masked<false>;
+template [[host_name("kernel_k3_decode_masked_iq2_expanded")]]
+kernel k3_masked_iq2_t kernel_mul_mv_addr_iq2_xxs_pair_swiglu_masked<true>;
 
 kernel void kernel_stream_expert_cache_validate(
         constant ds4_metal_stream_expert_validate_args & args,
@@ -6195,7 +6204,8 @@ kernel void kernel_mul_mv_slots6_q2_K_sum6_f32(
     (void)tgpig;
 }
 
-kernel void kernel_mul_mv_addr_q2_K_sum6_f32(
+template<bool k3_decode>
+kernel void kernel_mul_mv_addr_q2_K_sum6(
         constant ds4_metal_args_mul_mv_id & args,
         device const uint64_t * addrs,
         device const char * src1,
@@ -6223,12 +6233,25 @@ kernel void kernel_mul_mv_addr_q2_K_sum6_f32(
     const short ir = it % 4;
     const short is = (8 * ir) / 16;
 
-    for (int expert_slot = 0; expert_slot < args.nei0; expert_slot++) {
-        const int32_t expert = token_ids[expert_slot];
-        if (expert < 0 || expert >= args.ne02 || expert >= 1024) {
-            continue;
+    // The 16 routed slots fit in one SIMDgroup. Each lane loads one address
+    // and broadcasts it when that slot contributes to the ordered reduction.
+    ulong lane_address = 0;
+    if (k3_decode && tiisg < 16) {
+        const int expert = token_ids[tiisg];
+        if (expert >= 0 && expert < args.ne02 && expert < 1024) lane_address = addrs[expert];
+    }
+    const int slots = k3_decode ? 16 : args.nei0;
+    for (int expert_slot = 0; expert_slot < slots; expert_slot++) {
+        ulong addr;
+        if (k3_decode) {
+            const uint2 words = as_type<uint2>(lane_address);
+            addr = as_type<ulong>(uint2(simd_broadcast(words.x, expert_slot),
+                                        simd_broadcast(words.y, expert_slot)));
+        } else {
+            const int expert = token_ids[expert_slot];
+            if (expert < 0 || expert >= args.ne02 || expert >= 1024) continue;
+            addr = addrs[expert];
         }
-        const uint64_t addr = addrs[(uint)expert];
         if (addr == 0) {
             continue;
         }
@@ -6239,7 +6262,7 @@ kernel void kernel_mul_mv_addr_q2_K_sum6_f32(
         device const float *y = (device const float *)(token_src1 + expert_slot * args.nb11);
         device const float *y4 = y + ix * QK_K + 128 * iq + 8 * ir;
 
-        for (int ib = ix; ib < nb; ib += 4) {
+        for (int ib = ix; ib < (k3_decode ? 12 : nb); ib += 4) {
             float yl[32];
             float4 sumy = {0.f, 0.f, 0.f, 0.f};
             for (short i = 0; i < 8; ++i) {
@@ -6254,7 +6277,7 @@ kernel void kernel_mul_mv_addr_q2_K_sum6_f32(
             device const half     *dh = &x[ib].d;
 
             for (short row = 0; row < nr0; row++) {
-                if (first_row + row < args.ne0) {
+                if (k3_decode || first_row + row < args.ne0) {
                     float4 acc1 = {0.f, 0.f, 0.f, 0.f};
                     float4 acc2 = {0.f, 0.f, 0.f, 0.f};
                     for (int i = 0; i < 8; i += 2) {
@@ -6285,7 +6308,7 @@ kernel void kernel_mul_mv_addr_q2_K_sum6_f32(
     }
 
     device float * dst_f32 = (device float *)(dst + (uint64_t)token * args.nb1);
-    for (int row = 0; row < nr0 && first_row + row < args.ne0; row++) {
+    for (int row = 0; row < nr0 && (k3_decode || first_row + row < args.ne0); row++) {
         const float sum_all = simd_sum(sumf[row]);
         if (tiisg == 0) dst_f32[first_row + row] = sum_all;
     }
@@ -6294,6 +6317,12 @@ kernel void kernel_mul_mv_addr_q2_K_sum6_f32(
     (void)tiitg;
     (void)tgpig;
 }
+
+typedef decltype(kernel_mul_mv_addr_q2_K_sum6<false>) k3_q2_route_t;
+template [[host_name("kernel_mul_mv_addr_q2_K_sum6_f32")]]
+kernel k3_q2_route_t kernel_mul_mv_addr_q2_K_sum6<false>;
+template [[host_name("kernel_k3_q2_down_decode_f32")]]
+kernel k3_q2_route_t kernel_mul_mv_addr_q2_K_sum6<true>;
 
 kernel void kernel_mul_mv_addr_q2_K_sum6_masked_f32(
         constant ds4_metal_args_mul_mv_id & args,

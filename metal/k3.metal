@@ -528,6 +528,90 @@ kernel void kernel_k3_mul_mv4_bf16_f32_unroll8(
     }
 }
 
+static inline void k3_bf16_decode_vec8(
+        device const ushort *weights,
+        device const float *x,
+        device float *out,
+        uint width, uint simd_index, ushort lane) {
+    // Each group of four lanes reads one channel in eight-value vectors.
+    // Keep the original 32 independent FMA chains until the final reduction.
+    constexpr uint channels = 8u;
+    const uint output_base = simd_index * channels;
+    const uint output_channel = output_base + lane / 4u;
+    const uint input_start = (lane % 4u) * 8u;
+    device const ushort4 *w = (device const ushort4 *)(
+        weights + (ulong)output_channel * width + input_start);
+    device const float4 *input = (device const float4 *)(x + input_start);
+
+    float4 partial[2] = {};
+    for (uint k = 0; k < width / 4u; k += 16u) {
+        #pragma unroll
+        for (ushort block = 0; block < 2; ++block) {
+            #pragma unroll
+            for (ushort half_index = 0; half_index < 2; ++half_index) {
+                const uint i = k + block * 8u + half_index;
+                const float4 weight = as_type<float4>(uint4(w[i]) << 16u);
+                partial[half_index] = fma(weight, input[i], partial[half_index]);
+            }
+        }
+    }
+
+    // Restore the reference SIMD lane order for each of the eight channels.
+    #pragma unroll
+    for (ushort channel = 0; channel < channels; ++channel) {
+        const ushort source = channel * 4u + lane / 8u;
+        const float4 low = simd_shuffle(partial[0], source);
+        const float4 high = simd_shuffle(partial[1], source);
+        const float4 values = (lane & 4u) ? high : low;
+        const float sum = simd_sum(values[lane & 3u]);
+        if (lane == 0u) out[output_base + channel] = sum;
+    }
+}
+
+kernel void kernel_k3_bf16_decode_vec8(
+        constant k3_matmul_args &args,
+        device const ushort     *weights,
+        device const float      *x,
+        device float            *out,
+        uint2 tgpig [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]],
+        ushort nsg [[simdgroups_per_threadgroup]]) {
+    k3_bf16_decode_vec8(weights, x, out, args.in_dim, tgpig.x * nsg + sg, lane);
+}
+
+kernel void kernel_k3_qkvg_decode_vec8(
+        constant k3_matmul_args &args,
+        device const ushort     *weights0,
+        device const ushort     *weights1,
+        device const ushort     *weights2,
+        device const ushort     *weights3,
+        device const float      *x,
+        device float            *out0,
+        device float            *out1,
+        device float            *out2,
+        device float            *out3,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]],
+        ushort nsg [[simdgroups_per_threadgroup]]) {
+    const uint matrix = tgpig.z;
+    device const ushort *weights = weights0;
+    device float *out = out0;
+    if (matrix == 1u) {
+        weights = weights1;
+        out = out1;
+    } else if (matrix == 2u) {
+        weights = weights2;
+        out = out2;
+    } else if (matrix == 3u) {
+        weights = weights3;
+        out = out3;
+    }
+
+    k3_bf16_decode_vec8(weights, x, out, 7168u, tgpig.x * nsg + sg, lane);
+}
+
 kernel void kernel_k3_mul_mv4_bf16_f32_unroll16(
         constant k3_matmul_args &args,
         device const ushort     *weights0,

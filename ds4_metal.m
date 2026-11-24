@@ -437,6 +437,7 @@ static int16_t g_mxfp4_mv_nsg = 2;
 static int16_t g_mxfp4_mv_nxpsg;
 static int16_t g_k3_bf16_mv_unroll = 16;
 static int16_t g_k3_bf16_mv_nsg = 4;
+static bool g_k3_experimental_decode_kernels;
 static int g_k3_fused_qkvg = 1;
 static int g_k3_router_mode = 3;
 static uint16_t g_k3_router_rank_threads = 896;
@@ -7201,6 +7202,8 @@ typedef struct {
  * while long-context prefill and decode can still pick specialized variants. */
 int ds4_gpu_init(void) {
     if (g_initialized) return 1;
+    const char *decode_kernels = getenv("K3_EXPERIMENTAL_DECODE_KERNELS");
+    g_k3_experimental_decode_kernels = decode_kernels && strcmp(decode_kernels, "1") == 0;
     const char *k3_bf16_unroll = getenv("K3_BF16_MV_UNROLL");
     if (k3_bf16_unroll && k3_bf16_unroll[0]) {
         const int value = atoi(k3_bf16_unroll);
@@ -10608,6 +10611,7 @@ int ds4_gpu_commit_and_wait_selected_readback(uint64_t event_value, const char *
         g_batch_cb = ds4_gpu_new_command_buffer();
         g_batch_has_work = NO;
         if (g_batch_cb) ds4_gpu_stream_expert_cache_note_batch_created();
+        ds4_gpu_timeline_attach(g_batch_cb);
         if (!g_batch_cb) {
             (void)ds4_gpu_wait_pending_command_buffers(what);
             [g_transient_buffers removeAllObjects];
@@ -11878,6 +11882,7 @@ static int ds4_gpu_signal_batch_and_wait_event(const char *label) {
         g_batch_cb = ds4_gpu_new_command_buffer();
         g_batch_has_work = NO;
         if (g_batch_cb) ds4_gpu_stream_expert_cache_note_batch_created();
+        ds4_gpu_timeline_attach(g_batch_cb);
         if (!g_batch_cb) {
             (void)ds4_gpu_wait_pending_command_buffers(label ? label : "selected-id readback");
             [g_transient_buffers removeAllObjects];
@@ -33568,6 +33573,14 @@ static int ds4_gpu_encode_mul_mv_addr_q2_sum6(
     const NSUInteger rows_per_group = (NSUInteger)args->nr0 * nsg;
     const NSUInteger row_groups = ((NSUInteger)args->ne01 + rows_per_group - 1u) / rows_per_group;
 
+    if (g_k3_experimental_decode_kernels && g_ssd_streaming_mode &&
+        args->ne00 == 3072 && args->ne01 == 3584 && args->ne0 == 3584 &&
+        args->ne02 == 896 && args->nei0 == 16 && args->nei1 == 1 && args->nr0 == 4 &&
+        nsg == 2 && ds4_gpu_device_name_contains("Apple M1 Max")) {
+        id<MTLComputePipelineState> scalar =
+            ds4_gpu_get_mul_mv_pipeline("kernel_k3_q2_down_decode_f32", 2);
+        if (scalar && scalar.maxTotalThreadsPerThreadgroup >= 64) pipeline = scalar;
+    }
     id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
     [enc setComputePipelineState:pipeline];
     [enc setBytes:args length:sizeof(*args) atIndex:0];
@@ -33654,6 +33667,17 @@ static int ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu_masked(
     const NSUInteger row_groups = ((NSUInteger)args->ne01 + rows_per_group - 1u) / rows_per_group;
     const NSUInteger pairs = (NSUInteger)args->nei0 * (NSUInteger)args->nei1;
 
+    if (g_k3_experimental_decode_kernels && g_ssd_streaming_mode &&
+        act->activation_kind == 1u && args->ne00 == 3584 && args->ne01 == 3072 &&
+        args->nei0 == 16 && args->nei1 == 1 && args->nr0 == 4 && nsg == 2 &&
+        !rows_per_group_is_nr0 && ds4_gpu_device_name_contains("Apple M1 Max")) {
+        id<MTLComputePipelineState> expanded =
+            ds4_gpu_get_mul_mv_pipeline("kernel_k3_decode_masked_iq2_expanded", 2);
+        if (expanded && expanded.maxTotalThreadsPerThreadgroup >= 64 &&
+            expanded.staticThreadgroupMemoryLength + threadgroup_bytes <= g_device.maxThreadgroupMemoryLength) {
+            pipeline = expanded;
+        }
+    }
     id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
     [enc setComputePipelineState:pipeline];
     [enc setBytes:args  length:sizeof(*args)  atIndex:0];
@@ -51890,6 +51914,13 @@ bool k3_gpu_can_tile_bf16_prefill(uint32_t in_dim, uint32_t out_dim, uint32_t ro
             (in_dim == 1536u && out_dim == 18432u));
 }
 
+static bool k3_gpu_can_vec8_decode(bool m1_default, uint32_t rows,
+                                    const ds4_gpu_tensor *x, uint64_t weight_offsets) {
+    return g_k3_experimental_decode_kernels && rows == 1u && m1_default && g_ssd_streaming_mode &&
+        g_k3_bf16_mv_nsg == 4 && ds4_gpu_device_name_contains("Apple M1 Max") &&
+        (ds4_gpu_tensor_offset(x) & 15u) == 0u && (weight_offsets & 7u) == 0u;
+}
+
 static int k3_gpu_matmul_bf16_impl(
         ds4_gpu_tensor       *out,
         const void           *model_map,
@@ -51953,7 +51984,15 @@ static int k3_gpu_matmul_bf16_impl(
                         : (g_k3_bf16_mv_unroll == 4
                             ? "kernel_k3_mul_mv_bf16_f32_unroll4"
                             : "kernel_k3_mul_mv_bf16_f32"));
-            if (tiled) {
+            const bool vector_shape =
+                (in_dim == 7168u && (out_dim == 12288u || out_dim == 32768u)) ||
+                (in_dim == 12288u && out_dim == 7168u) ||
+                (in_dim == 1536u && out_dim == 18432u);
+            const bool vector_decode = vector_shape &&
+                k3_gpu_can_vec8_decode(m1_default, n_rows, x, weight_inner);
+            if (vector_decode) {
+                kernel = "kernel_k3_bf16_decode_vec8";
+            } else if (tiled) {
                 kernel = "kernel_k3_bf16_prefill_tiles";
             } else if (rows_per_group == 8u) {
                 kernel = "kernel_k3_mul_mv_bf16_f32_rows8";
@@ -51982,14 +52021,15 @@ static int k3_gpu_matmul_bf16_impl(
             [enc setBuffer:weightbuf offset:(NSUInteger)weight_inner atIndex:1];
             [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
             [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
-            const NSUInteger nsg = (NSUInteger)g_k3_bf16_mv_nsg;
+            const NSUInteger nsg = vector_decode ? 2u : (NSUInteger)g_k3_bf16_mv_nsg;
+            const NSUInteger channels_per_group = nsg * (vector_decode ? 8u : 1u);
             const NSUInteger output_groups = tiled ? ((NSUInteger)out_dim / (nsg * 2u)) * 4u :
-                ((NSUInteger)out_dim + nsg - 1u) / nsg;
+                ((NSUInteger)out_dim + channels_per_group - 1u) / channels_per_group;
             const NSUInteger token_tile = tiled ? 8u * 4u : rows_per_group;
             [enc dispatchThreadgroups:MTLSizeMake(output_groups,
                     ((NSUInteger)n_rows + token_tile - 1u) / token_tile, 1)
                 threadsPerThreadgroup:MTLSizeMake(
-                    32u * (NSUInteger)g_k3_bf16_mv_nsg, 1, 1)];
+                    32u * nsg, 1, 1)];
             ds4_gpu_end_compute_encoder(cb, enc);
             return ds4_gpu_finish_command_buffer(
                 cb, owned, "K3 BF16 matrix-vector multiply");
@@ -52123,6 +52163,10 @@ int k3_gpu_matmul4_bf16(
                (n_rows == 1u && m1_default && large_shape && wide_grid))
                 ? "kernel_k3_mul_mv4_bf16_f32_unroll8"
                 : "kernel_k3_mul_mv4_bf16_f32_unroll16";
+        const bool vector_decode = in_dim == 7168u && out_dim == 12288u &&
+            k3_gpu_can_vec8_decode(m1_default, n_rows, x,
+                weight_inners[0] | weight_inners[1] | weight_inners[2] | weight_inners[3]);
+        if (vector_decode) kernel = "kernel_k3_qkvg_decode_vec8";
         id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(kernel);
         if (!pipeline) return 0;
 
@@ -52149,14 +52193,12 @@ int k3_gpu_matmul4_bf16(
                     offset:ds4_gpu_tensor_offset(outputs[i])
                    atIndex:6u + i];
         }
+        const NSUInteger nsg = vector_decode ? 2u : (NSUInteger)g_k3_bf16_mv_nsg;
+        const NSUInteger channels_per_group = nsg * (vector_decode ? 8u : 1u);
         [enc dispatchThreadgroups:MTLSizeMake(
-                ((NSUInteger)out_dim +
-                 (NSUInteger)g_k3_bf16_mv_nsg - 1u) /
-                    (NSUInteger)g_k3_bf16_mv_nsg,
-                (n_rows + rows_per_group - 1u) / rows_per_group,
-                4u)
-            threadsPerThreadgroup:MTLSizeMake(
-                32u * (NSUInteger)g_k3_bf16_mv_nsg, 1, 1)];
+                ((NSUInteger)out_dim + channels_per_group - 1u) / channels_per_group,
+                (n_rows + rows_per_group - 1u) / rows_per_group, 4u)
+            threadsPerThreadgroup:MTLSizeMake(32u * nsg, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         return ds4_gpu_finish_command_buffer(
             cb, owned, "K3 fused QKVG BF16 matrix-vector multiply");

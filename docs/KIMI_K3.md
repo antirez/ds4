@@ -133,6 +133,14 @@ embeddings and the output head. The cache is tied to that file's identity,
 size and timestamps; the loader checks header/index CRCs and each decoded
 block's CRC, and rejects changed or corrupt data.
 
+For decode kernel A/B tests on an M1 Max, set
+`K3_EXPERIMENTAL_DECODE_KERNELS=1` with `--ssd-streaming` to try the
+single-token BF16 projections and the Q2_K and masked IQ2_XXS expert kernels.
+The switch defaults to off. On the 32 GiB M1 Max with a 10 GiB expert cache
+and the lossless sidecar, the eight-step reference and experimental runs took
+29.40 and 34.74 s/token. Reversing the order for four steps gave 38.25 and
+36.60 s/token respectively. All compared FP32 logits matched bit for bit.
+
 A reproducible short generation check uses a 10 GiB expert cache, a 12 GiB
 host reserve, and approximately 131 MiB of additional decoder workspace
 accounted for before allocation. All existing memory checks remain active.
