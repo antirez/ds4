@@ -5508,6 +5508,241 @@ cleanup:
     ds4_tokens_free(&pattern);
 }
 
+/* GLM-5.3 MTP reject replay must leave the same state as the legacy
+ * restore + full re-forward, not just the same visible tokens.  The two
+ * paths reach the kept row through different kernels (batched verify rows
+ * vs single-token decode), so the comparison is per payload segment and
+ * by tolerance; a stale indexer tail or a pool completed on one instead
+ * substitutes a whole wrong row.  A third run with the pool replay
+ * poisoned must fail the same comparison: that proves both that the replay
+ * path really ran and that the thresholds can see the failure. */
+enum {
+    GLM53_REPLAY_CYCLES = 32,
+    GLM53_REPLAY_POOL = 4,
+    GLM53_SEG_LOGITS = 0,
+    GLM53_SEG_KDA_CONV,
+    GLM53_SEG_KDA_STATE,
+    GLM53_SEG_KV,
+    GLM53_SEG_POOL,
+    GLM53_SEG_TAIL,
+    GLM53_SEG_COUNT,
+};
+
+typedef struct {
+    ds4_session_snapshot snap;
+    int accepted[GLM53_REPLAY_CYCLES * 2];
+    int total;
+    int prompt_len;
+    int rejects[GLM53_REPLAY_POOL];     /* by pos % pool size */
+} glm53_replay_run;
+
+typedef struct {
+    double err2;
+    double ref2;
+    float max_abs;
+    bool nonfinite;
+} glm53_replay_seg;
+
+static bool glm53_replay_run_cycles(ds4_engine *engine, const char *replay,
+                                    glm53_replay_run *run) {
+    ds4_tokens prompt = {0};
+    ds4_session *s = NULL;
+    char err[160] = {0};
+    bool ok = false;
+    setenv("DS4_GLM53_MTP_REPLAY", replay, 1);
+    ds4_chat_begin(engine, &prompt);
+    ds4_chat_append_message(engine, &prompt, "user",
+                            "Describe the life cycle of a frog in five short sentences.");
+    ds4_chat_append_assistant_prefix(engine, &prompt, DS4_THINK_NONE);
+    if (prompt.len <= 0 || ds4_session_create(&s, engine, 1024) != 0 || !s ||
+        ds4_session_sync(s, &prompt, err, sizeof(err)) != 0) goto done;
+    run->prompt_len = prompt.len;
+    for (int cycle = 0; cycle < GLM53_REPLAY_CYCLES; cycle++) {
+        const int pos = ds4_session_pos(s);
+        const int n = ds4_session_eval_speculative_argmax(
+                s, ds4_session_argmax(s), 2, -1,
+                run->accepted + run->total, 2, err, sizeof(err));
+        if (n < 1 || n > 2) goto done;
+        /* The first cycle has no draft; every later single is a rejection. */
+        if (n == 1 && cycle > 0) run->rejects[pos % GLM53_REPLAY_POOL]++;
+        run->total += n;
+    }
+    ok = ds4_session_save_snapshot(s, &run->snap, err, sizeof(err)) == 0 &&
+         run->snap.ptr != NULL;
+done:
+    ds4_session_free(s);
+    ds4_tokens_free(&prompt);
+    return ok;
+}
+
+static void glm53_replay_seg_add(glm53_replay_seg *seg, const uint8_t *got,
+                                 const uint8_t *want, size_t floats) {
+    for (size_t i = 0; i < floats; i++) {
+        float a, b;
+        uint32_t abits, bbits;
+        memcpy(&a, got + i * sizeof(float), sizeof(a));
+        memcpy(&b, want + i * sizeof(float), sizeof(b));
+        memcpy(&abits, &a, sizeof(abits));
+        memcpy(&bbits, &b, sizeof(bbits));
+        /* Bit test: this file builds with -ffast-math on macOS, where
+         * isfinite() and NaN comparisons are not reliable. */
+        if ((abits & 0x7f800000u) == 0x7f800000u ||
+            (bbits & 0x7f800000u) == 0x7f800000u) {
+            seg->nonfinite = true;
+            continue;
+        }
+        const float diff = fabsf(a - b);
+        if (diff > seg->max_abs) seg->max_abs = diff;
+        seg->err2 += (double)diff * diff;
+        seg->ref2 += (double)b * b;
+    }
+}
+
+/* Walk the GLM 5.3 session payload (ds4_session_save_payload): header,
+ * checkpoint, logits, two per-layer row tables, then per layer either the
+ * KDA conv + recurrent state or the compact KV rows, pooled indexer keys
+ * and the K/gate tails.  The final offset check keeps these shapes honest. */
+static bool glm53_replay_compare(const glm53_replay_run *got,
+                                 const glm53_replay_run *want,
+                                 size_t vocab,
+                                 glm53_replay_seg seg[GLM53_SEG_COUNT]) {
+    enum {
+        PROJECTION = 64 * 128,
+        KDA_CONV = 3 * 3 * PROJECTION,
+        KDA_STATE = PROJECTION * 128,
+        KV_LORA = 512,
+        INDEX_DIM = 128,
+        TAIL = 2 * GLM53_REPLAY_POOL * INDEX_DIM,
+    };
+    const uint8_t *a = got->snap.ptr;
+    const uint8_t *b = want->snap.ptr;
+    const size_t len = got->snap.len;
+    const size_t logits =
+        ((size_t)DS4_SESSION_PAYLOAD_U32_FIELDS +
+         (size_t)(got->prompt_len + got->total)) * sizeof(uint32_t);
+    const size_t tables = logits + vocab * sizeof(float);
+    uint32_t layers = 0;
+    if (len != want->snap.len || got->prompt_len != want->prompt_len ||
+        got->total != want->total || tables > len ||
+        memcmp(a, b, logits) != 0) return false;
+    memcpy(&layers, a + 8u * sizeof(uint32_t), sizeof(layers));
+    size_t off = tables + 2u * (size_t)layers * sizeof(uint32_t);
+    if (off > len || memcmp(a + tables, b + tables, off - tables) != 0) {
+        return false;
+    }
+    glm53_replay_seg_add(&seg[GLM53_SEG_LOGITS], a + logits, b + logits, vocab);
+    for (uint32_t il = 0; il < layers; il++) {
+        uint32_t live = 0, pools = 0;
+        memcpy(&live, a + tables + (size_t)il * sizeof(uint32_t), sizeof(live));
+        memcpy(&pools, a + tables + ((size_t)layers + il) * sizeof(uint32_t),
+               sizeof(pools));
+        const bool kda = il % 4u != 3u;
+        const size_t floats[3] = {
+            kda ? KDA_CONV : (size_t)live * KV_LORA,
+            kda ? KDA_STATE : (size_t)pools * INDEX_DIM,
+            kda ? 0 : TAIL,
+        };
+        const int ids[3] = {
+            kda ? GLM53_SEG_KDA_CONV : GLM53_SEG_KV,
+            kda ? GLM53_SEG_KDA_STATE : GLM53_SEG_POOL,
+            GLM53_SEG_TAIL,
+        };
+        for (int i = 0; i < 3; i++) {
+            const size_t bytes = floats[i] * sizeof(float);
+            if (bytes > len - off) return false;
+            glm53_replay_seg_add(&seg[ids[i]], a + off, b + off, floats[i]);
+            off += bytes;
+        }
+    }
+    return off == len;
+}
+
+static float glm53_replay_seg_rel(const glm53_replay_seg *seg) {
+    return (float)sqrt(seg->err2 / (seg->ref2 + 1e-30));
+}
+
+static void test_glm53_mtp_replay_state(void) {
+    /* Relative L2 per segment, calibrated on GLM-5.3-Flash-Q2 (M5 Max,
+     * Metal): clean-path noise stays below 3.1e-5 in every segment (F16 KV
+     * and pooled-key quantization dominate), while a skipped pool replay
+     * pushes the pooled-key segment to 2.2e-1.  The 1e-3 limits sit ~30x
+     * above the noise and require the poisoned run to clear them by 10x. */
+    static const char *const names[GLM53_SEG_COUNT] = {
+        "logits", "kda_conv", "kda_state", "kv", "pool", "tail",
+    };
+    static const float limit[GLM53_SEG_COUNT] = {
+        1.0e-3f, 1.0e-3f, 1.0e-3f, 1.0e-3f, 1.0e-3f, 1.0e-3f,
+    };
+    const char *poison_env = "DS4_GLM53_TEST_POISON_MTP_REPLAY_POOLS";
+    ds4_engine *engine = test_get_engine(false);
+    if (!engine || !ds4_engine_is_glm53(engine)) {
+        fprintf(stderr,
+                "ds4-test: glm53-mtp-replay-state skipped (GLM 5.3 model required)\n");
+        return;
+    }
+    if (!test_env_bool("DS4_TEST_GLM_MTP")) {
+        fprintf(stderr,
+                "ds4-test: glm53-mtp-replay-state skipped (DS4_TEST_GLM_MTP=1 required)\n");
+        return;
+    }
+
+    static glm53_replay_run replay, legacy, poisoned;
+    memset(&replay, 0, sizeof(replay));
+    memset(&legacy, 0, sizeof(legacy));
+    memset(&poisoned, 0, sizeof(poisoned));
+    char *env_saved = test_save_env("DS4_GLM53_MTP_REPLAY");
+    char *poison_saved = test_save_env(poison_env);
+    unsetenv(poison_env);
+    bool ran = glm53_replay_run_cycles(engine, "1", &replay) &&
+               glm53_replay_run_cycles(engine, "0", &legacy);
+    setenv(poison_env, "1", 1);
+    ran = ran && glm53_replay_run_cycles(engine, "1", &poisoned);
+    test_restore_env(poison_env, poison_saved);
+    test_restore_env("DS4_GLM53_MTP_REPLAY", env_saved);
+    TEST_ASSERT(ran);
+    if (!ran) goto cleanup;
+
+    /* Phases 0..2 are the ones whose kept row lives only in the tail. */
+    fprintf(stderr,
+            "ds4-test: glm53-mtp-replay-state rejects by pos%%4: %d %d %d %d\n",
+            replay.rejects[0], replay.rejects[1],
+            replay.rejects[2], replay.rejects[3]);
+    for (int i = 0; i < GLM53_REPLAY_POOL; i++) {
+        TEST_ASSERT(replay.rejects[i] == legacy.rejects[i]);
+        TEST_ASSERT(i == GLM53_REPLAY_POOL - 1 || replay.rejects[i] > 0);
+    }
+    TEST_ASSERT(replay.total == legacy.total);
+    TEST_ASSERT(memcmp(replay.accepted, legacy.accepted,
+                       sizeof(replay.accepted)) == 0);
+
+    const size_t vocab = (size_t)ds4_engine_vocab_size(engine);
+    glm53_replay_seg seg[GLM53_SEG_COUNT] = {{0}};
+    glm53_replay_seg bad[GLM53_SEG_COUNT] = {{0}};
+    const bool laid_out =
+        glm53_replay_compare(&replay, &legacy, vocab, seg) &&
+        glm53_replay_compare(&poisoned, &legacy, vocab, bad);
+    TEST_ASSERT(laid_out);
+    if (!laid_out) goto cleanup;
+    for (int i = 0; i < GLM53_SEG_COUNT; i++) {
+        fprintf(stderr,
+                "ds4-test: glm53-mtp-replay-state %-9s rel=%.3g max_abs=%.3g "
+                "(poisoned rel=%.3g max_abs=%.3g)\n",
+                names[i], glm53_replay_seg_rel(&seg[i]), seg[i].max_abs,
+                glm53_replay_seg_rel(&bad[i]), bad[i].max_abs);
+        TEST_ASSERT(!seg[i].nonfinite && !bad[i].nonfinite);
+        TEST_ASSERT(glm53_replay_seg_rel(&seg[i]) <= limit[i]);
+    }
+    TEST_ASSERT(glm53_replay_seg_rel(&bad[GLM53_SEG_POOL]) >
+                    10.0f * limit[GLM53_SEG_POOL] ||
+                glm53_replay_seg_rel(&bad[GLM53_SEG_TAIL]) >
+                    10.0f * limit[GLM53_SEG_TAIL]);
+
+cleanup:
+    ds4_session_snapshot_free(&replay.snap);
+    ds4_session_snapshot_free(&legacy.snap);
+    ds4_session_snapshot_free(&poisoned.snap);
+}
+
 static char *test_read_file(const char *path) {
     FILE *fp = fopen(path, "rb");
     if (!fp) return NULL;
@@ -7338,6 +7573,7 @@ static const ds4_test_entry test_entries[] = {
     {"--local-golden-vectors", "local-golden-vectors", "local top-k/logit drift regression for long Metal prefill", test_local_golden_vectors},
     {"--metal-short-prefill", "metal-short-prefill", "Metal ratio-4 short prefill regression", test_metal_short_prefill_ratio4},
     {"--glm53-continued-prefill", "glm53-continued-prefill", "GLM 5.3 resumed prefill latency, throughput, progress, and cold-path agreement", test_glm53_continued_prefill},
+    {"--glm53-mtp-replay-state", "glm53-mtp-replay-state", "GLM 5.3 MTP reject replay leaves segment-equivalent session state versus the legacy re-forward, and a poisoned pool replay must diverge (needs DS4_TEST_GLM_MTP=1)", test_glm53_mtp_replay_state},
     {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_kernel_group},
     {"--metal-tensor-equivalence", "metal-tensor-equivalence", "fast/quality Metal prompt-logit and greedy equivalence", test_metal_mpp_equivalence},
     {"--streaming-decode-prefill-correctness", "streaming-decode-prefill-correctness", "streaming decode-style cold prefill drift and repeatability", test_streaming_decode_prefill_correctness},
