@@ -183,6 +183,39 @@ static void test_file_cache_capacity(void) {
                                  UINT64_MAX, 0) == 0);
 }
 
+static void test_resident_static_fits(void) {
+    const uint64_t span = UINT64_C(8441) * GIB / 100;
+    const uint64_t enter = span + 512 * MIB, keep = 256 * MIB;
+
+    /* The M5 Max reported a 107.52 GiB admission budget before buffers,
+     * a 9.99 GiB expert cache, a 5.76 GiB transient peak, and 96.16 GiB
+     * of file-cache headroom at normal pressure. */
+    const uint64_t gpu_128 = (UINT64_C(10752) - 999 - 576) * GIB / 100;
+    const uint64_t live_128 = UINT64_C(9616) * GIB / 100;
+    CHECK(k3_resident_static_fits(span, gpu_128, live_128, 0));
+    CHECK(!k3_resident_static_fits(span, gpu_128, 16 * GIB, 0));
+    /* The 32 GiB M1 Max cannot pin the full span, even with no other load. */
+    CHECK(!k3_resident_static_fits(span, 20 * GIB, 32 * GIB, 0));
+
+    CHECK(k3_resident_static_fits(span, enter, enter, 0));
+    CHECK(!k3_resident_static_fits(span, enter - 1, enter, 0));
+    CHECK(!k3_resident_static_fits(span, enter, enter - 1, 0));
+    /* Once pinned, the live reserve has already paid for the span.
+     * Demote on either a lower GPU ceiling or insufficient live headroom. */
+    CHECK(k3_resident_static_fits(span, span, keep, 1));
+    CHECK(!k3_resident_static_fits(span, span - 1, live_128, 1));
+    CHECK(!k3_resident_static_fits(span, gpu_128, keep - 1, 1));
+    CHECK(!k3_resident_static_fits(span, gpu_128, 0, 1));
+    CHECK(!k3_resident_static_fits(span, gpu_128, 0, 0));
+    CHECK(!k3_resident_static_fits(span, span, keep, 0));
+
+    CHECK(!k3_resident_static_fits(0, UINT64_MAX, UINT64_MAX, 0));
+    CHECK(!k3_resident_static_fits(0, UINT64_MAX, UINT64_MAX, 1));
+    CHECK(!k3_resident_static_fits(UINT64_MAX, UINT64_MAX, UINT64_MAX, 0));
+    CHECK(k3_resident_static_fits(UINT64_MAX - 512 * MIB,
+                                  UINT64_MAX, UINT64_MAX, 0));
+}
+
 static void test_alignment(void) {
     const uint64_t page = 16384;
     uint64_t aligned = 42;
@@ -425,6 +458,7 @@ int main(void) {
     test_available();
     test_live_reserve_regression();
     test_file_cache_capacity();
+    test_resident_static_fits();
     test_alignment();
     test_transient_peak();
     test_32gb_cache_cap();

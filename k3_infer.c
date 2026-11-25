@@ -9,6 +9,7 @@
 #include "ds4_gpu.h"
 #include "k3_metal.h"
 
+#include <dispatch/dispatch.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -50,6 +51,7 @@ typedef enum {
     K3_STATIC_IO_UNDECIDED,
     K3_STATIC_IO_STREAMING,
     K3_STATIC_IO_MAPPED,
+    K3_STATIC_IO_RESIDENT,
 } k3_static_io_mode;
 
 typedef struct {
@@ -209,6 +211,8 @@ struct k3_context {
     struct k3_context *shared_owner;
     pthread_mutex_t execution_mutex;
     int execution_mutex_initialized;
+    dispatch_source_t gguf_pressure_watch;
+    dispatch_semaphore_t gguf_pressure_watch_stopped;
     int owns_execution;
     k3_model *model;
     k3_global_weights globals;
@@ -256,6 +260,7 @@ struct k3_context {
     int gguf_static_resident;
     uint32_t gguf_lookahead_experts;
     uint8_t gguf_static_layers[K3_N_LAYER];
+    int gguf_auto_pin_unavailable;
     int gguf_prefill_hotness;
     int gguf_readahead_done;
     int speculative_enabled;
@@ -289,6 +294,8 @@ struct k3_context {
     k3_mla_state mla[K3_N_LAYER];
     ds4_gpu_tensor *index_scores, *index_ids;
 };
+
+static int start_gguf_pressure_watch(k3_context *owner);
 
 static k3_context *execution_owner(k3_context *ctx) {
     return ctx && ctx->shared_owner ? ctx->shared_owner : ctx;
@@ -629,17 +636,27 @@ static int gguf_memory_budget(uint64_t allocated, uint64_t *budget,
 
 /* Only the active layer and its prefetch need temporary Metal views. Clean
  * pages from earlier layers can occupy the larger, reclaimable OS file cache. */
-static uint64_t gguf_file_cache_capacity(const k3_context *owner, uint64_t experts) {
+static uint64_t gguf_file_cache_capacity(const k3_context *owner, uint64_t experts,
+                                         uint64_t *gpu_capacity) {
     int pressure = 0;
     size_t size = sizeof(pressure);
     k3_memory_status memory;
+    if (gpu_capacity) *gpu_capacity = 0;
     const uint64_t physical = macos_physical_memory();
     if (!physical || sysctlbyname("kern.memorystatus_vm_pressure_level",
             &pressure, &size, NULL, 0) != 0 || size != sizeof(pressure) ||
         pressure != 1 || !macos_memory_status(&memory)) return 0;
+    const uint64_t allocated = ds4_gpu_tensor_allocated_bytes();
     const uint64_t process = k3_memory_remaining(
-        k3_memory_remaining(physical, resident_memory_reserve()),
-        ds4_gpu_tensor_allocated_bytes());
+        k3_memory_remaining(physical, resident_memory_reserve()), allocated);
+    /* Persistent Metal resources must also fit its recommended working set.
+     * Charge all slabs and staging, including their already-wired bytes. */
+    if (gpu_capacity) {
+        uint64_t gpu = k3_memory_remaining(ds4_gpu_recommended_working_set_size(), allocated);
+        if (gpu > process) gpu = process;
+        *gpu_capacity = k3_memory_remaining(
+            k3_memory_remaining(gpu, owner->gguf_transient_bytes), experts);
+    }
     return k3_file_cache_capacity(process,
         k3_memory_remaining(memory.reclaimable, K3_GGUF_LIVE_RESERVE_BYTES),
         owner->gguf_transient_bytes, owner->gguf_staging_locked_bytes,
@@ -653,23 +670,6 @@ static int automatic_gguf_static_io(const k3_context *ctx) {
         !getenv("K3_DISABLE_GGUF_STATIC_RESIDENCY") &&
         !getenv("K3_GGUF_STATIC_STAGING") && !getenv("K3_GGUF_STATIC_ALIGNED") &&
         !getenv("K3_GGUF_PREFILL_STAGING") && !getenv("K3_GGUF_HEAD_STAGING");
-}
-
-static int use_gguf_file_cache(k3_context *owner) {
-    if (!owner->gguf_file_cache_span) return 0;
-    const uint64_t capacity = gguf_file_cache_capacity(owner, owner->gguf_cache_bytes);
-    const int mapped = capacity >= owner->gguf_file_cache_span;
-    const k3_static_io_mode mode = mapped ? K3_STATIC_IO_MAPPED : K3_STATIC_IO_STREAMING;
-    if (mode != owner->gguf_file_cache_mode) {
-        fprintf(stderr,
-                "k3: automatic static weights: mode=%s, span %.2f GiB, "
-                "file-cache headroom %.2f GiB\n",
-                mapped ? "mapped" : "streaming",
-                (double)owner->gguf_file_cache_span / 1073741824.0,
-                (double)capacity / 1073741824.0);
-        owner->gguf_file_cache_mode = mode;
-    }
-    return mapped;
 }
 
 static int check_gguf_memory(const k3_context *ctx, const char *phase,
@@ -2263,6 +2263,78 @@ static void try_pin_gguf_static(k3_context *ctx, uint64_t budget) {
                     "%.3f GiB reserved for streamed experts\n",
             (double)total / 1073741824.0,
             (double)ctx->gguf_cache_bytes / 1073741824.0);
+}
+
+/* The execution owner holds the single Metal residency set. Every evaluation
+ * and clone allocation is serialized by its mutex. Only whole static spans
+ * are promoted automatically; expert weights remain in the bounded slabs. */
+static int pin_auto_gguf_residency(k3_context *owner) {
+    uint64_t offsets[K3_N_LAYER + 5], sizes[K3_N_LAYER + 5], span;
+    uint32_t count;
+    if (!gguf_resident_spans(owner, 0, offsets, sizes, &count, &span) ||
+        span != owner->gguf_file_cache_span ||
+        !k3_gpu_pin_model_spans(k3_st_map_base(owner->globals.shard),
+            k3_st_file_size(owner->globals.shard), offsets, sizes, count)) return 0;
+    for (uint32_t i = owner->layer_start; i <= owner->layer_end; ++i)
+        owner->gguf_static_layers[i] = 1;
+    owner->gguf_static_resident = 1;
+    owner->resident_static_bytes = span;
+    return 1;
+}
+
+static void copy_gguf_residency(k3_context *ctx, const k3_context *owner) {
+    ctx->gguf_static_resident = owner->gguf_static_resident;
+    ctx->resident_static_bytes = owner->resident_static_bytes;
+    memcpy(ctx->gguf_static_layers, owner->gguf_static_layers, sizeof(ctx->gguf_static_layers));
+}
+
+/* Caller holds execution_mutex and has drained the last Metal submission. */
+static void release_auto_gguf_residency(k3_context *owner) {
+    k3_gpu_clear_static_residency();
+    memset(owner->gguf_static_layers, 0, sizeof(owner->gguf_static_layers));
+    owner->gguf_static_resident = 0;
+    owner->resident_static_bytes = 0;
+    owner->gguf_file_cache_mode = K3_STATIC_IO_UNDECIDED;
+}
+
+static int drain_auto_gguf_residency(k3_context *owner) {
+    if (owner->gguf_file_cache_mode != K3_STATIC_IO_RESIDENT) return 1;
+    if (!ds4_gpu_synchronize()) return 0;
+    release_auto_gguf_residency(owner);
+    return 1;
+}
+
+static k3_static_io_mode select_gguf_static_io(k3_context *owner) {
+    const uint64_t span = owner->gguf_file_cache_span;
+    if (!span) return K3_STATIC_IO_UNDECIDED;
+    uint64_t gpu = 0;
+    const uint64_t capacity = gguf_file_cache_capacity(owner, owner->gguf_cache_bytes, &gpu);
+    const int resident = owner->gguf_file_cache_mode == K3_STATIC_IO_RESIDENT;
+    k3_static_io_mode mode = capacity >= span ? K3_STATIC_IO_MAPPED : K3_STATIC_IO_STREAMING;
+    if (!owner->gguf_auto_pin_unavailable && k3_resident_static_fits(span, gpu, capacity, resident)) {
+        if (resident) return K3_STATIC_IO_RESIDENT;
+        if (start_gguf_pressure_watch(owner) && pin_auto_gguf_residency(owner)) {
+            mode = K3_STATIC_IO_RESIDENT;
+        } else {
+            /* A device or OS that cannot install this residency set still
+             * has the original mapped/streaming paths for this context. */
+            owner->gguf_auto_pin_unavailable = 1;
+            fprintf(stderr, "k3: automatic Metal static residency unavailable\n");
+        }
+    } else if (resident) {
+        release_auto_gguf_residency(owner);
+    }
+    if (mode != owner->gguf_file_cache_mode) {
+        const char *name = mode == K3_STATIC_IO_RESIDENT ? "resident" :
+                           mode == K3_STATIC_IO_MAPPED ? "mapped" : "streaming";
+        fprintf(stderr,
+                "k3: automatic static weights: mode=%s, span %.2f GiB, "
+                "file-cache headroom %.2f GiB, Metal capacity %.2f GiB\n",
+                name, (double)span / 1073741824.0, (double)capacity / 1073741824.0,
+                (double)gpu / 1073741824.0);
+        owner->gguf_file_cache_mode = mode;
+    }
+    return mode;
 }
 
 static int load_resident_lm_head(k3_context *ctx,
@@ -5482,6 +5554,10 @@ static int evaluate(k3_context *ctx,
         set_error(err, errcap, "K3 GGUF output-view release failed");
         return 0;
     }
+    k3_context *owner = execution_owner(ctx);
+    const k3_static_io_mode mode = select_gguf_static_io(owner);
+    const int auto_resident = mode == K3_STATIC_IO_RESIDENT;
+    if (ctx != owner && owner->gguf_file_cache_span) copy_gguf_residency(ctx, owner);
     if (!check_gguf_memory(ctx, "evaluation start", ctx->layer_start,
                            err, errcap)) return 0;
 
@@ -5491,7 +5567,6 @@ static int evaluate(k3_context *ctx,
     const int trace = trace_enabled();
     const int profile = trace || io_profile_enabled();
     const int pagein = layer_pagein_enabled();
-    k3_context *owner = execution_owner(ctx);
     const int resident_readahead =
         ctx->gguf_resident && !owner->gguf_readahead_done;
     if (ctx->model->gguf && !ctx->gguf_resident) {
@@ -5503,13 +5578,14 @@ static int evaluate(k3_context *ctx,
     }
     /* Select the source after previous GPU views are retired. One token or
      * prefill chunk uses a single policy across all layers and the head. */
-    const int file_cache = use_gguf_file_cache(owner);
+    const int file_cache = mode == K3_STATIC_IO_MAPPED || auto_resident;
     const int staging_requested = static_staging_enabled(ctx, rows, prefill);
     const int stage_static = !file_cache && staging_requested;
     const int stage_head = !file_cache && output_logits &&
         gguf_head_staging_enabled(ctx, rows, prefill);
     const uint32_t streamed_prefill_rows =
-        staging_requested && prefill && ctx->static_cache && ctx->optimized_ssd_streaming &&
+        (staging_requested || (auto_resident && ctx->gguf_prefill_staging)) &&
+        prefill && ctx->static_cache && ctx->optimized_ssd_streaming &&
         (rows == 128u || rows == 256u) &&
         ctx->max_prefill_tokens == rows && owner->max_prefill_tokens == rows ? rows : 0u;
     const uint32_t first_layer = ctx->layer_start;
@@ -5774,7 +5850,7 @@ static int evaluate(k3_context *ctx,
                   .base = k3_st_map_base(gguf_static_shard),
                   .size = k3_st_file_size(gguf_static_shard),
                   .bias = 0,
-                  .streamed_small_batches = temporary_gguf_map &&
+                  .streamed_small_batches = (temporary_gguf_map || auto_resident) &&
                       ds4_gpu_device_is_pre_m5_apple_silicon(),
                   .streamed_prefill_rows = file_cache ? streamed_prefill_rows : 0u,
               }
@@ -6243,7 +6319,12 @@ int k3_context_create(k3_context **out,
         if (automatic_gguf_static_io(ctx)) {
             ctx->gguf_file_cache_span = static_bytes;
             if (automatic_cache) {
-                const uint64_t capacity = gguf_file_cache_capacity(ctx, 0);
+                uint64_t gpu = 0;
+                uint64_t capacity = gguf_file_cache_capacity(ctx, 0, &gpu);
+                const uint64_t limit = k3_memory_remaining(
+                    gpu < capacity ? gpu : capacity, K3_STATIC_PROMOTE_MARGIN);
+                if (limit >= static_bytes && required_slots <= (limit - static_bytes) / slot_bytes)
+                    capacity = limit;
                 cache_target = k3_ssd_file_cache_expert_target(cache_target,
                     capacity, static_bytes, slot_bytes, required_slots);
             }
@@ -6486,11 +6567,13 @@ int k3_context_clone(k3_context **out,
     ctx->q8_static = owner->q8_static;
     ctx->gguf_resident = owner->gguf_resident;
     ctx->gguf_lookahead_experts = owner->gguf_lookahead_experts;
-    ctx->gguf_static_resident = owner->gguf_static_resident;
-    memcpy(ctx->gguf_static_layers, owner->gguf_static_layers,
-           sizeof(ctx->gguf_static_layers));
+    pthread_mutex_lock(&owner->execution_mutex);
+    /* Give session states priority over optional resident weights. The next
+     * evaluation rechecks the budget with the new tensors already charged. */
+    int budget_ok = drain_auto_gguf_residency(owner);
+    if (!budget_ok) set_error(err, errcap, "could not synchronize K3 residency before cloning");
+    copy_gguf_residency(ctx, owner);
     ctx->speculative_enabled = owner->speculative_enabled;
-    ctx->resident_static_bytes = owner->resident_static_bytes;
     memcpy(ctx->static_slots, owner->static_slots, sizeof(ctx->static_slots));
     memcpy(ctx->resident_static_slots, owner->resident_static_slots,
            sizeof(ctx->resident_static_slots));
@@ -6508,10 +6591,8 @@ int k3_context_clone(k3_context **out,
     for (uint32_t bank = 0; bank < K3_SPECULATIVE_BANKS; bank++) {
         ctx->speculative_layer[bank] = UINT32_MAX;
     }
-    pthread_mutex_lock(&owner->execution_mutex);
-    int budget_ok = 1;
     ctx->tensor_allocation_limit = owner->tensor_allocation_limit;
-    if (ctx->model->gguf) {
+    if (budget_ok && ctx->model->gguf) {
         const uint64_t allocated = ds4_gpu_tensor_allocated_bytes();
         uint64_t available = 0;
         budget_ok = gguf_memory_budget(allocated, &available, err, errcap);
@@ -6532,6 +6613,54 @@ int k3_context_clone(k3_context **out,
     return 1;
 }
 
+/* A paused session can retain its static weights indefinitely. macOS can
+ * request their release even when no caller submits the next token. */
+static void gguf_memory_pressure(void *context) {
+    k3_context *owner = context;
+    pthread_mutex_lock(&owner->execution_mutex);
+    if (owner->gguf_file_cache_mode == K3_STATIC_IO_RESIDENT && drain_auto_gguf_residency(owner))
+        fprintf(stderr, "k3: released automatic static residency on macOS memory pressure\n");
+    pthread_mutex_unlock(&owner->execution_mutex);
+}
+
+static void gguf_pressure_watch_cancelled(void *context) {
+    k3_context *owner = context;
+    dispatch_semaphore_signal(owner->gguf_pressure_watch_stopped);
+}
+
+/* Called under execution_mutex before promoting the owner's static weights. */
+static int start_gguf_pressure_watch(k3_context *owner) {
+    if (owner->gguf_pressure_watch) return 1;
+    dispatch_semaphore_t stopped = dispatch_semaphore_create(0);
+    if (!stopped) return 0;
+    dispatch_source_t watch = dispatch_source_create(DISPATCH_SOURCE_TYPE_MEMORYPRESSURE,
+        0, DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL,
+        dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0));
+    if (!watch) {
+        dispatch_release(stopped);
+        return 0;
+    }
+    owner->gguf_pressure_watch = watch;
+    owner->gguf_pressure_watch_stopped = stopped;
+    dispatch_set_context(watch, owner);
+    dispatch_source_set_event_handler_f(watch, gguf_memory_pressure);
+    dispatch_source_set_cancel_handler_f(watch, gguf_pressure_watch_cancelled);
+    dispatch_resume(watch);
+    return 1;
+}
+
+static void stop_gguf_pressure_watch(k3_context *owner) {
+    if (!owner->gguf_pressure_watch) return;
+    /* The cancel handler runs after the last event handler has returned.
+     * Teardown must wait outside execution_mutex so that handler can finish. */
+    dispatch_source_cancel(owner->gguf_pressure_watch);
+    dispatch_semaphore_wait(owner->gguf_pressure_watch_stopped, DISPATCH_TIME_FOREVER);
+    dispatch_release(owner->gguf_pressure_watch);
+    dispatch_release(owner->gguf_pressure_watch_stopped);
+    owner->gguf_pressure_watch = NULL;
+    owner->gguf_pressure_watch_stopped = NULL;
+}
+
 void k3_context_destroy(k3_context *ctx) {
     if (!ctx) return;
     k3_context *owner = execution_owner(ctx);
@@ -6550,6 +6679,7 @@ void k3_context_destroy(k3_context *ctx) {
         free(ctx);
         return;
     }
+    stop_gguf_pressure_watch(ctx);
     (void)finish_all_speculative_experts(ctx, NULL, 0);
     (void)ds4_gpu_synchronize();
     expert_io_pool_shutdown(ctx);
@@ -6637,6 +6767,7 @@ int k3_context_prefill(k3_context *ctx,
     const int ok = evaluate(
         ctx, token_ids, n_tokens, 1,
         NULL, NULL, 1, logits, err, errcap);
+    if (!ok) (void)drain_auto_gguf_residency(owner);
     pthread_mutex_unlock(&owner->execution_mutex);
     return ok;
 }
@@ -6655,6 +6786,7 @@ int k3_context_decode(k3_context *ctx,
     const int ok = evaluate(
         ctx, &token_id, 1, 0,
         NULL, NULL, 1, logits, err, errcap);
+    if (!ok) (void)drain_auto_gguf_residency(owner);
     pthread_mutex_unlock(&owner->execution_mutex);
     return ok;
 }
@@ -6683,6 +6815,7 @@ int k3_context_eval_slice(k3_context *ctx,
         ctx, token_ids, n_tokens, prefill,
         input_boundary, output_boundary,
         output_logits ? 1 : 0, logits, err, errcap);
+    if (!ok) (void)drain_auto_gguf_residency(owner);
     pthread_mutex_unlock(&owner->execution_mutex);
     return ok;
 }

@@ -62,13 +62,23 @@ state by replaying the saved tokens.
 `--ssd-streaming` selects how Kimi K3 GGUF reads its static weights. Before
 each prefill chunk or decode step, ds4 checks the available RAM and macOS
 memory pressure. When pressure is normal and the complete static working set
-fits alongside the admitted expert cache, runtime buffers and memory reserves,
-Metal reads the weights directly from the GGUF mapping. The working set
-includes the static weights of the selected layers and the output weights
-when the slice owns them. macOS can cache these file-backed pages and reclaim
-them as needed.
+fits both the live memory budget and Metal's recommended working set, ds4
+chooses `mode=resident`. It registers the selected layers' static weights
+and their output weights once. Consecutive decode steps reuse the same Metal
+buffers. Experts continue to use the separately budgeted streaming cache.
 
-With less headroom, ds4 uses bounded staging. It discovers the lossless
+Promotion reserves the full expert cache, runtime tensors and transient
+buffers, then requires 512 MiB of additional headroom. A resident session
+keeps a 256 MiB live margin above its existing reserves. A macOS memory
+pressure notification can release the residency set between evaluations or
+while the session is idle. Creating another session also releases the set
+before allocating its state. The next evaluation checks the new budget.
+
+If the static weights fit the reclaimable file cache but fail residency
+admission, ds4 chooses `mode=mapped` and creates temporary Metal views of the
+GGUF. macOS can reuse those pages while they remain in memory.
+
+With less headroom, ds4 selects `mode=streaming` and uses bounded staging. It discovers the lossless
 sidecar beside the canonical GGUF by replacing `.gguf` with
 `.static-zstd-v1.cache`. A compatible sidecar supplies static layer weights
 during prefill and decode. Without a sidecar or libzstd, the bounded path
@@ -107,12 +117,14 @@ settings also retain their manual behavior. For example,
 To compare the automatic paths on a 128 GiB Mac, run `ds4-bench` twice with
 the same GGUF, sidecar next to the GGUF, prompt, context, chunk and token
 count. Leave the static-cache, residency, staging and profile overrides
-unset. First run at normal memory pressure, then repeat with
+unset. On the normal-pressure run, record whether the log shows
+`mode=resident` throughout decode. Then repeat with
 `--simulate-used-memory 80GB` to reproduce the constrained case. Keep
 `--ssd-streaming-cache-experts 10GB` in both runs to isolate the static I/O
 choice. Omit it in a separate pair to test automatic expert-cache sizing.
-Report the admitted cache, chosen static path, prefill throughput, seconds per
-decode step and any admission or live-memory stop.
+Report the admitted cache, any mode changes, `gen_first_ms` and
+`gen_steady_tps`. Compare the same prompt and decode length with both the
+`8099b26c` mapped path and the `8ba3fac` decode reference.
 
 For the original K3 mixed-Q2 GGUF, aligned static staging and tiled output-head
 reads reuse two bounded buffers. An optional lossless static cache stores

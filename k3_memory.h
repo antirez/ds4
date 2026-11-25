@@ -33,6 +33,19 @@ static inline uint64_t k3_file_cache_capacity(uint64_t process_budget,
     return process < live ? process : live;
 }
 
+/* Extra headroom on top of host/live reserves. A resident span is already
+ * charged to the VM independently of whether its pages are reclaimable. */
+#define K3_STATIC_PROMOTE_MARGIN (UINT64_C(512) << 20)
+#define K3_STATIC_KEEP_MARGIN    (UINT64_C(256) << 20)
+
+static inline int k3_resident_static_fits(uint64_t span, uint64_t gpu_capacity,
+                                         uint64_t live_capacity, int already_resident) {
+    if (!span || span > gpu_capacity) return 0;
+    if (already_resident) return live_capacity >= K3_STATIC_KEEP_MARGIN;
+    return gpu_capacity - span >= K3_STATIC_PROMOTE_MARGIN &&
+           live_capacity >= span && live_capacity - span >= K3_STATIC_PROMOTE_MARGIN;
+}
+
 static inline int k3_memory_step_required(uint64_t transient,
                                          uint64_t cache_budget,
                                          uint64_t locked_cache,
