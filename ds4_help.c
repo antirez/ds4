@@ -218,6 +218,8 @@ static void print_sampling(FILE *fp, const help_colors *c, bool full, ds4_help_t
     if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT)
         opt(fp, c, "--think-level N", "V4.1 thinking effort, 1..100; 0 disables thinking.");
     opt(fp, c, "--nothink", "Disable thinking and ask for direct replies.");
+    if (tool == DS4_HELP_DS4)
+        opt(fp, c, "--k3-prompt-cache DIR", "Save Kimi K3 GGUF prompt states across one-shot runs in a dedicated directory (4 GiB budget). Reuse identical prompts or complete prefill chunks.");
     if (full) {
         opt(fp, c, "-sys, --system TEXT", "System prompt. Empty string disables the default where supported.");
         opt(fp, c, "-p, --prompt TEXT", "One-shot prompt text.");

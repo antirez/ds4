@@ -2587,6 +2587,10 @@ template [[host_name(
     "kernel_mul_mv_ext_mxfp4_pair_situ_f32_r1_1")]]
 kernel mul_mv_ext_mxfp4_pair_situ_f32_t
 kernel_mul_mv_ext_mxfp4_pair_situ_f32_disp<1>;
+/* Each lane reuses both decoded weights across eight prompt rows, keeping
+ * the same FP32 dot products and per-row shuffle tree as the unfused matvec. */
+template [[host_name("kernel_k3_mxfp4_pair_situ_rows8")]]
+kernel mul_mv_ext_mxfp4_pair_situ_f32_t kernel_mul_mv_ext_mxfp4_pair_situ_f32_disp<8>;
 
 template [[host_name("kernel_mul_mv_ext_q8_0_pair_swiglu_f32_r1_2")]] kernel mul_mv_ext_q8_0_pair_swiglu_f32_t kernel_mul_mv_ext_q8_0_pair_swiglu_f32_disp<2>;
 template [[host_name("kernel_mul_mv_ext_q8_0_pair_swiglu_f32_r1_3")]] kernel mul_mv_ext_q8_0_pair_swiglu_f32_t kernel_mul_mv_ext_q8_0_pair_swiglu_f32_disp<3>;

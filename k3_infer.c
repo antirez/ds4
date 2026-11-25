@@ -9,6 +9,7 @@
 #include "ds4_gpu.h"
 #include "k3_metal.h"
 
+#include <CommonCrypto/CommonDigest.h>
 #include <dispatch/dispatch.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -215,6 +216,7 @@ struct k3_context {
     dispatch_semaphore_t gguf_pressure_watch_stopped;
     int owns_execution;
     k3_model *model;
+    uint64_t checkpoint_model_id[7];
     k3_global_weights globals;
     k3_layer *layers[K3_N_LAYER];
     int expert_fds[K3_N_LAYER];
@@ -299,6 +301,22 @@ static int start_gguf_pressure_watch(k3_context *owner);
 
 static k3_context *execution_owner(k3_context *ctx) {
     return ctx && ctx->shared_owner ? ctx->shared_owner : ctx;
+}
+
+/* Bind native state to the opened file, including replacements at the same
+ * path. Use fixed-width words rather than persisting struct stat padding. */
+static bool checkpoint_model_id(k3_context *ctx, uint64_t id[7]) {
+    struct stat st;
+    if (fstat(k3_st_fd(ctx->globals.shard), &st) != 0 ||
+        !S_ISREG(st.st_mode) || st.st_size <= 0) return false;
+    id[0] = st.st_dev;
+    id[1] = st.st_ino;
+    id[2] = st.st_size;
+    id[3] = st.st_mtimespec.tv_sec;
+    id[4] = st.st_mtimespec.tv_nsec;
+    id[5] = st.st_ctimespec.tv_sec;
+    id[6] = st.st_ctimespec.tv_nsec;
+    return true;
 }
 
 static void hidden_hook_emit(k3_context *ctx,
@@ -4473,7 +4491,9 @@ static int run_shared_experts(
         layer->shared_up->dtype == K3_ST_DTYPE_MXFP4 &&
         layer->shared_down->dtype == K3_ST_DTYPE_MXFP4;
     const int gguf_pair_f32 =
-        ctx->model->gguf && rows == 1u && !gguf_a8 &&
+        ctx->model->gguf && !gguf_a8 &&
+        (rows == 1u || (source->streamed_small_batches &&
+                        k3_gpu_mxfp4_pair_prefill_supported(rows))) &&
         getenv("K3_DISABLE_GGUF_SHARED_PAIR") == NULL &&
         layer->shared_gate->dtype == K3_ST_DTYPE_MXFP4 &&
         layer->shared_up->dtype == K3_ST_DTYPE_MXFP4 &&
@@ -4494,6 +4514,7 @@ static int run_shared_experts(
                    s->ffn_in,
                    K3_N_EMBD,
                    K3_SHARED_FF,
+                   rows,
                    4.0f,
                    25.0f) &&
                matmul(s->shared_out, layer->shared_down, s->shared_mid,
@@ -6121,6 +6142,7 @@ int k3_context_create(k3_context **out,
         k3_context_destroy(ctx);
         return 0;
     }
+    if (ctx->model->gguf) (void)checkpoint_model_id(ctx, ctx->checkpoint_model_id);
     resolve_gguf_streaming_options(ctx, config->optimized_ssd_streaming);
     ds4_gpu_set_k3_ssd_streaming_defaults(ctx->optimized_ssd_streaming != 0);
     for (uint32_t i = 0; i < K3_N_LAYER; i++) {
@@ -6822,6 +6844,190 @@ int k3_context_eval_slice(k3_context *ctx,
 
 uint32_t k3_context_position(const k3_context *ctx) {
     return ctx ? ctx->position : 0;
+}
+
+/* KSV3 v2 (Apple little endian): model identity, final f32 logits, then
+ * each layer's fixed KDA history + recurrence or live BF16 MLA rows +
+ * optional K3.1 index rows. A SHA-256 trailer covers the token prefix, model
+ * identity, logits and tensors. Execution scratch and reusable weights are
+ * deliberately absent. A change to these tensor layouts needs a new version. */
+typedef struct {
+    void *data;
+    size_t bytes;
+} k3_checkpoint_span;
+
+bool k3_context_checkpoint_supported(const k3_context *ctx) {
+    /* Short K3.1 contexts have no index keys to carry into a longer session.
+     * Keep their replay format so a restore can build those keys if needed. */
+    if (!ctx || !ctx->model || !ctx->model->gguf || !ctx->has_output ||
+        (ctx->model->dsa && ctx->context_capacity <= K31_INDEX_TOPK) ||
+        ctx->layer_start != 0 || ctx->layer_end != K3_N_LAYER - 1) return false;
+    const k3_context *owner = ctx->shared_owner ? ctx->shared_owner : ctx;
+    return owner->checkpoint_model_id[2] != 0;
+}
+
+static uint64_t checkpoint_layout(const k3_context *ctx, uint32_t rows,
+                                  k3_checkpoint_span *spans, size_t *count) {
+    if (!k3_context_checkpoint_supported(ctx) || !rows || rows > ctx->context_capacity) return 0;
+    uint64_t bytes = 0;
+    size_t used = 0;
+    for (uint32_t i = 0; i < K3_N_LAYER; i++) {
+        ds4_gpu_tensor *tensors[2];
+        uint64_t lengths[2];
+        if (k3_layer_is_mla(i)) {
+            tensors[0] = ctx->mla[i].cache;
+            lengths[0] = (uint64_t)rows * K3_MLA_CACHE_WIDTH * sizeof(uint16_t);
+            tensors[1] = ctx->mla[i].index_keys;
+            lengths[1] = tensors[1] ? (uint64_t)rows * (K31_INDEX_DIM + sizeof(float)) : 0;
+        } else {
+            tensors[0] = ctx->kda[i].conv;
+            lengths[0] = 3ull * (K3_CONV_WIDTH - 1u) * K3_KDA_PROJ * sizeof(float);
+            tensors[1] = ctx->kda[i].recurrent;
+            lengths[1] = (uint64_t)K3_KDA_PROJ * K3_HEAD_DIM * sizeof(float);
+        }
+        for (size_t j = 0; j < 2; j++) {
+            if (!lengths[j]) continue;
+            if (lengths[j] > ds4_gpu_tensor_bytes(tensors[j])) return 0;
+            if (spans) {
+                void *p = ds4_gpu_tensor_contents(tensors[j]);
+                if (!p) return 0;
+                spans[used] = (k3_checkpoint_span){p, lengths[j]};
+            }
+            used++;
+            bytes += lengths[j];
+        }
+    }
+    if (count) *count = used;
+    return bytes;
+}
+
+uint64_t k3_context_checkpoint_bytes(const k3_context *ctx, uint32_t rows) {
+    const uint64_t bytes = checkpoint_layout(ctx, rows, NULL, NULL);
+    if (!bytes) return 0;
+    return bytes + sizeof(ctx->checkpoint_model_id) + K3_N_VOCAB * sizeof(float) +
+           CC_SHA256_DIGEST_LENGTH;
+}
+
+static void checkpoint_hash(CC_SHA256_CTX *hash, const void *data, size_t bytes) {
+    const uint8_t *p = data;
+    while (bytes) {
+        const CC_LONG n = bytes > UINT32_MAX ? UINT32_MAX : (CC_LONG)bytes;
+        CC_SHA256_Update(hash, p, n);
+        p += n;
+        bytes -= n;
+    }
+}
+
+bool k3_context_checkpoint_model_matches(k3_context *ctx, FILE *fp) {
+    uint64_t current[7], disk_id[7];
+    return checkpoint_model_id(ctx, current) &&
+           memcmp(current, execution_owner(ctx)->checkpoint_model_id, sizeof(current)) == 0 &&
+           fread(disk_id, 1, sizeof(disk_id), fp) == sizeof(disk_id) &&
+           memcmp(current, disk_id, sizeof(current)) == 0;
+}
+
+bool k3_checkpoint_staging_fits(uint64_t bytes) {
+    uint64_t budget = 0;
+    return gguf_memory_budget(ds4_gpu_tensor_allocated_bytes(), &budget, NULL, 0) &&
+           bytes <= budget;
+}
+
+static int transfer_checkpoint(k3_context *ctx, FILE *fp, uint32_t rows,
+                               const int *tokens, float *logits, bool loading,
+                               char *err, size_t errcap) {
+    if (!k3_context_checkpoint_supported(ctx) || !fp || !tokens || !logits) {
+        set_error(err, errcap, "invalid K3 native checkpoint request");
+        return 0;
+    }
+    k3_context *owner = execution_owner(ctx);
+    pthread_mutex_lock(&owner->execution_mutex);
+    uint64_t id[7];
+    k3_checkpoint_span spans[1 + 2 * K3_N_LAYER];
+    size_t count = 0;
+    spans[0] = (k3_checkpoint_span){logits, K3_N_VOCAB * sizeof(float)};
+    const uint64_t tensor_bytes = checkpoint_layout(ctx, rows, spans + 1, &count);
+    count++; /* logits */
+    uint8_t *staged = NULL;
+    int ok = 0;
+    if (!tensor_bytes || (!loading && rows != ctx->position) ||
+        !checkpoint_model_id(ctx, id) ||
+        memcmp(id, owner->checkpoint_model_id, sizeof(id)) != 0) {
+        set_error(err, errcap, "K3 checkpoint state or GGUF identity changed");
+        goto done;
+    }
+    if (!finish_all_speculative_experts(ctx, err, errcap) || !ds4_gpu_synchronize()) {
+        set_error(err, errcap, "could not synchronize Metal for K3 checkpoint");
+        goto done;
+    }
+    CC_SHA256_CTX hash;
+    uint8_t digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256_Init(&hash);
+    checkpoint_hash(&hash, tokens, (uint64_t)rows * sizeof(*tokens));
+    checkpoint_hash(&hash, id, sizeof(id));
+    if (loading) {
+        if (!k3_context_checkpoint_model_matches(ctx, fp)) {
+            set_error(err, errcap, "K3 checkpoint identity does not match the opened GGUF");
+            goto done;
+        }
+        /* An invalid or truncated restore must preserve the previous live
+         * session, including its logits. Stage only the live rows, never the
+         * full context capacity, and retain the usual host/device headroom. */
+        const size_t data_bytes = tensor_bytes + spans[0].bytes;
+        if (!k3_checkpoint_staging_fits(data_bytes) || !(staged = malloc(data_bytes))) {
+            set_error(err, errcap, "insufficient memory to stage the K3 checkpoint");
+            goto done;
+        }
+        uint8_t expected[CC_SHA256_DIGEST_LENGTH];
+        if (fread(staged, 1, data_bytes, fp) != data_bytes ||
+            fread(expected, 1, sizeof(expected), fp) != sizeof(expected)) {
+            set_error(err, errcap, "truncated K3 native checkpoint");
+            goto done;
+        }
+        checkpoint_hash(&hash, staged, data_bytes);
+        CC_SHA256_Final(digest, &hash);
+        if (memcmp(expected, digest, sizeof(digest)) != 0) {
+            set_error(err, errcap, "K3 native checkpoint checksum mismatch");
+            goto done;
+        }
+        const uint8_t *p = staged;
+        for (size_t i = 0; i < count; i++) {
+            memcpy(spans[i].data, p, spans[i].bytes);
+            p += spans[i].bytes;
+        }
+        ctx->position = rows;
+        memset(ctx->previous_route_valid, 0, sizeof(ctx->previous_route_valid));
+        memset(ctx->predicted_route_valid, 0, sizeof(ctx->predicted_route_valid));
+        for (uint32_t bank = 0; bank < K3_SPECULATIVE_BANKS; bank++) {
+            ctx->speculative_layer[bank] = UINT32_MAX;
+            ctx->speculative_count[bank] = 0;
+        }
+    } else {
+        if (fwrite(id, 1, sizeof(id), fp) != sizeof(id)) goto write_error;
+        for (size_t i = 0; i < count; i++) {
+            checkpoint_hash(&hash, spans[i].data, spans[i].bytes);
+            if (fwrite(spans[i].data, 1, spans[i].bytes, fp) != spans[i].bytes) goto write_error;
+        }
+        CC_SHA256_Final(digest, &hash);
+        if (fwrite(digest, 1, sizeof(digest), fp) != sizeof(digest)) goto write_error;
+    }
+    ok = 1;
+    goto done;
+write_error:
+    set_error(err, errcap, "failed to write K3 native checkpoint");
+done:
+    free(staged);
+    pthread_mutex_unlock(&owner->execution_mutex);
+    return ok;
+}
+
+int k3_context_write_checkpoint(k3_context *ctx, FILE *fp, uint32_t rows,
+                                const int *tokens, float *logits, char *err, size_t errcap) {
+    return transfer_checkpoint(ctx, fp, rows, tokens, logits, false, err, errcap);
+}
+
+int k3_context_read_checkpoint(k3_context *ctx, FILE *fp, uint32_t rows,
+                               const int *tokens, float *logits, char *err, size_t errcap) {
+    return transfer_checkpoint(ctx, fp, rows, tokens, logits, true, err, errcap);
 }
 
 void k3_context_set_hidden_hook(k3_context *ctx,

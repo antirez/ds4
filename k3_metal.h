@@ -73,6 +73,7 @@ int k3_gpu_matmul_q8_0_tensor(
         const ds4_gpu_tensor *x,
         uint32_t              n_rows);
 
+bool k3_gpu_mxfp4_pair_prefill_supported(uint32_t rows);
 int k3_gpu_gguf_mxfp4_pair_situ_f32(
         ds4_gpu_tensor       *mid,
         const void           *model_map,
@@ -82,6 +83,7 @@ int k3_gpu_gguf_mxfp4_pair_situ_f32(
         const ds4_gpu_tensor *x,
         uint32_t              in_dim,
         uint32_t              out_dim,
+        uint32_t              rows,
         float                 beta,
         float                 linear_beta);
 

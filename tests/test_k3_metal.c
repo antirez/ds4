@@ -246,7 +246,7 @@ int main(void) {
     enum {
         GGUF_MXFP4_IN = 256,
         GGUF_MXFP4_OUT = 8,
-        GGUF_MXFP4_ROWS = 9,
+        GGUF_MXFP4_ROWS = 20,
         GGUF_MXFP4_ROW_BYTES = GGUF_MXFP4_IN / 32 * 17,
     };
     enum {
@@ -649,8 +649,7 @@ int main(void) {
     require_ok(ds4_gpu_tensor_write(
         gguf_mxfp4_x, 0, gguf_mxfp4_input,
         sizeof(gguf_mxfp4_input)), "GGUF MXFP4 input write");
-    for (uint32_t test_rows = 1; test_rows <= GGUF_MXFP4_ROWS;
-         test_rows += GGUF_MXFP4_ROWS - 1u) {
+    for (uint32_t test_rows = 1; test_rows <= 9; test_rows += 8) {
         require_ok(ds4_gpu_matmul_quant_tensor(
             gguf_mxfp4_out,
             model,
@@ -692,54 +691,61 @@ int main(void) {
             }
         }
     }
-    require_ok(k3_gpu_gguf_mxfp4_pair_situ_f32(
-        gguf_mxfp4_out,
-        model,
-        MAP_BYTES,
-        GGUF_MXFP4_OFF,
-        GGUF_MXFP4_UP_OFF,
-        gguf_mxfp4_x,
-        GGUF_MXFP4_IN,
-        GGUF_MXFP4_OUT,
-        4.0f,
-        25.0f), "GGUF MXFP4/F32 pair SiTU");
-    float gguf_pair_f32_actual[GGUF_MXFP4_OUT];
-    require_ok(ds4_gpu_tensor_read(
-        gguf_mxfp4_out,
-        0,
-        gguf_pair_f32_actual,
-        sizeof(gguf_pair_f32_actual)),
-        "GGUF MXFP4/F32 pair read");
-    for (uint32_t o = 0; o < GGUF_MXFP4_OUT; o++) {
-        const float gate_low = e2m1_to_f32(1u + o % 6u);
-        const float gate_high = e2m1_to_f32(9u + o % 6u);
-        const float up_low = e2m1_to_f32(6u - o % 6u);
-        const float up_high = e2m1_to_f32(14u - o % 6u);
-        float gate_sum = 0.0f;
-        float up_sum = 0.0f;
-        for (uint32_t block = 0;
-             block < GGUF_MXFP4_IN / 32u;
-             block++) {
-            for (uint32_t i = 0; i < 16u; i++) {
-                const float x_low =
-                    gguf_mxfp4_input[block * 32u + i];
-                const float x_high =
-                    gguf_mxfp4_input[block * 32u + 16u + i];
-                gate_sum += x_low * gate_low;
-                gate_sum += x_high * gate_high;
-                up_sum += x_low * up_low;
-                up_sum += x_high * up_high;
+    /* Cover scalar decode and the partial last tile of a 20-token prefill. */
+    for (uint32_t test_rows = 1; test_rows <= GGUF_MXFP4_ROWS;
+         test_rows += GGUF_MXFP4_ROWS - 1u) {
+        require_ok(k3_gpu_gguf_mxfp4_pair_situ_f32(
+            gguf_mxfp4_out,
+            model,
+            MAP_BYTES,
+            GGUF_MXFP4_OFF,
+            GGUF_MXFP4_UP_OFF,
+            gguf_mxfp4_x,
+            GGUF_MXFP4_IN,
+            GGUF_MXFP4_OUT,
+            test_rows,
+            4.0f,
+            25.0f), "GGUF MXFP4/F32 pair SiTU");
+        float gguf_pair_f32_actual[GGUF_MXFP4_ROWS * GGUF_MXFP4_OUT];
+        require_ok(ds4_gpu_tensor_read(
+            gguf_mxfp4_out,
+            0,
+            gguf_pair_f32_actual,
+            (size_t)test_rows * GGUF_MXFP4_OUT * sizeof(float)),
+            "GGUF MXFP4/F32 pair read");
+        for (uint32_t pos = 0; pos < test_rows * GGUF_MXFP4_OUT; pos++) {
+            const uint32_t o = pos % GGUF_MXFP4_OUT;
+            const float *input_row = gguf_mxfp4_input + (pos / GGUF_MXFP4_OUT) * GGUF_MXFP4_IN;
+            const float gate_low = e2m1_to_f32(1u + o % 6u);
+            const float gate_high = e2m1_to_f32(9u + o % 6u);
+            const float up_low = e2m1_to_f32(6u - o % 6u);
+            const float up_high = e2m1_to_f32(14u - o % 6u);
+            float gate_sum = 0.0f;
+            float up_sum = 0.0f;
+            for (uint32_t block = 0;
+                 block < GGUF_MXFP4_IN / 32u;
+                 block++) {
+                for (uint32_t i = 0; i < 16u; i++) {
+                    const float x_low =
+                        input_row[block * 32u + i];
+                    const float x_high =
+                        input_row[block * 32u + 16u + i];
+                    gate_sum += x_low * gate_low;
+                    gate_sum += x_high * gate_high;
+                    up_sum += x_low * up_low;
+                    up_sum += x_high * up_high;
+                }
             }
+            const float expected =
+                4.0f * tanhf(gate_sum / 4.0f) /
+                (1.0f + expf(-gate_sum)) *
+                (25.0f * tanhf(up_sum / 25.0f));
+            require_close(
+                "GGUF MXFP4/F32 pair SiTU",
+                gguf_pair_f32_actual[pos],
+                expected,
+                1e-3f);
         }
-        const float expected =
-            4.0f * tanhf(gate_sum / 4.0f) /
-            (1.0f + expf(-gate_sum)) *
-            (25.0f * tanhf(up_sum / 25.0f));
-        require_close(
-            "GGUF MXFP4/F32 pair SiTU",
-            gguf_pair_f32_actual[o],
-            expected,
-            1e-3f);
     }
     require_ok(k3_gpu_mxfp8_quantize(
         gguf_mxfp8_values,

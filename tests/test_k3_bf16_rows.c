@@ -34,9 +34,9 @@ static int guards_intact(const uint8_t *bytes, uint64_t size,
     return 1;
 }
 
-static int test_shape(uint32_t in_dim, uint32_t out_dim) {
+static int test_shape_offset(uint32_t in_dim, uint32_t out_dim, bool misaligned) {
     const bool tiled = k3_gpu_can_tile_bf16_prefill(in_dim, out_dim, 256);
-    const uint32_t max_rows = tiled ? 256u : 8u;
+    const uint32_t max_rows = tiled ? (misaligned ? 44u : 256u) : 8u;
     enum { MAX_ROWS = 256, INPUT_OFFSET = 64, OUTPUT_OFFSET = 128, GUARD = 128 };
     const uint64_t input_row = (uint64_t)in_dim * sizeof(float);
     const uint64_t output_row = (uint64_t)out_dim * sizeof(float);
@@ -61,7 +61,9 @@ static int test_shape(uint32_t in_dim, uint32_t out_dim) {
 } while (0)
 
     CHECK(page > 0);
-    const uint64_t weight_offset = (uint64_t)page + 128u;
+    /* A four-byte displacement still permits scalar BF16 access, and
+     * exercises the fallback for an unaligned vector of four weights. */
+    const uint64_t weight_offset = (uint64_t)page + (misaligned ? 132u : 128u);
     mapping_size = (weight_offset + weight_size + GUARD + (uint64_t)page - 1u)
         / (uint64_t)page * (uint64_t)page;
     CHECK(mapping_size < (tiled ? UINT64_C(176) : UINT64_C(12)) * 1024u * 1024u);
@@ -109,11 +111,12 @@ static int test_shape(uint32_t in_dim, uint32_t out_dim) {
 
     const char *prefill_setting = getenv("K3_EXPERIMENTAL_PREFILL_KERNELS");
     const bool short_tiles = !prefill_setting || strcmp(prefill_setting, "1") == 0;
-    const uint32_t tile_rows[] = {16, 44, 64, 256};
+    const uint32_t tile_rows[] = {16, 40, 44, 48, 64, 256};
     CHECK(!k3_gpu_can_tile_bf16_prefill(in_dim, out_dim, 45));
     const uint32_t cases = tiled ? sizeof(tile_rows) / sizeof(tile_rows[0]) : max_rows;
     for (uint32_t i = 0; i < cases; ++i) {
         const uint32_t rows = tiled ? tile_rows[i] : i + 1u;
+        if (misaligned && rows != max_rows) continue;
         if (tiled && rows != 256u) {
             CHECK(k3_gpu_can_tile_bf16_prefill(in_dim, out_dim, rows) == short_tiles);
             if (!short_tiles) continue;
@@ -200,6 +203,10 @@ cleanup:
 #undef CHECK
 }
 
+static int test_shape(uint32_t in_dim, uint32_t out_dim) {
+    return test_shape_offset(in_dim, out_dim, false);
+}
+
 int main(int argc, char **argv) {
     const bool resident = argc == 2 && strcmp(argv[1], "--resident") == 0;
     if (argc > 2 || (argc == 2 && !resident)) {
@@ -216,7 +223,11 @@ int main(int argc, char **argv) {
                    test_shape(1024, 4096) && test_shape(1025, 4097) &&
                    test_shape(128, 17) && test_shape(128, 1031) &&
                    test_shape(1024, 96) &&
-                   (!k3_gpu_can_tile_bf16_prefill(1536, 18432, 256) || test_shape(1536, 18432));
+                   (!k3_gpu_can_tile_bf16_prefill(1536, 18432, 256) ||
+                    (test_shape(1536, 18432) && test_shape(7168, 12288) &&
+                     test_shape(12288, 7168) &&
+                     (!k3_gpu_can_tile_bf16_prefill(7168, 12288, 44) ||
+                      test_shape_offset(7168, 12288, true))));
     ds4_gpu_cleanup();
     if (ok) puts("K3 BF16 batched rows match single-token projections exactly");
     return ok ? 0 : 1;

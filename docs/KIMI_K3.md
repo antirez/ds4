@@ -150,14 +150,23 @@ embeddings and the output head. The cache is tied to that file's identity,
 size and timestamps; the loader checks header/index CRCs and each decoded
 block's CRC, and rejects changed or corrupt data.
 
-On an M1 Max, `--ssd-streaming` uses the 4×4 BF16 prefill kernel by default
+On an M1 Max, `--ssd-streaming` uses tiled BF16 prefill kernels by default
 for supported projections with 16 to 64 rows in multiples of four.
 Set `K3_EXPERIMENTAL_PREFILL_KERNELS=0` to use the previous kernel for
-comparison. In a 44-token prefill with a 10 GiB expert cache and the
-lossless sidecar, GPU time for the 417 affected projections fell from 4.16 to
+comparison. In the initial 4×4 implementation, a 44-token prefill with a
+10 GiB expert cache and the lossless sidecar reduced GPU time for the 417
+affected projections from 4.16 to
 2.25 seconds. Full prefill took 141.69 and 102.93 seconds for the reference
 and trial. With the trial run first, it took 138.47 seconds and the reference
 took 111.39. All compared FP32 logits matched bit for bit.
+
+On the M1 Max, 40-, 44- and 48-row blocks can share BF16 projection weights
+in threadgroup memory for the KDA input/output and MLA Q-up projections.
+The shared-expert MXFP4 kernel combines gate, up and SiTU for streamed blocks
+of 16 to 64 rows in multiples of four. The routed Q2_K down projection uses
+its fixed GGUF row stride for 16 to 64 rows. These paths use the same prefill
+switch and preserve the original FP32 reduction order. Each processes fresh
+prompt activations.
 
 For decode kernel A/B tests on an M1 Max, set
 `K3_EXPERIMENTAL_DECODE_KERNELS=1` with `--ssd-streaming` to try the

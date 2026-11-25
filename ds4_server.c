@@ -22965,6 +22965,40 @@ static void test_kv_cache_eviction_makes_room_before_store(void) {
     rmdir(dir);
 }
 
+/* A v1 prefix remains readable if upgrading it to a larger native snapshot
+ * fails. Other files may be evicted to make room for the atomic replacement. */
+static void test_kv_cache_eviction_during_format_upgrade(void) {
+    char tmpl[] = "/tmp/ds4-kv-upgrade-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    const char *old_sha = "1111111111111111111111111111111111111111";
+    const char *other_sha = "2222222222222222222222222222222222222222";
+    uint64_t now = (uint64_t)time(NULL);
+    test_kv_stub_file(dir, old_sha, KV_REASON_COLD, 32, 0, now, 512);
+    test_kv_stub_file(dir, other_sha, KV_REASON_COLD, 2048, 10, now, 1024);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    kc.budget_bytes = 4096;
+    char *old_path = ds4_kvstore_path_for_sha(&kc, old_sha);
+    char *other_path = ds4_kvstore_path_for_sha(&kc, other_sha);
+    ds4_kvstore_eviction_context incoming = {.replace_path = old_path};
+    kv_cache_evict(&kc, NULL, kc.budget_bytes + 1, &incoming);
+    TEST_ASSERT(access(old_path, F_OK) == 0 && access(other_path, F_OK) == 0);
+    kv_cache_evict(&kc, NULL, kc.budget_bytes, &incoming);
+    TEST_ASSERT(access(old_path, F_OK) == 0 && access(other_path, F_OK) != 0);
+
+    kv_cache_close(&kc);
+    unlink(old_path);
+    unlink(other_path);
+    free(old_path);
+    free(other_path);
+    rmdir(dir);
+}
+
 static void test_kv_cache_eviction_ignores_oversize_incoming(void) {
     char tmpl[] = "/tmp/ds4-kv-oversize-store-evict-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -24015,6 +24049,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_prefers_anchor_reason();
     test_kv_cache_eviction_makes_room_before_store();
     test_kv_cache_eviction_ignores_oversize_incoming();
+    test_kv_cache_eviction_during_format_upgrade();
     test_kv_cache_eviction_prefers_superseded_continued_prefix();
     test_kv_cache_eviction_keeps_smaller_context_prefix();
     test_kv_cache_eviction_score_decays_stale_hits();

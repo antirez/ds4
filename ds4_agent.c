@@ -5244,13 +5244,13 @@ static bool agent_kv_load_path(agent_worker *w, const char *path,
             ok = false;
         }
         ds4_tokens_free(&rebuilt);
-    } else if (ok &&
-               ds4_session_load_payload(w->session, fp, hdr.payload_bytes,
-                                        load_err, sizeof(load_err)) != 0)
-    {
-        snprintf(err, err_len, "%s", load_err[0] ? load_err : "failed to load KV payload");
-        ds4_session_invalidate(w->session);
-        ok = false;
+    } else if (ok) {
+        int rc = ds4_session_load_payload(w->session, fp, hdr.payload_bytes, load_err, sizeof(load_err));
+        if (rc != 0) {
+            snprintf(err, err_len, "%s", load_err[0] ? load_err : "failed to load KV payload");
+            if (rc != DS4_SESSION_LOAD_UNCHANGED) ds4_session_invalidate(w->session);
+            ok = false;
+        }
     }
     fclose(fp);
 

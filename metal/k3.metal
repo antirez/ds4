@@ -424,6 +424,65 @@ kernel k3_bf16_prefill_tiles_t k3_bf16_prefill_tiles<8,2>;
 template [[host_name("kernel_k3_bf16_prefill_tiles4x4")]]
 kernel k3_bf16_prefill_tiles_t k3_bf16_prefill_tiles<4,4>;
 
+/* Each SIMD group computes four prompt rows against the same four output
+ * channels. Stage their weights once per threadgroup. Keep the lane-local
+ * FP32 FMA sequence and SIMD reduction of the ordinary 4x4 tile. */
+kernel void kernel_k3_bf16_prefill_shared_weights(
+        constant k3_matmul_args &args, device const ushort *weights,
+        device const float *x, device float *out,
+        uint2 group [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort nsg [[simdgroups_per_threadgroup]]) {
+    constexpr uint width = 2048;
+    threadgroup float staged[4 * width];
+    const uint first_channel = group.x * 4u;
+    const uint first_token = sg * 4u;
+    float sums[4][4] = {};
+    for (uint base = 0; base < args.in_dim; base += width) {
+        const uint live = min(width, args.in_dim - base);
+        for (uint i = uint(tid) * 4u; i < 4u * live; i += uint(nsg) * 128u) {
+            const uint channel = i / live, k = i % live;
+            device const ushort *src = weights +
+                (ulong)(first_channel + channel) * args.in_dim + base + k;
+            const ushort4 packed = *(device const ushort4 *)src;
+            *(threadgroup float4 *)(staged + channel * width + k) =
+                as_type<float4>(uint4(packed) << 16u);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint k = lane; k < live; k += 128u) {
+            float w[4][4];
+            #pragma unroll
+            for (uint c = 0; c < 4; c++) {
+                #pragma unroll
+                for (uint j = 0; j < 4; j++)
+                    w[c][j] = staged[c * width + k + 32u * j];
+            }
+            #pragma unroll
+            for (uint r = 0; r < 4; r++) {
+                device const float *row = x + (ulong)(first_token + r) * args.in_dim + base + k;
+                #pragma unroll
+                for (uint j = 0; j < 4; j++) {
+                    const float value = row[32u * j];
+                    #pragma unroll
+                    for (uint c = 0; c < 4; c++)
+                        sums[r][c] = fma(w[c][j], value, sums[r][c]);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    #pragma unroll
+    for (uint r = 0; r < 4; r++) {
+        #pragma unroll
+        for (uint c = 0; c < 4; c++) {
+            const float sum = simd_sum(sums[r][c]);
+            if (lane == 0) out[(ulong)(first_token + r) * args.out_dim + first_channel + c] = sum;
+        }
+    }
+}
+
 /* Reuse the same FP32 arithmetic for four independent QKVG projections. */
 template <ushort rows_per_group>
 kernel void kernel_k3_mul_mv4_bf16_f32_rows(

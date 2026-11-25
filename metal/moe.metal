@@ -6204,7 +6204,7 @@ kernel void kernel_mul_mv_slots6_q2_K_sum6_f32(
     (void)tgpig;
 }
 
-template<bool k3_decode>
+template<bool k3_shape, bool fixed_row_stride = false>
 kernel void kernel_mul_mv_addr_q2_K_sum6(
         constant ds4_metal_args_mul_mv_id & args,
         device const uint64_t * addrs,
@@ -6219,6 +6219,8 @@ kernel void kernel_mul_mv_addr_q2_K_sum6(
     const short NSG = FC_mul_mv_nsg;
     const short nr0 = N_R0_Q2_K;
     const int nb = args.ne00 / QK_K;
+    // A 3072-wide K3 expert row packs exactly twelve 84-byte Q2_K blocks.
+    const ulong row_bytes = fixed_row_stride ? 12u * sizeof(block_q2_K) : args.nb01;
     const int first_row = (tgpig.x * NSG + sgitg) * nr0;
     const uint token = tgpig.y;
     device const char *token_src1 = src1 + (uint64_t)token * args.nb12;
@@ -6236,14 +6238,14 @@ kernel void kernel_mul_mv_addr_q2_K_sum6(
     // The 16 routed slots fit in one SIMDgroup. Each lane loads one address
     // and broadcasts it when that slot contributes to the ordered reduction.
     ulong lane_address = 0;
-    if (k3_decode && tiisg < 16) {
+    if (k3_shape && tiisg < 16) {
         const int expert = token_ids[tiisg];
         if (expert >= 0 && expert < args.ne02 && expert < 1024) lane_address = addrs[expert];
     }
-    const int slots = k3_decode ? 16 : args.nei0;
+    const int slots = k3_shape ? 16 : args.nei0;
     for (int expert_slot = 0; expert_slot < slots; expert_slot++) {
         ulong addr;
-        if (k3_decode) {
+        if (k3_shape) {
             const uint2 words = as_type<uint2>(lane_address);
             addr = as_type<ulong>(uint2(simd_broadcast(words.x, expert_slot),
                                         simd_broadcast(words.y, expert_slot)));
@@ -6258,11 +6260,11 @@ kernel void kernel_mul_mv_addr_q2_K_sum6(
         device const char *src0_cur =
             reinterpret_cast<device const char *>(addr);
         device const block_q2_K *x =
-            (device const block_q2_K *)(src0_cur + first_row * args.nb01);
+            (device const block_q2_K *)(src0_cur + first_row * row_bytes);
         device const float *y = (device const float *)(token_src1 + expert_slot * args.nb11);
         device const float *y4 = y + ix * QK_K + 128 * iq + 8 * ir;
 
-        for (int ib = ix; ib < (k3_decode ? 12 : nb); ib += 4) {
+        for (int ib = ix; ib < (k3_shape ? 12 : nb); ib += 4) {
             float yl[32];
             float4 sumy = {0.f, 0.f, 0.f, 0.f};
             for (short i = 0; i < 8; ++i) {
@@ -6277,7 +6279,7 @@ kernel void kernel_mul_mv_addr_q2_K_sum6(
             device const half     *dh = &x[ib].d;
 
             for (short row = 0; row < nr0; row++) {
-                if (k3_decode || first_row + row < args.ne0) {
+                if (k3_shape || first_row + row < args.ne0) {
                     float4 acc1 = {0.f, 0.f, 0.f, 0.f};
                     float4 acc2 = {0.f, 0.f, 0.f, 0.f};
                     for (int i = 0; i < 8; i += 2) {
@@ -6299,16 +6301,16 @@ kernel void kernel_mul_mv_addr_q2_K_sum6(
                                  dmin * (sumy[0] * (sc[0] & 0xF0) + sumy[1] * (sc[2] & 0xF0) +
                                          sumy[2] * (sc[4] & 0xF0) + sumy[3] * (sc[6] & 0xF0));
                 }
-                qs += args.nb01 / 2;
-                sc += args.nb01;
-                dh += args.nb01 / 2;
+                qs += row_bytes / 2;
+                sc += row_bytes;
+                dh += row_bytes / 2;
             }
             y4 += 4 * QK_K;
         }
     }
 
     device float * dst_f32 = (device float *)(dst + (uint64_t)token * args.nb1);
-    for (int row = 0; row < nr0 && (k3_decode || first_row + row < args.ne0); row++) {
+    for (int row = 0; row < nr0 && (k3_shape || first_row + row < args.ne0); row++) {
         const float sum_all = simd_sum(sumf[row]);
         if (tiisg == 0) dst_f32[first_row + row] = sum_all;
     }
@@ -6323,6 +6325,9 @@ template [[host_name("kernel_mul_mv_addr_q2_K_sum6_f32")]]
 kernel k3_q2_route_t kernel_mul_mv_addr_q2_K_sum6<false>;
 template [[host_name("kernel_k3_q2_down_decode_f32")]]
 kernel k3_q2_route_t kernel_mul_mv_addr_q2_K_sum6<true>;
+
+template [[host_name("kernel_k3_q2_down_prefill_f32")]]
+kernel k3_q2_route_t kernel_mul_mv_addr_q2_K_sum6<true, true>;
 
 kernel void kernel_mul_mv_addr_q2_K_sum6_masked_f32(
         constant ds4_metal_args_mul_mv_id & args,

@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #include "ds4_gpu.h"
 #include "k3_model.h"
@@ -88,6 +89,16 @@ void k3_context_set_hidden_hook(k3_context *ctx,
                                 k3_hidden_hook_fn fn,
                                 void *ud);
 uint32_t k3_context_position(const k3_context *ctx);
+/* Native Metal GGUF checkpoints. The session layer owns the token prefix and
+ * common version header. These routines stream the remaining payload. */
+bool k3_context_checkpoint_supported(const k3_context *ctx);
+bool k3_context_checkpoint_model_matches(k3_context *ctx, FILE *fp);
+bool k3_checkpoint_staging_fits(uint64_t bytes);
+uint64_t k3_context_checkpoint_bytes(const k3_context *ctx, uint32_t rows);
+int k3_context_write_checkpoint(k3_context *ctx, FILE *fp, uint32_t rows,
+                                const int *tokens, float *logits, char *err, size_t errcap);
+int k3_context_read_checkpoint(k3_context *ctx, FILE *fp, uint32_t rows,
+                               const int *tokens, float *logits, char *err, size_t errcap);
 uint32_t k3_context_capacity(const k3_context *ctx);
 uint32_t k3_context_prefill_capacity(const k3_context *ctx);
 /* Admitted shared GGUF expert-cache capacity, before lazy slab allocation. */

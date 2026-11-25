@@ -33576,13 +33576,20 @@ static int ds4_gpu_encode_mul_mv_addr_q2_sum6(
     const NSUInteger rows_per_group = (NSUInteger)args->nr0 * nsg;
     const NSUInteger row_groups = ((NSUInteger)args->ne01 + rows_per_group - 1u) / rows_per_group;
 
-    if (g_k3_experimental_decode_kernels && g_ssd_streaming_mode &&
+    if (g_ssd_streaming_mode &&
         args->ne00 == 3072 && args->ne01 == 3584 && args->ne0 == 3584 &&
-        args->ne02 == 896 && args->nei0 == 16 && args->nei1 == 1 && args->nr0 == 4 &&
+        args->ne02 == 896 && args->nei0 == 16 && args->nr0 == 4 &&
         nsg == 2 && ds4_gpu_device_name_contains("Apple M1 Max")) {
-        id<MTLComputePipelineState> scalar =
-            ds4_gpu_get_mul_mv_pipeline("kernel_k3_q2_down_decode_f32", 2);
-        if (scalar && scalar.maxTotalThreadsPerThreadgroup >= 64) pipeline = scalar;
+        const char *kernel = NULL;
+        if (args->nei1 == 1 && g_k3_experimental_decode_kernels)
+            kernel = "kernel_k3_q2_down_decode_f32";
+        else if (g_k3_experimental_prefill_kernels && args->nei1 >= 16 &&
+                 args->nei1 <= 64 && args->nb01 == 12u * 84u)
+            kernel = "kernel_k3_q2_down_prefill_f32";
+        if (kernel) {
+            id<MTLComputePipelineState> specialized = ds4_gpu_get_mul_mv_pipeline(kernel, 2);
+            if (specialized && specialized.maxTotalThreadsPerThreadgroup >= 64) pipeline = specialized;
+        }
     }
     id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
     [enc setComputePipelineState:pipeline];
@@ -52012,8 +52019,17 @@ static int k3_gpu_matmul_bf16_impl(
                  * single token; retain the original path for small grids. */
                 kernel = "kernel_k3_mul_mv_bf16_f32_unroll8";
             }
-            id<MTLComputePipelineState> pipeline =
-                ds4_gpu_get_pipeline(kernel);
+            /* One SIMD group covers four token rows. Only use the cooperative
+             * tile on the measured M1 Max shapes with aligned vector loads. */
+            const bool shared_shape = short_tile &&
+                n_rows >= 40u && n_rows <= 48u &&
+                !(weight_inner & 7u) && g_device.maxThreadgroupMemoryLength >= 32768u;
+            id<MTLComputePipelineState> pipeline = shared_shape ?
+                ds4_gpu_get_pipeline("kernel_k3_bf16_prefill_shared_weights") : nil;
+            const NSUInteger shared_threads = 32u * (n_rows / 4u);
+            const bool shared = pipeline && pipeline.threadExecutionWidth == 32u &&
+                pipeline.maxTotalThreadsPerThreadgroup >= shared_threads;
+            if (!shared) pipeline = ds4_gpu_get_pipeline(kernel);
             if (!pipeline) return 0;
             k3_gpu_matmul_args args = {
                 .in_dim = in_dim,
@@ -52032,10 +52048,10 @@ static int k3_gpu_matmul_bf16_impl(
             const NSUInteger output_groups = tiled ? ((NSUInteger)out_dim / (nsg * tile_channels)) * 4u :
                 ((NSUInteger)out_dim + channels_per_group - 1u) / channels_per_group;
             const NSUInteger token_tile = tiled ? (short_tile ? 4u : 8u) * 4u : rows_per_group;
-            [enc dispatchThreadgroups:MTLSizeMake(output_groups,
-                    ((NSUInteger)n_rows + token_tile - 1u) / token_tile, 1)
-                threadsPerThreadgroup:MTLSizeMake(
-                    32u * nsg, 1, 1)];
+            const MTLSize grid = shared ? MTLSizeMake(out_dim / 4u, 1, 1) :
+                MTLSizeMake(output_groups, ((NSUInteger)n_rows + token_tile - 1u) / token_tile, 1);
+            [enc dispatchThreadgroups:grid
+                threadsPerThreadgroup:MTLSizeMake(shared ? shared_threads : 32u * nsg, 1, 1)];
             ds4_gpu_end_compute_encoder(cb, enc);
             return ds4_gpu_finish_command_buffer(
                 cb, owned, "K3 BF16 matrix-vector multiply");
@@ -52829,6 +52845,13 @@ int k3_gpu_gguf_mxfp4_pair_situ(
     }
 }
 
+bool k3_gpu_mxfp4_pair_prefill_supported(uint32_t rows) {
+    /* The unfused path uses the same eight-lane dot on 8- and 4-row pieces. */
+    return g_ssd_streaming_mode && g_k3_experimental_prefill_kernels &&
+           rows >= 16u && rows <= 64u && rows % 4u == 0u &&
+           ds4_gpu_device_name_contains("Apple M1 Max");
+}
+
 int k3_gpu_gguf_mxfp4_pair_situ_f32(
         ds4_gpu_tensor       *mid,
         const void           *model_map,
@@ -52838,11 +52861,12 @@ int k3_gpu_gguf_mxfp4_pair_situ_f32(
         const ds4_gpu_tensor *x,
         uint32_t              in_dim,
         uint32_t              out_dim,
+        uint32_t              rows,
         float                 beta,
         float                 linear_beta) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     uint64_t row_bytes = 0, weight_bytes = 0;
-    if (!mid || !x || !model_map || in_dim == 0 || out_dim == 0 ||
+    if (!mid || !x || !model_map || in_dim == 0 || out_dim == 0 || rows == 0 ||
         (in_dim % 128u) != 0u || beta <= 0.0f ||
         !ds4_gpu_quant_row_bytes(
             DS4_METAL_TENSOR_MXFP4, in_dim, &row_bytes) ||
@@ -52851,8 +52875,8 @@ int k3_gpu_gguf_mxfp4_pair_situ_f32(
         weight_bytes > model_size - gate_offset ||
         up_offset > model_size ||
         weight_bytes > model_size - up_offset ||
-        !k3_gpu_tensor_has(x, in_dim, sizeof(float)) ||
-        !k3_gpu_tensor_has(mid, out_dim, sizeof(float))) {
+        !k3_gpu_tensor_has(x, (uint64_t)rows * in_dim, sizeof(float)) ||
+        !k3_gpu_tensor_has(mid, (uint64_t)rows * out_dim, sizeof(float))) {
         fprintf(stderr,
                 "ds4: K3 fused generic MXFP4 pair received invalid buffers\n");
         return 0;
@@ -52865,15 +52889,18 @@ int k3_gpu_gguf_mxfp4_pair_situ_f32(
         id<MTLBuffer> up = k3_gpu_weight_buffer(
             model_map, model_size, up_offset, weight_bytes,
             &up_inner, "generic MXFP4 up");
-        const int16_t nsg = g_mxfp4_mv_nsg;
-        const int16_t nxpsg = g_mxfp4_mv_nxpsg != 0
+        const uint32_t rows_per_tile = rows == 1u ? 1u : 8u;
+        const int16_t nsg = rows == 1u ? g_mxfp4_mv_nsg : 2;
+        const int16_t nxpsg = rows > 1u ? ds4_gpu_mv_ext_nxpsg(in_dim, 8u)
+            : g_mxfp4_mv_nxpsg != 0
             ? g_mxfp4_mv_nxpsg
             : in_dim == 7168u && out_dim == 6144u
             ? 32
             : ds4_gpu_mv_ext_nxpsg(in_dim, 1u);
         id<MTLComputePipelineState> pipeline =
             ds4_gpu_get_mul_mv_ext_pipeline(
-                "kernel_mul_mv_ext_mxfp4_pair_situ_f32_r1_1",
+                rows == 1u ? "kernel_mul_mv_ext_mxfp4_pair_situ_f32_r1_1"
+                           : "kernel_k3_mxfp4_pair_situ_rows8",
                 nsg,
                 nxpsg);
         if (!gate || !up || !pipeline) return 0;
@@ -52881,7 +52908,7 @@ int k3_gpu_gguf_mxfp4_pair_situ_f32(
         const uint64_t r0ptg = (uint64_t)nypsg * (uint64_t)nsg;
         ds4_gpu_mul_mv_ext_args args =
             ds4_gpu_make_mv_ext_args(
-                in_dim, out_dim, 1u, row_bytes, row_bytes);
+                in_dim, out_dim, rows, row_bytes, row_bytes);
         struct {
             float beta;
             float linear_beta;
@@ -52905,7 +52932,7 @@ int k3_gpu_gguf_mxfp4_pair_situ_f32(
         [enc dispatchThreadgroups:MTLSizeMake(
                 ((NSUInteger)out_dim + (NSUInteger)r0ptg - 1u) /
                     (NSUInteger)r0ptg,
-                1,
+                ((NSUInteger)rows + rows_per_tile - 1u) / rows_per_tile,
                 1)
             threadsPerThreadgroup:MTLSizeMake(
                 32, (NSUInteger)nsg, 1)];

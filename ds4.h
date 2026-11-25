@@ -664,10 +664,19 @@ int ds4_session_eval_output_head_from_hc(ds4_session *s,
 uint64_t ds4_session_payload_bytes(ds4_session *s);
 int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
                               char *err, size_t errlen);
+/* Compact K3 token-replay encoding for stores whose quota cannot fit native state. */
+int ds4_session_stage_k3_replay_payload(ds4_session *s, ds4_session_payload_file *out,
+                                        char *err, size_t errlen);
 int ds4_session_write_staged_payload(const ds4_session_payload_file *payload,
                                      FILE *fp, char *err, size_t errlen);
 void ds4_session_payload_file_free(ds4_session_payload_file *payload);
+/* Check whether the KV store can retain an existing on-disk payload on save.
+ * fp starts at the payload and may be advanced. */
+bool ds4_session_cached_payload_current(ds4_session *s, FILE *fp, uint64_t bytes, bool k3_replay);
 int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen);
+/* A rejected transactional load leaves the caller's live session intact.
+ * Other nonzero return codes may have partially updated the backend state. */
+#define DS4_SESSION_LOAD_UNCHANGED 2
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen);
 int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *err, size_t errlen);
 int ds4_session_load_snapshot(ds4_session *s, const ds4_session_snapshot *snap, char *err, size_t errlen);
