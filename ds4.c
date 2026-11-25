@@ -47428,8 +47428,21 @@ typedef struct ds4_glm_gpu_graph {
     ds4_gpu_tensor *mtp_concat;
     ds4_gpu_tensor *mtp_selected;
     ds4_gpu_tensor *mtp_state_backup;
+    /* GLM-5.3 MTP reject replay (llama.cpp #31669 idea): the raw row-0 KDA
+     * inputs of the last verify, one slot per KDA layer, so a rejected draft
+     * replays the kept token through the KDA layers instead of re-running
+     * the whole model forward. */
+    ds4_gpu_tensor *mtp_replay_pending;
+    /* Row-0 indexer k/gate of the same verify pass, one slot per DSA layer,
+     * so the reject replay can also redo the indexer pool update of the kept
+     * row (the state restore rewinds the tails past it). */
+    ds4_gpu_tensor *mtp_replay_indexer_pending;
     float          *mtp_logits_host;
     int             mtp_ready;
+    bool            mtp_replay_capture;
+    bool            mtp_replay_captured;
+    uint32_t        mtp_replay_kda_layers;
+    uint32_t        mtp_replay_dsa_layers;
     ds4_gpu_tensor *layer_indexer_key_cache[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_indexer_tail_k[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_indexer_tail_gate[DS4_MAX_LAYER];
@@ -49233,14 +49246,22 @@ static void glm_graph_free(ds4_glm_gpu_graph *g) {
     ds4_gpu_tensor_free(g->mtp_concat);
     ds4_gpu_tensor_free(g->mtp_selected);
     ds4_gpu_tensor_free(g->mtp_state_backup);
+    ds4_gpu_tensor_free(g->mtp_replay_pending);
+    ds4_gpu_tensor_free(g->mtp_replay_indexer_pending);
     free(g->mtp_logits_host);
     g->mtp_kv_lora_cache = NULL;
     g->mtp_k_rope_cache = NULL;
     g->mtp_concat = NULL;
     g->mtp_selected = NULL;
     g->mtp_state_backup = NULL;
+    g->mtp_replay_pending = NULL;
+    g->mtp_replay_indexer_pending = NULL;
     g->mtp_logits_host = NULL;
     g->mtp_ready = 0;
+    g->mtp_replay_capture = false;
+    g->mtp_replay_captured = false;
+    g->mtp_replay_kda_layers = 0;
+    g->mtp_replay_dsa_layers = 0;
     for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
         ds4_gpu_tensor_free(g->layer_kda_conv_state[il]);
         ds4_gpu_tensor_free(g->layer_kda_recurrent_state[il]);
@@ -50211,6 +50232,11 @@ static bool glm53_graph_hc_pre_rows(
     return ok;
 }
 
+static bool glm53_graph_mtp_capture_replay_inputs(ds4_glm_gpu_graph *g,
+                                                   uint32_t il);
+static bool glm53_graph_mtp_capture_indexer_inputs(ds4_glm_gpu_graph *g,
+                                                   uint32_t il);
+
 static bool glm53_graph_kda_attention_rows(
         ds4_glm_gpu_graph       *g,
         const ds4_model         *model,
@@ -50295,6 +50321,11 @@ static bool glm53_graph_kda_attention_rows(
             (uint64_t)rows * projection, il, pos0);
     if (ok) failed_stage = "KDA recurrence";
     if (ok) failed_weight = NULL;
+    /* A failed capture only costs this cycle its replay: the verify's
+     * layer count no longer matches and a rejection re-runs the forward. */
+    if (ok && g->mtp_replay_capture) {
+        g->mtp_replay_capture = glm53_graph_mtp_capture_replay_inputs(g, il);
+    }
     if (ok) ok = ds4_gpu_glm53_kda_prefill(
             g->batch_kda_out,
             g->layer_kda_conv_state[il],
@@ -53525,6 +53556,239 @@ static bool glm53_graph_copy_spec_state(
     return ok && offset == expected;
 }
 
+/* Replay instead of rollback for GLM-5.3 MTP rejections (ported from the
+ * llama.cpp #31669 idea).  DS4_GLM53_MTP_REPLAY=0 keeps the old restore +
+ * full-model re-forward for comparisons.  Read per call so one process can
+ * A/B both modes (ds4_test). */
+static bool glm53_mtp_replay_enabled(void) {
+    const char *env = getenv("DS4_GLM53_MTP_REPLAY");
+    return !(env && env[0] && strcmp(env, "0") == 0);
+}
+
+/* One pending slot: the raw row-0 KDA inputs of a layer.  The decode kernel
+ * consumes exactly these (the prefill prepare pass rewrites q/k/v and the
+ * gate in place, so the raw values must be captured before it runs). */
+static uint64_t glm53_graph_mtp_replay_slot_floats(void) {
+    return 5ull * DS4_N_KDA_HEAD * DS4_N_KDA_HEAD_DIM + DS4_N_KDA_HEAD;
+}
+
+static uint64_t glm53_graph_mtp_replay_slot_offset(const ds4_glm_gpu_graph *g,
+                                                   uint32_t il) {
+    uint64_t slot = 0;
+    for (uint32_t j = g->layer_start; j < il; j++) {
+        if (ds4_glm53_layer_is_kda(j)) slot++;
+    }
+    return slot * glm53_graph_mtp_replay_slot_floats() * sizeof(float);
+}
+
+static bool glm53_graph_mtp_capture_replay_inputs(ds4_glm_gpu_graph *g,
+                                                   uint32_t il) {
+    const uint64_t row_bytes =
+        (uint64_t)DS4_N_KDA_HEAD * DS4_N_KDA_HEAD_DIM * sizeof(float);
+    const uint64_t beta_bytes = (uint64_t)DS4_N_KDA_HEAD * sizeof(float);
+    if (!g->mtp_replay_pending) return false;
+    const uint64_t base = glm53_graph_mtp_replay_slot_offset(g, il);
+    if (base + glm53_graph_mtp_replay_slot_floats() * sizeof(float) >
+        ds4_gpu_tensor_bytes(g->mtp_replay_pending)) {
+        return false;
+    }
+    const ds4_gpu_tensor *src[5] = {
+        g->batch_kda_q, g->batch_kda_k, g->batch_kda_v,
+        g->batch_kda_raw_gate, g->batch_kda_output_gate,
+    };
+    for (uint32_t i = 0; i < 5; i++) {
+        if (!src[i] ||
+            ds4_gpu_tensor_copy(g->mtp_replay_pending,
+                                base + (uint64_t)i * row_bytes,
+                                src[i], 0, row_bytes) == 0) {
+            return false;
+        }
+    }
+    if (!g->batch_kda_raw_beta ||
+        ds4_gpu_tensor_copy(g->mtp_replay_pending,
+                            base + 5ull * row_bytes,
+                            g->batch_kda_raw_beta, 0, beta_bytes) == 0) {
+        return false;
+    }
+    g->mtp_replay_kda_layers++;
+    return true;
+}
+
+/* Row 0 of the DSA indexer projections of layer il.  The pool update kernel
+ * consumes these without modifying them, and the state restore rewinds the
+ * tails past the kept row, so the reject replay must redo its pool update. */
+static uint64_t glm53_graph_mtp_replay_indexer_slot_floats(void) {
+    return 2ull * DS4_N_INDEXER_HEAD_DIM;
+}
+
+static uint64_t glm53_graph_mtp_replay_indexer_slot_offset(
+        const ds4_glm_gpu_graph *g,
+        uint32_t il) {
+    uint64_t slot = 0;
+    for (uint32_t j = g->layer_start; j < il; j++) {
+        if (glm_graph_layer_uses_full_indexer(j)) slot++;
+    }
+    return slot * glm53_graph_mtp_replay_indexer_slot_floats() * sizeof(float);
+}
+
+static bool glm53_graph_mtp_capture_indexer_inputs(ds4_glm_gpu_graph *g,
+                                                   uint32_t il) {
+    const uint64_t row_bytes = (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+    if (!g->mtp_replay_indexer_pending) return false;
+    const uint64_t base = glm53_graph_mtp_replay_indexer_slot_offset(g, il);
+    if (base + glm53_graph_mtp_replay_indexer_slot_floats() * sizeof(float) >
+        ds4_gpu_tensor_bytes(g->mtp_replay_indexer_pending)) {
+        return false;
+    }
+    if (!g->batch_indexer_k || !g->batch_indexer_gate ||
+        ds4_gpu_tensor_copy(g->mtp_replay_indexer_pending,
+                            base,
+                            g->batch_indexer_k, 0, row_bytes) == 0 ||
+        ds4_gpu_tensor_copy(g->mtp_replay_indexer_pending,
+                            base + row_bytes,
+                            g->batch_indexer_gate, 0, row_bytes) == 0) {
+        return false;
+    }
+    g->mtp_replay_dsa_layers++;
+    return true;
+}
+
+/* Replay the kept first verify row through every KDA layer, starting from
+ * the restored (pre-verify) state.  Each call is the same single-token KDA
+ * step the decode path runs, so the result is the state the full re-forward
+ * would have produced, at a fraction of the cost. */
+static bool glm53_graph_mtp_replay_first_row(
+        ds4_glm_gpu_graph *g,
+        const ds4_model *model,
+        const ds4_weights *weights) {
+    if (!g || !g->glm53 || !g->mtp_replay_pending || !model || !weights) {
+        return false;
+    }
+    const uint64_t row_bytes =
+        (uint64_t)DS4_N_KDA_HEAD * DS4_N_KDA_HEAD_DIM * sizeof(float);
+    const uint64_t beta_bytes = (uint64_t)DS4_N_KDA_HEAD * sizeof(float);
+    bool ok = true;
+    for (uint32_t il = g->layer_start; ok && il <= g->layer_end; il++) {
+        if (!ds4_glm53_layer_is_kda(il)) continue;
+        const ds4_layer_weights *l = &weights->layer[il];
+        const uint64_t base = glm53_graph_mtp_replay_slot_offset(g, il);
+        ds4_gpu_tensor *q = ds4_gpu_tensor_view(
+                g->mtp_replay_pending, base, row_bytes);
+        ds4_gpu_tensor *k = ds4_gpu_tensor_view(
+                g->mtp_replay_pending, base + row_bytes, row_bytes);
+        ds4_gpu_tensor *v = ds4_gpu_tensor_view(
+                g->mtp_replay_pending, base + 2ull * row_bytes, row_bytes);
+        ds4_gpu_tensor *raw_gate = ds4_gpu_tensor_view(
+                g->mtp_replay_pending, base + 3ull * row_bytes, row_bytes);
+        ds4_gpu_tensor *output_gate = ds4_gpu_tensor_view(
+                g->mtp_replay_pending, base + 4ull * row_bytes, row_bytes);
+        ds4_gpu_tensor *raw_beta = ds4_gpu_tensor_view(
+                g->mtp_replay_pending, base + 5ull * row_bytes, beta_bytes);
+        if (!q || !k || !v || !raw_gate || !output_gate || !raw_beta) {
+            ok = false;
+        }
+        if (ok) {
+            ok = ds4_gpu_glm53_kda_decode(
+                     g->kda_out,
+                     g->layer_kda_conv_state[il],
+                     g->layer_kda_recurrent_state[il],
+                     q, k, v, raw_gate, raw_beta, output_gate,
+                     model->map, model->size,
+                     l->kda_q_conv->abs_offset,
+                     l->kda_k_conv->abs_offset,
+                     l->kda_v_conv->abs_offset,
+                     l->kda_a_log->abs_offset,
+                     l->kda_dt_bias->abs_offset,
+                     l->kda_o_norm->abs_offset,
+                     DS4_N_KDA_HEAD,
+                     1,
+                     DS4_KDA_GATE_LOWER_BOUND,
+                     DS4_RMS_EPS) != 0;
+        }
+        ds4_gpu_tensor_free(raw_beta);
+        ds4_gpu_tensor_free(output_gate);
+        ds4_gpu_tensor_free(raw_gate);
+        ds4_gpu_tensor_free(v);
+        ds4_gpu_tensor_free(k);
+        ds4_gpu_tensor_free(q);
+    }
+    return ok;
+}
+
+/* Redo the indexer pool update of the kept row in every DSA layer.  The
+ * restore rewinds the tails to the pre-verify state, so without this the
+ * kept row's tail slot would hold a stale value and the pool completing on
+ * it would store a wrong pooled key (visible once sparse selection reads
+ * the pool cache).  This is the exact pool update the old full re-forward
+ * performed for the kept token.  DS4_GLM53_TEST_POISON_MTP_REPLAY_POOLS
+ * skips it so ds4_test can prove its state comparison sees the stale tail. */
+static bool glm53_graph_mtp_replay_indexer_pools(
+        ds4_glm_gpu_graph *g,
+        const ds4_model *model,
+        const ds4_weights *weights,
+        uint32_t pos) {
+    if (!g || !g->glm53 || !g->mtp_replay_indexer_pending || !model ||
+        !weights) {
+        return false;
+    }
+    if (getenv("DS4_GLM53_TEST_POISON_MTP_REPLAY_POOLS") != NULL) return true;
+    const uint64_t row_bytes = (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+    bool ok = true;
+    for (uint32_t il = g->layer_start; ok && il <= g->layer_end; il++) {
+        if (!glm_graph_layer_uses_full_indexer(il)) continue;
+        const ds4_layer_weights *l = &weights->layer[il];
+        const uint64_t base = glm53_graph_mtp_replay_indexer_slot_offset(g, il);
+        ds4_gpu_tensor *k = ds4_gpu_tensor_view(
+                g->mtp_replay_indexer_pending, base, row_bytes);
+        ds4_gpu_tensor *gate = ds4_gpu_tensor_view(
+                g->mtp_replay_indexer_pending, base + row_bytes, row_bytes);
+        if (!k || !gate) {
+            ok = false;
+        }
+        if (ok) {
+            ok = ds4_gpu_glm53_indexer_pool_update_tensor(
+                    g->layer_indexer_key_cache[il],
+                    g->layer_indexer_tail_k[il],
+                    g->layer_indexer_tail_gate[il],
+                    k,
+                    gate,
+                    model->map,
+                    model->size,
+                    l->indexer_k_norm->abs_offset,
+                    l->indexer_k_norm_b->abs_offset,
+                    l->indexer_compressor_ape->abs_offset,
+                    pos,
+                    1,
+                    g->compact_cache_cap,
+                    DS4_N_INDEXER_HEAD_DIM,
+                    DS4_GLM53_INDEX_POOL_SIZE,
+                    1.0e-6f,
+                    glm_graph_compact_cache_is_f16()) != 0;
+        }
+        ds4_gpu_tensor_free(gate);
+        ds4_gpu_tensor_free(k);
+    }
+    return ok;
+}
+
+/* Reject replay of the kept verify row: restore the pre-verify state, then
+ * redo only what the restore rewound past that row.  The 34 KDA steps and
+ * 11 pool updates share one command batch instead of committing and
+ * waiting on a buffer each. */
+static bool glm53_graph_mtp_replay_kept_row(
+        ds4_glm_gpu_graph *g,
+        const ds4_model *model,
+        const ds4_weights *weights,
+        uint32_t pos) {
+    bool ok = glm53_graph_copy_spec_state(g, false) &&
+              glm_graph_begin_commands_if_needed();
+    if (ok) ok = glm53_graph_mtp_replay_first_row(g, model, weights) &&
+                 glm53_graph_mtp_replay_indexer_pools(g, model, weights, pos);
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+    return ok;
+}
+
 static bool glm_graph_mtp_ensure(ds4_glm_gpu_graph *g) {
     if (g->mtp_ready) return true;
     const uint32_t cache_cap = glm_graph_mtp_cache_cap(g);
@@ -53542,6 +53806,22 @@ static bool glm_graph_mtp_ensure(ds4_glm_gpu_graph *g) {
     const uint64_t state_backup_bytes = glm53_graph_spec_state_bytes(g);
     if (g->glm53 && state_backup_bytes != 0) {
         g->mtp_state_backup = ds4_gpu_tensor_alloc(state_backup_bytes);
+        /* Row-0 KDA and DSA-indexer inputs of one verify pass, for MTP
+         * reject replay.  A failed allocation only means rejections keep
+         * using the legacy re-forward. */
+        const uint64_t replay_slots =
+            glm53_graph_kda_layer_count_range(g->layer_start, g->layer_end);
+        g->mtp_replay_pending = ds4_gpu_tensor_alloc(
+                replay_slots * glm53_graph_mtp_replay_slot_floats() *
+                sizeof(float));
+        g->mtp_replay_indexer_pending = ds4_gpu_tensor_alloc(
+                (uint64_t)g->indexer_full_layers *
+                glm53_graph_mtp_replay_indexer_slot_floats() * sizeof(float));
+        if (!g->mtp_replay_pending || !g->mtp_replay_indexer_pending) {
+            fprintf(stderr,
+                    "ds4: glm mtp: reject replay buffers unavailable; "
+                    "rejections use the full re-forward\n");
+        }
     }
     g->mtp_logits_host = malloc((size_t)DS4_N_VOCAB * sizeof(float));
     if (!g->mtp_kv_lora_cache || !g->mtp_k_rope_cache || !g->mtp_concat ||
@@ -53561,12 +53841,16 @@ static bool glm_graph_mtp_ensure(ds4_glm_gpu_graph *g) {
         ds4_gpu_tensor_free(g->mtp_concat);
         ds4_gpu_tensor_free(g->mtp_selected);
         ds4_gpu_tensor_free(g->mtp_state_backup);
+        ds4_gpu_tensor_free(g->mtp_replay_pending);
+        ds4_gpu_tensor_free(g->mtp_replay_indexer_pending);
         free(g->mtp_logits_host);
         g->mtp_kv_lora_cache = NULL;
         g->mtp_k_rope_cache = NULL;
         g->mtp_concat = NULL;
         g->mtp_selected = NULL;
         g->mtp_state_backup = NULL;
+        g->mtp_replay_pending = NULL;
+        g->mtp_replay_indexer_pending = NULL;
         g->mtp_logits_host = NULL;
         return false;
     }
@@ -55073,6 +55357,10 @@ static bool glm_graph_forward_tokens(
                         g->batch_attn_norm,
                         n_tokens);
             }
+            if (ok && g->mtp_replay_capture) {
+                g->mtp_replay_capture =
+                    glm53_graph_mtp_capture_indexer_inputs(g, il);
+            }
             if (ok && g->glm53) {
                 ok = ds4_gpu_glm53_indexer_pool_update_tensor(
                         g->layer_indexer_key_cache[il],
@@ -56289,6 +56577,10 @@ static bool glm_graph_forward_indexed_tokens(
                         DS4_N_INDEXER_HEAD_DIM,
                         g->batch_attn_norm,
                         n_tokens);
+            }
+            if (ok && g->mtp_replay_capture) {
+                g->mtp_replay_capture =
+                    glm53_graph_mtp_capture_indexer_inputs(g, il);
             }
             if (ok && g->glm53) {
                 ok = ds4_gpu_glm53_indexer_pool_update_tensor(
@@ -77211,9 +77503,22 @@ static int ds4_session_glm_spec_cycle_impl(
     bool verified = false;
     bool state_saved = false;
     if (g->glm53) {
+        g->mtp_replay_capture = false;
+        g->mtp_replay_captured = false;
+        g->mtp_replay_kda_layers = 0;
+        g->mtp_replay_dsa_layers = 0;
         state_saved = glm_graph_mtp_ensure(g) &&
                     glm53_graph_copy_spec_state(g, true);
         if (state_saved) {
+            /* TP ranks must not diverge onto different reject paths, under
+             * SSD streaming the replay's weight reads may not map, and a
+             * multi-tier graph would need the per-layer workspace switch;
+             * all three stay on the legacy re-forward. */
+            const bool replay_capture =
+                glm53_mtp_replay_enabled() && g->mtp_replay_pending &&
+                g->mtp_replay_indexer_pending && !g->ssd_streaming &&
+                !g->placement && g->tp_world <= 1;
+            g->mtp_replay_capture = replay_capture;
             if (!glm53_graph_use_indexed_prefill(g) &&
                 glm_graph_span_fits_full_attention(g, pos, 2u)) {
                 verified = glm_graph_forward_tokens(g,
@@ -77250,6 +77555,14 @@ static int ds4_session_glm_spec_cycle_impl(
                                                              0,
                                                              2);
             }
+            g->mtp_replay_capture = false;
+            /* The capture hooks must have fired for every layer of this
+             * verify; anything else falls back to the legacy re-forward. */
+            g->mtp_replay_captured = replay_capture && verified &&
+                g->mtp_replay_kda_layers ==
+                    glm53_graph_kda_layer_count_range(g->layer_start,
+                                                      g->layer_end) &&
+                g->mtp_replay_dsa_layers == g->indexer_full_layers;
         }
     } else if (pos + 2u <= glm_graph_indexer_top_k_limit()) {
         /* GLM-5.2 verification must use the compact caches populated by
@@ -77385,16 +77698,44 @@ static int ds4_session_glm_spec_cycle_impl(
     } else {
         bool replay_ok = true;
         if (g->glm53) {
-            replay_ok = glm53_graph_copy_spec_state(g, false) &&
-                        glm_graph_forward_token(g,
-                                                &e->model,
-                                                &e->weights,
-                                                first_token,
-                                                NULL,
-                                                pos,
-                                                NULL,
-                                                s->logits,
-                                                false);
+            /* Replay instead of rollback: the verify already ran the kept
+             * row through every layer.  Restore the pre-verify state, then
+             * replay only what the restore rewound past the kept row: the
+             * KDA recurrent/conv step, and the DSA indexer pool update (a
+             * stale tail slot would poison the pooled key once the pool
+             * completes on it).  Logits come from the verify's row-0 head;
+             * hc_cur already holds the row-0 hyper-connection state from
+             * that head pass.  Anything else re-derives the kept row from
+             * the restored state with the full forward. */
+            bool replayed = false;
+            if (g->mtp_replay_captured) {
+                replayed = glm53_graph_mtp_replay_kept_row(g, &e->model,
+                                                           &e->weights, pos);
+                if (replayed) {
+                    memcpy(s->logits, s->glm_mtp_logits0,
+                           (size_t)DS4_N_VOCAB * sizeof(float));
+                } else {
+                    static bool warned = false;
+                    if (!warned) {
+                        warned = true;
+                        fprintf(stderr,
+                                "ds4: glm mtp: reject replay failed; "
+                                "using the full re-forward\n");
+                    }
+                }
+            }
+            if (!replayed) {
+                replay_ok = glm53_graph_copy_spec_state(g, false) &&
+                            glm_graph_forward_token(g,
+                                                    &e->model,
+                                                    &e->weights,
+                                                    first_token,
+                                                    NULL,
+                                                    pos,
+                                                    NULL,
+                                                    s->logits,
+                                                    false);
+            }
         } else {
             memcpy(s->logits, s->glm_mtp_logits0,
                    (size_t)DS4_N_VOCAB * sizeof(float));
