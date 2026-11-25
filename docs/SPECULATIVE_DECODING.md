@@ -89,6 +89,14 @@ GLM's draft block is already in its main GGUF:
 The current GLM cycle commits up to two tokens. No external support file is
 needed, and ordinary decode remains the default.
 
+A rejected draft replays the kept row through the KDA layers instead of
+re-running the whole model forward: the verify pass captures the row-0 KDA
+inputs, and the reject path restores the pre-verify recurrent state and
+re-runs the single-token KDA step per layer (the same idea as llama.cpp's
+GDN "replay instead of rollback"). The non-KDA caches are position-indexed
+and self-healing, so nothing else rolls back. `DS4_GLM53_MTP_REPLAY=0`
+restores the older full re-forward for comparisons.
+
 ## Qwen3.8: built-in MTP
 
 Both Qwen downloads include MTP and native BF16 n-grams in the main GGUF:
