@@ -449,8 +449,8 @@ static int static_staging_enabled(const k3_context *ctx,
     if (!ctx->model->gguf) return rows == 1u;
     if (ctx->gguf_resident) return 0;
     if (!prefill) return rows == 1u;
-    return ctx->static_cache && ctx->gguf_static_aligned &&
-        !ctx->gguf_static_resident && ctx->gguf_prefill_staging;
+    /* The layer loop skips pinned layers before scheduling a cache read. */
+    return ctx->static_cache && ctx->gguf_static_aligned && ctx->gguf_prefill_staging;
 }
 
 static uint64_t macos_physical_memory(void) {
@@ -1330,7 +1330,6 @@ static int gguf_static_cache_compatible(const k3_context *ctx) {
     const char *full = getenv("K3_GGUF_RESIDENT");
     return ctx && ctx->model && ctx->model->gguf &&
         ctx->gguf_staging_requested && ctx->gguf_static_aligned &&
-        resident_static_disabled(ctx) &&
         (!full || !full[0] || strcmp(full, "0") == 0 || strcmp(full, "auto") == 0);
 }
 
@@ -1341,7 +1340,10 @@ static int open_gguf_static_cache(k3_context *ctx, char *err, size_t errcap) {
     const char *specified = getenv("K3_GGUF_STATIC_CACHE");
     const char *path = specified;
     char discovered[PATH_MAX];
-    const int automatic = !specified && ctx && ctx->optimized_ssd_streaming;
+    /* Manual partial residency keeps its raw GGUF path unless the caller
+     * selects a sidecar for the remaining layers. */
+    const int automatic = !specified && ctx && ctx->optimized_ssd_streaming &&
+        resident_static_disabled(ctx);
     if (automatic && gguf_static_cache_compatible(ctx)) {
         if (!adjacent_gguf_static_cache_path(k3_st_path(ctx->globals.shard),
                 discovered, sizeof(discovered), err, errcap)) return 0;
@@ -1378,8 +1380,7 @@ static int open_gguf_static_cache(k3_context *ctx, char *err, size_t errcap) {
     if (path[0] != '/' || !gguf_static_cache_compatible(ctx)) {
         set_error(err, errcap,
                   "K3_GGUF_STATIC_CACHE requires an absolute path, GGUF "
-                  "staging/aligned reads, zero resident-static budget without "
-                  "a GIB override, and nonresident GGUF mode");
+                  "staging/aligned reads and a streamed GGUF");
         return 0;
     }
     k3_static_cache_span spans[K3_N_LAYER];
@@ -6274,8 +6275,8 @@ int k3_context_create(k3_context **out,
         ? 0 : resident_static_budget(ctx, allocated_tensors);
     if (ctx->model->gguf && resident_budget > gguf_budget)
         resident_budget = gguf_budget;
-    /* A requested sidecar selects the nonresident staging path. Explicit
-     * full residency was rejected before metadata open; skip auto-residency. */
+    /* A selected sidecar supplies nonresident layers. Skip whole-model
+     * residency, then budget partial pins together with its decoder below. */
     if (!ctx->static_cache && !try_pin_resident_gguf(
             ctx, resident_budget, err, errcap)) {
         k3_context_destroy(ctx);

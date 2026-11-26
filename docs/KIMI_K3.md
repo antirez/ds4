@@ -150,6 +150,13 @@ embeddings and the output head. The cache is tied to that file's identity,
 size and timestamps; the loader checks header/index CRCs and each decoded
 block's CRC, and rejects changed or corrupt data.
 
+On a Mac with room for only some static layers, set `K3_RESIDENT_STATIC=auto`
+and `K3_GGUF_STATIC_CACHE=/absolute/path/to/the.cache` with `--ssd-streaming`.
+Metal keeps the output weights and as many complete layers as fit in the
+admitted budget. The loader reads the remaining layers from the lossless
+cache into the existing staging buffers. `K3_IO_PROFILE=1` reports the
+compressed bytes read and the original GGUF bytes they represent.
+
 On an M1 Max, `--ssd-streaming` uses tiled BF16 prefill kernels by default
 for supported projections with 16 to 64 rows in multiples of four.
 Set `K3_EXPERIMENTAL_PREFILL_KERNELS=0` to use the previous kernel for

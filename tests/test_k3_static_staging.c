@@ -116,13 +116,13 @@ static void test_streaming_option_resolution(void) {
     ctx.model = &model; model.gguf = true;
     resolve_gguf_streaming_options(&ctx, true);
     assert(setenv("K3_RESIDENT_STATIC", "", 1) == 0);
-    assert(!resident_static_disabled(&ctx) && !gguf_static_cache_compatible(&ctx));
+    assert(!resident_static_disabled(&ctx) && gguf_static_cache_compatible(&ctx));
     assert(setenv("K3_RESIDENT_STATIC", "auto", 1) == 0);
     assert(!resident_static_disabled(&ctx));
     assert(setenv("K3_RESIDENT_STATIC", "0", 1) == 0);
     assert(resident_static_disabled(&ctx));
     assert(setenv("K3_RESIDENT_STATIC_GIB", "0", 1) == 0);
-    assert(!resident_static_disabled(&ctx) && !gguf_static_cache_compatible(&ctx));
+    assert(!resident_static_disabled(&ctx) && gguf_static_cache_compatible(&ctx));
     assert(setenv("K3_RESIDENT_STATIC_GIB", "", 1) == 0);
     assert(resident_static_disabled(&ctx));
     assert(setenv("K3_GGUF_RESIDENT", "1", 1) == 0);
@@ -185,6 +185,15 @@ static void test_static_cache_discovery(void) {
     assert(cache_fd >= 0);
     const unsigned char invalid[128] = {0};
     write_all(cache_fd, invalid, sizeof(invalid), 0); close(cache_fd);
+    /* A manual pin budget alone still reads the raw GGUF. Explicitly
+     * selecting the sidecar must reach validation even with that budget. */
+    assert(setenv("K3_RESIDENT_STATIC", "auto", 1) == 0);
+    assert(open_gguf_static_cache(&ctx, err, sizeof(err)));
+    assert(!ctx.static_cache);
+    assert(setenv("K3_GGUF_STATIC_CACHE", cache, 1) == 0);
+    assert(!open_gguf_static_cache(&ctx, err, sizeof(err)));
+    assert(strstr(err, cache));
+    assert(unsetenv("K3_RESIDENT_STATIC") == 0);
     assert(setenv("K3_GGUF_STATIC_CACHE", "", 1) == 0);
     resolve_gguf_streaming_options(&ctx, true);
     assert(open_gguf_static_cache(&ctx, err, sizeof(err)));
@@ -268,7 +277,10 @@ static void test_prefill_staging_policy(void) {
     REJECT_PREFILL(ctx.model, NULL);
     REJECT_PREFILL(ctx.static_staging, 0);
     REJECT_PREFILL(ctx.gguf_resident, 1);
-    REJECT_PREFILL(ctx.gguf_static_resident, 1);
+    ctx.gguf_static_resident = 1;
+    assert(static_staging_enabled(&ctx, 32u, 1));
+    assert(static_staging_enabled(&ctx, 1u, 0));
+    ctx.gguf_static_resident = 0;
     REJECT_PREFILL(ctx.gguf_static_aligned, 0);
     REJECT_PREFILL(ctx.static_cache, NULL);
 #undef REJECT_PREFILL
