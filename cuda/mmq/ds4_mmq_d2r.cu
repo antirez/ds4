@@ -3339,8 +3339,12 @@ int ds4_mmq_q8_0_dense_d2r_launch(
         fprintf(stderr, "ds4_mmq_q8_0_dense_d2r_launch: bad args M=%d N=%d K=%d\n", M, N, K);
         return -1;
     }
-    static int smem_opted = 0;
-    if (!smem_opted) {
+    // The opt-in belongs to the current card's context, so it is kept per card
+    // (with the layers split for SSD streaming both cards run this kernel).
+    static int smem_opted[16] = {0};
+    int dev = -1;
+    if (cudaGetDevice(&dev) != cudaSuccess) { (void)cudaGetLastError(); dev = -1; }
+    if (dev < 0 || dev >= 16 || !smem_opted[dev]) {
         const cudaError_t aerr = cudaFuncSetAttribute(
             dense_q8_d2r_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
             (int)kDqSmemTotalBytes);
@@ -3349,7 +3353,7 @@ int ds4_mmq_q8_0_dense_d2r_launch(
                     cudaGetErrorString(aerr));
             return -2;
         }
-        smem_opted = 1;
+        if (dev >= 0 && dev < 16) smem_opted[dev] = 1;
     }
     const uint64_t nblk = (uint64_t)M * (uint64_t)(K / 32);
     const uint64_t dq_bytes = (nblk * 2u + 63u) & ~63ull;

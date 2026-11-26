@@ -116,6 +116,8 @@ void ds4_gpu_tensor_free_in_place(ds4_gpu_tensor *t);
  * legacy ds4_gpu_tensor_alloc(bytes) which is equivalent to
  * ds4_gpu_tensor_alloc_ptr_on(0, bytes). */
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_ptr_on(int tier, uint64_t bytes);
+/* A second name for `base` whose home is `tier` (CUDA; managed storage shared by two cards' working sets). */
+ds4_gpu_tensor *ds4_gpu_tensor_view_on(const ds4_gpu_tensor *base, int tier);
 int ds4_gpu_tensor_copy_async(ds4_gpu_tensor *dst, const ds4_gpu_tensor *src, uint64_t bytes);
 void ds4_gpu_enable_q8_dequant_gemm(void);
 
