@@ -293,6 +293,228 @@ kernel void kernel_k3_mul_mv_bf16_f32_unroll16(
     if (lane == 0u) out[(ulong)token * args.out_dim + out_row] = sum;
 }
 
+/* Reuse each BF16 weight across a few token rows without changing any token's
+ * lane-local FMA sequence or its final SIMD reduction. Four-load unrolling
+ * leaves room for the independent accumulators and their input values. */
+template <ushort rows_per_group>
+inline void k3_mul_mv_bf16_f32_rows_body(
+        constant k3_matmul_args &args,
+        device const ushort     *weights,
+        device const float      *x,
+        device float            *out,
+        uint2 tgpig, ushort lane, ushort sg, ushort nsg) {
+    const uint out_row = tgpig.x * (uint)nsg + sg;
+    const uint token = tgpig.y * rows_per_group;
+    if (out_row >= args.out_dim || token >= args.n_rows) return;
+
+    device const ushort *w = weights + (ulong)out_row * args.in_dim;
+    float sums[rows_per_group] = {};
+    uint k = lane;
+    for (; k + 96u < args.in_dim; k += 128u) {
+        const float w0 = k3_bf16_to_f32(w[k]);
+        const float w1 = k3_bf16_to_f32(w[k + 32u]);
+        const float w2 = k3_bf16_to_f32(w[k + 64u]);
+        const float w3 = k3_bf16_to_f32(w[k + 96u]);
+        #pragma unroll
+        for (ushort row = 0; row < rows_per_group; row++) {
+            if (token + row < args.n_rows) {
+                device const float *xr =
+                    x + (ulong)(token + row) * args.in_dim;
+                const float x0 = xr[k];
+                const float x1 = xr[k + 32u];
+                const float x2 = xr[k + 64u];
+                const float x3 = xr[k + 96u];
+                float sum = sums[row];
+                sum = fma(w0, x0, sum);
+                sum = fma(w1, x1, sum);
+                sum = fma(w2, x2, sum);
+                sum = fma(w3, x3, sum);
+                sums[row] = sum;
+            }
+        }
+    }
+    for (; k < args.in_dim; k += 32u) {
+        const float value = k3_bf16_to_f32(w[k]);
+        #pragma unroll
+        for (ushort row = 0; row < rows_per_group; row++) {
+            if (token + row < args.n_rows) {
+                sums[row] = fma(value,
+                    x[(ulong)(token + row) * args.in_dim + k], sums[row]);
+            }
+        }
+    }
+    #pragma unroll
+    for (ushort row = 0; row < rows_per_group; row++) {
+        const float sum = simd_sum(sums[row]);
+        if (lane == 0u && token + row < args.n_rows) {
+            out[(ulong)(token + row) * args.out_dim + out_row] = sum;
+        }
+    }
+}
+
+template <ushort rows_per_group>
+kernel void kernel_k3_mul_mv_bf16_f32_rows(
+        constant k3_matmul_args &args,
+        device const ushort *weights, device const float *x, device float *out,
+        uint2 tgpig [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]],
+        ushort nsg [[simdgroups_per_threadgroup]]) {
+    k3_mul_mv_bf16_f32_rows_body<rows_per_group>(
+        args, weights, x, out, tgpig, lane, sg, nsg);
+}
+
+typedef decltype(kernel_k3_mul_mv_bf16_f32_rows<4>) k3_mul_mv_bf16_rows_t;
+template [[host_name("kernel_k3_mul_mv_bf16_f32_rows2")]]
+kernel k3_mul_mv_bf16_rows_t kernel_k3_mul_mv_bf16_f32_rows<2>;
+template [[host_name("kernel_k3_mul_mv_bf16_f32_rows3")]]
+kernel k3_mul_mv_bf16_rows_t kernel_k3_mul_mv_bf16_f32_rows<3>;
+template [[host_name("kernel_k3_mul_mv_bf16_f32_rows4")]]
+kernel k3_mul_mv_bf16_rows_t kernel_k3_mul_mv_bf16_f32_rows<4>;
+template [[host_name("kernel_k3_mul_mv_bf16_f32_rows8")]]
+kernel k3_mul_mv_bf16_rows_t kernel_k3_mul_mv_bf16_f32_rows<8>;
+
+
+/* Neighboring threadgroups reuse weights across four token tiles. Short
+ * prefills use a 4x4 tile to reuse more activations per input load. */
+template<uint tokens, uint channels>
+kernel void k3_bf16_prefill_tiles(
+        constant k3_matmul_args &args, device const ushort *weights,
+        device const float *x, device float *out,
+        uint2 group [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort simd [[simdgroup_index_in_threadgroup]],
+        ushort simd_count [[simdgroups_per_threadgroup]]) {
+    constexpr uint token_groups = 4;
+    const uint first_channel = ((group.x / token_groups) * simd_count + simd) * channels;
+    const uint first_token = (group.y * token_groups + group.x % token_groups) * tokens;
+    if (tokens == 4u && first_token >= args.n_rows) return;
+    float sums[tokens][channels] = {};
+    for (uint k = lane; k < args.in_dim; k += 128u) {
+        float w[channels][4];
+        #pragma unroll
+        for (uint col = 0; col < channels; col++) {
+            device const ushort *wc = weights + (ulong)(first_channel + col) * args.in_dim + k;
+            #pragma unroll
+            for (uint j = 0; j < 4; j++) w[col][j] = k3_bf16_to_f32(wc[j * 32u]);
+        }
+        #pragma unroll
+        for (uint r = 0; r < tokens; r++) {
+            device const float *in = x + (ulong)(first_token + r) * args.in_dim + k;
+            #pragma unroll
+            for (uint j = 0; j < 4; j++) {
+                float value = in[j * 32u];
+                #pragma unroll
+                for (uint col = 0; col < channels; col++) sums[r][col] = fma(w[col][j], value, sums[r][col]);
+            }
+        }
+    }
+    #pragma unroll
+    for (uint r = 0; r < tokens; r++) {
+        #pragma unroll
+        for (uint col = 0; col < channels; col++) {
+            float sum = simd_sum(sums[r][col]);
+            if (lane == 0u) out[(ulong)(first_token + r) * args.out_dim + first_channel + col] = sum;
+        }
+    }
+}
+typedef decltype(k3_bf16_prefill_tiles<8,2>) k3_bf16_prefill_tiles_t;
+template [[host_name("kernel_k3_bf16_prefill_tiles")]]
+kernel k3_bf16_prefill_tiles_t k3_bf16_prefill_tiles<8,2>;
+template [[host_name("kernel_k3_bf16_prefill_tiles4x4")]]
+kernel k3_bf16_prefill_tiles_t k3_bf16_prefill_tiles<4,4>;
+
+/* Each SIMD group computes four prompt rows against the same four output
+ * channels. Stage their weights once per threadgroup. Keep the lane-local
+ * FP32 FMA sequence and SIMD reduction of the ordinary 4x4 tile. */
+kernel void kernel_k3_bf16_prefill_shared_weights(
+        constant k3_matmul_args &args, device const ushort *weights,
+        device const float *x, device float *out,
+        uint2 group [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort nsg [[simdgroups_per_threadgroup]]) {
+    constexpr uint width = 2048;
+    threadgroup float staged[4 * width];
+    const uint first_channel = group.x * 4u;
+    const uint first_token = sg * 4u;
+    float sums[4][4] = {};
+    for (uint base = 0; base < args.in_dim; base += width) {
+        const uint live = min(width, args.in_dim - base);
+        for (uint i = uint(tid) * 4u; i < 4u * live; i += uint(nsg) * 128u) {
+            const uint channel = i / live, k = i % live;
+            device const ushort *src = weights +
+                (ulong)(first_channel + channel) * args.in_dim + base + k;
+            const ushort4 packed = *(device const ushort4 *)src;
+            *(threadgroup float4 *)(staged + channel * width + k) =
+                as_type<float4>(uint4(packed) << 16u);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint k = lane; k < live; k += 128u) {
+            float w[4][4];
+            #pragma unroll
+            for (uint c = 0; c < 4; c++) {
+                #pragma unroll
+                for (uint j = 0; j < 4; j++)
+                    w[c][j] = staged[c * width + k + 32u * j];
+            }
+            #pragma unroll
+            for (uint r = 0; r < 4; r++) {
+                device const float *row = x + (ulong)(first_token + r) * args.in_dim + base + k;
+                #pragma unroll
+                for (uint j = 0; j < 4; j++) {
+                    const float value = row[32u * j];
+                    #pragma unroll
+                    for (uint c = 0; c < 4; c++)
+                        sums[r][c] = fma(w[c][j], value, sums[r][c]);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    #pragma unroll
+    for (uint r = 0; r < 4; r++) {
+        #pragma unroll
+        for (uint c = 0; c < 4; c++) {
+            const float sum = simd_sum(sums[r][c]);
+            if (lane == 0) out[(ulong)(first_token + r) * args.out_dim + first_channel + c] = sum;
+        }
+    }
+}
+
+/* Reuse the same FP32 arithmetic for four independent QKVG projections. */
+template <ushort rows_per_group>
+kernel void kernel_k3_mul_mv4_bf16_f32_rows(
+        constant k3_matmul_args &args,
+        device const ushort *weights0, device const ushort *weights1,
+        device const ushort *weights2, device const ushort *weights3,
+        device const float *x,
+        device float *out0, device float *out1,
+        device float *out2, device float *out3,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]],
+        ushort nsg [[simdgroups_per_threadgroup]]) {
+    const uint matrix = tgpig.z;
+    if (matrix >= 4u) return;
+    device const ushort *weights = matrix == 0u ? weights0 :
+        (matrix == 1u ? weights1 : (matrix == 2u ? weights2 : weights3));
+    device float *out = matrix == 0u ? out0 :
+        (matrix == 1u ? out1 : (matrix == 2u ? out2 : out3));
+    k3_mul_mv_bf16_f32_rows_body<rows_per_group>(
+        args, weights, x, out, tgpig.xy, lane, sg, nsg);
+}
+typedef decltype(kernel_k3_mul_mv4_bf16_f32_rows<4>) k3_mul_mv4_bf16_rows_t;
+template [[host_name("kernel_k3_mul_mv4_bf16_f32_rows2")]]
+kernel k3_mul_mv4_bf16_rows_t kernel_k3_mul_mv4_bf16_f32_rows<2>;
+template [[host_name("kernel_k3_mul_mv4_bf16_f32_rows3")]]
+kernel k3_mul_mv4_bf16_rows_t kernel_k3_mul_mv4_bf16_f32_rows<3>;
+template [[host_name("kernel_k3_mul_mv4_bf16_f32_rows4")]]
+kernel k3_mul_mv4_bf16_rows_t kernel_k3_mul_mv4_bf16_f32_rows<4>;
+template [[host_name("kernel_k3_mul_mv4_bf16_f32_rows8")]]
+kernel k3_mul_mv4_bf16_rows_t kernel_k3_mul_mv4_bf16_f32_rows<8>;
+
 /*
  * KDA's Q/K/V/output-gate projections share input and shape. A third grid
  * dimension selects the matrix, reducing four independent dispatches to one
@@ -371,6 +593,90 @@ kernel void kernel_k3_mul_mv4_bf16_f32_unroll8(
     if (lane == 0u) {
         out[(ulong)token * args.out_dim + out_row] = sum;
     }
+}
+
+static inline void k3_bf16_decode_vec8(
+        device const ushort *weights,
+        device const float *x,
+        device float *out,
+        uint width, uint simd_index, ushort lane) {
+    // Each group of four lanes reads one channel in eight-value vectors.
+    // Keep the original 32 independent FMA chains until the final reduction.
+    constexpr uint channels = 8u;
+    const uint output_base = simd_index * channels;
+    const uint output_channel = output_base + lane / 4u;
+    const uint input_start = (lane % 4u) * 8u;
+    device const ushort4 *w = (device const ushort4 *)(
+        weights + (ulong)output_channel * width + input_start);
+    device const float4 *input = (device const float4 *)(x + input_start);
+
+    float4 partial[2] = {};
+    for (uint k = 0; k < width / 4u; k += 16u) {
+        #pragma unroll
+        for (ushort block = 0; block < 2; ++block) {
+            #pragma unroll
+            for (ushort half_index = 0; half_index < 2; ++half_index) {
+                const uint i = k + block * 8u + half_index;
+                const float4 weight = as_type<float4>(uint4(w[i]) << 16u);
+                partial[half_index] = fma(weight, input[i], partial[half_index]);
+            }
+        }
+    }
+
+    // Restore the reference SIMD lane order for each of the eight channels.
+    #pragma unroll
+    for (ushort channel = 0; channel < channels; ++channel) {
+        const ushort source = channel * 4u + lane / 8u;
+        const float4 low = simd_shuffle(partial[0], source);
+        const float4 high = simd_shuffle(partial[1], source);
+        const float4 values = (lane & 4u) ? high : low;
+        const float sum = simd_sum(values[lane & 3u]);
+        if (lane == 0u) out[output_base + channel] = sum;
+    }
+}
+
+kernel void kernel_k3_bf16_decode_vec8(
+        constant k3_matmul_args &args,
+        device const ushort     *weights,
+        device const float      *x,
+        device float            *out,
+        uint2 tgpig [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]],
+        ushort nsg [[simdgroups_per_threadgroup]]) {
+    k3_bf16_decode_vec8(weights, x, out, args.in_dim, tgpig.x * nsg + sg, lane);
+}
+
+kernel void kernel_k3_qkvg_decode_vec8(
+        constant k3_matmul_args &args,
+        device const ushort     *weights0,
+        device const ushort     *weights1,
+        device const ushort     *weights2,
+        device const ushort     *weights3,
+        device const float      *x,
+        device float            *out0,
+        device float            *out1,
+        device float            *out2,
+        device float            *out3,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]],
+        ushort nsg [[simdgroups_per_threadgroup]]) {
+    const uint matrix = tgpig.z;
+    device const ushort *weights = weights0;
+    device float *out = out0;
+    if (matrix == 1u) {
+        weights = weights1;
+        out = out1;
+    } else if (matrix == 2u) {
+        weights = weights2;
+        out = out2;
+    } else if (matrix == 3u) {
+        weights = weights3;
+        out = out3;
+    }
+
+    k3_bf16_decode_vec8(weights, x, out, 7168u, tgpig.x * nsg + sg, lane);
 }
 
 kernel void kernel_k3_mul_mv4_bf16_f32_unroll16(
@@ -501,6 +807,77 @@ kernel k3_mul_mm_bf16_t kernel_mul_mm<
         half, half2x4, simdgroup_half8x8,
         k3_bf16_block16, 1, k3_dequantize_bf16,
         half, half4x4, float, float2x4>;
+
+#ifdef DS4_K3_M5_BF16_TENSOROPS
+// The existing BF16 matrix kernel narrows both operands to half. Match that
+// conversion before the TensorOps multiply and accumulate into float.
+kernel void kernel_k3_bf16_prefill_tensorops(
+        constant ds4_metal_args_mul_mm &args,
+        device const packed_ushort4 *weights,
+        device const packed_float4 *x,
+        device float *out,
+        uint2 group [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]]) {
+    constexpr int tokens = 32, channels = 64, depth = 32, threads = 128;
+    constexpr int packs = depth / 4;
+    const int first_token = group.x * tokens;
+    const int first_channel = group.y * channels;
+    const int valid_tokens = min(tokens, args.ne1 - first_token);
+    const int row_packs = args.ne00 / 4;
+
+    // Reuse the 8 KiB tile for the partial output after the last K barrier.
+    threadgroup float4 scratch[tokens * channels / 4];
+    threadgroup half4 *weight_tile = (threadgroup half4 *)scratch;
+    threadgroup half4 *input_tile = weight_tile + channels * packs;
+    auto w = tensor((threadgroup half *)weight_tile, dextents<int32_t, 2>(depth, channels));
+    auto a = tensor((threadgroup half *)input_tile, dextents<int32_t, 2>(depth, tokens));
+    matmul2d<matmul2d_descriptor(tokens, channels, depth, false, true, false,
+             matmul2d_descriptor::mode::multiply_accumulate), execution_simdgroups<4>> mm;
+    auto acc = mm.get_destination_cooperative_tensor<decltype(a), decltype(w), float>();
+    for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
+        if (acc.is_valid_element(i)) acc[i] = 0.0f;
+    }
+
+    for (int k = 0; k < row_packs; k += packs) {
+        #pragma unroll
+        for (int i = tid; i < channels * packs; i += threads) {
+            const ulong row = first_channel + i / packs;
+            const ushort4 bits = ushort4(weights[row * row_packs + k + i % packs]);
+            weight_tile[i] = half4(as_type<float4>(uint4(bits) << 16u));
+        }
+        #pragma unroll
+        for (int i = tid; i < tokens * packs; i += threads) {
+            const int token = i / packs;
+            const ulong row = first_token + token;
+            input_tile[i] = token < valid_tokens
+                ? half4(float4(x[row * row_packs + k + i % packs])) : half4(0.0h);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto lhs = a.slice(0, 0);
+        auto rhs = w.slice(0, 0);
+        mm.run(lhs, rhs, acc);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (valid_tokens == tokens) {
+        auto dst = tensor(out, dextents<int32_t, 2>(args.ne0, args.ne1));
+        auto tile = dst.slice(first_channel, first_token);
+        acc.store(tile);
+    } else {
+        // The cooperative tile has 32 rows even for the final 13 of a
+        // 45-token prompt. Scatter only real rows into the caller's buffer.
+        threadgroup float *tail_output = (threadgroup float *)scratch;
+        auto dst = tensor(tail_output, dextents<int32_t, 2>(channels, tokens));
+        auto tile = dst.slice(0, 0);
+        acc.store(tile);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int i = tid; i < valid_tokens * channels; i += threads) {
+            const ulong row = first_token + i / channels;
+            out[row * args.ne0 + first_channel + i % channels] = tail_output[i];
+        }
+    }
+}
+#endif
 
 struct k3_norm_args {
     uint width;
@@ -1541,6 +1918,17 @@ kernel void kernel_k3_kda_decode(
     }
 }
 
+inline float4 k3_kda_conv_weights(device const float *w) {
+    return float4(w[0], w[1], w[2], w[3]);
+}
+
+inline float k3_kda_conv4(float3 history, float sample, float4 weight) {
+    float sum = fma(history.x, weight.x, 0.0f);
+    sum = fma(history.y, weight.y, sum);
+    sum = fma(history.z, weight.z, sum);
+    return fma(sample, weight.w, sum);
+}
+
 kernel void kernel_k3_kda_prefill_prepare(
         constant k3_kda_args &args,
         device float         *q,
@@ -1561,56 +1949,43 @@ kernel void kernel_k3_kda_prefill_prepare(
     constexpr uint D = 128u;
     constexpr uint HISTORY = 3u;
     if (head >= args.n_heads) return;
-    threadgroup float *sq = scratch;
-    threadgroup float *sk = sq + D;
-    threadgroup float *reduce_q = sk + D;
+    threadgroup float *reduce_q = scratch;
     threadgroup float *reduce_k = reduce_q + 4u;
     const uint projection = args.n_heads * D;
     const uint channel = head * D + tid;
-    device float *q_state = conv_state;
+    device float *q_state = conv_state + channel;
     device float *k_state = q_state + HISTORY * projection;
     device float *v_state = k_state + HISTORY * projection;
 
+    // One channel belongs to one thread for the entire chunk.
+    float3 q_history(q_state[0], q_state[projection], q_state[2ul * projection]);
+    float3 k_history(k_state[0], k_state[projection], k_state[2ul * projection]);
+    float3 v_history(v_state[0], v_state[projection], v_state[2ul * projection]);
+    const float4 qw = k3_kda_conv_weights(q_conv + (ulong)channel * 4u);
+    const float4 kw = k3_kda_conv_weights(k_conv + (ulong)channel * 4u);
+    const float4 vw = k3_kda_conv_weights(v_conv + (ulong)channel * 4u);
+    const float gate_bias = dt_bias[channel];
+    const float gate_slope = exp(a_log[head]);
     for (uint token = 0; token < args.n_rows; token++) {
         const ulong index = (ulong)token * projection + channel;
-        float q_acc = 0.0f;
-        float k_acc = 0.0f;
-        float v_acc = 0.0f;
-        for (uint w = 0; w < HISTORY; w++) {
-            q_acc = fma(q_state[(ulong)w * projection + channel],
-                        q_conv[(ulong)channel * 4u + w], q_acc);
-            k_acc = fma(k_state[(ulong)w * projection + channel],
-                        k_conv[(ulong)channel * 4u + w], k_acc);
-            v_acc = fma(v_state[(ulong)w * projection + channel],
-                        v_conv[(ulong)channel * 4u + w], v_acc);
-        }
         const float q_new = q[index];
         const float k_new = k[index];
         const float v_new = v[index];
-        q_acc = fma(q_new, q_conv[(ulong)channel * 4u + 3u], q_acc);
-        k_acc = fma(k_new, k_conv[(ulong)channel * 4u + 3u], k_acc);
-        v_acc = fma(v_new, v_conv[(ulong)channel * 4u + 3u], v_acc);
-        q_state[channel] = q_state[projection + channel];
-        q_state[projection + channel] = q_state[2ul * projection + channel];
-        q_state[2ul * projection + channel] = q_new;
-        k_state[channel] = k_state[projection + channel];
-        k_state[projection + channel] = k_state[2ul * projection + channel];
-        k_state[2ul * projection + channel] = k_new;
-        v_state[channel] = v_state[projection + channel];
-        v_state[projection + channel] = v_state[2ul * projection + channel];
-        v_state[2ul * projection + channel] = v_new;
+        const float q_acc = k3_kda_conv4(q_history, q_new, qw);
+        const float k_acc = k3_kda_conv4(k_history, k_new, kw);
+        const float v_acc = k3_kda_conv4(v_history, v_new, vw);
+        q_history = float3(q_history.yz, q_new);
+        k_history = float3(k_history.yz, k_new);
+        v_history = float3(v_history.yz, v_new);
 
-        sq[tid] = q_acc / (1.0f + exp(-q_acc));
-        sk[tid] = k_acc / (1.0f + exp(-k_acc));
+        const float q_raw = q_acc / (1.0f + exp(-q_acc));
+        const float k_raw = k_acc / (1.0f + exp(-k_acc));
         v[index] = v_acc / (1.0f + exp(-v_acc));
-        const float gate = raw_gate[index] + dt_bias[channel];
+        const float gate = raw_gate[index] + gate_bias;
         raw_gate[index] = exp(args.lower_bound *
-            (1.0f / (1.0f + exp(-exp(a_log[head]) * gate))));
-        threadgroup_barrier(mem_flags::mem_threadgroup |
-                           mem_flags::mem_device);
-
-        float q_sumsq = simd_sum(sq[tid] * sq[tid]);
-        float k_sumsq = simd_sum(sk[tid] * sk[tid]);
+            (1.0f / (1.0f + exp(-gate_slope * gate))));
+        const float q_sumsq = simd_sum(q_raw * q_raw);
+        const float k_sumsq = simd_sum(k_raw * k_raw);
         if (lane == 0u) {
             reduce_q[sg] = q_sumsq;
             reduce_k[sg] = k_sumsq;
@@ -1620,12 +1995,19 @@ kernel void kernel_k3_kda_prefill_prepare(
         float k_total = lane < 4u ? reduce_k[lane] : 0.0f;
         q_total = simd_sum(q_total);
         k_total = simd_sum(k_total);
-        q[index] = sq[tid] * rsqrt(q_total + 1.0e-6f) *
-                   0x1.6a09e6p-4f;
-        k[index] = sk[tid] * rsqrt(k_total + 1.0e-6f);
-        threadgroup_barrier(mem_flags::mem_threadgroup |
-                           mem_flags::mem_device);
+        q[index] = q_raw * rsqrt(q_total + 1.0e-6f) * 0x1.6a09e6p-4f;
+        k[index] = k_raw * rsqrt(k_total + 1.0e-6f);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+    q_state[0] = q_history.x;
+    q_state[projection] = q_history.y;
+    q_state[2ul * projection] = q_history.z;
+    k_state[0] = k_history.x;
+    k_state[projection] = k_history.y;
+    k_state[2ul * projection] = k_history.z;
+    v_state[0] = v_history.x;
+    v_state[projection] = v_history.y;
+    v_state[2ul * projection] = v_history.z;
 }
 
 kernel void kernel_k3_kda_prefill_recurrence(
@@ -2160,6 +2542,150 @@ kernel void kernel_k3_mla_prefill_value_up_gate(
     float sum = 0.0f;
     for (uint k = 0; k < 512u; k++) {
         sum = fma(lh[k], k3_bf16_to_f32(kv_b[weight_row + k]), sum);
+    }
+    const ulong output =
+        ((ulong)row * args.n_heads + head) * 128u + value;
+    out[output] = sum /
+        (1.0f + exp(-output_gate[output]));
+}
+
+/* Load groups retain the same ascending FP32 FMA sequence as prefill. */
+kernel void kernel_k3_mla_prefill_absorb_q_unroll16(
+        constant k3_mla_prefill_args &args,
+        device const float           *q,
+        device const ushort          *kv_b,
+        device float                 *q_latent,
+        uint2 tgpig [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]]) {
+    const uint row = tgpig.x;
+    const uint head = tgpig.y;
+    if (row >= args.n_tokens || head >= args.n_heads) return;
+    device const float *qh =
+        q + ((ulong)row * args.n_heads + head) * 192u;
+    device float *ql =
+        q_latent + ((ulong)row * args.n_heads + head) * 512u;
+    for (uint latent = tid; latent < 512u; latent += 128u) {
+        float sum = 0.0f;
+        for (uint d = 0; d < 128u; d += 16u) {
+            const ulong weight = ((ulong)head * 256u + d) * 512u + latent;
+            const float q0 = qh[d];
+            const float q1 = qh[d + 1u];
+            const float q2 = qh[d + 2u];
+            const float q3 = qh[d + 3u];
+            const float q4 = qh[d + 4u];
+            const float q5 = qh[d + 5u];
+            const float q6 = qh[d + 6u];
+            const float q7 = qh[d + 7u];
+            const float q8 = qh[d + 8u];
+            const float q9 = qh[d + 9u];
+            const float q10 = qh[d + 10u];
+            const float q11 = qh[d + 11u];
+            const float q12 = qh[d + 12u];
+            const float q13 = qh[d + 13u];
+            const float q14 = qh[d + 14u];
+            const float q15 = qh[d + 15u];
+            const ushort w0 = kv_b[weight];
+            const ushort w1 = kv_b[weight + 512u];
+            const ushort w2 = kv_b[weight + 1024u];
+            const ushort w3 = kv_b[weight + 1536u];
+            const ushort w4 = kv_b[weight + 2048u];
+            const ushort w5 = kv_b[weight + 2560u];
+            const ushort w6 = kv_b[weight + 3072u];
+            const ushort w7 = kv_b[weight + 3584u];
+            const ushort w8 = kv_b[weight + 4096u];
+            const ushort w9 = kv_b[weight + 4608u];
+            const ushort w10 = kv_b[weight + 5120u];
+            const ushort w11 = kv_b[weight + 5632u];
+            const ushort w12 = kv_b[weight + 6144u];
+            const ushort w13 = kv_b[weight + 6656u];
+            const ushort w14 = kv_b[weight + 7168u];
+            const ushort w15 = kv_b[weight + 7680u];
+            sum = fma(q0, k3_bf16_to_f32(w0), sum);
+            sum = fma(q1, k3_bf16_to_f32(w1), sum);
+            sum = fma(q2, k3_bf16_to_f32(w2), sum);
+            sum = fma(q3, k3_bf16_to_f32(w3), sum);
+            sum = fma(q4, k3_bf16_to_f32(w4), sum);
+            sum = fma(q5, k3_bf16_to_f32(w5), sum);
+            sum = fma(q6, k3_bf16_to_f32(w6), sum);
+            sum = fma(q7, k3_bf16_to_f32(w7), sum);
+            sum = fma(q8, k3_bf16_to_f32(w8), sum);
+            sum = fma(q9, k3_bf16_to_f32(w9), sum);
+            sum = fma(q10, k3_bf16_to_f32(w10), sum);
+            sum = fma(q11, k3_bf16_to_f32(w11), sum);
+            sum = fma(q12, k3_bf16_to_f32(w12), sum);
+            sum = fma(q13, k3_bf16_to_f32(w13), sum);
+            sum = fma(q14, k3_bf16_to_f32(w14), sum);
+            sum = fma(q15, k3_bf16_to_f32(w15), sum);
+        }
+        ql[latent] = sum;
+    }
+}
+
+kernel void kernel_k3_mla_prefill_value_up_gate_unroll16(
+        constant k3_mla_prefill_args &args,
+        device const float           *latent,
+        device const ushort          *kv_b,
+        device const float           *output_gate,
+        device float                 *out,
+        uint2 tgpig [[threadgroup_position_in_grid]],
+        ushort value [[thread_index_in_threadgroup]]) {
+    const uint row = tgpig.x;
+    const uint head = tgpig.y;
+    if (row >= args.n_tokens || head >= args.n_heads || value >= 128u) return;
+    device const float *lh =
+        latent + ((ulong)row * args.n_heads + head) * 512u;
+    const ulong weight_row =
+        ((ulong)head * 256u + 128u + value) * 512u;
+    float sum = 0.0f;
+    for (uint k = 0; k < 512u; k += 16u) {
+        const float x0 = lh[k];
+        const float x1 = lh[k + 1u];
+        const float x2 = lh[k + 2u];
+        const float x3 = lh[k + 3u];
+        const float x4 = lh[k + 4u];
+        const float x5 = lh[k + 5u];
+        const float x6 = lh[k + 6u];
+        const float x7 = lh[k + 7u];
+        const float x8 = lh[k + 8u];
+        const float x9 = lh[k + 9u];
+        const float x10 = lh[k + 10u];
+        const float x11 = lh[k + 11u];
+        const float x12 = lh[k + 12u];
+        const float x13 = lh[k + 13u];
+        const float x14 = lh[k + 14u];
+        const float x15 = lh[k + 15u];
+        const ushort w0 = kv_b[weight_row + k];
+        const ushort w1 = kv_b[weight_row + k + 1u];
+        const ushort w2 = kv_b[weight_row + k + 2u];
+        const ushort w3 = kv_b[weight_row + k + 3u];
+        const ushort w4 = kv_b[weight_row + k + 4u];
+        const ushort w5 = kv_b[weight_row + k + 5u];
+        const ushort w6 = kv_b[weight_row + k + 6u];
+        const ushort w7 = kv_b[weight_row + k + 7u];
+        const ushort w8 = kv_b[weight_row + k + 8u];
+        const ushort w9 = kv_b[weight_row + k + 9u];
+        const ushort w10 = kv_b[weight_row + k + 10u];
+        const ushort w11 = kv_b[weight_row + k + 11u];
+        const ushort w12 = kv_b[weight_row + k + 12u];
+        const ushort w13 = kv_b[weight_row + k + 13u];
+        const ushort w14 = kv_b[weight_row + k + 14u];
+        const ushort w15 = kv_b[weight_row + k + 15u];
+        sum = fma(x0, k3_bf16_to_f32(w0), sum);
+        sum = fma(x1, k3_bf16_to_f32(w1), sum);
+        sum = fma(x2, k3_bf16_to_f32(w2), sum);
+        sum = fma(x3, k3_bf16_to_f32(w3), sum);
+        sum = fma(x4, k3_bf16_to_f32(w4), sum);
+        sum = fma(x5, k3_bf16_to_f32(w5), sum);
+        sum = fma(x6, k3_bf16_to_f32(w6), sum);
+        sum = fma(x7, k3_bf16_to_f32(w7), sum);
+        sum = fma(x8, k3_bf16_to_f32(w8), sum);
+        sum = fma(x9, k3_bf16_to_f32(w9), sum);
+        sum = fma(x10, k3_bf16_to_f32(w10), sum);
+        sum = fma(x11, k3_bf16_to_f32(w11), sum);
+        sum = fma(x12, k3_bf16_to_f32(w12), sum);
+        sum = fma(x13, k3_bf16_to_f32(w13), sum);
+        sum = fma(x14, k3_bf16_to_f32(w14), sum);
+        sum = fma(x15, k3_bf16_to_f32(w15), sum);
     }
     const ulong output =
         ((ulong)row * args.n_heads + head) * 128u + value;

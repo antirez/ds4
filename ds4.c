@@ -42,6 +42,7 @@
 #include <unistd.h>
 
 #include "ds4.h"
+#include "k3_streaming.h"
 #include "ds4_tool_text.h"
 #include "ds4_distributed.h"
 #include "ds4_image.h"
@@ -61978,7 +61979,8 @@ static void ds4_session_dspark_scheduler_note(
 
 #define DS4_SESSION_IO_CHUNK (8u * 1024u * 1024u)
 #define DS4_K3_SESSION_PAYLOAD_MAGIC UINT32_C(0x3356534b) /* "KSV3" */
-#define DS4_K3_SESSION_PAYLOAD_VERSION UINT32_C(1)
+#define DS4_K3_SESSION_REPLAY_VERSION UINT32_C(1)
+#define DS4_K3_SESSION_NATIVE_VERSION UINT32_C(2)
 #define DS4_K3_SESSION_PAYLOAD_U32_FIELDS 6u
 
 static void payload_set_err(char *err, size_t errlen, const char *msg) {
@@ -63828,6 +63830,20 @@ static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
 static uint64_t qwen4_payload_tensor_bytes(uint32_t rows, uint32_t mtp_rows);
 #endif
 
+static uint64_t ds4_k3_replay_payload_bytes(const ds4_session *s) {
+    return DS4_K3_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t) +
+           (uint64_t)s->checkpoint.len * sizeof(uint32_t);
+}
+
+static bool ds4_k3_native_checkpoint(const ds4_session *s) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    return !s->distributed && k3_context_checkpoint_supported(s->k3);
+#else
+    (void)s;
+    return false;
+#endif
+}
+
 uint64_t ds4_session_payload_bytes(ds4_session *s) {
     if (s && !s->distributed && ds4_session_is_qwen4(s)) {
 #ifndef DS4_HAS_QWEN4_GPU
@@ -63846,9 +63862,16 @@ uint64_t ds4_session_payload_bytes(ds4_session *s) {
     }
     if (!s || !s->checkpoint_valid) return 0;
     if (ds4_session_is_k3(s)) {
-        return (uint64_t)DS4_K3_SESSION_PAYLOAD_U32_FIELDS *
-                   sizeof(uint32_t) +
-               (uint64_t)s->checkpoint.len * sizeof(uint32_t);
+        uint64_t extra = 0;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+        if (ds4_k3_native_checkpoint(s)) {
+            const uint32_t rows = (uint32_t)s->checkpoint.len;
+            if (rows != k3_context_position(s->k3)) return 0;
+            extra = k3_context_checkpoint_bytes(s->k3, rows);
+            if (!extra) return 0;
+        }
+#endif
+        return ds4_k3_replay_payload_bytes(s) + extra;
     }
     if (s->distributed) return 0;
 #ifdef DS4_HAS_DEEPSEEK41_GPU
@@ -63929,8 +63952,10 @@ void ds4_session_payload_file_free(ds4_session_payload_file *payload) {
     memset(payload, 0, sizeof(*payload));
 }
 
-int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
-                              char *err, size_t errlen) {
+static int ds4_k3_save_checkpoint(ds4_session *s, FILE *fp, bool native, char *err, size_t errlen);
+
+static int ds4_stage_payload(ds4_session *s, ds4_session_payload_file *out,
+                             bool k3_replay, char *err, size_t errlen) {
     if (!out) {
         payload_set_err(err, errlen, "invalid session payload staging request");
         return 1;
@@ -63957,7 +63982,8 @@ int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
         return 1;
     }
 
-    int rc = ds4_session_save_payload(s, fp, err, errlen);
+    int rc = k3_replay ? ds4_k3_save_checkpoint(s, fp, false, err, errlen) :
+                         ds4_session_save_payload(s, fp, err, errlen);
     if (rc == 0 && fflush(fp) != 0) {
         payload_set_err(err, errlen, "failed to flush staged session payload");
         rc = 1;
@@ -63981,6 +64007,20 @@ int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
     out->path = ds4_strdup(tmpl);
     out->bytes = (uint64_t)pos;
     return 0;
+}
+
+int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
+                              char *err, size_t errlen) {
+    return ds4_stage_payload(s, out, false, err, errlen);
+}
+
+int ds4_session_stage_k3_replay_payload(ds4_session *s, ds4_session_payload_file *out,
+                                        char *err, size_t errlen) {
+    if (!s || !ds4_session_is_k3(s)) {
+        payload_set_err(err, errlen, "Kimi K3 replay snapshot requires a K3 session");
+        return 1;
+    }
+    return ds4_stage_payload(s, out, true, err, errlen);
 }
 
 #ifdef DS4_HAS_QWEN4_GPU
@@ -64218,30 +64258,72 @@ static int qwen4_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *
 }
 #endif
 
+static int ds4_k3_save_checkpoint(ds4_session *s, FILE *fp, bool native, char *err, size_t errlen) {
+    if (native && !ds4_session_payload_bytes(s)) {
+        payload_set_err(err, errlen, "Kimi K3 session state is not ready for a checkpoint");
+        return 1;
+    }
+    const uint32_t header[DS4_K3_SESSION_PAYLOAD_U32_FIELDS] = {
+        DS4_K3_SESSION_PAYLOAD_MAGIC,
+        native ? DS4_K3_SESSION_NATIVE_VERSION : DS4_K3_SESSION_REPLAY_VERSION,
+        (uint32_t)s->ctx_size,
+        s->prefill_cap,
+        (uint32_t)s->checkpoint.len,
+        K3_N_VOCAB,
+    };
+    for (uint32_t i = 0; i < DS4_K3_SESSION_PAYLOAD_U32_FIELDS; i++) {
+        if (payload_write_u32(fp, header[i], err, errlen) != 0) return 1;
+    }
+    for (int i = 0; i < s->checkpoint.len; i++) {
+        if (payload_write_u32(
+                fp, (uint32_t)s->checkpoint.v[i], err, errlen) != 0) {
+            return 1;
+        }
+    }
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (native) return !k3_context_write_checkpoint(
+        s->k3, fp, header[4], s->checkpoint.v, s->logits, err, errlen);
+#endif
+    return 0;
+}
+
+/* Called at the start of an already cached payload before reusing its file
+ * on save. Keep v1 readable, but migrate it when a native snapshot fits. */
+bool ds4_session_cached_payload_current(ds4_session *s, FILE *fp, uint64_t bytes, bool k3_replay) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (s && ds4_session_is_k3(s)) {
+        const bool native = !k3_replay && ds4_k3_native_checkpoint(s);
+        if (bytes != (native ? ds4_session_payload_bytes(s) : ds4_k3_replay_payload_bytes(s))) return false;
+        uint32_t h[DS4_K3_SESSION_PAYLOAD_U32_FIELDS];
+        for (size_t i = 0; i < DS4_K3_SESSION_PAYLOAD_U32_FIELDS; i++) {
+            if (payload_read_u32(fp, &h[i], &bytes, NULL, 0) != 0) return false;
+        }
+        if (h[0] != DS4_K3_SESSION_PAYLOAD_MAGIC || h[5] != K3_N_VOCAB ||
+            h[1] != (native ? DS4_K3_SESSION_NATIVE_VERSION : DS4_K3_SESSION_REPLAY_VERSION) ||
+            h[4] != (uint32_t)s->checkpoint.len) return false;
+        for (uint32_t i = 0; i < h[4]; i++) {
+            uint32_t token;
+            if (payload_read_u32(fp, &token, &bytes, NULL, 0) ||
+                token != (uint32_t)s->checkpoint.v[i]) return false;
+        }
+        return !native || k3_context_checkpoint_model_matches(s->k3, fp);
+    }
+#else
+    (void)s;
+    (void)fp;
+    (void)bytes;
+    (void)k3_replay;
+#endif
+    return true;
+}
+
 int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
     if (!s || !fp || !s->checkpoint_valid) {
         payload_set_err(err, errlen, "session has no valid checkpoint to save");
         return 1;
     }
     if (ds4_session_is_k3(s)) {
-        const uint32_t header[DS4_K3_SESSION_PAYLOAD_U32_FIELDS] = {
-            DS4_K3_SESSION_PAYLOAD_MAGIC,
-            DS4_K3_SESSION_PAYLOAD_VERSION,
-            (uint32_t)s->ctx_size,
-            s->prefill_cap,
-            (uint32_t)s->checkpoint.len,
-            K3_N_VOCAB,
-        };
-        for (uint32_t i = 0; i < DS4_K3_SESSION_PAYLOAD_U32_FIELDS; i++) {
-            if (payload_write_u32(fp, header[i], err, errlen) != 0) return 1;
-        }
-        for (int i = 0; i < s->checkpoint.len; i++) {
-            if (payload_write_u32(
-                    fp, (uint32_t)s->checkpoint.v[i], err, errlen) != 0) {
-                return 1;
-            }
-        }
-        return 0;
+        return ds4_k3_save_checkpoint(s, fp, ds4_k3_native_checkpoint(s), err, errlen);
     }
     if (s->distributed) {
         return ds4_dist_session_save_payload(s->distributed, s, fp, err, errlen);
@@ -64604,28 +64686,30 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         for (uint32_t i = 0; i < DS4_K3_SESSION_PAYLOAD_U32_FIELDS; i++) {
             if (payload_read_u32(
                     fp, &h[i], &remaining, err, errlen) != 0) {
-                return 1;
+                return DS4_SESSION_LOAD_UNCHANGED;
             }
         }
+        const bool native = h[1] == DS4_K3_SESSION_NATIVE_VERSION;
         if (h[0] != DS4_K3_SESSION_PAYLOAD_MAGIC ||
-            h[1] != DS4_K3_SESSION_PAYLOAD_VERSION) {
+            (native ? !ds4_k3_native_checkpoint(s) : h[1] != DS4_K3_SESSION_REPLAY_VERSION)) {
             payload_set_err(err, errlen,
                             "unsupported Kimi K3 session payload version");
-            return 1;
+            return DS4_SESSION_LOAD_UNCHANGED;
         }
         const uint32_t saved_tokens = h[4];
         if (h[2] > (uint32_t)s->ctx_size ||
             saved_tokens == 0 ||
-            saved_tokens >= (uint32_t)s->ctx_size) {
+            saved_tokens > (uint32_t)s->ctx_size) {
             payload_set_err(
                 err, errlen, "Kimi K3 checkpoint does not fit current context");
-            return 1;
+            return DS4_SESSION_LOAD_UNCHANGED;
         }
-        if (h[5] != K3_N_VOCAB ||
-            remaining != (uint64_t)saved_tokens * sizeof(uint32_t)) {
+        const uint64_t extra = native ? k3_context_checkpoint_bytes(s->k3, saved_tokens) : 0;
+        if (h[5] != K3_N_VOCAB || (native && (!extra || h[2] < saved_tokens)) ||
+            remaining != (uint64_t)saved_tokens * sizeof(uint32_t) + extra) {
             payload_set_err(
                 err, errlen, "invalid Kimi K3 session payload layout");
-            return 1;
+            return DS4_SESSION_LOAD_UNCHANGED;
         }
 
         token_vec new_checkpoint = {0};
@@ -64634,21 +64718,33 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
             if (payload_read_u32(
                     fp, &token, &remaining, err, errlen) != 0) {
                 token_vec_free(&new_checkpoint);
-                return 1;
+                return DS4_SESSION_LOAD_UNCHANGED;
             }
             if (token >= K3_N_VOCAB) {
                 token_vec_free(&new_checkpoint);
                 payload_set_err(
                     err, errlen, "Kimi K3 checkpoint token is outside vocabulary");
-                return 1;
+                return DS4_SESSION_LOAD_UNCHANGED;
             }
             token_vec_push(&new_checkpoint, (int)token);
+        }
+        if (native) {
+            if (!k3_context_read_checkpoint(s->k3, fp, saved_tokens,
+                                             new_checkpoint.v, s->logits, err, errlen)) {
+                token_vec_free(&new_checkpoint);
+                return DS4_SESSION_LOAD_UNCHANGED;
+            }
+            token_vec_free(&s->checkpoint);
+            s->checkpoint = new_checkpoint;
+            s->checkpoint_valid = true;
+            s->mtp_draft_valid = false;
+            return 0;
         }
         if (remaining != 0) {
             token_vec_free(&new_checkpoint);
             payload_set_err(
                 err, errlen, "Kimi K3 checkpoint has trailing payload bytes");
-            return 1;
+            return DS4_SESSION_LOAD_UNCHANGED;
         }
 
         s->checkpoint_valid = false;
@@ -65331,7 +65427,17 @@ int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *
         payload_set_err(err, errlen, "distributed session snapshots are not supported yet");
         return 1;
     }
-    const uint64_t bytes = ds4_session_payload_bytes(s);
+    uint64_t bytes = ds4_session_payload_bytes(s);
+    bool replay = false;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (ds4_session_is_k3(s) && ds4_k3_native_checkpoint(s) && bytes &&
+        (snap->cap <= bytes || snap->len) && !k3_checkpoint_staging_fits(bytes + 1)) {
+        /* Keep the lightweight replay snapshot available under memory
+         * pressure; a disk-backed save never needs this buffer. */
+        replay = true;
+        bytes = ds4_k3_replay_payload_bytes(s);
+    }
+#endif
     if (bytes == 0) {
         payload_set_err(err, errlen, "session has no valid checkpoint to snapshot");
         return 1;
@@ -65342,29 +65448,41 @@ int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *
     }
     /* fmemopen appends a NUL even in binary mode. Keep it outside the payload
      * or fclose can overwrite the final byte of the last cache tensor. */
+    ds4_session_snapshot fresh = {0};
+    ds4_session_snapshot *target = ds4_session_is_k3(s) && snap->len ? &fresh : snap;
     const uint64_t capacity = bytes + 1;
-    if (snap->cap < capacity) {
-        uint8_t *p = realloc(snap->ptr, (size_t)capacity);
+    if (target->cap < capacity) {
+        uint8_t *p = realloc(target->ptr, (size_t)capacity);
         if (!p) {
             payload_set_err(err, errlen, "out of memory while allocating session snapshot");
             return 1;
         }
-        snap->ptr = p;
-        snap->cap = capacity;
+        target->ptr = p;
+        target->cap = capacity;
     }
 
-    FILE *fp = fmemopen(snap->ptr, (size_t)capacity, "wb");
+    FILE *fp = fmemopen(target->ptr, (size_t)capacity, "wb");
     if (!fp) {
+        free(fresh.ptr);
         payload_set_err(err, errlen, "failed to open memory stream for session snapshot");
         return 1;
     }
-    const int rc = ds4_session_save_payload(s, fp, err, errlen);
+    const int rc = replay ? ds4_k3_save_checkpoint(s, fp, false, err, errlen) :
+                            ds4_session_save_payload(s, fp, err, errlen);
     if (fclose(fp) != 0 && rc == 0) {
+        free(fresh.ptr);
         payload_set_err(err, errlen, "failed to finalize memory session snapshot");
         return 1;
     }
-    if (rc != 0) return 1;
-    snap->len = bytes;
+    if (rc != 0) {
+        free(fresh.ptr);
+        return 1;
+    }
+    target->len = bytes;
+    if (target == &fresh) {
+        free(snap->ptr);
+        *snap = fresh;
+    }
     return 0;
 }
 
@@ -72267,10 +72385,18 @@ static int ds4_engine_open_k3(ds4_engine *e,
             return 0;
         }
     }
+    struct stat k3_path_stat;
+    const bool is_gguf = stat(opt->model_path, &k3_path_stat) == 0 &&
+        S_ISREG(k3_path_stat.st_mode);
+    const bool optimized_ssd = k3_ssd_defaults_enabled(
+        opt->ssd_streaming, is_gguf, getenv("K3_SSD_STREAMING_DEFAULTS"));
     const uint32_t requested_prefill =
-        opt->prefill_chunk ? opt->prefill_chunk : 512u;
+        k3_ssd_prefill_chunk(opt->prefill_chunk, optimized_ssd);
+    /* Preserve an unspecified target until the K3 context has measured live
+     * memory and charged its tensors, staging buffers and cache workspace. */
+    const uint64_t expert_cache_bytes = opt->ssd_streaming_cache_bytes;
     const uint32_t initial_context =
-        opt->context_size > 0 ? (uint32_t)opt->context_size : requested_prefill;
+        k3_ssd_initial_context(opt->context_size, opt->prefill_chunk);
     e->is_k3 = true;
     if (pthread_mutex_init(&e->k3_lifecycle_mutex, NULL) != 0) {
         fprintf(stderr, "ds4: could not initialize Kimi K3 engine locks\n");
@@ -72282,10 +72408,9 @@ static int ds4_engine_open_k3(ds4_engine *e,
         return 0;
     }
     e->k3_tokenizer_mutex_ready = true;
-    struct stat k3_path_stat;
-    e->k3_gguf =
-        stat(opt->model_path, &k3_path_stat) == 0 &&
-        S_ISREG(k3_path_stat.st_mode);
+    e->k3_gguf = is_gguf;
+    e->ssd_streaming_cache_bytes = expert_cache_bytes;
+    e->ssd_streaming_cache_experts = opt->ssd_streaming_cache_experts;
     e->k3_layer_start = layer_start;
     e->k3_layer_end = layer_end;
     e->k3_has_output = has_output;
@@ -72331,6 +72456,9 @@ static int ds4_engine_open_k3(ds4_engine *e,
             .layer_start = layer_start,
             .layer_end = layer_end,
             .has_output = has_output,
+            .expert_cache_bytes = expert_cache_bytes,
+            .expert_cache_slots = opt->ssd_streaming_cache_experts,
+            .optimized_ssd_streaming = optimized_ssd,
         };
         if (!k3_context_create(
                 &e->k3_primary, &config, err, sizeof(err))) {
@@ -72338,6 +72466,8 @@ static int ds4_engine_open_k3(ds4_engine *e,
                     err[0] ? err : "open failed");
             return 0;
         }
+        e->ssd_streaming_cache_bytes =
+            k3_context_expert_cache_bytes(e->k3_primary);
         e->metal_ready = true;
     }
     const char *k3_format = e->k3_gguf ? "GGUF" : "SafeTensors";

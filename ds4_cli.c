@@ -3,6 +3,7 @@
 #include "ds4_gpu_args.h"
 #include "ds4_tp.h"
 #include "ds4_help.h"
+#include "ds4_kvstore.h"
 #include "ds4_prompt_prefix.h"
 #include "linenoise.h"
 
@@ -25,6 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -62,6 +64,7 @@ static bool cli_greedy_argmax_requested(bool speculative_requested) {
 typedef struct {
     const char *prompt;
     const char *system;
+    const char *prompt_cache_dir;
     ds4_prompt_prefix prefix;
     bool raw_prompt;
     int n_predict;
@@ -585,6 +588,66 @@ static void cli_apply_model_sampling_defaults(
     if (!gen->min_p_set) gen->min_p = 0.0f;
 }
 
+/* Key the disk prefix index by token IDs. A short final chunk may have used
+ * different matrix kernels than a full chunk, so only identical prompts
+ * reuse its state. Complete chunks may also start longer prompts. */
+static char *cli_prompt_cache_key(const ds4_tokens *prompt, uint32_t chunk) {
+    if (prompt->len <= 0 || !chunk || (size_t)prompt->len > (SIZE_MAX - 32) / 8)
+        return NULL;
+    char *key = malloc(32 + (size_t)prompt->len * 8);
+    if (!key) return NULL;
+    char *p = key + sprintf(key, "ds4-k3-%u/", chunk);
+    for (int i = 0; i < prompt->len; i++, p += 8)
+        snprintf(p, 9, "%08x", (unsigned)prompt->v[i]);
+    if ((uint32_t)prompt->len % chunk) *p++ = '!';
+    *p = '\0';
+    return key;
+}
+
+static int cli_sync_prompt(ds4_engine *engine, ds4_session *session,
+                           const cli_config *cfg, const ds4_tokens *prompt,
+                           char *err, size_t errlen) {
+    if (!cfg->gen.prompt_cache_dir)
+        return ds4_session_sync(session, prompt, err, errlen);
+    ds4_kvstore cache = {0};
+    ds4_kvstore_options options = ds4_kvstore_default_options();
+    options.min_tokens = 1;
+    char *key = cli_prompt_cache_key(prompt, ds4_engine_prefill_chunk(engine));
+    if (!key || !ds4_kvstore_open(&cache, cfg->gen.prompt_cache_dir,
+                                   DS4_KVSTORE_DEFAULT_MB, true, options,
+                                   "ds4", NULL, NULL)) {
+        fprintf(stderr, "ds4: prompt cache unavailable; processing input normally\n");
+        free(key);
+        return ds4_session_sync(session, prompt, err, errlen);
+    }
+    const double start = cli_now_sec();
+    int matched = ds4_kvstore_try_load_text(&cache, engine, session, key,
+                                             NULL, NULL, NULL, false);
+    if (matched && ds4_session_common_prefix(session, prompt) != matched) {
+        ds4_session_invalidate(session);
+        matched = 0;
+    }
+    if (matched)
+        fprintf(stderr, "ds4: prompt cache restored %d/%d tokens in %.3f s\n",
+                matched, prompt->len, cli_now_sec() - start);
+    else
+        fprintf(stderr, "ds4: prompt cache miss\n");
+
+    const int rc = ds4_session_sync(session, prompt, err, errlen);
+    if (!rc) {
+        char save_err[160] = "";
+        if (!ds4_kvstore_store_live_prefix_text(&cache, engine, session,
+                prompt, prompt->len, "cold", key, 0, "tokens", NULL,
+                save_err, sizeof(save_err))) {
+            fprintf(stderr, "ds4: could not save the prompt checkpoint%s%s\n",
+                    save_err[0] ? ": " : "", save_err);
+        }
+    }
+    ds4_kvstore_close(&cache);
+    free(key);
+    return rc;
+}
+
 static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
     ds4_session *session = NULL;
     if (ds4_session_create(&session, engine, cfg->gen.ctx_size) != 0) {
@@ -623,7 +686,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
                                      progress.use_color ? cli_prefill_progress_cb : NULL,
                                      progress.use_color ? &progress : NULL);
     cli_dist_busy_set(cfg, true);
-    int sync_rc = ds4_session_sync(session, prompt, err, sizeof(err));
+    int sync_rc = cli_sync_prompt(engine, session, cfg, prompt, err, sizeof(err));
     cli_dist_busy_set(cfg, false);
     if (sync_rc != 0) {
         ds4_session_set_progress(session, NULL, NULL);
@@ -823,7 +886,7 @@ static int run_logits_dump(ds4_engine *engine, const cli_config *cfg, const ds4_
     ds4_session_set_display_progress(session,
                                      progress.use_color ? cli_prefill_progress_cb : NULL,
                                      progress.use_color ? &progress : NULL);
-    if (ds4_session_sync(session, prompt, err, sizeof(err)) != 0) {
+    if (cli_sync_prompt(engine, session, cfg, prompt, err, sizeof(err)) != 0) {
         ds4_session_set_progress(session, NULL, NULL);
         ds4_session_set_display_progress(session, NULL, NULL);
         fprintf(stderr, "ds4: prompt processing failed: %s\n", err);
@@ -911,7 +974,7 @@ static int run_logprob_dump(ds4_engine *engine, const cli_config *cfg, const ds4
     ds4_session_set_display_progress(session,
                                      progress.use_color ? cli_prefill_progress_cb : NULL,
                                      progress.use_color ? &progress : NULL);
-    if (ds4_session_sync(session, prompt, err, sizeof(err)) != 0) {
+    if (cli_sync_prompt(engine, session, cfg, prompt, err, sizeof(err)) != 0) {
         ds4_session_set_progress(session, NULL, NULL);
         ds4_session_set_display_progress(session, NULL, NULL);
         fprintf(stderr, "ds4: prompt processing failed: %s\n", err);
@@ -2112,6 +2175,8 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.seed = parse_u64(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--quality")) {
             c.engine.quality = true;
+        } else if (!strcmp(arg, "--k3-prompt-cache")) {
+            c.gen.prompt_cache_dir = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--ssd-streaming")) {
             c.engine.ssd_streaming = true;
         } else if (!strcmp(arg, "--ssd-streaming-cold")) {
@@ -2266,6 +2331,14 @@ static cli_config parse_options(int argc, char **argv) {
         }
     }
 
+    if (c.gen.prompt_cache_dir && (!c.gen.prompt_cache_dir[0] || !c.gen.prompt ||
+        c.inspect || c.gen.dump_tokens || c.gen.head_test || c.gen.first_token_test ||
+        c.gen.metal_graph_test || c.gen.metal_graph_full_test || c.gen.metal_graph_prompt_test ||
+        c.gen.imatrix_output_path || c.gen.perplexity_file_path || c.gen.decode_consistency_tokens ||
+        (c.dist && c.dist->role != DS4_DISTRIBUTED_NONE) || c.engine.tp.role != DS4_TP_NONE)) {
+        fprintf(stderr, "ds4: --k3-prompt-cache DIR requires a local one-shot prompt (-p or --prompt-file)\n");
+        exit(2);
+    }
     if (c.engine.directional_steering_file && !directional_steering_scale_set) {
         c.engine.directional_steering_ffn = 1.0f;
     }
@@ -2402,6 +2475,17 @@ int main(int argc, char **argv) {
         ds4_prompt_prefix_free(&cfg.gen.prefix);
         free(cfg.prompt_owned);
         return 2;
+    }
+    if (cfg.gen.prompt_cache_dir) {
+        struct stat st;
+        if (!ds4_engine_is_k3(engine) || stat(cfg.engine.model_path, &st) || !S_ISREG(st.st_mode)) {
+            fprintf(stderr, "ds4: --k3-prompt-cache requires a Kimi K3 GGUF file\n");
+            ds4_engine_close(engine);
+            ds4_dist_options_free(cfg.dist);
+            ds4_prompt_prefix_free(&cfg.gen.prefix);
+            free(cfg.prompt_owned);
+            return 2;
+        }
     }
     cli_apply_model_sampling_defaults(engine, &cfg.gen);
     if (cfg.inspect) {

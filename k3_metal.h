@@ -9,6 +9,10 @@
 extern "C" {
 #endif
 
+/* Guaranteed resident expert-cache bytes, including individual-buffer
+ * fallback. Read only between completed cache loads under K3's execution lock. */
+uint64_t k3_gpu_streaming_cache_locked_bytes(void);
+
 /*
  * Kimi K3 checkpoint-native Metal operations. Model tensor offsets are
  * absolute offsets in the mmaped SafeTensors shard.
@@ -38,6 +42,17 @@ int k3_gpu_matmul_bf16(
         const ds4_gpu_tensor *x,
         uint32_t              n_rows);
 
+bool k3_gpu_can_tile_bf16_prefill(uint32_t in_dim, uint32_t out_dim, uint32_t rows);
+int k3_gpu_matmul_bf16_prefill_tiles(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_rows);
+
 int k3_gpu_matmul4_bf16_enabled(void);
 int k3_gpu_matmul4_bf16(
         ds4_gpu_tensor * const outputs[4],
@@ -58,6 +73,7 @@ int k3_gpu_matmul_q8_0_tensor(
         const ds4_gpu_tensor *x,
         uint32_t              n_rows);
 
+bool k3_gpu_mxfp4_pair_prefill_supported(uint32_t rows);
 int k3_gpu_gguf_mxfp4_pair_situ_f32(
         ds4_gpu_tensor       *mid,
         const void           *model_map,
@@ -67,6 +83,7 @@ int k3_gpu_gguf_mxfp4_pair_situ_f32(
         const ds4_gpu_tensor *x,
         uint32_t              in_dim,
         uint32_t              out_dim,
+        uint32_t              rows,
         float                 beta,
         float                 linear_beta);
 

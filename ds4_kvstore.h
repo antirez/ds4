@@ -71,6 +71,7 @@ typedef struct {
     bool reject_different_quant;
     ds4_kvstore_options opt;
     int continued_last_store_tokens;
+    char rejected_sha[41]; /* Last rejected transactional payload, eligible for replacement. */
     ds4_kvstore_entry *entry;
     int len;
     int cap;
@@ -86,6 +87,7 @@ typedef struct {
     uint8_t quant_bits;
     uint32_t ctx_size;
     bool reject_different_quant;
+    const char *replace_path; /* Keep the previous file until the atomic rename. */
 } ds4_kvstore_eviction_context;
 
 typedef struct {

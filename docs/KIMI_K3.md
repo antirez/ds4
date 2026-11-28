@@ -30,7 +30,8 @@ The original K3 GGUF is 799.783 GiB. It streams from SSD automatically when its 
 weights cannot fit safely in memory. The router still selects all 16 experts;
 streaming changes where the weights live, not the computation.
 
-On a 128 GiB Mac, the runtime keeps the non-routed weights resident when they
+Without the optimized `--ssd-streaming` profile, on a 128 GiB Mac the runtime
+keeps the non-routed weights resident when they
 fit, then uses the remaining safe budget for an expert cache. With less free
 memory it keeps only some layers' non-routed weights resident. This is automatic;
 no cache or residency flags are needed.
@@ -55,6 +56,250 @@ embeddings, the output head, routers, and norms retain higher precision.
 K3 uses its native XTML chat and tool format. Its sampling defaults are
 temperature 1, top-p 0.95, and min-p 0. Saved sessions rebuild their inference
 state by replaying the saved tokens.
+
+## Automatic SSD streaming on Apple Silicon
+
+`--ssd-streaming` selects how Kimi K3 GGUF reads its static weights. Before
+each prefill chunk or decode step, ds4 checks the available RAM and macOS
+memory pressure. When pressure is normal and the complete static working set
+fits both the live memory budget and Metal's recommended working set, ds4
+chooses `mode=resident`. It registers the selected layers' static weights
+and their output weights once. Consecutive decode steps reuse the same Metal
+buffers. Experts continue to use the separately budgeted streaming cache.
+
+Promotion reserves the full expert cache, runtime tensors and transient
+buffers, then requires 512 MiB of additional headroom. A resident session
+keeps a 256 MiB live margin above its existing reserves. A macOS memory
+pressure notification can release the residency set between evaluations or
+while the session is idle. Creating another session also releases the set
+before allocating its state. The next evaluation checks the new budget.
+
+If the static weights fit the reclaimable file cache but fail residency
+admission, ds4 chooses `mode=mapped` and creates temporary Metal views of the
+GGUF. macOS can reuse those pages while they remain in memory.
+
+With less headroom, ds4 selects `mode=streaming` and uses bounded staging. It discovers the lossless
+sidecar beside the canonical GGUF by replacing `.gguf` with
+`.static-zstd-v1.cache`. A compatible sidecar supplies static layer weights
+during prefill and decode. Without a sidecar or libzstd, the bounded path
+uses the original GGUF with aligned decode staging. A sidecar selected for
+loading must pass validation. The profile uses a default prefill chunk of
+64 tokens and four static I/O threads.
+
+The expert-cache target is set at startup. The automatic target starts at
+10 GiB, subject to admission. When the static working set fits alongside a
+full prefill batch of experts, ds4 leaves room for the file-backed pages.
+On larger Macs with additional headroom, ds4 uses half the excess above
+10 GiB for additional experts. Expert slabs start at 256 MiB and are
+allocated lazily.
+
+If the selected experts for a prefill layer exceed the available slots,
+ds4 processes the routed experts in smaller groups of token rows. This
+also applies when macOS reduces the number of slots that can be locked
+after startup. Each group must fit at least one token's 16 experts.
+Attention and dense projections keep the original prefill chunk, and each
+nonresident static layer is still loaded once per chunk.
+
+Admission accounts for live reclaimable RAM, physical RAM, the Metal
+working-set recommendation and a default host reserve of at least 12 GiB.
+A running session can switch static read paths. If headroom is too low even
+for bounded streaming, the live memory guard stops the evaluation.
+
+```sh
+./ds4 -m "/absolute/path/to/Kimi-K3-IQ2_XXS-Q2_K.gguf" \
+  --ssd-streaming --ctx 1024 --nothink -n 64 -p "Ciao, come stai?"
+```
+
+Explicit `--prefill-chunk` and `--ssd-streaming-cache-experts` values take
+priority. Setting `K3_GGUF_STATIC_CACHE` selects manual static I/O policy.
+An absolute path selects and validates that sidecar, and an empty value
+disables sidecar discovery. Explicit static-residency or GGUF staging
+settings also retain their manual behavior. For example,
+`K3_RESIDENT_STATIC=0` requests zero resident-static budget and
+`K3_GGUF_PREFILL_STAGING=0` disables cached prefill.
+`K3_SSD_STREAMING_DEFAULTS=0` selects the legacy profile.
+
+To compare the automatic paths on a 128 GiB Mac, run `ds4-bench` twice with
+the same GGUF, sidecar next to the GGUF, prompt, context, chunk and token
+count. Leave the static-cache, residency, staging and profile overrides
+unset. On the normal-pressure run, record whether the log shows
+`mode=resident` throughout decode. Then repeat with
+`--simulate-used-memory 80GB` to reproduce the constrained case. Keep
+`--ssd-streaming-cache-experts 10GB` in both runs to isolate the static I/O
+choice. Omit it in a separate pair to test automatic expert-cache sizing.
+Report the admitted cache, any mode changes, `gen_first_ms` and
+`gen_steady_tps`. Compare the same prompt and decode length with both the
+`8099b26c` mapped path and the `8ba3fac` decode reference.
+
+For the original K3 mixed-Q2 GGUF, aligned static staging and tiled output-head
+reads reuse two bounded buffers. An optional lossless static cache stores
+16 MiB blocks using byte-plane shuffling and zstd, with raw blocks when
+compression does not save space. It changes no tensor values or model math.
+
+The cache requires `libzstd` discoverable through `pkg-config`; the normal
+build still works without this optional dependency. These commands build the
+tools and create a new cache without installing packages:
+
+```sh
+k3_model_file="/absolute/path/to/Kimi-K3-IQ2_XXS-Q2_K.gguf"
+k3_static_cache_file="/absolute/path/to/Kimi-K3-IQ2_XXS-Q2_K.static-zstd-v1.cache"
+pkg-config --exists libzstd && make ds4 k3-static-cache-build
+./k3-static-cache-build "$k3_model_file" "$k3_static_cache_file"
+```
+
+Allow about 59 GiB of additional disk space for this GGUF. The builder reads
+its static spans, compares every decoded block byte-for-byte with the source,
+and publishes the completed cache atomically without replacing an existing
+file. The original GGUF remains unchanged and is still required for experts,
+embeddings and the output head. The cache is tied to that file's identity,
+size and timestamps; the loader checks header/index CRCs and each decoded
+block's CRC, and rejects changed or corrupt data.
+
+On a Mac with room for only some static layers, set `K3_RESIDENT_STATIC=auto`
+and `K3_GGUF_STATIC_CACHE=/absolute/path/to/the.cache` with `--ssd-streaming`.
+Metal keeps the output weights and as many complete layers as fit in the
+admitted budget. The loader reads the remaining layers from the lossless
+cache into the existing staging buffers. `K3_IO_PROFILE=1` reports the
+compressed bytes read and the original GGUF bytes they represent.
+
+On an M1 Max, `--ssd-streaming` uses tiled BF16 prefill kernels by default
+for supported streamed projections with 16 to 64 rows. For a 45-row projection,
+the tiled kernel handles the first 44 rows and the small-batch kernel handles the last row.
+Set `K3_EXPERIMENTAL_PREFILL_KERNELS=0` to use the previous kernel for
+comparison. In the initial 4×4 implementation, a 44-token prefill with a
+10 GiB expert cache and the lossless sidecar reduced GPU time for the 417
+affected projections from 4.16 to
+2.25 seconds. Full prefill took 141.69 and 102.93 seconds for the reference
+and trial. With the trial run first, it took 138.47 seconds and the reference
+took 111.39. All compared FP32 logits matched bit for bit.
+
+On the M1 Max, 40-, 44- and 48-row blocks can share BF16 projection weights
+in threadgroup memory for the KDA input/output and MLA Q-up projections.
+The shared-expert MXFP4 kernel combines gate, up and SiTU for streamed blocks
+of 16 to 64 rows in multiples of four. The routed Q2_K down projection uses
+its fixed GGUF row stride for 16 to 64 rows. These paths use the same prefill
+switch and preserve the original FP32 reduction order. Each processes fresh
+prompt activations.
+
+For decode kernel A/B tests on an M1 Max, set
+`K3_EXPERIMENTAL_DECODE_KERNELS=1` with `--ssd-streaming` to try the
+single-token BF16 projections and the Q2_K and masked IQ2_XXS expert kernels.
+The switch defaults to off. On the 32 GiB M1 Max with a 10 GiB expert cache
+and the lossless sidecar, the eight-step reference and experimental runs took
+29.40 and 34.74 s/token. Reversing the order for four steps gave 38.25 and
+36.60 s/token respectively. All compared FP32 logits matched bit for bit.
+
+### M5 Max BF16 prefill comparison
+
+On the tester's 128 GiB M5 Max, run the comparison from the repository root.
+
+```sh
+make -j4 ds4-bench test-k3-m5-bf16-tensorops
+python3 speed-bench/k3_m5_bf16_ab.py "/path/to/Kimi-K3-IQ2_XXS-Q2_K.gguf"
+```
+
+The runner uses the same binary for both kernels. It sets
+`K3_M5_BF16_TENSOROPS=0` for the reference and `=1` for the experimental
+prefill kernel. Each run formats the same 45-token chat prompt, generates
+32 greedy tokens, locks 64 GiB to simulate memory pressure, and uses a
+10 GiB expert cache, chunk 64 and direct GGUF streaming. The candidate log
+must confirm a TensorOps dispatch with 45 rows. The global Metal 4 startup
+message alone only describes device capability.
+
+The opt-in kernel uses TensorOps for BF16 projections with at least 32 rows,
+an input width divisible by 32 and an output width divisible by 64. It
+processes a partial final token tile, including the last 13 rows of this
+prompt. Single-token decode and quality mode use their existing kernels.
+The small Metal test checks aligned and partial tiles against both the
+reference kernel and CPU dot products before loading the model.
+
+Two speed runs produce `bench.csv` with prefill and generation throughput.
+The runner also prints the prefill evaluation time and mean decode time per
+token from the high-resolution timings in each log.
+Two separate runs dump the full-vocabulary logits after prefill and after
+each decode step. The runner prints the first differing generated token
+and writes `logits.csv` with the argmax IDs, bitwise FP32 equality, maximum
+absolute error and RMS error for each matching token history. Step 0 is
+the prompt frontier. The magnitude of numerical drift can be inspected
+even when the generated tokens agree.
+Each invocation prints its new results directory. Report the two speed CSVs,
+the candidate dispatch line and the logits comparison.
+
+A reproducible short generation check uses a 10 GiB expert cache, a 12 GiB
+host reserve, and approximately 131 MiB of additional decoder workspace
+accounted for before allocation. All existing memory checks remain active.
+
+```sh
+K3_SSD_STREAMING_DEFAULTS=0 \
+K3_MEMORY_RESERVE_GIB=12 K3_RESIDENT_STATIC=0 \
+K3_GGUF_STATIC_STAGING=1 K3_GGUF_STATIC_ALIGNED=1 \
+K3_GGUF_HEAD_STAGING=1 K3_GGUF_STATIC_CACHE="$k3_static_cache_file" \
+K3_STATIC_IO_THREADS=4 K3_LAYER_PAGEIN=0 K3_ROUTE_PREDICT=1 \
+K3_BF16_MV_UNROLL=16 K3_BF16_MV_NSG=4 \
+DS4_METAL_STREAMING_EXPERT_SLAB_MB=256 \
+DS4_METAL_DISABLE_STREAMING_EXPERT_READAHEAD=1 K3_IO_PROFILE=1 \
+./ds4 -m "$k3_model_file" --ssd-streaming \
+  --ssd-streaming-cache-experts 10GB --prefill-chunk 64 --ctx 1024 \
+  --nothink --temp 0 --seed 1 -n 9 -p "Ciao, come stai?"
+```
+
+The command above records the earlier explicit configuration used for the
+decode measurements below. In the automatic profile, a prefill using the
+sidecar shares the two static buffers and decoder workspace with decode.
+For the explicit configuration above, add `K3_GGUF_PREFILL_STAGING=1` to
+enable cached prefill.
+
+An invalid cache causes an explicit error rather than a silent fallback.
+`make test-k3-static-cache` runs the CPU format and decoder fixtures.
+`make test-k3-streaming test-k3-static-staging` checks default precedence,
+sidecar discovery and loader policy without executing the GPU.
+On the 32 GiB M1 Max, one controlled comparison of eight greedy decode steps
+for this prompt measured 41.488 to 28.379 seconds per step: 46.2% more tokens
+per second, or 31.6% less decode time. The reference already used GGUF static
+staging (`8ba3fac3`); these numbers measure the combined settings above.
+Prefill was 181.156 versus 183.668 seconds. Peak task footprint was 13.827
+versus 13.949 GiB, with normal memory pressure and no new swap in either run.
+Generated text matched, all 5,309 cache blocks were roundtrip verified, and
+separate KDA/MLA boundary and full output-head checks were bitwise identical.
+This is one measured pair with a short prompt, not a long-session benchmark;
+filesystem cache, external load and temperature were not controlled.
+
+
+With `K3_GGUF_PREFILL_STAGING=1`, four alternating full-model runs on the
+same M1 Max compared commit `bb4ae3e9` with this prefill extension. Each run
+used the prompt above (44 formatted tokens), chunk64, ctx1024 and the same
+10 GiB expert cache, 12 GiB host reserve and lossless-cache configuration.
+`--dump-logits` measured one complete prefill without generation:
+
+| Prefill path | Run 1 | Run 2 | Median |
+| --- | ---: | ---: | ---: |
+| Reference `bb4ae3e9` | 183.589 s | 178.048 s | 180.819 s |
+| Lossless prefill staging | 103.380 s | 102.212 s | 102.796 s |
+
+The median prefill time fell 43.15%, equivalent to 75.90% more tokens per
+second. Comparing the slowest optimized run with the fastest reference still
+reduced time by 41.94%. All 163,840 final FP32 logits were bitwise identical
+across all four runs. A separate real-model KDA/MLA slice check compared all
+931,840 boundary values after 9-token prefill, 3-token continuation and one
+decode step, also bitwise identical. Peak task footprint was 13.747 GiB for
+the optimized path versus 13.629 GiB for the reference, with normal memory
+pressure and no new swap in every run. This measures the short prompt above;
+longer contexts were not benchmarked, and filesystem cache, temperature and
+external load were not controlled.
+
+
+For decode correctness checks, `ds4-bench --dump-decode-logits` together with
+`--dump-frontier-logits-dir DIR` writes the full vocabulary logits after each
+successful scalar decode step, in addition to the prefill frontier. Create
+`DIR` before running the benchmark. Decode files include the consumed token
+ID, step number and actual session position, so comparisons can check every
+FP32 value and the token sequence rather than only the generated text. The
+option is incompatible with `--dspark`.
+
+Direct dump time is excluded from the reported generation timings, but the
+pauses and diagnostic I/O can still affect subsequent work. Use matching dump
+settings for correctness comparisons and separate runs without decode dumps
+for performance measurements.
 
 ## Two 512 GiB Macs
 

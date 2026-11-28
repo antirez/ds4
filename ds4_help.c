@@ -171,13 +171,13 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     }
     opt(fp, c, "-t, --threads N", "CPU helper threads for host-side/reference work.");
     opt(fp, c, "--power N", "GPU duty-cycle target, 1..100. Default: 100");
-    opt(fp, c, "--ssd-streaming", "Metal/CUDA/ROCm: opt in to SSD-backed model streaming instead of full residency.");
+    opt(fp, c, "--ssd-streaming", "Metal/CUDA/ROCm: opt in to SSD-backed model streaming. Kimi K3 GGUF: enable optimized streaming, discover the adjacent lossless cache, and size the expert cache from available memory (up to 10 GiB on <=32 GiB Macs) with chunk64; explicit settings override defaults.");
     opt(fp, c, "--ssd-streaming-cold", "SSD streaming: skip default popularity-based expert-cache preload.");
     opt(fp, c, "--ssd-streaming-cache-experts N|NGB", "SSD streaming cache target. N requests dynamic expert slots; NGB also reserves two full prefill layers. Either may be reduced to fit the model, graph, context, and backend working set.");
     opt(fp, c, "--ssd-streaming-full-layers N", "GLM Metal streaming: keep the first N routed layers fully resident. Default: auto from NGB expert budget; use 0 to disable.");
     opt(fp, c, "--ssd-streaming-preload-experts N", "SSD streaming: upfront popularity preload count. DeepSeek auto-seeds by default; GLM demand-fills unless N is explicit.");
     opt(fp, c, "--simulate-used-memory NGB", "Diagnostic: lock N GiB before model load to simulate a smaller-memory machine.");
-    opt(fp, c, "--prefill-chunk N", "Graph prefill chunk size. Default: CUDA TP 2048; PRO long prompts 8192; others 4096.");
+    opt(fp, c, "--prefill-chunk N", "Graph prefill chunk size. Defaults are 64 for K3 GGUF SSD streaming, 2048 for CUDA TP, 8192 for long PRO prompts and 4096 otherwise. On pre-M5 Macs with the K3 sidecar, full 128- or 256-token chunks share expert reads across their 64-token groups.");
     if (full) {
         if (tool == DS4_HELP_EVAL || tool == DS4_HELP_BENCH) {
             opt(fp, c, "--mtp-model FILE", "External MTP or DSpark support GGUF.");
@@ -218,6 +218,8 @@ static void print_sampling(FILE *fp, const help_colors *c, bool full, ds4_help_t
     if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT)
         opt(fp, c, "--think-level N", "V4.1 thinking effort, 1..100; 0 disables thinking.");
     opt(fp, c, "--nothink", "Disable thinking and ask for direct replies.");
+    if (tool == DS4_HELP_DS4)
+        opt(fp, c, "--k3-prompt-cache DIR", "Save Kimi K3 GGUF prompt states across one-shot runs in a dedicated directory (4 GiB budget). Reuse identical prompts or complete prefill chunks.");
     if (full) {
         opt(fp, c, "-sys, --system TEXT", "System prompt. Empty string disables the default where supported.");
         opt(fp, c, "-p, --prompt TEXT", "One-shot prompt text.");
@@ -397,6 +399,7 @@ static void print_bench_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "--teacher-forced-decode", "Decode the following prompt tokens instead of each predicted argmax.");
     opt(fp, c, "--csv FILE", "Write CSV there instead of stdout.");
     opt(fp, c, "--dump-frontier-logits-dir DIR", "Write one full-logit JSON file per frontier.");
+    opt(fp, c, "--dump-decode-logits", "Also dump full logits after each scalar decode step into --dump-frontier-logits-dir. Not compatible with --dspark; dump time is excluded from throughput.");
     fputc('\n', fp);
 }
 

@@ -70,6 +70,7 @@ typedef struct {
     bool cuda_tensor_parallel;
     bool show_output;
     bool teacher_forced_decode;
+    bool dump_decode_logits;
     bool dspark;
     bool dspark_confidence_threshold_set;
     float dspark_confidence_threshold;
@@ -303,6 +304,8 @@ static bench_config parse_options(int argc, char **argv) {
             c.csv_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dump-frontier-logits-dir")) {
             c.dump_frontier_logits_dir = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--dump-decode-logits")) {
+            c.dump_decode_logits = true;
         } else if (!strcmp(arg, "--expert-profile")) {
             c.expert_profile_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
@@ -386,6 +389,19 @@ static bench_config parse_options(int argc, char **argv) {
         fprintf(stderr, "ds4-bench: specify exactly one of --prompt-file or --chat-prompt-file\n");
         exit(2);
     }
+    if (c.dump_decode_logits &&
+        (!c.dump_frontier_logits_dir || !c.dump_frontier_logits_dir[0])) {
+        fprintf(stderr,
+                "ds4-bench: --dump-decode-logits requires "
+                "--dump-frontier-logits-dir DIR\n");
+        exit(2);
+    }
+    if (c.dump_decode_logits && c.dspark) {
+        fprintf(stderr,
+                "ds4-bench: --dump-decode-logits requires scalar decoding "
+                "and cannot be combined with --dspark\n");
+        exit(2);
+    }
     if (c.dspark && !c.mtp_path) {
         fprintf(stderr, "ds4-bench: --dspark requires --mtp-model FILE\n");
         exit(2);
@@ -459,38 +475,54 @@ static void json_write_string(FILE *fp, const char *s) {
     fputc('"', fp);
 }
 
-static int write_frontier_logits_json(
+/* decode_step==0 preserves the existing frontier file/schema. A positive
+ * step describes logits after consuming input_token, not the sampled token
+ * those logits will choose next. Both paths serialize the same FP32 values. */
+static int write_logits_json(
         const bench_config *cfg,
         ds4_engine         *engine,
         ds4_session        *session,
         int                 frontier,
-        int                 previous) {
+        int                 previous,
+        int                 decode_step,
+        int                 input_token) {
     if (!cfg->dump_frontier_logits_dir) return 0;
 
     const int vocab = ds4_engine_vocab_size(engine);
+    if (vocab <= 0 || (size_t)vocab > SIZE_MAX / sizeof(float)) {
+        fprintf(stderr, "ds4-bench: invalid vocabulary size for logits dump\n");
+        return 1;
+    }
     float *logits = malloc((size_t)vocab * sizeof(logits[0]));
     if (!logits) {
-        fprintf(stderr, "ds4-bench: out of memory copying frontier logits\n");
+        fprintf(stderr, "ds4-bench: out of memory copying logits\n");
         return 1;
     }
     if (ds4_session_copy_logits(session, logits, vocab) != vocab) {
-        fprintf(stderr, "ds4-bench: failed to copy frontier logits at %d\n", frontier);
+        fprintf(stderr, "ds4-bench: failed to copy logits at frontier %d, decode step %d\n",
+                frontier, decode_step);
         free(logits);
         return 1;
     }
 
     char path[PATH_MAX];
-    const int n = snprintf(path,
-                           sizeof(path),
-                           "%s/frontier_%06d.logits.json",
-                           cfg->dump_frontier_logits_dir,
-                           frontier);
+    const int n = decode_step > 0
+        ? snprintf(path, sizeof(path), "%s/frontier_%06d_decode_%06d.logits.json",
+                   cfg->dump_frontier_logits_dir, frontier, decode_step)
+        : snprintf(path, sizeof(path), "%s/frontier_%06d.logits.json",
+                   cfg->dump_frontier_logits_dir, frontier);
     if (n <= 0 || (size_t)n >= sizeof(path)) {
-        fprintf(stderr, "ds4-bench: frontier logits path is too long\n");
+        fprintf(stderr, "ds4-bench: logits path is too long\n");
         free(logits);
         return 1;
     }
 
+    const int argmax = ds4_session_argmax(session);
+    if (argmax < 0 || argmax >= vocab) {
+        fprintf(stderr, "ds4-bench: invalid argmax for logits dump\n");
+        free(logits);
+        return 1;
+    }
     FILE *fp = fopen(path, "wb");
     if (!fp) {
         fprintf(stderr, "ds4-bench: failed to open %s: %s\n", path, strerror(errno));
@@ -498,25 +530,30 @@ static int write_frontier_logits_json(
         return 1;
     }
 
-    const int argmax = ds4_session_argmax(session);
     fprintf(fp, "{\n  \"source\":\"ds4-bench\",\n  \"model\":");
     json_write_string(fp, cfg->model_path);
     fprintf(fp,
             ",\n  \"backend\":\"%s\",\n  \"quality\":%s,\n"
-            "  \"quant_bits\":%d,\n  \"prompt_tokens\":%d,\n"
-            "  \"frontier_tokens\":%d,\n  \"prefill_tokens\":%d,\n"
-            "  \"ctx\":%d,\n  \"vocab\":%d,\n"
-            "  \"argmax_id\":%d,\n  \"argmax_logit\":%.9g,\n  \"logits\":[",
+            "  \"quant_bits\":%d,\n",
             ds4_backend_name(cfg->backend),
             cfg->quality ? "true" : "false",
-            ds4_engine_routed_quant_bits(engine),
-            frontier,
-            frontier,
-            frontier - previous,
-            cfg->ctx_alloc,
-            vocab,
-            argmax,
-            logits[argmax]);
+            ds4_engine_routed_quant_bits(engine));
+    if (decode_step > 0) {
+        fprintf(fp,
+                "  \"phase\":\"decode\",\n  \"frontier_tokens\":%d,\n"
+                "  \"decode_step\":%d,\n  \"input_token_id\":%d,\n"
+                "  \"session_position\":%d,\n",
+                frontier, decode_step, input_token, ds4_session_pos(session));
+    } else {
+        fprintf(fp,
+                "  \"prompt_tokens\":%d,\n  \"frontier_tokens\":%d,\n"
+                "  \"prefill_tokens\":%d,\n",
+                frontier, frontier, frontier - previous);
+    }
+    fprintf(fp,
+            "  \"ctx\":%d,\n  \"vocab\":%d,\n"
+            "  \"argmax_id\":%d,\n  \"argmax_logit\":%.9g,\n  \"logits\":[",
+            cfg->ctx_alloc, vocab, argmax, logits[argmax]);
     for (int i = 0; i < vocab; i++) {
         if (i) fputc(',', fp);
         if ((i % 8) == 0) fputs("\n    ", fp);
@@ -524,13 +561,20 @@ static int write_frontier_logits_json(
         else fputs("null", fp);
     }
     fputs("\n  ]\n}\n", fp);
-    if (fclose(fp) != 0) {
-        fprintf(stderr, "ds4-bench: failed to close %s\n", path);
+    const int write_failed = ferror(fp);
+    if (fclose(fp) != 0 || write_failed) {
+        fprintf(stderr, "ds4-bench: failed to write or close %s\n", path);
         free(logits);
         return 1;
     }
     free(logits);
     return 0;
+}
+
+static int write_frontier_logits_json(
+        const bench_config *cfg, ds4_engine *engine, ds4_session *session,
+        int frontier, int previous) {
+    return write_logits_json(cfg, engine, session, frontier, previous, 0, -1);
 }
 
 static int next_frontier(const bench_config *c, int cur) {
@@ -873,6 +917,7 @@ int main(int argc, char **argv) {
         const double gen_t0 = bench_now_sec();
         double gen_first_sec = 0.0;
         double gen_steady_sec = 0.0;
+        double gen_dump_sec = 0.0;
         int gen_first_tokens = 0;
         int gen_done = 0;
         int *gen_token_buf = cfg.show_output && cfg.gen_tokens > 0
@@ -969,6 +1014,18 @@ int main(int argc, char **argv) {
             }
 #endif
             const double token_t1 = bench_now_sec();
+            if (cfg.dump_decode_logits) {
+                /* Scalar-only option: capture the completed step before the
+                 * next token is chosen, outside throughput timing windows. */
+                const double dump_t0 = bench_now_sec();
+                const int dump_rc = write_logits_json(
+                    &cfg, engine, session, frontier, previous, gen_done + 1, token);
+                gen_dump_sec += bench_now_sec() - dump_t0;
+                if (dump_rc != 0) {
+                    rc = 1;
+                    break;
+                }
+            }
             int cycle_tokens = 0;
             for (int j = 0; j < ntok && gen_done < cfg.gen_tokens; j++) {
                 if (toks[j] == eos) {
@@ -1019,7 +1076,7 @@ int main(int argc, char **argv) {
             }
         }
 
-        const double gen_sec = gen_t1 - gen_t0;
+        const double gen_sec = gen_t1 - gen_t0 - gen_dump_sec;
         const int gen_steady_tokens = gen_done > gen_first_tokens ?
             gen_done - gen_first_tokens : 0;
         fprintf(out,
