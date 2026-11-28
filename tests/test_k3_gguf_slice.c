@@ -21,6 +21,14 @@ static void fail(const char *message, const char *detail) {
     exit(1);
 }
 
+static void dump_boundary(const char *path, const float *values, size_t count) {
+    if (!path || !path[0]) return;
+    FILE *fp = fopen(path, "wb");
+    if (!fp) fail("could not open boundary dump", path);
+    const size_t written = fwrite(values, sizeof(*values), count, fp);
+    if (fclose(fp) != 0 || written != count) fail("could not write boundary dump", path);
+}
+
 typedef struct {
     uint32_t layer_start;
     uint32_t layer_end;
@@ -135,6 +143,18 @@ int main(int argc, char **argv) {
     if (context_capacity < prefill_rows + 1u) {
         context_capacity = prefill_rows + 1u;
     }
+    uint32_t expert_slots = 0;
+    const char *slots_env = getenv("K3_TEST_EXPERT_SLOTS");
+    if (slots_env && slots_env[0]) {
+        char *end = NULL;
+        errno = 0;
+        const unsigned long value = strtoul(slots_env, &end, 10);
+        if (errno || end == slots_env || *end != '\0' ||
+            value < 1u || value > K3_N_LAYER * K3_N_EXPERT) {
+            fail("invalid K3_TEST_EXPERT_SLOTS", slots_env);
+        }
+        expert_slots = (uint32_t)value;
+    }
     const k3_context_config config = {
         .model_directory = argv[1],
         .context_capacity = context_capacity,
@@ -143,6 +163,7 @@ int main(int argc, char **argv) {
         .layer_start = layer_start,
         .layer_end = layer_end,
         .has_output = false,
+        .expert_cache_slots = expert_slots,
     };
     char err[512] = {0};
     k3_context *ctx = NULL;
@@ -180,6 +201,7 @@ int main(int argc, char **argv) {
                 err, sizeof(err))) {
             fail("layer batch prefill evaluation failed", err);
         }
+        dump_boundary(getenv("K3_TEST_PREFILL_DUMP"), output, boundary_values);
         result = output +
             (size_t)(prefill_rows - 1u) * K3_BOUNDARY_F32_VALUES;
         if (!k3_context_eval_slice(
@@ -231,22 +253,7 @@ int main(int argc, char **argv) {
     if (hook.invalid) fail("hidden hook received an invalid stage", NULL);
     k3_context_set_hidden_hook(ctx, NULL, NULL);
 
-    const char *dump_path = getenv("K3_TEST_DUMP");
-    if (dump_path && dump_path[0]) {
-        FILE *fp = fopen(dump_path, "wb");
-        int ok = fp != NULL;
-        if (ok) {
-            ok =
-                fwrite(result, sizeof(*result),
-                       K3_BOUNDARY_F32_VALUES, fp) ==
-                    K3_BOUNDARY_F32_VALUES &&
-                fflush(fp) == 0;
-            if (fclose(fp) != 0) ok = 0;
-        }
-        if (!ok) {
-            fail("could not write K3_TEST_DUMP", dump_path);
-        }
-    }
+    dump_boundary(getenv("K3_TEST_DUMP"), result, K3_BOUNDARY_F32_VALUES);
 
     const char *compare_path = getenv("K3_TEST_COMPARE");
     if (compare_path && compare_path[0]) {

@@ -14274,9 +14274,10 @@ static uint32_t ds4_gpu_stream_expert_slab_locked_slot_count(void) {
 }
 
 static void ds4_gpu_stream_expert_cache_cap_budget_to_locked(void) {
-    uint32_t cap = g_stream_expert_cache_entry_count;
+    /* Slots acquired by a pending batch are already wired, even if no entries
+     * have been installed yet. They go back to the free list on a retry. */
     const uint32_t locked_slots = ds4_gpu_stream_expert_slab_locked_slot_count();
-    if (locked_slots != 0 && locked_slots < cap) cap = locked_slots;
+    uint32_t cap = locked_slots ? locked_slots : g_stream_expert_cache_entry_count;
     const uint64_t gib = 1024ull * 1024ull * 1024ull;
     uint64_t safe_gib = g_stream_expert_cache_mlock_bytes / gib;
     if (safe_gib > 1) safe_gib--;
@@ -14608,6 +14609,15 @@ static int ds4_gpu_stream_expert_slab_slot_buffers(
     return 1;
 }
 
+static uint64_t ds4_gpu_stream_expert_slab_slot_size(uint64_t gate_bytes,
+                                                     uint64_t down_bytes) {
+    if (!gate_bytes || !down_bytes || gate_bytes > (UINT64_MAX - down_bytes) / 2u) return 0;
+    const uint64_t bytes = 2u * gate_bytes + down_bytes;
+    const uint64_t page = (uint64_t)getpagesize();
+    if (!page || bytes > (uint64_t)NSUIntegerMax - (page - 1u)) return 0;
+    return round_up_u64(bytes, page);
+}
+
 static int ds4_gpu_stream_expert_alloc_slab_slot(
         uint64_t gate_expert_bytes,
         uint64_t down_expert_bytes,
@@ -14619,19 +14629,13 @@ static int ds4_gpu_stream_expert_alloc_slab_slot(
         NSUInteger *down_inner) {
     if (!ds4_gpu_stream_expert_slab_enabled() ||
         !gate_buf || !up_buf || !down_buf ||
-        !gate_inner || !up_inner || !down_inner ||
-        gate_expert_bytes == 0 || down_expert_bytes == 0 ||
-        gate_expert_bytes > (UINT64_MAX - down_expert_bytes) / 2ull) {
+        !gate_inner || !up_inner || !down_inner) {
         return 0;
     }
 
-    uint64_t slot_bytes = gate_expert_bytes * 2ull + down_expert_bytes;
-    if (slot_bytes == 0 || slot_bytes > (uint64_t)NSUIntegerMax) return 0;
-    const uint64_t page = (uint64_t)getpagesize();
-    if (page != 0) {
-        slot_bytes = round_up_u64(slot_bytes, page);
-        if (slot_bytes == 0 || slot_bytes > (uint64_t)NSUIntegerMax) return 0;
-    }
+    const uint64_t slot_bytes = ds4_gpu_stream_expert_slab_slot_size(gate_expert_bytes,
+                                                                    down_expert_bytes);
+    if (!slot_bytes) return 0;
     if (g_stream_expert_cache_slab_slot_bytes != 0 &&
         g_stream_expert_cache_slab_slot_bytes != slot_bytes) {
         return 0;
@@ -15002,9 +15006,10 @@ static int ds4_gpu_stream_prefill_batch_selected_addr_enabled(
         uint32_t n_total_expert,
         uint32_t n_expert,
         uint32_t gate_type,
-        uint32_t down_type) {
+        uint32_t down_type,
+        bool tile_k3) {
     if (!g_ssd_streaming_mode ||
-        n_tokens <= 1 ||
+        n_tokens == 0 || (n_tokens == 1 && !tile_k3) ||
         n_total_expert == 0 ||
         n_expert == 0 ||
         n_expert > DS4_METAL_MAX_ROUTED_EXPERT_USED ||
@@ -15026,7 +15031,9 @@ static int ds4_gpu_stream_prefill_batch_selected_addr_enabled(
     const uint32_t required_slots =
         selected_count < n_total_expert
             ? (uint32_t)selected_count : n_total_expert;
-    if (ds4_gpu_stream_expert_cache_configured_count() < required_slots) {
+    /* K3 checks the actual routed IDs when preparing the address table and
+     * splits the dispatch if they exceed the available cache. */
+    if (!tile_k3 && ds4_gpu_stream_expert_cache_configured_count() < required_slots) {
         return 0;
     }
     if (getenv("DS4_METAL_ENABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR") != NULL) {
@@ -15036,7 +15043,8 @@ static int ds4_gpu_stream_prefill_batch_selected_addr_enabled(
         ds4_gpu_stream_prefill_batch_selected_addr_auto_max(n_total_expert);
     const uint32_t min_tokens =
         ds4_gpu_stream_prefill_batch_selected_addr_auto_min(n_total_expert);
-    return max_tokens != 0 && n_tokens >= min_tokens && n_tokens <= max_tokens;
+    const bool single_tail = tile_k3 && n_tokens == 1 && min_tokens == 2;
+    return max_tokens != 0 && (n_tokens >= min_tokens || single_tail) && n_tokens <= max_tokens;
 }
 
 static int ds4_gpu_glm_streaming_prefill_full_layer_active(void) {
@@ -16218,9 +16226,12 @@ static uint32_t ds4_gpu_stream_expert_cache_release_mlock_margin(
 
     const uint32_t locked_before =
         ds4_gpu_stream_expert_slab_locked_slot_count();
-    if (locked_before == 0) return 0;
-
-    const uint32_t target_release = (locked_before + 9u) / 10u;
+    /* Keep enough already-wired slots for one routed row to make progress. */
+    const uint32_t keep = n_protect < DS4_METAL_MAX_ROUTED_EXPERT_USED
+        ? n_protect : DS4_METAL_MAX_ROUTED_EXPERT_USED;
+    if (locked_before <= keep) return 0;
+    uint32_t target_release = (locked_before + 9u) / 10u;
+    if (target_release > locked_before - keep) target_release = locked_before - keep;
     uint32_t released = 0;
     while (released < target_release) {
         uint32_t victim_layer = UINT32_MAX;
@@ -16284,10 +16295,7 @@ static uint32_t ds4_gpu_stream_expert_cache_release_mlock_margin(
     if (released == 0) return 0;
     g_stream_expert_cache_mlock_relief_applied = 1;
 
-    uint32_t cap = g_stream_expert_cache_entry_count;
-    const uint32_t locked_after =
-        ds4_gpu_stream_expert_slab_locked_slot_count();
-    if (locked_after != 0 && locked_after < cap) cap = locked_after;
+    const uint32_t cap = ds4_gpu_stream_expert_slab_locked_slot_count();
     if (cap != 0 &&
         (g_stream_expert_cache_mlock_budget_cap == 0 ||
          cap < g_stream_expert_cache_mlock_budget_cap)) {
@@ -16306,6 +16314,7 @@ static uint32_t ds4_gpu_stream_expert_cache_release_mlock_margin(
 }
 
 static int ds4_gpu_stream_expert_cache_take_capped_reusable(
+        int            force_reuse,
         uint32_t       protect_layer,
         const int32_t *protect_ids,
         uint32_t       n_protect,
@@ -16322,6 +16331,23 @@ static int ds4_gpu_stream_expert_cache_take_capped_reusable(
     ds4_gpu_stream_expert_cache_release_mlock_margin(protect_layer,
                                                      protect_ids,
                                                      n_protect);
+    /* A failed batch releases its uninstalled slots. Consume only slots
+     * that remain locked and that still fit the reduced entry budget. */
+    if (!force_reuse && g_stream_expert_cache_free_slot_count &&
+        g_stream_expert_cache_entry_count < ds4_gpu_stream_expert_cache_configured_budget() &&
+        ds4_gpu_stream_expert_slab_slot_size(gate_expert_bytes, down_expert_bytes) ==
+            g_stream_expert_cache_slab_slot_bytes) {
+        for (uint32_t i = g_stream_expert_cache_free_slot_count; i > 0; --i) {
+            const uint32_t slot = g_stream_expert_cache_free_slots[i - 1];
+            if (!g_stream_expert_cache_slab_slot_locked[slot]) continue;
+            if (!ds4_gpu_stream_expert_slab_slot_buffers(slot, gate_expert_bytes,
+                    down_expert_bytes, gate_buf, up_buf, down_buf,
+                    gate_inner, up_inner, down_inner)) return 0;
+            g_stream_expert_cache_free_slots[i - 1] =
+                g_stream_expert_cache_free_slots[--g_stream_expert_cache_free_slot_count];
+            return 1;
+        }
+    }
     ds4_gpu_stream_expert_reusable_buffers reuse = { nil, nil, nil, 0, 0, 0 };
     if (!ds4_gpu_stream_expert_cache_take_reusable(1,
                                                    protect_layer,
@@ -16436,7 +16462,7 @@ static int ds4_gpu_stream_expert_cache_prepare_load_buffers(
         }
         if (g_stream_expert_cache_mlock_budget_cap != 0) {
             return ds4_gpu_stream_expert_cache_take_capped_reusable(
-                    protect_layer, protect_ids, n_protect,
+                    force_reuse, protect_layer, protect_ids, n_protect,
                     gate_expert_bytes, down_expert_bytes,
                     gate_buf, up_buf, down_buf,
                     gate_inner, up_inner, down_inner);
@@ -16453,7 +16479,7 @@ static int ds4_gpu_stream_expert_cache_prepare_load_buffers(
         }
         if (g_stream_expert_cache_mlock_budget_cap != 0) {
             return ds4_gpu_stream_expert_cache_take_capped_reusable(
-                    protect_layer, protect_ids, n_protect,
+                    force_reuse, protect_layer, protect_ids, n_protect,
                     gate_expert_bytes, down_expert_bytes,
                     gate_buf, up_buf, down_buf,
                     gate_inner, up_inner, down_inner);
@@ -16470,7 +16496,7 @@ static int ds4_gpu_stream_expert_cache_prepare_load_buffers(
                                                @"ds4_stream_expert_combined");
         if (!combined) {
             return ds4_gpu_stream_expert_cache_take_capped_reusable(
-                    protect_layer, protect_ids, n_protect,
+                    force_reuse, protect_layer, protect_ids, n_protect,
                     gate_expert_bytes, down_expert_bytes,
                     gate_buf, up_buf, down_buf,
                     gate_inner, up_inner, down_inner);
@@ -16502,7 +16528,7 @@ static int ds4_gpu_stream_expert_cache_prepare_load_buffers(
         ds4_gpu_stream_expert_unlock_explicit_buffer(explicit_up);
         ds4_gpu_stream_expert_unlock_explicit_buffer(explicit_down);
         return ds4_gpu_stream_expert_cache_take_capped_reusable(
-                protect_layer, protect_ids, n_protect,
+                force_reuse, protect_layer, protect_ids, n_protect,
                 gate_expert_bytes, down_expert_bytes,
                 gate_buf, up_buf, down_buf,
                 gate_inner, up_inner, down_inner);
@@ -18028,6 +18054,7 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         uint64_t       model_size,
         uint32_t       layer,
         const ds4_gpu_tensor *selected,
+        uint32_t       first_token,
         uint32_t       n_tokens,
         uint32_t       n_total_expert,
         uint32_t       n_selected,
@@ -18045,7 +18072,8 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         id<MTLBuffer> *overflow_gate,
         id<MTLBuffer> *overflow_up,
         id<MTLBuffer> *overflow_down,
-        bool          allow_overflow_views) {
+        uint32_t      *retry_rows) {
+    const bool allow_overflow_views = retry_rows == NULL;
     if (overflow_gate) *overflow_gate = nil;
     if (overflow_up) *overflow_up = nil;
     if (overflow_down) *overflow_down = nil;
@@ -18082,7 +18110,7 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         getenv("DS4_METAL_STREAMING_PREFILL_BATCH_SELECTED_ADDR_PROFILE") != NULL;
     const double t0 = profile ? ds4_gpu_now_ms() : 0.0;
     int ok = ds4_gpu_tensor_read(selected,
-                                 0,
+                                 (uint64_t)first_token * n_selected * sizeof(ids[0]),
                                  ids,
                                  n_ids * sizeof(ids[0]));
     const double t_read = profile ? ds4_gpu_now_ms() : 0.0;
@@ -18091,6 +18119,8 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
     uint32_t frequency[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT] = { 0 };
     int32_t unique_ids[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
     uint32_t unique_count = 0;
+    const uint32_t cache_budget = ds4_gpu_stream_expert_cache_configured_budget();
+    uint32_t fitting_rows = n_tokens;
     *n_resources = 0;
     *unique_out = 0;
     if (ok) {
@@ -18114,23 +18144,25 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
             if (!seen[(uint32_t)selected_id]) {
                 seen[(uint32_t)selected_id] = true;
                 unique_ids[unique_count++] = selected_id;
+                if (retry_rows && unique_count > cache_budget && fitting_rows == n_tokens) {
+                    fitting_rows = (uint32_t)(i / n_selected);
+                }
             }
         }
+    }
+    if (ok && fitting_rows < n_tokens) {
+        *retry_rows = fitting_rows;
+        if (fitting_rows == 0) {
+            fprintf(stderr, "ds4: K3 expert cache cannot fit a single row at layer %u (%u slots)\n",
+                    layer, cache_budget);
+        }
+        free(ids);
+        return 0;
     }
     if (ok) {
         ds4_gpu_stream_expert_cache_note_frequency_hotness(layer,
                                                            frequency,
                                                            n_total_expert);
-    }
-    if (ok && !allow_overflow_views &&
-        unique_count > ds4_gpu_stream_expert_cache_configured_budget()) {
-        fprintf(stderr,
-                "ds4: K3 streaming prefill needs %u simultaneous expert slots "
-                "at layer %u, but only %u are available; reduce --prefill-chunk\n",
-                unique_count, layer,
-                ds4_gpu_stream_expert_cache_configured_budget());
-        free(ids);
-        return 0;
     }
     /*
      * When the layer's unique selected set does not fit the cache budget, the
@@ -18185,8 +18217,6 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         tasks = calloc((size_t)unique_count * 3u, sizeof(tasks[0]));
         if (!tasks) ok = 0;
     }
-    const uint32_t cache_budget =
-        ds4_gpu_stream_expert_cache_configured_budget();
     uint32_t reserved_entries = g_stream_expert_cache_entry_count;
     if (ok) {
         for (uint32_t u = 0; u < unique_count; u++) {
@@ -18380,6 +18410,16 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
                         ds4_gpu_now_ms() - task_t0);
             }
             load_unique[n_loads++] = u;
+        }
+    }
+    /* mlock may have lowered the cap while this batch was acquiring slots.
+     * No MoE commands have been encoded. Unwind the pending reservations
+     * below and retry only these rows with a group guaranteed to fit. */
+    if (retry_rows) {
+        const uint32_t live_cap = ds4_gpu_stream_expert_cache_configured_budget();
+        if (live_cap < cache_budget) {
+            *retry_rows = unique_count <= live_cap ? n_tokens : live_cap / n_selected;
+            ok = 0;
         }
     }
     if (ok && n_loads != 0) {
@@ -40587,6 +40627,7 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
                         model_size,
                         layer_index,
                         selected,
+                        0,
                         n_tokens,
                         n_total_expert,
                         n_expert,
@@ -40604,7 +40645,7 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
                         &stream_overflow_gate,
                         &stream_overflow_up,
                         &stream_overflow_down,
-                        true)) {
+                        NULL)) {
                 return 0;
             }
             if (stream_unique == 0) {
@@ -44107,7 +44148,9 @@ static int ds4_gpu_routed_moe_batch_tensor_impl(
         uint32_t                activation_kind,
         float                   activation_beta,
         float                   activation_linear_beta,
-        bool                    require_stream_cache) {
+        uint32_t                first_token,
+        uint32_t               *retry_rows) {
+    const bool require_stream_cache = retry_rows != NULL;
     if (!g_initialized && !ds4_gpu_init()) return 0;
     /* TP sharding (see ds4_gpu_routed_moe_one_tensor): bind from the owned
      * expert range and rebase ids in the kernels. */
@@ -44280,19 +44323,21 @@ static int ds4_gpu_routed_moe_batch_tensor_impl(
         id<MTLBuffer> expertsbuf = ds4_gpu_tensor_buffer(experts);
         id<MTLBuffer> selectedbuf = ds4_gpu_tensor_buffer(selected);
         id<MTLBuffer> weightsbuf = ds4_gpu_tensor_buffer(weights);
-        const uint64_t x_bytes = (uint64_t)n_tokens * expert_in_dim * sizeof(float);
-        const uint64_t mid_bytes = (uint64_t)n_tokens * n_expert * expert_mid_dim * sizeof(float);
-        const uint64_t out_bytes = (uint64_t)n_tokens * out_dim * sizeof(float);
-        const uint64_t selected_bytes = (uint64_t)n_tokens * n_expert * sizeof(int);
-        const uint64_t weights_bytes = (uint64_t)n_tokens * n_expert * sizeof(float);
+        const uint64_t end_token = (uint64_t)first_token + n_tokens;
+        const uint64_t x_stride = (uint64_t)expert_in_dim * sizeof(float);
+        const uint64_t mid_stride = (uint64_t)n_expert * expert_mid_dim * sizeof(float);
+        const uint64_t out_stride = (uint64_t)out_dim * sizeof(float);
+        const uint64_t selected_stride = (uint64_t)n_expert * sizeof(int32_t);
+        const uint64_t weights_stride = (uint64_t)n_expert * sizeof(float);
         if (!xbuf || !gatebuf || !upbuf || !midbuf || !outbuf || !selectedbuf || !weightsbuf ||
-            ds4_gpu_tensor_bytes(x) < x_bytes ||
-            ds4_gpu_tensor_bytes(gate) < mid_bytes ||
-            ds4_gpu_tensor_bytes(up) < mid_bytes ||
-            ds4_gpu_tensor_bytes(mid) < mid_bytes ||
-            ds4_gpu_tensor_bytes(out) < out_bytes ||
-            ds4_gpu_tensor_bytes(selected) < selected_bytes ||
-            ds4_gpu_tensor_bytes(weights) < weights_bytes) {
+            !x_stride || !mid_stride || !out_stride ||
+            ds4_gpu_tensor_bytes(x) / x_stride < end_token ||
+            ds4_gpu_tensor_bytes(gate) / mid_stride < end_token ||
+            ds4_gpu_tensor_bytes(up) / mid_stride < end_token ||
+            ds4_gpu_tensor_bytes(mid) / mid_stride < end_token ||
+            ds4_gpu_tensor_bytes(out) / out_stride < end_token ||
+            ds4_gpu_tensor_bytes(selected) / selected_stride < end_token ||
+            ds4_gpu_tensor_bytes(weights) / weights_stride < end_token) {
             fprintf(stderr, "ds4: Metal routed batch MoE received undersized activation buffers\n");
             return 0;
         }
@@ -44343,8 +44388,8 @@ static int ds4_gpu_routed_moe_batch_tensor_impl(
                                                                n_total_expert,
                                                                n_expert,
                                                                gate_type,
-                                                               down_type) &&
-            n_tokens > 1 &&
+                                                               down_type,
+                                                               require_stream_cache) &&
             n_total_expert <= DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT &&
             !g_quality_mode &&
             getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") == NULL &&
@@ -44824,6 +44869,7 @@ static int ds4_gpu_routed_moe_batch_tensor_impl(
                         model_size,
                         layer_index,
                         selected,
+                        first_token,
                         n_tokens,
                         n_total_expert,
                         n_expert,
@@ -44841,8 +44887,11 @@ static int ds4_gpu_routed_moe_batch_tensor_impl(
                         &stream_overflow_gate,
                         &stream_overflow_up,
                         &stream_overflow_down,
-                        !require_stream_cache)) {
+                        retry_rows)) {
                 g_stream_prefill_batch_selected_addr_building--;
+                if (retry_rows && *retry_rows && had_batch && !ds4_gpu_begin_commands()) {
+                    *retry_rows = 0;
+                }
                 return 0;
             }
             g_stream_prefill_batch_selected_addr_building--;
@@ -45099,17 +45148,17 @@ static int ds4_gpu_routed_moe_batch_tensor_impl(
                     stream_gate_addr_buf,
                     stream_up_addr_buf,
                     xbuf,
-                    ds4_gpu_tensor_offset(x),
+                    ds4_gpu_tensor_offset(x) + first_token * x_stride,
                     gatebuf,
-                    ds4_gpu_tensor_offset(gate),
+                    ds4_gpu_tensor_offset(gate) + first_token * mid_stride,
                     upbuf,
-                    ds4_gpu_tensor_offset(up),
+                    ds4_gpu_tensor_offset(up) + first_token * mid_stride,
                     midbuf,
-                    ds4_gpu_tensor_offset(mid),
+                    ds4_gpu_tensor_offset(mid) + first_token * mid_stride,
                     selectedbuf,
-                    ds4_gpu_tensor_offset(selected),
+                    ds4_gpu_tensor_offset(selected) + first_token * selected_stride,
                     weightsbuf,
-                    ds4_gpu_tensor_offset(weights),
+                    ds4_gpu_tensor_offset(weights) + first_token * weights_stride,
                     gate_smem,
                     2,
                     false,
@@ -45478,11 +45527,11 @@ static int ds4_gpu_routed_moe_batch_tensor_impl(
                         stream_resource_count,
                         stream_down_addr_buf,
                         midbuf,
-                        ds4_gpu_tensor_offset(mid),
+                        ds4_gpu_tensor_offset(mid) + first_token * mid_stride,
                         outbuf,
-                        ds4_gpu_tensor_offset(out),
+                        ds4_gpu_tensor_offset(out) + first_token * out_stride,
                         selectedbuf,
-                        ds4_gpu_tensor_offset(selected),
+                        ds4_gpu_tensor_offset(selected) + first_token * selected_stride,
                         down_smem,
                         2,
                         stream_overflow_down);
@@ -45663,7 +45712,7 @@ int ds4_gpu_routed_moe_batch_tensor(
         expert_in_dim, expert_mid_dim, out_dim,
         selected, weights, n_total_expert, n_expert, clamp,
         x, layer_index, n_tokens, mid_is_f16, force_resident,
-        0u, 0.0f, 0.0f, false);
+        0u, 0.0f, 0.0f, 0, NULL);
 }
 
 int ds4_gpu_k3_routed_moe_batch_tensor(
@@ -45693,16 +45742,36 @@ int ds4_gpu_k3_routed_moe_batch_tensor(
         uint32_t                n_tokens,
         bool                    force_resident) {
     bool mid_is_f16 = false;
-    return ds4_gpu_routed_moe_batch_tensor_impl(
-        out, gate, up, mid, experts, model_map, model_size,
-        gate_offset, up_offset, down_offset,
-        DS4_METAL_TENSOR_IQ2_XXS, DS4_METAL_TENSOR_Q2_K,
-        gate_expert_bytes, gate_row_bytes,
-        down_expert_bytes, down_row_bytes,
-        expert_in_dim, expert_mid_dim, out_dim,
-        selected, weights, n_total_expert, n_expert, 0.0f,
-        x, layer_index, n_tokens, &mid_is_f16, force_resident,
-        1u, 4.0f, 25.0f, !force_resident);
+    /* Split only the independent MoE rows. Dense prefill and KV state keep
+     * their original batch, and completed expert tiles are never replayed. */
+    uint32_t rows = n_tokens;
+    for (uint32_t first = 0; first < n_tokens;) {
+        uint32_t retry_rows = 0;
+        if (!ds4_gpu_routed_moe_batch_tensor_impl(
+                out, gate, up, mid, experts, model_map, model_size,
+                gate_offset, up_offset, down_offset,
+                DS4_METAL_TENSOR_IQ2_XXS, DS4_METAL_TENSOR_Q2_K,
+                gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
+                expert_in_dim, expert_mid_dim, out_dim,
+                selected, weights, n_total_expert, n_expert, 0.0f,
+                x, layer_index, rows, &mid_is_f16, force_resident,
+                1u, 4.0f, 25.0f, first, force_resident ? NULL : &retry_rows)) {
+            /* A same-size retry is issued only when preparation observed a
+             * strictly lower mlock cap and all selected IDs still fit it. */
+            if (retry_rows == 0 || retry_rows > rows) return 0;
+            const char *profile = getenv("K3_IO_PROFILE");
+            if (profile && profile[0] && strcmp(profile, "0") != 0) {
+                fprintf(stderr, "k3: routed prefill layer %u row %u: %u -> %u rows (%u expert slots)\n",
+                        layer_index, first, rows, retry_rows,
+                        ds4_gpu_stream_expert_cache_configured_count());
+            }
+            rows = retry_rows;
+            continue;
+        }
+        first += rows;
+        if (rows > n_tokens - first) rows = n_tokens - first;
+    }
+    return n_tokens != 0;
 }
 
 int ds4_gpu_hc_split_sinkhorn_tensor(

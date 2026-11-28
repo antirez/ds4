@@ -15,6 +15,16 @@ static inline uint64_t k3_memory_remaining(uint64_t budget, uint64_t used) {
     return budget > used ? budget - used : 0;
 }
 
+/* If mlock curtailed the expert cache, only the slots Metal can still fill
+ * count toward future growth. Keep the admission ceiling for other allocations. */
+static inline uint64_t k3_memory_live_cache_limit(uint64_t admitted_bytes,
+                                                   uint64_t slot_bytes,
+                                                   uint32_t live_slots) {
+    if (slot_bytes && live_slots && live_slots < admitted_bytes / slot_bytes)
+        return slot_bytes * live_slots;
+    return admitted_bytes;
+}
+
 /* File-backed weights can remain in the OS cache between temporary Metal
  * views. The live snapshot already excludes wired pages, whereas the physical
  * ceiling must include the full admitted cache and both staging buffers. */

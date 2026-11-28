@@ -334,12 +334,19 @@ test-k3-gguf: ds4 tests/test_k3_gguf tests/test_k3_tokenizer tests/test_k3_gguf_
 	    ./tests/test_k3_gguf_slice "$(K3_GGUF)"; \
 	done; \
 	cmp "$$dir/0" "$$dir/1"; \
-	for mode in serial overlap; do \
+	for mode in serial overlap small-cache one-row-cache; do \
 	    ( if test "$$mode" = serial; then export DS4_METAL_DISABLE_STREAMING_EXPERT_MASKED_ADDR=1; fi; \
+	      if test "$$mode" = small-cache; then export K3_TEST_EXPERT_SLOTS=32; fi; \
+	      if test "$$mode" = one-row-cache; then export K3_TEST_EXPERT_SLOTS=16; fi; \
 	      K3_TEST_STATIC=1 K3_TEST_LAYER=10 K3_TEST_STREAM_LAYERS=4 K3_TEST_PREFILL_ROWS=8 \
-	      K3_TEST_DUMP="$$dir/$$mode" ./tests/test_k3_gguf_slice "$(K3_GGUF)" ); \
+	      K3_TEST_PREFILL_DUMP="$$dir/$$mode.prefill" K3_TEST_DUMP="$$dir/$$mode" \
+	      ./tests/test_k3_gguf_slice "$(K3_GGUF)" ); \
 	done; \
-	cmp "$$dir/serial" "$$dir/overlap"
+	cmp "$$dir/serial" "$$dir/overlap"; \
+	for mode in small-cache one-row-cache; do \
+	    cmp "$$dir/overlap.prefill" "$$dir/$$mode.prefill"; \
+	    cmp "$$dir/overlap" "$$dir/$$mode"; \
+	done
 
 test-k3-gguf-source: tests/test_k3_gguf
 	./tests/test_k3_gguf "$(K3_GGUF)" "$(K3_MODEL)"
@@ -482,6 +489,7 @@ test-metal-ssd-experts: tests/test_metal_ssd_experts
 	./tests/test_metal_ssd_experts
 	./tests/test_metal_ssd_experts --q4
 	./tests/test_metal_ssd_experts --mxfp4
+	./tests/test_metal_ssd_experts --k3-tiling
 
 tests/test_metal_command_memory: tests/test_metal_command_memory.c ds4_gpu.h $(CORE_OBJS)
 	$(CC) $(CFLAGS) -I. -o $@ $< $(CORE_OBJS) $(METAL_LDLIBS)

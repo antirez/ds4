@@ -31,6 +31,16 @@ static void test_step_required(void) {
     const uint64_t reclaimable = UINT64_C(758) * GIB / 100;
     uint64_t required = 0;
 
+    /* A failed mlock reduced a 1155-slot cache to 462 slots on the M5.
+     * Slots still wired beyond the reduced limit cannot demand more pages. */
+    const uint64_t slot = 9 * MIB, admitted = 1155 * slot;
+    const uint64_t live = k3_memory_live_cache_limit(admitted, slot, 462);
+    CHECK(live == 462 * slot);
+    CHECK(k3_memory_step_required(transient, live, 550 * slot, reserve, &required));
+    CHECK(required == transient + reserve);
+    CHECK(k3_memory_live_cache_limit(admitted, slot, 0) == admitted);
+    CHECK(k3_memory_live_cache_limit(admitted, slot, 1200) == admitted);
+
     /* The reported 7.58 GiB is enough once the 2 GiB cache is locked. The
      * previous fixed 128-expert charge incorrectly still required 8.13 GiB. */
     CHECK(k3_memory_step_required(transient, cache, cache, reserve, &required));
@@ -292,23 +302,24 @@ static void test_32gb_cache_cap(void) {
     CHECK(plan.cache_bytes == 9 * GIB);
     CHECK(plan.static_bytes == 0);
 
-    /* 128 simultaneous slots fit a small prefill; a large prefill needs 896. */
-    const uint64_t small_budget = transient + 128 * slot;
-    CHECK(k3_plan_gguf_memory(small_budget, transient, slot, 128, 1472,
+    /* Routed prefill can dispatch one token at a time at its lower bound. */
+    const uint64_t small_budget = transient + 16 * slot;
+    CHECK(k3_plan_gguf_memory(small_budget, transient, slot, 16, 1472,
                               maximum, 16 * GIB, 0, 0, &plan));
-    CHECK(plan.cache_slots == 128);
-    check_plan(plan, small_budget, transient, slot, 128, maximum);
-    CHECK(!k3_plan_gguf_memory(small_budget - 1, transient, slot, 128,
+    CHECK(plan.cache_slots == 16);
+    check_plan(plan, small_budget, transient, slot, 16, maximum);
+    CHECK(!k3_plan_gguf_memory(small_budget - 1, transient, slot, 16,
                                1472, maximum, 16 * GIB, 0, 0, &plan));
-    CHECK(!k3_plan_gguf_memory(small_budget, transient, slot, 896, 1472,
-                               maximum, 16 * GIB, 0, 0, &plan));
-    const uint64_t large_prefill_budget = transient + 896 * slot;
-    CHECK(k3_plan_gguf_memory(large_prefill_budget, transient, slot, 896,
-                              1472, maximum, 16 * GIB, 0, 0, &plan));
-    CHECK(plan.cache_slots == 896);
-    check_plan(plan, large_prefill_budget, transient, slot, 896, maximum);
-    CHECK(!k3_plan_gguf_memory(large_prefill_budget - 1, transient, slot,
-                               896, 1472, maximum, 16 * GIB, 0, 0, &plan));
+
+    /* M5 Max sidecar report: a 64-row chunk, 4 GiB cache and 5.88 GiB
+     * transient reserve. Keep the cache cap even though a whole layer's
+     * 896 experts would require 7.75 GiB. */
+    const uint64_t real_slot = UINT64_C(9289728);
+    const uint64_t sidecar_reserve = 588 * GIB / 100;
+    CHECK(k3_plan_gguf_memory(49 * GIB, sidecar_reserve, real_slot, 16,
+                              1472, maximum, 84 * GIB, 4 * GIB, 0, &plan));
+    CHECK(plan.cache_slots == 462);
+    check_plan(plan, 49 * GIB, sidecar_reserve, real_slot, 16, maximum);
 }
 
 static void test_user_cache_limits(void) {

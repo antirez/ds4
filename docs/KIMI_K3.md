@@ -86,19 +86,24 @@ uses the original GGUF with aligned decode staging. A sidecar selected for
 loading must pass validation. The profile uses a default prefill chunk of
 64 tokens and four static I/O threads.
 
-Expert-cache capacity is set at startup. The automatic target starts at
+The expert-cache target is set at startup. The automatic target starts at
 10 GiB, subject to admission. When the static working set fits alongside a
 full prefill batch of experts, ds4 leaves room for the file-backed pages.
-If less than 10 GiB remains for experts, the cache can shrink as far as the
-capacity needed for one batch. On larger Macs with additional headroom, ds4
-uses half the excess above 10 GiB for additional experts. Expert slabs start
-at 256 MiB and are allocated lazily.
+On larger Macs with additional headroom, ds4 uses half the excess above
+10 GiB for additional experts. Expert slabs start at 256 MiB and are
+allocated lazily.
+
+If the selected experts for a prefill layer exceed the available slots,
+ds4 processes the routed experts in smaller groups of token rows. This
+also applies when macOS reduces the number of slots that can be locked
+after startup. Each group must fit at least one token's 16 experts.
+Attention and dense projections keep the original prefill chunk, and each
+nonresident static layer is still loaded once per chunk.
 
 Admission accounts for live reclaimable RAM, physical RAM, the Metal
 working-set recommendation and a default host reserve of at least 12 GiB.
-A running session can switch static read paths while keeping the same
-expert-cache capacity. If headroom is too low even for bounded streaming,
-the live memory guard stops the evaluation.
+A running session can switch static read paths. If headroom is too low even
+for bounded streaming, the live memory guard stops the evaluation.
 
 ```sh
 ./ds4 -m "/absolute/path/to/Kimi-K3-IQ2_XXS-Q2_K.gguf" \

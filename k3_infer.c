@@ -271,6 +271,7 @@ struct k3_context {
     uint64_t resident_static_bytes;
     uint64_t tensor_allocation_limit;
     uint64_t gguf_cache_bytes;
+    uint64_t gguf_expert_slot_bytes;
     uint64_t gguf_file_cache_span;
     k3_static_io_mode gguf_file_cache_mode;
     uint64_t gguf_transient_bytes;
@@ -698,8 +699,11 @@ static int check_gguf_memory(const k3_context *ctx, const char *phase,
     /* Slabs are allocated lazily. Reserve every cache byte not yet guaranteed
      * resident by mlock, without charging the already-filled cache again. */
     const uint64_t locked_cache = k3_gpu_streaming_cache_locked_bytes();
+    const uint64_t cache_limit = k3_memory_live_cache_limit(
+        owner->gguf_cache_bytes, owner->gguf_expert_slot_bytes,
+        ds4_gpu_stream_expert_cache_configured_count());
     const uint64_t cache_growth =
-        k3_memory_remaining(owner->gguf_cache_bytes, locked_cache);
+        k3_memory_remaining(cache_limit, locked_cache);
     /* Successfully mlocked staging pages are already wired and excluded
      * from reclaimable memory. Reserve only their future growth here; full
      * slot capacity remains charged to admission and session-clone limits. */
@@ -712,7 +716,7 @@ static int check_gguf_memory(const k3_context *ctx, const char *phase,
         owner->gguf_transient_bytes - owner->gguf_staging_locked_bytes;
     uint64_t minimum = 0;
     if (!k3_memory_step_required(transient_growth,
-            owner->gguf_cache_bytes, locked_cache,
+            cache_limit, locked_cache,
             K3_GGUF_LIVE_RESERVE_BYTES, &minimum)) {
         set_error(err, errcap, "K3 GGUF streaming memory requirement overflow");
         return 0;
@@ -6322,11 +6326,13 @@ int k3_context_create(k3_context **out,
             k3_context_destroy(ctx);
             return 0;
         }
-        /* A batch can select at most rows * top-k distinct experts in a
-         * layer. Lookahead only advises disk reads; it needs no cache slots. */
-        uint32_t required_slots = ctx->max_prefill_tokens * K3_N_EXPERT_USED;
-        if (required_slots > K3_N_EXPERT) required_slots = K3_N_EXPERT;
-        if (!routed_layers) required_slots = 0;
+        /* Prefer to dispatch the entire prefill in one group. A smaller
+         * cache only tiles routed experts, so one token's top-k is enough. */
+        const uint32_t required_slots = routed_layers ? K3_N_EXPERT_USED : 0;
+        uint32_t batch_slots = ctx->max_prefill_tokens * required_slots;
+        if (batch_slots > K3_N_EXPERT) batch_slots = K3_N_EXPERT;
+        uint32_t desired_slots = routed_layers * K3_N_EXPERT_USED;
+        if (desired_slots < batch_slots) desired_slots = batch_slots;
         /* Select automatic cache capacity only after runtime tensors and
          * both staging slots have been accounted for. A larger Mac can use
          * more experts while retaining file-cache headroom for static reads.
@@ -6346,27 +6352,28 @@ int k3_context_create(k3_context **out,
                 uint64_t capacity = gguf_file_cache_capacity(ctx, 0, &gpu);
                 const uint64_t limit = k3_memory_remaining(
                     gpu < capacity ? gpu : capacity, K3_STATIC_PROMOTE_MARGIN);
-                if (limit >= static_bytes && required_slots <= (limit - static_bytes) / slot_bytes)
+                if (limit >= static_bytes && batch_slots <= (limit - static_bytes) / slot_bytes)
                     capacity = limit;
                 cache_target = k3_ssd_file_cache_expert_target(cache_target,
-                    capacity, static_bytes, slot_bytes, required_slots);
+                    capacity, static_bytes, slot_bytes, batch_slots);
             }
         }
         k3_memory_plan plan;
         if (!k3_plan_gguf_memory(gguf_budget, ctx->gguf_transient_bytes,
-                slot_bytes, required_slots, routed_layers * K3_N_EXPERT_USED,
+                slot_bytes, required_slots, desired_slots,
                 routed_layers * K3_N_EXPERT, static_bytes,
                 cache_target, config->expert_cache_slots, &plan)) {
             set_error(err, errcap,
                       "K3 GGUF memory/cache limit cannot fit %u expert slots "
                       "(%.2f GiB) and %.2f GiB streaming reserve; "
-                      "reduce --prefill-chunk or --ctx, or close other applications",
+                      "check the expert cache limit, reduce --ctx, or close other applications",
                       required_slots, (double)required_slots * slot_bytes / 1073741824.0,
                       (double)ctx->gguf_transient_bytes / 1073741824.0);
             k3_context_destroy(ctx);
             return 0;
         }
         ctx->gguf_cache_bytes = plan.cache_bytes;
+        ctx->gguf_expert_slot_bytes = slot_bytes;
         if (automatic_cache) {
             fprintf(stderr,
                     "k3: automatic SSD expert cache: physical %.2f GiB, "

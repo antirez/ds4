@@ -8,12 +8,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <unistd.h>
 
 enum { STEPS = 48 };
 static int D = 256, H = 512, E = 256, N = 8;
 static uint32_t quant_type = 16;
 typedef struct { uint16_t d; uint8_t qs[64]; } iq2_block;
+typedef struct { uint8_t scales[16], qs[64]; uint16_t d, dmin; } q2_block;
 typedef struct { uint16_t d, dmin; uint8_t scales[12], qs[128]; } q4_block;
 typedef struct { uint8_t e, qs[16]; } mxfp4_block;
 static uint64_t block_bytes = sizeof(iq2_block);
@@ -176,6 +178,83 @@ static uint64_t memory_footprint(void) {
     return info.phys_footprint;
 }
 
+static int check_k3_prefill_tiles(void *model, size_t bytes, int fd,
+                                  uint64_t gate_expert, uint64_t down_expert) {
+    enum { rows = 5, top_k = 16 };
+    float x[rows * D], weights[rows * top_k], reference[rows * D], result[rows * D];
+    int32_t ids[rows * top_k];
+    const size_t hidden_bytes = rows * top_k * H * sizeof(float);
+    struct rlimit original;
+    ds4_gpu_tensor *xt = ds4_gpu_tensor_alloc(sizeof(x));
+    ds4_gpu_tensor *it = ds4_gpu_tensor_alloc(sizeof(ids));
+    ds4_gpu_tensor *wt = ds4_gpu_tensor_alloc(sizeof(weights));
+    ds4_gpu_tensor *gate = ds4_gpu_tensor_alloc(hidden_bytes);
+    ds4_gpu_tensor *up = ds4_gpu_tensor_alloc(hidden_bytes);
+    ds4_gpu_tensor *mid = ds4_gpu_tensor_alloc(hidden_bytes);
+    ds4_gpu_tensor *down = ds4_gpu_tensor_alloc(rows * top_k * D * sizeof(float));
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(sizeof(result));
+    for (size_t i = 0; i < rows * (size_t)D; i++)
+        x[i] = ((int)(random_u32() % 101) - 50) / 32.0f;
+    for (int i = 0; i < rows * top_k; i++) {
+        ids[i] = i;
+        weights[i] = (float)(1 + i % top_k) / 136.0f;
+    }
+    ds4_gpu_set_ssd_streaming(true);
+    int ok = xt && it && wt && gate && up && mid && down && out &&
+        ds4_gpu_set_model_map(model, bytes) && ds4_gpu_set_model_fd(fd) &&
+        ds4_gpu_tensor_write(xt, 0, x, sizeof(x)) &&
+        ds4_gpu_tensor_write(it, 0, ids, sizeof(ids)) &&
+        ds4_gpu_tensor_write(wt, 0, weights, sizeof(weights)) &&
+        getrlimit(RLIMIT_MEMLOCK, &original) == 0;
+    /* Each row routes to 16 disjoint experts. 32 slots force 2+2+1;
+     * 16 slots force all singletons. Finally request the full 80 again
+     * but let macOS refuse a lock during preparation of the first tile. */
+    const uint32_t budgets[] = {rows * top_k, 32, 16, rows * top_k};
+    const uint64_t page = (uint64_t)getpagesize();
+    const uint64_t stride = (2 * gate_expert + down_expert + page - 1) / page * page;
+    for (unsigned pass = 0; pass < 4 && ok; pass++) {
+        ds4_gpu_set_streaming_expert_cache_budget(budgets[pass]);
+        ds4_gpu_set_streaming_expert_cache_expert_bytes(2 * gate_expert + down_expert);
+        if (pass == 3) {
+            struct rlimit limit = original;
+            limit.rlim_cur = 38 * stride;
+            if (limit.rlim_cur > original.rlim_cur || setrlimit(RLIMIT_MEMLOCK, &limit) != 0) {
+                fprintf(stderr, "Cannot set test mlock limit to %llu bytes\n",
+                        (unsigned long long)limit.rlim_cur);
+                ok = 0;
+                break;
+            }
+        }
+        ok = ds4_gpu_tensor_fill_f32(out, NAN, rows * D) &&
+            ds4_gpu_begin_commands() &&
+            ds4_gpu_k3_routed_moe_batch_tensor(out, gate, up, mid, down,
+                model, bytes, 0, E * gate_expert, 2 * E * gate_expert,
+                gate_expert, gate_expert / H, down_expert, down_expert / D,
+                D, H, D, it, wt, E, top_k, xt, 3, rows, false) &&
+            ds4_gpu_end_commands() &&
+            ds4_gpu_tensor_read(out, 0, result, sizeof(result));
+        const uint32_t cap = ds4_gpu_stream_expert_cache_configured_count();
+        const uint32_t live = ds4_gpu_stream_expert_cache_current_count();
+        if (pass == 3) {
+            if (setrlimit(RLIMIT_MEMLOCK, &original) != 0 ||
+                cap < top_k || cap >= budgets[pass]) ok = 0;
+        } else if (cap != budgets[pass]) ok = 0;
+        if (!live || live > cap) ok = 0;
+        for (int i = 0; i < rows * D && ok; i++)
+            if (!isfinite(result[i])) ok = 0;
+        if (ok && pass == 0) {
+            memcpy(reference, result, sizeof(reference));
+            if (memcmp(reference, reference + D, D * sizeof(float)) == 0) ok = 0;
+        } else if (ok && memcmp(reference, result, sizeof(reference))) ok = 0;
+        fprintf(stderr, "Metal K3 routed prefill: requested=%u cap=%u live=%u %s\n",
+                budgets[pass], cap, live, ok ? "PASS" : "FAIL");
+    }
+    ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(it); ds4_gpu_tensor_free(wt);
+    ds4_gpu_tensor_free(gate); ds4_gpu_tensor_free(up); ds4_gpu_tensor_free(mid);
+    ds4_gpu_tensor_free(down); ds4_gpu_tensor_free(out);
+    return ok;
+}
+
 static int check_seed_release(void *model, uint64_t bytes, uint64_t expert) {
     int32_t ids[E];
     for (int i = 0; i < E; i++) ids[i] = i;
@@ -209,7 +288,10 @@ static int check_seed_release(void *model, uint64_t bytes, uint64_t expert) {
 }
 
 int main(int argc, char **argv) {
-    if (argc == 2 && !strcmp(argv[1], "--table-admission")) {
+    const int k3_tiles = argc == 2 && !strcmp(argv[1], "--k3-tiling");
+    if (k3_tiles) {
+        H = D;
+    } else if (argc == 2 && !strcmp(argv[1], "--table-admission")) {
         const int ok = ds4_gpu_init() && check_streaming_table_admission();
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
@@ -227,20 +309,22 @@ int main(int argc, char **argv) {
         block_bytes = sizeof(mxfp4_block);
         block_values = 32;
     } else if (argc != 1) {
-        fprintf(stderr, "usage: %s [--full-glm-shape | --q4 | --mxfp4 | --table-admission]\n", argv[0]);
+        fprintf(stderr, "usage: %s [--full-glm-shape | --q4 | --mxfp4 | --table-admission | --k3-tiling]\n", argv[0]);
         return 1;
     }
     const uint64_t row = D / block_values * block_bytes;
     const uint64_t down_row = H / block_values * block_bytes;
     const uint64_t expert = H * row;
     const uint64_t tensor = E * expert;
-    const size_t bytes = 3 * tensor;
+    const uint64_t down_expert = k3_tiles ? D * (H / 256) * sizeof(q2_block) : expert;
+    const size_t bytes = 2 * tensor + E * down_expert;
     FILE *file = tmpfile();
     if (!file || ftruncate(fileno(file), bytes)) return 1;
     void *model = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED,
                        fileno(file), 0);
     if (model == MAP_FAILED) return 1;
-    for (size_t i = 0; i < bytes / block_bytes; i++) {
+    const size_t primary_bytes = k3_tiles ? 2 * tensor : bytes;
+    for (size_t i = 0; i < primary_bytes / block_bytes; i++) {
         if (quant_type == 12) {
             q4_block *block = (q4_block *)model + i;
             block->d = 0x0400;
@@ -261,7 +345,25 @@ int main(int argc, char **argv) {
                 block->qs[j] = random_u32();
         }
     }
+    if (k3_tiles) {
+        q2_block *blocks = (q2_block *)((uint8_t *)model + 2 * tensor);
+        for (size_t i = 0; i < E * down_expert / sizeof(*blocks); i++) {
+            for (size_t j = 0; j < sizeof(blocks[i].scales); j++)
+                blocks[i].scales[j] = random_u32();
+            for (size_t j = 0; j < sizeof(blocks[i].qs); j++)
+                blocks[i].qs[j] = random_u32();
+            blocks[i].d = 0x1400;
+            blocks[i].dmin = 0x1000;
+        }
+    }
     int ok = msync(model, bytes, MS_SYNC) == 0 && ds4_gpu_init();
+    if (k3_tiles) {
+        ok = ok && check_k3_prefill_tiles(model, bytes, fileno(file), expert, down_expert);
+        ds4_gpu_cleanup();
+        munmap(model, bytes);
+        fclose(file);
+        return ok ? 0 : 1;
+    }
     if (ok) ok = check_streaming_table_admission();
     ds4_gpu_set_quality(false);
     ds4_gpu_set_glm_model(quant_type == 16);
