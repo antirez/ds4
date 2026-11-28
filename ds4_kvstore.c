@@ -12,6 +12,7 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
+#include <signal.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -474,6 +475,8 @@ bool ds4_kvstore_read_entry_file(const char *path, const char sha[41],
 static void kv_cache_refresh(ds4_kvstore *kc) {
     if (!kc->enabled) return;
     ds4_kvstore_clear(kc);
+    kc->foreign_files = 0;
+    kc->foreign_bytes = 0;
     DIR *d = opendir(kc->dir);
     if (!d) return;
     struct dirent *de;
@@ -482,7 +485,15 @@ static void kv_cache_refresh(ds4_kvstore *kc) {
         if (!ds4_kvstore_sha_hex_name(de->d_name, sha)) continue;
         char *path = ds4_kvstore_path_join(kc->dir, de->d_name);
         ds4_kvstore_entry e = {0};
-        if (ds4_kvstore_read_entry_file(path, sha, &e)) kv_cache_push(kc, e);
+        if (ds4_kvstore_read_entry_file(path, sha, &e)) {
+            if (kc->owned && e.model_id != kc->owner_model_id) {
+                kc->foreign_files++;
+                kc->foreign_bytes += e.file_size;
+                ds4_kvstore_entry_free(&e);
+            } else {
+                kv_cache_push(kc, e);
+            }
+        }
         free(path);
     }
     closedir(d);
@@ -612,13 +623,86 @@ void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
     }
 }
 
-bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
-                      bool reject_different_quant, ds4_kvstore_options opt,
-                      const char *log_name,
-                      void (*log)(void *ud, ds4_kvstore_log_type type, const char *msg),
-                      void *log_ud) {
+void ds4_kvstore_note_refused(ds4_kvstore *kc, const char sha[41]) {
+    if (!kc || !kc->replace_refused || ds4_kvstore_is_refused(kc, sha)) return;
+    if (kc->n_refused == kc->cap_refused) {
+        kc->cap_refused = kc->cap_refused ? kc->cap_refused * 2 : 8;
+        kc->refused = kv_xrealloc(kc->refused, (size_t)kc->cap_refused * sizeof(kc->refused[0]));
+    }
+    memcpy(kc->refused[kc->n_refused++], sha, 41);
+}
+
+/* The key now holds a file this process wrote itself: forget the refusal, or the replacement would be skipped by every lookup and
+ * rewritten (a full payload) on every store until restart. */
+void ds4_kvstore_forget_refused(ds4_kvstore *kc, const char sha[41]) {
+    if (!kc || !kc->replace_refused) return;
+    for (int i = 0; i < kc->n_refused; i++) {
+        if (strcmp(kc->refused[i], sha)) continue;
+        memmove(kc->refused + i, kc->refused + i + 1, (size_t)(kc->n_refused - i - 1) * sizeof(kc->refused[0]));
+        kc->n_refused--;
+        return;
+    }
+}
+
+bool ds4_kvstore_is_refused(const ds4_kvstore *kc, const char sha[41]) {
+    if (!kc || !kc->replace_refused) return false;
+    for (int i = 0; i < kc->n_refused; i++)
+        if (!strcmp(kc->refused[i], sha)) return true;
+    return false;
+}
+
+/* Remove what a crashed server left in the directory: staged payloads (.ds4-stage-PID-XXXXXX) and half-written files
+ * (NAME.kv.tmp.PID) whose PID is no longer alive.  A live PID (another server, this one) is left alone.  Returns the count. */
+int ds4_kvstore_sweep_partial(ds4_kvstore *kc) {
+    if (!kc || !kc->dir) return 0;
+    DIR *d = opendir(kc->dir);
+    if (!d) return 0;
+    int removed = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        long pid = 0;
+        const char *n = de->d_name;
+        if (!strncmp(n, ".ds4-stage-", 11)) pid = strtol(n + 11, NULL, 10);
+        else {
+            const char *t = strstr(n, ".kv.tmp.");
+            if (t && ds4_kvstore_sha_hex_name(n, (char[41]){0}) == false) {
+                char head[48];
+                const size_t hl = (size_t)(t - n) + 3;
+                if (hl < sizeof(head)) {
+                    memcpy(head, n, hl);
+                    head[hl] = '\0';
+                    char sha[41];
+                    if (ds4_kvstore_sha_hex_name(head, sha)) pid = strtol(t + 8, NULL, 10);
+                }
+            }
+        }
+        if (pid <= 0) continue;
+        if (kill((pid_t)pid, 0) == 0 || errno == EPERM) continue;
+        char *path = ds4_kvstore_path_join(kc->dir, n);
+        struct stat st;
+        const double mb = stat(path, &st) == 0 ? (double)st.st_size / (1024.0 * 1024.0) : 0.0;
+        if (unlink(path) == 0) {
+            removed++;
+            kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE, "%s: kv cache removed a partial file left by a stopped process (pid %ld): %s (%.1f MiB)",
+                    kv_log_name(kc), pid, n, mb);
+        }
+        free(path);
+    }
+    closedir(d);
+    return removed;
+}
+
+bool ds4_kvstore_open_owned(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
+                            bool reject_different_quant, ds4_kvstore_options opt,
+                            int owner_model_id, const char *log_name,
+                            void (*log)(void *ud, ds4_kvstore_log_type type, const char *msg),
+                            void *log_ud) {
     memset(kc, 0, sizeof(*kc));
     if (!dir) return false;
+    if (owner_model_id >= 0) {
+        kc->owned = true;
+        kc->owner_model_id = (uint8_t)owner_model_id;
+    }
     kc->log_name = log_name;
     kc->log = log;
     kc->log_ud = log_ud;
@@ -634,7 +718,16 @@ bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
     kc->budget_bytes = budget_mb * 1024ull * 1024ull;
     kc->reject_different_quant = reject_different_quant;
     kc->opt = opt;
+    ds4_kvstore_sweep_partial(kc);
     ds4_kvstore_evict(kc, NULL, 0, NULL);
+    if (kc->owned && kc->foreign_files > 0)
+        kv_logf(kc, DS4_KVSTORE_LOG_WARNING,
+                "%s: WARNING: KV cache directory %s holds %d file(s), %.2f MiB, written by another model (this server is model id %u). "
+                "They are left alone and not counted against the %llu MiB budget, but another server that shares the directory may delete this server's files. "
+                "Use a directory of its own for each model.",
+                kv_log_name(kc), dir, kc->foreign_files,
+                (double)kc->foreign_bytes / (1024.0 * 1024.0), (unsigned)kc->owner_model_id,
+                (unsigned long long)(kc->budget_bytes / (1024ull * 1024ull)));
     kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
             "%s: KV disk cache %s (budget=%llu MiB, cross-quant=%s, min=%d, cold_max=%d, continued=%d, trim=%d, align=%d, hit_half_life=%llus)",
             kv_log_name(kc),
@@ -650,8 +743,18 @@ bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
     return true;
 }
 
+bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
+                      bool reject_different_quant, ds4_kvstore_options opt,
+                      const char *log_name,
+                      void (*log)(void *ud, ds4_kvstore_log_type type, const char *msg),
+                      void *log_ud) {
+    return ds4_kvstore_open_owned(kc, dir, budget_mb, reject_different_quant, opt, -1,
+                                  log_name, log, log_ud);
+}
+
 void ds4_kvstore_close(ds4_kvstore *kc) {
     ds4_kvstore_clear(kc);
+    free(kc->refused);
     free(kc->dir);
     memset(kc, 0, sizeof(*kc));
 }
@@ -846,6 +949,19 @@ static bool kv_cache_file_text_matches(const char *path, const char sha[41],
     return ok;
 }
 
+/* A file of another model sits under this key (owned stores only).  The caller must not store, and nothing may delete it. */
+bool ds4_kvstore_key_held_by_other_model(const ds4_kvstore *kc, const char sha[41]) {
+    if (!kc || !kc->owned) return false;
+    char name[48];
+    snprintf(name, sizeof(name), "%.40s.kv", sha);
+    char *path = ds4_kvstore_path_join(kc->dir, name);
+    ds4_kvstore_entry e = {0};
+    const bool held = ds4_kvstore_read_entry_file(path, sha, &e) && e.model_id != kc->owner_model_id;
+    ds4_kvstore_entry_free(&e);
+    free(path);
+    return held;
+}
+
 static bool kv_cache_existing_compatible(ds4_kvstore *kc, const char *path,
                                          const char sha[41],
                                          const char *text, size_t text_len,
@@ -853,7 +969,8 @@ static bool kv_cache_existing_compatible(ds4_kvstore *kc, const char *path,
     if (access(path, F_OK) != 0) return false;
     ds4_kvstore_entry e = {0};
     if (!ds4_kvstore_read_entry_file(path, sha, &e)) return false;
-    bool compatible = e.model_id == (uint8_t)model_id &&
+    bool compatible = !ds4_kvstore_is_refused(kc, sha) &&
+                      e.model_id == (uint8_t)model_id &&
                       (!kc->reject_different_quant ||
                        e.quant_bits == (uint8_t)quant_bits) &&
                       e.ctx_size <= (uint32_t)ctx_size &&
@@ -1000,6 +1117,15 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     char *path = ds4_kvstore_path_for_sha(kc, sha);
     const uint8_t reason_code = ds4_kvstore_reason_code(reason);
 
+    if (ds4_kvstore_key_held_by_other_model(kc, sha)) {
+        kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                "%s: kv cache skipped tokens=%d reason=%s because %s holds a file of another model under the same key (left alone)",
+                kv_log_name(kc), store_tokens.len, reason, path);
+        free(text);
+        free(path);
+        ds4_tokens_free(&store_tokens);
+        return false;
+    }
     if (kv_cache_existing_compatible(kc, path, sha, text, text_len,
                                      model_id,
                                      quant_bits, ds4_session_ctx(session))) {
@@ -1011,8 +1137,8 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     }
 
     ds4_session_payload_file staged = {0};
-    if (ds4_session_stage_payload(session, &staged,
-                                  save_err, sizeof(save_err)) != 0) {
+    if (ds4_session_stage_payload_in(session, &staged, kc->dir,
+                                     save_err, sizeof(save_err)) != 0) {
         kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
                 "%s: kv cache skipped tokens=%d reason=%s because KV payload staging failed: %s",
                 kv_log_name(kc),
@@ -1114,6 +1240,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         saved_errno = errno;
         ok = false;
     }
+    if (ok) ds4_kvstore_forget_refused(kc, sha);
     const double save_ms = (kv_now_sec() - save_t0) * 1000.0;
     if (!ok) {
         if (final_size_over_budget) {
@@ -1211,6 +1338,7 @@ int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
             if (e->text_bytes < b->text_bytes) continue;
             if (e->text_bytes == b->text_bytes && e->tokens <= b->tokens) continue;
         }
+        if (ds4_kvstore_is_refused(kc, e->sha)) continue;   /* it could not be loaded: do not let it hide a shorter usable file */
         char sha[41];
         ds4_kvstore_sha1_bytes_hex(prompt_text, (size_t)e->text_bytes, sha);
         if (!strcmp(sha, e->sha)) best = i;
@@ -1308,7 +1436,10 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
                     path);
         }
     } else {
-        if (header_ok) ds4_session_invalidate(session);
+        if (header_ok) {
+            ds4_session_invalidate(session);
+            ds4_kvstore_note_refused(kc, e.sha);
+        }
         kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
                 "%s: kv cache load failed%s%s %s: %s load=%.1f ms",
                 kv_log_name(kc),

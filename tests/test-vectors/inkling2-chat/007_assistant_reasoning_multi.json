@@ -1,0 +1,80 @@
+{
+ "name": "007_assistant_reasoning_multi",
+ "request": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "a"
+   },
+   {
+    "role": "assistant",
+    "content": "b",
+    "reasoning_content": "think1"
+   },
+   {
+    "role": "user",
+    "content": "c"
+   },
+   {
+    "role": "assistant",
+    "content": "d",
+    "reasoning_content": "think2\nline two"
+   },
+   {
+    "role": "user",
+    "content": "e"
+   }
+  ]
+ },
+ "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>a<|end_message|><|message_model|><|content_thinking|>think1<|end_message|><|message_model|><|content_text|>b<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>c<|end_message|><|message_model|><|content_thinking|>think2\nline two<|end_message|><|message_model|><|content_text|>d<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>e<|end_message|>",
+ "tokens": [
+  200002,
+  200004,
+  34182,
+  279,
+  154554,
+  150628,
+  25,
+  220,
+  15,
+  13,
+  24,
+  200010,
+  200000,
+  200004,
+  64,
+  200010,
+  200001,
+  200008,
+  2090,
+  16,
+  200010,
+  200001,
+  200004,
+  65,
+  200010,
+  200006,
+  200000,
+  200004,
+  66,
+  200010,
+  200001,
+  200008,
+  2090,
+  17,
+  198,
+  909,
+  150103,
+  200010,
+  200001,
+  200004,
+  67,
+  200010,
+  200006,
+  200000,
+  200004,
+  68,
+  200010
+ ],
+ "llama_error": false
+}

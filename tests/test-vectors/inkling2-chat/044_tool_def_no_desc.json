@@ -1,0 +1,147 @@
+{
+ "name": "044_tool_def_no_desc",
+ "request": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Call no_desc with x=1.5"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "no_desc",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "x": {
+        "type": "number"
+       }
+      },
+      "required": [
+       "x"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ "prompt": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"\",\"name\":\"no_desc\",\"parameters\":{\"properties\":{\"x\":{\"type\":\"number\"}},\"required\":[\"x\"],\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Call no_desc with x=1.5<|end_message|>",
+ "tokens": [
+  200002,
+  2251,
+  62,
+  76529,
+  200024,
+  58,
+  90,
+  1,
+  70469,
+  1,
+  25,
+  68723,
+  11,
+  1,
+  930,
+  1,
+  25,
+  1,
+  316,
+  62,
+  32808,
+  1,
+  11,
+  1,
+  71968,
+  1,
+  25,
+  90,
+  1,
+  71961,
+  1,
+  25,
+  90,
+  1,
+  87,
+  1,
+  25,
+  90,
+  1,
+  1008,
+  1,
+  25,
+  1,
+  1158,
+  1,
+  92,
+  92,
+  11,
+  1,
+  69812,
+  1,
+  25,
+  58,
+  1,
+  87,
+  1,
+  60,
+  11,
+  1,
+  1008,
+  1,
+  25,
+  1,
+  3156,
+  1,
+  92,
+  11,
+  1,
+  1008,
+  1,
+  25,
+  1,
+  36404,
+  1,
+  92,
+  60,
+  200010,
+  200002,
+  200004,
+  34182,
+  279,
+  154554,
+  150628,
+  25,
+  220,
+  15,
+  13,
+  24,
+  200010,
+  200000,
+  200004,
+  4122,
+  149923,
+  62,
+  32808,
+  149899,
+  149924,
+  28,
+  16,
+  13,
+  20,
+  200010
+ ],
+ "llama_error": false,
+ "raw_generation": "<|message_model|><|content_thinking|>The user asks to call no_desc with x=1.5. We have a tool named no_desc with parameter x number. Need to call it. This is a benign function presumably. We should use the tool. Then respond. Need not overthink. Ensure exact call.<|end_message|><|message_model|>no_desc<|content_invoke_tool_json|>{\"name\":\"no_desc\",\"args\":{\"x\":1.5}}<|end_message|><|content_model_end_sampling|>",
+ "expect": {
+  "content": "",
+  "reasoning_content": "The user asks to call no_desc with x=1.5. We have a tool named no_desc with parameter x number. Need to call it. This is a benign function presumably. We should use the tool. Then respond. Need not overthink. Ensure exact call.",
+  "calls": [
+   {
+    "name": "no_desc",
+    "arguments": "{\"x\":1.5}"
+   }
+  ]
+ }
+}

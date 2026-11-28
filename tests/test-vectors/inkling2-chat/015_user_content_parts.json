@@ -1,0 +1,46 @@
+{
+ "name": "015_user_content_parts",
+ "request": {
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "part one"
+     },
+     {
+      "type": "text",
+      "text": "part two"
+     }
+    ]
+   }
+  ]
+ },
+ "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>part one<|end_message|><|message_user|><|content_text|>part two<|end_message|>",
+ "tokens": [
+  200002,
+  200004,
+  34182,
+  279,
+  154554,
+  150628,
+  25,
+  220,
+  15,
+  13,
+  24,
+  200010,
+  200000,
+  200004,
+  863,
+  150011,
+  200010,
+  200000,
+  200004,
+  863,
+  150103,
+  200010
+ ],
+ "llama_error": false
+}

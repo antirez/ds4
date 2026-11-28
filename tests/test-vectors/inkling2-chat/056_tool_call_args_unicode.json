@@ -1,0 +1,152 @@
+{
+ "name": "056_tool_call_args_unicode",
+ "request": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "go"
+   },
+   {
+    "role": "assistant",
+    "content": null,
+    "tool_calls": [
+     {
+      "id": "a",
+      "type": "function",
+      "function": {
+       "name": "u",
+       "arguments": "{\"名前\":\"Zoë 日本 🙂\",\"k\\u00e9y\":\"caf\\u00e9 \\ud83d\\ude42\"}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "ok",
+    "tool_call_id": "a"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "u",
+     "description": "x"
+    }
+   }
+  ],
+  "reasoning_effort": "none"
+ },
+ "prompt": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"x\",\"name\":\"u\",\"parameters\":{},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>go<|end_message|><|message_model|>u<|content_invoke_tool_json|>{\"name\":\"u\",\"args\":{\"kéy\":\"café 🙂\",\"名前\":\"Zoë 日本 🙂\"}}<|end_message|><|content_model_end_sampling|><|message_tool|>u<|content_text|>ok<|end_message|>",
+ "tokens": [
+  200002,
+  2251,
+  62,
+  76529,
+  200024,
+  58,
+  90,
+  1,
+  70469,
+  1,
+  25,
+  1,
+  87,
+  1,
+  11,
+  1,
+  930,
+  1,
+  25,
+  1,
+  84,
+  1,
+  11,
+  1,
+  71968,
+  1,
+  25,
+  70044,
+  11,
+  1,
+  1008,
+  1,
+  25,
+  1,
+  36404,
+  1,
+  92,
+  60,
+  200010,
+  200002,
+  200004,
+  34182,
+  279,
+  154554,
+  150628,
+  25,
+  220,
+  15,
+  200010,
+  200000,
+  200004,
+  850,
+  200010,
+  200001,
+  84,
+  200049,
+  90,
+  1,
+  930,
+  1,
+  25,
+  1,
+  84,
+  1,
+  11,
+  1,
+  70747,
+  1,
+  25,
+  90,
+  1,
+  68962,
+  88,
+  1,
+  25,
+  1,
+  85593,
+  220,
+  104523,
+  1,
+  11,
+  1,
+  116223,
+  1,
+  25,
+  1,
+  34146,
+  5166,
+  220,
+  90626,
+  220,
+  104523,
+  1,
+  92,
+  92,
+  200010,
+  200006,
+  200003,
+  84,
+  200004,
+  873,
+  200010
+ ],
+ "llama_error": false,
+ "raw_generation": "<|message_model|><|content_thinking|>The user said \"go\" and then invoked a function with weird parameters: \"kéy\":\"café 🙂\",\"名前\":\"Zoë 日本 🙂\". The function \"u\" appears to be a tool whose description is \"x\". I need to interpret. The user likely wants me to call the function? The function name is \"u\" and parameters are odd. In this environment, I have a tool \"u\" with no parameters? Actually the schema says parameters: {} (empty). But the user provided arguments with kéy and 名前. The tool call format in the transcript shows <invoke name=\"u\"> with parameters. The result was \"ok\". So the function executed and returned \"ok\". Now I need to respond to the user. The user's \"go\" plus the tool call suggests they want me to proceed. The tool returned \"ok\". I should give a concise response acknowledging.\n\nNeed be careful: The function \"u\" seems to be a no-op/echo? It returned \"ok\". I shouldn't pretend to do something else. Respond naturally: \"ok\" maybe. Since user said go, and tool returned ok, final can be brief.<|end_message|><|message_model|><|content_text|>ok<|end_message|><|content_model_end_sampling|>",
+ "expect": {
+  "content": "ok",
+  "reasoning_content": "The user said \"go\" and then invoked a function with weird parameters: \"kéy\":\"café 🙂\",\"名前\":\"Zoë 日本 🙂\". The function \"u\" appears to be a tool whose description is \"x\". I need to interpret. The user likely wants me to call the function? The function name is \"u\" and parameters are odd. In this environment, I have a tool \"u\" with no parameters? Actually the schema says parameters: {} (empty). But the user provided arguments with kéy and 名前. The tool call format in the transcript shows <invoke name=\"u\"> with parameters. The result was \"ok\". So the function executed and returned \"ok\". Now I need to respond to the user. The user's \"go\" plus the tool call suggests they want me to proceed. The tool returned \"ok\". I should give a concise response acknowledging.\n\nNeed be careful: The function \"u\" seems to be a no-op/echo? It returned \"ok\". I shouldn't pretend to do something else. Respond naturally: \"ok\" maybe. Since user said go, and tool returned ok, final can be brief.",
+  "calls": []
+ }
+}

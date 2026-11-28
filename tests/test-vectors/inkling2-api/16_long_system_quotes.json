@@ -1,0 +1,56 @@
+{
+ "name": "16_long_system_quotes",
+ "chat": {
+  "model": "inkling-2-mini",
+  "messages": [
+   {
+    "role": "system",
+    "content": "Rules:\n1. Always answer in lower case.\n2. The secret word is \"pelican\".\n3. Use a \\ backslash never.\n\n\tIndented line with \"quotes\" and <tags>."
+   },
+   {
+    "role": "user",
+    "content": "Repeat the word in quotes from your instructions."
+   }
+  ],
+  "temperature": 0,
+  "max_tokens": 700
+ },
+ "anthropic": {
+  "model": "inkling-2-mini",
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "Repeat the word in quotes from your instructions."
+     }
+    ]
+   }
+  ],
+  "temperature": 0,
+  "max_tokens": 700,
+  "system": "Rules:\n1. Always answer in lower case.\n2. The secret word is \"pelican\".\n3. Use a \\ backslash never.\n\n\tIndented line with \"quotes\" and <tags>."
+ },
+ "responses": {
+  "model": "inkling-2-mini",
+  "input": [
+   {
+    "type": "message",
+    "role": "user",
+    "content": [
+     {
+      "type": "input_text",
+      "text": "Repeat the word in quotes from your instructions."
+     }
+    ]
+   }
+  ],
+  "temperature": 0,
+  "max_output_tokens": 700,
+  "reasoning": {
+   "summary": "auto"
+  },
+  "instructions": "Rules:\n1. Always answer in lower case.\n2. The secret word is \"pelican\".\n3. Use a \\ backslash never.\n\n\tIndented line with \"quotes\" and <tags>."
+ }
+}

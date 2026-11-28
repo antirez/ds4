@@ -1,0 +1,26 @@
+{
+ "name": "047_tool_def_flat_no_wrapper",
+ "request": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ],
+  "tools": [
+   {
+    "name": "flat",
+    "description": "no function wrapper",
+    "parameters": {
+     "type": "object",
+     "properties": {}
+    }
+   }
+  ]
+ },
+ "prompt": null,
+ "tokens": null,
+ "llama_error": true,
+ "ds4": "skip",
+ "ds4_note": "llama.cpp rejects a tool without the {type:function,function:{..}} wrapper; ds4 declares it as given"
+}

@@ -1,0 +1,56 @@
+{
+ "name": "06_budget_1500",
+ "chat": {
+  "model": "inkling-2-mini",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is 12+30? Just the number."
+   }
+  ],
+  "temperature": 0,
+  "max_tokens": 700,
+  "reasoning_effort": "low"
+ },
+ "anthropic": {
+  "model": "inkling-2-mini",
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "What is 12+30? Just the number."
+     }
+    ]
+   }
+  ],
+  "temperature": 0,
+  "max_tokens": 700,
+  "thinking": {
+   "type": "enabled",
+   "budget_tokens": 1500
+  }
+ },
+ "responses": {
+  "model": "inkling-2-mini",
+  "input": [
+   {
+    "type": "message",
+    "role": "user",
+    "content": [
+     {
+      "type": "input_text",
+      "text": "What is 12+30? Just the number."
+     }
+    ]
+   }
+  ],
+  "temperature": 0,
+  "max_output_tokens": 700,
+  "reasoning": {
+   "summary": "auto",
+   "effort": "low"
+  }
+ }
+}

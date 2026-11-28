@@ -1,0 +1,96 @@
+{
+ "name": "075_tool_no_tools_but_calls_in_history",
+ "request": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "w?"
+   },
+   {
+    "role": "assistant",
+    "content": null,
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": "{\"city\": \"Rome\"}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "sunny",
+    "tool_call_id": "c1"
+   }
+  ],
+  "reasoning_effort": "none"
+ },
+ "prompt": "<|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>w?<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Rome\"}}<|end_message|><|content_model_end_sampling|><|message_tool|>get_weather<|content_text|>sunny<|end_message|>",
+ "tokens": [
+  200002,
+  200004,
+  34182,
+  279,
+  154554,
+  150628,
+  25,
+  220,
+  15,
+  200010,
+  200000,
+  200004,
+  86,
+  30,
+  200010,
+  200001,
+  832,
+  62,
+  30847,
+  200049,
+  90,
+  1,
+  930,
+  1,
+  25,
+  1,
+  832,
+  62,
+  30847,
+  1,
+  11,
+  1,
+  70747,
+  1,
+  25,
+  90,
+  1,
+  2958,
+  1,
+  25,
+  1,
+  31974,
+  1,
+  92,
+  92,
+  200010,
+  200006,
+  200003,
+  832,
+  62,
+  30847,
+  200004,
+  3705,
+  3900,
+  200010
+ ],
+ "llama_error": false,
+ "raw_generation": "<|message_model|><|content_thinking|>The user wrote \"w?\" and then included a tool call get_weather for Rome. We need answer likely interpret \"w?\" as weather? Need use tool? We already have tool result sunny. Need respond concise. Need mention Rome is sunny. Could ask if they meant something else? Since user typed \"w?\" likely asking weather. We can say Rome is sunny. Ensure no extra unsupported details.<|end_message|><|message_model|><|content_text|>Rome is sunny.<|end_message|><|content_model_end_sampling|>",
+ "expect": {
+  "content": "Rome is sunny.",
+  "reasoning_content": "The user wrote \"w?\" and then included a tool call get_weather for Rome. We need answer likely interpret \"w?\" as weather? Need use tool? We already have tool result sunny. Need respond concise. Need mention Rome is sunny. Could ask if they meant something else? Since user typed \"w?\" likely asking weather. We can say Rome is sunny. Ensure no extra unsupported details.",
+  "calls": []
+ }
+}

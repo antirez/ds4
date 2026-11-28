@@ -1,0 +1,134 @@
+{
+ "name": "060_tool_call_args_empty",
+ "request": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "go"
+   },
+   {
+    "role": "assistant",
+    "content": null,
+    "tool_calls": [
+     {
+      "id": "a",
+      "type": "function",
+      "function": {
+       "name": "ping",
+       "arguments": "{}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "pong",
+    "tool_call_id": "a"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "ping",
+     "description": "Check liveness; takes no arguments."
+    }
+   }
+  ],
+  "reasoning_effort": "none"
+ },
+ "prompt": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Check liveness; takes no arguments.\",\"name\":\"ping\",\"parameters\":{},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>go<|end_message|><|message_model|>ping<|content_invoke_tool_json|>{\"name\":\"ping\",\"args\":{}}<|end_message|><|content_model_end_sampling|><|message_tool|>ping<|content_text|>pong<|end_message|>",
+ "tokens": [
+  200002,
+  2251,
+  62,
+  76529,
+  200024,
+  58,
+  90,
+  1,
+  70469,
+  1,
+  25,
+  1,
+  3598,
+  184263,
+  26,
+  153373,
+  149923,
+  155159,
+  13,
+  1,
+  11,
+  1,
+  930,
+  1,
+  25,
+  1,
+  2725,
+  1,
+  11,
+  1,
+  71968,
+  1,
+  25,
+  70044,
+  11,
+  1,
+  1008,
+  1,
+  25,
+  1,
+  36404,
+  1,
+  92,
+  60,
+  200010,
+  200002,
+  200004,
+  34182,
+  279,
+  154554,
+  150628,
+  25,
+  220,
+  15,
+  200010,
+  200000,
+  200004,
+  850,
+  200010,
+  200001,
+  2725,
+  200049,
+  90,
+  1,
+  930,
+  1,
+  25,
+  1,
+  2725,
+  1,
+  11,
+  1,
+  70747,
+  1,
+  25,
+  70044,
+  92,
+  200010,
+  200006,
+  200003,
+  2725,
+  200004,
+  32091,
+  200010
+ ],
+ "llama_error": false,
+ "raw_generation": "<|message_model|><|content_thinking|>The user just said \"go\". Ambiguous. Likely wants me to proceed/start something, but there's no prior task. I should respond briefly, noting I'm ready and asking what they'd like, or just say ready. Since no task context, best to say ready and ask what to do.<|end_message|><|message_model|><|content_text|>Ready — what would you like me to do?<|end_message|><|content_model_end_sampling|>",
+ "expect": {
+  "content": "Ready — what would you like me to do?",
+  "reasoning_content": "The user just said \"go\". Ambiguous. Likely wants me to proceed/start something, but there's no prior task. I should respond briefly, noting I'm ready and asking what they'd like, or just say ready. Since no task context, best to say ready and ask what to do.",
+  "calls": []
+ }
+}

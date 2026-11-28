@@ -1,0 +1,128 @@
+{
+ "name": "20_add_ask_system",
+ "chat": {
+  "model": "inkling-2-mini",
+  "messages": [
+   {
+    "role": "system",
+    "content": "Always use the tools for arithmetic. Never calculate yourself."
+   },
+   {
+    "role": "user",
+    "content": "Add 123.5 and 876.25."
+   }
+  ],
+  "temperature": 0,
+  "max_tokens": 700,
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "add",
+     "description": "Add two numbers.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "number"
+       },
+       "b": {
+        "type": "number"
+       }
+      },
+      "required": [
+       "a",
+       "b"
+      ]
+     }
+    }
+   }
+  ],
+  "reasoning_effort": "low"
+ },
+ "anthropic": {
+  "model": "inkling-2-mini",
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "Add 123.5 and 876.25."
+     }
+    ]
+   }
+  ],
+  "temperature": 0,
+  "max_tokens": 700,
+  "system": "Always use the tools for arithmetic. Never calculate yourself.",
+  "tools": [
+   {
+    "name": "add",
+    "description": "Add two numbers.",
+    "input_schema": {
+     "type": "object",
+     "properties": {
+      "a": {
+       "type": "number"
+      },
+      "b": {
+       "type": "number"
+      }
+     },
+     "required": [
+      "a",
+      "b"
+     ]
+    }
+   }
+  ],
+  "output_config": {
+   "effort": "low"
+  }
+ },
+ "responses": {
+  "model": "inkling-2-mini",
+  "input": [
+   {
+    "type": "message",
+    "role": "user",
+    "content": [
+     {
+      "type": "input_text",
+      "text": "Add 123.5 and 876.25."
+     }
+    ]
+   }
+  ],
+  "temperature": 0,
+  "max_output_tokens": 700,
+  "reasoning": {
+   "summary": "auto",
+   "effort": "low"
+  },
+  "instructions": "Always use the tools for arithmetic. Never calculate yourself.",
+  "tools": [
+   {
+    "type": "function",
+    "name": "add",
+    "description": "Add two numbers.",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "a": {
+       "type": "number"
+      },
+      "b": {
+       "type": "number"
+      }
+     },
+     "required": [
+      "a",
+      "b"
+     ]
+    }
+   }
+  ]
+ }
+}

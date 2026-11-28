@@ -1,0 +1,50 @@
+{
+ "name": "010_assistant_reasoning_only",
+ "request": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hi"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "reasoning_content": "just thinking"
+   },
+   {
+    "role": "user",
+    "content": "ok"
+   }
+  ]
+ },
+ "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Hi<|end_message|><|message_model|><|content_thinking|>just thinking<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>ok<|end_message|>",
+ "tokens": [
+  200002,
+  200004,
+  34182,
+  279,
+  154554,
+  150628,
+  25,
+  220,
+  15,
+  13,
+  24,
+  200010,
+  200000,
+  200004,
+  4896,
+  200010,
+  200001,
+  200008,
+  1324,
+  154762,
+  200010,
+  200006,
+  200000,
+  200004,
+  873,
+  200010
+ ],
+ "llama_error": false
+}

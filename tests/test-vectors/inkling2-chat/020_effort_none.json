@@ -1,0 +1,30 @@
+{
+ "name": "020_effort_none",
+ "request": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hi"
+   }
+  ],
+  "reasoning_effort": "none"
+ },
+ "prompt": "<|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>Hi<|end_message|>",
+ "tokens": [
+  200002,
+  200004,
+  34182,
+  279,
+  154554,
+  150628,
+  25,
+  220,
+  15,
+  200010,
+  200000,
+  200004,
+  4896,
+  200010
+ ],
+ "llama_error": false
+}

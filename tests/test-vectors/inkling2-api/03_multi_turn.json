@@ -1,0 +1,96 @@
+{
+ "name": "03_multi_turn",
+ "chat": {
+  "model": "inkling-2-mini",
+  "messages": [
+   {
+    "role": "user",
+    "content": "My name is Ada."
+   },
+   {
+    "role": "assistant",
+    "content": "Nice to meet you, Ada."
+   },
+   {
+    "role": "user",
+    "content": "What is my name? One word."
+   }
+  ],
+  "temperature": 0,
+  "max_tokens": 700
+ },
+ "anthropic": {
+  "model": "inkling-2-mini",
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "My name is Ada."
+     }
+    ]
+   },
+   {
+    "role": "assistant",
+    "content": [
+     {
+      "type": "text",
+      "text": "Nice to meet you, Ada."
+     }
+    ]
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "What is my name? One word."
+     }
+    ]
+   }
+  ],
+  "temperature": 0,
+  "max_tokens": 700
+ },
+ "responses": {
+  "model": "inkling-2-mini",
+  "input": [
+   {
+    "type": "message",
+    "role": "user",
+    "content": [
+     {
+      "type": "input_text",
+      "text": "My name is Ada."
+     }
+    ]
+   },
+   {
+    "type": "message",
+    "role": "assistant",
+    "content": [
+     {
+      "type": "output_text",
+      "text": "Nice to meet you, Ada."
+     }
+    ]
+   },
+   {
+    "type": "message",
+    "role": "user",
+    "content": [
+     {
+      "type": "input_text",
+      "text": "What is my name? One word."
+     }
+    ]
+   }
+  ],
+  "temperature": 0,
+  "max_output_tokens": 700,
+  "reasoning": {
+   "summary": "auto"
+  }
+ }
+}

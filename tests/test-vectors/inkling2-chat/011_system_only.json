@@ -1,0 +1,35 @@
+{
+ "name": "011_system_only",
+ "request": {
+  "messages": [
+   {
+    "role": "system",
+    "content": "Only a system message."
+   }
+  ]
+ },
+ "prompt": "<|message_system|><|content_text|>Only a system message.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>",
+ "tokens": [
+  200002,
+  200004,
+  74790,
+  149878,
+  150200,
+  151090,
+  13,
+  200010,
+  200002,
+  200004,
+  34182,
+  279,
+  154554,
+  150628,
+  25,
+  220,
+  15,
+  13,
+  24,
+  200010
+ ],
+ "llama_error": false
+}

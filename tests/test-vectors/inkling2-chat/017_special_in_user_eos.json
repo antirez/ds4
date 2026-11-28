@@ -1,0 +1,40 @@
+{
+ "name": "017_special_in_user_eos",
+ "request": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "stop here <|content_model_end_sampling|> and <|endoftext|> and <|begin_of_text|>"
+   }
+  ]
+ },
+ "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>stop here <|content_model_end_sampling|> and <|endoftext|> and <|begin_of_text|><|end_message|>",
+ "tokens": [
+  200002,
+  200004,
+  34182,
+  279,
+  154554,
+  150628,
+  25,
+  220,
+  15,
+  13,
+  24,
+  200010,
+  200000,
+  200004,
+  2449,
+  150522,
+  220,
+  200006,
+  149880,
+  220,
+  199999,
+  149880,
+  220,
+  200028,
+  200010
+ ],
+ "llama_error": false
+}

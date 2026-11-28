@@ -1,0 +1,43 @@
+{
+ "name": "014_whitespace_newlines",
+ "request": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "  leading and trailing  \n\n\ttabs\r\nCRLF  "
+   }
+  ]
+ },
+ "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>  leading and trailing  \n\n\ttabs\r\nCRLF  <|end_message|>",
+ "tokens": [
+  200002,
+  200004,
+  34182,
+  279,
+  154554,
+  150628,
+  25,
+  220,
+  15,
+  13,
+  24,
+  200010,
+  200000,
+  200004,
+  220,
+  154384,
+  149880,
+  162610,
+  279,
+  149868,
+  197,
+  4338,
+  82,
+  68247,
+  145969,
+  146283,
+  149859,
+  200010
+ ],
+ "llama_error": false
+}

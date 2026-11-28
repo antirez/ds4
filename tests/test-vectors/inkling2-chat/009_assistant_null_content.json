@@ -1,0 +1,48 @@
+{
+ "name": "009_assistant_null_content",
+ "request": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hi"
+   },
+   {
+    "role": "assistant",
+    "content": null
+   },
+   {
+    "role": "user",
+    "content": "Hello?"
+   }
+  ]
+ },
+ "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Hi<|end_message|><|message_model|><|content_text|><|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>Hello?<|end_message|>",
+ "tokens": [
+  200002,
+  200004,
+  34182,
+  279,
+  154554,
+  150628,
+  25,
+  220,
+  15,
+  13,
+  24,
+  200010,
+  200000,
+  200004,
+  4896,
+  200010,
+  200001,
+  200004,
+  200010,
+  200006,
+  200000,
+  200004,
+  32269,
+  30,
+  200010
+ ],
+ "llama_error": false
+}

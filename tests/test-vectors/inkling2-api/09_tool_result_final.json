@@ -1,0 +1,196 @@
+{
+ "name": "09_tool_result_final",
+ "chat": {
+  "model": "inkling-2-mini",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "reasoning_content": "I should call the tool.",
+    "tool_calls": [
+     {
+      "id": "toolu_01",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": "{\"city\": \"Paris\", \"unit\": \"c\"}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "toolu_01",
+    "content": "18 C, light rain"
+   }
+  ],
+  "temperature": 0,
+  "max_tokens": 700,
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather for a city.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "c",
+         "f"
+        ]
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ "anthropic": {
+  "model": "inkling-2-mini",
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "Weather in Paris?"
+     }
+    ]
+   },
+   {
+    "role": "assistant",
+    "content": [
+     {
+      "type": "thinking",
+      "thinking": "I should call the tool.",
+      "signature": "sig"
+     },
+     {
+      "type": "tool_use",
+      "id": "toolu_01",
+      "name": "get_weather",
+      "input": {
+       "city": "Paris",
+       "unit": "c"
+      }
+     }
+    ]
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "tool_result",
+      "tool_use_id": "toolu_01",
+      "content": "18 C, light rain"
+     }
+    ]
+   }
+  ],
+  "temperature": 0,
+  "max_tokens": 700,
+  "tools": [
+   {
+    "name": "get_weather",
+    "description": "Current weather for a city.",
+    "input_schema": {
+     "type": "object",
+     "properties": {
+      "city": {
+       "type": "string"
+      },
+      "unit": {
+       "type": "string",
+       "enum": [
+        "c",
+        "f"
+       ]
+      }
+     },
+     "required": [
+      "city"
+     ]
+    }
+   }
+  ]
+ },
+ "responses": {
+  "model": "inkling-2-mini",
+  "input": [
+   {
+    "type": "message",
+    "role": "user",
+    "content": [
+     {
+      "type": "input_text",
+      "text": "Weather in Paris?"
+     }
+    ]
+   },
+   {
+    "type": "reasoning",
+    "id": "rs_x",
+    "summary": [
+     {
+      "type": "summary_text",
+      "text": "I should call the tool."
+     }
+    ]
+   },
+   {
+    "type": "function_call",
+    "call_id": "toolu_01",
+    "name": "get_weather",
+    "arguments": "{\"city\": \"Paris\", \"unit\": \"c\"}"
+   },
+   {
+    "type": "function_call_output",
+    "call_id": "toolu_01",
+    "output": "18 C, light rain"
+   }
+  ],
+  "temperature": 0,
+  "max_output_tokens": 700,
+  "reasoning": {
+   "summary": "auto"
+  },
+  "tools": [
+   {
+    "type": "function",
+    "name": "get_weather",
+    "description": "Current weather for a city.",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "city": {
+       "type": "string"
+      },
+      "unit": {
+       "type": "string",
+       "enum": [
+        "c",
+        "f"
+       ]
+      }
+     },
+     "required": [
+      "city"
+     ]
+    }
+   }
+  ]
+ }
+}

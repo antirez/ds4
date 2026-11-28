@@ -55,6 +55,8 @@ enum {
 static id<MTLDevice> g_device;
 static id<MTLCommandQueue> g_queue;
 static id<MTLLibrary> g_library;
+static id<MTLLibrary> g_ik_library;   /* Inkling 2 kernels: a separate library, built on first use (ds4_inkling2_metal.inc) */
+static int g_ik_library_tried;
 static id<MTLCommandBuffer> g_batch_cb;
 static id<MTLComputeCommandEncoder> g_batch_enc;
 static BOOL g_batch_encoder_concurrent;
@@ -4872,9 +4874,47 @@ static const char *ds4_gpu_source =
 "\n"
 "\n";
 
+/* Reads one Metal source file (environment override first, then ./path); prints a message and returns nil on failure. */
+static NSString *ds4_gpu_read_source_file(NSString *env_name, NSString *rel_path, NSString **loaded_path_out) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    const char *override_path = getenv([env_name UTF8String]);
+    NSMutableArray<NSString *> *paths = [NSMutableArray array];
+    if (override_path && override_path[0]) {
+        [paths addObject:[NSString stringWithUTF8String:override_path]];
+    }
+    [paths addObject:rel_path];
+    [paths addObject:[@"./" stringByAppendingString:rel_path]];
+
+    NSString *loaded = nil;
+    NSString *loaded_path = nil;
+    for (NSString *path in paths) {
+        if (![fm fileExistsAtPath:path]) continue;
+
+        NSError *error = nil;
+        loaded = [NSString stringWithContentsOfFile:path
+                                           encoding:NSUTF8StringEncoding
+                                              error:&error];
+        if (!loaded) {
+            fprintf(stderr, "ds4: failed to read Metal source %s: %s\n",
+                    [path UTF8String], [[error localizedDescription] UTF8String]);
+            return nil;
+        }
+        loaded_path = path;
+        break;
+    }
+
+    if (!loaded) {
+        fprintf(stderr,
+                "ds4: Metal source %s not found (set %s to override)\n",
+                [rel_path UTF8String], [env_name UTF8String]);
+        return nil;
+    }
+    *loaded_path_out = loaded_path;
+    return loaded;
+}
+
 static NSString *ds4_gpu_full_source(void) {
     NSString *base = [NSString stringWithUTF8String:ds4_gpu_source];
-    NSFileManager *fm = [NSFileManager defaultManager];
     /*
      * Kernels are kept as separate files for review, then concatenated into one
      * Metal library.  Environment overrides are still honored so a diagnostic
@@ -4911,38 +4951,9 @@ static NSString *ds4_gpu_full_source(void) {
 
     NSMutableString *source = [NSMutableString stringWithString:base];
     for (NSArray<NSString *> *spec in required_sources) {
-        const char *override_path = getenv([spec[0] UTF8String]);
-        NSMutableArray<NSString *> *paths = [NSMutableArray array];
-        if (override_path && override_path[0]) {
-            [paths addObject:[NSString stringWithUTF8String:override_path]];
-        }
-        [paths addObject:spec[1]];
-        [paths addObject:[@"./" stringByAppendingString:spec[1]]];
-
-        NSString *loaded = nil;
         NSString *loaded_path = nil;
-        for (NSString *path in paths) {
-            if (![fm fileExistsAtPath:path]) continue;
-
-            NSError *error = nil;
-            loaded = [NSString stringWithContentsOfFile:path
-                                               encoding:NSUTF8StringEncoding
-                                                  error:&error];
-            if (!loaded) {
-                fprintf(stderr, "ds4: failed to read Metal source %s: %s\n",
-                        [path UTF8String], [[error localizedDescription] UTF8String]);
-                return nil;
-            }
-            loaded_path = path;
-            break;
-        }
-
-        if (!loaded) {
-            fprintf(stderr,
-                    "ds4: Metal source %s not found (set %s to override)\n",
-                    [spec[1] UTF8String], [spec[0] UTF8String]);
-            return nil;
-        }
+        NSString *loaded = ds4_gpu_read_source_file(spec[0], spec[1], &loaded_path);
+        if (!loaded) return nil;
         [source appendFormat:@"\n// appended %@\n%@\n", loaded_path, loaded];
     }
     return source;
@@ -12305,6 +12316,8 @@ void ds4_gpu_cleanup(void) {
         g_transient_buffers = nil;
         g_pending_cbs = nil;
         g_library = nil;
+        g_ik_library = nil;
+        g_ik_library_tried = 0;
         g_queue = nil;
         g_device = nil;
         g_initialized = 0;
@@ -54438,3 +54451,7 @@ int ds4_gpu_qwen4_hc_mix_rows_tensor(ds4_gpu_tensor *mixed, const ds4_gpu_tensor
     return qwen4_dispatch(QWEN4_K_HC_MIX_ROWS, &args, sizeof(args), b, 3,
                           MTLSizeMake((n_embd + 255) / 256, n_tokens, 1), MTLSizeMake(256, 1, 1), 0);
 }
+
+
+/* Inkling 2 Mini wrappers (metal/inkling2.metal) */
+#include "ds4_inkling2_metal.inc"

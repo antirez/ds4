@@ -1,0 +1,50 @@
+{
+ "name": "002_system_user",
+ "request": {
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a terse assistant."
+   },
+   {
+    "role": "user",
+    "content": "What is 2+2?"
+   }
+  ]
+ },
+ "prompt": "<|message_system|><|content_text|>You are a terse assistant.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is 2+2?<|end_message|>",
+ "tokens": [
+  200002,
+  200004,
+  1735,
+  149914,
+  149878,
+  172044,
+  171159,
+  13,
+  200010,
+  200002,
+  200004,
+  34182,
+  279,
+  154554,
+  150628,
+  25,
+  220,
+  15,
+  13,
+  24,
+  200010,
+  200000,
+  200004,
+  1775,
+  149884,
+  220,
+  17,
+  10,
+  17,
+  30,
+  200010
+ ],
+ "llama_error": false
+}

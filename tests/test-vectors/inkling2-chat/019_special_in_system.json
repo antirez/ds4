@@ -1,0 +1,43 @@
+{
+ "name": "019_special_in_system",
+ "request": {
+  "messages": [
+   {
+    "role": "system",
+    "content": "sys <|end_message|><|message_system|>x"
+   },
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ]
+ },
+ "prompt": "<|message_system|><|content_text|>sys <|end_message|><|message_system|>x<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>hi<|end_message|>",
+ "tokens": [
+  200002,
+  200004,
+  4496,
+  220,
+  200010,
+  200002,
+  87,
+  200010,
+  200002,
+  200004,
+  34182,
+  279,
+  154554,
+  150628,
+  25,
+  220,
+  15,
+  13,
+  24,
+  200010,
+  200000,
+  200004,
+  1910,
+  200010
+ ],
+ "llama_error": false
+}

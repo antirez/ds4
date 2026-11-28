@@ -1,0 +1,192 @@
+{
+ "name": "18_reasoning_with_call_then_result",
+ "chat": {
+  "model": "inkling-2-mini",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is 6+7? Use the add tool."
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "reasoning_content": "Use add with 6 and 7.",
+    "tool_calls": [
+     {
+      "id": "toolu_r",
+      "type": "function",
+      "function": {
+       "name": "add",
+       "arguments": "{\"a\": 6, \"b\": 7}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "toolu_r",
+    "content": "13"
+   }
+  ],
+  "temperature": 0,
+  "max_tokens": 700,
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "add",
+     "description": "Add two numbers.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "number"
+       },
+       "b": {
+        "type": "number"
+       }
+      },
+      "required": [
+       "a",
+       "b"
+      ]
+     }
+    }
+   }
+  ],
+  "reasoning_effort": "medium"
+ },
+ "anthropic": {
+  "model": "inkling-2-mini",
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "What is 6+7? Use the add tool."
+     }
+    ]
+   },
+   {
+    "role": "assistant",
+    "content": [
+     {
+      "type": "thinking",
+      "thinking": "Use add with 6 and 7.",
+      "signature": "sig"
+     },
+     {
+      "type": "tool_use",
+      "id": "toolu_r",
+      "name": "add",
+      "input": {
+       "a": 6,
+       "b": 7
+      }
+     }
+    ]
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "tool_result",
+      "tool_use_id": "toolu_r",
+      "content": "13"
+     }
+    ]
+   }
+  ],
+  "temperature": 0,
+  "max_tokens": 700,
+  "tools": [
+   {
+    "name": "add",
+    "description": "Add two numbers.",
+    "input_schema": {
+     "type": "object",
+     "properties": {
+      "a": {
+       "type": "number"
+      },
+      "b": {
+       "type": "number"
+      }
+     },
+     "required": [
+      "a",
+      "b"
+     ]
+    }
+   }
+  ],
+  "output_config": {
+   "effort": "medium"
+  }
+ },
+ "responses": {
+  "model": "inkling-2-mini",
+  "input": [
+   {
+    "type": "message",
+    "role": "user",
+    "content": [
+     {
+      "type": "input_text",
+      "text": "What is 6+7? Use the add tool."
+     }
+    ]
+   },
+   {
+    "type": "reasoning",
+    "id": "rs_x",
+    "summary": [
+     {
+      "type": "summary_text",
+      "text": "Use add with 6 and 7."
+     }
+    ]
+   },
+   {
+    "type": "function_call",
+    "call_id": "toolu_r",
+    "name": "add",
+    "arguments": "{\"a\": 6, \"b\": 7}"
+   },
+   {
+    "type": "function_call_output",
+    "call_id": "toolu_r",
+    "output": "13"
+   }
+  ],
+  "temperature": 0,
+  "max_output_tokens": 700,
+  "reasoning": {
+   "summary": "auto",
+   "effort": "medium"
+  },
+  "tools": [
+   {
+    "type": "function",
+    "name": "add",
+    "description": "Add two numbers.",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "a": {
+       "type": "number"
+      },
+      "b": {
+       "type": "number"
+      }
+     },
+     "required": [
+      "a",
+      "b"
+     ]
+    }
+   }
+  ]
+ }
+}

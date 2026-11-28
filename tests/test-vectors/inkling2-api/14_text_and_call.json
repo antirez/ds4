@@ -1,0 +1,193 @@
+{
+ "name": "14_text_and_call",
+ "chat": {
+  "model": "inkling-2-mini",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Check the weather in Madrid."
+   },
+   {
+    "role": "assistant",
+    "content": "Let me check that for you.",
+    "tool_calls": [
+     {
+      "id": "toolu_m",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": "{\"city\": \"Madrid\"}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "toolu_m",
+    "content": "31 C"
+   }
+  ],
+  "temperature": 0,
+  "max_tokens": 700,
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather for a city.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "c",
+         "f"
+        ]
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ "anthropic": {
+  "model": "inkling-2-mini",
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "Check the weather in Madrid."
+     }
+    ]
+   },
+   {
+    "role": "assistant",
+    "content": [
+     {
+      "type": "text",
+      "text": "Let me check that for you."
+     },
+     {
+      "type": "tool_use",
+      "id": "toolu_m",
+      "name": "get_weather",
+      "input": {
+       "city": "Madrid"
+      }
+     }
+    ]
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "tool_result",
+      "tool_use_id": "toolu_m",
+      "content": "31 C"
+     }
+    ]
+   }
+  ],
+  "temperature": 0,
+  "max_tokens": 700,
+  "tools": [
+   {
+    "name": "get_weather",
+    "description": "Current weather for a city.",
+    "input_schema": {
+     "type": "object",
+     "properties": {
+      "city": {
+       "type": "string"
+      },
+      "unit": {
+       "type": "string",
+       "enum": [
+        "c",
+        "f"
+       ]
+      }
+     },
+     "required": [
+      "city"
+     ]
+    }
+   }
+  ]
+ },
+ "responses": {
+  "model": "inkling-2-mini",
+  "input": [
+   {
+    "type": "message",
+    "role": "user",
+    "content": [
+     {
+      "type": "input_text",
+      "text": "Check the weather in Madrid."
+     }
+    ]
+   },
+   {
+    "type": "message",
+    "role": "assistant",
+    "content": [
+     {
+      "type": "output_text",
+      "text": "Let me check that for you."
+     }
+    ]
+   },
+   {
+    "type": "function_call",
+    "call_id": "toolu_m",
+    "name": "get_weather",
+    "arguments": "{\"city\": \"Madrid\"}"
+   },
+   {
+    "type": "function_call_output",
+    "call_id": "toolu_m",
+    "output": "31 C"
+   }
+  ],
+  "temperature": 0,
+  "max_output_tokens": 700,
+  "reasoning": {
+   "summary": "auto"
+  },
+  "tools": [
+   {
+    "type": "function",
+    "name": "get_weather",
+    "description": "Current weather for a city.",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "city": {
+       "type": "string"
+      },
+      "unit": {
+       "type": "string",
+       "enum": [
+        "c",
+        "f"
+       ]
+      }
+     },
+     "required": [
+      "city"
+     ]
+    }
+   }
+  ]
+ }
+}

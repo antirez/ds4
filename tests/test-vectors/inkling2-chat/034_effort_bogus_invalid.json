@@ -1,0 +1,16 @@
+{
+ "name": "034_effort_bogus_invalid",
+ "request": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hi"
+   }
+  ],
+  "reasoning_effort": "bogus"
+ },
+ "prompt": null,
+ "tokens": null,
+ "llama_error": true,
+ "ds4": "error"
+}

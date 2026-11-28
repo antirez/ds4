@@ -1,0 +1,40 @@
+{
+ "name": "038_effort_with_system_first",
+ "request": {
+  "messages": [
+   {
+    "role": "system",
+    "content": "sys"
+   },
+   {
+    "role": "user",
+    "content": "Hi"
+   }
+  ],
+  "reasoning_effort": "low"
+ },
+ "prompt": "<|message_system|><|content_text|>sys<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.2<|end_message|><|message_user|><|content_text|>Hi<|end_message|>",
+ "tokens": [
+  200002,
+  200004,
+  4496,
+  200010,
+  200002,
+  200004,
+  34182,
+  279,
+  154554,
+  150628,
+  25,
+  220,
+  15,
+  13,
+  17,
+  200010,
+  200000,
+  200004,
+  4896,
+  200010
+ ],
+ "llama_error": false
+}

@@ -1,0 +1,171 @@
+{
+ "name": "15_json_tool_result",
+ "chat": {
+  "model": "inkling-2-mini",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Search my notes for apples."
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "toolu_s",
+      "type": "function",
+      "function": {
+       "name": "search",
+       "arguments": "{\"query\": \"apples\", \"filters\": {\"tag\": \"fruit\", \"n\": 3}}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "toolu_s",
+    "content": "{\"hits\": [{\"title\": \"Apple pie\", \"score\": 0.9}, {\"title\": \"Cider\", \"score\": 0.4}]}"
+   }
+  ],
+  "temperature": 0,
+  "max_tokens": 700,
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "description": "Search the notes.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "query": {
+        "type": "string"
+       },
+       "filters": {
+        "type": "object"
+       }
+      },
+      "required": [
+       "query"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ "anthropic": {
+  "model": "inkling-2-mini",
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "Search my notes for apples."
+     }
+    ]
+   },
+   {
+    "role": "assistant",
+    "content": [
+     {
+      "type": "tool_use",
+      "id": "toolu_s",
+      "name": "search",
+      "input": {
+       "query": "apples",
+       "filters": {
+        "tag": "fruit",
+        "n": 3
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "tool_result",
+      "tool_use_id": "toolu_s",
+      "content": "{\"hits\": [{\"title\": \"Apple pie\", \"score\": 0.9}, {\"title\": \"Cider\", \"score\": 0.4}]}"
+     }
+    ]
+   }
+  ],
+  "temperature": 0,
+  "max_tokens": 700,
+  "tools": [
+   {
+    "name": "search",
+    "description": "Search the notes.",
+    "input_schema": {
+     "type": "object",
+     "properties": {
+      "query": {
+       "type": "string"
+      },
+      "filters": {
+       "type": "object"
+      }
+     },
+     "required": [
+      "query"
+     ]
+    }
+   }
+  ]
+ },
+ "responses": {
+  "model": "inkling-2-mini",
+  "input": [
+   {
+    "type": "message",
+    "role": "user",
+    "content": [
+     {
+      "type": "input_text",
+      "text": "Search my notes for apples."
+     }
+    ]
+   },
+   {
+    "type": "function_call",
+    "call_id": "toolu_s",
+    "name": "search",
+    "arguments": "{\"query\": \"apples\", \"filters\": {\"tag\": \"fruit\", \"n\": 3}}"
+   },
+   {
+    "type": "function_call_output",
+    "call_id": "toolu_s",
+    "output": "{\"hits\": [{\"title\": \"Apple pie\", \"score\": 0.9}, {\"title\": \"Cider\", \"score\": 0.4}]}"
+   }
+  ],
+  "temperature": 0,
+  "max_output_tokens": 700,
+  "reasoning": {
+   "summary": "auto"
+  },
+  "tools": [
+   {
+    "type": "function",
+    "name": "search",
+    "description": "Search the notes.",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "query": {
+       "type": "string"
+      },
+      "filters": {
+       "type": "object"
+      }
+     },
+     "required": [
+      "query"
+     ]
+    }
+   }
+  ]
+ }
+}

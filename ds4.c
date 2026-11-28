@@ -56,6 +56,9 @@
 #define DS4_HAS_QWEN4_METAL 1
 #endif
 #endif
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+#define DS4_HAS_INKLING2_GPU 1
+#endif
 #if defined(DS4_ROCM_BUILD) || (!defined(__APPLE__) && !defined(DS4_NO_GPU))
 #include "ds4_linux_memory.h"
 #endif
@@ -1005,6 +1008,9 @@ static bool ds4_glm53_layer_is_kda(uint32_t il) {
            il + DS4_N_NEXTN_PREDICT < DS4_N_LAYER &&
            il % 4u != 3u;
 }
+
+/* Inkling 2 Mini (ds4_inkling2.inc) is loaded and tokenized without touching g_ds4_shape. */
+static bool g_ds4_inkling2;
 
 static bool ds4_model_is_qwen4(void) {
     return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4_EXP;
@@ -2446,6 +2452,7 @@ static const gguf_type_info gguf_types[] = {
     [29] = {"iq1_m",  256,  56},
     [30] = {"bf16",     1,   2},
     [39] = {"mxfp4",   32,  17},
+    [40] = {"nvfp4",   64,  36},   /* CPU only: Inkling 2 experts */
 };
 
 enum {
@@ -2464,6 +2471,7 @@ enum {
     DS4_TENSOR_I32      = 26,
     DS4_TENSOR_BF16     = 30,
     DS4_TENSOR_MXFP4    = 39,
+    DS4_TENSOR_NVFP4    = 40,
 };
 
 typedef struct {
@@ -2948,6 +2956,11 @@ static void model_unmap_qwen_ngrams(ds4_model *m, const char *path) {
  * MTLBuffers; CPU uses a private read-only mapping to avoid Darwin VM stress.
  * Tokenizer-only callers pass prefetch_cpu=false so inspecting tokens never
  * walks the huge tensor payload. */
+static bool model_is_inkling2(const ds4_model *m) {
+    ds4_str arch = {0};
+    return model_get_string(m, "general.architecture", &arch) && ds4_streq(arch, "inkling2_loop");
+}
+
 static void model_open(ds4_model *m, const char *path, bool metal_mapping,
                        bool prefetch_cpu) {
     memset(m, 0, sizeof(*m));
@@ -2997,7 +3010,8 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
     model_unmap_engram(m);
     model_unmap_qwen_ngrams(m, path);
 
-    if (!metal_mapping && prefetch_cpu) model_prefetch_cpu_mapping(m);
+    /* Inkling reads 8 of 128 experts per token: asking the kernel to page in the whole file would be wasted. */
+    if (!metal_mapping && prefetch_cpu && !model_is_inkling2(m)) model_prefetch_cpu_mapping(m);
 }
 
 static void print_size(uint64_t bytes) {
@@ -7249,8 +7263,11 @@ static void config_validate_qwen4_model(const ds4_model *m) {
     }
 }
 
+static void inkling2_config_validate(const ds4_model *m);
+
 static void config_validate_model(const ds4_model *m) {
     g_ds4_flash_vision_exp = false;
+    g_ds4_inkling2 = false;
     ds4_str arch = {0};
     if (model_get_string(m, "general.architecture", &arch)) {
         if (ds4_streq(arch, "deepseek41")) {
@@ -7267,6 +7284,10 @@ static void config_validate_model(const ds4_model *m) {
         }
         if (ds4_streq(arch, "qwen4exp")) {
             config_validate_qwen4_model(m);
+            return;
+        }
+        if (ds4_streq(arch, "inkling2_loop")) {
+            inkling2_config_validate(m);
             return;
         }
     }
@@ -40548,6 +40569,12 @@ static ds4_context_memory glm_graph_context_memory_estimate_for_compact_cap(
 #ifdef DS4_HAS_DEEPSEEK41_GPU
 static ds4_context_memory ds41_graph_memory(uint32_t ctx);
 #endif
+#ifdef DS4_HAS_INKLING2_GPU
+static ds4_context_memory ik_context_memory(uint32_t ctx, uint32_t chunk);   /* ds4_inkling2_gpu.inc */
+static int iks_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen);   /* ds4_inkling2_session.inc */
+static int iks_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen);
+static uint64_t iks_payload_bytes(ds4_session *s);
+#endif
 
 ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
         ds4_backend backend,
@@ -40556,6 +40583,9 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
         bool        ssd_streaming) {
     ds4_context_memory m = {0};
     uint32_t ctx = ctx_size > 0 ? (uint32_t)ctx_size : 1u;
+#ifdef DS4_HAS_INKLING2_GPU
+    if (g_ds4_inkling2 && ds4_backend_uses_graph(backend)) return ik_context_memory(ctx, 0);
+#endif
     if (ds4_backend_uses_graph(backend) && ds4_model_is_qwen4())
         return qwen4_graph_memory_estimate(ctx, prefill_chunk);
 
@@ -44539,6 +44569,7 @@ struct ds4_engine {
     ds4_model vision_model;
     ds4_vocab vocab;
     ds4_weights weights;
+    struct ds4_inkling2 *ik;   /* Inkling 2 bound tensors (CPU oracle only) */
     ds4_mtp_weights mtp_weights;
     ds4_dspark_weights dspark_weights;
 #ifndef DS4_NO_GPU
@@ -45512,7 +45543,13 @@ static void bpe_tokenize_text_qwen35(const ds4_vocab *vocab, const char *text, t
  * word (for example ">;\n").  Splitting those newlines separately changes the
  * token stream for code prompts and produces wrong long-context logits.
  */
+#include "ds4_inkling2.inc"
+
 static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_vec *out) {
+    if (g_ds4_inkling2) {
+        ik_tokenize(vocab, text, false, out);
+        return;
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         bpe_tokenize_text_glm4(vocab, text, out);
         return;
@@ -45643,6 +45680,11 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
     vocab->im_start_id = -1;
     vocab->im_end_id = -1;
     vocab->endoftext_id = -1;
+
+    if (g_ds4_inkling2) {
+        ik_vocab_init(vocab, model);
+        return;
+    }
 
     if (ds4_model_is_qwen4()) {
         /* ChatML without BOS; <|endoftext|> is the document separator and a
@@ -45788,6 +45830,55 @@ static const char *DS4_QWEN4_REASONING_LOW =
     "Reasoning effort is set to low. Keep your thinking brief and focused, "
     "moving directly to the conclusion without unnecessary elaboration.";
 
+/* Inkling 2 chat (docs/INKLING2.md, "Chat template").  The template has no
+ * generation prompt: every message is <role token><kind token>text<|end_message|>,
+ * an assistant turn ends with <|content_model_end_sampling|> (the EOS token),
+ * and a "Thinking effort level" system block goes before the first non-system
+ * message.  The server renders whole requests as text (ds4_server.c); these
+ * helpers serve the CLI, which appends message by message.  Special-token text
+ * inside messages is tokenized as special tokens, as llama.cpp does. */
+static ds4_think_mode g_ik_chat_think = DS4_THINK_HIGH;
+
+static void ik_chat_text(const ds4_vocab *vocab, const char *a, const char *b, const char *c, const char *d, token_vec *out) {
+    const size_t n = strlen(a) + strlen(b) + strlen(c) + strlen(d) + 1;
+    char *tmp = xmalloc(n);
+    snprintf(tmp, n, "%s%s%s%s", a, b, c, d);
+    ik_tokenize(vocab, tmp, true, out);
+    free(tmp);
+}
+
+static bool ik_chat_has_non_system(const ds4_vocab *vocab, const token_vec *out) {
+    const int ids[3] = {
+        vocab_lookup_optional(vocab, "<|message_user|>"),
+        vocab_lookup_optional(vocab, "<|message_model|>"),
+        vocab_lookup_optional(vocab, "<|message_tool|>"),
+    };
+    for (int i = 0; i < out->len; i++)
+        for (int k = 0; k < 3; k++)
+            if (ids[k] >= 0 && out->v[i] == ids[k]) return true;
+    return false;
+}
+
+static void ik_chat_effort(const ds4_vocab *vocab, token_vec *out) {
+    ik_chat_text(vocab, "<|message_system|><|content_text|>Thinking effort level: ",
+                 ds4_inkling2_effort_text(g_ik_chat_think), "<|end_message|>", "", out);
+}
+
+static void ik_chat_message(const ds4_vocab *vocab, const char *role, const char *content, token_vec *out) {
+    const char *head = "<|message_user|>";
+    if (!strcmp(role, "system") || !strcmp(role, "developer")) head = "<|message_system|>";
+    else if (!strcmp(role, "assistant")) head = "<|message_model|>";
+    else if (!strcmp(role, "tool") || !strcmp(role, "function")) head = "<|message_tool|>";
+    if (strcmp(head, "<|message_system|>") && !ik_chat_has_non_system(vocab, out)) ik_chat_effort(vocab, out);
+    if (!strcmp(head, "<|message_model|>") && !strncmp(content, head, strlen(head))) {
+        /* already rendered blocks (generated text): keep them, close the turn */
+        ik_tokenize(vocab, content, true, out);
+    } else {
+        ik_chat_text(vocab, head, "<|content_text|>", content, "<|end_message|>", out);
+    }
+    if (!strcmp(head, "<|message_model|>") && vocab->eos_id >= 0) token_vec_push(out, vocab->eos_id);
+}
+
 static void qwen4_chat_open(const ds4_vocab *vocab, const char *role, token_vec *out) {
     token_vec_push(out, vocab->im_start_id);
     bpe_tokenize_text(vocab, role, out);
@@ -45830,6 +45921,12 @@ static void encode_chat_prompt(
         const char      *prompt,
         ds4_think_mode   think_mode,
         token_vec       *out) {
+    if (g_ds4_inkling2) {
+        g_ik_chat_think = think_mode;
+        if (system && system[0]) ik_chat_message(vocab, "system", system, out);
+        ik_chat_message(vocab, "user", prompt, out);
+        return;
+    }
     if (ds4_model_is_qwen4()) {
         if (vocab->im_start_id < 0 || vocab->im_end_id < 0 ||
             vocab->think_start_id < 0 || vocab->think_end_id < 0) {
@@ -45936,6 +46033,10 @@ static void tokenize_span(const ds4_vocab *vocab, const char *p, size_t n, token
 static void tokenize_rendered_chat_vocab(const ds4_vocab *vocab, const char *text,
                                          token_vec *out) {
     if (!text) text = "";
+    if (g_ds4_inkling2) {
+        ik_tokenize(vocab, text, true, out);
+        return;
+    }
 
     const char *span = text;
     const char *p = text;
@@ -45976,6 +46077,10 @@ void ds4_chat_append_max_effort_prefix(ds4_engine *e, ds4_tokens *tokens) {
 }
 
 void ds4_chat_append_think_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode mode) {
+    if (g_ds4_inkling2) {   /* the effort block waits for the first non-system message */
+        g_ik_chat_think = mode;
+        return;
+    }
     chat_push_think_prefix(&e->vocab, mode, tokens);
 }
 
@@ -46027,6 +46132,10 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
     if (!role) role = "user";
     if (!content) content = "";
 
+    if (g_ds4_inkling2) {
+        ik_chat_message(vocab, role, content, tokens);
+        return;
+    }
     if (ds4_model_is_qwen4()) {
         if (!strcmp(role, "tool") || !strcmp(role, "function")) {
             qwen4_chat_open(vocab, "user", tokens);
@@ -46093,6 +46202,13 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
 }
 
 void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode think_mode) {
+    if (g_ds4_inkling2) {   /* no generation prompt: the model writes <|message_model|> itself */
+        if (!ik_chat_has_non_system(&e->vocab, tokens)) {
+            g_ik_chat_think = think_mode;
+            ik_chat_effort(&e->vocab, tokens);
+        }
+        return;
+    }
     if (ds4_model_is_qwen4()) {
         qwen4_chat_assistant_prefix(&e->vocab, think_mode, tokens);
         return;
@@ -62882,7 +62998,7 @@ uint32_t ds4_think_max_min_context(void) {
 }
 
 ds4_think_mode ds4_think_mode_for_context(ds4_think_mode mode, int ctx_size) {
-    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41 &&
+    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41 && !g_ds4_inkling2 &&
         mode == DS4_THINK_MAX && (uint32_t)(ctx_size > 0 ? ctx_size : 0) < DS4_THINK_MAX_MIN_CONTEXT) {
         return DS4_THINK_HIGH;
     }
@@ -63117,6 +63233,12 @@ struct ds4_session {
     bool checkpoint_valid;
     bool mtp_draft_valid;
     bool greedy_splitkv_anchor_valid;
+#ifdef DS4_HAS_INKLING2_GPU
+    ik_gpu *ikg;   /* Inkling 2 GPU state (ds4_inkling2_session.inc) */
+    token_vec snap_tokens;     /* Inkling 2: the prompt whose end state ikg holds a copy of (see iks_snapshot) */
+    float *snap_logits;        /* logits at the end of that prompt */
+    bool snap_valid;
+#endif
 };
 
 static bool ds4_session_tp_leader(const ds4_session *s);
@@ -64998,6 +65120,10 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
 
 int ds4_engine_routed_quant_bits(ds4_engine *e) {
     if (!e) return 0;
+    if (g_ds4_inkling2 && e->ik) {   /* disk KV key: 4 for the 4-bit expert files, 8 for BF16 (the payload also carries a model-file fingerprint) */
+        const ds4_tensor *gu = e->ik->layer[IK_LOOP_START].gate_up;
+        return gu && (gu->type == DS4_TENSOR_NVFP4 || gu->type == DS4_TENSOR_MXFP4) ? 4 : 8;
+    }
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const ds4_tensor *gate = e->weights.layer[il].ffn_gate_exps;
         if (!gate) continue;
@@ -65351,6 +65477,9 @@ static uint64_t qwen4_payload_tensor_bytes(uint32_t rows, uint32_t mtp_rows, boo
 #endif
 
 uint64_t ds4_session_payload_bytes(ds4_session *s) {
+#ifdef DS4_HAS_INKLING2_GPU
+    if (g_ds4_inkling2) return iks_payload_bytes(s);
+#endif
     if (s && !s->distributed && ds4_session_is_qwen4(s)) {
 #ifndef DS4_HAS_QWEN4_GPU
         return 0;
@@ -65451,6 +65580,13 @@ void ds4_session_payload_file_free(ds4_session_payload_file *payload) {
 
 int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
                               char *err, size_t errlen) {
+    return ds4_session_stage_payload_in(s, out, NULL, err, errlen);
+}
+
+/* stage_dir NULL: the system temp area, as before.  The disk KV store passes its own directory, so a save never writes outside
+ * --kv-disk-dir; the name carries the pid so ds4_kvstore_open can sweep what a crashed server left behind. */
+int ds4_session_stage_payload_in(ds4_session *s, ds4_session_payload_file *out, const char *stage_dir,
+                                 char *err, size_t errlen) {
     if (!out) {
         payload_set_err(err, errlen, "invalid session payload staging request");
         return 1;
@@ -65461,7 +65597,11 @@ int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
         return 1;
     }
 
-    char tmpl[] = "/tmp/ds4-session-payload.XXXXXX";
+    char tmpl[4096];
+    if (stage_dir && stage_dir[0])
+        snprintf(tmpl, sizeof(tmpl), "%s/.ds4-stage-%ld-XXXXXX", stage_dir, (long)getpid());
+    else
+        snprintf(tmpl, sizeof(tmpl), "/tmp/ds4-session-payload.XXXXXX");
     int fd = mkstemp(tmpl);
     if (fd < 0) {
         payload_set_err(err, errlen, "failed to create staged session payload");
@@ -65770,6 +65910,9 @@ static int qwen4_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *
 #endif
 
 int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
+#ifdef DS4_HAS_INKLING2_GPU
+    if (g_ds4_inkling2) return iks_save_payload(s, fp, err, errlen);
+#endif
     if (!s || !fp || !s->checkpoint_valid) {
         payload_set_err(err, errlen, "session has no valid checkpoint to save");
         return 1;
@@ -66121,6 +66264,9 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
 }
 
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen) {
+#ifdef DS4_HAS_INKLING2_GPU
+    if (g_ds4_inkling2) return iks_load_payload(s, fp, payload_bytes, err, errlen);
+#endif
     if (!s || !fp) {
         payload_set_err(err, errlen, "invalid session payload load");
         return 1;
@@ -67972,6 +68118,9 @@ int ds4_engine_generate_argmax(
         void              *emit_ud,
         ds4_session_progress_fn progress,
         void              *progress_ud) {
+#ifdef DS4_HAS_INKLING2_GPU
+    if (g_ds4_inkling2) return iks_generate_argmax(e, prompt, n_predict, ctx_size, emit, done, emit_ud, progress, progress_ud);
+#endif
     const ds4_model *model = &e->model;
     const ds4_vocab *vocab = &e->vocab;
     const ds4_weights *weights = &e->weights;
@@ -70943,6 +71092,10 @@ static int qwen4_first_token_test(const ds4_model *model, const ds4_vocab *vocab
 }
 
 int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt) {
+#ifdef DS4_HAS_INKLING2_GPU
+    if (g_ds4_inkling2 && getenv("DS4_INKLING2_SESSION_TEST")) return iks_selftest(e, prompt);
+#endif
+    if (g_ds4_inkling2) return ik_first_token_test(e, prompt);
     if (!engine_legacy_graph_test_supported(e)) return 1;
     if (!prompt || prompt->len <= 0) {
         fprintf(stderr, "ds4: first-token test requires a non-empty prompt\n");
@@ -73897,6 +74050,15 @@ static int ds4_engine_open_internal(ds4_engine **out,
     if (e->backend == DS4_BACKEND_METAL)
         ds4_gpu_set_model_untracked_default(DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41);
 #endif
+    if (g_ds4_inkling2) {
+        if (inkling2_engine_open(e, opt) != 0) {
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        *out = e;
+        return 0;
+    }
     if (ds4_model_is_qwen4() && !opt->inspect_only) {
         if (e->ssd_streaming && (e->ssd_streaming_full_layers || e->ssd_streaming_preload_experts)) {
             fprintf(stderr, "ds4: Qwen SSD fills its expert cache on demand; full resident layers "
@@ -75212,6 +75374,7 @@ int ds4_engine_set_power(ds4_engine *e, int power_percent) {
 
 const char *ds4_engine_model_name(ds4_engine *e) {
     (void)e;
+    if (g_ds4_inkling2) return "inkling-2-mini";
     return DS4_MODEL_SHAPE_NAME;
 }
 
@@ -75267,8 +75430,13 @@ bool ds4_engine_glm_layer_payload_bytes(ds4_engine *e,
 #endif
 }
 
+/* Model id stored in disk KV files (header byte 7) and used to tell the families apart.  Inkling 2 must not share id 0 with
+ * DeepSeek V4 Flash: a server only touches the files of its own id (ds4_kvstore_open_owned). */
+#define DS4_MODEL_ID_INKLING2 64
+
 int ds4_engine_model_id(ds4_engine *e) {
     (void)e;
+    if (g_ds4_inkling2) return DS4_MODEL_ID_INKLING2;
     return (int)DS4_MODEL_VARIANT;
 }
 
@@ -75280,6 +75448,32 @@ bool ds4_engine_is_glm53(ds4_engine *e) {
 bool ds4_engine_is_qwen4(ds4_engine *e) {
     (void)e;
     return ds4_model_is_qwen4();
+}
+
+bool ds4_engine_is_inkling2(ds4_engine *e) {
+    (void)e;
+    return g_ds4_inkling2;
+}
+
+/* The template prints "Thinking effort level: N" before the first non-system
+ * message.  Named modes use the template's own numbers (low 0.2, medium 0.7,
+ * high 0.9, max 0.99, none 0); an explicit level L (1..100) prints L/100,
+ * capped at the template's maximum 0.99. */
+const char *ds4_inkling2_effort_text(ds4_think_mode mode) {
+    static __thread char text[8];
+    int level = ds4_think_mode_level(mode);
+    switch (mode) {
+    case DS4_THINK_NONE:   return "0";
+    case DS4_THINK_LOW:    return "0.2";
+    case DS4_THINK_MEDIUM: return "0.7";
+    case DS4_THINK_HIGH:   return "0.9";
+    case DS4_THINK_MAX:    return "0.99";
+    }
+    if (level <= 0) return "0";
+    if (level >= 99) return "0.99";
+    if (level % 10 == 0) snprintf(text, sizeof(text), "0.%d", level / 10);
+    else snprintf(text, sizeof(text), "0.%02d", level);
+    return text;
 }
 
 /* The official template's default effort is xhigh; medium adds no text. */
@@ -76136,6 +76330,7 @@ void ds4_engine_close(ds4_engine *e) {
     ds41_narrow_free();
 #endif
     weights_free(&e->weights);
+    free(e->ik);
     vocab_free(&e->vocab);
     ds4_threads_shutdown();
     if (e->mtp_model.map) model_close(&e->mtp_model);
@@ -76301,8 +76496,20 @@ static int ds4_session_tp_register(ds4_session *s) {
     return 1;
 }
 
+#ifdef DS4_HAS_INKLING2_GPU
+#include "ds4_inkling2_session.inc"
+#endif
+
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     if (!out || !e || ctx_size <= 0) return 1;
+    if (g_ds4_inkling2) {
+#ifdef DS4_HAS_INKLING2_GPU
+        return iks_create(out, e, ctx_size);
+#else
+        fprintf(stderr, "ds4: inkling2: sessions need Metal\n");
+        return 1;
+#endif
+    }
     if (e->backend == DS4_BACKEND_CPU) {
         if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
             fprintf(stderr, "ds4: GLM sessions currently require a graph backend\n");
@@ -76795,6 +77002,9 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
 }
 
 void ds4_session_free(ds4_session *s) {
+#ifdef DS4_HAS_INKLING2_GPU
+    if (g_ds4_inkling2) { iks_free(s); return; }
+#endif
     if (!s) return;
     if (s->glm_reserved_graph_bytes && s->engine) {
         s->engine->glm_session_graph_bytes -= s->glm_reserved_graph_bytes;
@@ -78638,6 +78848,9 @@ static int ds4_session_sync_lockstep(ds4_session *s, const ds4_tokens *prompt,
  * once its matching prefill completes, surfacing worker-side failures
  * here instead of as a gate timeout mid-decode. */
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
+#ifdef DS4_HAS_INKLING2_GPU
+    if (g_ds4_inkling2) return iks_sync(s, prompt, err, errlen);
+#endif
 #ifndef DS4_NO_GPU
     if (s) s->dspark_rewind_end = 0;
 #endif
@@ -78735,6 +78948,9 @@ int ds4_session_sync_multimodal(
         size_t image_count,
         char *err,
         size_t errlen) {
+#ifdef DS4_HAS_INKLING2_GPU
+    if (g_ds4_inkling2) return iks_unsupported(err, errlen, "vision input");
+#endif
     if (!s || !prompt || (image_count != 0 && !images)) {
         snprintf(err, errlen, "invalid multimodal prompt");
         return 1;
@@ -80082,6 +80298,14 @@ ds4_session_rewrite_result ds4_session_rewrite_from_common(
     return DS4_SESSION_REWRITE_ERROR;
 }
 
+int ds4_session_restore_prefix(ds4_session *s, const ds4_tokens *prompt) {
+#ifdef DS4_HAS_INKLING2_GPU
+    if (g_ds4_inkling2) return iks_restore_prefix(s, prompt);
+#endif
+    (void)s; (void)prompt;
+    return 0;
+}
+
 int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
     if (!s->checkpoint_valid) return 0;
     int n = s->checkpoint.len < prompt->len ? s->checkpoint.len : prompt->len;
@@ -80091,11 +80315,17 @@ int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
 }
 
 int ds4_session_argmax(ds4_session *s) {
+#ifdef DS4_HAS_INKLING2_GPU
+    if (g_ds4_inkling2) return iks_argmax_excluding(s, -1);
+#endif
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
     return sample_argmax(s->logits, DS4_N_VOCAB);
 }
 
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
+#ifdef DS4_HAS_INKLING2_GPU
+    if (g_ds4_inkling2) return iks_argmax_excluding(s, excluded_id);
+#endif
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
     if (getenv("DS4_CPU_DISABLE_UNROLLED_ARGMAX") == NULL) {
         return argmax_f32_excluding_unrolled8(
@@ -80116,6 +80346,9 @@ int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
 
 int ds4_session_argmax_ignoring_eos(ds4_session *s,
                                     ds4_think_mode think_mode) {
+#ifdef DS4_HAS_INKLING2_GPU
+    if (g_ds4_inkling2) return iks_argmax_ignoring_eos(s, think_mode);
+#endif
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
     int best = -1;
     float best_logit = DS4_NEG_INF;
@@ -80145,12 +80378,21 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
 }
 
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
+#ifdef DS4_HAS_INKLING2_GPU
+    if (g_ds4_inkling2) {
+        if (!s || !s->checkpoint_valid || !s->logits) return -1;
+        return sample_top_p_min_p(s->logits, IK_VOCAB, temperature, top_k, top_p, min_p, rng, s->sample_probs);
+    }
+#endif
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
     return sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k,
                               top_p, min_p, rng, s->sample_probs);
 }
 
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
+#ifdef DS4_HAS_INKLING2_GPU
+    if (g_ds4_inkling2) return iks_top_logprobs(s, out, k);
+#endif
     if (!s || !out || k <= 0) return 0;
     if (k > (int)DS4_N_VOCAB) k = (int)DS4_N_VOCAB;
     for (int i = 0; i < k; i++) {
@@ -80188,6 +80430,9 @@ int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
 }
 
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out) {
+#ifdef DS4_HAS_INKLING2_GPU
+    if (g_ds4_inkling2) return iks_token_logprob(s, token, out);
+#endif
     if (!s || !out || token < 0 || token >= (int)DS4_N_VOCAB) return 0;
 
     float max_logit = DS4_NEG_INF;
@@ -80210,6 +80455,9 @@ int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out) {
 }
 
 int ds4_session_copy_logits(ds4_session *s, float *out, int cap) {
+#ifdef DS4_HAS_INKLING2_GPU
+    if (g_ds4_inkling2) return iks_copy_logits(s, out, cap);
+#endif
     if (!s || !out || cap < (int)DS4_N_VOCAB) return 0;
     memcpy(out, s->logits, (size_t)DS4_N_VOCAB * sizeof(out[0]));
     return (int)DS4_N_VOCAB;
@@ -80229,6 +80477,9 @@ int ds4_session_set_logits(ds4_session *s, const float *logits, int n) {
  * on the M5 Max pair -- the whole first-run TP deficit vs single
  * node, which pays the same cost before its timing window starts). */
 void ds4_session_gpu_warmup(ds4_session *s) {
+#ifdef DS4_HAS_INKLING2_GPU
+    if (g_ds4_inkling2) return;
+#endif
 #ifndef DS4_NO_GPU
     if (!s || ds4_session_is_cpu(s)) return;
     if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK4) return;
@@ -81338,6 +81589,9 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
 }
 
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
+#ifdef DS4_HAS_INKLING2_GPU
+    if (g_ds4_inkling2) return iks_eval(s, token, err, errlen);
+#endif
     bool probe_mtp = true;
 #ifndef DS4_NO_GPU
     if (s && s->engine && s->engine->support_kind == DS4_SUPPORT_DSPARK) {
@@ -83727,6 +83981,9 @@ static bool qwen4_batch_spec_next(const ds4_engine *e) {
 int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count,
                                                int (*accepted)[2], int *n_accepted,
                                                char *err, size_t errlen) {
+#ifdef DS4_HAS_INKLING2_GPU
+    if (g_ds4_inkling2) return iks_unsupported(err, errlen, "speculative decoding");
+#endif
     if (!items || count <= 0 || !accepted || !n_accepted) {
         if (err && errlen) snprintf(err, errlen, "empty speculative decode batch");
         return 1;
@@ -83942,6 +84199,9 @@ int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count
 
 int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
                             char *err, size_t errlen) {
+#ifdef DS4_HAS_INKLING2_GPU
+    if (g_ds4_inkling2) return iks_eval_batch(items, count, err, errlen);
+#endif
     if (!items || count <= 0) {
         if (err && errlen) snprintf(err, errlen, "empty decode batch");
         return 1;
@@ -84021,6 +84281,9 @@ int ds4_sessions_eval_batch_with_prefill(
         const ds4_tokens *prefill_prompt,
         char *err,
         size_t errlen) {
+#ifdef DS4_HAS_INKLING2_GPU
+    if (g_ds4_inkling2) return iks_unsupported(err, errlen, "batched prefill scheduling");
+#endif
     if (!items || count <= 0 || !prefill_session || !prefill_prompt ||
         !prefill_session->engine) {
         if (err && errlen) snprintf(err, errlen, "invalid mixed model batch");
@@ -89293,6 +89556,9 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen) {
+#ifdef DS4_HAS_INKLING2_GPU
+    if (g_ds4_inkling2) return -iks_unsupported(err, errlen, "speculative decoding");
+#endif
     return ds4_session_eval_speculative_argmax_impl(
         s, first_token, max_tokens, eos_token, false, DS4_THINK_HIGH,
         accepted, accepted_cap, err, errlen);
@@ -89302,6 +89568,9 @@ int ds4_session_eval_speculative_argmax_ignoring_eos(
         ds4_session *s, int first_token, int max_tokens, int eos_token,
         ds4_think_mode think_mode,
         int *accepted, int accepted_cap, char *err, size_t errlen) {
+#ifdef DS4_HAS_INKLING2_GPU
+    if (g_ds4_inkling2) return -iks_unsupported(err, errlen, "speculative decoding");
+#endif
     return ds4_session_eval_speculative_argmax_impl(
         s, first_token, max_tokens, eos_token, true, think_mode,
         accepted, accepted_cap, err, errlen);
@@ -89313,6 +89582,9 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
                                  float top_p, float min_p, uint64_t *rng,
                                  int *accepted, int accepted_cap,
                                  char *err, size_t errlen) {
+#ifdef DS4_HAS_INKLING2_GPU
+    if (g_ds4_inkling2) return -iks_unsupported(err, errlen, "speculative decoding");
+#endif
     if (temperature <= 0.0f) {
         return ds4_session_eval_speculative_argmax(
             s, first_token, max_tokens, eos_token,
@@ -89458,6 +89730,9 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
 }
 
 void ds4_session_invalidate(ds4_session *s) {
+#ifdef DS4_HAS_INKLING2_GPU
+    if (g_ds4_inkling2) { iks_invalidate(s); return; }
+#endif
     if (!s) return;
     if (ds4_session_tp_leader(s) &&
         !ds4_tp_failed(s->engine->tp.ctx)) {
@@ -89618,6 +89893,9 @@ bool ds4_session_rewind_speculative(ds4_session *s, int pos) {
 }
 
 void ds4_session_rewind(ds4_session *s, int pos) {
+#ifdef DS4_HAS_INKLING2_GPU
+    if (g_ds4_inkling2) { iks_rewind(s, pos); return; }
+#endif
     if (!s) return;
     if (pos < 0) pos = 0;
     if (pos >= s->checkpoint.len) return;
