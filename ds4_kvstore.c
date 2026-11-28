@@ -12,6 +12,7 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
+#include <signal.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -622,6 +623,47 @@ void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
     }
 }
 
+/* Remove what a crashed server left in the directory: staged payloads (.ds4-stage-PID-XXXXXX) and half-written files
+ * (NAME.kv.tmp.PID) whose PID is no longer alive.  A live PID (another server, this one) is left alone.  Returns the count. */
+int ds4_kvstore_sweep_partial(ds4_kvstore *kc) {
+    if (!kc || !kc->dir) return 0;
+    DIR *d = opendir(kc->dir);
+    if (!d) return 0;
+    int removed = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        long pid = 0;
+        const char *n = de->d_name;
+        if (!strncmp(n, ".ds4-stage-", 11)) pid = strtol(n + 11, NULL, 10);
+        else {
+            const char *t = strstr(n, ".kv.tmp.");
+            if (t && ds4_kvstore_sha_hex_name(n, (char[41]){0}) == false) {
+                char head[48];
+                const size_t hl = (size_t)(t - n) + 3;
+                if (hl < sizeof(head)) {
+                    memcpy(head, n, hl);
+                    head[hl] = '\0';
+                    char sha[41];
+                    if (ds4_kvstore_sha_hex_name(head, sha)) pid = strtol(t + 8, NULL, 10);
+                }
+            }
+        }
+        if (pid <= 0) continue;
+        if (kill((pid_t)pid, 0) == 0 || errno == EPERM) continue;
+        char *path = ds4_kvstore_path_join(kc->dir, n);
+        struct stat st;
+        const double mb = stat(path, &st) == 0 ? (double)st.st_size / (1024.0 * 1024.0) : 0.0;
+        if (unlink(path) == 0) {
+            removed++;
+            kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE, "%s: kv cache removed a partial file left by a stopped process (pid %ld): %s (%.1f MiB)",
+                    kv_log_name(kc), pid, n, mb);
+        }
+        free(path);
+    }
+    closedir(d);
+    return removed;
+}
+
 bool ds4_kvstore_open_owned(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
                             bool reject_different_quant, ds4_kvstore_options opt,
                             int owner_model_id, const char *log_name,
@@ -648,6 +690,7 @@ bool ds4_kvstore_open_owned(ds4_kvstore *kc, const char *dir, uint64_t budget_mb
     kc->budget_bytes = budget_mb * 1024ull * 1024ull;
     kc->reject_different_quant = reject_different_quant;
     kc->opt = opt;
+    ds4_kvstore_sweep_partial(kc);
     ds4_kvstore_evict(kc, NULL, 0, NULL);
     if (kc->owned && kc->foreign_files > 0)
         kv_logf(kc, DS4_KVSTORE_LOG_WARNING,
@@ -1064,8 +1107,8 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     }
 
     ds4_session_payload_file staged = {0};
-    if (ds4_session_stage_payload(session, &staged,
-                                  save_err, sizeof(save_err)) != 0) {
+    if (ds4_session_stage_payload_in(session, &staged, kc->dir,
+                                     save_err, sizeof(save_err)) != 0) {
         kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
                 "%s: kv cache skipped tokens=%d reason=%s because KV payload staging failed: %s",
                 kv_log_name(kc),

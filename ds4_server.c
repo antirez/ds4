@@ -22166,6 +22166,34 @@ static void test_kv_cache_owner_guard_leaves_foreign_files(void) {
     test_kv_remove_all(dir, texts, 5);
 }
 
+/* Staged payloads and half-written files of a dead process are removed at open; a live process's are not. */
+static void test_kv_cache_open_sweeps_partial_files(void) {
+    char tmpl[] = "/tmp/ds4-kv-sweep-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    const char *sha = "3333333333333333333333333333333333333333";
+    char names[6][128];
+    snprintf(names[0], sizeof(names[0]), "%s/.ds4-stage-999999999-abcdef", dir);          /* dead pid */
+    snprintf(names[1], sizeof(names[1]), "%s/%s.kv.tmp.999999999", dir, sha);             /* dead pid */
+    snprintf(names[2], sizeof(names[2]), "%s/.ds4-stage-%ld-abcdef", dir, (long)getpid()); /* live pid */
+    snprintf(names[3], sizeof(names[3]), "%s/%s.kv.tmp.%ld", dir, sha, (long)getpid());   /* live pid */
+    snprintf(names[4], sizeof(names[4]), "%s/notes.txt", dir);                            /* not ours */
+    for (int i = 0; i < 5; i++) {
+        FILE *fp = fopen(names[i], "wb");
+        TEST_ASSERT(fp != NULL);
+        if (fp) { fputs("partial", fp); fclose(fp); }
+    }
+    kv_disk_cache kc = {0};
+    kc.opt = kv_cache_default_options();
+    TEST_ASSERT(ds4_kvstore_open_owned(&kc, dir, 1, false, kc.opt, 7, "test", test_kv_owner_log, NULL));
+    TEST_ASSERT(access(names[0], F_OK) != 0 && access(names[1], F_OK) != 0);
+    TEST_ASSERT(access(names[2], F_OK) == 0 && access(names[3], F_OK) == 0 && access(names[4], F_OK) == 0);
+    kv_cache_close(&kc);
+    for (int i = 0; i < 5; i++) unlink(names[i]);
+    rmdir(dir);
+}
+
 static void test_kv_cache_eviction_prefers_anchor_reason(void) {
     char tmpl[] = "/tmp/ds4-kv-anchor-reason-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -23278,6 +23306,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_values_fresh_snapshots();
     test_kv_cache_eviction_prefers_anchor_reason();
     test_kv_cache_owner_guard_leaves_foreign_files();
+    test_kv_cache_open_sweeps_partial_files();
     test_kv_cache_eviction_makes_room_before_store();
     test_kv_cache_eviction_ignores_oversize_incoming();
     test_kv_cache_eviction_prefers_superseded_continued_prefix();

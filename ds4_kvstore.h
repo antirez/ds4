@@ -129,6 +129,7 @@ bool ds4_kvstore_open_owned(ds4_kvstore *kc, const char *dir, uint64_t budget_mb
                             int owner_model_id, const char *log_name,
                             void (*log)(void *ud, ds4_kvstore_log_type type, const char *msg),
                             void *log_ud);
+int ds4_kvstore_sweep_partial(ds4_kvstore *kc);
 bool ds4_kvstore_key_held_by_other_model(const ds4_kvstore *kc, const char sha[41]);
 void ds4_kvstore_close(ds4_kvstore *kc);
 void ds4_kvstore_clear(ds4_kvstore *kc);
