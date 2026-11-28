@@ -66,7 +66,7 @@ export DS4_LOCK_FILE=/tmp/ds4-inkling.lock
 ./ds4 -m Inkling-2-Mini-NVFP4.gguf --metal --raw-prompt -p 'The capital of France is' -n 64 --temp 0 --ctx 4096
 ```
 
-Memory: the model file is mapped (NVFP4: 16.8 GiB wired by the Metal views). Per context: K/V half rows
+Memory: the model file is mapped (NVFP4 file: 16.4 GiB). Per context: K/V half rows
 (8 global slots x ctx rows, 40 local slots x (1024 + chunk) rows, 2 x 2 KiB per row) plus per-chunk scratch;
 `ds4: memory:` and `ds4: inkling2 gpu:` print the estimate and the bytes actually allocated (they agree within 1 %).
 Example: ctx 16384, chunk 512: about 0.9 GiB state + 0.4 GiB scratch. `DS4_INKLING2_CHUNK` (default 512, max 4096) sets
@@ -110,7 +110,7 @@ What made the difference (all in fast mode only; EXACT keeps the old kernels):
 - Kernels need many loads in flight per thread: single-pass rms, unrolled loops, and a 16-entry nibble table (a 256-entry byte table is slower because of threadgroup bank conflicts).
 - Prefill: experts on simdgroup matrices with the tokens of a chunk grouped by expert (any expert type), and flash-style attention on simdgroup matrices (Q and the softmax weights are rounded to half for the matrix products, everything else f32). The K/V caches are zero-initialised because whole 8-key tiles are read.
 - `DS4_INKLING2_PROFILE=1` prints CPU encode time versus GPU wait time; `DS4_METAL_ENCODER_TIMELINE=f` plus `tests/inkling2_gpu/tl_agg.py` gives per kernel GPU time; `DS4_INKLING2_ATTN_SCALAR=1` selects the old attention kernel for A/B runs.
-- Accuracy (router decisions replayed in the CPU oracle, worst top-20 log-prob difference): decode path (chunk 1) count 0.00014, long_300 0.0007, long_1030 0.0055; prefill (chunk 512) count 0.0003, long_300 0.0008, long_1030 0.010, long_9000 0.043 (exact kernels: 0.0036; limits 0.01 / 0.02 / 0.06 / 0.4). Top-1 matches at every position. Router decisions differ from the CPU in 0.13-0.15 % of cases.
+- Accuracy (router decisions replayed in the CPU oracle, worst top-20 log-prob difference): decode path (chunk 1) count 0.00014, long_300 0.0007, long_1030 0.0055; prefill (chunk 512) count 0.0003, long_300 0.0008, long_1030 0.010, long_9000 0.043 (exact kernels: 0.0036; limits 0.01 / 0.02 / 0.06 / 0.4). Top-1 matches at every position. Without the replay, some router decisions differ from the CPU at near-ties (8th and 9th scores within about 1e-4).
 
 ## Reading disagreements with llama.cpp
 
@@ -243,7 +243,7 @@ per session").
   (102.4 GiB)" for 8 x 307,200; that size starts only when about 78% of RAM is free. 4 x 307,200 (57.4 GiB in all) started at 66% free.
   One session of 262,144 tokens costs 8.9 GiB, so 8 sessions at `--ctx 262144` need 87 GiB plus the model.
   `--ctx 65536 --batched-session 8` is 23 GiB of state plus the 16.4 GiB mapped model.
-* **A memory cap tool may not see the model.** The 16.8 GiB NVFP4 file is mapped, not read: a process monitor that counts
+* **A memory cap tool may not see the model.** The 16.4 GiB NVFP4 file is mapped, not read: a process monitor that counts
   resident memory reports far less than the real footprint. With a cap tool that does count mapped memory, set it to the
   footprint of the configuration: about 48 GB for 8 x 65,536, about 64 GB for 4 x 307,200.
 * **It shares the GPU with the other server.** While Inkling prefilled 9,177 tokens, a tiny request to another ds4 server on the
