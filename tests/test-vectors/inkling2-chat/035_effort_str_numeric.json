@@ -1,0 +1,16 @@
+{
+ "name": "035_effort_str_numeric",
+ "request": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hi"
+   }
+  ],
+  "reasoning_effort": "0.5"
+ },
+ "prompt": null,
+ "tokens": null,
+ "llama_error": true,
+ "ds4": "error"
+}

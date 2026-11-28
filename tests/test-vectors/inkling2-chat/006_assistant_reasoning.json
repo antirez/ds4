@@ -1,0 +1,70 @@
+{
+ "name": "006_assistant_reasoning",
+ "request": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is 17*3?"
+   },
+   {
+    "role": "assistant",
+    "content": "51",
+    "reasoning_content": "17*3 = 51."
+   },
+   {
+    "role": "user",
+    "content": "And 17*4?"
+   }
+  ]
+ },
+ "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is 17*3?<|end_message|><|message_model|><|content_thinking|>17*3 = 51.<|end_message|><|message_model|><|content_text|>51<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>And 17*4?<|end_message|>",
+ "tokens": [
+  200002,
+  200004,
+  34182,
+  279,
+  154554,
+  150628,
+  25,
+  220,
+  15,
+  13,
+  24,
+  200010,
+  200000,
+  200004,
+  1775,
+  149884,
+  220,
+  68107,
+  9,
+  18,
+  30,
+  200010,
+  200001,
+  200008,
+  68107,
+  9,
+  18,
+  196977,
+  220,
+  69387,
+  13,
+  200010,
+  200001,
+  200004,
+  69387,
+  200010,
+  200006,
+  200000,
+  200004,
+  1790,
+  220,
+  68107,
+  9,
+  19,
+  30,
+  200010
+ ],
+ "llama_error": false
+}

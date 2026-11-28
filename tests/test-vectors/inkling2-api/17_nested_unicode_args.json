@@ -1,0 +1,193 @@
+{
+ "name": "17_nested_unicode_args",
+ "chat": {
+  "model": "inkling-2-mini",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Find notes about Zürich."
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "reasoning_content": "Search notes for Zürich.",
+    "tool_calls": [
+     {
+      "id": "toolu_z",
+      "type": "function",
+      "function": {
+       "name": "search",
+       "arguments": "{\"query\": \"Zürich 🙂\", \"filters\": {\"city\": \"Zürich\", \"ids\": [1, 2, 3], \"ok\": true, \"x\": null}}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "toolu_z",
+    "content": "no notes found"
+   }
+  ],
+  "temperature": 0,
+  "max_tokens": 700,
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "description": "Search the notes.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "query": {
+        "type": "string"
+       },
+       "filters": {
+        "type": "object"
+       }
+      },
+      "required": [
+       "query"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ "anthropic": {
+  "model": "inkling-2-mini",
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "Find notes about Zürich."
+     }
+    ]
+   },
+   {
+    "role": "assistant",
+    "content": [
+     {
+      "type": "thinking",
+      "thinking": "Search notes for Zürich.",
+      "signature": "sig"
+     },
+     {
+      "type": "tool_use",
+      "id": "toolu_z",
+      "name": "search",
+      "input": {
+       "query": "Zürich 🙂",
+       "filters": {
+        "city": "Zürich",
+        "ids": [
+         1,
+         2,
+         3
+        ],
+        "ok": true,
+        "x": null
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "tool_result",
+      "tool_use_id": "toolu_z",
+      "content": "no notes found"
+     }
+    ]
+   }
+  ],
+  "temperature": 0,
+  "max_tokens": 700,
+  "tools": [
+   {
+    "name": "search",
+    "description": "Search the notes.",
+    "input_schema": {
+     "type": "object",
+     "properties": {
+      "query": {
+       "type": "string"
+      },
+      "filters": {
+       "type": "object"
+      }
+     },
+     "required": [
+      "query"
+     ]
+    }
+   }
+  ]
+ },
+ "responses": {
+  "model": "inkling-2-mini",
+  "input": [
+   {
+    "type": "message",
+    "role": "user",
+    "content": [
+     {
+      "type": "input_text",
+      "text": "Find notes about Zürich."
+     }
+    ]
+   },
+   {
+    "type": "reasoning",
+    "id": "rs_x",
+    "summary": [
+     {
+      "type": "summary_text",
+      "text": "Search notes for Zürich."
+     }
+    ]
+   },
+   {
+    "type": "function_call",
+    "call_id": "toolu_z",
+    "name": "search",
+    "arguments": "{\"query\": \"Zürich 🙂\", \"filters\": {\"city\": \"Zürich\", \"ids\": [1, 2, 3], \"ok\": true, \"x\": null}}"
+   },
+   {
+    "type": "function_call_output",
+    "call_id": "toolu_z",
+    "output": "no notes found"
+   }
+  ],
+  "temperature": 0,
+  "max_output_tokens": 700,
+  "reasoning": {
+   "summary": "auto"
+  },
+  "tools": [
+   {
+    "type": "function",
+    "name": "search",
+    "description": "Search the notes.",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "query": {
+       "type": "string"
+      },
+      "filters": {
+       "type": "object"
+      }
+     },
+     "required": [
+      "query"
+     ]
+    }
+   }
+  ]
+ }
+}

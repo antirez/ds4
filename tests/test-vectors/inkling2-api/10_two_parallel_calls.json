@@ -1,0 +1,216 @@
+{
+ "name": "10_two_parallel_calls",
+ "chat": {
+  "model": "inkling-2-mini",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Weather in Rome and Oslo, use the tool for both."
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "toolu_a",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": "{\"city\": \"Rome\"}"
+      }
+     },
+     {
+      "id": "toolu_b",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": "{\"city\": \"Oslo\"}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "toolu_a",
+    "content": "24 C, sunny"
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "toolu_b",
+    "content": "3 C, snow"
+   }
+  ],
+  "temperature": 0,
+  "max_tokens": 700,
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather for a city.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "c",
+         "f"
+        ]
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ "anthropic": {
+  "model": "inkling-2-mini",
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "Weather in Rome and Oslo, use the tool for both."
+     }
+    ]
+   },
+   {
+    "role": "assistant",
+    "content": [
+     {
+      "type": "tool_use",
+      "id": "toolu_a",
+      "name": "get_weather",
+      "input": {
+       "city": "Rome"
+      }
+     },
+     {
+      "type": "tool_use",
+      "id": "toolu_b",
+      "name": "get_weather",
+      "input": {
+       "city": "Oslo"
+      }
+     }
+    ]
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "tool_result",
+      "tool_use_id": "toolu_a",
+      "content": "24 C, sunny"
+     },
+     {
+      "type": "tool_result",
+      "tool_use_id": "toolu_b",
+      "content": "3 C, snow"
+     }
+    ]
+   }
+  ],
+  "temperature": 0,
+  "max_tokens": 700,
+  "tools": [
+   {
+    "name": "get_weather",
+    "description": "Current weather for a city.",
+    "input_schema": {
+     "type": "object",
+     "properties": {
+      "city": {
+       "type": "string"
+      },
+      "unit": {
+       "type": "string",
+       "enum": [
+        "c",
+        "f"
+       ]
+      }
+     },
+     "required": [
+      "city"
+     ]
+    }
+   }
+  ]
+ },
+ "responses": {
+  "model": "inkling-2-mini",
+  "input": [
+   {
+    "type": "message",
+    "role": "user",
+    "content": [
+     {
+      "type": "input_text",
+      "text": "Weather in Rome and Oslo, use the tool for both."
+     }
+    ]
+   },
+   {
+    "type": "function_call",
+    "call_id": "toolu_a",
+    "name": "get_weather",
+    "arguments": "{\"city\": \"Rome\"}"
+   },
+   {
+    "type": "function_call",
+    "call_id": "toolu_b",
+    "name": "get_weather",
+    "arguments": "{\"city\": \"Oslo\"}"
+   },
+   {
+    "type": "function_call_output",
+    "call_id": "toolu_a",
+    "output": "24 C, sunny"
+   },
+   {
+    "type": "function_call_output",
+    "call_id": "toolu_b",
+    "output": "3 C, snow"
+   }
+  ],
+  "temperature": 0,
+  "max_output_tokens": 700,
+  "reasoning": {
+   "summary": "auto"
+  },
+  "tools": [
+   {
+    "type": "function",
+    "name": "get_weather",
+    "description": "Current weather for a city.",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "city": {
+       "type": "string"
+      },
+      "unit": {
+       "type": "string",
+       "enum": [
+        "c",
+        "f"
+       ]
+      }
+     },
+     "required": [
+      "city"
+     ]
+    }
+   }
+  ]
+ }
+}

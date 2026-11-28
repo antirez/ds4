@@ -1,0 +1,82 @@
+{
+ "name": "005_multi_turn",
+ "request": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hi"
+   },
+   {
+    "role": "assistant",
+    "content": "Hello! How can I help?"
+   },
+   {
+    "role": "user",
+    "content": "Tell me a joke"
+   },
+   {
+    "role": "assistant",
+    "content": "Why did the chicken cross the road?"
+   },
+   {
+    "role": "user",
+    "content": "Why?"
+   }
+  ]
+ },
+ "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Hi<|end_message|><|message_model|><|content_text|>Hello! How can I help?<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>Tell me a joke<|end_message|><|message_model|><|content_text|>Why did the chicken cross the road?<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>Why?<|end_message|>",
+ "tokens": [
+  200002,
+  200004,
+  34182,
+  279,
+  154554,
+  150628,
+  25,
+  220,
+  15,
+  13,
+  24,
+  200010,
+  200000,
+  200004,
+  4896,
+  200010,
+  200001,
+  200004,
+  32269,
+  0,
+  151337,
+  149951,
+  149904,
+  150572,
+  30,
+  200010,
+  200006,
+  200000,
+  200004,
+  34751,
+  149991,
+  149878,
+  193279,
+  200010,
+  200001,
+  200004,
+  4492,
+  150439,
+  149876,
+  171668,
+  151458,
+  149876,
+  155569,
+  30,
+  200010,
+  200006,
+  200000,
+  200004,
+  4492,
+  30,
+  200010
+ ],
+ "llama_error": false
+}

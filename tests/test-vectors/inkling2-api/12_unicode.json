@@ -1,0 +1,56 @@
+{
+ "name": "12_unicode",
+ "chat": {
+  "model": "inkling-2-mini",
+  "messages": [
+   {
+    "role": "system",
+    "content": "Tu es un assistant. Réponds brièvement. ñ ü €"
+   },
+   {
+    "role": "user",
+    "content": "Écris « bonjour » en japonais: こんにちは. Emoji: 🙂. Reply with one short line."
+   }
+  ],
+  "temperature": 0,
+  "max_tokens": 700
+ },
+ "anthropic": {
+  "model": "inkling-2-mini",
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "Écris « bonjour » en japonais: こんにちは. Emoji: 🙂. Reply with one short line."
+     }
+    ]
+   }
+  ],
+  "temperature": 0,
+  "max_tokens": 700,
+  "system": "Tu es un assistant. Réponds brièvement. ñ ü €"
+ },
+ "responses": {
+  "model": "inkling-2-mini",
+  "input": [
+   {
+    "type": "message",
+    "role": "user",
+    "content": [
+     {
+      "type": "input_text",
+      "text": "Écris « bonjour » en japonais: こんにちは. Emoji: 🙂. Reply with one short line."
+     }
+    ]
+   }
+  ],
+  "temperature": 0,
+  "max_output_tokens": 700,
+  "reasoning": {
+   "summary": "auto"
+  },
+  "instructions": "Tu es un assistant. Réponds brièvement. ñ ü €"
+ }
+}

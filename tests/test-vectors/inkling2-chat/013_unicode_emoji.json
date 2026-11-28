@@ -1,0 +1,48 @@
+{
+ "name": "013_unicode_emoji",
+ "request": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Héllo wörld 日本語 العربية 🙂🚀 é ​ zero-width"
+   }
+  ]
+ },
+ "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Héllo wörld 日本語 العربية 🙂🚀 é ​ zero-width<|end_message|>",
+ "tokens": [
+  200002,
+  200004,
+  34182,
+  279,
+  154554,
+  150628,
+  25,
+  220,
+  15,
+  13,
+  24,
+  200010,
+  200000,
+  200004,
+  108357,
+  31835,
+  149997,
+  68175,
+  483,
+  220,
+  90626,
+  22912,
+  168984,
+  220,
+  104523,
+  108185,
+  174962,
+  220,
+  68619,
+  151712,
+  12,
+  32707,
+  200010
+ ],
+ "llama_error": false
+}

@@ -1,0 +1,146 @@
+{
+ "name": "055_tool_call_args_bool_null",
+ "request": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "go"
+   },
+   {
+    "role": "assistant",
+    "content": null,
+    "tool_calls": [
+     {
+      "id": "a",
+      "type": "function",
+      "function": {
+       "name": "flags",
+       "arguments": "{\"t\":true,\"f\":false,\"n\":null}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "ok",
+    "tool_call_id": "a"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "flags",
+     "description": "x"
+    }
+   }
+  ],
+  "reasoning_effort": "none"
+ },
+ "prompt": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"x\",\"name\":\"flags\",\"parameters\":{},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>go<|end_message|><|message_model|>flags<|content_invoke_tool_json|>{\"name\":\"flags\",\"args\":{\"f\":false,\"n\":null,\"t\":true}}<|end_message|><|content_model_end_sampling|><|message_tool|>flags<|content_text|>ok<|end_message|>",
+ "tokens": [
+  200002,
+  2251,
+  62,
+  76529,
+  200024,
+  58,
+  90,
+  1,
+  70469,
+  1,
+  25,
+  1,
+  87,
+  1,
+  11,
+  1,
+  930,
+  1,
+  25,
+  1,
+  76596,
+  1,
+  11,
+  1,
+  71968,
+  1,
+  25,
+  70044,
+  11,
+  1,
+  1008,
+  1,
+  25,
+  1,
+  36404,
+  1,
+  92,
+  60,
+  200010,
+  200002,
+  200004,
+  34182,
+  279,
+  154554,
+  150628,
+  25,
+  220,
+  15,
+  200010,
+  200000,
+  200004,
+  850,
+  200010,
+  200001,
+  76596,
+  200049,
+  90,
+  1,
+  930,
+  1,
+  25,
+  1,
+  76596,
+  1,
+  11,
+  1,
+  70747,
+  1,
+  25,
+  90,
+  1,
+  69,
+  1,
+  25,
+  2121,
+  11,
+  1,
+  77,
+  1,
+  25,
+  2451,
+  11,
+  1,
+  83,
+  1,
+  25,
+  1750,
+  92,
+  92,
+  200010,
+  200006,
+  200003,
+  76596,
+  200004,
+  873,
+  200010
+ ],
+ "llama_error": false,
+ "raw_generation": "<|message_model|><|content_thinking|>The user said \"go\". There's no prior task. I should respond helpfully, perhaps asking what they'd like to do, or if they want me to proceed with something. Since no context, I can say ready and ask what they want. Need final answer.<|end_message|><|message_model|><|content_text|>Ready—what would you like to do?<|end_message|><|content_model_end_sampling|>",
+ "expect": {
+  "content": "Ready—what would you like to do?",
+  "reasoning_content": "The user said \"go\". There's no prior task. I should respond helpfully, perhaps asking what they'd like to do, or if they want me to proceed with something. Since no context, I can say ready and ask what they want. Need final answer.",
+  "calls": []
+ }
+}

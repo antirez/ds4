@@ -1,0 +1,55 @@
+{
+ "name": "07_thinking_disabled",
+ "chat": {
+  "model": "inkling-2-mini",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is the capital of Italy? One word."
+   }
+  ],
+  "temperature": 0,
+  "max_tokens": 700,
+  "reasoning_effort": "none"
+ },
+ "anthropic": {
+  "model": "inkling-2-mini",
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "What is the capital of Italy? One word."
+     }
+    ]
+   }
+  ],
+  "temperature": 0,
+  "max_tokens": 700,
+  "thinking": {
+   "type": "disabled"
+  }
+ },
+ "responses": {
+  "model": "inkling-2-mini",
+  "input": [
+   {
+    "type": "message",
+    "role": "user",
+    "content": [
+     {
+      "type": "input_text",
+      "text": "What is the capital of Italy? One word."
+     }
+    ]
+   }
+  ],
+  "temperature": 0,
+  "max_output_tokens": 700,
+  "reasoning": {
+   "summary": "auto",
+   "effort": "none"
+  }
+ }
+}

@@ -1,0 +1,51 @@
+{
+ "name": "004_two_system",
+ "request": {
+  "messages": [
+   {
+    "role": "system",
+    "content": "Rule one."
+   },
+   {
+    "role": "system",
+    "content": "Rule two."
+   },
+   {
+    "role": "user",
+    "content": "Go"
+   }
+  ]
+ },
+ "prompt": "<|message_system|><|content_text|>Rule one.<|end_message|><|message_system|><|content_text|>Rule two.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Go<|end_message|>",
+ "tokens": [
+  200002,
+  200004,
+  30989,
+  150011,
+  13,
+  200010,
+  200002,
+  200004,
+  30989,
+  150103,
+  13,
+  200010,
+  200002,
+  200004,
+  34182,
+  279,
+  154554,
+  150628,
+  25,
+  220,
+  15,
+  13,
+  24,
+  200010,
+  200000,
+  200004,
+  1932,
+  200010
+ ],
+ "llama_error": false
+}

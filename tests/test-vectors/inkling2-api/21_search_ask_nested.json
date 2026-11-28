@@ -1,0 +1,119 @@
+{
+ "name": "21_search_ask_nested",
+ "chat": {
+  "model": "inkling-2-mini",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Search my notes for 'tea', with filters {\"tag\": \"beverage\", \"limit\": 5}."
+   }
+  ],
+  "temperature": 0,
+  "max_tokens": 700,
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "description": "Search the notes.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "query": {
+        "type": "string"
+       },
+       "filters": {
+        "type": "object"
+       }
+      },
+      "required": [
+       "query"
+      ]
+     }
+    }
+   }
+  ],
+  "reasoning_effort": "low"
+ },
+ "anthropic": {
+  "model": "inkling-2-mini",
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "Search my notes for 'tea', with filters {\"tag\": \"beverage\", \"limit\": 5}."
+     }
+    ]
+   }
+  ],
+  "temperature": 0,
+  "max_tokens": 700,
+  "tools": [
+   {
+    "name": "search",
+    "description": "Search the notes.",
+    "input_schema": {
+     "type": "object",
+     "properties": {
+      "query": {
+       "type": "string"
+      },
+      "filters": {
+       "type": "object"
+      }
+     },
+     "required": [
+      "query"
+     ]
+    }
+   }
+  ],
+  "output_config": {
+   "effort": "low"
+  }
+ },
+ "responses": {
+  "model": "inkling-2-mini",
+  "input": [
+   {
+    "type": "message",
+    "role": "user",
+    "content": [
+     {
+      "type": "input_text",
+      "text": "Search my notes for 'tea', with filters {\"tag\": \"beverage\", \"limit\": 5}."
+     }
+    ]
+   }
+  ],
+  "temperature": 0,
+  "max_output_tokens": 700,
+  "reasoning": {
+   "summary": "auto",
+   "effort": "low"
+  },
+  "tools": [
+   {
+    "type": "function",
+    "name": "search",
+    "description": "Search the notes.",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "query": {
+       "type": "string"
+      },
+      "filters": {
+       "type": "object"
+      }
+     },
+     "required": [
+      "query"
+     ]
+    }
+   }
+  ]
+ }
+}

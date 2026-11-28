@@ -673,6 +673,7 @@ typedef enum {
     SERVER_MODEL_SYNTAX_GLM,
     SERVER_MODEL_SYNTAX_DEEPSEEK41,
     SERVER_MODEL_SYNTAX_QWEN,
+    SERVER_MODEL_SYNTAX_INKLING,
 } server_model_syntax;
 
 #define DS41_TOOL_CALLS_START "<｜DSML｜ calls>"
@@ -767,6 +768,13 @@ typedef struct {
     tool_calls calls;
     tool_result_span *tool_results;
     int tool_results_len;
+    /* Inkling 2 template inputs: the message `name`, and where each content
+     * part of an array `content` ends in `content` (the template writes one
+     * block per part). */
+    char *name;
+    size_t *part_ends;
+    int n_parts;
+    int cap_parts;
     /* Parser bookkeeping so that appending a content block, noting a tool call id or a tool result costs O(1) instead of a copy of
      * everything before it (a message with thousands of blocks was quadratic).  content_len/content_cap describe `content` only
      * while content_tag == content; the Anthropic content parser resets them when it is done. */
@@ -803,6 +811,19 @@ static bool responses_live_has_call_id(server *s, const char *id);
 static bool anthropic_live_has_call_id(server *s, const char *id);
 static stop_list live_tool_call_order(server *s, api_style api, const stop_list *ids);
 
+/* Token logprobs of one generation (Inkling): the JSON pieces are built as tokens are sampled. */
+typedef struct {
+    size_t start;                /* byte offset of the token in the generated text */
+    char *entry;                 /* chat: {"token","logprob","bytes","top_logprobs"} */
+    char *ts, *ls, *ps;          /* completions: token string, logprob, {alternative: logprob} */
+} lp_tok;
+typedef struct {
+    lp_tok *v;
+    int n, cap;
+    size_t off;                  /* byte offset of the next token in the generated text */
+} lp_acc;
+static void lp_acc_free(lp_acc *a);
+
 typedef struct {
     req_kind kind;
     api_style api;
@@ -816,6 +837,7 @@ typedef struct {
     stop_list stops;
     char *raw_body;
     char *prompt_text;
+    bool prompt_is_ids;     /* /v1/completions sent token ids: they reach the model as sent, never replaced by stored tokens of the same text */
     tool_schema_orders tool_orders;
     int max_tokens;
     int top_k;
@@ -836,6 +858,11 @@ typedef struct {
     int cache_write_tokens;
     ds4_think_mode think_mode;
     bool has_tools;
+    bool logprobs;               /* return token logprobs (Inkling only) */
+    bool lp_limited;             /* a stop sequence cut the text: tokens that start at or after lp_limit are not reported */
+    size_t lp_limit;
+    int top_logprobs;            /* 0..20 alternatives per token */
+    lp_acc *lp;                  /* filled while generating */
     bool prompt_preserves_reasoning;
     /* For /v1/responses: emit reasoning_summary_* events / fields only when the
      * client opted in via reasoning.summary. Other APIs leave this false; the
@@ -951,6 +978,8 @@ static void chat_msg_free(chat_msg *m) {
         free(m->tool_results[i].content);
     }
     free(m->tool_results);
+    free(m->name);
+    free(m->part_ends);
     free(m->id_tab);
     memset(m, 0, sizeof(*m));
 }
@@ -1063,6 +1092,7 @@ static void request_free(request *r) {
     free(r->stops.v);
     free(r->raw_body);
     free(r->prompt_text);
+    if (r->lp) { lp_acc_free(r->lp); free(r->lp); }
     stop_list_clear(&r->responses_live_call_ids);
     free(r->responses_live_call_ids.v);
     free(r->responses_live_suffix_text);
@@ -1072,6 +1102,10 @@ static void request_free(request *r) {
     tool_schema_orders_free(&r->tool_orders);
     memset(r, 0, sizeof(*r));
 }
+
+/* Inkling 2 tells minimal (0.1) and xhigh (0.99) apart from low and high; the other families fold them.
+ * Set whenever a request picks its syntax. */
+static bool g_effort_fine_names;
 
 static ds4_think_mode think_mode_from_enabled(bool enabled, ds4_think_mode effort) {
     if (!enabled || effort == DS4_THINK_NONE) return DS4_THINK_NONE;
@@ -1084,12 +1118,20 @@ static bool parse_reasoning_effort_name(const char *s, ds4_think_mode *out) {
         *out = DS4_THINK_MAX;
         return true;
     }
+    if (g_effort_fine_names && !strcmp(s, "xhigh")) {
+        *out = (ds4_think_mode)(DS4_THINK_LEVEL_BASE + 99);   /* 0.99, like max */
+        return true;
+    }
     if (!strcmp(s, "xhigh") || !strcmp(s, "high")) {
         *out = DS4_THINK_HIGH;
         return true;
     }
     if (!strcmp(s, "medium")) {
         *out = DS4_THINK_MEDIUM;
+        return true;
+    }
+    if (g_effort_fine_names && !strcmp(s, "minimal")) {
+        *out = (ds4_think_mode)(DS4_THINK_LEVEL_BASE + 10);   /* 0.1 */
         return true;
     }
     if (!strcmp(s, "low") || !strcmp(s, "minimal")) {
@@ -1108,8 +1150,19 @@ static bool parse_reasoning_effort_name(const char *s, ds4_think_mode *out) {
 static bool parse_reasoning_effort_value(const char **p, ds4_think_mode *out) {
     json_ws(p);
     if (json_lit(p, "null")) return true;
+    /* llama.cpp ignores a JSON number here (the template then uses its default); Inkling does the same */
+    if (g_effort_fine_names && (**p == '-' || isdigit((unsigned char)**p))) return json_skip_value(p);
     char *effort = NULL;
     if (!json_string(p, &effort)) return false;
+    if (g_effort_fine_names) {   /* the template trims the string before it looks it up */
+        char *a = effort;
+        while (*a && isspace((unsigned char)*a)) a++;
+        size_t n = strlen(a);
+        while (n > 0 && isspace((unsigned char)a[n - 1])) n--;
+        char *t = xstrndup(a, n);
+        free(effort);
+        effort = t;
+    }
     bool ok = parse_reasoning_effort_name(effort, out) ||
               ds4_think_mode_parse_level(effort, out);
     free(effort);
@@ -1242,7 +1295,8 @@ static bool model_alias_disables_thinking(const char *model) {
             !strcmp(model, "glm-5.3-flash-chat") ||
             !strcmp(model, "glm-5.3-flash-no-think") ||
             !strcmp(model, "glm-5.3-flash-nothink") ||
-            !strcmp(model, "zai/glm-5.3-flash-chat"));
+            !strcmp(model, "zai/glm-5.3-flash-chat") ||
+            !strcmp(model, "inkling-2-mini-chat"));
 }
 
 static bool model_alias_enables_thinking(const char *model) {
@@ -1253,17 +1307,39 @@ static bool model_alias_enables_thinking(const char *model) {
             !strcmp(model, "glm-5.2-reasoner") ||
             !strcmp(model, "zai/glm-5.2-reasoner") ||
             !strcmp(model, "glm-5.3-flash-reasoner") ||
-            !strcmp(model, "zai/glm-5.3-flash-reasoner"));
+            !strcmp(model, "zai/glm-5.3-flash-reasoner") ||
+            !strcmp(model, "inkling-2-mini-reasoner"));
 }
 
+#ifdef DS4_SERVER_TEST
+static int g_test_force_syntax = -1;
+#endif
+
 static server_model_syntax server_model_syntax_for_engine(ds4_engine *engine) {
+    g_effort_fine_names = false;
+#ifdef DS4_SERVER_TEST
+    if (g_test_force_syntax >= 0) {
+        g_effort_fine_names = g_test_force_syntax == SERVER_MODEL_SYNTAX_INKLING;
+        return (server_model_syntax)g_test_force_syntax;
+    }
+#endif
+    if (ds4_engine_is_inkling2(engine)) {
+        g_effort_fine_names = true;
+        return SERVER_MODEL_SYNTAX_INKLING;
+    }
     if (ds4_engine_is_qwen4(engine)) return SERVER_MODEL_SYNTAX_QWEN;
     return ds4_engine_is_glm_dsa(engine) ?
            SERVER_MODEL_SYNTAX_GLM : ds4_engine_is_deepseek41(engine) ?
            SERVER_MODEL_SYNTAX_DEEPSEEK41 : SERVER_MODEL_SYNTAX_DEEPSEEK;
 }
 
+/* The lock a ds4 process takes when DS4_LOCK_FILE is unset or empty (ds4_acquire_instance_lock). */
+static bool server_lock_file_is_default(const char *env) {
+    return !env || !env[0] || !strcmp(env, "/tmp/ds4.lock");
+}
+
 static const char *server_model_id_from_engine(ds4_engine *engine) {
+    if (ds4_engine_is_inkling2(engine)) return "inkling-2-mini";
     if (ds4_engine_is_deepseek41(engine)) return "deepseek-v4.1-flash";
     if (ds4_engine_is_qwen4(engine)) return "qwen3.8-flash-next";
     if (ds4_engine_is_glm53(engine)) return "glm-5.3-flash";
@@ -1275,6 +1351,9 @@ static const char *server_model_id_from_engine(ds4_engine *engine) {
 static bool server_model_alias_known(const char *id) {
     return id &&
            (!strcmp(id, "deepseek-v4-flash") ||
+            !strcmp(id, "inkling-2-mini") ||
+            !strcmp(id, "inkling-2-mini-chat") ||
+            !strcmp(id, "inkling-2-mini-reasoner") ||
             !strcmp(id, "deepseek-v4.1-flash") ||
             !strcmp(id, "qwen3.8-flash-next") ||
             !strcmp(id, "qwen3.8-flash-next-chat") ||
@@ -2076,6 +2155,14 @@ bad:
     return false;
 }
 
+static void chat_msg_note_part(chat_msg *msg) {
+    if (msg->n_parts == msg->cap_parts) {
+        msg->cap_parts = msg->cap_parts ? msg->cap_parts * 2 : 4;
+        msg->part_ends = xrealloc(msg->part_ends, (size_t)msg->cap_parts * sizeof(msg->part_ends[0]));
+    }
+    msg->part_ends[msg->n_parts++] = msg->content ? strlen(msg->content) : 0;
+}
+
 /* Content of the message being parsed by the Anthropic content parser: O(1) amortised appends. */
 static size_t chat_msg_content_len(chat_msg *m) {
     if (!m->content) return 0;
@@ -2102,6 +2189,19 @@ static void chat_msg_content_done(chat_msg *m) {
     m->content_tag = NULL;
 }
 
+static void chat_msg_note_part_at(chat_msg *msg, size_t at) {
+    if (msg->n_parts == msg->cap_parts) {
+        msg->cap_parts = msg->cap_parts ? msg->cap_parts * 2 : 4;
+        msg->part_ends = xrealloc(msg->part_ends, (size_t)msg->cap_parts * sizeof(msg->part_ends[0]));
+    }
+    msg->part_ends[msg->n_parts++] = at;
+}
+
+/* A client that cannot be answered with images (Inkling: no vision) sends them inside tool results anyway (Claude Code Read of a PNG
+ * or PDF, tool search).  For such a family the block becomes a short text placeholder instead of a 400 that would stay in the client's
+ * history and fail every later turn.  Set by parse_anthropic_request around the messages; thread-local, requests parse concurrently. */
+static __thread bool g_anth_media_as_text;
+
 static bool parse_openai_content(const char **p, chat_msg *msg) {
     json_ws(p);
     if (**p == '"') {
@@ -2115,14 +2215,18 @@ static bool parse_openai_content(const char **p, chat_msg *msg) {
     if (**p != '[') return false;
     (*p)++;
     json_ws(p);
+    msg->n_parts = 0;
     while (**p && **p != ']') {
         if (**p == '"') {
             char *text = NULL;
             if (!json_string(p, &text)) return false;
             append_owned_text(&msg->content, text);
             free(text);
+            chat_msg_note_part(msg);
         } else if (**p == '{') {
+            const size_t before = msg->content ? strlen(msg->content) : 0;
             if (!parse_openai_content_object(p, msg)) return false;
+            if ((msg->content ? strlen(msg->content) : 0) != before) chat_msg_note_part(msg);
         } else if (!json_skip_value(p)) {
             return false;
         }
@@ -2175,6 +2279,7 @@ static bool parse_messages(const char **p, chat_msgs *msgs) {
             } else if (!strcmp(key, "content")) {
                 free(msg.content);
                 msg.content = NULL;
+                msg.n_parts = 0;   /* a repeated content key starts over: no stale part ends */
                 server_image_inputs_free(&msg.images);
                 if (!parse_openai_content(p, &msg)) {
                     free(key);
@@ -2188,6 +2293,11 @@ static bool parse_messages(const char **p, chat_msgs *msgs) {
                 if (text_is_blank(msg.reasoning)) {
                     free(msg.reasoning);
                     msg.reasoning = NULL;
+                }
+            } else if (!strcmp(key, "name")) {
+                if (!json_content_replace(p, &msg.name)) {
+                    free(key);
+                    goto fail;
                 }
             } else if (!strcmp(key, "tool_call_id")) {
                 char *id = NULL;
@@ -2327,7 +2437,7 @@ static bool parse_anthropic_content_block(const char **p, bool allow_tools, chat
                 free(key);
                 goto bad;
             }
-        } else if (!strcmp(key, "name")) {
+        } else if (!strcmp(key, "name") || (!allow_tools && g_anth_media_as_text && !strcmp(key, "tool_name"))) {
             if (!json_string_replace(p, &name)) {
                 free(key);
                 goto bad;
@@ -2339,6 +2449,11 @@ static bool parse_anthropic_content_block(const char **p, bool allow_tools, chat
             }
         } else if (!strcmp(key, "content")) {
             if (!json_raw_value_replace(p, &tool_result)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "source") && !allow_tools && g_anth_media_as_text) {
+            if (!json_skip_value(p)) {   /* media inside a tool result: only a placeholder is kept, the payload is never decoded */
                 free(key);
                 goto bad;
             }
@@ -2365,9 +2480,18 @@ static bool parse_anthropic_content_block(const char **p, bool allow_tools, chat
      * caller may not know the enclosing role yet while parsing content blocks.
      * Classify protocol blocks by their own "type" field; later rendering and
      * validation use the final message role. */
-    if (!allow_tools && (!type || (strcmp(type, "text") && strcmp(type, "image"))))
+    const bool media_text = !allow_tools && g_anth_media_as_text && type &&
+        (!strcmp(type, "image") || !strcmp(type, "document") || !strcmp(type, "search_result") || !strcmp(type, "tool_reference"));
+    if (!allow_tools && !media_text && (!type || (strcmp(type, "text") && strcmp(type, "image"))))
         goto bad;
-    if (type && !strcmp(type, "tool_use")) {
+    if (media_text) {
+        buf ph = {0};
+        if (!strcmp(type, "tool_reference")) buf_printf(&ph, "[tool loaded: %s]", name && name[0] ? name : "unknown");
+        else buf_printf(&ph, "[%s omitted: this model cannot read it]", !strcmp(type, "image") ? "image" : !strcmp(type, "document") ? "document" : "search result");
+        chat_msg_content_append(msg, ph.ptr, ph.len);
+        chat_msg_note_part_at(msg, chat_msg_content_len(msg));
+        buf_free(&ph);
+    } else if (type && !strcmp(type, "tool_use")) {
         tool_call tc = {0};
         tc.id = id ? xstrdup(id) : NULL;
         tc.name = name ? xstrdup(name) : xstrdup("");
@@ -2419,7 +2543,10 @@ static bool parse_anthropic_content_block(const char **p, bool allow_tools, chat
     } else {
         if (text) {
             if (!msg->content) msg->content = xstrdup("");
-            if (text[0]) chat_msg_content_append(msg, text, strlen(text));
+            if (text[0]) {
+                chat_msg_content_append(msg, text, strlen(text));
+                chat_msg_note_part_at(msg, chat_msg_content_len(msg));   /* one block per text block, like an array content in chat */
+            }
         }
         if (thinking) {
             buf b = {0};
@@ -2471,6 +2598,7 @@ static bool parse_anthropic_content(const char **p, chat_msg *msg, bool allow_to
             if (!json_string(p, &s)) return false;
             if (!msg->content) msg->content = xstrdup("");
             chat_msg_content_append(msg, s, strlen(s));
+            if (s[0]) chat_msg_note_part_at(msg, chat_msg_content_len(msg));
             free(s);
         } else if (**p == '{') {
             if (!parse_anthropic_content_block(p, allow_tools, msg)) return false;
@@ -3697,6 +3825,8 @@ static char *render_qwen_chat_prompt_text(const chat_msgs *msgs,
     return buf_take(&out);
 }
 
+#include "ds4_inkling2_chat.inc"
+
 static char *render_chat_prompt_text_for_syntax(server_model_syntax syntax,
                                                 const chat_msgs *msgs,
                                                 const char *tool_schemas,
@@ -3711,6 +3841,8 @@ static char *render_chat_prompt_text_for_syntax(server_model_syntax syntax,
     if (syntax == SERVER_MODEL_SYNTAX_QWEN) {
         return render_qwen_chat_prompt_text(msgs, tool_schemas, tool_orders, think_mode);
     }
+    if (syntax == SERVER_MODEL_SYNTAX_INKLING)
+        return render_inkling_chat_prompt_text(msgs, tool_schemas, think_mode);
     return render_deepseek_chat_prompt_text(msgs, tool_schemas,
                                             tool_orders, think_mode);
 }
@@ -3735,7 +3867,7 @@ static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
     size_t count = 0;
     for (int i = 0; msgs && i < msgs->len; i++) count += msgs->v[i].images.len;
     if (count == 0) {
-        ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+        if (e) ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);   /* NULL: model-free render tests */
         return true;
     }
     if (count > SERVER_MAX_IMAGES) {
@@ -3940,6 +4072,7 @@ static char *render_live_tool_tail_for_syntax(server_model_syntax syntax,
     if (syntax == SERVER_MODEL_SYNTAX_QWEN) {
         return render_qwen_live_tool_tail(msgs, start, tool_orders, think_mode);
     }
+    if (syntax == SERVER_MODEL_SYNTAX_INKLING) return NULL;   /* Responses/Anthropic live tails: refused for Inkling */
     return render_deepseek_live_tool_tail(msgs, start, think_mode);
 }
 
@@ -4194,6 +4327,10 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     bool got_thinking = false;
     bool thinking_enabled = true;
     ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
+    const char *bad_msg = NULL;   /* message for the `bad` exit when it is not the generic one */
+    bool want_logprobs = false;   /* logprobs:true or top_logprobs > 0 (served for Inkling, ignored by the other families) */
+    int top_logprobs = 0;
+    int logprobs_flag = -1;       /* -1 not given, 0 false, 1 true; an explicit false wins over top_logprobs */
     chat_msgs msgs = {0};
     char *tool_schemas = NULL;
 
@@ -4310,6 +4447,28 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
         } else if (!strcmp(key, "reasoning_effort")) {
             if (!parse_reasoning_effort_value(&p, &reasoning_effort)) {
                 free(key);
+                bad_msg = "invalid reasoning_effort";
+                goto bad;
+            }
+        } else if (!strcmp(key, "logprobs") || !strcmp(key, "top_logprobs")) {
+            json_ws(&p);
+            if (key[0] == 'l') {
+                if (!strncmp(p, "true", 4)) logprobs_flag = 1;
+                else if (!strncmp(p, "false", 5)) logprobs_flag = 0;
+            } else if (*p >= '0' && *p <= '9') {
+                int v = 0;
+                const char *q = p;
+                if (json_int(&q, &v)) {
+                    if (v > 20 && r->model_syntax == SERVER_MODEL_SYNTAX_INKLING) {
+                        free(key);
+                        bad_msg = "top_logprobs must be between 0 and 20";
+                        goto bad;
+                    }
+                    top_logprobs = v;
+                }
+            }
+            if (!json_skip_value(&p)) {
+                free(key);
                 goto bad;
             }
         } else if (!strcmp(key, "chat_template_kwargs")) {
@@ -4338,6 +4497,11 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
         json_ws(&p);
     }
     if (*p != '}') goto bad;
+    want_logprobs = logprobs_flag == 1 || (logprobs_flag < 0 && top_logprobs > 0);
+    if (want_logprobs && r->model_syntax == SERVER_MODEL_SYNTAX_INKLING) {
+        r->logprobs = true;
+        r->top_logprobs = top_logprobs;
+    }
     if (!got_messages) {
         snprintf(err, errlen, "missing messages");
         chat_msgs_free(&msgs);
@@ -4354,11 +4518,22 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
-    r->think_mode = ds4_think_mode_for_context(
-        think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    r->think_mode = think_mode_from_enabled(thinking_enabled, reasoning_effort);
+    /* max stays 0.99 for Inkling whatever the context size; the other families fall back to high */
+    if (r->model_syntax != SERVER_MODEL_SYNTAX_INKLING)
+        r->think_mode = ds4_think_mode_for_context(r->think_mode, ctx_size);
+    if (r->model_syntax == SERVER_MODEL_SYNTAX_INKLING &&
+        (!ik_validate_messages(&msgs, err, errlen) || !ik_validate_tools(tool_schemas, err, errlen))) {
+        chat_msgs_free(&msgs);
+        free(tool_schemas);
+        request_free(r);
+        return false;
+    }
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
-    const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
+    /* Inkling declares the tools even for tool_choice none (like llama.cpp); it only ignores calls then. */
+    const char *active_tool_schemas =
+        (r->has_tools || r->model_syntax == SERVER_MODEL_SYNTAX_INKLING) ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
     r->prompt_text = render_chat_prompt_text_for_syntax(
@@ -4376,7 +4551,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
 bad:
     chat_msgs_free(&msgs);
     free(tool_schemas);
-    snprintf(err, errlen, "invalid JSON request");
+    snprintf(err, errlen, "%s", bad_msg ? bad_msg : "invalid JSON request");
     request_free(r);
     return false;
 }
@@ -4386,11 +4561,14 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     request_init(r, REQ_CHAT, def_tokens);
     r->api = API_ANTHROPIC;
     r->model_syntax = server_model_syntax_for_engine(e);
+    const bool inkling = r->model_syntax == SERVER_MODEL_SYNTAX_INKLING;
     const char *p = body;
     bool got_messages = false;
     bool tool_choice_none = false;
     bool got_thinking = false;
     bool thinking_enabled = true;
+    int thinking_budget = -1;        /* thinking.budget_tokens; maps to an effort for Inkling */
+    bool effort_given = false;       /* output_config.effort or reasoning_effort was in the request */
     ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
     chat_msgs msgs = {0};
     char *system = NULL;
@@ -4411,7 +4589,10 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
         p++;
         if (!strcmp(key, "messages")) {
             chat_msgs_free(&msgs);
-            if (!parse_anthropic_messages(&p, &msgs)) {
+            g_anth_media_as_text = inkling;
+            const bool msgs_ok = parse_anthropic_messages(&p, &msgs);
+            g_anth_media_as_text = false;
+            if (!msgs_ok) {
                 free(key);
                 goto bad;
             }
@@ -4521,21 +4702,34 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
                 goto bad;
             }
         } else if (!strcmp(key, "thinking")) {
-            if (!parse_thinking_control_value(&p, &thinking_enabled)) {
+            char *traw = NULL;
+            if (!json_raw_value(&p, &traw)) {
+                free(key);
+                goto bad;
+            }
+            const char *tq = traw;
+            const bool tok = parse_thinking_control_value(&tq, &thinking_enabled);
+            if (tok && inkling) thinking_budget = ik_anthropic_thinking_budget(traw);
+            free(traw);
+            if (!tok) {
                 free(key);
                 goto bad;
             }
             got_thinking = true;
-        } else if (!strcmp(key, "output_config")) {
-            if (!parse_output_config_effort(&p, &reasoning_effort)) {
+        } else if (!strcmp(key, "output_config") || !strcmp(key, "reasoning_effort")) {
+            /* parse twice from two starting values: if the field set the effort both ends agree on it */
+            const bool is_oc = !strcmp(key, "output_config");
+            const char *p1 = p, *p2 = p;
+            ds4_think_mode a = reasoning_effort, b = reasoning_effort == DS4_THINK_NONE ? DS4_THINK_HIGH : DS4_THINK_NONE;
+            const bool ok1 = is_oc ? parse_output_config_effort(&p1, &a) : parse_reasoning_effort_value(&p1, &a);
+            const bool ok2 = is_oc ? parse_output_config_effort(&p2, &b) : parse_reasoning_effort_value(&p2, &b);
+            if (!ok1 || !ok2) {
                 free(key);
                 goto bad;
             }
-        } else if (!strcmp(key, "reasoning_effort")) {
-            if (!parse_reasoning_effort_value(&p, &reasoning_effort)) {
-                free(key);
-                goto bad;
-            }
+            p = p1;
+            reasoning_effort = a;
+            if (a == b) effort_given = true;   /* a field without an effort leaves both at their own starting value */
         } else if (!json_skip_value(&p)) {
             free(key);
             goto bad;
@@ -4554,7 +4748,17 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
         request_free(r);
         return false;
     }
-    if (system && system[0]) {
+    if (inkling) ik_split_tool_results(&msgs);
+    if (inkling && system && system[0]) {
+        /* the template opens with the system blocks */
+        chat_msg msg = {0};
+        msg.role = xstrdup("system");
+        msg.content = system;
+        system = NULL;
+        chat_msgs_push(&msgs, msg);
+        memmove(msgs.v + 1, msgs.v, (size_t)(msgs.len - 1) * sizeof(msgs.v[0]));
+        msgs.v[0] = msg;
+    } else if (system && system[0]) {
         chat_msg msg = {0};
         msg.role = xstrdup("system");
         msg.content = system;
@@ -4570,9 +4774,21 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
-    r->think_mode = ds4_think_mode_for_context(
-        think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
-    if (!anthropic_validate_tool_results(s, &msgs,
+    if (inkling && !effort_given && thinking_enabled && thinking_budget >= 0)
+        reasoning_effort = ik_anthropic_budget_mode(thinking_budget);
+    r->think_mode = think_mode_from_enabled(thinking_enabled, reasoning_effort);
+    if (!inkling) r->think_mode = ds4_think_mode_for_context(r->think_mode, ctx_size);
+    if (inkling &&
+        (!ik_validate_messages(&msgs, err, errlen) || !ik_validate_tools(tool_schemas, err, errlen))) {
+        chat_msgs_free(&msgs);
+        free(system);
+        free(tool_schemas);
+        request_free(r);
+        return false;
+    }
+    /* Inkling replays the visible history only (no live tool state): a tool_result for an id the request does not
+     * carry is rendered under its own name or none, as in the chat completions path. */
+    if (!inkling && !anthropic_validate_tool_results(s, &msgs,
                                          &r->anthropic_requires_live_tool_state,
                                          err, errlen))
     {
@@ -4584,8 +4800,9 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     }
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
-    anthropic_prepare_live_continuation(s, r, &msgs);
-    const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
+    if (!inkling) anthropic_prepare_live_continuation(s, r, &msgs);
+    /* Inkling declares the tools even for tool_choice none (like llama.cpp and the chat completions path). */
+    const char *active_tool_schemas = (r->has_tools || inkling) ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
     r->prompt_text = render_chat_prompt_text_for_syntax(
@@ -5375,6 +5592,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     request_init(r, REQ_CHAT, def_tokens);
     r->api = API_RESPONSES;
     r->model_syntax = server_model_syntax_for_engine(e);
+    const bool inkling = r->model_syntax == SERVER_MODEL_SYNTAX_INKLING;
     const char *p = body;
     bool got_input = false;
     bool tool_choice_none = false;
@@ -5597,11 +5815,25 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
         (!tool_choice_none && combined_tool_schemas.len) ?
         combined_tool_schemas.ptr : NULL;
     r->has_tools = active_tool_schemas && active_tool_schemas[0];
+    /* Inkling declares the tools even for tool_choice none (like llama.cpp and the chat completions path). */
+    if (inkling && combined_tool_schemas.len) active_tool_schemas = combined_tool_schemas.ptr;
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
-    r->think_mode = ds4_think_mode_for_context(
-        think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
-    if (!responses_validate_tool_outputs(s, &msgs, r->think_mode,
+    r->think_mode = think_mode_from_enabled(thinking_enabled, reasoning_effort);
+    if (!inkling) r->think_mode = ds4_think_mode_for_context(r->think_mode, ctx_size);
+    if (inkling &&
+        (!ik_validate_messages(&msgs, err, errlen) ||
+         !ik_validate_tools(combined_tool_schemas.len ? combined_tool_schemas.ptr : NULL, err, errlen))) {
+        chat_msgs_free(&msgs);
+        buf_free(&combined_tool_schemas);
+        buf_free(&loaded_tool_schemas);
+        free(instructions);
+        free(tool_schemas);
+        request_free(r);
+        return false;
+    }
+    /* Inkling replays the visible input items only: no live tool or reasoning state to check. */
+    if (!inkling && !responses_validate_tool_outputs(s, &msgs, r->think_mode,
                                          &r->responses_requires_live_tool_state,
                                          &r->responses_requires_live_reasoning,
                                          err, errlen)) {
@@ -5617,7 +5849,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
-    responses_prepare_live_continuation(s, r, &msgs);
+    if (!inkling) responses_prepare_live_continuation(s, r, &msgs);
     r->prompt_text = render_chat_prompt_text_for_syntax(
         r->model_syntax, &msgs, active_tool_schemas,
         &r->tool_orders, r->think_mode);
@@ -5676,12 +5908,73 @@ static bool parse_prompt(const char **p, char **out) {
     return true;
 }
 
+/* Inkling /v1/completions prompt: a string, a list of one string, a list of token ids, or a list with one list of token ids.  A list
+ * of several prompts means several choices, which this server does not do: refused with a message instead of keeping the first. */
+static bool parse_prompt_inkling(const char **p, char **text, ds4_tokens *ids, bool *have_ids, char *err, size_t errlen) {
+    static const char *const kind = "prompt must be a string, a list with one string, or a list of token ids";
+    static const char *const many = "a list with more than one prompt is not supported (one choice per request): send one request per prompt";
+    json_ws(p);
+    if (**p == '"') return json_string(p, text) || (snprintf(err, errlen, "invalid JSON request"), false);
+    if (**p != '[') { snprintf(err, errlen, "%s", kind); return false; }
+    (*p)++;
+    json_ws(p);
+    if (**p == ']') { snprintf(err, errlen, "prompt must not be empty"); return false; }
+    if (**p == '"') {
+        if (!json_string(p, text)) { snprintf(err, errlen, "invalid JSON request"); return false; }
+        json_ws(p);
+        if (**p == ',') { snprintf(err, errlen, "%s", many); return false; }
+        if (**p != ']') { snprintf(err, errlen, "%s", kind); return false; }
+        (*p)++;
+        return true;
+    }
+    bool nested = false;
+    if (**p == '[') {
+        nested = true;
+        (*p)++;
+        json_ws(p);
+    }
+    while (**p && **p != ']') {
+        double dv = 0.0;
+        if (!((**p >= '0' && **p <= '9') || **p == '-') || !json_number(p, &dv)) { snprintf(err, errlen, "%s", kind); return false; }
+        if (!(dv >= 0.0) || dv > 2147483647.0 || dv != floor(dv)) { snprintf(err, errlen, "token ids must be non-negative integers"); return false; }
+        ds4_tokens_push(ids, (int)dv);
+        json_ws(p);
+        if (**p == ',') { (*p)++; json_ws(p); }
+        else if (**p != ']') { snprintf(err, errlen, "%s", kind); return false; }
+    }
+    if (**p != ']') { snprintf(err, errlen, "invalid JSON request"); return false; }
+    (*p)++;
+    if (nested) {
+        json_ws(p);
+        if (**p == ',') { snprintf(err, errlen, "%s", many); return false; }
+        if (**p != ']') { snprintf(err, errlen, "%s", kind); return false; }
+        (*p)++;
+    }
+    if (ids->len == 0) { snprintf(err, errlen, "prompt must not be empty"); return false; }
+    *have_ids = true;
+    return true;
+}
+
+/* completions fields this server does not implement (OpenAI semantics): refuse a value that would change the answer */
+static bool completion_unsupported_value(const char *key, const char *raw) {
+    while (*raw == ' ') raw++;
+    if (!strcmp(raw, "null")) return false;
+    if (!strcmp(key, "echo")) return strcmp(raw, "false") != 0;
+    if (!strcmp(key, "suffix")) return strcmp(raw, "\"\"") != 0;
+    return strcmp(raw, "1") != 0 && strcmp(raw, "1.0") != 0;   /* n, best_of */
+}
+
 static bool parse_completion_request(ds4_engine *e, const char *body, int def_tokens,
                                      int ctx_size, request *r, char *err, size_t errlen) {
     request_init(r, REQ_COMPLETION, def_tokens);
     r->model_syntax = server_model_syntax_for_engine(e);
+    /* Inkling: the prompt goes to the model as given, no chat template, and the answer is the raw generated text
+     * (block markers included).  The other families wrap the prompt in their chat template. */
+    const bool inkling = r->model_syntax == SERVER_MODEL_SYNTAX_INKLING;
     const char *p = body;
     char *prompt = NULL;
+    ds4_tokens prompt_ids = {0};
+    bool have_ids = false;
     bool got_thinking = false;
     bool thinking_enabled = true;
     ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
@@ -5699,7 +5992,37 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
             goto bad;
         }
         p++;
-        if (!strcmp(key, "prompt")) {
+        if (inkling && !strcmp(key, "prompt")) {
+            char *tmp = NULL;
+            ds4_tokens_free(&prompt_ids);
+            have_ids = false;
+            if (!parse_prompt_inkling(&p, &tmp, &prompt_ids, &have_ids, err, errlen)) {
+                free(tmp);
+                free(key);
+                free(prompt);
+                ds4_tokens_free(&prompt_ids);
+                request_free(r);
+                return false;
+            }
+            free(prompt);
+            prompt = tmp;
+        } else if (inkling && (!strcmp(key, "echo") || !strcmp(key, "suffix") || !strcmp(key, "n") || !strcmp(key, "best_of"))) {
+            char *raw = NULL;
+            if (!json_raw_value(&p, &raw)) {
+                free(key);
+                goto bad;
+            }
+            const bool refuse = completion_unsupported_value(key, raw);
+            free(raw);
+            if (refuse) {
+                snprintf(err, errlen, "%s is not supported by this server (one choice, no echo, no suffix)", key);
+                free(key);
+                free(prompt);
+                ds4_tokens_free(&prompt_ids);
+                request_free(r);
+                return false;
+            }
+        } else if (!strcmp(key, "prompt")) {
             char *tmp = NULL;
             if (!parse_prompt(&p, &tmp)) {
                 free(tmp);
@@ -5756,6 +6079,26 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
                 goto bad;
             }
             r->seed = v > 0.0 ? (uint64_t)v : 0;
+        } else if (!strcmp(key, "logprobs") && !inkling) {
+            if (!json_skip_value(&p)) {   /* the other families ignore it */
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "logprobs")) {
+            /* completions: an integer N = the N most likely alternatives per token (0: only the chosen token) */
+            json_ws(&p);
+            double dv = 0.0;
+            if (json_lit(&p, "null")) {
+            } else if (!json_number(&p, &dv) || !(dv >= 0.0) || dv > 20.0 || dv != floor(dv)) {
+                free(key);
+                snprintf(err, errlen, "logprobs must be an integer between 0 and 20");
+                free(prompt);
+                request_free(r);
+                return false;
+            } else {
+                r->logprobs = true;
+                r->top_logprobs = (int)dv;
+            }
         } else if (!strcmp(key, "stream")) {
             if (!json_bool(&p, &r->stream)) {
                 free(key);
@@ -5798,10 +6141,50 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
         json_ws(&p);
     }
     if (*p != '}') goto bad;
-    if (!prompt) {
+    if (!prompt && !have_ids) {
         snprintf(err, errlen, "missing prompt");
+        ds4_tokens_free(&prompt_ids);
         request_free(r);
         return false;
+    }
+    if (inkling) {
+        r->think_mode = DS4_THINK_NONE;   /* no template, so no effort block; nothing to enable */
+        if (have_ids) {
+            /* token ids go to the model as given; the text is what they spell, for the prefix cache */
+            buf text = {0};
+            for (int i = 0; i < prompt_ids.len; i++) {
+                if (e) {
+                    size_t tl = 0;
+                    if (prompt_ids.v[i] >= ds4_engine_vocab_size(e)) {
+                        snprintf(err, errlen, "token id %d is out of range", prompt_ids.v[i]);
+                        buf_free(&text);
+                        free(prompt);
+                        ds4_tokens_free(&prompt_ids);
+                        request_free(r);
+                        return false;
+                    }
+                    char *piece = ds4_token_text(e, prompt_ids.v[i], &tl);
+                    buf_append(&text, piece, tl);
+                    free(piece);
+                }
+                ds4_tokens_push(&r->prompt, prompt_ids.v[i]);
+            }
+            free(prompt);
+            r->prompt_text = text.ptr ? buf_take(&text) : xstrdup("");
+            r->prompt_is_ids = true;
+            prompt = NULL;
+            ds4_tokens_free(&prompt_ids);
+            return true;
+        }
+        r->prompt_text = prompt;
+        prompt = NULL;
+        if (e) ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+        if (e && r->prompt.len == 0) {
+            snprintf(err, errlen, "prompt must not be empty");
+            request_free(r);
+            return false;
+        }
+        return true;
     }
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
@@ -5822,9 +6205,11 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
     ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
     free(prompt);
+    ds4_tokens_free(&prompt_ids);
     return true;
 bad:
     free(prompt);
+    ds4_tokens_free(&prompt_ids);
     snprintf(err, errlen, "invalid JSON request");
     request_free(r);
     return false;
@@ -6773,6 +7158,9 @@ static bool parse_generated_message_ex_for_syntax(server_model_syntax syntax,
         return parse_qwen_generated_message_ex(text, require_thinking_closed,
                                                content_out, reasoning_out, calls, NULL);
     }
+    if (syntax == SERVER_MODEL_SYNTAX_INKLING) {
+        return parse_inkling_generated_message_ex(text, true, content_out, reasoning_out, calls);
+    }
     return parse_deepseek_generated_message_ex(text, require_thinking_closed,
                                                content_out, reasoning_out,
                                                calls);
@@ -6886,7 +7274,9 @@ static bool parse_generated_message_for_response_for_syntax(server_model_syntax 
                                                             const tool_schema_orders *orders) {
     if (recovered_out) *recovered_out = false;
 
-    bool parsed_ok = syntax == SERVER_MODEL_SYNTAX_QWEN ?
+    bool parsed_ok = syntax == SERVER_MODEL_SYNTAX_INKLING ?
+        parse_inkling_generated_message_ex(text, has_tools, content_out, reasoning_out, calls) :
+        syntax == SERVER_MODEL_SYNTAX_QWEN ?
         parse_qwen_generated_message_ex(text, require_thinking_closed,
                                          content_out, reasoning_out, calls, orders) :
         parse_generated_message_ex_for_syntax(syntax,
@@ -6962,13 +7352,13 @@ static void append_tool_calls_json(buf *b, const tool_calls *calls, const char *
     buf_putc(b, ']');
 }
 
-static void append_tool_call_deltas_json(buf *b, const tool_calls *calls, const char *id_prefix,
-                                         const tool_schema_orders *orders) {
-    (void)orders;
+/* Tool-call deltas for calls[from..]; the wire index stays the position in the whole list. */
+static void append_tool_call_deltas_json_from(buf *b, const tool_calls *calls, const char *id_prefix,
+                                              int from) {
     buf_putc(b, '[');
-    for (int i = 0; i < calls->len; i++) {
+    for (int i = from; i < calls->len; i++) {
         const tool_call *tc = &calls->v[i];
-        if (i) buf_putc(b, ',');
+        if (i > from) buf_putc(b, ',');
         char idbuf[128];
         snprintf(idbuf, sizeof(idbuf), "%s_tool_%d", id_prefix, i);
         buf_puts(b, "{\"index\":");
@@ -6982,6 +7372,12 @@ static void append_tool_call_deltas_json(buf *b, const tool_calls *calls, const 
         buf_puts(b, "}}");
     }
     buf_putc(b, ']');
+}
+
+static void append_tool_call_deltas_json(buf *b, const tool_calls *calls, const char *id_prefix,
+                                         const tool_schema_orders *orders) {
+    (void)orders;
+    append_tool_call_deltas_json_from(b, calls, id_prefix, 0);
 }
 
 static void append_cors_headers(buf *h) {
@@ -7050,6 +7446,8 @@ static bool http_error_context_length_exceeded(int fd, bool enable_cors,
              "Prompt has %d tokens, but the configured context size is %d tokens",
              n_prompt_tokens, ctx_size);
 
+    if (r && r->api == API_ANTHROPIC && r->model_syntax == SERVER_MODEL_SYNTAX_INKLING)
+        snprintf(msg, sizeof(msg), "prompt is too long: %d tokens > %d maximum", n_prompt_tokens, ctx_size);   /* what Claude Code reads to compact */
     if (r && r->api == API_ANTHROPIC) {
         buf_puts(&b, "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":");
         json_escape(&b, msg);
@@ -7274,12 +7672,14 @@ typedef struct {
     bool guard_second_reasoning;
     bool sent_reasoning;
     bool sent_content;
+    ik_stream ik;
     openai_tool_stream tool;
 } openai_stream;
 
 static bool stream_needs_second_reasoning_guard(const request *r) {
     return ds4_think_mode_enabled(r->think_mode) && r->has_tools &&
-           r->model_syntax != SERVER_MODEL_SYNTAX_QWEN;
+           r->model_syntax != SERVER_MODEL_SYNTAX_QWEN &&
+           r->model_syntax != SERVER_MODEL_SYNTAX_INKLING;
 }
 
 static void openai_stream_start(const request *r, openai_stream *st) {
@@ -7677,6 +8077,10 @@ static void dsml_decode_tracker_init(dsml_decode_tracker *dt) {
 static void dsml_decode_tracker_update(dsml_decode_tracker *dt,
                                        const char *raw, size_t raw_len) {
     if (!dt || !raw) return;
+    if (dt->model_syntax == SERVER_MODEL_SYNTAX_INKLING) {   /* tool calls are JSON blocks, parsed at the end */
+        dt->decode = DSML_DECODE_OUTSIDE;
+        return;
+    }
 
     for (;;) {
         if (dt->mode == DSML_TRACK_DONE) {
@@ -8100,11 +8504,45 @@ static bool openai_tool_stream_update(int fd, server *s, const request *r, const
     return true;
 }
 
+typedef struct {
+    int fd;
+    server *s;
+    const request *r;
+    const char *id;
+    openai_stream *st;
+} ik_emit_ctx;
+
+static bool ik_emit_openai(void *vctx, const char *field, const char *text, size_t len) {
+    ik_emit_ctx *c = vctx;
+    openai_tool_stream *ts = &c->st->tool;
+    if (!strcmp(field, "tool_name")) {
+        ts->index = c->st->ik.tools_streamed - 1;
+        ts->emitted_any = true;
+        char *name = xstrndup(text, len);
+        const bool ok = sse_chat_tool_call_start_delta(c->fd, c->r, c->id, ts->index,
+                                                       openai_tool_stream_id(c->s, ts, ts->index), name);
+        free(name);
+        return ok;
+    }
+    if (!strcmp(field, "tool_args"))
+        return sse_chat_tool_call_args_delta_n(c->fd, c->r, c->id, c->st->ik.tools_streamed - 1, text, len);
+    if (!strcmp(field, "tool_done")) return true;
+    if (!sse_chat_delta_n(c->fd, c->r, c->id, field, text, len)) return false;
+    if (!strcmp(field, "content")) c->st->sent_content = true;
+    else c->st->sent_reasoning = true;
+    return true;
+}
+
 static bool openai_sse_stream_update(int fd, server *s, const request *r, const char *id,
                                      openai_stream *st,
                                      const char *raw, size_t raw_len,
                                      bool final) {
     if (!st->active || !raw) return true;
+    if (r->model_syntax == SERVER_MODEL_SYNTAX_INKLING) {
+        ik_emit_ctx c = { fd, s, r, id, st };
+        st->ik.want_tools = r->has_tools;
+        return ik_stream_step(&st->ik, raw, raw_len, final, ik_emit_openai, &c);
+    }
 
     if (st->mode == OPENAI_STREAM_THINKING) {
         if (!st->checked_think_prefix) {
@@ -8227,11 +8665,15 @@ static bool openai_sse_finish_live(int fd, server *s, const request *r, const ch
 
     buf b = {0};
     long now = (long)time(NULL);
-    if (calls && calls->len && !st->tool.emitted_any) {
+    /* Inkling streams its calls as they come (st->ik.tools_streamed of them); the rest, and every call of the
+     * other families that did not stream, goes out whole here. */
+    const int sent_calls = r->model_syntax == SERVER_MODEL_SYNTAX_INKLING ? st->ik.tools_streamed
+                           : st->tool.emitted_any ? (calls ? calls->len : 0) : 0;
+    if (calls && calls->len > sent_calls) {
         buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
         json_escape(&b, r->model);
         buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":");
-        append_tool_call_deltas_json(&b, calls, id, &r->tool_orders);
+        append_tool_call_deltas_json_from(&b, calls, id, sent_calls);
         buf_puts(&b, "},\"finish_reason\":null}]}\n\n");
     }
     buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
@@ -8302,6 +8744,7 @@ typedef struct {
     bool message_item_closed;
     bool reasoning_emitted_any;
     bool message_emitted_any;
+    ik_stream ik;
     buf reasoning_text;
     buf message_text;
     char response_id[40];
@@ -8819,11 +9262,68 @@ static bool responses_sse_completed(int fd, const request *r,
  * consumes: <think>...</think> is reasoning, anything before the tool-call
  * marker is output text. Tool-call argument deltas are not surfaced because
  * Codex' SSE parser only ingests function_call items via output_item.done. */
+typedef struct {
+    int fd;
+    const request *r;
+    responses_stream *st;
+} ik_resp_ctx;
+
+/* Inkling: reasoning and answer text as they arrive, in the same events the other families send.  Tool calls are
+ * not streamed here: like the other families they go out as function_call items when the turn ends. */
+static bool ik_emit_responses(void *vctx, const char *field, const char *text, size_t len) {
+    ik_resp_ctx *c = vctx;
+    responses_stream *st = c->st;
+    if (!strcmp(field, "reasoning_content")) {
+        if (!c->r->reasoning_summary_emit) return true;   /* the client did not opt in */
+        /* thinking, answer, thinking again: the reasoning item is closed (its output_item.done is out), a later thinking block is
+         * dropped instead of being streamed into it */
+        if (st->reasoning_item_closed) return true;
+        if (!st->reasoning_item_opened) {
+            st->reasoning_index = st->next_output_index++;
+            if (!responses_sse_reasoning_added(c->fd, st)) return false;
+            st->reasoning_item_opened = true;
+        }
+        if (!st->reasoning_summary_started) {
+            if (!responses_sse_reasoning_summary_part_added(c->fd, st)) return false;
+            st->reasoning_summary_started = true;
+        }
+        if (!responses_sse_reasoning_delta(c->fd, st, text, len)) return false;
+        buf_append(&st->reasoning_text, text, len);
+        st->reasoning_emitted_any = true;
+        return true;
+    }
+    if (!strcmp(field, "content")) {
+        if (st->reasoning_item_opened && !st->reasoning_item_closed) {   /* the reasoning item ends where the answer starts */
+            st->reasoning_closed_naturally = true;
+            if (!responses_sse_reasoning_done(c->fd, st, "stop")) return false;
+            st->reasoning_item_closed = true;
+        }
+        if (!st->message_item_opened) {
+            st->message_index = st->next_output_index++;
+            if (!responses_sse_message_added(c->fd, st)) return false;
+            st->message_item_opened = true;
+        }
+        if (!st->message_text_part_open) {
+            if (!responses_sse_message_text_part_added(c->fd, st)) return false;
+            st->message_text_part_open = true;
+        }
+        if (!responses_sse_output_text_delta(c->fd, st, text, len)) return false;
+        buf_append(&st->message_text, text, len);
+        st->message_emitted_any = true;
+    }
+    return true;
+}
+
 static bool responses_sse_stream_update(int fd, const request *r,
                                         responses_stream *st,
                                         const char *raw, size_t raw_len,
                                         bool final) {
     if (!st->active || !raw) return true;
+    if (r->model_syntax == SERVER_MODEL_SYNTAX_INKLING) {
+        ik_resp_ctx c = { fd, r, st };
+        st->ik.want_tools = false;
+        return ik_stream_step(&st->ik, raw, raw_len, final, ik_emit_responses, &c);
+    }
 
     /* The client only sees reasoning if it explicitly opted in via
      * reasoning.summary. Otherwise we still need to walk past <think>...</think>
@@ -8954,6 +9454,9 @@ static bool responses_sse_finish_live(int fd, const request *r,
                                       int prompt_tokens, int completion_tokens,
                                       long created_at) {
     if (!responses_sse_stream_update(fd, r, st, raw, raw_len, true)) return false;
+    /* A reasoning item that never saw an answer after it ends complete unless the turn was cut off. */
+    if (r->model_syntax == SERVER_MODEL_SYNTAX_INKLING && st->reasoning_item_opened && !st->reasoning_item_closed)
+        st->reasoning_closed_naturally = !(finish && (!strcmp(finish, "length") || !strcmp(finish, "error")));
 
     /* Close any half-open reasoning summary so the TUI knows the part ended
      * before we slot in any tool calls or completion. */
@@ -9085,6 +9588,188 @@ static bool responses_final_response(int fd, bool enable_cors,
     return ok;
 }
 
+/* ---- token logprobs (Inkling) ----
+ * The values are the model's own log-softmax over the whole vocabulary at the position the token was sampled
+ * from (before temperature, top-k, top-p).  Every sampled token of the turn is listed, in order: reasoning and block
+ * marker tokens included, because that is what the engine sampled.  The token that ends the turn is not listed. */
+
+static void lp_acc_free(lp_acc *a) {
+    if (!a) return;
+    for (int i = 0; i < a->n; i++) {
+        free(a->v[i].entry);
+        free(a->v[i].ts);
+        free(a->v[i].ls);
+        free(a->v[i].ps);
+    }
+    free(a->v);
+    memset(a, 0, sizeof(*a));
+}
+
+/* invalid UTF-8 (a token can be half a character) becomes U+FFFD in the string form; "bytes" carries the real bytes */
+static void lp_put_token_string(buf *b, const char *s, size_t n) {
+    buf clean = {0};
+    for (size_t i = 0; i < n;) {
+        const unsigned char c = (unsigned char)s[i];
+        size_t len = c < 0x80 ? 1 : (c >> 5) == 6 ? 2 : (c >> 4) == 14 ? 3 : (c >> 3) == 30 ? 4 : 0;
+        bool ok = len > 0 && i + len <= n;
+        for (size_t k = 1; ok && k < len; k++) ok = ((unsigned char)s[i + k] & 0xc0) == 0x80;
+        if (ok && len == 2 && c < 0xc2) ok = false;                                   /* overlong */
+        if (ok && len == 3) {
+            const unsigned char c1 = (unsigned char)s[i + 1];
+            if ((c == 0xe0 && c1 < 0xa0) || (c == 0xed && c1 >= 0xa0)) ok = false;    /* overlong, surrogate */
+        }
+        if (ok && len == 4) {
+            const unsigned char c1 = (unsigned char)s[i + 1];
+            if (c > 0xf4 || (c == 0xf0 && c1 < 0x90) || (c == 0xf4 && c1 >= 0x90)) ok = false;   /* overlong, above U+10FFFF */
+        }
+        if (ok) { buf_append(&clean, s + i, len); i += len; }
+        else { buf_puts(&clean, "\xef\xbf\xbd"); i++; }
+    }
+    json_escape_n(b, clean.ptr ? clean.ptr : "", clean.len);
+    buf_free(&clean);
+}
+
+static void lp_put_bytes(buf *b, const char *s, size_t n) {
+    buf_putc(b, '[');
+    for (size_t i = 0; i < n; i++) buf_printf(b, "%s%u", i ? "," : "", (unsigned)(unsigned char)s[i]);
+    buf_putc(b, ']');
+}
+
+static void lp_put_number(buf *b, float v) {
+    if (!isfinite(v) || v < -9999.0f) v = -9999.0f;
+    buf_printf(b, "%.6f", (double)v);
+}
+
+/* Record the token sampled from the session's current logits.  Returns the JSON piece for a stream chunk
+ * (`{"content":[entry]}` for chat, the four-list object for completions), or NULL if the engine had no logprobs. */
+static char *lp_capture(request *r, ds4_engine *e, ds4_session *sess, int token) {
+    if (!r->lp) {
+        r->lp = xmalloc(sizeof(*r->lp));
+        memset(r->lp, 0, sizeof(*r->lp));
+    }
+    lp_acc *a = r->lp;
+    if (a->n == a->cap) {
+        a->cap = a->cap ? a->cap * 2 : 64;
+        a->v = xrealloc(a->v, (size_t)a->cap * sizeof(a->v[0]));
+    }
+    lp_tok *tk = &a->v[a->n];
+    memset(tk, 0, sizeof(*tk));
+    tk->start = a->off;
+    ds4_token_score cur = {0};
+    ds4_token_score top[20];
+    int nt = 0;
+    if (!ds4_session_token_logprob(sess, token, &cur)) return NULL;
+    if (r->top_logprobs > 0) nt = ds4_session_top_logprobs(sess, top, r->top_logprobs > 20 ? 20 : r->top_logprobs);
+    size_t tl = 0;
+    char *tt = ds4_token_text(e, token, &tl);
+    buf one = {0};
+    if (r->kind == REQ_CHAT) {
+        buf en = {0};
+        buf_puts(&en, "{\"token\":");
+        lp_put_token_string(&en, tt, tl);
+        buf_puts(&en, ",\"logprob\":");
+        lp_put_number(&en, cur.logprob);
+        buf_puts(&en, ",\"bytes\":");
+        lp_put_bytes(&en, tt, tl);
+        buf_puts(&en, ",\"top_logprobs\":[");
+        for (int i = 0; i < nt && top[i].id >= 0; i++) {
+            size_t ul = 0;
+            char *ut = ds4_token_text(e, top[i].id, &ul);
+            if (i) buf_putc(&en, ',');
+            buf_puts(&en, "{\"token\":");
+            lp_put_token_string(&en, ut, ul);
+            buf_puts(&en, ",\"logprob\":");
+            lp_put_number(&en, top[i].logprob);
+            buf_puts(&en, ",\"bytes\":");
+            lp_put_bytes(&en, ut, ul);
+            buf_putc(&en, '}');
+            free(ut);
+        }
+        buf_puts(&en, "]}");
+        tk->entry = xstrndup(en.ptr, en.len);
+        buf_puts(&one, "{\"content\":[");
+        buf_append(&one, en.ptr, en.len);
+        buf_puts(&one, "]}");
+        buf_free(&en);
+    } else {
+        buf ts = {0}, ls = {0}, ps = {0};
+        lp_put_token_string(&ts, tt, tl);
+        lp_put_number(&ls, cur.logprob);
+        buf_putc(&ps, '{');
+        for (int i = 0; i < nt && top[i].id >= 0; i++) {
+            size_t ul = 0;
+            char *ut = ds4_token_text(e, top[i].id, &ul);
+            if (i) buf_putc(&ps, ',');
+            lp_put_token_string(&ps, ut, ul);
+            buf_putc(&ps, ':');
+            lp_put_number(&ps, top[i].logprob);
+            free(ut);
+        }
+        buf_putc(&ps, '}');
+        char off[32];
+        snprintf(off, sizeof(off), "%zu", a->off);
+        tk->ts = xstrndup(ts.ptr, ts.len);
+        tk->ls = xstrndup(ls.ptr, ls.len);
+        tk->ps = xstrndup(ps.ptr, ps.len);
+        buf_printf(&one, "{\"tokens\":[%s],\"token_logprobs\":[%s],\"top_logprobs\":[%s],\"text_offset\":[%s]}",
+                   ts.ptr, ls.ptr, ps.ptr, off);
+        buf_free(&ts);
+        buf_free(&ls);
+        buf_free(&ps);
+    }
+    a->off += tl;
+    a->n++;
+    free(tt);
+    return buf_take(&one);
+}
+
+/* the whole-turn logprobs object, or null */
+static void lp_append_json(buf *b, const request *r) {
+    const lp_acc *a = r->lp;
+    if (!r->logprobs || !a) {
+        buf_puts(b, "null");
+        return;
+    }
+    /* tokens that start inside text a stop sequence cut away are not part of the answer */
+    int keep = 0;
+    while (keep < a->n && (!r->lp_limited || a->v[keep].start < r->lp_limit)) keep++;
+    if (r->kind == REQ_CHAT) {
+        buf_puts(b, "{\"content\":[");
+        for (int i = 0; i < keep; i++) { if (i) buf_putc(b, ','); buf_puts(b, a->v[i].entry); }
+        buf_puts(b, "],\"refusal\":null}");
+    } else {
+        buf_puts(b, "{\"tokens\":[");
+        for (int i = 0; i < keep; i++) { if (i) buf_putc(b, ','); buf_puts(b, a->v[i].ts); }
+        buf_puts(b, "],\"token_logprobs\":[");
+        for (int i = 0; i < keep; i++) { if (i) buf_putc(b, ','); buf_puts(b, a->v[i].ls); }
+        buf_puts(b, "],\"top_logprobs\":[");
+        for (int i = 0; i < keep; i++) { if (i) buf_putc(b, ','); buf_puts(b, a->v[i].ps); }
+        buf_puts(b, "],\"text_offset\":[");
+        for (int i = 0; i < keep; i++) buf_printf(b, "%s%zu", i ? "," : "", a->v[i].start);
+        buf_puts(b, "]}");
+    }
+}
+
+/* one stream chunk carrying the logprobs of the token just sampled (no text; the text arrives in its own chunks) */
+static bool sse_logprobs_chunk(int fd, const request *r, const char *id, const char *lp_json) {
+    buf b = {0};
+    long now = (long)time(NULL);
+    if (r->kind == REQ_CHAT) {
+        buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
+        json_escape(&b, r->model);
+        buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{},\"logprobs\":");
+    } else {
+        buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"text_completion\",\"created\":%ld,\"model\":", id, now);
+        json_escape(&b, r->model);
+        buf_puts(&b, ",\"choices\":[{\"text\":\"\",\"index\":0,\"logprobs\":");
+    }
+    buf_puts(&b, lp_json);
+    buf_puts(&b, ",\"finish_reason\":null}]}\n\n");
+    bool ok = send_all(fd, b.ptr, b.len);
+    buf_free(&b);
+    return ok;
+}
+
 static bool final_response(int fd, bool enable_cors,
                            const request *r, const char *id, const char *text,
                            const char *reasoning, const tool_calls *calls, const char *finish,
@@ -9104,7 +9789,12 @@ static bool final_response(int fd, bool enable_cors,
             buf_puts(&b, ",\"tool_calls\":");
             append_tool_calls_json(&b, calls, id, &r->tool_orders);
         }
-        buf_puts(&b, "},\"finish_reason\":");
+        buf_putc(&b, '}');
+        if (r->logprobs) {
+            buf_puts(&b, ",\"logprobs\":");
+            lp_append_json(&b, r);
+        }
+        buf_puts(&b, ",\"finish_reason\":");
         json_escape(&b, finish);
         buf_puts(&b, "}],\"usage\":");
     } else {
@@ -9112,7 +9802,12 @@ static bool final_response(int fd, bool enable_cors,
         json_escape(&b, r->model);
         buf_puts(&b, ",\"choices\":[{\"text\":");
         json_escape(&b, text);
-        buf_puts(&b, ",\"index\":0,\"finish_reason\":");
+        buf_puts(&b, ",\"index\":0");
+        if (r->logprobs) {
+            buf_puts(&b, ",\"logprobs\":");
+            lp_append_json(&b, r);
+        }
+        buf_puts(&b, ",\"finish_reason\":");
         json_escape(&b, finish);
         buf_puts(&b, "}],\"usage\":");
     }
@@ -9271,6 +9966,7 @@ typedef struct {
     bool guard_second_reasoning;
     bool sent_thinking;
     bool sent_text;
+    ik_stream ik;
     anthropic_tool_stream tool;
 } anthropic_stream;
 
@@ -9727,11 +10423,60 @@ static size_t text_stream_safe_limit(const char *raw, size_t start,
     return utf8_stream_safe_len(raw, start, limit, final);
 }
 
+typedef struct {
+    int fd;
+    server *s;
+    const char *id;
+    anthropic_stream *st;
+} ik_anth_ctx;
+
+/* Close whatever block is open and open `want` (a thinking block never continues after text, as in the other families). */
+static bool ik_anth_switch(ik_anth_ctx *c, anthropic_block_type want) {
+    anthropic_stream *st = c->st;
+    if (st->open_block == want) return true;
+    if (st->open_block != ANTH_BLOCK_NONE && !anthropic_sse_close_block_live(c->fd, c->id, st)) return false;
+    return anthropic_sse_open_block(c->fd, st, want);
+}
+
+static bool ik_emit_anthropic(void *vctx, const char *field, const char *text, size_t len) {
+    ik_anth_ctx *c = vctx;
+    anthropic_stream *st = c->st;
+    if (!strcmp(field, "reasoning_content")) {
+        if (!ik_anth_switch(c, ANTH_BLOCK_THINKING)) return false;
+        st->sent_thinking = true;
+        return anthropic_sse_delta_live(c->fd, st, ANTH_BLOCK_THINKING, text, len);
+    }
+    if (!strcmp(field, "content")) {
+        if (!ik_anth_switch(c, ANTH_BLOCK_TEXT)) return false;
+        st->sent_text = true;
+        return anthropic_sse_delta_live(c->fd, st, ANTH_BLOCK_TEXT, text, len);
+    }
+    if (!strcmp(field, "tool_name")) {
+        if (st->open_block != ANTH_BLOCK_NONE && !anthropic_sse_close_block_live(c->fd, c->id, st)) return false;
+        const int idx = st->ik.tools_streamed - 1;
+        char *name = xstrndup(text, len);
+        const bool ok = anthropic_sse_open_tool_block(c->fd, st, anthropic_tool_stream_id(c->s, &st->tool, idx), name);
+        free(name);
+        st->tool.emitted_any = true;
+        return ok;
+    }
+    if (!strcmp(field, "tool_args")) return anthropic_sse_tool_delta_live(c->fd, st, text, len);
+    if (!strcmp(field, "tool_done")) return anthropic_sse_close_block_live(c->fd, c->id, st);
+    return true;
+}
+
 static bool anthropic_sse_stream_update(int fd, server *s, const request *r, const char *id,
                                         anthropic_stream *st,
                                         const char *raw, size_t raw_len,
                                         bool final) {
     if (!st->active || !raw) return true;
+    if (r->model_syntax == SERVER_MODEL_SYNTAX_INKLING) {
+        ik_anth_ctx c = { fd, s, id, st };
+        st->ik.want_tools = r->has_tools;
+        if (!ik_stream_step(&st->ik, raw, raw_len, final, ik_emit_anthropic, &c)) return false;
+        /* the turn is over: a block left open (text, or a call cut off by the token limit) is closed */
+        return !final || st->open_block == ANTH_BLOCK_NONE || anthropic_sse_close_block_live(fd, id, st);
+    }
 
     if (st->mode == ANTH_STREAM_THINKING) {
         if (!st->checked_think_prefix) {
@@ -9922,17 +10667,47 @@ static bool anthropic_sse_stop_live(int fd, const char *finish,
     return ok;
 }
 
+/* Inkling: run the tracker's final step, then say whether a call it streamed is not what the turn parser returned.  A stop string
+ * holds the last bytes of the text back until the final step, so the end marker of the last call (where the tracker finds a bad
+ * call) may only be seen here: judging earlier lets an invalid call end as a normal tool call.  Exactly one of os / as is set.
+ * Returns false when the client write failed. */
+static bool inkling_stream_settle(int fd, server *s, const request *r, const char *id,
+                                  openai_stream *os, anthropic_stream *as,
+                                  const char *raw, size_t raw_len, int parsed_calls, bool *bad) {
+    const ik_stream *iks = NULL;
+    *bad = false;
+    if (os) {
+        if (!openai_sse_stream_update(fd, s, r, id, os, raw, raw_len, true)) return false;
+        iks = &os->ik;
+    } else if (as) {
+        if (!anthropic_sse_stream_update(fd, s, r, id, as, raw, raw_len, true)) return false;
+        iks = &as->ik;
+    }
+    *bad = iks && (iks->tool_bad > 0 || iks->tools_streamed > parsed_calls);
+    return true;
+}
+
 static bool anthropic_sse_finish_live(int fd, server *s, const request *r, const char *id,
                                       anthropic_stream *st, const char *raw,
                                       size_t raw_len, const tool_calls *calls,
                                       const char *finish, int completion_tokens) {
     if (!anthropic_sse_stream_update(fd, s, r, id, st, raw, raw_len, true)) return false;
 
+    if (r->model_syntax == SERVER_MODEL_SYNTAX_INKLING && finish && !strcmp(finish, "error")) {
+        /* Anthropic's way to end a stream that went wrong */
+        return sse_event(fd, "error", "{\"type\":\"error\",\"error\":{\"type\":\"api_error\","
+                                      "\"message\":\"the model wrote a tool call that is not valid\"}}");
+    }
     if (st->sent_thinking && !st->sent_text && (!calls || calls->len == 0)) {
         if (!anthropic_sse_open_block(fd, st, ANTH_BLOCK_TEXT)) return false;
         if (!anthropic_sse_close_block_live(fd, id, st)) return false;
     }
 
+    if (r->model_syntax == SERVER_MODEL_SYNTAX_INKLING) {
+        /* calls the tracker streamed are done; the rest go out whole, from the first one it did not send */
+        st->tool.index = st->ik.tools_streamed;
+        st->tool.emitted_any = st->ik.tools_streamed > 0;
+    }
     if (!anthropic_sse_tool_blocks_live(fd, r, id, st, calls)) return false;
     return anthropic_sse_stop_live(fd, finish, completion_tokens);
 }
@@ -11776,6 +12551,16 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
         pr.reuse_tokens = common;
         return pr;
     }
+    /* Inkling 2: the live state diverged after an earlier prompt (the client dropped reasoning_content), but the session kept a
+     * copy of that prompt's end state: the next sync restores it and evaluates only the rest. */
+    if (ds4_engine_is_inkling2(s->engine) && token_image_prefix) {
+        const int restore = ds4_session_restore_prefix(slot->session, &req->prompt);
+        if (restore > 0) {
+            pr.kind = REUSE_MEMORY_TOKEN;
+            pr.reuse_tokens = restore;
+            return pr;
+        }
+    }
 
     if (req->kind == REQ_CHAT && req->api != API_RESPONSES && ptext) {
         visible_image_key vimages;
@@ -11803,7 +12588,7 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
         }
     }
 
-    if (ptext && slot->live_text && slot->live_text_pos == live_pos &&
+    if (ptext && !req->prompt_is_ids && slot->live_text && slot->live_text_pos == live_pos &&
         slot->live_text_len <= plen &&
         byte_prefix_match(ptext, plen, slot->live_text, slot->live_text_len))
     {
@@ -12287,6 +13072,7 @@ static void thinking_state_feed(thinking_state *st, const char *p, size_t len) {
 
 static thinking_state thinking_state_from_prompt(const request *r) {
     thinking_state st = {0};
+    if (r && r->model_syntax == SERVER_MODEL_SYNTAX_INKLING) return st;   /* no <think> tags in this family */
     if (r && r->prompt_text) {
         thinking_state_feed(&st, r->prompt_text, strlen(r->prompt_text));
     } else if (r && ds4_think_mode_enabled(r->think_mode)) {
@@ -12535,6 +13321,14 @@ static int server_session_sync(server *s, server_slot *slot,
     int common = ds4_session_common_prefix(slot->session, prompt);
     pthread_mutex_unlock(&s->inference_mu);
     int done = common == live && prompt->len >= live ? live : 0;
+    if (done == 0 && ds4_engine_is_inkling2(s->engine)) {
+        /* Inkling 2 keeps the end state of its last prompt (a follow-up that drops reasoning_content, or the same prompt again, restores it
+         * and evaluates the rest).  Start at that frontier: a first slice of 2048 tokens would not contain it and would replay everything. */
+        pthread_mutex_lock(&s->inference_mu);
+        const int restore = ds4_session_restore_prefix(slot->session, prompt);
+        pthread_mutex_unlock(&s->inference_mu);
+        if (restore > 0) done = restore;
+    }
     bool called = false;
 
     while (!g_stop_requested && !slot_job_cancelled(slot) &&
@@ -12723,6 +13517,7 @@ static bool should_remember_thinking_checkpoint(const request *r,
                                                 const thinking_state *thinking,
                                                 const char *finish) {
     if (!r || r->kind != REQ_CHAT) return false;
+    if (r->model_syntax == SERVER_MODEL_SYNTAX_INKLING) return false;
     /* Qwen Chat Completions clients may omit reasoning even with tools.
      * Remember an alternative visible key without changing exact replay.
      * Actual tool calls have their own checkpoint path at the call site. */
@@ -13380,6 +14175,8 @@ static void *decode_worker_main(void *arg) {
     server_slot **members = xmalloc((size_t)s->slot_count * sizeof(*members));
     int (*accepted)[2] = xmalloc((size_t)s->slot_count * sizeof(*accepted));
     int *n_accepted = xmalloc((size_t)s->slot_count * sizeof(*n_accepted));
+    int *pos_before = xmalloc((size_t)s->slot_count * sizeof(*pos_before));
+    bool *item_failed = xmalloc((size_t)s->slot_count * sizeof(*item_failed));
     const long coalesce_us = server_decode_coalesce_us();
     const bool log_batches = getenv("DS4_SERVER_BATCH_LOG") != NULL;
 
@@ -13433,8 +14230,17 @@ static void *decode_worker_main(void *arg) {
         char batch_err[160] = {0};
         const double batch_t0 = log_batches ? now_sec() : 0.0;
         pthread_mutex_lock(&s->inference_mu);
+        for (int i = 0; i < count; i++) {
+            pos_before[i] = ds4_session_pos(items[i].session);
+            item_failed[i] = false;
+        }
         int rc = plain_count ? ds4_sessions_eval_batch(items, plain_count,
                                          batch_err, sizeof(batch_err)) : 0;
+        /* A batch can succeed while one session of it failed alone (Inkling: non-finite logits invalidate just that session): its
+         * position did not advance by one.  Only that request fails. */
+        if (rc == 0)
+            for (int i = 0; i < plain_count; i++)
+                item_failed[i] = ds4_session_pos(items[i].session) != pos_before[i] + 1;
         for (int i = 0; i < plain_count; i++) {
             accepted[i][0] = items[i].token;
             n_accepted[i] = 1;
@@ -13457,14 +14263,17 @@ static void *decode_worker_main(void *arg) {
         for (int i = 0; i < count; i++) {
             server_slot *slot = members[i];
             slot->decode_in_flight = false;
-            slot->decode_rc = rc;
-            if (rc == 0) {
+            slot->decode_rc = rc != 0 || item_failed[i] ? 1 : 0;
+            if (slot->decode_rc == 0) {
                 slot->decode_accepted_count = n_accepted[i];
                 memcpy(slot->decode_accepted, accepted[i], (size_t)n_accepted[i] * sizeof(int));
             }
             if (rc != 0) {
                 snprintf(slot->decode_err, sizeof(slot->decode_err), "%s",
                          batch_err[0] ? batch_err : "batched decode failed");
+            } else if (item_failed[i]) {
+                snprintf(slot->decode_err, sizeof(slot->decode_err), "%s",
+                         "the model state of this request failed (non-finite values) and was dropped; retry the request");
             }
             slot->decode_done = true;
         }
@@ -13475,6 +14284,8 @@ static void *decode_worker_main(void *arg) {
     free(items);
     free(accepted);
     free(n_accepted);
+    free(pos_before);
+    free(item_failed);
     return NULL;
 }
 
@@ -13703,7 +14514,24 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         disk_cached = kv_cache_try_load(s, slot, &j->req, &effective_prompt,
                                         &disk_cache_path,
                                         &disk_cache_ext_flags);
-        if (disk_cached > 0) {
+        if (disk_cached > 0 && j->req.prompt_is_ids) {
+            /* The file was found by the text the ids spell, but it holds its own token ids.  Use it only when they are the first
+             * ids of the request; the request's ids are what the model gets. */
+            pthread_mutex_lock(&s->inference_mu);
+            const bool same_ids = disk_cached <= j->req.prompt.len &&
+                                  ds4_session_common_prefix(slot->session, &j->req.prompt) == disk_cached;
+            if (!same_ids) ds4_session_invalidate(slot->session);
+            pthread_mutex_unlock(&s->inference_mu);
+            if (!same_ids) {
+                server_log(DS4_LOG_KVCACHE, "ds4-server: kv cache refused a file: it holds other token ids than the request's prompt");
+                free(disk_cache_path);
+                disk_cache_path = NULL;
+                disk_cached = 0;
+            } else {
+                cached = disk_cached;
+                cache_source = "disk-text";
+            }
+        } else if (disk_cached > 0) {
             cached = disk_cached;
             cache_source = "disk-text";
             prompt_for_sync = &effective_prompt;
@@ -14017,7 +14845,8 @@ decode_again:
     double last_decode_log_t = decode_t0;
     int last_decode_log_completion = 0;
     thinking_state thinking = thinking_state_from_prompt(&j->req);
-    const bool thinking_gates_tool_markers = ds4_think_mode_enabled(j->req.think_mode);
+    const bool thinking_gates_tool_markers = ds4_think_mode_enabled(j->req.think_mode) &&
+        j->req.model_syntax != SERVER_MODEL_SYNTAX_INKLING;
     bool tool_scan_waiting_for_think_close =
         thinking_gates_tool_markers && thinking.inside;
     size_t think_recovery_scan_from = 0;
@@ -14072,6 +14901,19 @@ decode_again:
             stop_detail = "stop token";
             stop_token = token;
             break;
+        }
+        if (j->req.logprobs) {
+            /* the logits of this position are still in the session: read them before the token is evaluated */
+            char *lp_piece = lp_capture(&j->req, s->engine, slot->session, token);
+            const bool sent = !(j->req.stream && lp_piece) ||
+                              sse_logprobs_chunk(j->fd, &j->req, id, lp_piece);
+            free(lp_piece);
+            if (!sent) {
+                job_mark_cancelled(j);
+                finish = "error";
+                snprintf(err, sizeof(err), "client stream write failed");
+                break;
+            }
         }
 
         int toks[17];
@@ -14607,6 +15449,14 @@ decode_again:
             ds4_tokens_free(&effective_prompt);
             return;
         }
+        bool inkling_stream_bad = false;
+        if (j->req.model_syntax == SERVER_MODEL_SYNTAX_INKLING && j->req.stream && !job_cancelled(j) &&
+            (openai_live_chat || j->req.api == API_ANTHROPIC)) {
+            if (!inkling_stream_settle(j->fd, s, &j->req, id, openai_live_chat ? &openai_live : NULL,
+                                       !openai_live_chat ? &anthropic_live : NULL,
+                                       text.ptr ? text.ptr : "", text.len, parsed_calls.len, &inkling_stream_bad))
+                job_mark_cancelled(j);
+        }
         if (parsed_calls.len) {
             if (openai_live_chat) apply_openai_stream_tool_ids(&parsed_calls, &openai_live);
             if (j->req.api == API_ANTHROPIC && j->req.stream)
@@ -14617,6 +15467,20 @@ decode_again:
         } else if (j->req.api == API_RESPONSES) {
             responses_live_clear(s, slot);
         }
+        /* Inkling streams a call before the turn is over.  If the turn parser then disagrees (broken JSON, repeated
+         * keys, a later bad call), the client holds a call that does not exist: say so with finish "error" instead
+         * of a normal stop.  A turn cut off by the token limit keeps "length". */
+        if (j->req.model_syntax == SERVER_MODEL_SYNTAX_INKLING && j->req.stream && strcmp(final_finish, "length") &&
+            strcmp(final_finish, "error")) {
+            if (inkling_stream_bad) {
+                final_finish = "error";
+                snprintf(err, sizeof(err), "the model wrote a tool call that is not valid");
+            }
+        }
+    }
+    if (j->req.lp_limited == false && j->req.logprobs && text.len < (j->req.lp ? j->req.lp->off : 0)) {
+        j->req.lp_limited = true;     /* a stop sequence cut the text: tokens after the cut are not reported */
+        j->req.lp_limit = text.len;
     }
     if (job_cancelled(j)) {
         request_live_state_clear(s, slot);
@@ -14674,6 +15538,7 @@ decode_again:
 
     if (j->req.kind == REQ_CHAT && parsed_calls.len &&
         j->req.api != API_RESPONSES &&
+        j->req.model_syntax != SERVER_MODEL_SYNTAX_INKLING &&
         should_canonicalize_tool_checkpoint(s, &parsed_calls))
     {
         /* Chat/completions has no protocol object that binds the next request
@@ -14705,7 +15570,20 @@ decode_again:
     }
 
     bool response_ok = !job_cancelled(j);
-    if (response_ok && j->req.stream) {
+    /* An Inkling request that failed (decode/NaN failure, an invalid tool call) is answered like a prefill failure: HTTP 500 with the
+     * message before any byte went out, an error event once the stream has started.  Responses streams keep response.failed. */
+    const bool inkling_failed = j->req.model_syntax == SERVER_MODEL_SYNTAX_INKLING && !strcmp(final_finish, "error") && err[0] &&
+                                !(j->req.stream && j->req.api == API_RESPONSES);
+    if (response_ok && inkling_failed) {
+        if (!j->req.stream) {
+            response_ok = http_error(j->fd, s->enable_cors, 500, err);
+        } else {
+            const char *raw = text.ptr ? text.ptr : "";
+            response_ok = j->req.api == API_ANTHROPIC ? anthropic_sse_stream_update(j->fd, s, &j->req, id, &anthropic_live, raw, text.len, true) :
+                          openai_live_chat ? openai_sse_stream_update(j->fd, s, &j->req, id, &openai_live, raw, text.len, true) : true;
+            if (response_ok) response_ok = sse_error_event(j->fd, &j->req, err);
+        }
+    } else if (response_ok && j->req.stream) {
         if (j->req.api == API_ANTHROPIC) {
             response_ok = anthropic_sse_finish_live(j->fd, s, &j->req, id, &anthropic_live,
                                                     text.ptr ? text.ptr : "", text.len,
@@ -15242,7 +16120,13 @@ static bool send_model(server *s, int fd, const char *id) {
 static bool send_models(server *s, int fd) {
     buf b = {0};
     buf_puts(&b, "{\"object\":\"list\",\"data\":[");
-    if (ds4_engine_is_deepseek41(s->engine)) {
+    if (ds4_engine_is_inkling2(s->engine)) {
+        append_model_json(&b, s, "inkling-2-mini");
+        buf_putc(&b, ',');
+        append_model_json(&b, s, "inkling-2-mini-chat");
+        buf_putc(&b, ',');
+        append_model_json(&b, s, "inkling-2-mini-reasoner");
+    } else if (ds4_engine_is_deepseek41(s->engine)) {
         append_model_json(&b, s, server_model_id_from_engine(s->engine));
     } else if (ds4_engine_is_qwen4(s->engine)) {
         append_model_json(&b, s, "qwen3.8-flash-next");
@@ -15412,7 +16296,14 @@ static void *client_main(void *arg) {
     char err[160];
     bool ok = false;
     const int ctx_size = s->ctx_size;
+    bool count_only = false;
     if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/messages")) {
+        ok = parse_anthropic_request(s->engine, s, hr.body, s->default_tokens,
+                                     ctx_size, &req, err, sizeof(err));
+    } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/messages/count_tokens") &&
+               s->engine && ds4_engine_is_inkling2(s->engine)) {
+        /* Claude Code asks for the size of a request before sending it (/context, tool listings) */
+        count_only = true;
         ok = parse_anthropic_request(s->engine, s, hr.body, s->default_tokens,
                                      ctx_size, &req, err, sizeof(err));
     } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/chat/completions")) {
@@ -15433,6 +16324,13 @@ static void *client_main(void *arg) {
     http_request_free(&hr);
     if (!ok) {
         http_error(fd, s->enable_cors, 400, err);
+        goto done;
+    }
+    if (count_only) {
+        char body[64];
+        snprintf(body, sizeof(body), "{\"input_tokens\":%d}\n", req.prompt.len);
+        http_response(fd, s->enable_cors, 200, "application/json", body);
+        request_free(&req);
         goto done;
     }
     if (!req.model_from_request) {
@@ -15990,6 +16888,11 @@ int main(int argc, char **argv) {
     } else if (ds4_engine_open(&engine, &cfg.engine) != 0) {
         return 1;
     }
+    if (ds4_engine_is_inkling2(engine) && server_lock_file_is_default(getenv("DS4_LOCK_FILE"))) {
+        server_log(DS4_LOG_WARNING, "ds4-server: WARNING *** this Inkling 2 server holds the default lock file /tmp/ds4.lock, the lock every other ds4 "
+                   "process takes by default. While it runs no other ds4 server can start on this machine. "
+                   "Set DS4_LOCK_FILE to a path of its own, for example DS4_LOCK_FILE=/tmp/ds4-inkling.lock (docs/INKLING2.md, service section) ***");
+    }
 
     if (cfg.engine.distributed.role == DS4_DISTRIBUTED_WORKER) {
         ds4_dist_generation_options gen = {
@@ -16091,6 +16994,7 @@ int main(int argc, char **argv) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
                       cfg.kv_cache_reject_different_quant, cfg.kv_cache,
                       ds4_engine_model_id(engine));
+        s.kv.replace_refused = ds4_engine_is_inkling2(engine);
     }
     if (s.disable_exact_dsml_tool_replay) {
         server_log(DS4_LOG_DEFAULT,
@@ -16694,6 +17598,9 @@ static void test_slot_probe_vision_tiers(void) {
         TEST_ASSERT(pr.kind == REUSE_MEMORY_TEXT);
         TEST_ASSERT(pr.reuse_tokens == 10);
         TEST_ASSERT(pr.suffix_off == 11);
+        j.req.prompt_is_ids = true;          /* token ids sent by the client are never replaced by the stored tokens of the same text */
+        TEST_ASSERT(slot_probe_reuse_locked(&s, &slots[0], &j.req).kind == REUSE_NONE);
+        j.req.prompt_is_ids = false;
         TEST_ASSERT(job_slot_score(&s, &slots[0], &j, -1, now) == 10);
         TEST_ASSERT(job_slot_score(&s, &slots[0], &j, -1, now) >
                     job_slot_score(&s, &slots[1], &j, -1, now));
@@ -18310,50 +19217,7 @@ static void test_reasoning_effort_mapping(void) {
                                            (int)ds4_think_max_min_context()) == DS4_THINK_MAX);
 }
 
-/* A message with thousands of Anthropic content blocks parses in linear time: every block used to copy the whole content
- * before it, and every tool call id was checked against all earlier ones. */
-static void test_anthropic_many_blocks_parse_linear(void) {
-    double t[2] = {0, 0};
-    const int ns[2] = {8000, 32000};
-    for (int w = 0; w < 2; w++) {
-        const int n = ns[w];
-        buf b = {0};
-        buf_puts(&b, "[{\"role\":\"user\",\"content\":\"go\"},{\"role\":\"assistant\",\"content\":[");
-        for (int i = 0; i < n; i++) buf_printf(&b, "%s{\"type\":\"tool_use\",\"id\":\"toolu_%d\",\"name\":\"f\",\"input\":{}}", i ? "," : "", i);
-        buf_puts(&b, "]},{\"role\":\"user\",\"content\":[");
-        for (int i = 0; i < n; i++) buf_printf(&b, "%s{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_%d\",\"content\":\"result %d\"},{\"type\":\"text\",\"text\":\"note %d\"}", i ? "," : "", i, i, i);
-        buf_puts(&b, "]}]");
-        chat_msgs msgs = {0};
-        const char *p = b.ptr;
-        const double t0 = now_sec();
-        const bool ok = parse_anthropic_messages(&p, &msgs);
-        t[w] = now_sec() - t0;
-        TEST_ASSERT(ok && msgs.len == 3);
-        if (ok && msgs.len == 3) {
-            TEST_ASSERT(msgs.v[1].calls.len == n && msgs.v[2].tool_call_ids_len == n);   /* tool_result ids are noted on the user message */
-            const chat_msg *u = &msgs.v[2];
-            TEST_ASSERT(u->tool_results_len == n);
-            if (u->tool_results_len == n) {   /* the spans still point at their own text */
-                const tool_result_span *r = &u->tool_results[n - 1];
-                TEST_ASSERT(r->end <= strlen(u->content) && !strncmp(u->content + r->begin, "<tool_result>", 13));
-                TEST_ASSERT(strstr(u->content + r->end, "note") == u->content + r->end);
-            }
-        }
-        chat_msgs_free(&msgs);
-        buf_free(&b);
-    }
-    TEST_ASSERT(t[1] < 0.6);
-    TEST_ASSERT(t[1] < 8.0 * (t[0] + 0.005));    /* 4x the blocks: linear is 4x, quadratic 16x */
-    chat_msg m = {0};
-    for (int rep = 0; rep < 2; rep++)
-        for (int i = 0; i < 200; i++) {
-            char id[32];
-            snprintf(id, sizeof(id), "toolu_%d", i);
-            chat_msg_add_tool_call_id(&m, id);
-        }
-    TEST_ASSERT(m.tool_call_ids_len == 200);
-    chat_msg_free(&m);
-}
+#include "ds4_inkling2_chat_test.inc"
 
 static void test_model_alias_thinking_controls(void) {
     TEST_ASSERT(model_alias_disables_thinking("deepseek-chat"));
@@ -22211,6 +23075,82 @@ static void test_kv_remove_all(const char *dir, const char *const *texts, int n)
     rmdir(dir);
 }
 
+/* Staged payloads and half-written files of a dead process are removed at open; a live process's are not. */
+static void test_kv_cache_open_sweeps_partial_files(void) {
+    char tmpl[] = "/tmp/ds4-kv-sweep-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    const char *sha = "3333333333333333333333333333333333333333";
+    char names[6][128];
+    snprintf(names[0], sizeof(names[0]), "%s/.ds4-stage-999999999-abcdef", dir);          /* dead pid */
+    snprintf(names[1], sizeof(names[1]), "%s/%s.kv.tmp.999999999", dir, sha);             /* dead pid */
+    snprintf(names[2], sizeof(names[2]), "%s/.ds4-stage-%ld-abcdef", dir, (long)getpid()); /* live pid */
+    snprintf(names[3], sizeof(names[3]), "%s/%s.kv.tmp.%ld", dir, sha, (long)getpid());   /* live pid */
+    snprintf(names[4], sizeof(names[4]), "%s/notes.txt", dir);                            /* not ours */
+    for (int i = 0; i < 5; i++) {
+        FILE *fp = fopen(names[i], "wb");
+        TEST_ASSERT(fp != NULL);
+        if (fp) { fputs("partial", fp); fclose(fp); }
+    }
+    kv_disk_cache kc = {0};
+    kc.opt = kv_cache_default_options();
+    TEST_ASSERT(ds4_kvstore_open_owned(&kc, dir, 1, false, kc.opt, 7, "test", test_kv_owner_log, NULL));
+    TEST_ASSERT(access(names[0], F_OK) != 0 && access(names[1], F_OK) != 0);
+    TEST_ASSERT(access(names[2], F_OK) == 0 && access(names[3], F_OK) == 0 && access(names[4], F_OK) == 0);
+    kv_cache_close(&kc);
+    for (int i = 0; i < 5; i++) unlink(names[i]);
+    rmdir(dir);
+}
+
+static void test_inkling2_default_lock_file_is_detected(void) {
+    TEST_ASSERT(server_lock_file_is_default(NULL));
+    TEST_ASSERT(server_lock_file_is_default(""));
+    TEST_ASSERT(server_lock_file_is_default("/tmp/ds4.lock"));
+    TEST_ASSERT(!server_lock_file_is_default("/tmp/ds4-inkling.lock"));
+    TEST_ASSERT(!server_lock_file_is_default("/tmp/ds4.lock2"));
+}
+
+/* A file the loader refused (another --ctx, another model file) must not hide a shorter usable prefix, and the next store under its
+ * key replaces it.  Only for stores with replace_refused (Inkling). */
+static void test_kv_cache_refused_file_does_not_shadow_prefix(void) {
+    char tmpl[] = "/tmp/ds4-kv-refused-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    const char *short_text = "system prompt and a first question";
+    const char *long_text = "system prompt and a first question and the answer and a second question";
+    const char *texts[] = {short_text, long_text};
+    test_kv_text_stub_file_model(dir, short_text, 7, KV_REASON_COLD, 2048, 4096);
+    test_kv_text_stub_file_model(dir, long_text, 7, KV_REASON_COLD, 3000, 4096);
+    kv_disk_cache kc = {0};
+    kc.opt = kv_cache_default_options();
+    kc.opt.min_tokens = 16;
+    TEST_ASSERT(ds4_kvstore_open_owned(&kc, dir, 1, false, kc.opt, 7, "test", test_kv_owner_log, NULL));
+    kc.replace_refused = true;
+    const char *prompt = "system prompt and a first question and the answer and a second question and more";
+    int idx = ds4_kvstore_find_text_prefix(&kc, prompt, 7, 2, 32768);
+    TEST_ASSERT(idx >= 0 && kc.entry[idx].tokens == 3000);          /* the longest prefix wins */
+    ds4_kvstore_note_refused(&kc, kc.entry[idx].sha);
+    char sha[41];
+    sha1_bytes_hex(long_text, strlen(long_text), sha);
+    TEST_ASSERT(ds4_kvstore_is_refused(&kc, sha));
+    idx = ds4_kvstore_find_text_prefix(&kc, prompt, 7, 2, 32768);
+    TEST_ASSERT(idx >= 0 && kc.entry[idx].tokens == 2048);          /* once refused, the shorter usable file is found */
+    char other[41];                                                 /* the store under the key replaced the file: forget only that key */
+    sha1_bytes_hex(short_text, strlen(short_text), other);
+    ds4_kvstore_note_refused(&kc, other);
+    ds4_kvstore_forget_refused(&kc, sha);
+    TEST_ASSERT(!ds4_kvstore_is_refused(&kc, sha) && ds4_kvstore_is_refused(&kc, other) && kc.n_refused == 1);
+    ds4_kvstore_forget_refused(&kc, sha);                           /* forgetting an unknown key is a no-op */
+    TEST_ASSERT(kc.n_refused == 1);
+    kv_disk_cache plain = {0};                                      /* not enabled: the old behaviour, nothing is remembered */
+    ds4_kvstore_note_refused(&plain, sha);
+    TEST_ASSERT(!ds4_kvstore_is_refused(&plain, sha) && plain.n_refused == 0);
+    kv_cache_close(&kc);
+    test_kv_remove_all(dir, texts, 2);
+}
+
 /* A server only evicts, replaces and counts the files of its own model id.  Files of another model (here ids 6 and 7: two
  * servers of different models sharing one directory) are left alone, counted separately, and named in a warning at open. */
 static void test_kv_cache_owner_guard_leaves_foreign_files(void) {
@@ -22277,74 +23217,6 @@ static void test_kv_cache_owner_guard_leaves_foreign_files(void) {
     TEST_ASSERT(qk.len == 3 && qk.foreign_files == 0 && test_kv_owner_warnings == 0);
     kv_cache_close(&qk);
     test_kv_remove_all(dir, texts, 5);
-}
-
-/* Staged payloads and half-written files of a dead process are removed at open; a live process's are not. */
-static void test_kv_cache_open_sweeps_partial_files(void) {
-    char tmpl[] = "/tmp/ds4-kv-sweep-test.XXXXXX";
-    char *dir = mkdtemp(tmpl);
-    TEST_ASSERT(dir != NULL);
-    if (!dir) return;
-    const char *sha = "3333333333333333333333333333333333333333";
-    char names[6][128];
-    snprintf(names[0], sizeof(names[0]), "%s/.ds4-stage-999999999-abcdef", dir);          /* dead pid */
-    snprintf(names[1], sizeof(names[1]), "%s/%s.kv.tmp.999999999", dir, sha);             /* dead pid */
-    snprintf(names[2], sizeof(names[2]), "%s/.ds4-stage-%ld-abcdef", dir, (long)getpid()); /* live pid */
-    snprintf(names[3], sizeof(names[3]), "%s/%s.kv.tmp.%ld", dir, sha, (long)getpid());   /* live pid */
-    snprintf(names[4], sizeof(names[4]), "%s/notes.txt", dir);                            /* not ours */
-    for (int i = 0; i < 5; i++) {
-        FILE *fp = fopen(names[i], "wb");
-        TEST_ASSERT(fp != NULL);
-        if (fp) { fputs("partial", fp); fclose(fp); }
-    }
-    kv_disk_cache kc = {0};
-    kc.opt = kv_cache_default_options();
-    TEST_ASSERT(ds4_kvstore_open_owned(&kc, dir, 1, false, kc.opt, 7, "test", test_kv_owner_log, NULL));
-    TEST_ASSERT(access(names[0], F_OK) != 0 && access(names[1], F_OK) != 0);
-    TEST_ASSERT(access(names[2], F_OK) == 0 && access(names[3], F_OK) == 0 && access(names[4], F_OK) == 0);
-    kv_cache_close(&kc);
-    for (int i = 0; i < 5; i++) unlink(names[i]);
-    rmdir(dir);
-}
-
-/* A file the loader refused (another --ctx, another model file) must not hide a shorter usable prefix, and the next store under its
- * key replaces it.  Only for stores with replace_refused (Inkling). */
-static void test_kv_cache_refused_file_does_not_shadow_prefix(void) {
-    char tmpl[] = "/tmp/ds4-kv-refused-test.XXXXXX";
-    char *dir = mkdtemp(tmpl);
-    TEST_ASSERT(dir != NULL);
-    if (!dir) return;
-    const char *short_text = "system prompt and a first question";
-    const char *long_text = "system prompt and a first question and the answer and a second question";
-    const char *texts[] = {short_text, long_text};
-    test_kv_text_stub_file_model(dir, short_text, 7, KV_REASON_COLD, 2048, 4096);
-    test_kv_text_stub_file_model(dir, long_text, 7, KV_REASON_COLD, 3000, 4096);
-    kv_disk_cache kc = {0};
-    kc.opt = kv_cache_default_options();
-    kc.opt.min_tokens = 16;
-    TEST_ASSERT(ds4_kvstore_open_owned(&kc, dir, 1, false, kc.opt, 7, "test", test_kv_owner_log, NULL));
-    kc.replace_refused = true;
-    const char *prompt = "system prompt and a first question and the answer and a second question and more";
-    int idx = ds4_kvstore_find_text_prefix(&kc, prompt, 7, 2, 32768);
-    TEST_ASSERT(idx >= 0 && kc.entry[idx].tokens == 3000);          /* the longest prefix wins */
-    ds4_kvstore_note_refused(&kc, kc.entry[idx].sha);
-    char sha[41];
-    sha1_bytes_hex(long_text, strlen(long_text), sha);
-    TEST_ASSERT(ds4_kvstore_is_refused(&kc, sha));
-    idx = ds4_kvstore_find_text_prefix(&kc, prompt, 7, 2, 32768);
-    TEST_ASSERT(idx >= 0 && kc.entry[idx].tokens == 2048);          /* once refused, the shorter usable file is found */
-    char other[41];                                                 /* the store under the key replaced the file: forget only that key */
-    sha1_bytes_hex(short_text, strlen(short_text), other);
-    ds4_kvstore_note_refused(&kc, other);
-    ds4_kvstore_forget_refused(&kc, sha);
-    TEST_ASSERT(!ds4_kvstore_is_refused(&kc, sha) && ds4_kvstore_is_refused(&kc, other) && kc.n_refused == 1);
-    ds4_kvstore_forget_refused(&kc, sha);                           /* forgetting an unknown key is a no-op */
-    TEST_ASSERT(kc.n_refused == 1);
-    kv_disk_cache plain = {0};                                      /* not enabled: the old behaviour, nothing is remembered */
-    ds4_kvstore_note_refused(&plain, sha);
-    TEST_ASSERT(!ds4_kvstore_is_refused(&plain, sha) && plain.n_refused == 0);
-    kv_cache_close(&kc);
-    test_kv_remove_all(dir, texts, 2);
 }
 
 static void test_kv_cache_eviction_prefers_anchor_reason(void) {
@@ -23324,7 +24196,7 @@ static void ds4_server_unit_tests_run(void) {
     test_render_preserves_reasoning_with_tools();
     test_render_chat_prompt_text_renders_tools_before_system();
     test_render_glm_chat_prompt_text();
-    test_anthropic_many_blocks_parse_linear();
+    test_inkling2_chat();
     test_render_qwen_chat_prompt_text();
     test_render_qwen_tool_round_trip();
     test_qwen_tool_visible_checkpoint_boundary();
@@ -23461,6 +24333,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_prefers_anchor_reason();
     test_kv_cache_owner_guard_leaves_foreign_files();
     test_kv_cache_refused_file_does_not_shadow_prefix();
+    test_inkling2_default_lock_file_is_detected();
     test_kv_cache_open_sweeps_partial_files();
     test_kv_cache_eviction_makes_room_before_store();
     test_kv_cache_eviction_ignores_oversize_incoming();

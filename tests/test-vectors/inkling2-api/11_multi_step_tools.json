@@ -1,0 +1,262 @@
+{
+ "name": "11_multi_step_tools",
+ "chat": {
+  "model": "inkling-2-mini",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Add 2 and 3, then add the result to 10."
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "toolu_1",
+      "type": "function",
+      "function": {
+       "name": "add",
+       "arguments": "{\"a\": 2, \"b\": 3}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "toolu_1",
+    "content": "5"
+   },
+   {
+    "role": "assistant",
+    "content": "2+3 is 5. Now adding 10.",
+    "tool_calls": [
+     {
+      "id": "toolu_2",
+      "type": "function",
+      "function": {
+       "name": "add",
+       "arguments": "{\"a\": 5, \"b\": 10}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "toolu_2",
+    "content": "15"
+   },
+   {
+    "role": "user",
+    "content": "Thanks. What was the last sum? Answer in a few words."
+   }
+  ],
+  "temperature": 0,
+  "max_tokens": 700,
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "add",
+     "description": "Add two numbers.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "number"
+       },
+       "b": {
+        "type": "number"
+       }
+      },
+      "required": [
+       "a",
+       "b"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ "anthropic": {
+  "model": "inkling-2-mini",
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "Add 2 and 3, then add the result to 10."
+     }
+    ]
+   },
+   {
+    "role": "assistant",
+    "content": [
+     {
+      "type": "tool_use",
+      "id": "toolu_1",
+      "name": "add",
+      "input": {
+       "a": 2,
+       "b": 3
+      }
+     }
+    ]
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "tool_result",
+      "tool_use_id": "toolu_1",
+      "content": "5"
+     }
+    ]
+   },
+   {
+    "role": "assistant",
+    "content": [
+     {
+      "type": "text",
+      "text": "2+3 is 5. Now adding 10."
+     },
+     {
+      "type": "tool_use",
+      "id": "toolu_2",
+      "name": "add",
+      "input": {
+       "a": 5,
+       "b": 10
+      }
+     }
+    ]
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "tool_result",
+      "tool_use_id": "toolu_2",
+      "content": "15"
+     }
+    ]
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "Thanks. What was the last sum? Answer in a few words."
+     }
+    ]
+   }
+  ],
+  "temperature": 0,
+  "max_tokens": 700,
+  "tools": [
+   {
+    "name": "add",
+    "description": "Add two numbers.",
+    "input_schema": {
+     "type": "object",
+     "properties": {
+      "a": {
+       "type": "number"
+      },
+      "b": {
+       "type": "number"
+      }
+     },
+     "required": [
+      "a",
+      "b"
+     ]
+    }
+   }
+  ]
+ },
+ "responses": {
+  "model": "inkling-2-mini",
+  "input": [
+   {
+    "type": "message",
+    "role": "user",
+    "content": [
+     {
+      "type": "input_text",
+      "text": "Add 2 and 3, then add the result to 10."
+     }
+    ]
+   },
+   {
+    "type": "function_call",
+    "call_id": "toolu_1",
+    "name": "add",
+    "arguments": "{\"a\": 2, \"b\": 3}"
+   },
+   {
+    "type": "function_call_output",
+    "call_id": "toolu_1",
+    "output": "5"
+   },
+   {
+    "type": "message",
+    "role": "assistant",
+    "content": [
+     {
+      "type": "output_text",
+      "text": "2+3 is 5. Now adding 10."
+     }
+    ]
+   },
+   {
+    "type": "function_call",
+    "call_id": "toolu_2",
+    "name": "add",
+    "arguments": "{\"a\": 5, \"b\": 10}"
+   },
+   {
+    "type": "function_call_output",
+    "call_id": "toolu_2",
+    "output": "15"
+   },
+   {
+    "type": "message",
+    "role": "user",
+    "content": [
+     {
+      "type": "input_text",
+      "text": "Thanks. What was the last sum? Answer in a few words."
+     }
+    ]
+   }
+  ],
+  "temperature": 0,
+  "max_output_tokens": 700,
+  "reasoning": {
+   "summary": "auto"
+  },
+  "tools": [
+   {
+    "type": "function",
+    "name": "add",
+    "description": "Add two numbers.",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "a": {
+       "type": "number"
+      },
+      "b": {
+       "type": "number"
+      }
+     },
+     "required": [
+      "a",
+      "b"
+     ]
+    }
+   }
+  ]
+ }
+}

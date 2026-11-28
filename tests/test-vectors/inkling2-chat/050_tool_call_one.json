@@ -1,0 +1,84 @@
+{
+ "name": "050_tool_call_one",
+ "request": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "content": null,
+    "tool_calls": [
+     {
+      "id": "call_1",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": "{\"city\": \"Paris\", \"unit\": \"celsius\"}"
+      }
+     }
+    ]
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Get the current weather for a city.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "City name"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "celsius",
+         "fahrenheit"
+        ]
+       },
+       "days": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 7
+       },
+       "coords": {
+        "type": "object",
+        "properties": {
+         "lat": {
+          "type": "number"
+         },
+         "lon": {
+          "type": "number"
+         }
+        },
+        "required": [
+         "lat",
+         "lon"
+        ]
+       },
+       "tags": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ "prompt": null,
+ "tokens": null,
+ "llama_error": true,
+ "ds4": "skip",
+ "ds4_note": "llama.cpp refuses to continue a final assistant message with tool calls; ds4 renders the history as is"
+}

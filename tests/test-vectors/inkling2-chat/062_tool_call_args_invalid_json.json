@@ -1,0 +1,43 @@
+{
+ "name": "062_tool_call_args_invalid_json",
+ "request": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "go"
+   },
+   {
+    "role": "assistant",
+    "content": null,
+    "tool_calls": [
+     {
+      "id": "a",
+      "type": "function",
+      "function": {
+       "name": "ping",
+       "arguments": "{not json"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "pong",
+    "tool_call_id": "a"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "ping",
+     "description": "Check liveness; takes no arguments."
+    }
+   }
+  ]
+ },
+ "prompt": null,
+ "tokens": null,
+ "llama_error": true,
+ "ds4": "error"
+}

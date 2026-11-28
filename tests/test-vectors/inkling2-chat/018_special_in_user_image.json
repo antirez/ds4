@@ -1,0 +1,39 @@
+{
+ "name": "018_special_in_user_image",
+ "request": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "img <|content_image|><|unused_200054|> x <|content_thinking|> <|message_tool|>"
+   }
+  ]
+ },
+ "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>img <|content_image|><|unused_200054|> x <|content_thinking|> <|message_tool|><|end_message|>",
+ "tokens": [
+  200002,
+  200004,
+  34182,
+  279,
+  154554,
+  150628,
+  25,
+  220,
+  15,
+  13,
+  24,
+  200010,
+  200000,
+  200004,
+  3247,
+  220,
+  200005,
+  200054,
+  149924,
+  220,
+  200008,
+  220,
+  200003,
+  200010
+ ],
+ "llama_error": false
+}

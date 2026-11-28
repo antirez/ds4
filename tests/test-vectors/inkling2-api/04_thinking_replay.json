@@ -1,0 +1,112 @@
+{
+ "name": "04_thinking_replay",
+ "chat": {
+  "model": "inkling-2-mini",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is 17*3?"
+   },
+   {
+    "role": "assistant",
+    "content": "17*3 is 51.",
+    "reasoning_content": "17*3 = 51."
+   },
+   {
+    "role": "user",
+    "content": "And times 2? Just the number."
+   }
+  ],
+  "temperature": 0,
+  "max_tokens": 700
+ },
+ "anthropic": {
+  "model": "inkling-2-mini",
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "What is 17*3?"
+     }
+    ]
+   },
+   {
+    "role": "assistant",
+    "content": [
+     {
+      "type": "thinking",
+      "thinking": "17*3 = 51.",
+      "signature": "sig"
+     },
+     {
+      "type": "text",
+      "text": "17*3 is 51."
+     }
+    ]
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "And times 2? Just the number."
+     }
+    ]
+   }
+  ],
+  "temperature": 0,
+  "max_tokens": 700
+ },
+ "responses": {
+  "model": "inkling-2-mini",
+  "input": [
+   {
+    "type": "message",
+    "role": "user",
+    "content": [
+     {
+      "type": "input_text",
+      "text": "What is 17*3?"
+     }
+    ]
+   },
+   {
+    "type": "reasoning",
+    "id": "rs_x",
+    "summary": [
+     {
+      "type": "summary_text",
+      "text": "17*3 = 51."
+     }
+    ]
+   },
+   {
+    "type": "message",
+    "role": "assistant",
+    "content": [
+     {
+      "type": "output_text",
+      "text": "17*3 is 51."
+     }
+    ]
+   },
+   {
+    "type": "message",
+    "role": "user",
+    "content": [
+     {
+      "type": "input_text",
+      "text": "And times 2? Just the number."
+     }
+    ]
+   }
+  ],
+  "temperature": 0,
+  "max_output_tokens": 700,
+  "reasoning": {
+   "summary": "auto"
+  }
+ }
+}

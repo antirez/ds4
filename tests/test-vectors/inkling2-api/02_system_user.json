@@ -1,0 +1,56 @@
+{
+ "name": "02_system_user",
+ "chat": {
+  "model": "inkling-2-mini",
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a terse assistant. Reply in at most five words."
+   },
+   {
+    "role": "user",
+    "content": "Say hello."
+   }
+  ],
+  "temperature": 0,
+  "max_tokens": 700
+ },
+ "anthropic": {
+  "model": "inkling-2-mini",
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "Say hello."
+     }
+    ]
+   }
+  ],
+  "temperature": 0,
+  "max_tokens": 700,
+  "system": "You are a terse assistant. Reply in at most five words."
+ },
+ "responses": {
+  "model": "inkling-2-mini",
+  "input": [
+   {
+    "type": "message",
+    "role": "user",
+    "content": [
+     {
+      "type": "input_text",
+      "text": "Say hello."
+     }
+    ]
+   }
+  ],
+  "temperature": 0,
+  "max_output_tokens": 700,
+  "reasoning": {
+   "summary": "auto"
+  },
+  "instructions": "You are a terse assistant. Reply in at most five words."
+ }
+}
