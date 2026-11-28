@@ -33670,14 +33670,17 @@ static int ds4_gpu_encode_mul_mv_addr_q2_sum6(
     return 1;
 }
 
-static void ds4_gpu_bind_k3_split_slots(
+static uint32_t ds4_gpu_bind_k3_split_slots(
         id<MTLComputeCommandEncoder> enc, ds4_gpu_stream_expert_cache_entry *const *entries,
-        uint32_t mask, bool down) {
+        uint32_t mask, bool down, bool compact_slots) {
     uint64_t first[16] = {0}, up[16] = {0};
-    int32_t slots[16];
+    int32_t slots[16] = {0};
+    uint32_t active_count = 0;
     for (uint32_t i = 0; i < 16; i++) {
-        slots[i] = (int32_t)i;
+        if (!compact_slots) slots[i] = (int32_t)i;
         if (!(mask & (1u << i))) continue;
+        if (compact_slots) slots[active_count] = (int32_t)i;
+        active_count++;
         ds4_gpu_stream_expert_cache_entry *entry = entries[i];
         if (down) first[i] = entry->down_buffer.gpuAddress + entry->down_inner;
         else {
@@ -33688,6 +33691,7 @@ static void ds4_gpu_bind_k3_split_slots(
     [enc setBytes:first length:sizeof(first) atIndex:down ? 2 : 3];
     if (!down) [enc setBytes:up length:sizeof(up) atIndex:4];
     [enc setBytes:slots length:sizeof(slots) atIndex:down ? 5 : 9];
+    return active_count;
 }
 
 static int ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu_masked(
@@ -33721,6 +33725,7 @@ static int ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu_masked(
         args->ne02 <= 0 || args->ne02 > DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT) {
         return 0;
     }
+    if ((split->active_mask & ((1u << args->nei0) - 1u)) == 0) return 1;
     for (uint32_t i = 0; i < (uint32_t)args->nei0; i++) {
         if ((split->active_mask & (1u << i)) == 0) continue;
         if (!entries[i] || !entries[i]->gate_buffer || !entries[i]->up_buffer) return 0;
@@ -33734,7 +33739,7 @@ static int ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu_masked(
     const NSUInteger nr0 = (NSUInteger)args->nr0;
     const NSUInteger rows_per_group = rows_per_group_is_nr0 ? nr0 : nr0 * nsg;
     const NSUInteger row_groups = ((NSUInteger)args->ne01 + rows_per_group - 1u) / rows_per_group;
-    const NSUInteger pairs = (NSUInteger)args->nei0 * (NSUInteger)args->nei1;
+    NSUInteger pairs = (NSUInteger)args->nei0 * (NSUInteger)args->nei1;
 
     if (g_k3_experimental_decode_kernels && g_ssd_streaming_mode &&
         act->activation_kind == 1u && args->ne00 == 3584 && args->ne01 == 3072 &&
@@ -33753,7 +33758,10 @@ static int ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu_masked(
     [enc setBytes:act   length:sizeof(*act)   atIndex:1];
     [enc setBytes:split length:sizeof(*split) atIndex:2];
     if (args->nei0 == 16) {
-        ds4_gpu_bind_k3_split_slots(enc, entries, split->active_mask, false);
+        const bool compact_slots = args->nei1 == 1 && act->activation_kind == 1u;
+        const uint32_t active_count = ds4_gpu_bind_k3_split_slots(
+            enc, entries, split->active_mask, false, compact_slots);
+        if (compact_slots) pairs = active_count;
     } else {
         [enc setBuffer:gate_addrs offset:0 atIndex:3];
         [enc setBuffer:up_addrs offset:0 atIndex:4];
@@ -33818,7 +33826,7 @@ static int ds4_gpu_encode_mul_mv_addr_q2_sum6_masked(
     [enc setBytes:args  length:sizeof(*args)  atIndex:0];
     [enc setBytes:split length:sizeof(*split) atIndex:1];
     /* Only the early prefix runs concurrently with cache installation. */
-    if (split->accumulate == 2u) ds4_gpu_bind_k3_split_slots(enc, entries, split->active_mask, true);
+    if (split->accumulate == 2u) ds4_gpu_bind_k3_split_slots(enc, entries, split->active_mask, true, false);
     else {
         [enc setBuffer:addrs offset:0 atIndex:2];
         [enc setBuffer:ids offset:ids_off atIndex:5];
@@ -52007,7 +52015,7 @@ bool k3_gpu_can_tile_bf16_prefill(uint32_t in_dim, uint32_t out_dim, uint32_t ro
     return g_ssd_streaming_mode && g_k3_bf16_mv_unroll == 16 && g_k3_bf16_mv_nsg == 4 &&
         ds4_gpu_device_is_pre_m5_apple_silicon() && ds4_gpu_device_name_contains("Apple M1 Max") &&
         (rows == 256u || (g_k3_experimental_prefill_kernels &&
-                          rows >= 16u && rows <= 64u && rows % 4u == 0u)) &&
+                          rows >= 16u && rows <= 64u)) &&
         ((in_dim == 7168u && out_dim == 12288u) ||
             (in_dim == 12288u && out_dim == 7168u) ||
             (in_dim == 1536u && out_dim == 18432u));
@@ -52204,8 +52212,29 @@ int k3_gpu_matmul_bf16_prefill_tiles(
         const ds4_gpu_tensor *x,
         uint32_t              n_rows) {
     if (!k3_gpu_can_tile_bf16_prefill(in_dim, out_dim, n_rows)) return 0;
-    return k3_gpu_matmul_bf16_impl(out, model_map, model_size, weight_offset,
-        in_dim, out_dim, x, n_rows, true);
+    const uint32_t tail_rows = n_rows % 4u;
+    if (!tail_rows) {
+        return k3_gpu_matmul_bf16_impl(out, model_map, model_size, weight_offset,
+            in_dim, out_dim, x, n_rows, true);
+    }
+
+    /* Short tiles load and store four complete rows. Keep the whole prefix
+     * on that kernel and apply the small-batch projection to the final rows. */
+    const uint32_t tiled_rows = n_rows - tail_rows;
+    const uint64_t input_stride = (uint64_t)in_dim * sizeof(float);
+    const uint64_t output_stride = (uint64_t)out_dim * sizeof(float);
+    ds4_gpu_tensor *tail_x = ds4_gpu_tensor_view(x, tiled_rows * input_stride,
+                                                 tail_rows * input_stride);
+    ds4_gpu_tensor *tail_out = ds4_gpu_tensor_view(out, tiled_rows * output_stride,
+                                                   tail_rows * output_stride);
+    const int ok = tail_x && tail_out &&
+        k3_gpu_matmul_bf16_impl(out, model_map, model_size, weight_offset,
+            in_dim, out_dim, x, tiled_rows, true) &&
+        k3_gpu_matmul_bf16_impl(tail_out, model_map, model_size, weight_offset,
+            in_dim, out_dim, tail_x, tail_rows, false);
+    ds4_gpu_tensor_free(tail_out);
+    ds4_gpu_tensor_free(tail_x);
+    return ok;
 }
 
 int k3_gpu_matmul4_bf16_enabled(void) {

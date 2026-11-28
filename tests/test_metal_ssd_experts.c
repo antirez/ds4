@@ -178,8 +178,8 @@ static uint64_t memory_footprint(void) {
     return info.phys_footprint;
 }
 
-static int check_k3_prefill_tiles(void *model, size_t bytes, int fd,
-                                  uint64_t gate_expert, uint64_t down_expert) {
+static int check_k3_cache(void *model, size_t bytes, int fd,
+                          uint64_t gate_expert, uint64_t down_expert) {
     enum { rows = 5, top_k = 16 };
     float x[rows * D], weights[rows * top_k], reference[rows * D], result[rows * D];
     int32_t ids[rows * top_k];
@@ -248,6 +248,48 @@ static int check_k3_prefill_tiles(void *model, size_t bytes, int fd,
         } else if (ok && memcmp(reference, result, sizeof(reference))) ok = 0;
         fprintf(stderr, "Metal K3 routed prefill: requested=%u cap=%u live=%u %s\n",
                 budgets[pass], cap, live, ok ? "PASS" : "FAIL");
+    }
+    /* The all-cached reference uses the ordinary address kernel. The other
+     * passes split the same 16 slots across both mask phases. The first
+     * mixed mask includes a resident prefix for the Q2 down accumulator;
+     * the second starts with a miss. Slot numbers differ from expert IDs. */
+    const uint32_t masks[] = {0xffffu, 0xa5abu, 0x5a54u};
+    const ds4_gpu_stream_expert_table table = {
+        .model_map = model, .model_size = bytes, .layer = 3, .n_total_expert = E,
+        .gate_offset = 0, .up_offset = E * gate_expert, .down_offset = 2 * E * gate_expert,
+        .gate_expert_bytes = gate_expert, .down_expert_bytes = down_expert,
+    };
+    float reference_mid[top_k * H], actual_mid[top_k * H];
+    for (int i = 0; i < top_k; i++) ids[i] = (17 * i + 3) % E;
+    ok = ok && ds4_gpu_tensor_write(it, 0, ids, top_k * sizeof(*ids));
+    for (size_t pass = 0; pass < sizeof(masks) / sizeof(*masks) && ok; pass++) {
+        int32_t seed[top_k];
+        uint32_t count = 0;
+        for (int i = 0; i < top_k; i++)
+            if (masks[pass] & (1u << i)) seed[count++] = ids[i];
+        ds4_gpu_set_streaming_expert_cache_budget(32);
+        ds4_gpu_set_streaming_expert_cache_expert_bytes(2 * gate_expert + down_expert);
+        ok = ds4_gpu_stream_expert_cache_seed_experts(&table, seed, NULL, count) &&
+            ds4_gpu_stream_expert_cache_current_count() == count &&
+            ds4_gpu_tensor_fill_f32(mid, NAN, top_k * H) && ds4_gpu_tensor_fill_f32(out, NAN, D) &&
+            ds4_gpu_begin_commands() &&
+            ds4_gpu_k3_routed_moe_one_tensor(out, gate, up, mid, down,
+                model, bytes, 0, table.up_offset, table.down_offset,
+                gate_expert, gate_expert / H, down_expert, down_expert / D,
+                D, H, D, it, wt, E, top_k, xt, table.layer, false, ids) &&
+            ds4_gpu_end_commands() &&
+            ds4_gpu_tensor_read(mid, 0, actual_mid, sizeof(actual_mid)) &&
+            ds4_gpu_tensor_read(out, 0, result, D * sizeof(*result));
+        if (ok && pass == 0) {
+            for (int i = 0; i < top_k * H; i++) if (!isfinite(actual_mid[i])) ok = 0;
+            for (int i = 0; i < D; i++) if (!isfinite(result[i])) ok = 0;
+            memcpy(reference_mid, actual_mid, sizeof(actual_mid));
+            memcpy(reference, result, D * sizeof(*result));
+        } else if (ok) {
+            ok = !memcmp(reference_mid, actual_mid, sizeof(actual_mid)) &&
+                 !memcmp(reference, result, D * sizeof(*result));
+        }
+        fprintf(stderr, "Metal K3 decode resident mask %04x: %s\n", masks[pass], ok ? "PASS" : "FAIL");
     }
     ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(it); ds4_gpu_tensor_free(wt);
     ds4_gpu_tensor_free(gate); ds4_gpu_tensor_free(up); ds4_gpu_tensor_free(mid);
@@ -358,7 +400,7 @@ int main(int argc, char **argv) {
     }
     int ok = msync(model, bytes, MS_SYNC) == 0 && ds4_gpu_init();
     if (k3_tiles) {
-        ok = ok && check_k3_prefill_tiles(model, bytes, fileno(file), expert, down_expert);
+        ok = ok && check_k3_cache(model, bytes, fileno(file), expert, down_expert);
         ds4_gpu_cleanup();
         munmap(model, bytes);
         fclose(file);

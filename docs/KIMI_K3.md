@@ -163,7 +163,8 @@ cache into the existing staging buffers. `K3_IO_PROFILE=1` reports the
 compressed bytes read and the original GGUF bytes they represent.
 
 On an M1 Max, `--ssd-streaming` uses tiled BF16 prefill kernels by default
-for supported projections with 16 to 64 rows in multiples of four.
+for supported streamed projections with 16 to 64 rows. For a 45-row projection,
+the tiled kernel handles the first 44 rows and the small-batch kernel handles the last row.
 Set `K3_EXPERIMENTAL_PREFILL_KERNELS=0` to use the previous kernel for
 comparison. In the initial 4×4 implementation, a 44-token prefill with a
 10 GiB expert cache and the lossless sidecar reduced GPU time for the 417

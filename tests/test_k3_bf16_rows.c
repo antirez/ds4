@@ -38,7 +38,7 @@ static int test_shape_offset(uint32_t in_dim, uint32_t out_dim, bool misaligned,
                              uint32_t tensorops_rows) {
     const bool tiled = k3_gpu_can_tile_bf16_prefill(in_dim, out_dim, 256);
     const uint32_t max_rows = tensorops_rows ? tensorops_rows :
-        tiled ? (misaligned ? 44u : 256u) : 8u;
+        tiled ? (misaligned ? 45u : 256u) : 8u;
     enum { MAX_ROWS = 256, INPUT_OFFSET = 64, OUTPUT_OFFSET = 128, GUARD = 128 };
     const uint64_t input_row = (uint64_t)in_dim * sizeof(float);
     const uint64_t output_row = (uint64_t)out_dim * sizeof(float);
@@ -115,8 +115,8 @@ static int test_shape_offset(uint32_t in_dim, uint32_t out_dim, bool misaligned,
 
     const char *prefill_setting = getenv("K3_EXPERIMENTAL_PREFILL_KERNELS");
     const bool short_tiles = !prefill_setting || strcmp(prefill_setting, "1") == 0;
-    const uint32_t tile_rows[] = {16, 40, 44, 48, 64, 256};
-    CHECK(!k3_gpu_can_tile_bf16_prefill(in_dim, out_dim, 45));
+    const uint32_t tile_rows[] = {16, 40, 44, 45, 46, 47, 48, 64, 256};
+    CHECK(k3_gpu_can_tile_bf16_prefill(in_dim, out_dim, 45) == (tiled && short_tiles));
     const uint32_t cases = tensorops_rows ? 1u :
         tiled ? sizeof(tile_rows) / sizeof(tile_rows[0]) : max_rows;
     for (uint32_t i = 0; i < cases; ++i) {
