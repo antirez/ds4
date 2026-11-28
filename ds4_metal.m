@@ -439,6 +439,8 @@ static int16_t g_k3_bf16_mv_unroll = 16;
 static int16_t g_k3_bf16_mv_nsg = 4;
 static bool g_k3_experimental_decode_kernels;
 static bool g_k3_experimental_prefill_kernels;
+static id<MTLComputePipelineState> g_k3_m5_bf16_prefill_pipeline;
+static bool g_k3_m5_bf16_prefill_reported;
 static int g_k3_fused_qkvg = 1;
 static int g_k3_router_mode = 3;
 static uint16_t g_k3_router_rank_threads = 896;
@@ -7326,6 +7328,10 @@ int ds4_gpu_init(void) {
             macros[@"DS4_METAL_HAS_TENSOR"] = @"1";
             fprintf(stderr, "ds4: Metal 4 tensor API enabled for Tensor kernels\n");
         }
+        const bool k3_m5_bf16_prefill = g_metal4_tensor_api_enabled &&
+            ds4_gpu_device_name_contains("Apple M5 Max") &&
+            ds4_gpu_env_bool("K3_M5_BF16_TENSOROPS") > 0;
+        if (k3_m5_bf16_prefill) macros[@"DS4_K3_M5_BF16_TENSOROPS"] = @"1";
 
         const int drift_hc_stable        = ds4_gpu_env_bool("DS4_METAL_HC_STABLE")          != 0; // default ON
         const int drift_norm_unify       = ds4_gpu_env_bool("DS4_METAL_NORM_RSQRT_DISABLE") != 0; // default ON
@@ -7376,6 +7382,18 @@ int ds4_gpu_init(void) {
             return 0;
         }
         g_library = library;
+        g_k3_m5_bf16_prefill_pipeline = nil;
+        g_k3_m5_bf16_prefill_reported = false;
+        if (k3_m5_bf16_prefill) {
+            id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_k3_bf16_prefill_tensorops");
+            if (pipeline && pipeline.threadExecutionWidth == 32 &&
+                pipeline.maxTotalThreadsPerThreadgroup >= 128 &&
+                pipeline.staticThreadgroupMemoryLength <= g_device.maxThreadgroupMemoryLength) {
+                g_k3_m5_bf16_prefill_pipeline = pipeline;
+            } else {
+                fprintf(stderr, "k3: M5 Max BF16 TensorOps pipeline unavailable; using standard BF16 prefill\n");
+            }
+        }
 
         id<MTLFunction> fn = [library newFunctionWithName:@"kernel_get_rows_f32"];
         if (!fn) {
@@ -12329,6 +12347,7 @@ void ds4_gpu_cleanup(void) {
         g_model_buffer_cache = nil;
         g_transient_buffers = nil;
         g_pending_cbs = nil;
+        g_k3_m5_bf16_prefill_pipeline = nil;
         g_library = nil;
         g_queue = nil;
         g_device = nil;
@@ -52060,8 +52079,12 @@ static int k3_gpu_matmul_bf16_impl(
         const bool bc_inp = (in_dim % 32u) != 0u;
         const bool bc_out = (out_dim % 64u) != 0u ||
                             (n_rows % 32u) != 0u;
-        id<MTLComputePipelineState> pipeline =
-            ds4_gpu_get_mul_mm_pipeline(
+        /* The TensorOps kernel pads the final token tile in threadgroup
+         * memory. Weight tiles must cover complete input and output blocks. */
+        const bool tensorops = g_k3_m5_bf16_prefill_pipeline && !g_quality_mode &&
+            n_rows >= 32u && !bc_inp && (out_dim % 64u) == 0u;
+        id<MTLComputePipelineState> pipeline = tensorops
+            ? g_k3_m5_bf16_prefill_pipeline : ds4_gpu_get_mul_mm_pipeline(
                 "kernel_k3_mul_mm_bf16_f32", bc_inp, bc_out);
         if (!pipeline) return 0;
         ds4_gpu_mul_mm_args args = ds4_gpu_make_mm_args(
@@ -52072,13 +52095,18 @@ static int k3_gpu_matmul_bf16_impl(
         [enc setBuffer:weightbuf offset:(NSUInteger)weight_inner atIndex:1];
         [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
-        [enc setThreadgroupMemoryLength:(bc_out ? 8192u : 6144u) atIndex:0];
+        if (!tensorops) [enc setThreadgroupMemoryLength:(bc_out ? 8192u : 6144u) atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(
                 ((NSUInteger)n_rows + 31u) / 32u,
                 ((NSUInteger)out_dim + 63u) / 64u,
                 1)
             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
+        if (tensorops && !g_k3_m5_bf16_prefill_reported) {
+            fprintf(stderr, "k3: M5 Max BF16 TensorOps prefill dispatched rows=%u in=%u out=%u\n",
+                    n_rows, in_dim, out_dim);
+            g_k3_m5_bf16_prefill_reported = true;
+        }
         return ds4_gpu_finish_command_buffer(
             cb, owned, "K3 BF16 matrix-matrix multiply");
     }

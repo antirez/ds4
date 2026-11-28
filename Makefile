@@ -213,6 +213,21 @@ test-k3-bf16-rows: tests/test_k3_bf16_rows
 	K3_EXPERIMENTAL_PREFILL_KERNELS=0 ./tests/test_k3_bf16_rows
 	K3_EXPERIMENTAL_PREFILL_KERNELS=1 ./tests/test_k3_bf16_rows
 
+.PHONY: test-k3-m5-bf16-tensorops
+test-k3-m5-bf16-tensorops: tests/test_k3_bf16_rows
+	@set -eu; chip=$$(sysctl -n machdep.cpu.brand_string); \
+	for rows in 32 45 64; do \
+	    log=$$(K3_M5_BF16_TENSOROPS=1 ./tests/test_k3_bf16_rows --tensorops-rows $$rows 2>&1) || { echo "$$log"; exit 1; }; \
+	    echo "$$log"; marker="M5 Max BF16 TensorOps prefill dispatched rows=$$rows in=256 out=192"; \
+	    case "$$chip" in \
+	        *"M5 Max"*) echo "$$log" | grep -Fq "$$marker" || { echo "Missing K3 TensorOps dispatch for $$rows rows" >&2; exit 1; } ;; \
+	        *) if echo "$$log" | grep -Fq "$$marker"; then echo "Unexpected TensorOps dispatch on $$chip" >&2; exit 1; fi ;; \
+	    esac; \
+	done; \
+	case "$$chip" in *"M5 Max"*) echo "Verified M5 Max TensorOps dispatch" ;; \
+	    *) echo "Verified standard BF16 fallback on $$chip; M5 Max execution requires target hardware" ;; \
+	esac
+
 tests/test_k3_bf16_fused.o: tests/test_k3_bf16_fused.c k3_metal.h ds4_gpu.h
 	$(CC) $(QUALITY_CFLAGS) -I. -c -o $@ $<
 

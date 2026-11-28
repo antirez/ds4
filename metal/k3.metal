@@ -808,6 +808,77 @@ kernel k3_mul_mm_bf16_t kernel_mul_mm<
         k3_bf16_block16, 1, k3_dequantize_bf16,
         half, half4x4, float, float2x4>;
 
+#ifdef DS4_K3_M5_BF16_TENSOROPS
+// The existing BF16 matrix kernel narrows both operands to half. Match that
+// conversion before the TensorOps multiply and accumulate into float.
+kernel void kernel_k3_bf16_prefill_tensorops(
+        constant ds4_metal_args_mul_mm &args,
+        device const packed_ushort4 *weights,
+        device const packed_float4 *x,
+        device float *out,
+        uint2 group [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]]) {
+    constexpr int tokens = 32, channels = 64, depth = 32, threads = 128;
+    constexpr int packs = depth / 4;
+    const int first_token = group.x * tokens;
+    const int first_channel = group.y * channels;
+    const int valid_tokens = min(tokens, args.ne1 - first_token);
+    const int row_packs = args.ne00 / 4;
+
+    // Reuse the 8 KiB tile for the partial output after the last K barrier.
+    threadgroup float4 scratch[tokens * channels / 4];
+    threadgroup half4 *weight_tile = (threadgroup half4 *)scratch;
+    threadgroup half4 *input_tile = weight_tile + channels * packs;
+    auto w = tensor((threadgroup half *)weight_tile, dextents<int32_t, 2>(depth, channels));
+    auto a = tensor((threadgroup half *)input_tile, dextents<int32_t, 2>(depth, tokens));
+    matmul2d<matmul2d_descriptor(tokens, channels, depth, false, true, false,
+             matmul2d_descriptor::mode::multiply_accumulate), execution_simdgroups<4>> mm;
+    auto acc = mm.get_destination_cooperative_tensor<decltype(a), decltype(w), float>();
+    for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
+        if (acc.is_valid_element(i)) acc[i] = 0.0f;
+    }
+
+    for (int k = 0; k < row_packs; k += packs) {
+        #pragma unroll
+        for (int i = tid; i < channels * packs; i += threads) {
+            const ulong row = first_channel + i / packs;
+            const ushort4 bits = ushort4(weights[row * row_packs + k + i % packs]);
+            weight_tile[i] = half4(as_type<float4>(uint4(bits) << 16u));
+        }
+        #pragma unroll
+        for (int i = tid; i < tokens * packs; i += threads) {
+            const int token = i / packs;
+            const ulong row = first_token + token;
+            input_tile[i] = token < valid_tokens
+                ? half4(float4(x[row * row_packs + k + i % packs])) : half4(0.0h);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto lhs = a.slice(0, 0);
+        auto rhs = w.slice(0, 0);
+        mm.run(lhs, rhs, acc);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (valid_tokens == tokens) {
+        auto dst = tensor(out, dextents<int32_t, 2>(args.ne0, args.ne1));
+        auto tile = dst.slice(first_channel, first_token);
+        acc.store(tile);
+    } else {
+        // The cooperative tile has 32 rows even for the final 13 of a
+        // 45-token prompt. Scatter only real rows into the caller's buffer.
+        threadgroup float *tail_output = (threadgroup float *)scratch;
+        auto dst = tensor(tail_output, dextents<int32_t, 2>(channels, tokens));
+        auto tile = dst.slice(0, 0);
+        acc.store(tile);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int i = tid; i < valid_tokens * channels; i += threads) {
+            const ulong row = first_token + i / channels;
+            out[row * args.ne0 + first_channel + i % channels] = tail_output[i];
+        }
+    }
+}
+#endif
+
 struct k3_norm_args {
     uint width;
     uint n_rows;

@@ -183,6 +183,42 @@ and the lossless sidecar, the eight-step reference and experimental runs took
 29.40 and 34.74 s/token. Reversing the order for four steps gave 38.25 and
 36.60 s/token respectively. All compared FP32 logits matched bit for bit.
 
+### M5 Max BF16 prefill comparison
+
+On the tester's 128 GiB M5 Max, run the comparison from the repository root.
+
+```sh
+make -j4 ds4-bench test-k3-m5-bf16-tensorops
+python3 speed-bench/k3_m5_bf16_ab.py "/path/to/Kimi-K3-IQ2_XXS-Q2_K.gguf"
+```
+
+The runner uses the same binary for both kernels. It sets
+`K3_M5_BF16_TENSOROPS=0` for the reference and `=1` for the experimental
+prefill kernel. Each run formats the same 45-token chat prompt, generates
+32 greedy tokens, locks 64 GiB to simulate memory pressure, and uses a
+10 GiB expert cache, chunk 64 and direct GGUF streaming. The candidate log
+must confirm a TensorOps dispatch with 45 rows. The global Metal 4 startup
+message alone only describes device capability.
+
+The opt-in kernel uses TensorOps for BF16 projections with at least 32 rows,
+an input width divisible by 32 and an output width divisible by 64. It
+processes a partial final token tile, including the last 13 rows of this
+prompt. Single-token decode and quality mode use their existing kernels.
+The small Metal test checks aligned and partial tiles against both the
+reference kernel and CPU dot products before loading the model.
+
+Two speed runs produce `bench.csv` with prefill and generation throughput.
+The runner also prints the prefill evaluation time and mean decode time per
+token from the high-resolution timings in each log.
+Two separate runs dump the full-vocabulary logits after prefill and after
+each decode step. The runner prints the first differing generated token
+and writes `logits.csv` with the argmax IDs, bitwise FP32 equality, maximum
+absolute error and RMS error for each matching token history. Step 0 is
+the prompt frontier. The magnitude of numerical drift can be inspected
+even when the generated tokens agree.
+Each invocation prints its new results directory. Report the two speed CSVs,
+the candidate dispatch line and the logits comparison.
+
 A reproducible short generation check uses a 10 GiB expert cache, a 12 GiB
 host reserve, and approximately 131 MiB of additional decoder workspace
 accounted for before allocation. All existing memory checks remain active.

@@ -34,14 +34,18 @@ static int guards_intact(const uint8_t *bytes, uint64_t size,
     return 1;
 }
 
-static int test_shape_offset(uint32_t in_dim, uint32_t out_dim, bool misaligned) {
+static int test_shape_offset(uint32_t in_dim, uint32_t out_dim, bool misaligned,
+                             uint32_t tensorops_rows) {
     const bool tiled = k3_gpu_can_tile_bf16_prefill(in_dim, out_dim, 256);
-    const uint32_t max_rows = tiled ? (misaligned ? 44u : 256u) : 8u;
+    const uint32_t max_rows = tensorops_rows ? tensorops_rows :
+        tiled ? (misaligned ? 44u : 256u) : 8u;
     enum { MAX_ROWS = 256, INPUT_OFFSET = 64, OUTPUT_OFFSET = 128, GUARD = 128 };
     const uint64_t input_row = (uint64_t)in_dim * sizeof(float);
     const uint64_t output_row = (uint64_t)out_dim * sizeof(float);
     const uint64_t input_size = INPUT_OFFSET + max_rows * input_row + GUARD;
-    const uint64_t output_size = OUTPUT_OFFSET + max_rows * output_row + GUARD;
+    /* Keep a whole tile of sentinels after a partial TensorOps output. */
+    const uint64_t output_guard = tensorops_rows ? 32u * output_row : GUARD;
+    const uint64_t output_size = OUTPUT_OFFSET + max_rows * output_row + output_guard;
     const uint64_t weight_size = (uint64_t)in_dim * out_dim * sizeof(uint16_t);
     const long page = sysconf(_SC_PAGESIZE);
     uint64_t mapping_size = 0;
@@ -113,9 +117,10 @@ static int test_shape_offset(uint32_t in_dim, uint32_t out_dim, bool misaligned)
     const bool short_tiles = !prefill_setting || strcmp(prefill_setting, "1") == 0;
     const uint32_t tile_rows[] = {16, 40, 44, 48, 64, 256};
     CHECK(!k3_gpu_can_tile_bf16_prefill(in_dim, out_dim, 45));
-    const uint32_t cases = tiled ? sizeof(tile_rows) / sizeof(tile_rows[0]) : max_rows;
+    const uint32_t cases = tensorops_rows ? 1u :
+        tiled ? sizeof(tile_rows) / sizeof(tile_rows[0]) : max_rows;
     for (uint32_t i = 0; i < cases; ++i) {
-        const uint32_t rows = tiled ? tile_rows[i] : i + 1u;
+        const uint32_t rows = tensorops_rows ? tensorops_rows : tiled ? tile_rows[i] : i + 1u;
         if (misaligned && rows != max_rows) continue;
         if (tiled && rows != 256u) {
             CHECK(k3_gpu_can_tile_bf16_prefill(in_dim, out_dim, rows) == short_tiles);
@@ -132,15 +137,29 @@ static int test_shape_offset(uint32_t in_dim, uint32_t out_dim, bool misaligned)
             CHECK(k3_gpu_matmul_bf16(output, mapping, mapping_size, weight_offset,
                 in_dim, out_dim, input, rows));
         }
-        for (uint32_t row = 0; row < rows; row++) {
-            CHECK(k3_gpu_matmul_bf16(output_rows[row], mapping, mapping_size,
-                weight_offset, in_dim, out_dim, input_rows[row], 1));
+        if (tensorops_rows) {
+            /* Quality mode selects the existing simdgroup kernel for this
+             * projection with the same weights, activations and row count. */
+            ds4_gpu_set_quality(true);
+            ds4_gpu_tensor *reference = ds4_gpu_tensor_view(reference_base, OUTPUT_OFFSET,
+                                                            rows * output_row);
+            const int reference_ok = reference && k3_gpu_matmul_bf16(reference, mapping,
+                mapping_size, weight_offset, in_dim, out_dim, input, rows);
+            ds4_gpu_tensor_free(reference);
+            ds4_gpu_set_quality(false);
+            CHECK(reference_ok);
+        } else {
+            for (uint32_t row = 0; row < rows; row++) {
+                CHECK(k3_gpu_matmul_bf16(output_rows[row], mapping, mapping_size,
+                    weight_offset, in_dim, out_dim, input_rows[row], 1));
+            }
         }
         CHECK(ds4_gpu_end_commands());
         CHECK(ds4_gpu_tensor_read(output_base, 0, actual, output_size));
         CHECK(ds4_gpu_tensor_read(reference_base, 0, expected, output_size));
         CHECK(guards_intact(actual, output_size, OUTPUT_OFFSET, rows * output_row));
         CHECK(guards_intact(expected, output_size, OUTPUT_OFFSET, rows * output_row));
+        if (tensorops_rows) continue; /* Both batched results are checked below. */
         for (uint64_t i = 0; i < (uint64_t)rows * out_dim; i++) {
             uint32_t a, b;
             memcpy(&a, actual + OUTPUT_OFFSET + i * sizeof(float), sizeof(a));
@@ -157,14 +176,17 @@ static int test_shape_offset(uint32_t in_dim, uint32_t out_dim, bool misaligned)
      * mistakes that a comparison between two GPU calls could miss. */
     const uint32_t columns[] = {0, out_dim / 2u, out_dim - 1u};
     for (uint32_t row = 0; row < max_rows; row++) {
-        for (uint32_t sample = 0; sample < 3u; sample++) {
-            const uint32_t column = columns[sample];
+        for (uint32_t sample = 0; sample < (tensorops_rows ? out_dim : 3u); sample++) {
+            const uint32_t column = tensorops_rows ? sample : columns[sample];
             double sum = 0, absolute_sum = 0;
             for (uint32_t k = 0; k < in_dim; k++) {
                 const uint32_t bits = (uint32_t)weights[(uint64_t)column * in_dim + k] << 16;
                 float weight, x;
                 memcpy(&weight, &bits, sizeof(weight));
                 memcpy(&x, inputs + INPUT_OFFSET + row * input_row + k * sizeof(float), sizeof(x));
+                /* Both batched kernels narrow the operands to half and
+                 * accumulate in float. The generated BF16 weights fit half. */
+                if (tensorops_rows) x = (float)(__fp16)x;
                 const double product = (double)weight * x;
                 sum += product;
                 absolute_sum += fabs(product);
@@ -172,6 +194,13 @@ static int test_shape_offset(uint32_t in_dim, uint32_t out_dim, bool misaligned)
             float value;
             memcpy(&value, actual + OUTPUT_OFFSET + row * output_row + column * sizeof(float), sizeof(value));
             CHECK(fabs((double)value - sum) <= 4e-6 * absolute_sum + 1e-7);
+            if (tensorops_rows) {
+                float legacy;
+                memcpy(&legacy, expected + OUTPUT_OFFSET + row * output_row +
+                       column * sizeof(float), sizeof(legacy));
+                CHECK(fabs((double)legacy - sum) <= 4e-6 * absolute_sum + 1e-7);
+                CHECK(fabs((double)value - legacy) <= 4e-6 * absolute_sum + 1e-7);
+            }
         }
     }
     CHECK(ds4_gpu_tensor_read(input_base, 0, input_check, input_size));
@@ -204,13 +233,19 @@ cleanup:
 }
 
 static int test_shape(uint32_t in_dim, uint32_t out_dim) {
-    return test_shape_offset(in_dim, out_dim, false);
+    return test_shape_offset(in_dim, out_dim, false, 0);
 }
 
 int main(int argc, char **argv) {
     const bool resident = argc == 2 && strcmp(argv[1], "--resident") == 0;
-    if (argc > 2 || (argc == 2 && !resident)) {
-        fprintf(stderr, "usage: %s [--resident]\n", argv[0]);
+    uint32_t tensorops_rows = 0;
+    if (argc == 3 && !strcmp(argv[1], "--tensorops-rows")) {
+        if (!strcmp(argv[2], "32")) tensorops_rows = 32;
+        if (!strcmp(argv[2], "45")) tensorops_rows = 45;
+        if (!strcmp(argv[2], "64")) tensorops_rows = 64;
+    }
+    if (argc != 1 && !resident && !tensorops_rows) {
+        fprintf(stderr, "usage: %s [--resident | --tensorops-rows 32|45|64]\n", argv[0]);
         return 2;
     }
     /* Fix the dispatch configuration so an inherited tuning override cannot
@@ -219,6 +254,12 @@ int main(int argc, char **argv) {
         setenv("K3_BF16_MV_NSG", "4", 1)) return 1;
     ds4_gpu_set_ssd_streaming(!resident);
     if (!ds4_gpu_init()) return 1;
+    if (tensorops_rows) {
+        const int ok = test_shape_offset(256, 192, false, tensorops_rows);
+        ds4_gpu_cleanup();
+        if (ok) printf("K3 BF16 rows=%u: batched outputs and guards verified\n", tensorops_rows);
+        return ok ? 0 : 1;
+    }
     const int ok = test_shape(1024, 1024) && test_shape(1025, 1031) &&
                    test_shape(1024, 4096) && test_shape(1025, 4097) &&
                    test_shape(128, 17) && test_shape(128, 1031) &&
@@ -227,7 +268,7 @@ int main(int argc, char **argv) {
                     (test_shape(1536, 18432) && test_shape(7168, 12288) &&
                      test_shape(12288, 7168) &&
                      (!k3_gpu_can_tile_bf16_prefill(7168, 12288, 44) ||
-                      test_shape_offset(7168, 12288, true))));
+                      test_shape_offset(7168, 12288, true, 0))));
     ds4_gpu_cleanup();
     if (ok) puts("K3 BF16 batched rows match single-token projections exactly");
     return ok ? 0 : 1;
