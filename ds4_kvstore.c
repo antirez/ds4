@@ -474,6 +474,8 @@ bool ds4_kvstore_read_entry_file(const char *path, const char sha[41],
 static void kv_cache_refresh(ds4_kvstore *kc) {
     if (!kc->enabled) return;
     ds4_kvstore_clear(kc);
+    kc->foreign_files = 0;
+    kc->foreign_bytes = 0;
     DIR *d = opendir(kc->dir);
     if (!d) return;
     struct dirent *de;
@@ -482,7 +484,15 @@ static void kv_cache_refresh(ds4_kvstore *kc) {
         if (!ds4_kvstore_sha_hex_name(de->d_name, sha)) continue;
         char *path = ds4_kvstore_path_join(kc->dir, de->d_name);
         ds4_kvstore_entry e = {0};
-        if (ds4_kvstore_read_entry_file(path, sha, &e)) kv_cache_push(kc, e);
+        if (ds4_kvstore_read_entry_file(path, sha, &e)) {
+            if (kc->owned && e.model_id != kc->owner_model_id) {
+                kc->foreign_files++;
+                kc->foreign_bytes += e.file_size;
+                ds4_kvstore_entry_free(&e);
+            } else {
+                kv_cache_push(kc, e);
+            }
+        }
         free(path);
     }
     closedir(d);
@@ -612,13 +622,17 @@ void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
     }
 }
 
-bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
-                      bool reject_different_quant, ds4_kvstore_options opt,
-                      const char *log_name,
-                      void (*log)(void *ud, ds4_kvstore_log_type type, const char *msg),
-                      void *log_ud) {
+bool ds4_kvstore_open_owned(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
+                            bool reject_different_quant, ds4_kvstore_options opt,
+                            int owner_model_id, const char *log_name,
+                            void (*log)(void *ud, ds4_kvstore_log_type type, const char *msg),
+                            void *log_ud) {
     memset(kc, 0, sizeof(*kc));
     if (!dir) return false;
+    if (owner_model_id >= 0) {
+        kc->owned = true;
+        kc->owner_model_id = (uint8_t)owner_model_id;
+    }
     kc->log_name = log_name;
     kc->log = log;
     kc->log_ud = log_ud;
@@ -635,6 +649,14 @@ bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
     kc->reject_different_quant = reject_different_quant;
     kc->opt = opt;
     ds4_kvstore_evict(kc, NULL, 0, NULL);
+    if (kc->owned && kc->foreign_files > 0)
+        kv_logf(kc, DS4_KVSTORE_LOG_WARNING,
+                "%s: WARNING: KV cache directory %s holds %d file(s), %.2f MiB, written by another model (this server is model id %u). "
+                "They are left alone and not counted against the %llu MiB budget, but another server that shares the directory may delete this server's files. "
+                "Use a directory of its own for each model.",
+                kv_log_name(kc), dir, kc->foreign_files,
+                (double)kc->foreign_bytes / (1024.0 * 1024.0), (unsigned)kc->owner_model_id,
+                (unsigned long long)(kc->budget_bytes / (1024ull * 1024ull)));
     kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
             "%s: KV disk cache %s (budget=%llu MiB, cross-quant=%s, min=%d, cold_max=%d, continued=%d, trim=%d, align=%d, hit_half_life=%llus)",
             kv_log_name(kc),
@@ -648,6 +670,15 @@ bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
             kc->opt.boundary_align_tokens,
             (unsigned long long)DS4_KVSTORE_HIT_HALF_LIFE_SECONDS);
     return true;
+}
+
+bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
+                      bool reject_different_quant, ds4_kvstore_options opt,
+                      const char *log_name,
+                      void (*log)(void *ud, ds4_kvstore_log_type type, const char *msg),
+                      void *log_ud) {
+    return ds4_kvstore_open_owned(kc, dir, budget_mb, reject_different_quant, opt, -1,
+                                  log_name, log, log_ud);
 }
 
 void ds4_kvstore_close(ds4_kvstore *kc) {
@@ -846,6 +877,19 @@ static bool kv_cache_file_text_matches(const char *path, const char sha[41],
     return ok;
 }
 
+/* A file of another model sits under this key (owned stores only).  The caller must not store, and nothing may delete it. */
+bool ds4_kvstore_key_held_by_other_model(const ds4_kvstore *kc, const char sha[41]) {
+    if (!kc || !kc->owned) return false;
+    char name[48];
+    snprintf(name, sizeof(name), "%.40s.kv", sha);
+    char *path = ds4_kvstore_path_join(kc->dir, name);
+    ds4_kvstore_entry e = {0};
+    const bool held = ds4_kvstore_read_entry_file(path, sha, &e) && e.model_id != kc->owner_model_id;
+    ds4_kvstore_entry_free(&e);
+    free(path);
+    return held;
+}
+
 static bool kv_cache_existing_compatible(ds4_kvstore *kc, const char *path,
                                          const char sha[41],
                                          const char *text, size_t text_len,
@@ -1000,6 +1044,15 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     char *path = ds4_kvstore_path_for_sha(kc, sha);
     const uint8_t reason_code = ds4_kvstore_reason_code(reason);
 
+    if (ds4_kvstore_key_held_by_other_model(kc, sha)) {
+        kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                "%s: kv cache skipped tokens=%d reason=%s because %s holds a file of another model under the same key (left alone)",
+                kv_log_name(kc), store_tokens.len, reason, path);
+        free(text);
+        free(path);
+        ds4_tokens_free(&store_tokens);
+        return false;
+    }
     if (kv_cache_existing_compatible(kc, path, sha, text, text_len,
                                      model_id,
                                      quant_bits, ds4_session_ctx(session))) {

@@ -69,6 +69,13 @@ typedef struct {
     char *dir;
     uint64_t budget_bytes;
     bool reject_different_quant;
+    /* Owner guard (ds4_kvstore_open_owned): when owned, only files whose header model id equals owner_model_id are listed,
+     * evicted or replaced.  Files of any other model are left alone and only counted here.  A zero-initialised store is
+     * not owned and behaves as before. */
+    bool owned;
+    uint8_t owner_model_id;
+    int foreign_files;
+    uint64_t foreign_bytes;
     ds4_kvstore_options opt;
     int continued_last_store_tokens;
     ds4_kvstore_entry *entry;
@@ -115,6 +122,14 @@ bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
                       const char *log_name,
                       void (*log)(void *ud, ds4_kvstore_log_type type, const char *msg),
                       void *log_ud);
+/* Same as ds4_kvstore_open, but this store belongs to one model id (ds4_engine_model_id): files written by another model in
+ * the same directory are never deleted, evicted, replaced or loaded, and a warning names them at open. */
+bool ds4_kvstore_open_owned(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
+                            bool reject_different_quant, ds4_kvstore_options opt,
+                            int owner_model_id, const char *log_name,
+                            void (*log)(void *ud, ds4_kvstore_log_type type, const char *msg),
+                            void *log_ud);
+bool ds4_kvstore_key_held_by_other_model(const ds4_kvstore *kc, const char sha[41]);
 void ds4_kvstore_close(ds4_kvstore *kc);
 void ds4_kvstore_clear(ds4_kvstore *kc);
 void ds4_kvstore_entry_free(ds4_kvstore_entry *e);

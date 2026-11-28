@@ -11178,9 +11178,10 @@ static void kv_cache_log_cb(void *ud, ds4_kvstore_log_type type, const char *msg
 }
 
 static bool kv_cache_open(kv_disk_cache *kc, const char *dir, uint64_t budget_mb,
-                          bool reject_different_quant, kv_cache_options opt) {
-    return ds4_kvstore_open(kc, dir, budget_mb, reject_different_quant, opt,
-                            "ds4-server", kv_cache_log_cb, NULL);
+                          bool reject_different_quant, kv_cache_options opt,
+                          int owner_model_id) {
+    return ds4_kvstore_open_owned(kc, dir, budget_mb, reject_different_quant, opt,
+                                  owner_model_id, "ds4-server", kv_cache_log_cb, NULL);
 }
 
 static void kv_cache_close(kv_disk_cache *kc) {
@@ -16020,7 +16021,8 @@ int main(int argc, char **argv) {
 
     if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
-                      cfg.kv_cache_reject_different_quant, cfg.kv_cache);
+                      cfg.kv_cache_reject_different_quant, cfg.kv_cache,
+                      ds4_engine_model_id(engine));
     }
     if (s.disable_exact_dsml_tool_replay) {
         server_log(DS4_LOG_DEFAULT,
@@ -22068,6 +22070,102 @@ static void test_kv_cache_eviction_values_fresh_snapshots(void) {
     rmdir(dir);
 }
 
+static int test_kv_owner_warnings;
+static void test_kv_owner_log(void *ud, ds4_kvstore_log_type type, const char *msg) {
+    (void)ud;
+    if (type == DS4_KVSTORE_LOG_WARNING && strstr(msg, "another model")) test_kv_owner_warnings++;
+}
+
+static bool test_kv_exists(const char *dir, const char *text) {
+    char sha[41], name[48];
+    sha1_bytes_hex(text, strlen(text), sha);
+    snprintf(name, sizeof(name), "%.40s.kv", sha);
+    char *path = path_join(dir, name);
+    const bool ok = access(path, F_OK) == 0;
+    free(path);
+    return ok;
+}
+
+static void test_kv_remove_all(const char *dir, const char *const *texts, int n) {
+    for (int i = 0; i < n; i++) {
+        char sha[41], name[48];
+        sha1_bytes_hex(texts[i], strlen(texts[i]), sha);
+        snprintf(name, sizeof(name), "%.40s.kv", sha);
+        char *path = path_join(dir, name);
+        unlink(path);
+        free(path);
+    }
+    rmdir(dir);
+}
+
+/* A server only evicts, replaces and counts the files of its own model id.  Files of another model (here ids 6 and 7: two
+ * servers of different models sharing one directory) are left alone, counted separately, and named in a warning at open. */
+static void test_kv_cache_owner_guard_leaves_foreign_files(void) {
+    char tmpl[] = "/tmp/ds4-kv-owner-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    const char *texts[] = {"foreign one", "foreign two", "same key", "own one", "own two"};
+    test_kv_text_stub_file_model(dir, texts[0], 6, KV_REASON_COLD, 2048, 4096);
+    test_kv_text_stub_file_model(dir, texts[1], 6, KV_REASON_COLD, 2048, 4096);
+    test_kv_text_stub_file_model(dir, texts[2], 6, KV_REASON_COLD, 2048, 4096);
+    test_kv_text_stub_file_model(dir, texts[3], 7, KV_REASON_COLD, 2048, 4096);
+    test_kv_text_stub_file_model(dir, texts[4], 7, KV_REASON_COLD, 2048, 4096);
+
+    /* control: a store that is not owned behaves as before and evicts by score whoever wrote the file */
+    kv_disk_cache plain = {0};
+    plain.enabled = true;
+    plain.dir = xstrdup(dir);
+    plain.opt = kv_cache_default_options();
+    plain.budget_bytes = (KV_CACHE_FIXED_HEADER + 4u + 4096u + 12u) * 2u;
+    kv_cache_evict(&plain, NULL, 0, NULL);
+    int left = 0;
+    for (int i = 0; i < 5; i++) left += test_kv_exists(dir, texts[i]);
+    TEST_ASSERT(left == 2);   /* 5 files, room for 2: three are deleted, foreign ones included */
+    TEST_ASSERT(plain.foreign_files == 0);
+    kv_cache_close(&plain);
+    /* rewrite whatever the control deleted */
+    test_kv_text_stub_file_model(dir, texts[0], 6, KV_REASON_COLD, 2048, 4096);
+    test_kv_text_stub_file_model(dir, texts[1], 6, KV_REASON_COLD, 2048, 4096);
+    test_kv_text_stub_file_model(dir, texts[2], 6, KV_REASON_COLD, 2048, 4096);
+    test_kv_text_stub_file_model(dir, texts[3], 7, KV_REASON_COLD, 2048, 4096);
+    test_kv_text_stub_file_model(dir, texts[4], 7, KV_REASON_COLD, 2048, 4096);
+
+    /* owner = model 7, room for one file: the opening eviction removes one of its own two files, nothing else */
+    test_kv_owner_warnings = 0;
+    kv_disk_cache kc = {0};
+    kc.opt = kv_cache_default_options();
+    TEST_ASSERT(ds4_kvstore_open_owned(&kc, dir, 1, false, kc.opt, 7, "test", test_kv_owner_log, NULL));
+    TEST_ASSERT(test_kv_owner_warnings == 1);
+    TEST_ASSERT(kc.foreign_files == 3);
+    TEST_ASSERT(test_kv_exists(dir, texts[0]) && test_kv_exists(dir, texts[1]) && test_kv_exists(dir, texts[2]));
+    kc.budget_bytes = KV_CACHE_FIXED_HEADER + 4u + 4096u + 12u;
+    kv_cache_evict(&kc, NULL, 0, NULL);
+    TEST_ASSERT(test_kv_exists(dir, texts[0]) && test_kv_exists(dir, texts[1]) && test_kv_exists(dir, texts[2]));
+    TEST_ASSERT(test_kv_exists(dir, texts[3]) + test_kv_exists(dir, texts[4]) == 1);
+    TEST_ASSERT(kc.len == 1 && kc.foreign_files == 3);
+    kc.budget_bytes = 1;     /* even a cap nothing fits under leaves the foreign files alone */
+    kv_cache_evict(&kc, NULL, 0, NULL);
+    TEST_ASSERT(test_kv_exists(dir, texts[0]) && test_kv_exists(dir, texts[1]) && test_kv_exists(dir, texts[2]));
+    TEST_ASSERT(kc.len == 0);
+    /* a foreign file under a key this server wants to store is reported, so the store skips instead of replacing it */
+    char sha[41];
+    sha1_bytes_hex(texts[2], strlen(texts[2]), sha);
+    TEST_ASSERT(ds4_kvstore_key_held_by_other_model(&kc, sha));
+    sha1_bytes_hex(texts[3], strlen(texts[3]), sha);
+    TEST_ASSERT(!ds4_kvstore_key_held_by_other_model(&kc, sha));
+    kv_cache_close(&kc);
+
+    /* the same directory seen by the other model: its files are the foreign ones now */
+    test_kv_owner_warnings = 0;
+    kv_disk_cache qk = {0};
+    qk.opt = kv_cache_default_options();
+    TEST_ASSERT(ds4_kvstore_open_owned(&qk, dir, 1, false, qk.opt, 6, "test", test_kv_owner_log, NULL));
+    TEST_ASSERT(qk.len == 3 && qk.foreign_files == 0 && test_kv_owner_warnings == 0);
+    kv_cache_close(&qk);
+    test_kv_remove_all(dir, texts, 5);
+}
+
 static void test_kv_cache_eviction_prefers_anchor_reason(void) {
     char tmpl[] = "/tmp/ds4-kv-anchor-reason-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -23179,6 +23277,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_lookup_rejects_stale_payload_abi();
     test_kv_cache_eviction_values_fresh_snapshots();
     test_kv_cache_eviction_prefers_anchor_reason();
+    test_kv_cache_owner_guard_leaves_foreign_files();
     test_kv_cache_eviction_makes_room_before_store();
     test_kv_cache_eviction_ignores_oversize_incoming();
     test_kv_cache_eviction_prefers_superseded_continued_prefix();
