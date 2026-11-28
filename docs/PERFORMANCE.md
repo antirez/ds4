@@ -70,3 +70,10 @@ Historical PRO Q2 measurements on the M3 Ultra are retained in this chart:
 Recent focused TP and DSpark comparisons, including their limitations, live in
 [QA_BEFORE_RELEASES.md](../QA_BEFORE_RELEASES.md). Use its speed-regression
 procedure rather than accumulating one-off timings in the main README.
+
+## Inkling 2 Mini (Metal, NVFP4)
+
+Measured on an M3 Ultra against llama.cpp in the same session (decode 59.4 vs 34.8 t/s at a short context, prefill 764 vs 667 t/s);
+method, kernels and accuracy limits are in [INKLING2.md](INKLING2.md#speed). Decode speed falls with context depth (61 t/s at
+8 tokens, 56 at 6.8k, 50 at 29k, 43 at 59k; table in INKLING2.md). Run `tests/inkling2_gpu/speed.py decode 5`, `prefill 5` and
+`tests/inkling2_gpu/depth.py 6700,32000,65000` with the other GPU tenants idle, and check any other server's log before and after each run.
