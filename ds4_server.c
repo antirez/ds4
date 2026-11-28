@@ -767,6 +767,14 @@ typedef struct {
     tool_calls calls;
     tool_result_span *tool_results;
     int tool_results_len;
+    /* Parser bookkeeping so that appending a content block, noting a tool call id or a tool result costs O(1) instead of a copy of
+     * everything before it (a message with thousands of blocks was quadratic).  content_len/content_cap describe `content` only
+     * while content_tag == content; the Anthropic content parser resets them when it is done. */
+    size_t content_len, content_cap;
+    const char *content_tag;
+    int *id_tab;
+    int id_tab_cap;
+    int tool_results_cap;
 } chat_msg;
 
 typedef struct {
@@ -880,11 +888,45 @@ static void tool_calls_push(tool_calls *calls, tool_call tc) {
     calls->v[calls->len++] = tc;
 }
 
+static uint64_t chat_id_hash(const char *s) {
+    uint64_t h = 1469598103934665603ull;
+    for (; *s; s++) { h ^= (unsigned char)*s; h *= 1099511628211ull; }
+    return h;
+}
+
+static void chat_msg_id_tab_rebuild(chat_msg *m, int cap) {
+    free(m->id_tab);
+    m->id_tab = xmalloc((size_t)cap * sizeof(m->id_tab[0]));
+    memset(m->id_tab, 0, (size_t)cap * sizeof(m->id_tab[0]));
+    m->id_tab_cap = cap;
+    for (int i = 0; i < m->tool_call_ids_len; i++) {
+        size_t k = (size_t)(chat_id_hash(m->tool_call_ids[i]) & (uint64_t)(cap - 1));
+        while (m->id_tab[k]) k = (k + 1) & (size_t)(cap - 1);
+        m->id_tab[k] = i + 1;
+    }
+}
+
 static void chat_msg_add_tool_call_id(chat_msg *m, const char *id) {
     if (!m || !id || !id[0]) return;
     if (!m->tool_call_id) m->tool_call_id = xstrdup(id);
-    for (int i = 0; i < m->tool_call_ids_len; i++) {
-        if (m->tool_call_ids[i] && !strcmp(m->tool_call_ids[i], id)) return;
+    size_t slot = 0;
+    if (m->tool_call_ids_len < 8) {
+        for (int i = 0; i < m->tool_call_ids_len; i++) {
+            if (m->tool_call_ids[i] && !strcmp(m->tool_call_ids[i], id)) return;
+        }
+    } else {
+        /* many ids: a hash table of indexes keeps the duplicate check O(1) */
+        if (!m->id_tab || (m->tool_call_ids_len + 1) * 2 > m->id_tab_cap) {
+            int cap = 32;
+            while (cap < (m->tool_call_ids_len + 1) * 4) cap *= 2;
+            chat_msg_id_tab_rebuild(m, cap);
+        }
+        slot = (size_t)(chat_id_hash(id) & (uint64_t)(m->id_tab_cap - 1));
+        while (m->id_tab[slot]) {
+            const char *seen = m->tool_call_ids[m->id_tab[slot] - 1];
+            if (seen && !strcmp(seen, id)) return;
+            slot = (slot + 1) & (size_t)(m->id_tab_cap - 1);
+        }
     }
     if (m->tool_call_ids_len == m->tool_call_ids_cap) {
         m->tool_call_ids_cap = m->tool_call_ids_cap ? m->tool_call_ids_cap * 2 : 2;
@@ -892,6 +934,7 @@ static void chat_msg_add_tool_call_id(chat_msg *m, const char *id) {
             (size_t)m->tool_call_ids_cap * sizeof(m->tool_call_ids[0]));
     }
     m->tool_call_ids[m->tool_call_ids_len++] = xstrdup(id);
+    if (m->id_tab) m->id_tab[slot] = m->tool_call_ids_len;
 }
 
 static void chat_msg_free(chat_msg *m) {
@@ -908,6 +951,7 @@ static void chat_msg_free(chat_msg *m) {
         free(m->tool_results[i].content);
     }
     free(m->tool_results);
+    free(m->id_tab);
     memset(m, 0, sizeof(*m));
 }
 
@@ -2032,6 +2076,32 @@ bad:
     return false;
 }
 
+/* Content of the message being parsed by the Anthropic content parser: O(1) amortised appends. */
+static size_t chat_msg_content_len(chat_msg *m) {
+    if (!m->content) return 0;
+    if (m->content_tag != m->content) { m->content_len = strlen(m->content); m->content_cap = m->content_len + 1; m->content_tag = m->content; }
+    return m->content_len;
+}
+
+static void chat_msg_content_append(chat_msg *m, const char *s, size_t n) {
+    const size_t len = chat_msg_content_len(m);
+    if (!m->content || m->content_cap < len + n + 1) {
+        size_t cap = (len + n + 1) * 2;
+        if (cap < 64) cap = 64;
+        m->content = xrealloc(m->content, cap);
+        m->content_cap = cap;
+    }
+    if (n) memcpy(m->content + len, s, n);
+    m->content[len + n] = '\0';
+    m->content_len = len + n;
+    m->content_tag = m->content;
+}
+
+static void chat_msg_content_done(chat_msg *m) {
+    m->content_len = m->content_cap = 0;
+    m->content_tag = NULL;
+}
+
 static bool parse_openai_content(const char **p, chat_msg *msg) {
     json_ws(p);
     if (**p == '"') {
@@ -2312,21 +2382,24 @@ static bool parse_anthropic_content_block(const char **p, bool allow_tools, chat
         }
         chat_msg_add_tool_call_id(msg, id);
         buf b = {0};
-        buf_puts(&b, msg->content ? msg->content : "");
-        const size_t begin = b.len;
         buf_puts(&b, "<tool_result>");
         append_tool_result_text(&b, nested.content);
         buf_puts(&b, "</tool_result>");
+        const size_t begin = chat_msg_content_len(msg);
+        chat_msg_content_append(msg, b.ptr, b.len);
+        const size_t end = begin + b.len;
+        buf_free(&b);
         /* Preserve parsed boundaries, not just markup which ordinary user
          * text can also contain. V4.1 orders and separates these blocks. */
-        msg->tool_results = xrealloc(msg->tool_results,
-            (size_t)(msg->tool_results_len + 1) * sizeof(msg->tool_results[0]));
+        if (msg->tool_results_len == msg->tool_results_cap) {
+            msg->tool_results_cap = msg->tool_results_cap ? msg->tool_results_cap * 2 : 4;
+            msg->tool_results = xrealloc(msg->tool_results,
+                (size_t)msg->tool_results_cap * sizeof(msg->tool_results[0]));
+        }
         msg->tool_results[msg->tool_results_len++] = (tool_result_span){
-            .begin = begin, .end = b.len, .id = id ? xstrdup(id) : NULL,
+            .begin = begin, .end = end, .id = id ? xstrdup(id) : NULL,
             .content = nested.content};
         nested.content = NULL;
-        free(msg->content);
-        msg->content = buf_take(&b);
         if (nested.images.len) {
             size_t total = msg->images.len + nested.images.len;
             msg->images.v = xrealloc(msg->images.v, total * sizeof(msg->images.v[0]));
@@ -2342,14 +2415,11 @@ static bool parse_anthropic_content_block(const char **p, bool allow_tools, chat
             !server_image_inputs_push_base64(&msg->images, media_type,
                                              image_data, marker))
             goto bad;
-        append_owned_text(&msg->content, marker);
+        chat_msg_content_append(msg, marker, strlen(marker));
     } else {
         if (text) {
-            buf b = {0};
-            buf_puts(&b, msg->content ? msg->content : "");
-            append_anthropic_block_content(&b, text);
-            free(msg->content);
-            msg->content = buf_take(&b);
+            if (!msg->content) msg->content = xstrdup("");
+            if (text[0]) chat_msg_content_append(msg, text, strlen(text));
         }
         if (thinking) {
             buf b = {0};
@@ -2399,11 +2469,8 @@ static bool parse_anthropic_content(const char **p, chat_msg *msg, bool allow_to
         if (**p == '"') {
             char *s = NULL;
             if (!json_string(p, &s)) return false;
-            buf b = {0};
-            buf_puts(&b, msg->content ? msg->content : "");
-            buf_puts(&b, s);
-            free(msg->content);
-            msg->content = buf_take(&b);
+            if (!msg->content) msg->content = xstrdup("");
+            chat_msg_content_append(msg, s, strlen(s));
             free(s);
         } else if (**p == '{') {
             if (!parse_anthropic_content_block(p, allow_tools, msg)) return false;
@@ -2417,6 +2484,7 @@ static bool parse_anthropic_content(const char **p, chat_msg *msg, bool allow_to
     if (**p != ']') return false;
     (*p)++;
     if (!msg->content) msg->content = xstrdup("");
+    chat_msg_content_done(msg);
     return true;
 }
 
@@ -18242,6 +18310,51 @@ static void test_reasoning_effort_mapping(void) {
                                            (int)ds4_think_max_min_context()) == DS4_THINK_MAX);
 }
 
+/* A message with thousands of Anthropic content blocks parses in linear time: every block used to copy the whole content
+ * before it, and every tool call id was checked against all earlier ones. */
+static void test_anthropic_many_blocks_parse_linear(void) {
+    double t[2] = {0, 0};
+    const int ns[2] = {8000, 32000};
+    for (int w = 0; w < 2; w++) {
+        const int n = ns[w];
+        buf b = {0};
+        buf_puts(&b, "[{\"role\":\"user\",\"content\":\"go\"},{\"role\":\"assistant\",\"content\":[");
+        for (int i = 0; i < n; i++) buf_printf(&b, "%s{\"type\":\"tool_use\",\"id\":\"toolu_%d\",\"name\":\"f\",\"input\":{}}", i ? "," : "", i);
+        buf_puts(&b, "]},{\"role\":\"user\",\"content\":[");
+        for (int i = 0; i < n; i++) buf_printf(&b, "%s{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_%d\",\"content\":\"result %d\"},{\"type\":\"text\",\"text\":\"note %d\"}", i ? "," : "", i, i, i);
+        buf_puts(&b, "]}]");
+        chat_msgs msgs = {0};
+        const char *p = b.ptr;
+        const double t0 = now_sec();
+        const bool ok = parse_anthropic_messages(&p, &msgs);
+        t[w] = now_sec() - t0;
+        TEST_ASSERT(ok && msgs.len == 3);
+        if (ok && msgs.len == 3) {
+            TEST_ASSERT(msgs.v[1].calls.len == n && msgs.v[2].tool_call_ids_len == n);   /* tool_result ids are noted on the user message */
+            const chat_msg *u = &msgs.v[2];
+            TEST_ASSERT(u->tool_results_len == n);
+            if (u->tool_results_len == n) {   /* the spans still point at their own text */
+                const tool_result_span *r = &u->tool_results[n - 1];
+                TEST_ASSERT(r->end <= strlen(u->content) && !strncmp(u->content + r->begin, "<tool_result>", 13));
+                TEST_ASSERT(strstr(u->content + r->end, "note") == u->content + r->end);
+            }
+        }
+        chat_msgs_free(&msgs);
+        buf_free(&b);
+    }
+    TEST_ASSERT(t[1] < 0.6);
+    TEST_ASSERT(t[1] < 8.0 * (t[0] + 0.005));    /* 4x the blocks: linear is 4x, quadratic 16x */
+    chat_msg m = {0};
+    for (int rep = 0; rep < 2; rep++)
+        for (int i = 0; i < 200; i++) {
+            char id[32];
+            snprintf(id, sizeof(id), "toolu_%d", i);
+            chat_msg_add_tool_call_id(&m, id);
+        }
+    TEST_ASSERT(m.tool_call_ids_len == 200);
+    chat_msg_free(&m);
+}
+
 static void test_model_alias_thinking_controls(void) {
     TEST_ASSERT(model_alias_disables_thinking("deepseek-chat"));
     TEST_ASSERT(model_alias_disables_thinking("glm-5.2-chat"));
@@ -23211,6 +23324,7 @@ static void ds4_server_unit_tests_run(void) {
     test_render_preserves_reasoning_with_tools();
     test_render_chat_prompt_text_renders_tools_before_system();
     test_render_glm_chat_prompt_text();
+    test_anthropic_many_blocks_parse_linear();
     test_render_qwen_chat_prompt_text();
     test_render_qwen_tool_round_trip();
     test_qwen_tool_visible_checkpoint_boundary();
