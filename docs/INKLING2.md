@@ -14,7 +14,7 @@ directly from llama.cpp's GGUF: same tensor names, metadata under `inkling2_loop
 `ds4.c` only has the family hooks (a few lines each, all inert unless `general.architecture == inkling2_loop`).
 Supported: `--metal` generation (`--raw-prompt` only: the chat template is not merged), `--first-token-test` on
 `--metal` or `--cpu`, `--inspect`. Several sessions per server (`--batched-session N`, up to 8 decoded in one GPU pass), disk KV
-snapshots (`--kv-disk-dir`) and `--ctx 262144` work (see "Several sessions, disk KV, 262,144 tokens" below). Refused with a message:
+snapshots (`--kv-disk-dir`) and contexts of 307,200 tokens per session work (see "Several sessions, disk KV, 262,144 tokens" and "About 300,000 tokens per session" below). Refused with a message:
 speculative/MTP decoding, vision, CUDA/ROCm, distributed/TP, SSD streaming.
 
 ## Files that load
@@ -214,9 +214,17 @@ differs earlier (an edited or dropped older turn), or two conversations alternat
 ```sh
 cd /path/to/ds4      # Metal sources are read from ./metal at start
 DS4_LOCK_FILE=/tmp/ds4-inkling.lock ./ds4-server -m Inkling-2-Mini-NVFP4.gguf --metal \
-    --host 127.0.0.1 --port 8001 --ctx 65536 --batched-session 8 \
-    --kv-disk-dir /path/to/inkling-kv --kv-disk-space-mb 20000
+    --host 127.0.0.1 --port 8001 --ctx 307200 --batched-session 4 \
+    --kv-disk-dir /path/to/inkling-kv --kv-disk-space-mb 60000
 ```
+
+**Suggested default: 4 sessions of 307,200 tokens** (the model card allows 1,048,576, which was not tried). The alternative for many
+short conversations is `--ctx 65536 --batched-session 8` with `--kv-disk-space-mb 20000`. The trade-off: 4 x 307,200 gives each of 4
+concurrent conversations room for about 300,000 tokens and costs 39 GB of process footprint (10 GB per session) plus the 16.4 GiB
+mapped model, while 8 x 65,536 serves 8 conversations of at most 65,536 tokens in 23 GiB of state plus the model. A further concurrent
+conversation waits for a free session in either setup. A disk KV file of a deep conversation is large (about 9.7 GB for 290,000
+tokens), so give `--kv-disk-space-mb` room for a few of them; decode and prefill slow down with depth (see "About 300,000 tokens
+per session").
 
 * **Set `DS4_LOCK_FILE` to a path of its own when another ds4 server runs on the machine.** The default is `/tmp/ds4.lock`:
   an Inkling server on the default lock either refuses to start while the other server runs or, started first, keeps the other
@@ -227,13 +235,17 @@ DS4_LOCK_FILE=/tmp/ds4-inkling.lock ./ds4-server -m Inkling-2-Mini-NVFP4.gguf --
   naming how many there are. That protects them from this server only: a server of an older build still counts and evicts
   everything in its directory, so never point two servers at one directory.
 * Use a port of its own (8001 above).
-* **Size the state to fit.** One session of 262,144 tokens costs 8.9 GiB, so 8 sessions at `--ctx 262144` need 87 GiB plus the
-  model. The start check looks at what is free: it refuses when the sessions plus the mapped model would leave less than 40% of
-  RAM free (`DS4_INKLING2_FREE_FLOOR_PCT`, default 40; the fixed budget `DS4_INKLING2_BUDGET_GB`, default half of RAM, still
-  applies and the log prints both). `--ctx 65536 --batched-session 8` is 23 GiB of state plus the 16.4 GiB mapped model.
+* **Size the state to fit.** One session of 307,200 tokens costs 10.24 GiB (estimate; 10,270 MiB allocated; process footprint
+  10 GB for one session, 39 GB for four, 42 GB after requests), so 8 sessions at `--ctx 307200` would need 98.4 GiB in all. The start
+  check looks at what is free: it refuses when the sessions plus the mapped model would leave less than 40% of RAM free
+  (`DS4_INKLING2_FREE_FLOOR_PCT`, default 40; the fixed budget `DS4_INKLING2_BUDGET_GB`, default half of RAM, still applies and
+  the log prints both). On a 256 GB machine with 70% free it printed "98.37 GiB would leave 80.8 GiB free, under the 40% floor
+  (102.4 GiB)" for 8 x 307,200; that size starts only when about 78% of RAM is free. 4 x 307,200 (57.4 GiB in all) started at 66% free.
+  One session of 262,144 tokens costs 8.9 GiB, so 8 sessions at `--ctx 262144` need 87 GiB plus the model.
+  `--ctx 65536 --batched-session 8` is 23 GiB of state plus the 16.4 GiB mapped model.
 * **A memory cap tool may not see the model.** The 16.8 GiB NVFP4 file is mapped, not read: a process monitor that counts
   resident memory reports far less than the real footprint. With a cap tool that does count mapped memory, set it to the
-  footprint of the configuration: about 48 GB for 8 x 65,536.
+  footprint of the configuration: about 48 GB for 8 x 65,536, about 64 GB for 4 x 307,200.
 * **It shares the GPU with the other server.** While Inkling prefilled 9,177 tokens, a tiny request to another ds4 server on the
   same GPU took 0.9 s instead of 0.68 s and one of its decode steps took 63-67 ms instead of 22 ms (three probes, not a
   distribution); Inkling itself was not slowed. Long Inkling prefills during the other server's traffic are the thing to avoid.
@@ -258,10 +270,10 @@ Save as `~/Library/LaunchAgents/<label>.plist` (or a LaunchDaemon), edit the pat
     <string>--metal</string>
     <string>--host</string><string>127.0.0.1</string>
     <string>--port</string><string>8001</string>
-    <string>--ctx</string><string>65536</string>
-    <string>--batched-session</string><string>8</string>
+    <string>--ctx</string><string>307200</string>
+    <string>--batched-session</string><string>4</string>
     <string>--kv-disk-dir</string><string>/path/to/inkling-kv</string>
-    <string>--kv-disk-space-mb</string><string>20000</string>
+    <string>--kv-disk-space-mb</string><string>60000</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
@@ -280,15 +292,18 @@ Save as `~/Library/LaunchAgents/<label>.plist` (or a LaunchDaemon), edit the pat
 
 Notes: keep `KeepAlive` with a `ThrottleInterval`: the start check exits with code 1 when memory is short, and launchd
 would otherwise restart it every 10 s. If the job starts at boot together with other GPU jobs, the start check sees what they
-have already taken.
+have already taken. With a memory cap wrapper, put the wrapper in `ProgramArguments` before `ds4-server` and give it 64 GB for this
+configuration (see the memory-cap note above).
 
 ### Limits
 
 * Without `--batched-session` there is one session: requests queue, and two alternating conversations never reuse the cache (one kept prompt state). With `--batched-session N` every slot keeps its own cache.
 * No images or audio.
-* Tested context depth: server behaviour to 16,384 tokens (`--ctx 16384`); decode speed measured to about 59,000 tokens of context
-  (and 65,000 and 81,920 in separate speed-only runs); output past 16k tokens was only checked to be sensible text. Parity against the CPU oracle: up to
-  9,008 tokens. Deep context was measured to 221,760 tokens (table below) and parity at 29,393 tokens.
+* Context per session: up to 307,200 tokens tested (see "About 300,000 tokens per session"); one session of 1,048,576 (the model card)
+  would need about 33 GiB of state and was not tried.
+* Tested context depth: server behaviour to 16,384 tokens (`--ctx 16384`) and the 290k-token needle test below; decode speed measured to about
+  59,000 tokens of context in the table (and 65,000 and 81,920 in separate speed-only runs, 290,000 in the needle run). Parity against the CPU oracle:
+  up to 9,008 tokens (29,393 for a deeper check).
 * Decode slows with depth, see the table below.
 
 ### Decode speed by context depth
@@ -480,3 +495,32 @@ python3 tests/inkling2_server/logprobs.py --port 8001 --ref llama_lp.json
 python3 tests/inkling2_server/sdk_roundtrip.py --port 8001   # anthropic and openai SDK tool round trips (needs both SDKs)
 python3 tests/inkling2_api_tokens.py capture --log LLAMA.log --out refs && python3 tests/inkling2_api_tokens.py compare --refs refs --model MODEL.gguf
 ```
+
+## About 300,000 tokens per session
+
+`--ctx 307200`. A code read found no cap at or below 262,144: the K/V and tensor offsets in the Metal kernels are 64-bit (`ulong`) products,
+the row counts are 32-bit but stay under 2^20, the position factor tau(pos) = 1 + 0.1 ln(max(1, pos/8192)) has no ceiling, and the disk KV
+payload sizes are 64-bit (a 290,000-token file is 9.7 GB, past 4 GiB). Nothing had to change.
+
+**Memory** (M3 Ultra, 256 GB, next to another busy server). One session at 307,200 allocates 10,270 MiB of tensors (estimate 10.24 GiB) and
+the process footprint is 10 GB; four sessions allocate 4 x 10,270 MiB, footprint 39 GB right after start and 42 GB after a few requests;
+the mapped model (16.4 GiB) comes on top and is not in either number. Free memory went from 66% to 59% at the start of the four
+sessions. Eight sessions are refused by the start check unless about 78% of RAM is free (see "Size the state to fit").
+
+**Boundary.** A prompt of exactly `--ctx` tokens and one of `--ctx` + 1 are refused with HTTP 400 (`context_length_exceeded`, no prefill);
+a prompt of ctx - 1 = 307,199 tokens is accepted and one token can be generated (position reaches 307,200). Prefill of the 307,199-token
+prompt: 1,023 s (300 tokens/s on average).
+
+**Needle recall at depth** (289,748 prompt tokens of Python standard-library documentation, five notes "the access code for vault NAME
+is CODE" at 10, 30, 50, 70 and 90% of the text, then a question for the five codes; greedy, chat endpoint, `reasoning_effort none`,
+NVFP4 file, one session). Both ds4 and llama.cpp (e8d7128, `llama-server -ngl 99 -np 1`, same file and prompt) answered all five codes
+correctly (`Alpha: TANGERINE-4821`, `Bravo: LANTERN-7305`, `Charlie: MARBLE-1194`, `Delta: COBALT-6672`, `Echo: SADDLE-9058`). The first 10
+generated tokens are the same; the top-20 log-probabilities of the chosen tokens differ by less than 0.08 (a single run each, not bit-identical).
+
+| 289,748-token prompt | ds4 | llama.cpp |
+| --- | --- | --- |
+| prefill | 959 s (302 tokens/s; 600 t/s in the first 10,000 tokens, 250 at 220,000) | 3,081 s (94 tokens/s; 330 t/s in the first 25,000, 100 at 270,000) |
+| decode at 290,000 tokens of context | 20.3 tokens/s (441 tokens) | 17.0 tokens/s (391 tokens) |
+
+A second ds4 request with the same prompt reused the kept state (289,748 cached tokens) and answered in 21.8 s. The model thinks aloud
+first on this prompt and writes the list after about 330 tokens, so the first generated tokens are the thinking header.
