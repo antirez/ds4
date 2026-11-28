@@ -22194,6 +22194,46 @@ static void test_kv_cache_open_sweeps_partial_files(void) {
     rmdir(dir);
 }
 
+/* A file the loader refused (another --ctx, another model file) must not hide a shorter usable prefix, and the next store under its
+ * key replaces it.  Only for stores with replace_refused (Inkling). */
+static void test_kv_cache_refused_file_does_not_shadow_prefix(void) {
+    char tmpl[] = "/tmp/ds4-kv-refused-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    const char *short_text = "system prompt and a first question";
+    const char *long_text = "system prompt and a first question and the answer and a second question";
+    const char *texts[] = {short_text, long_text};
+    test_kv_text_stub_file_model(dir, short_text, 7, KV_REASON_COLD, 2048, 4096);
+    test_kv_text_stub_file_model(dir, long_text, 7, KV_REASON_COLD, 3000, 4096);
+    kv_disk_cache kc = {0};
+    kc.opt = kv_cache_default_options();
+    kc.opt.min_tokens = 16;
+    TEST_ASSERT(ds4_kvstore_open_owned(&kc, dir, 1, false, kc.opt, 7, "test", test_kv_owner_log, NULL));
+    kc.replace_refused = true;
+    const char *prompt = "system prompt and a first question and the answer and a second question and more";
+    int idx = ds4_kvstore_find_text_prefix(&kc, prompt, 7, 2, 32768);
+    TEST_ASSERT(idx >= 0 && kc.entry[idx].tokens == 3000);          /* the longest prefix wins */
+    ds4_kvstore_note_refused(&kc, kc.entry[idx].sha);
+    char sha[41];
+    sha1_bytes_hex(long_text, strlen(long_text), sha);
+    TEST_ASSERT(ds4_kvstore_is_refused(&kc, sha));
+    idx = ds4_kvstore_find_text_prefix(&kc, prompt, 7, 2, 32768);
+    TEST_ASSERT(idx >= 0 && kc.entry[idx].tokens == 2048);          /* once refused, the shorter usable file is found */
+    char other[41];                                                 /* the store under the key replaced the file: forget only that key */
+    sha1_bytes_hex(short_text, strlen(short_text), other);
+    ds4_kvstore_note_refused(&kc, other);
+    ds4_kvstore_forget_refused(&kc, sha);
+    TEST_ASSERT(!ds4_kvstore_is_refused(&kc, sha) && ds4_kvstore_is_refused(&kc, other) && kc.n_refused == 1);
+    ds4_kvstore_forget_refused(&kc, sha);                           /* forgetting an unknown key is a no-op */
+    TEST_ASSERT(kc.n_refused == 1);
+    kv_disk_cache plain = {0};                                      /* not enabled: the old behaviour, nothing is remembered */
+    ds4_kvstore_note_refused(&plain, sha);
+    TEST_ASSERT(!ds4_kvstore_is_refused(&plain, sha) && plain.n_refused == 0);
+    kv_cache_close(&kc);
+    test_kv_remove_all(dir, texts, 2);
+}
+
 static void test_kv_cache_eviction_prefers_anchor_reason(void) {
     char tmpl[] = "/tmp/ds4-kv-anchor-reason-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -23306,6 +23346,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_values_fresh_snapshots();
     test_kv_cache_eviction_prefers_anchor_reason();
     test_kv_cache_owner_guard_leaves_foreign_files();
+    test_kv_cache_refused_file_does_not_shadow_prefix();
     test_kv_cache_open_sweeps_partial_files();
     test_kv_cache_eviction_makes_room_before_store();
     test_kv_cache_eviction_ignores_oversize_incoming();

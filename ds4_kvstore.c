@@ -623,6 +623,34 @@ void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
     }
 }
 
+void ds4_kvstore_note_refused(ds4_kvstore *kc, const char sha[41]) {
+    if (!kc || !kc->replace_refused || ds4_kvstore_is_refused(kc, sha)) return;
+    if (kc->n_refused == kc->cap_refused) {
+        kc->cap_refused = kc->cap_refused ? kc->cap_refused * 2 : 8;
+        kc->refused = kv_xrealloc(kc->refused, (size_t)kc->cap_refused * sizeof(kc->refused[0]));
+    }
+    memcpy(kc->refused[kc->n_refused++], sha, 41);
+}
+
+/* The key now holds a file this process wrote itself: forget the refusal, or the replacement would be skipped by every lookup and
+ * rewritten (a full payload) on every store until restart. */
+void ds4_kvstore_forget_refused(ds4_kvstore *kc, const char sha[41]) {
+    if (!kc || !kc->replace_refused) return;
+    for (int i = 0; i < kc->n_refused; i++) {
+        if (strcmp(kc->refused[i], sha)) continue;
+        memmove(kc->refused + i, kc->refused + i + 1, (size_t)(kc->n_refused - i - 1) * sizeof(kc->refused[0]));
+        kc->n_refused--;
+        return;
+    }
+}
+
+bool ds4_kvstore_is_refused(const ds4_kvstore *kc, const char sha[41]) {
+    if (!kc || !kc->replace_refused) return false;
+    for (int i = 0; i < kc->n_refused; i++)
+        if (!strcmp(kc->refused[i], sha)) return true;
+    return false;
+}
+
 /* Remove what a crashed server left in the directory: staged payloads (.ds4-stage-PID-XXXXXX) and half-written files
  * (NAME.kv.tmp.PID) whose PID is no longer alive.  A live PID (another server, this one) is left alone.  Returns the count. */
 int ds4_kvstore_sweep_partial(ds4_kvstore *kc) {
@@ -726,6 +754,7 @@ bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
 
 void ds4_kvstore_close(ds4_kvstore *kc) {
     ds4_kvstore_clear(kc);
+    free(kc->refused);
     free(kc->dir);
     memset(kc, 0, sizeof(*kc));
 }
@@ -940,7 +969,8 @@ static bool kv_cache_existing_compatible(ds4_kvstore *kc, const char *path,
     if (access(path, F_OK) != 0) return false;
     ds4_kvstore_entry e = {0};
     if (!ds4_kvstore_read_entry_file(path, sha, &e)) return false;
-    bool compatible = e.model_id == (uint8_t)model_id &&
+    bool compatible = !ds4_kvstore_is_refused(kc, sha) &&
+                      e.model_id == (uint8_t)model_id &&
                       (!kc->reject_different_quant ||
                        e.quant_bits == (uint8_t)quant_bits) &&
                       e.ctx_size <= (uint32_t)ctx_size &&
@@ -1210,6 +1240,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         saved_errno = errno;
         ok = false;
     }
+    if (ok) ds4_kvstore_forget_refused(kc, sha);
     const double save_ms = (kv_now_sec() - save_t0) * 1000.0;
     if (!ok) {
         if (final_size_over_budget) {
@@ -1307,6 +1338,7 @@ int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
             if (e->text_bytes < b->text_bytes) continue;
             if (e->text_bytes == b->text_bytes && e->tokens <= b->tokens) continue;
         }
+        if (ds4_kvstore_is_refused(kc, e->sha)) continue;   /* it could not be loaded: do not let it hide a shorter usable file */
         char sha[41];
         ds4_kvstore_sha1_bytes_hex(prompt_text, (size_t)e->text_bytes, sha);
         if (!strcmp(sha, e->sha)) best = i;
@@ -1404,7 +1436,10 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
                     path);
         }
     } else {
-        if (header_ok) ds4_session_invalidate(session);
+        if (header_ok) {
+            ds4_session_invalidate(session);
+            ds4_kvstore_note_refused(kc, e.sha);
+        }
         kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
                 "%s: kv cache load failed%s%s %s: %s load=%.1f ms",
                 kv_log_name(kc),

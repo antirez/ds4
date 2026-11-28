@@ -74,6 +74,13 @@ typedef struct {
      * not owned and behaves as before. */
     bool owned;
     uint8_t owner_model_id;
+    /* replace_refused: a file this process could not load (payload refused: other model file, other --ctx, corrupt) is remembered
+     * and no longer shadows its prefix; the next store under its key replaces it.  Off: the old behaviour (the file is kept and
+     * counted as compatible).  Set by the Inkling server, whose loader refuses by exact --ctx and model file. */
+    bool replace_refused;
+    char (*refused)[41];
+    int n_refused;
+    int cap_refused;
     int foreign_files;
     uint64_t foreign_bytes;
     ds4_kvstore_options opt;
@@ -130,6 +137,9 @@ bool ds4_kvstore_open_owned(ds4_kvstore *kc, const char *dir, uint64_t budget_mb
                             void (*log)(void *ud, ds4_kvstore_log_type type, const char *msg),
                             void *log_ud);
 int ds4_kvstore_sweep_partial(ds4_kvstore *kc);
+void ds4_kvstore_note_refused(ds4_kvstore *kc, const char sha[41]);
+void ds4_kvstore_forget_refused(ds4_kvstore *kc, const char sha[41]);
+bool ds4_kvstore_is_refused(const ds4_kvstore *kc, const char sha[41]);
 bool ds4_kvstore_key_held_by_other_model(const ds4_kvstore *kc, const char sha[41]);
 void ds4_kvstore_close(ds4_kvstore *kc);
 void ds4_kvstore_clear(ds4_kvstore *kc);
