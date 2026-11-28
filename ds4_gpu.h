@@ -3882,6 +3882,53 @@ int ds4_gpu_qwen4_mtp_project_tensor(
 int ds4_gpu_qwen4_mtp_combine_tensor(
         ds4_gpu_tensor *R_out, const ds4_gpu_tensor *proj, uint32_t n_embd, uint32_t n_hc);
 
+/* Inkling 2 Mini (metal/inkling2.metal; wrappers in ds4_inkling2_metal.inc).  Activations are f32 tensors addressed as
+ * (tensor, byte offset); weights are bound from the mapped model by file offset. */
+typedef struct { const ds4_gpu_tensor *t; uint64_t off; } ds4_gpu_ik_ref;
+typedef struct { const void *map; uint64_t size, off, bytes; uint32_t type, pad; } ds4_gpu_ik_w;
+int ds4_gpu_ik_ready(void);   /* the Inkling 2 kernel library loaded and compiled (metal/inkling2.metal) */
+int ds4_gpu_ik_mm(ds4_gpu_ik_ref y, ds4_gpu_ik_w w, uint32_t in_dim, uint32_t out_rows, ds4_gpu_ik_ref x, uint32_t n);
+int ds4_gpu_ik_embed(ds4_gpu_ik_ref x, ds4_gpu_ik_w emb, ds4_gpu_ik_w norm, ds4_gpu_ik_ref tokens, uint32_t n);
+int ds4_gpu_ik_mix(ds4_gpu_ik_ref out, ds4_gpu_ik_ref streams, uint32_t stream_stride, const uint32_t *idx, uint32_t n_streams,
+                   ds4_gpu_ik_ref cur, ds4_gpu_ik_w queries, uint32_t nq, uint32_t n);
+int ds4_gpu_ik_rms(ds4_gpu_ik_ref y, ds4_gpu_ik_ref x, ds4_gpu_ik_w w, uint32_t dim, uint32_t n_rows, ds4_gpu_ik_ref rows);
+int ds4_gpu_ik_ctl_prep(ds4_gpu_ik_ref g, ds4_gpu_ik_ref cur, ds4_gpu_ik_ref msg, uint32_t n);
+int ds4_gpu_ik_ctl_apply(ds4_gpu_ik_ref out, ds4_gpu_ik_ref cur, ds4_gpu_ik_ref msg, ds4_gpu_ik_ref gain, ds4_gpu_ik_ref forget, uint32_t count);
+int ds4_gpu_ik_conv(ds4_gpu_ik_ref out, ds4_gpu_ik_ref x, ds4_gpu_ik_ref tail, ds4_gpu_ik_w w, ds4_gpu_ik_ref dyn,
+                    uint32_t C, uint32_t hd, float scale, uint32_t n);
+int ds4_gpu_ik_qr_prep(ds4_gpu_ik_ref Q, ds4_gpu_ik_ref R, ds4_gpu_ik_w qclip, ds4_gpu_ik_w rclip, ds4_gpu_ik_ref tau,
+                       int global, uint32_t n);
+int ds4_gpu_ik_kv_store(ds4_gpu_ik_ref Kc, ds4_gpu_ik_ref Vc, ds4_gpu_ik_ref kcache, ds4_gpu_ik_ref vcache,
+                        uint32_t p0, uint32_t rows, uint32_t n);
+int ds4_gpu_ik_attn(ds4_gpu_ik_ref O, ds4_gpu_ik_ref Q, ds4_gpu_ik_ref R, ds4_gpu_ik_ref sink, ds4_gpu_ik_ref gate,
+                    ds4_gpu_ik_w relb, ds4_gpu_ik_ref kcache, ds4_gpu_ik_ref vcache,
+                    uint32_t p0, uint32_t rows, int local, uint32_t n, ds4_gpu_ik_ref part, uint32_t part_splits);
+int ds4_gpu_ik_router(ds4_gpu_ik_ref picks, ds4_gpu_ik_ref wts, ds4_gpu_ik_ref logits, ds4_gpu_ik_w bias,
+                      ds4_gpu_ik_ref forced, uint32_t force_ntok, uint32_t slot, uint32_t p0, uint32_t n);
+int ds4_gpu_ik_moe_lists(ds4_gpu_ik_ref lists, ds4_gpu_ik_ref counts, ds4_gpu_ik_ref picks, ds4_gpu_ik_ref tiles, uint32_t n);
+int ds4_gpu_ik_moe_gu_mma(ds4_gpu_ik_ref ac, ds4_gpu_ik_w w, ds4_gpu_ik_w gscale, ds4_gpu_ik_ref h, ds4_gpu_ik_ref lists, ds4_gpu_ik_ref counts,
+                          ds4_gpu_ik_ref tiles, uint32_t n);
+int ds4_gpu_ik_moe_down_mma(ds4_gpu_ik_ref yd, ds4_gpu_ik_w w, ds4_gpu_ik_ref ac, ds4_gpu_ik_ref lists, ds4_gpu_ik_ref counts, ds4_gpu_ik_ref tiles,
+                            uint32_t n);
+int ds4_gpu_ik_moe_gu(ds4_gpu_ik_ref ac, ds4_gpu_ik_w w, ds4_gpu_ik_w gscale, ds4_gpu_ik_ref h, ds4_gpu_ik_ref lists,
+                      ds4_gpu_ik_ref counts, uint32_t n);
+int ds4_gpu_ik_moe_down(ds4_gpu_ik_ref yd, ds4_gpu_ik_w w, ds4_gpu_ik_ref ac, ds4_gpu_ik_ref lists, ds4_gpu_ik_ref counts, uint32_t n);
+int ds4_gpu_ik_moe_combine(ds4_gpu_ik_ref out, ds4_gpu_ik_ref yd, ds4_gpu_ik_ref wts, ds4_gpu_ik_ref picks, ds4_gpu_ik_w dscale, uint32_t n);
+int ds4_gpu_ik_ctl_multi(uint32_t nctl, const ds4_gpu_ik_w *wdown, const ds4_gpu_ik_w *wgain, const ds4_gpu_ik_w *wforget,
+                         ds4_gpu_ik_ref cur, uint32_t cur_stride, ds4_gpu_ik_ref msg, uint32_t msg_stride, ds4_gpu_ik_ref d,
+                         const ds4_gpu_ik_ref *out);
+int ds4_gpu_ik_rms3(uint32_t nrow, const ds4_gpu_ik_ref *x, const ds4_gpu_ik_w *w, const ds4_gpu_ik_ref *y);
+int ds4_gpu_ik_mm_multi(uint32_t nseg, const ds4_gpu_ik_w *w, const uint32_t *rows, uint32_t in_dim, const ds4_gpu_ik_ref *x,
+                        const uint32_t *xsel, const ds4_gpu_ik_ref *y);
+int ds4_gpu_ik_fast1(uint32_t n);
+int ds4_gpu_ik_conv1(ds4_gpu_ik_ref out, ds4_gpu_ik_ref x, ds4_gpu_ik_ref tail, ds4_gpu_ik_w w, ds4_gpu_ik_ref dyn, ds4_gpu_ik_ref addend,
+                     uint32_t C, uint32_t hd, float scale);
+int ds4_gpu_ik_moe_decode_ok(uint32_t gu_type, uint32_t down_type);
+int ds4_gpu_ik_moe_gu1(ds4_gpu_ik_ref ac, ds4_gpu_ik_w w, ds4_gpu_ik_w gscale, ds4_gpu_ik_ref h, ds4_gpu_ik_ref picks, uint32_t n);
+int ds4_gpu_ik_moe_dc1(ds4_gpu_ik_ref out, ds4_gpu_ik_w w, ds4_gpu_ik_ref ac, ds4_gpu_ik_ref picks, ds4_gpu_ik_ref wts, ds4_gpu_ik_w dscale, uint32_t n);
+int ds4_gpu_ik_add(ds4_gpu_ik_ref out, ds4_gpu_ik_ref a, ds4_gpu_ik_ref b, uint32_t count);
+int ds4_gpu_ik_softcap(ds4_gpu_ik_ref x, uint32_t count);
+
 #ifdef __cplusplus
 }
 #endif

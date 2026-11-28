@@ -56,6 +56,9 @@
 #define DS4_HAS_QWEN4_METAL 1
 #endif
 #endif
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+#define DS4_HAS_INKLING2_GPU 1
+#endif
 #if defined(DS4_ROCM_BUILD) || (!defined(__APPLE__) && !defined(DS4_NO_GPU))
 #include "ds4_linux_memory.h"
 #endif
