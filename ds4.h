@@ -310,6 +310,12 @@ bool ds4_engine_is_glm53(ds4_engine *e);
 bool ds4_engine_is_qwen4(ds4_engine *e);
 /* Qwen3.8 reasoning-effort system instruction for a think mode (NULL when none) */
 const char *ds4_qwen4_reasoning_effort_text(ds4_think_mode mode);
+/* Inkling 2: the model family uses a template "Thinking effort level: N" block
+ * instead of a think on/off switch.  ds4_engine_is_inkling2() is true for
+ * arch inkling2_loop; ds4_inkling2_effort_text() maps a think mode to N
+ * ("0", "0.2", "0.7", "0.9", "0.99", or level/100); docs/INKLING2.md. */
+bool ds4_engine_is_inkling2(ds4_engine *e);
+const char *ds4_inkling2_effort_text(ds4_think_mode mode);
 const char *ds4_backend_name(ds4_backend backend);
 bool ds4_think_mode_enabled(ds4_think_mode mode);
 int ds4_think_mode_level(ds4_think_mode mode);
@@ -475,6 +481,9 @@ ds4_session_rewrite_result ds4_session_rewrite_from_common(
         ds4_session *s, const ds4_tokens *prompt, int common,
         char *err, size_t errlen);
 int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt);
+/* Inkling 2 only (0 for every other family): when the live state is not a prefix of `prompt`, the length of the earlier prompt
+ * whose end state the session kept a copy of and that `prompt` starts with, i.e. how many tokens the next sync will reuse. */
+int ds4_session_restore_prefix(ds4_session *s, const ds4_tokens *prompt);
 bool ds4_session_checkpoint_valid(const ds4_session *s);
 /* Test helpers (ds4-test): allocate a session shell holding only the given
  * checkpoint tokens, for server-side routing/probe unit tests.  Not usable
